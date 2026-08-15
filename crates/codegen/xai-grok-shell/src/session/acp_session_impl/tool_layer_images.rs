@@ -80,8 +80,6 @@ mod tests {
         ToolRunResult {
             output,
             prompt_text: "prompt".into(),
-            trusted_prompt_suffix: String::new(),
-            trusted_prompt_reminders: Vec::new(),
             effective_tool_name: None,
         }
     }

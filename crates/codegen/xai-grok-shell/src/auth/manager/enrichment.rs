@@ -192,9 +192,8 @@ async fn run_user_info_enrichment(manager: &AuthManager, auth: GrokAuth) {
             None,
             Some(serde_json::json!({
                 "reason": "sibling_rotated",
-                "written_access_token_present": !auth.key.is_empty(),
-                "disk_access_token_present": !disk.key.is_empty(),
-                "access_token_relation": if auth.key == disk.key { "same" } else { "different" },
+                "written_key_prefix": xai_grok_auth::bearer_suffix(&auth.key),
+                "disk_key_prefix": xai_grok_auth::bearer_suffix(&disk.key),
             })),
         );
         return;

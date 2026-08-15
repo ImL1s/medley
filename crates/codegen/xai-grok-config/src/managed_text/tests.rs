@@ -227,7 +227,7 @@ fn invalid_inputs_and_all_marker_shapes_are_refused() {
         vec![b'x'; super::source::MAX_CONFIG_BYTES as usize + 1],
     )
     .unwrap();
-    let nul = temp.path().join("nul");
+    let nul = temp.path().join("null-byte");
     fs::write(&nul, b"a\0b").unwrap();
     let non_utf8 = temp.path().join("non-utf8");
     fs::write(&non_utf8, [0xff]).unwrap();

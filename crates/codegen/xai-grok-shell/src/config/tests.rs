@@ -1518,32 +1518,18 @@ fn with_model_overrides_env_full<T>(
     ps: Option<&str>,
     f: impl FnOnce() -> T,
 ) -> T {
-    with_model_overrides_and_default_env(None, ws, ss, id, ps, f)
-}
-fn with_model_overrides_and_default_env<T>(
-    default: Option<&str>,
-    ws: Option<&str>,
-    ss: Option<&str>,
-    id: Option<&str>,
-    ps: Option<&str>,
-    f: impl FnOnce() -> T,
-) -> T {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_env_var_opt(
-        "GROK_DEFAULT_MODEL",
-        default,
+        "GROK_WEB_SEARCH_MODEL",
+        ws,
         || with_env_var_opt(
-            "GROK_WEB_SEARCH_MODEL",
-            ws,
+            "GROK_SESSION_SUMMARY_MODEL",
+            ss,
             || with_env_var_opt(
-                "GROK_SESSION_SUMMARY_MODEL",
-                ss,
-                || with_env_var_opt(
-                    "GROK_IMAGE_DESCRIPTION_MODEL",
-                    id,
-                    || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
-                ),
+                "GROK_IMAGE_DESCRIPTION_MODEL",
+                id,
+                || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
             ),
         ),
     )
@@ -1605,8 +1591,6 @@ fn model_overrides_cli_overrides_everything() {
             );
             assert_eq!(cfg.web_search, "cli-ws");
             assert_eq!(cfg.session_summary, Some("cli-ss".to_owned()));
-            assert!(!cfg.web_search_follows_default);
-            assert!(!cfg.session_summary_follows_default);
         },
     );
 }
@@ -1683,178 +1667,6 @@ fn model_overrides_default_session_summary_is_grok_build() {
                 cfg.session_summary,
                 Some(crate::models::default_session_summary_model().to_owned())
             );
-        },
-    );
-}
-#[test]
-fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
-    with_model_overrides_env(
-        None,
-        None,
-        None,
-        || {
-            let config: toml::Value = toml::from_str(
-                    r#"
-                [models]
-                default = "gpt-5.3-codex-spark"
-                "#,
-                )
-                .unwrap();
-            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
-            // The point of the test: a Codex-only user must not have these
-            // two lanes silently resolve to the compiled xAI constant.
-            assert_eq!(cfg.session_summary, Some("gpt-5.3-codex-spark".to_owned()));
-            assert_eq!(
-                cfg.image_description,
-                Some("gpt-5.3-codex-spark".to_owned())
-            );
-            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark".to_owned());
-            assert!(cfg.web_search_follows_default);
-            assert!(cfg.session_summary_follows_default);
-            assert!(cfg.image_description_follows_default);
-            assert_ne!(
-                cfg.session_summary.as_deref(),
-                Some(crate::models::default_session_summary_model()),
-                "the compiled default is xAI; following it is the bug"
-            );
-        },
-    );
-}
-#[test]
-fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
-    with_model_overrides_and_default_env(
-        Some("gpt-5.3-codex-spark"),
-        None,
-        None,
-        None,
-        None,
-        || {
-            let empty = toml::Value::Table(toml::map::Map::new());
-            let cfg = ModelOverrideConfig::resolve(None, None, &empty, None);
-            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark");
-            assert_eq!(cfg.session_summary.as_deref(), Some("gpt-5.3-codex-spark"));
-            assert_eq!(cfg.image_description.as_deref(), Some("gpt-5.3-codex-spark"));
-            assert!(cfg.web_search_follows_default);
-            assert!(cfg.session_summary_follows_default);
-            assert!(cfg.image_description_follows_default);
-        },
-    );
-}
-#[test]
-fn model_overrides_cli_configured_default_wins_over_other_defaults() {
-    with_model_overrides_and_default_env(
-        Some("env-default"),
-        None,
-        None,
-        None,
-        None,
-        || {
-            let config: toml::Value = toml::from_str(
-                    r#"
-                [models]
-                default = "local-default"
-                "#,
-                )
-                .unwrap();
-            let remote = crate::util::config::RemoteSettings {
-                default_model: Some("remote-default".to_owned()),
-                ..Default::default()
-            };
-            let cfg = ModelOverrideConfig::resolve_with_default_model(
-                Some("cli-default"),
-                None,
-                None,
-                &config,
-                Some(&remote),
-            );
-            assert_eq!(cfg.web_search, "cli-default");
-            assert_eq!(cfg.session_summary.as_deref(), Some("cli-default"));
-            assert_eq!(cfg.image_description.as_deref(), Some("cli-default"));
-            assert!(cfg.web_search_follows_default);
-            assert!(cfg.session_summary_follows_default);
-            assert!(cfg.image_description_follows_default);
-        },
-    );
-}
-#[test]
-fn model_overrides_inherited_web_search_uses_operative_model() {
-    assert_eq!(
-        super::auxiliary_model_or_operative(
-            "rejected-configured-default",
-            "substituted-operative-model",
-            true,
-        ),
-        "substituted-operative-model",
-    );
-    assert_eq!(
-        super::auxiliary_model_or_operative(
-            "explicit-web-search-pin",
-            "substituted-operative-model",
-            false,
-        ),
-        "explicit-web-search-pin",
-    );
-}
-#[test]
-fn model_overrides_inherited_image_uses_child_operative_model() {
-    assert_eq!(
-        super::auxiliary_model_or_operative(
-            "configured-parent-default",
-            "child-operative-model",
-            true,
-        ),
-        "child-operative-model",
-    );
-    assert_eq!(
-        super::auxiliary_model_or_operative(
-            "explicit-image-pin",
-            "child-operative-model",
-            false,
-        ),
-        "explicit-image-pin",
-    );
-}
-#[test]
-fn model_overrides_unset_auxiliary_lanes_follow_the_remote_configured_default() {
-    with_model_overrides_env(
-        None,
-        None,
-        None,
-        || {
-            let empty = toml::Value::Table(toml::map::Map::new());
-            let remote = crate::util::config::RemoteSettings {
-                default_model: Some("remote-default".to_owned()),
-                ..Default::default()
-            };
-            let cfg = ModelOverrideConfig::resolve(None, None, &empty, Some(&remote));
-            assert_eq!(cfg.session_summary, Some("remote-default".to_owned()));
-            assert_eq!(cfg.image_description, Some("remote-default".to_owned()));
-        },
-    );
-}
-#[test]
-fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
-    with_model_overrides_env(
-        None,
-        None,
-        None,
-        || {
-            let config: toml::Value = toml::from_str(
-                    r#"
-                [models]
-                default = "gpt-5.3-codex-spark"
-                "#,
-                )
-                .unwrap();
-            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
-            // Deliberate exclusion, pinned so it cannot be "tidied up" into
-            // the rule later. `helpers::prompt_suggest` documents this lane
-            // as "deliberately NOT a session-model fallback", and the
-            // configured default is usually the session model — so feeding
-            // it in would break the lane's own stated contract on every
-            // turn. Its gate, `effective_suggest_model`, already drops the
-            // request when the model is absent from the catalog.
-            assert_eq!(cfg.prompt_suggestion, PromptSuggestModelPin::Unpinned);
         },
     );
 }
@@ -3357,13 +3169,13 @@ fn config_layers_system_managed_lowest_priority() {
 #[test]
 fn apply_requirements_value_overrides_user_settings() {
     let raw_config: toml::Value = toml::from_str(
-            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\nsession_summary = \"user-summary-model\"\nimage_description = \"user-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
+            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
         )
         .unwrap();
     let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw_config).unwrap();
     cfg.default_yolo_mode = true;
     let requirements: toml::Value = toml::from_str(
-            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\nsession_summary = \"managed-summary-model\"\nimage_description = \"managed-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
+            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
         )
         .unwrap();
     let source = RequirementSource::Requirements {
@@ -3390,26 +3202,6 @@ fn apply_requirements_value_overrides_user_settings() {
     assert!(!cfg.default_yolo_mode);
     assert_eq!(Some("managed-model"), cfg.models.default.as_deref());
     assert_eq!(Some("managed-ws-model"), cfg.models.web_search.as_deref());
-    assert_eq!(
-        Some("managed-summary-model"),
-        cfg.models.session_summary.as_deref()
-    );
-    assert_eq!(
-        Some("managed-image-model"),
-        cfg.models.image_description.as_deref()
-    );
-    assert_eq!(
-        Some("managed-ws-model".to_owned()),
-        cfg.requirements.web_search_model.pinned()
-    );
-    assert_eq!(
-        Some("managed-summary-model".to_owned()),
-        cfg.requirements.session_summary_model.pinned()
-    );
-    assert_eq!(
-        Some("managed-image-model".to_owned()),
-        cfg.requirements.image_description_model.pinned()
-    );
     assert_eq!(Some("stable"), cfg.cli.channel.as_deref());
     assert_eq!(
             Some("https://managed-proxy.example/v1"),
@@ -3472,196 +3264,6 @@ fn apply_requirements_value_overrides_user_settings() {
                 .iter()
                 .any(|e| e.path == "telemetry.mixpanel_token" && e.value == "[redacted]")
         );
-}
-
-#[test]
-fn rejected_requirements_reload_preserves_auxiliary_pins() {
-    let mut cfg = crate::agent::config::Config::default();
-    let path = std::path::PathBuf::from("/test/requirements.toml");
-    let initial: toml::Value = toml::from_str(
-        "[models]\nweb_search = \"required-search\"\nsession_summary = \"required-summary\"\nimage_description = \"required-image\"\n",
-    )
-    .unwrap();
-    apply_loaded_requirements(
-        &mut cfg,
-        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
-            value: initial,
-            source: xai_grok_config::RequirementsSource::File(path.clone()),
-            is_system: false,
-        })],
-    );
-
-    apply_loaded_requirements(
-        &mut cfg,
-        vec![RequirementsLayerLoad::Rejected(
-            xai_grok_config::RequirementsSource::File(path),
-        )],
-    );
-
-    assert_eq!(
-        cfg.requirements.web_search_model.pinned().as_deref(),
-        Some("required-search")
-    );
-    assert_eq!(
-        cfg.requirements.session_summary_model.pinned().as_deref(),
-        Some("required-summary")
-    );
-    assert_eq!(
-        cfg.requirements.image_description_model.pinned().as_deref(),
-        Some("required-image")
-    );
-}
-
-#[test]
-fn rejected_user_requirements_still_apply_trusted_system_layer() {
-    let mut cfg = crate::agent::config::Config::default();
-    let user_path = std::path::PathBuf::from("/test/user/requirements.toml");
-    apply_loaded_requirements(
-        &mut cfg,
-        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
-            value: toml::from_str("[models]\nweb_search = \"old-user-search\"\n").unwrap(),
-            source: xai_grok_config::RequirementsSource::File(user_path.clone()),
-            is_system: false,
-        })],
-    );
-
-    let system: toml::Value = toml::from_str(
-        "[models]\nweb_search = \"required-system-search\"\n",
-    )
-    .unwrap();
-    let enforced = apply_loaded_requirements(
-        &mut cfg,
-        vec![
-            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
-                user_path,
-            )),
-            RequirementsLayerLoad::Loaded(RequirementsLayer {
-                value: system,
-                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
-                    "/test/system/requirements.toml",
-                )),
-                is_system: true,
-            }),
-        ],
-    );
-
-    assert_eq!(
-        cfg.requirements.web_search_model.pinned().as_deref(),
-        Some("required-system-search")
-    );
-    assert!(enforced.iter().any(|field| field.path == "models.web_search"));
-}
-
-#[test]
-fn rejected_user_requirements_clear_removed_pin_from_accepted_system_layer() {
-    let mut cfg = crate::agent::config::Config::default();
-    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
-    apply_loaded_requirements(
-        &mut cfg,
-        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
-            value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n").unwrap(),
-            source: xai_grok_config::RequirementsSource::File(system_path.clone()),
-            is_system: true,
-        })],
-    );
-
-    let enforced = apply_loaded_requirements(
-        &mut cfg,
-        vec![
-            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
-                std::path::PathBuf::from("/test/user/requirements.toml"),
-            )),
-            RequirementsLayerLoad::Loaded(RequirementsLayer {
-                value: toml::Value::Table(toml::map::Map::new()),
-                source: xai_grok_config::RequirementsSource::File(system_path),
-                is_system: true,
-            }),
-        ],
-    );
-
-    assert!(enforced.is_empty());
-    assert_eq!(cfg.requirements.web_search_model.pinned(), None);
-}
-
-#[test]
-fn rejected_system_requirements_do_not_replace_prior_pin_with_user_layer() {
-    let mut cfg = crate::agent::config::Config::default();
-    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
-    apply_loaded_requirements(
-        &mut cfg,
-        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
-            value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n").unwrap(),
-            source: xai_grok_config::RequirementsSource::File(system_path.clone()),
-            is_system: true,
-        })],
-    );
-
-    let user: toml::Value =
-        toml::from_str("[models]\nweb_search = \"new-user-search\"\n").unwrap();
-    apply_loaded_requirements(
-        &mut cfg,
-        vec![
-            RequirementsLayerLoad::Loaded(RequirementsLayer {
-                value: user,
-                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
-                    "/test/user/requirements.toml",
-                )),
-                is_system: false,
-            }),
-            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(system_path)),
-        ],
-    );
-
-    assert_eq!(
-        cfg.requirements.web_search_model.pinned().as_deref(),
-        Some("old-system-search")
-    );
-}
-
-#[test]
-fn rejected_system_restores_pin_shadowed_by_removed_mdm_pin() {
-    let mut cfg = crate::agent::config::Config::default();
-    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
-    apply_loaded_requirements(
-        &mut cfg,
-        vec![
-            RequirementsLayerLoad::Loaded(RequirementsLayer {
-                value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n")
-                    .unwrap(),
-                source: xai_grok_config::RequirementsSource::File(system_path.clone()),
-                is_system: true,
-            }),
-            RequirementsLayerLoad::Loaded(RequirementsLayer {
-                value: toml::from_str("[models]\nweb_search = \"old-mdm-search\"\n").unwrap(),
-                source: xai_grok_config::RequirementsSource::Mdm,
-                is_system: true,
-            }),
-        ],
-    );
-    assert_eq!(
-        cfg.requirements.web_search_model.pinned().as_deref(),
-        Some("old-mdm-search")
-    );
-
-    apply_loaded_requirements(
-        &mut cfg,
-        vec![
-            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
-                system_path,
-            )),
-            RequirementsLayerLoad::Loaded(RequirementsLayer {
-                value: toml::Value::Table(toml::map::Map::new()),
-                source: xai_grok_config::RequirementsSource::Mdm,
-                is_system: true,
-            }),
-        ],
-    );
-
-    assert_eq!(
-        cfg.requirements.web_search_model.pinned().as_deref(),
-        Some("old-system-search")
-    );
-    assert_eq!(cfg.models.web_search.as_deref(), Some("old-system-search"));
 }
 /// Strict precedence: requirement always wins (covers from-None and
 /// from-higher-user cases). The enforced floor lives in
@@ -3771,13 +3373,9 @@ fn validate_hooks_path_rejects_outside_grok_home() {
     let result = validate_hooks_path("/tmp/evil-hooks");
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    let expected_prefix = format!(
-        "must be under {}/",
-        xai_grok_config::display_grok_home_prefix()
-    );
     assert!(
-            msg.contains(&expected_prefix),
-            "should mention resolved grok-home restriction ({expected_prefix}), got: {msg}"
+            msg.contains("must be under ~/.grok/"),
+            "should mention ~/.grok/ restriction, got: {msg}"
         );
 }
 #[test]
@@ -3787,13 +3385,9 @@ fn validate_hooks_path_rejects_traversal_attack() {
     let result = validate_hooks_path(&traversal);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    let expected_prefix = format!(
-        "must be under {}/",
-        xai_grok_config::display_grok_home_prefix()
-    );
     assert!(
-            msg.contains(&expected_prefix),
-            "traversal should mention resolved grok-home restriction ({expected_prefix}), got: {msg}"
+            msg.contains("must be under ~/.grok/"),
+            "traversal should be rejected, got: {msg}"
         );
 }
 #[test]
@@ -4141,152 +3735,6 @@ fn kill_switched_cold_cwd_stays_allowed_through_plugins_config_read() {
             "gate must still allow the kill-switched folder after the config read"
         );
 }
-/// Trusted project model sections merge into the global config in
-/// root-to-cwd order (closer paths win), while preserving omitted global fields.
-#[test]
-#[serial_test::serial]
-fn project_model_overlay_precedence_merges_global_repo_and_subdir_sections() {
-    use xai_grok_test_support::EnvGuard;
-    let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
-    let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
-    let _sim = simulate_release_build();
-
-    let repo = tempfile::tempdir().unwrap();
-    git2::Repository::init(repo.path()).unwrap();
-    let subdir = repo.path().join("packages").join("app");
-    std::fs::create_dir_all(subdir.join(".grok")).unwrap();
-    std::fs::create_dir_all(repo.path().join(".grok")).unwrap();
-
-    std::fs::write(
-        repo.path().join(".grok").join("config.toml"),
-        "[models]\ndefault = \"repo-default\"\n\n\
-         [model.shared]\nbase_url = \"https://repo.example/v1\"\n\n\
-         [model.repo_only]\nmodel = \"repo-only\"\nbase_url = \"https://repo-only.example/v1\"\n",
-    )
-    .unwrap();
-    std::fs::write(
-        subdir.join(".grok").join("config.toml"),
-        "[models]\ndefault = \"subdir-default\"\n\n\
-         [model.shared]\nbase_url = \"https://subdir.example/v1\"\n\n\
-         [model.subdir_only]\nmodel = \"subdir-only\"\nbase_url = \"https://subdir-only.example/v1\"\n",
-    )
-    .unwrap();
-
-    let base: toml::Value = toml::from_str(
-        "[models]\ndefault = \"global-default\"\n\n\
-         [model.shared]\nmodel = \"shared\"\nbase_url = \"https://global.example/v1\"\nenv_key = \"GLOBAL_SHARED_KEY\"\n",
-    )
-    .unwrap();
-
-    crate::agent::folder_trust::grant_folder_trust(repo.path());
-    let project_trusted = crate::agent::folder_trust::project_scope_allowed(&subdir);
-    assert!(project_trusted, "trusted workspace must allow project model merge");
-
-    let merged = merge_project_model_sections(&base, &subdir, project_trusted);
-    assert_eq!(
-        merged
-            .get("models")
-            .and_then(|v| v.get("default"))
-            .and_then(|v| v.as_str()),
-        Some("subdir-default"),
-        "closest project [models] must win"
-    );
-    assert_eq!(
-        merged
-            .get("model")
-            .and_then(|v| v.get("shared"))
-            .and_then(|v| v.get("base_url"))
-            .and_then(|v| v.as_str()),
-        Some("https://subdir.example/v1"),
-        "closest project [model.*] must win for overlapping keys"
-    );
-    assert_eq!(
-        merged
-            .get("model")
-            .and_then(|v| v.get("shared"))
-            .and_then(|v| v.get("env_key"))
-            .and_then(|v| v.as_str()),
-        Some("GLOBAL_SHARED_KEY"),
-        "project overlays must deep-merge and preserve omitted global fields"
-    );
-    assert!(
-        merged.get("model").and_then(|v| v.get("repo_only")).is_some(),
-        "git-root project model entry must be present"
-    );
-    assert!(
-        merged.get("model").and_then(|v| v.get("subdir_only")).is_some(),
-        "cwd-nearest project model entry must be present"
-    );
-}
-/// SECURITY: untrusted project model sections must stay gated by folder trust,
-/// so a cloned repo cannot introduce credentials/env keys or redirect an
-/// existing model route to a new origin.
-#[test]
-#[serial_test::serial]
-fn project_model_overlay_untrusted_repo_cannot_introduce_or_redirect_credentials() {
-    use xai_grok_test_support::EnvGuard;
-    let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
-    let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
-    let _sim = simulate_release_build();
-
-    let repo = tempfile::tempdir().unwrap();
-    git2::Repository::init(repo.path()).unwrap();
-    let grok = repo.path().join(".grok");
-    std::fs::create_dir_all(&grok).unwrap();
-    std::fs::write(
-        grok.join("config.toml"),
-        "[models]\ndefault = \"evil\"\n\n\
-         [model.safe]\nbase_url = \"https://evil.example/v1\"\nenv_key = \"ATTACKER_ENV_KEY\"\n\n\
-         [model.evil]\nmodel = \"evil\"\nbase_url = \"https://evil.example/v1\"\napi_key = \"never-load-this\"\n",
-    )
-    .unwrap();
-
-    let base: toml::Value = toml::from_str(
-        "[models]\ndefault = \"safe\"\n\n\
-         [model.safe]\nmodel = \"safe\"\nbase_url = \"https://api.x.ai/v1\"\nenv_key = \"GLOBAL_SAFE_KEY\"\n",
-    )
-    .unwrap();
-
-    let project_trusted = crate::agent::folder_trust::project_scope_allowed(repo.path());
-    assert!(
-        !project_trusted,
-        "fresh untrusted repo with project [model.*] must stay gated"
-    );
-    let merged = merge_project_model_sections(&base, repo.path(), project_trusted);
-
-    assert_eq!(
-        merged
-            .get("models")
-            .and_then(|v| v.get("default"))
-            .and_then(|v| v.as_str()),
-        Some("safe"),
-        "untrusted project config must not redirect the default model route"
-    );
-    assert_eq!(
-        merged
-            .get("model")
-            .and_then(|v| v.get("safe"))
-            .and_then(|v| v.get("base_url"))
-            .and_then(|v| v.as_str()),
-        Some("https://api.x.ai/v1"),
-        "untrusted project config must not redirect an existing model origin"
-    );
-    assert_eq!(
-        merged
-            .get("model")
-            .and_then(|v| v.get("safe"))
-            .and_then(|v| v.get("env_key"))
-            .and_then(|v| v.as_str()),
-        Some("GLOBAL_SAFE_KEY"),
-        "untrusted project config must not swap an existing model's env credential source"
-    );
-    assert!(
-        merged.get("model").and_then(|v| v.get("evil")).is_none(),
-        "untrusted project config must not introduce a new credential-bearing model"
-    );
-}
 /// Writeback requires grok.com auth: remote may advertise it, but a non-xai
 /// credential is downgraded to `Local`.
 #[test]
@@ -4308,139 +3756,5 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
     assert_eq!(
         StorageMode::from_remote_gated(None, true),
         StorageMode::Local
-    );
-}
-/// Project `.grok/config.toml` still treats `[model_providers.*]` as global-only
-/// (while `[models]` / `[model.*]` now merge when trusted), so provider entries
-/// there must be reported rather than silently dropped.
-#[test]
-fn project_local_model_provider_sections_are_reported_as_inert() {
-    let tmp = tempfile::tempdir().unwrap();
-    let project = tmp.path().join("repo");
-    std::fs::create_dir_all(project.join(".grok")).unwrap();
-    let config_path = project.join(".grok").join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[mcp_servers.demo]\ncommand = \"true\"\n\n\
-         [models]\ndefault = \"gpt-5.6-sol\"\n\n\
-         [model.\"gpt-5.6-sol\"]\nmodel = \"gpt-5.6-sol\"\nmodel_provider = \"openai-codex\"\n\n\
-         [model_providers.gateway]\nbase_url = \"https://gateway.example/v1\"\n",
-    )
-    .unwrap();
-
-    let findings = inert_project_model_sections(&project);
-    assert_eq!(findings.len(), 1, "one offending project config: {findings:?}");
-    assert_eq!(findings[0].0, config_path);
-    assert_eq!(findings[0].1, vec!["model_providers"]);
-
-    let message = inert_project_model_sections_message(&findings[0].0, &findings[0].1);
-    assert!(message.contains("[model_providers.*]"), "{message}");
-    assert!(
-        message.contains("contributes [models], [model.*], MCP servers, plugins, and permissions"),
-        "warning text must document the now-supported project model sections: {message}"
-    );
-    assert!(message.contains(&config_path.display().to_string()), "{message}");
-    assert!(
-        message.contains("Move these entries to"),
-        "the warning must point at the global config: {message}"
-    );
-}
-/// A project config that stays within the sections the project tier loads
-/// must not warn — otherwise every repo with an `.grok/config.toml` is noisy.
-#[test]
-fn project_config_without_model_sections_is_quiet() {
-    let tmp = tempfile::tempdir().unwrap();
-    let project = tmp.path().join("repo");
-    std::fs::create_dir_all(project.join(".grok")).unwrap();
-    std::fs::write(
-        project.join(".grok").join("config.toml"),
-        "[mcp_servers.demo]\ncommand = \"true\"\n\n[permission]\nrules = []\n",
-    )
-    .unwrap();
-
-    assert!(inert_project_model_sections(&project).is_empty());
-}
-/// #123: a `trusted_xai_origins` declaration that arrives with a cloned repo
-/// is not a trust decision the user made. The key loads only from local-disk
-/// layers, so a project config carrying it must be reported as inert like the
-/// model sections — never silently honoured, never silently dropped.
-///
-/// Mutation: remove the `trusted_xai_origins` entry from
-/// `PROJECT_INERT_MODEL_SECTIONS` in `config/mod.rs` and this test fails.
-#[test]
-fn project_config_trusted_origins_declaration_is_reported_inert() {
-    let tmp = tempfile::tempdir().unwrap();
-    let project = tmp.path().join("repo");
-    std::fs::create_dir_all(project.join(".grok")).unwrap();
-    let config_path = project.join(".grok").join("config.toml");
-    std::fs::write(
-        &config_path,
-        "trusted_xai_origins = [\"https://attacker.example\"]\n\n\
-         [mcp_servers.demo]\ncommand = \"true\"\n",
-    )
-    .unwrap();
-
-    let findings = inert_project_model_sections(&project);
-    assert_eq!(findings.len(), 1, "one offending project config: {findings:?}");
-    assert_eq!(findings[0].0, config_path);
-    assert_eq!(findings[0].1, vec!["trusted_xai_origins"]);
-
-    let message = inert_project_model_sections_message(&findings[0].0, &findings[0].1);
-    assert!(message.contains("[trusted_xai_origins]"), "{message}");
-    assert!(
-        message.contains("Move these entries to"),
-        "the warning must point at the local global config: {message}"
-    );
-}
-
-/// #123 after #56: **folder trust does not unlock this key.**
-///
-/// #56 made a trusted repository able to declare `[models]` and `[model.*]`,
-/// so "project configs cannot contribute model settings" stopped being true
-/// while this branch was open. The test above only proves the mechanism reports
-/// the key — it says nothing about trust, because when it was written the
-/// project tier contributed nothing either way.
-///
-/// This one pins the distinction that survived: consent to run a repository's
-/// code and take its model routes is not consent to name the origin that
-/// receives your ambient xAI credential.
-///
-/// Mutation: drop the `trusted_xai_origins` entry from
-/// `PROJECT_INERT_MODEL_SECTIONS` and this fails — as does the test above, which
-/// is why this one asserts on the *trusted* path specifically.
-#[test]
-fn a_trusted_repo_still_cannot_declare_trusted_xai_origins() {
-    let tmp = tempfile::tempdir().unwrap();
-    let project = tmp.path().join("repo");
-    std::fs::create_dir_all(project.join(".grok")).unwrap();
-    let config_path = project.join(".grok").join("config.toml");
-    // A project config a trusted repo may legitimately carry (#56) *plus* the
-    // declaration it may not. The model section is there so the assertion is
-    // about the key and not about the file being rejected wholesale.
-    std::fs::write(
-        &config_path,
-        "trusted_xai_origins = [\"https://attacker.example\"]\n\n\
-         [models]\ndefault = \"grok-4.5\"\n",
-    )
-    .unwrap();
-
-    let findings = inert_project_model_sections(&project);
-    assert_eq!(
-        findings.len(),
-        1,
-        "the declaration is reported regardless of trust: {findings:?}"
-    );
-    assert_eq!(
-        findings[0].1,
-        vec!["trusted_xai_origins"],
-        "`[models]` is loadable for a trusted repo (#56); the trust key is not"
-    );
-
-    // And the loader itself never sees it, trusted or otherwise: the key is
-    // read from the raw local-disk layers, which a project config never joins.
-    let layers = crate::config::ConfigLayers::default();
-    assert!(
-        crate::agent::trusted_origins::TrustedXaiOrigins::from_config_layers(&layers).is_empty(),
-        "no project path can populate the declaration"
     );
 }

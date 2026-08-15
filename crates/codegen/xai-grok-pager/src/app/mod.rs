@@ -26,7 +26,7 @@ mod csi_filter;
 mod dispatch;
 /// Display-refresh probe + motion cadence + terminal telemetry at startup.
 mod display_refresh_startup;
-mod effects;
+pub mod effects;
 pub(crate) mod error_display;
 pub mod roster;
 pub mod session_startup;
@@ -34,8 +34,8 @@ pub(crate) mod session_title_resolve;
 pub mod status_blocks;
 pub mod subagent;
 pub mod subscription;
-pub(crate) use effects::{parse_session_web_search_disabled, sanitize_user_error};
 mod event_loop;
+mod exit_timeout;
 pub(crate) mod external_editor;
 mod foreign_sessions;
 mod inline_edit;
@@ -45,7 +45,9 @@ mod modals;
 mod mouse;
 mod queue_edit;
 pub(crate) mod screen_mode_relaunch;
+mod session_load_barrier;
 pub mod signal_handler;
+mod startup_failure;
 mod turn_completion;
 mod xt_filter;
 pub(crate) use crate::terminal::{kitty_flags_pushed, kitty_releases_reported};
@@ -66,6 +68,7 @@ pub(crate) use foreign_sessions::{
     badge_for_picker_source, foreign_tool_display_label, is_foreign_picker_source,
 };
 use ratatui::backend::CrosstermBackend;
+pub use startup_failure::StartupFailure;
 use std::io::{self, Write};
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -377,7 +380,7 @@ pub(crate) struct ExitInfo {
     pub session_id: String,
     pub minimal: bool,
     /// Glanceable session tail; `Some` exactly when it should print. The
-    /// presence policy lives at the sole construction site, `make_run_result`.
+    /// presence policy lives at the sole construction site, `finish_run`.
     pub summary: Option<ExitSummary>,
 }
 /// Session tail printed above the resume command on fullscreen quits.
@@ -561,7 +564,7 @@ async fn bounded_connect(
         biased;
         () = cancel.cancelled() => Err(ConnectFailure {
             outcome: StartupOutcome::Cancelled,
-            error: anyhow::anyhow!("startup cancelled before {target} connected"),
+            error: anyhow::anyhow!("startup cancelled before {target:?} connected"),
             timeout_secs: None,
         }),
         r = connect => r.map_err(|error| ConnectFailure {
@@ -570,11 +573,11 @@ async fn bounded_connect(
             timeout_secs: None,
         }),
         () = tokio::time::sleep(timeout) => {
-            let stuck = timer.stuck_in();
+            let stuck = timer.phase_snapshot().stuck_in();
             let phases = timer.summary();
             // `connect_target`: tracing reserves bare `target=` for the log target.
             tracing::error!(
-                connect_target = %target,
+                connect_target = ?target,
                 stuck_in = stuck,
                 phases = %phases,
                 timeout_secs = timeout.as_secs(),
@@ -583,7 +586,7 @@ async fn bounded_connect(
             Err(ConnectFailure {
                 outcome: StartupOutcome::Timeout,
                 error: anyhow::anyhow!(
-                    "timed out after {}s connecting to {target}\n  \
+                    "timed out after {}s connecting to {target:?}\n  \
                      stuck in: {stuck}\n  \
                      phases: {phases}\n  \
                      startup log: {}",
@@ -866,7 +869,11 @@ pub async fn run(
     let (frame_tx, writer_sync, writer_event_rx, writer_thread) =
         crate::render::draw::spawn_writer_thread();
     let cursor_blink = event_loop::load_initial_ui_config().cursor_blink;
-    let (mut terminal, screen_mode) = init_terminal(
+    let TerminalInit {
+        mut terminal,
+        screen_mode,
+        startup_typeahead,
+    } = init_terminal(
         screen_mode,
         minimal_live_rows,
         relaunched_into_minimal,
@@ -964,16 +971,19 @@ pub async fn run(
         fork_session: false,
         ..args
     };
+    let pending_startup = xai_grok_telemetry::startup::PendingStartup::new();
     let term_state = event_loop::TerminalState {
         is_control_mode,
         screen_mode,
         relaunched_into_minimal,
         relaunched_into_fullscreen,
         initial_theme: crate::theme::cache::current_kind(),
+        startup_typeahead,
     };
     let result = event_loop::run(
         &mut terminal,
         connection,
+        pending_startup,
         &mut config_watcher,
         &effective_args,
         session_cwd,
@@ -984,6 +994,16 @@ pub async fn run(
         writer_event_rx,
     )
     .await;
+    signal_handler::clear_quit_notify();
+    let forced_exit_code = match &result {
+        Ok(run_result) if run_result.quit_for_update || run_result.relaunch.is_some() => None,
+        Ok(_) => Some(0),
+        Err(_) => Some(1),
+    };
+    if let Some(code) = forced_exit_code {
+        exit_timeout::arm(code);
+        exit_timeout::hold_teardown_for_test();
+    }
     crate::unified_log::flush_blocking().await;
     let restore_result = restore_terminal(terminal, writer_thread, screen_mode);
     drop(agent_guard);
@@ -1088,22 +1108,6 @@ fn disable_mouse_paste_raw() {
         let _ = stderr.write_all(xai_crash_handler::terminal::MOUSE_PASTE_RESET);
         let _ = stderr.flush();
     });
-}
-/// Drain any pending terminal input events.
-///
-/// External processes (SSH/GPG agents, etc.) may write to the TTY (e.g. "Enter
-/// encryption key:") before we take over. This helper drains the crossterm
-/// event queue so those characters don't appear as ghost text in the input
-/// field.
-fn drain_pending_events() {
-    drain_pending_events_with_timeout(std::time::Duration::from_millis(0));
-}
-fn drain_pending_events_with_timeout(timeout: std::time::Duration) {
-    while crossterm::event::poll(timeout).unwrap_or(false) {
-        if crossterm::event::read().is_err() {
-            break;
-        }
-    }
 }
 /// Set the console output code page to UTF-8 and enable
 /// `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on the stderr console handle.
@@ -1320,11 +1324,23 @@ fn cursor_style_policy(cursor_blink: Option<bool>) -> CursorStylePolicy {
         Some(false) => CursorStylePolicy::ForceSteady,
     }
 }
+/// Outcome of [`init_terminal`]: the live terminal, the effective screen mode,
+/// and any startup type-ahead captured after raw mode was enabled.
+pub(crate) struct TerminalInit {
+    pub terminal: PagerTerminal,
+    /// The *effective* screen mode, which may differ from the requested one (see
+    /// [`init_terminal`]).
+    pub screen_mode: ScreenMode,
+    /// Keystrokes the user typed while the app was still loading, captured by the
+    /// post-raw-mode drains; replayed into the composer by [`event_loop::run`].
+    pub startup_typeahead: Vec<event_loop::TimedInputEvent>,
+}
 /// Initialize the terminal for `mode`. Returns the live terminal handle and the
 /// *effective* screen mode, which may differ from the requested one: a
 /// `Minimal` request downgrades to `Inline` if the inline-viewport probe fails
 /// (its `insert_before` / `set_viewport_height` commit pipeline is a no-op on
-/// the `Viewport::Fixed` fallback, so minimal cannot function there).
+/// the `Viewport::Fixed` fallback, so minimal cannot function there). Also
+/// returns any startup type-ahead captured by the post-raw-mode drains.
 fn init_terminal(
     mode: ScreenMode,
     minimal_live_rows: u16,
@@ -1332,14 +1348,17 @@ fn init_terminal(
     frame_tx: crate::render::draw::WriterSender,
     writer_sync: crate::render::draw::WriterSync,
     cursor_blink: Option<bool>,
-) -> io::Result<(PagerTerminal, ScreenMode)> {
+) -> io::Result<TerminalInit> {
     xai_crash_handler::enable_terminal_escape_restore();
     terminal::enable_raw_mode()?;
     #[cfg(windows)]
     configure_windows_console();
     let want_minimal = mode.is_minimal();
-    (move || -> io::Result<(PagerTerminal, ScreenMode)> {
-        drain_pending_events();
+    let mut startup_typeahead: Vec<event_loop::TimedInputEvent> = Vec::new();
+    let (terminal, screen_mode) = (|| -> io::Result<(PagerTerminal, ScreenMode)> {
+        startup_typeahead.extend(event_loop::capture_startup_typeahead(
+            std::time::Duration::from_millis(0),
+        ));
         set_terminal_title("");
         if want_minimal && clear_main_screen {
             xai_grok_shell::util::with_locked_stderr(|stderr| {
@@ -1397,7 +1416,7 @@ fn init_terminal(
         } else {
             std::time::Duration::ZERO
         };
-        drain_pending_events_with_timeout(drain_timeout);
+        startup_typeahead.extend(event_loop::capture_startup_typeahead(drain_timeout));
         crate::theme::apply_cursor_color();
         let ctx = crate::terminal::terminal_context();
         let skip_reason: Option<&str> =
@@ -1516,6 +1535,11 @@ fn init_terminal(
         let _ = terminal::disable_raw_mode();
         signal_handler::mark_restored();
         xai_crash_handler::disable_terminal_escape_restore();
+    })?;
+    Ok(TerminalInit {
+        terminal,
+        screen_mode,
+        startup_typeahead,
     })
 }
 /// Drop the terminal (closing the writer mpsc channel) and join the
@@ -1608,7 +1632,7 @@ fn restore_terminal_with(
     let inline_cursor_row = (!mode.is_fullscreen()).then(|| terminal.viewport_area().bottom());
     let drain_result = drain(terminal, writer_thread);
     teardown(mode, inline_cursor_row);
-    drain_pending_events_with_timeout(std::time::Duration::from_millis(10));
+    let _ = event_loop::drain_pending_events(std::time::Duration::from_millis(10), |_| false);
     let _ = terminal::disable_raw_mode();
     signal_handler::mark_restored();
     xai_crash_handler::disable_terminal_escape_restore();
@@ -1657,6 +1681,7 @@ fn set_panic_hook(mode: ScreenMode) {
         xai_crash_handler::disable_terminal_escape_restore();
         xai_tty_utils::restore_native_stderr();
         xai_tty_utils::global_process_scope().kill_all();
+        crate::memory_trace::record_crash_sample();
         hook(info);
     }));
 }

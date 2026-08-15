@@ -11,7 +11,6 @@ use futures_util::stream::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-use xai_grok_sampler::EndpointTrustClass;
 use xai_grok_shell::sampling::{
     ApiBackend, Client, ConversationItem, ConversationRequest, ConversationToolChoice,
     SamplingError, ToolCall, ToolSpec, rs,
@@ -22,20 +21,7 @@ use xai_grok_test_support::{MockInferenceServer, ScriptedResponse, SseEvent};
 
 mod common;
 
-use common::{create_test_client, test_sampler_config};
-
-/// Make a loopback server stand in for the first-party xAI API. Tests using
-/// this helper own their synthetic model key and explicitly exercise metadata
-/// that production must strip from Local and External endpoints.
-fn first_party_xai_config(
-    base_url: &str,
-    api_backend: ApiBackend,
-    extra_headers: &[(&str, &str)],
-) -> xai_grok_sampler::SamplerConfig {
-    let mut config = test_sampler_config(base_url, api_backend, extra_headers);
-    config.endpoint_trust = Some(EndpointTrustClass::FirstPartyXai);
-    config
-}
+use common::{create_test_client, create_test_client_with_extra_headers, test_sampler_config};
 
 // ============================================================================
 // Mock Response Generators
@@ -919,11 +905,10 @@ async fn test_chat_completions_401_unauthorized() {
 
 #[tokio::test]
 async fn test_chat_completions_500_server_error() {
-    const PROVIDER_DETAIL: &str = "provider-controlled internal server detail";
     let server = MockInferenceServer::start().await.unwrap();
     server.enqueue_response(
         "/v1/chat/completions",
-        ScriptedResponse::json(500, json!({"error": {"message": PROVIDER_DETAIL}})),
+        ScriptedResponse::json(500, json!({"error": {"message": "Internal server error"}})),
     );
     let client = create_test_client(&server.url(), ApiBackend::ChatCompletions);
 
@@ -937,11 +922,7 @@ async fn test_chat_completions_500_server_error() {
     }) = result
     {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            message,
-            xai_grok_sampling_types::status_user_message(status)
-        );
-        assert!(!message.contains(PROVIDER_DETAIL));
+        assert!(message.contains("Internal server error"));
     } else {
         panic!("Expected Api error");
     }
@@ -1096,12 +1077,7 @@ async fn test_stream_error_during_responses_streaming() {
 async fn test_request_includes_headers() {
     let server = MockInferenceServer::start().await.unwrap();
     server.set_response("OK");
-    let client = Client::new(first_party_xai_config(
-        &server.url(),
-        ApiBackend::ChatCompletions,
-        &[],
-    ))
-    .unwrap();
+    let client = create_test_client(&server.url(), ApiBackend::ChatCompletions);
 
     let request = ConversationRequest::from_items(vec![ConversationItem::user("Hello")])
         .with_conv_id("conv-12345")
@@ -1123,12 +1099,11 @@ async fn test_request_includes_headers() {
 async fn test_request_forwards_compaction_at_header() {
     let server = MockInferenceServer::start().await.unwrap();
     server.set_response("OK");
-    let client = Client::new(first_party_xai_config(
+    let client = create_test_client_with_extra_headers(
         &server.url(),
         ApiBackend::ChatCompletions,
         &[("x-compaction-at", "217600")],
-    ))
-    .unwrap();
+    );
 
     let request = ConversationRequest::from_items(vec![ConversationItem::user("Hello")]);
     let (mut stream, _metadata) = client.conversation_stream(request).await.unwrap();
@@ -1221,7 +1196,7 @@ async fn test_doom_loop_check_enabled_sends_header_and_absorbs_check_event() {
     );
     server.enqueue_response("/v1/responses", ScriptedResponse::sse(events));
 
-    let mut config = first_party_xai_config(&server.url(), ApiBackend::Responses, &[]);
+    let mut config = test_sampler_config(&server.url(), ApiBackend::Responses, &[]);
     config.doom_loop_recovery = Some(Default::default());
     let client = Client::new(config).unwrap();
 
@@ -1241,7 +1216,7 @@ async fn test_doom_loop_check_enabled_sends_header_and_absorbs_check_event() {
 
     let logged = server.requests().pop().unwrap();
     assert!(logged.path.contains("/responses"));
-    assert_eq!(logged.header("x-grok-doom-loop-check"), Some("true"));
+    assert_eq!(logged.header("x-grok-doom-loop-check"), Some("1024"));
 }
 
 /// With the check disabled no header goes on the wire, and check frames from
@@ -1262,10 +1237,7 @@ async fn test_doom_loop_check_disabled_sends_no_header_and_drops_check_frames() 
     events.insert(2, SseEvent::data(SAMPLE_CHECK_EVENT_DATA));
     server.enqueue_response("/v1/responses", ScriptedResponse::sse(events));
 
-    // Keep the origin gate open so this test proves the disabled policy, not
-    // merely the loopback endpoint's default Local trust classification.
-    let config = first_party_xai_config(&server.url(), ApiBackend::Responses, &[]);
-    let client = Client::new(config).unwrap();
+    let client = create_test_client(&server.url(), ApiBackend::Responses);
     let request = ConversationRequest::from_items(vec![ConversationItem::user("Hello")]);
     let (mut stream, _metadata, collector) =
         client.conversation_stream_responses(request).await.unwrap();
@@ -1416,9 +1388,6 @@ async fn test_responses_backend_hits_responses_endpoint_not_chat_completions() {
         ApiBackend::ChatCompletions => {
             panic!("Expected Responses backend but got ChatCompletions");
         }
-        ApiBackend::CodexResponses => {
-            panic!("Expected Responses backend but got CodexResponses");
-        }
         ApiBackend::Messages => {
             panic!("Expected Responses backend but got Messages");
         }
@@ -1456,9 +1425,6 @@ async fn test_chat_completions_backend_hits_chat_endpoint_not_responses() {
         }
         ApiBackend::Responses => {
             panic!("Expected ChatCompletions backend but got Responses");
-        }
-        ApiBackend::CodexResponses => {
-            panic!("Expected ChatCompletions backend but got CodexResponses");
         }
         ApiBackend::Messages => {
             panic!("Expected ChatCompletions backend but got Messages");

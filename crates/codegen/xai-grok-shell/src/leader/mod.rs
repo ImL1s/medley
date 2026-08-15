@@ -63,8 +63,8 @@ use crate::env::GrokBuildEnvironment;
 pub use client::{ClientError, DisconnectReason, LeaderClient, LeaderRegistration};
 pub use lock::{
     LEADER_SOCKET_ENV, LeaderLock, LockError, ReclaimOutcome, compute_ws_url_suffix,
-    lock_path_for_ws_url, lock_path_for_ws_url_in, reclaim_lock_if_unheld, socket_path_for_ws_url,
-    socket_path_for_ws_url_in, ws_url_suffix_from_paths,
+    lock_path_for_ws_url, lock_path_for_ws_url_in, reclaim_lock_if_unheld,
+    socket_path_for_ws_url, socket_path_for_ws_url_in, ws_url_suffix_from_paths,
 };
 pub use protocol::{
     ClientCapabilities, ClientId, ClientMode, ControlCommand, ControlPayload,
@@ -517,47 +517,15 @@ async fn discover_leaders_in(root: &Path) -> Vec<LeaderDescriptor> {
 pub async fn discover_leaders() -> Vec<LeaderDescriptor> {
     discover_leaders_in(&crate::util::grok_home::grok_home()).await
 }
-/// The startup kill path sends a Unix signal via `Pid::from_raw(pid as i32)`.
-/// A wire PID is plausible for that cast only when it maps to a positive `pid_t`
-/// (`pid != 0 && pid <= i32::MAX`): 0 targets the caller's process group, and
-/// larger `u32` values reinterpret to negative `pid_t`s.
-fn is_plausible_signal_pid(pid: u32) -> bool {
-    pid != 0 && pid <= i32::MAX as u32
-}
-/// Corroborate the lock holder from local filesystem evidence.
-///
-/// Socket payload values are attacker-controlled input. This check trusts only
-/// what the local lock can prove: lock-file PID == confirmed flock holder, and
-/// that live holder currently has this lock file open.
-///
-/// On non-Linux, `/proc` lacks the data needed to confirm the holder, so this
-/// returns `None` and callers must treat the socket PID as uncorroborated.
-fn corroborated_lock_holder_pid(lock_path: &Path) -> Option<u32> {
-    let file_pid = LeaderLock::read_pid_from_path(lock_path)?;
-    let pid = evictable_holder(file_pid, confirmed_flock_holder(lock_path))?;
-    evictable_if_ours(
-        pid,
-        crate::util::is_process_alive(pid),
-        holder_has_lock_file_open(pid, lock_path),
-    )
-}
-/// (pid, leader_binary_version) of reachable leaders whose socket PID is both
-/// plausible and corroborated by the lock holder. Stale-lock-only descriptors,
-/// implausible socket PIDs, and uncorroborated socket PIDs are all skipped.
+/// (pid, leader_binary_version) of socket-verified (Reachable) leaders; a
+/// stale-lock-only descriptor is skipped (its `pid_from_lock` may be recycled).
 fn reachable_leader_pids(leaders: &[LeaderDescriptor]) -> Vec<(u32, String)> {
     leaders
         .iter()
         .filter_map(|d| {
-            let live_info = d.live_info.as_ref()?;
-            if !is_plausible_signal_pid(live_info.pid) {
-                return None;
-            }
-            let lock_holder = d
-                .lock_path
-                .as_deref()
-                .and_then(corroborated_lock_holder_pid);
-            (lock_holder == Some(live_info.pid))
-                .then(|| (live_info.pid, live_info.leader_binary_version.clone()))
+            d.live_info
+                .as_ref()
+                .map(|li| (li.pid, li.leader_binary_version.clone()))
         })
         .collect()
 }
@@ -1289,83 +1257,20 @@ fn zombie_evict_decision(
         }
     }
 }
-/// The live PID that ACTUALLY holds the flock on the lock file, if any.
-/// `None` for a dead PID, for a PID that cannot be shown to be ours, OR when the
-/// file PID can't be confirmed to be the real flock holder — so the auto-kill
-/// zombie net never SIGKILLs a process that does not hold the flock (a
-/// stale-but-live PID left in `leader.lock`, or a brief spawner that held the
-/// flock without rewriting the file).
-///
-/// ## Why identity is not a name check (issue #158)
-///
-/// This used to gate on `is_grok_process_strict`, which asks whether the
-/// process is *named* `grok`. That can never be true for this fork: the shipped
-/// command is `medley` (renamed in `release.yml` and again in `install.sh`), so
-/// the gate was always false and auto-kill silently never fired. Re-adding
-/// `medley` to a name list would only defer the same failure to the next
-/// rename — `program_name()` exists precisely because the invoked name varies.
-///
-/// The replacement asks the question the gate actually needs answered — *is
-/// this our process* — with evidence no name can give: the PID must hold an
-/// open descriptor on this very lock file, matched by `(device, inode)`. That
-/// is strictly stronger than the old check, which matched the substring `grok`
-/// anywhere in the whole cmdline and so would have accepted an unrelated
-/// `vim grok.rs` that inherited a recycled PID.
+/// The live *grok* PID that ACTUALLY holds the flock on the lock file, if any.
+/// `None` for a dead / non-grok PID, OR when the file PID can't be confirmed to be
+/// the real flock holder — so the auto-kill zombie net never SIGKILLs a process
+/// that does not hold the flock (a stale-but-live PID left in `leader.lock`, or a
+/// brief spawner that held the flock without rewriting the file). Uses the
+/// stricter (name-matching) grok check since this drives the auto-kill path.
 ///
 /// Linux confirms the holder via `/proc/locks`. macOS/BSD have no `/proc/locks`,
 /// so the holder is unconfirmable and this returns `None` (eviction skipped),
 /// accepting that a genuine zombie there is not auto-killed.
 fn live_grok_lock_holder(lock: &LeaderLock) -> Option<u32> {
-    corroborated_lock_holder_pid(lock.lock_path())
-}
-/// Safety gate: evict only a PID that is both alive AND demonstrably ours.
-///
-/// `owns_lock_file` is the name-free identity proof (see
-/// [`holder_has_lock_file_open`]). Pure, so the "never evict a process we
-/// cannot prove is ours" invariant is unit-testable on every host — the real
-/// check needs `/proc` and therefore only runs on Linux.
-fn evictable_if_ours(pid: u32, alive: bool, owns_lock_file: bool) -> Option<u32> {
-    (alive && owns_lock_file).then_some(pid)
-}
-/// Does `pid` hold an open descriptor on `lock_path`?
-///
-/// Name-independent identity: scans `/proc/<pid>/fd` and compares each
-/// descriptor's `(device, inode)` against the lock file's. A process that
-/// merely inherited a recycled PID has no reason to have our lock file open, so
-/// this rejects it; the real leader necessarily has it open, because holding
-/// the flock requires holding the fd.
-///
-/// This also closes a hole `/proc/locks` alone leaves: the kernel attributes a
-/// lock to the PID that *created* it, so if that process exited while a forked
-/// child kept the inherited descriptor, `/proc/locks` still names the original
-/// PID — which may since have been recycled. Checking the descriptor directly
-/// asks the live process, not the lock's historical owner.
-///
-/// Non-Linux returns `false` (never evict): there is no `/proc`, and the caller
-/// has already returned `None` from [`confirmed_flock_holder`] anyway, so this
-/// keeps macOS/BSD eviction skipped exactly as before.
-fn holder_has_lock_file_open(pid: u32, lock_path: &Path) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(target) = std::fs::metadata(lock_path) else {
-            return false;
-        };
-        let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-            return false;
-        };
-        // `metadata` follows the /proc/<pid>/fd/<n> symlink to the open file.
-        // Entries that vanish mid-scan (fd closed) simply fail to match.
-        entries.flatten().any(|entry| {
-            std::fs::metadata(entry.path())
-                .is_ok_and(|m| m.dev() == target.dev() && m.ino() == target.ino())
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (pid, lock_path);
-        false
-    }
+    let file_pid = lock.read_pid()?;
+    let pid = evictable_holder(file_pid, confirmed_flock_holder(lock.lock_path()))?;
+    crate::util::is_process_alive(pid).then_some(pid)
 }
 /// Safety gate: a file PID is evictable only when the confirmed flock `holder` is
 /// known AND equals it. An unknown holder or a mismatch (file PID ≠ real holder)
@@ -1961,93 +1866,6 @@ mod tests {
         assert_eq!(evictable_holder(100, Some(200)), None);
         assert_eq!(evictable_holder(100, None), None);
     }
-    /// Issue #158, the invariant that must not be weakened: a live PID is
-    /// evicted ONLY when it is also proven ours. An unrelated process that
-    /// inherited a recycled PID reaches this gate alive but without our lock
-    /// file open, and must survive.
-    ///
-    /// Pure, so it runs on every host — the real ownership probe needs
-    /// `/proc` and therefore only executes on Linux.
-    #[test]
-    fn evictable_if_ours_requires_both_alive_and_ownership() {
-        assert_eq!(evictable_if_ours(100, true, true), Some(100));
-        assert_eq!(
-            evictable_if_ours(100, true, false),
-            None,
-            "a live process we cannot prove is ours must never be evicted — \
-             this is the recycled-PID case the gate exists for",
-        );
-        assert_eq!(
-            evictable_if_ours(100, false, true),
-            None,
-            "a dead PID is not a zombie leader to evict",
-        );
-        assert_eq!(evictable_if_ours(100, false, false), None);
-    }
-    /// Issue #158: identity must not depend on what the binary is called.
-    ///
-    /// The old gate asked `is_grok_process_strict`, which is false for the
-    /// shipped `medley` command and so never fired. The replacement takes
-    /// ownership as a fact, so the same decision holds no matter what the
-    /// process is named — there is no name in this gate to get wrong.
-    #[test]
-    fn evictable_if_ours_decision_is_independent_of_program_name() {
-        // Whatever the binary is called, these two facts decide it.
-        for owns in [true, false] {
-            assert_eq!(
-                evictable_if_ours(4242, true, owns),
-                owns.then_some(4242),
-                "ownership alone decides; nothing here consults a name",
-            );
-        }
-    }
-    /// macOS/BSD behaviour is unchanged: with no `/proc`, the ownership probe
-    /// cannot confirm anything and must answer "not ours" (never evict). On
-    /// Linux this same call is a real `/proc/<pid>/fd` scan, and our own
-    /// process does NOT have this freshly-created path open either.
-    #[test]
-    fn holder_has_lock_file_open_is_false_for_a_file_we_do_not_hold() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("leader.lock");
-        fs::write(&path, "1").unwrap();
-        assert!(
-            !holder_has_lock_file_open(std::process::id(), &path),
-            "we never opened this path, so it must not read as ours",
-        );
-    }
-    /// Linux-only, and the half that makes eviction able to fire at all: a
-    /// process holding the lock file open IS recognised as ours — regardless
-    /// of what its binary is called, which is the whole point of issue #158.
-    ///
-    /// **This test does not run on macOS/BSD, so a green local suite is not
-    /// evidence for it** — there is no `/proc/<pid>/fd` to scan, and every
-    /// development machine on this project is macOS. Only CI executes it.
-    ///
-    /// That is true only because `ci.yml` names it explicitly, in the
-    /// "Leader lock identity" step. `ci.yml` has no full-suite job — every
-    /// `cargo test` there is filtered to a named pattern — so a test nothing
-    /// selects runs nowhere at all, which is what happened to this one until
-    /// issue #158 added the step. It goes through `run_nonzero`, which fails
-    /// on a zero-match filter, so renaming or moving this test breaks CI
-    /// loudly instead of silently dropping its coverage.
-    ///
-    /// If you rename it, update that step.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn holder_has_lock_file_open_true_for_a_file_this_process_holds() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("leader.lock");
-        // Bound, not dropped: the descriptor must stay open across the check.
-        let _held = fs::File::create(&path).unwrap();
-        assert!(
-            holder_has_lock_file_open(std::process::id(), &path),
-            "the process holding the lock file open must read as ours",
-        );
-        assert!(
-            !holder_has_lock_file_open(u32::MAX, &path),
-            "a PID that cannot exist is never ours",
-        );
-    }
     /// glibc `dev_t` decode matches the logical major:minor the kernel prints.
     /// makedev(253, 1) == 0xfd01 → (253, 1).
     #[test]
@@ -2173,17 +1991,8 @@ mod tests {
         };
         assert_eq!(
             reachable_leader_pids(&[reachable, stale]),
-            Vec::<(u32, String)>::new(),
-            "socket PID must be corroborated by a lock holder before startup \
-             auto-kill can trust it"
+            vec![(222, "0.2.52".to_string())]
         );
-    }
-    #[test]
-    fn startup_kill_socket_pid_plausibility_bounds() {
-        assert!(!is_plausible_signal_pid(0));
-        assert!(!is_plausible_signal_pid(u32::MAX));
-        assert!(is_plausible_signal_pid(1));
-        assert!(is_plausible_signal_pid(i32::MAX as u32));
     }
     #[test]
     fn leader_is_older_than_directional() {

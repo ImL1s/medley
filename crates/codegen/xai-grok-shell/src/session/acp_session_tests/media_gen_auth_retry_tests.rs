@@ -67,8 +67,6 @@ fn ok_result(text: &str) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
     Ok(ToolRunResult {
         output: ToolOutput::Text(text.to_owned().into()),
         prompt_text: text.to_owned(),
-        trusted_prompt_suffix: String::new(),
-        trusted_prompt_reminders: Vec::new(),
         effective_tool_name: None,
     })
 }
@@ -112,20 +110,6 @@ fn is_auth_tool_error_classification() {
             .with_details(
                 serde_json::json!({"code": "http_failure", HTTP_STATUS_DETAILS_KEY: 401}),
             ),
-        ),
-        // Provider-scoped clients own their bounded refresh and retry. Once
-        // exhausted, the session-wide xAI manager must not substitute its
-        // unrelated bearer or trigger a third request.
-        (
-            false,
-            xai_tool_runtime::ToolError::new(
-                xai_tool_runtime::ToolErrorKind::Custom,
-                "Codex web search failed with HTTP 401 Unauthorized",
-            )
-            .with_details(serde_json::json!({
-                HTTP_STATUS_DETAILS_KEY: 401,
-                (xai_grok_tools::types::PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY): true,
-            })),
         ),
         // Negative: 403 Forbidden must NOT trigger a refresh. Mirrors
         // the inference path's gate in xai-grok-sampling-types/src/error.rs:

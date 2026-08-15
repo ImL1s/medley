@@ -10,6 +10,12 @@ pub const MAX_STOP_HOOK_CONTINUATIONS_PER_TURN: u32 = 8;
 
 const SESSION_END_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn commit_stop_report(claim: TurnReportClaim<'_>, prompt_id: &str) {
+    if claim.commit() == CommitOutcome::LostToAnotherReporter {
+        tracing::debug!(prompt_id, "a cancel already reported this turn");
+    }
+}
+
 /// `command` is a shell-only field, so a monitor's watch command is carried in
 /// `description` instead.
 fn stop_entry_from_task(task: &xai_grok_tools::types::TaskSnapshot) -> StopBackgroundTask {
@@ -81,24 +87,6 @@ fn format_stop_feedback(blocks: &[dispatcher::StopBlock], additional_context: &[
     feedback
 }
 
-fn format_force_stop_annotation(prevent: &dispatcher::StopBlock) -> String {
-    format!(
-        "\u{26a0} Hook `{}` stopped the agent: {}",
-        prevent.hook_name, prevent.reason
-    )
-}
-
-fn format_keep_working_block_annotation(block: &dispatcher::StopBlock) -> String {
-    format!(
-        "\u{21a9} Stop blocked by hook `{}`, continuing: {}",
-        block.hook_name, block.reason
-    )
-}
-
-fn format_keep_working_context_annotation(context: &str) -> String {
-    format!("\u{21a9} Stop hook feedback, continuing: {context}")
-}
-
 /// Downgrade `Blocked` to `Success` for the observe-only session-end fire: the
 /// decision is discarded, so scrollback and telemetry must not report a block.
 pub(super) fn demote_ignored_blocks(
@@ -128,7 +116,7 @@ impl SessionActor {
     /// exit code 2 parses as a block, but the decision is discarded (no turn
     /// left to continue).
     pub(crate) async fn dispatch_session_end_stop(&self, reason: &str) {
-        if self.startup_hints.is_subagent || !self.hook_event_active(event::HookEventName::Stop) {
+        if self.startup_hints.is_subagent || !self.may_have_hooks_for(event::HookEventName::Stop) {
             return;
         }
         let envelope = self.fire_hook(
@@ -218,15 +206,26 @@ impl SessionActor {
     }
 
     async fn announce_force_stop(&self, prevent: &dispatcher::StopBlock) {
-        self.send_hook_annotation(&format_force_stop_annotation(prevent))
-            .await;
+        self.send_hook_annotation(&format!(
+            "\u{26a0} Hook `{}` stopped the agent: {}",
+            prevent.hook_name, prevent.reason
+        ))
+        .await;
+    }
+
+    /// Answering the gate's hook request takes a client, so a test reaches the payload here.
+    #[cfg(test)]
+    pub(super) async fn stop_payload_for_test(&self) -> event::HookPayload {
+        self.build_stop_payload(/* stop_hook_active */ false).await
     }
 
     async fn build_stop_payload(&self, stop_hook_active: bool) -> event::HookPayload {
         let last_assistant_message = self
             .chat_state_handle
             .get_last_assistant_text_in_turn()
-            .await;
+            .await
+            .as_deref()
+            .map(event::clip_assistant_message);
         if self.startup_hints.is_subagent {
             event::HookPayload::SubagentStop {
                 phase: event::SubagentStopPhase::Gate,
@@ -273,13 +272,7 @@ impl SessionActor {
         } else {
             event::HookEventName::Stop
         };
-        let has_file_hooks = self
-            .hook_registry
-            .borrow()
-            .as_ref()
-            .is_some_and(|r| r.has_enabled_hooks_for_canonical(event));
-        let has_client_hooks = self.client_hooks.borrow().contains_key(&event);
-        if !has_file_hooks && !has_client_hooks {
+        if !self.has_enabled_hooks_for(event) {
             return StopGateDecision::AllowStop;
         }
         // At the cap no hook is consulted or notified for this forced stop,
@@ -295,6 +288,16 @@ impl SessionActor {
             .await;
             return StopGateDecision::AllowStop;
         }
+
+        // Claim before the hooks, not after: a turn already reported is being torn down, so the
+        // gate skips instead of running verification hooks for a turn the user cancelled.
+        let Some(claim) = self.turn_report.claim_for_gate() else {
+            tracing::debug!(
+                prompt_id,
+                "a cancel already reported this turn; the stop gate did not run"
+            );
+            return StopGateDecision::AllowStop;
+        };
 
         let payload = self.build_stop_payload(continuations_this_turn > 0).await;
         // Gate envelope via `make_hook_envelope`, not the observe-notify
@@ -318,6 +321,7 @@ impl SessionActor {
             self.emit_stop_results(event, prompt_id, &result.results)
                 .await;
             self.notify_client_hooks(&envelope);
+            commit_stop_report(claim, prompt_id);
             self.announce_force_stop(&prevent).await;
             return StopGateDecision::AllowStop;
         }
@@ -334,14 +338,25 @@ impl SessionActor {
         result.blocks.extend(client.blocks);
         result.additional_context.extend(client.additional_context);
         if let Some(prevent) = client.prevent_continuation {
+            commit_stop_report(claim, prompt_id);
             self.announce_force_stop(&prevent).await;
             return StopGateDecision::AllowStop;
         }
 
         if !result.wants_continuation() {
+            // A gate whose hooks all skipped or crashed told nobody the turn ended, so it
+            // releases the claim and a later cancel or failure can still report.
+            let any_hook_succeeded = all_results
+                .iter()
+                .any(|r| matches!(r, result::HookRunResult::Success { .. }));
+            if any_hook_succeeded {
+                commit_stop_report(claim, prompt_id);
+            }
             return StopGateDecision::AllowStop;
         }
 
+        // The turn has not ended, so a later interrupt must still be able to report it.
+        drop(claim);
         self.announce_keep_working(&result.blocks, &result.additional_context)
             .await;
         StopGateDecision::KeepWorking {
@@ -358,16 +373,21 @@ impl SessionActor {
         additional_context: &[String],
     ) {
         for block in blocks {
-            self.send_hook_annotation(&format_keep_working_block_annotation(block))
-                .await;
+            self.send_hook_annotation(&format!(
+                "\u{21a9} Stop blocked by hook `{}`, continuing: {}",
+                block.hook_name, block.reason
+            ))
+            .await;
             xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::HookBlocked {
                 hook_name: block.hook_name.clone(),
             });
         }
         if blocks.is_empty() {
             for context in additional_context {
-                self.send_hook_annotation(&format_keep_working_context_annotation(context))
-                    .await;
+                self.send_hook_annotation(&format!(
+                    "\u{21a9} Stop hook feedback, continuing: {context}"
+                ))
+                .await;
             }
         }
     }
@@ -396,6 +416,7 @@ mod stop_gate_snapshot_tests {
             kind,
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -444,65 +465,22 @@ mod stop_gate_snapshot_tests {
 
     #[test]
     fn format_stop_feedback_lists_blocks_then_appends_context() {
-        let mut projected = dispatcher::StopDispatchResult::default();
-        projected.absorb(
-            "h1",
-            dispatcher::StopSignals {
-                block_reason: Some("first".into()),
-                ..Default::default()
-            },
-        );
-        projected.absorb(
-            "h2",
-            dispatcher::StopSignals {
-                block_reason: Some("second".into()),
-                additional_context: Some("note".into()),
-                ..Default::default()
-            },
+        let block = |reason: &str| dispatcher::StopBlock {
+            hook_name: "h".into(),
+            reason: reason.into(),
+        };
+        assert_eq!(
+            format_stop_feedback(&[block("first"), block("second")], &[]),
+            "Stop hook feedback:\n- first\n- second\n"
         );
         assert_eq!(
-            format_stop_feedback(&projected.blocks, &projected.additional_context),
-            "Stop hook feedback:\n- stop blocked by hook (reason provided)\n- stop blocked by hook (reason provided)\n\nhook provided additional context (content omitted)"
+            format_stop_feedback(&[block("fix tests")], &["note".to_string()]),
+            "Stop hook feedback:\n- fix tests\n\nnote"
         );
-    }
-
-    #[test]
-    fn stop_feedback_and_annotations_omit_provider_text_and_significant_fragments() {
-        const SECRET: &str = "GB002STOPSECRETabcdefgh87654321";
-        let mut projected = dispatcher::StopDispatchResult::default();
-        projected.absorb(
-            "blocker",
-            dispatcher::StopSignals {
-                block_reason: Some(SECRET.into()),
-                additional_context: Some(SECRET.into()),
-                ..Default::default()
-            },
+        assert_eq!(
+            format_stop_feedback(&[], &["only context".to_string()]),
+            "only context"
         );
-        projected.absorb(
-            "stopper",
-            dispatcher::StopSignals {
-                stop_reason: Some(SECRET.into()),
-                ..Default::default()
-            },
-        );
-
-        let prevent = projected.prevent_continuation.as_ref().unwrap();
-        let rendered = [
-            format_stop_feedback(&projected.blocks, &projected.additional_context),
-            format_keep_working_block_annotation(&projected.blocks[0]),
-            format_keep_working_context_annotation(&projected.additional_context[0]),
-            format_force_stop_annotation(prevent),
-            format!("{projected:?}"),
-        ]
-        .join("\n");
-        assert!(!rendered.contains(SECRET));
-        for fragment in SECRET.as_bytes().windows(8) {
-            let fragment = std::str::from_utf8(fragment).unwrap();
-            assert!(
-                !rendered.contains(fragment),
-                "stop feedback/annotation leaked credential fragment: {fragment}"
-            );
-        }
     }
 
     #[test]

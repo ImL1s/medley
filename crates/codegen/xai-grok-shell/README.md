@@ -1338,8 +1338,8 @@ Each feature section below documents its own config. This section covers the gen
 auto_update = true                     # check for updates on launch
 
 [models]
-default = "grok-4.5"                   # model used for new sessions
-web_search = "grok-4.5"                # model used by the web_search tool
+default = "grok-4.6"                   # model used for new sessions
+web_search = "grok-4.6"                # model used by the web_search tool
 
 [ui]
 max_thoughts_width = 120               # max column width for reasoning display
@@ -1734,47 +1734,6 @@ instructions = "Be extremely concise. No filler words."
 
 Both are also discovered from `.grok/roles/*.toml` and `.grok/personas/*.toml` files respectively. If a requested persona is not found, the spawn fails (fail-closed).
 
-### External Tool Capability Metadata
-
-Restricted subagents fail closed for MCP/custom tools without capability
-metadata. Classify a trusted tool by its exact runtime ID, which follows the
-`server__tool` form used by `search_tool` / `use_tool` (for example,
-`docs__read`):
-
-```toml
-[subagents.tool_capabilities."docs__read"]
-classification = "classified"
-effects = ["network-read"]
-```
-
-Supported effects are `local-read`, `local-write`, `execute`, `network-read`,
-`external-mutation`, `secret-access`, and `subagent-spawn`. Every declared
-effect must be permitted by the child's capability mode.
-
-For a temporary, audited migration of a still-unclassified tool, an exact-ID
-exception must name restricted modes and include a non-empty reason:
-
-```toml
-[subagents.unclassified_tool_overrides."legacy__read"]
-modes = ["read-only"]
-reason = "Audited read-only connector pending descriptor support"
-```
-
-Exceptions emit a warning and appear in both `grok inspect` views. Capability
-metadata is accepted only from local trusted config layers; project
-`.grok/config.toml` entries require folder trust. Remote MCP `_meta`, remote
-settings, and remote campaign patches are never treated as capability authority.
-User/system/MDM requirements remain the final authority over trusted project
-entries for the same exact tool ID.
-
-Root sessions remain unrestricted (`all`), so this does not silently narrow
-top-level user permissions. Restricted workspace/SDK sessions also fail closed
-for kind-less tools: embedders must pass an equivalent locally trusted exact-ID
-catalog through `WorkspaceSessionContextFactory::with_trusted_tool_capabilities`
-or their `SessionContextFactory::trusted_tool_capabilities` implementation.
-Serialized `ToolConfig.kind` values and remote MCP/gateway metadata are ignored
-as capability authority.
-
 ---
 
 ## Plugins
@@ -1857,7 +1816,7 @@ base_url = "https://api.example.com/v1"  # OpenAI-compatible endpoint
 name = "Display Name"                 # Shown in model picker
 description = "Model description"     # Optional description
 api_key = "sk-..."                    # API key for this provider (optional)
-env_key = "OPENAI_API_KEY"            # Env var name(s); trimmed, must be [A-Za-z_][A-Za-z0-9_]* (string or array; first set wins)
+env_key = "OPENAI_API_KEY"            # Env var(s) holding the API key (string or array; first set wins)
 auth_provider = "corp-gateway"        # Named credential helper for rotating tokens (optional)
 temperature = 0.7                     # Sampling temperature (0.0-2.0)
 top_p = 0.95                          # Nucleus sampling parameter
@@ -1989,7 +1948,7 @@ grok
 
 Grok fetches the model list from `{GROK_MODELS_BASE_URL}/models` on startup and sends inference requests to `GROK_MODELS_BASE_URL`. This follows the standard OpenAI-compatible convention used by OpenAI, Anthropic, OpenRouter, Groq, Together.ai, and others.
 
-If your model list endpoint differs from `{base_url}/models`, set `GROK_MODELS_LIST_URL` explicitly to the final URL. Catalog redirects are rejected so the API key cannot be forwarded to a redirect target.
+If your model list endpoint differs from `{base_url}/models`, set `GROK_MODELS_LIST_URL` explicitly.
 
 **Combining with `[endpoints]` config:** You can also set endpoints in `~/.grok/config.toml`:
 
@@ -2004,9 +1963,7 @@ api_key = "my-api-key"
 
 When using `[endpoints]` with partial model overrides, the `base_url` is inherited from the endpoints config — you don't need to specify it in each `[model.*]` section.
 
-The per-model `api_key` above authenticates inference requests only. Catalog discovery still requires `XAI_API_KEY` (or the legacy `GROK_CODE_XAI_API_KEY`) in the environment.
-
-**Auth behavior:** When `models_base_url` or `models_list_url` is set, Grok uses the explicit `XAI_API_KEY` (`Authorization: Bearer`) instead of session auth. A `grok login` credential never authenticates a custom catalog, so the API key must be set separately.
+**Auth behavior:** When `models_base_url` is set, Grok uses API key auth (`Authorization: Bearer`) instead of session auth. `grok login` is not required — only the API key.
 
 ---
 
@@ -2290,7 +2247,8 @@ restrict_network = true
 # Paths the agent can read but NOT write/delete
 read_only = ["/data"]
 
-# Additional writable paths
+# Additional writable paths (literal directory grants — no globs;
+# trailing /** is treated as the parent directory)
 read_write = ["/tmp/scratch"]
 
 # Paths denied entirely
@@ -2355,7 +2313,6 @@ The output shows all loaded configuration organized by type:
 - **LSP Servers** — language servers from `lsp.json` and plugins
 - **Hooks** — project and plugin hooks
 - **Permissions, Config Sources** — which config files are active
-- **Trusted Tool Capabilities** — exact-ID descriptors, active unclassified overrides, and warnings
 
 Plugin-provided components appear in their respective sections with a `[plugin: name]` tag, so you can see at a glance where each skill, MCP server, or agent originates.
 

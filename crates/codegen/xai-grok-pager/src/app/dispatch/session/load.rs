@@ -118,7 +118,7 @@ pub(in crate::app::dispatch) fn focus_if_session_already_open(
     switch_to_agent(app, existing_id, SwitchCause::Load);
     Some(existing_id)
 }
-fn effective_loaded_session_chat_kind(app: &AppView, conversation_entry: bool) -> bool {
+pub(in crate::app::dispatch) fn effective_loaded_session_chat_kind(app: &AppView, conversation_entry: bool) -> bool {
     #[cfg(feature = "local-workspace")]
     {
         conversation_entry || (app.chat_mode && !app.welcome_history_load_as_build)
@@ -181,7 +181,10 @@ fn dispatch_load_session_ungated(
             state: AgentState::Idle,
             tracker: AcpUpdateTracker::new(),
             cwd: session_cwd.clone().unwrap_or_else(|| app.cwd.clone()),
-            is_worktree: false,
+            is_worktree: crate::app::session_startup::parent_session_is_worktree(
+                &session_id,
+                session_cwd.as_deref().unwrap_or(app.cwd.as_path()),
+            ),
             forked_from: None,
             pending_prompts: std::collections::VecDeque::new(),
             next_queue_id: 0,
@@ -951,7 +954,10 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             state: AgentState::Idle,
             tracker: AcpUpdateTracker::new(),
             cwd: app.cwd.clone(),
-            is_worktree: false,
+            is_worktree: crate::app::session_startup::parent_session_is_worktree(
+                &session_id,
+                &app.cwd,
+            ),
             forked_from: None,
             pending_prompts: std::collections::VecDeque::new(),
             next_queue_id: 0,
@@ -1054,7 +1060,6 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
     restore_degree: Option<xai_grok_workspace::session::git::RestoreDegree>,
     running_prompt_id: Option<String>,
     scheduler_background_loops: Option<bool>,
-    web_search_disabled: Option<xai_grok_shell::session::WebSearchDisabledNotice>,
 ) -> Vec<Effect> {
     // #161: a resumed session must be told too. The notice was never persisted,
     // so replayed history cannot carry it — this response is the only source.
@@ -1074,23 +1079,12 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         if defer_to_open_reload_window(agent, agent_id, "SessionLoaded") {
             return vec![];
         }
-        if let Some(notice) = web_search_disabled {
-            crate::app::acp_handler::apply_session_event(
-                &xai_grok_shell::extensions::notification::SessionUpdate::WebSearchDisabled {
-                    model_id: notice.model_id,
-                    reason: notice.reason,
-                    message: notice.message,
-                },
-                &mut agent.session,
-                &mut agent.scrollback,
-                is_api_key_auth,
-            );
-        }
         let hydrate_sid = session_id.clone();
         agent.bind_session_id(session_id);
         agent.scheduler_background_loops = scheduler_background_loops;
         agent.scrollback.end_batch();
         agent.session.loading_replay = false;
+        agent.arm_late_replay_grace();
         agent.session.restore_degree = restore_degree;
         agent.session.finish_turn(&mut agent.scrollback);
         agent.mark_turn_finished();
@@ -1210,6 +1204,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
+            nonce: 0,
         });
         if std::mem::take(&mut agent.pending_extensions_fetch)
             && let Some(modal) = agent.extensions_modal.as_mut()

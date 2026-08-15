@@ -45,7 +45,6 @@ fn session_loaded_with_restore_shows_summary_in_scrollback() {
             restore_degree: Some(xai_grok_workspace::session::git::RestoreDegree::Full),
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -104,7 +103,6 @@ fn restored_session_applies_deferred_switch_before_draining_prompt_queue() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -187,6 +185,42 @@ fn session_title_hydration_manual_restores_display_name_cold_cache_only() {
         app.agents[&id].display_name.as_deref(),
         Some("Fresh Rename"),
         "hydration is a cold-cache fallback, never an overwrite"
+    );
+    assert_eq!(
+        app.agents[&id].generated_session_title.as_deref(),
+        Some("Disk Title"),
+        "generated_session_title is also cold-cache; a live title must not be clobbered"
+    );
+}
+/// A live auto title (SessionSummaryGenerated) that wins the race with the
+/// disk read must not be replaced — ghost-prefill falls back to this field.
+#[test]
+fn session_title_hydration_does_not_clobber_live_generated_title() {
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-title".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().generated_session_title = Some("Live Auto".into());
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: Some(("Stale Disk Title".into(), false)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    assert_eq!(
+        agent.generated_session_title.as_deref(),
+        Some("Live Auto"),
+        "late disk hydrate must not replace a live generated title"
+    );
+    assert!(
+        agent.display_name.is_none(),
+        "auto disk titles must not restore display_name"
     );
 }
 /// Whitespace-only titles from disk are ignored entirely, manual or not.
@@ -310,7 +344,6 @@ fn session_loaded_without_adoption_finishes_replayed_running_entries() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -319,6 +352,58 @@ fn session_loaded_without_adoption_finishes_replayed_running_entries() {
         !agent.scrollback.has_running_entries(),
         "replayed running entries must be finished when no turn is adopted"
     );
+}
+/// Resume into a cwd with `.git/grok-worktree-source` sets `session.is_worktree`.
+#[test]
+fn load_session_marks_standalone_worktree_cwd() {
+    let mut app = test_app();
+    let main = crate::test_util::TempGitRepo::init("main-only");
+    let clone = main.standalone_clone("wt-branch");
+    dispatch(
+        Action::LoadSession("sess-wt".into(), Some(clone.path.clone()), false),
+        &mut app,
+    );
+    assert!(
+        app.agents[&AgentId(0)].session.is_worktree,
+        "resume into a standalone grok worktree must set session.is_worktree"
+    );
+    assert_eq!(app.agents[&AgentId(0)].session.cwd, clone.path);
+}
+#[test]
+fn load_session_plain_repo_is_not_worktree() {
+    let mut app = test_app();
+    let repo = crate::test_util::TempGitRepo::init("main");
+    dispatch(
+        Action::LoadSession("sess-plain-git".into(), Some(repo.path.clone()), false),
+        &mut app,
+    );
+    assert!(!app.agents[&AgentId(0)].session.is_worktree);
+}
+#[test]
+fn remote_restore_marks_standalone_worktree_cwd() {
+    let mut app = test_app();
+    let main = crate::test_util::TempGitRepo::init("main-only");
+    let clone = main.standalone_clone("wt-branch");
+    app.cwd = clone.path.clone();
+    let _ = dispatch_load_session_with_restore(
+        &mut app,
+        "remote-wt".into(),
+        clone.path.display().to_string(),
+    );
+    assert!(app.agents[&AgentId(0)].session.is_worktree);
+    assert_eq!(app.agents[&AgentId(0)].session.cwd, clone.path);
+}
+#[test]
+fn remote_restore_plain_repo_is_not_worktree() {
+    let mut app = test_app();
+    let repo = crate::test_util::TempGitRepo::init("main");
+    app.cwd = repo.path.clone();
+    let _ = dispatch_load_session_with_restore(
+        &mut app,
+        "remote-plain".into(),
+        repo.path.display().to_string(),
+    );
+    assert!(!app.agents[&AgentId(0)].session.is_worktree);
 }
 /// Cross-cwd resume anchors the agent cwd to the resolved origin cwd.
 #[test]
@@ -379,7 +464,6 @@ fn session_loaded_purges_replay_transient() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -405,7 +489,6 @@ fn session_loaded_during_open_reload_window_defers_to_window() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -423,7 +506,6 @@ fn session_loaded_during_open_reload_window_defers_to_window() {
 /// Rendering before `defer_to_open_reload_window` would commit a duplicate (or
 /// a false notice) when the authoritative post-window load also carries one.
 #[test]
-fn web_search_disabled_meta_defers_during_open_reload_window() {
     const MSG: &str =
         "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)";
     let mut app = test_app();
@@ -444,7 +526,6 @@ fn web_search_disabled_meta_defers_during_open_reload_window() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: Some(xai_grok_shell::session::WebSearchDisabledNotice {
                 model_id: "grok-4-fast".into(),
                 reason: "model is not ready".into(),
                 message: MSG.to_string(),
@@ -563,7 +644,6 @@ fn session_loaded_with_restore_failure_shows_warning_banner() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -606,7 +686,6 @@ fn session_loaded_without_restore_no_summary() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -650,7 +729,6 @@ fn session_loaded_without_restore_resets_restore_degree() {
             restore_degree: Some(xai_grok_workspace::session::git::RestoreDegree::Full),
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -668,7 +746,6 @@ fn session_loaded_without_restore_resets_restore_degree() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -698,7 +775,6 @@ fn session_loaded_with_flag_emits_five_fetches_and_clears_flag() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -824,10 +900,11 @@ fn session_restored_refuses_local_build_under_chat_mode() {
         "placeholder agent must be removed on refuse"
     );
 }
-/// `SessionRestored` never carries a conversation-entry bit: the follow-up
-/// LoadSession stays `chat_kind: false`; the agent UI bit is sticky `--chat`.
+/// `SessionRestored` follow-up LoadSession stays `chat_kind: false` (not a
+/// picker conversation entry). Sticky `--chat` with no local disk still
+/// opens as chat, so `conversation_entry` / rename kind are Chat.
 #[test]
-fn session_restored_load_never_sets_conversation_entry_bit() {
+fn session_restored_sticky_chat_sets_conversation_entry() {
     let mut app = test_app_with_agent();
     let id = *app.agents.keys().next().unwrap();
     app.chat_mode = true;
@@ -848,6 +925,14 @@ fn session_restored_load_never_sets_conversation_entry_bit() {
     ));
     let agent = app.agents.get(&id).expect("agent kept");
     assert!(agent.chat_kind, "agent UI bit comes from sticky --chat");
+    assert!(
+        agent.conversation_entry,
+        "sticky --chat restore with no local disk opens as chat (rename kind)"
+    );
+    assert_eq!(
+        agent.rename_kind(),
+        xai_grok_shell::session::unified_list::SessionKind::Chat
+    );
 }
 /// Completing a mid-session login restores the agent view instead of
 /// running the startup load-session flow.
@@ -892,7 +977,6 @@ fn session_loaded_drains_pending_first_prompt_to_front() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -923,7 +1007,6 @@ fn session_loaded_with_no_pending_first_prompt_does_not_enqueue() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1030,7 +1113,6 @@ fn session_loaded_clears_stale_running_entries() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1071,7 +1153,6 @@ fn resume_focuses_existing_agent_for_open_session() {
             session_id: "wt-sess-1".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1090,7 +1171,6 @@ fn resume_focuses_existing_agent_for_open_session() {
             session_id: "new-sess-2".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1122,7 +1202,6 @@ fn resume_unknown_session_still_creates_new_agent() {
             session_id: "sess-aaa".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1154,7 +1233,6 @@ fn resume_open_session_does_not_rearm_stale_overlay() {
             session_id: "sess-a".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1166,7 +1244,6 @@ fn resume_open_session_does_not_rearm_stale_overlay() {
             session_id: "sess-b".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1193,7 +1270,6 @@ fn resume_conversation_does_not_focus_build_id_collision() {
             session_id: "shared-id".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1226,7 +1302,6 @@ fn duplicate_load_unbind_invalidates_old_minimal_btw_response() {
             session_id: "shared-id".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1271,7 +1346,6 @@ fn resume_under_chat_mode_focuses_despite_entry_false() {
             session_id: "chat-mode-sess".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1284,7 +1358,6 @@ fn resume_under_chat_mode_focuses_despite_entry_false() {
             session_id: "other".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1311,7 +1384,6 @@ fn resume_stale_attached_target_focuses_dashboard_row() {
             session_id: "sess-a".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1323,7 +1395,6 @@ fn resume_stale_attached_target_focuses_dashboard_row() {
             session_id: "sess-b".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1398,7 +1469,6 @@ fn session_restored_clears_stale_session_id() {
             session_id: "remote-sess".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -2588,7 +2658,6 @@ fn plain_picker_fetch_carries_no_query_and_bumps_seq() {
 /// tell a resuming user — asserting the other direction would have been
 /// asserting a fiction.
 #[test]
-fn web_search_disabled_meta_renders_once_on_resume() {
     use crate::scrollback::block::RenderBlock;
     const MSG: &str =
         "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)";
@@ -2608,7 +2677,6 @@ fn web_search_disabled_meta_renders_once_on_resume() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-            web_search_disabled: Some(xai_grok_shell::session::WebSearchDisabledNotice {
                 model_id: "grok-4-fast".into(),
                 reason: "model is not ready".into(),
                 message: MSG.to_string(),

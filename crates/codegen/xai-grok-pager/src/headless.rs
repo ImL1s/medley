@@ -22,6 +22,7 @@ use xai_grok_shell::sampling::types::{
     REASONING_EFFORT_META_KEY, parse_canonical_effort_token, reasoning_effort_meta_value,
 };
 use xai_grok_shell::util::config as cli_config;
+use xai_grok_telemetry::startup::PendingStartup;
 
 use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::spawn::{AgentShutdownGuard, spawn_grok_shell};
@@ -33,7 +34,7 @@ use crate::headless::reducer::{
 
 mod ext_protocol;
 mod reducer;
-use ext_protocol::{ExtEvent, handle_ext_notification};
+use ext_protocol::{ExtEvent, handle_ext_notification, reply_headless_ext_method};
 
 mod cli;
 pub use cli::{HeadlessPrompt, OutputFormat, parse_json_schema, parse_permission_rules_lenient};
@@ -651,14 +652,8 @@ struct OpenedSession {
 
 /// Read the #161 web-search disable message out of a `session/new` /
 /// `session/load` response `_meta`.
-///
-/// Shares [`crate::app::parse_session_web_search_disabled`] with the
-/// interactive pager so headless and TUI cannot diverge on shape. This is the
-/// only channel that reaches headless at all: the shell used to announce this
-/// with an `x.ai/session_notification`, and headless has no xAI notification
-/// consumer, so `medley -p` never surfaced it under any timing.
-fn web_search_disabled_message(meta: Option<&acp::Meta>) -> Option<String> {
-    crate::app::parse_session_web_search_disabled(meta).map(|n| n.message)
+fn web_search_disabled_message(_meta: Option<&acp::Meta>) -> Option<String> {
+    None
 }
 
 async fn open_session(
@@ -1167,14 +1162,12 @@ pub async fn run_single_turn(
 
     let track_active = std::env::var("GROK_TRACK_HEADLESS").is_ok();
     if track_active {
-        let _ = xai_grok_shell::active_sessions::register(
-            xai_grok_shell::active_sessions::ActiveSession {
-                session_id: session_id.clone(),
-                pid: std::process::id(),
-                cwd: cwd.display().to_string(),
-                opened_at: chrono::Utc::now(),
-            },
-        );
+        let _ = xai_grok_active_sessions::register(xai_grok_active_sessions::ActiveSession {
+            session_id: session_id.clone(),
+            pid: std::process::id(),
+            cwd: cwd.display().to_string(),
+            opened_at: chrono::Utc::now(),
+        });
     }
 
     // Seed the reducer's session context BEFORE applying model/effort so a later failure carries it.
@@ -1198,6 +1191,44 @@ pub async fn run_single_turn(
             context_window: session_models.get_context_window(),
         });
     }
+
+    // One bounded catalog read covers what the session catalog cannot resolve.
+    let effort_unresolved = |token: &str| {
+        if parse_canonical_effort_token(token).is_some() {
+            return false;
+        }
+        let target = options
+            .model
+            .as_deref()
+            .and_then(|m| session_models.resolve_by_name_or_id(m))
+            .or_else(|| session_models.current.clone());
+        match target {
+            Some(model_id) => matches!(
+                session_models.resolve_effort_for_model(&model_id, token),
+                Err(EffortTokenError::UnknownToken { .. } | EffortTokenError::NoActiveModel)
+            ),
+            None => true,
+        }
+    };
+    let needs_fresh_catalog = options
+        .model
+        .as_deref()
+        .is_some_and(|m| session_models.resolve_by_name_or_id(m).is_none())
+        || options
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(effort_unresolved);
+    let session_models = if needs_fresh_catalog {
+        match xai_grok_shell::cli_models::fetch_model_state(&acp_tx).await {
+            Ok(state) => ModelState::from(Some(state)),
+            Err(e) => {
+                tracing::warn!(error = %e, "headless: model catalog refresh failed; using session state");
+                session_models
+            }
+        }
+    } else {
+        session_models
+    };
 
     if let Err(e) = apply_headless_model_and_effort(
         &acp_tx,
@@ -1373,7 +1404,7 @@ pub async fn run_single_turn(
 
     if track_active {
         // Non-blocking flock so a slow/network ~/.grok can't hang exit.
-        let _ = xai_grok_shell::active_sessions::try_unregister(&session_id);
+        let _ = xai_grok_active_sessions::try_unregister(&session_id);
     }
     // A mid-turn ACP close already reaped above; return that error before the normal outcome.
     if connection_closed {
@@ -1425,7 +1456,7 @@ pub async fn run_single_turn(
         Some(Err(err)) => {
             let msg = if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
                 let detail = err.data.as_ref().and_then(error_detail_from_data);
-                crate::app::sanitize_user_error(&format_rate_limited_user_message(
+                crate::app::effects::sanitize_user_error(&format_rate_limited_user_message(
                     detail.as_deref(),
                     is_api_key_auth,
                 ))
@@ -1482,6 +1513,7 @@ fn reap_request_for_work(
             serde_json::value::to_raw_value(&KillTaskRequest {
                 session_id: session_id.0.to_string(),
                 task_id: id.clone(),
+                source: xai_grok_shell::extensions::task::TaskKillSource::Teardown,
             })?,
         ),
     };
@@ -1755,6 +1787,7 @@ fn handle_headless_acp_message(
                 )))
                 .ok();
         }
+        AcpClientMessageBox::ExtMethod(args) => reply_headless_ext_method(args),
         _ => {}
     }
 }

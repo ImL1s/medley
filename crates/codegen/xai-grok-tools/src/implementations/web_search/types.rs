@@ -46,6 +46,12 @@ pub enum WebSearchConfig {
         env_http_headers: IndexMap<String, String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         alpha_test_key: Option<String>,
+        /// Authoritative domain allowlist from `[toolset.web_search] allowed_domains`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_domains: Option<Vec<String>>,
+        /// Authoritative domain blocklist from `[toolset.web_search] excluded_domains`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        excluded_domains: Option<Vec<String>>,
         /// Optional provider scoped to this web-search model. Runtime-only:
         /// deserialized configs continue to use the caller's default provider.
         #[serde(skip)]
@@ -64,6 +70,8 @@ impl std::fmt::Debug for WebSearchConfig {
                 extra_headers,
                 env_http_headers,
                 alpha_test_key,
+                allowed_domains,
+                excluded_domains,
                 api_key_provider,
             } => f
                 .debug_struct("WebSearchConfig::Enabled")
@@ -76,6 +84,8 @@ impl std::fmt::Debug for WebSearchConfig {
                 .field("extra_headers_present", &!extra_headers.is_empty())
                 .field("env_http_headers_present", &!env_http_headers.is_empty())
                 .field("alpha_test_key_present", &alpha_test_key.is_some())
+                .field("allowed_domains", allowed_domains)
+                .field("excluded_domains", excluded_domains)
                 .field("provider_scoped", &api_key_provider.is_some())
                 .finish(),
         }
@@ -105,6 +115,8 @@ impl WebSearchConfig {
                 model,
                 extra_headers,
                 env_http_headers,
+                allowed_domains,
+                excluded_domains,
                 ..
             } => Self::Enabled {
                 api_key: api_key.as_ref().map(|_| "***REDACTED***".to_string()),
@@ -115,6 +127,8 @@ impl WebSearchConfig {
                 // never hold its value, so there is nothing here to redact.
                 env_http_headers: env_http_headers.clone(),
                 alpha_test_key: None,
+                allowed_domains: allowed_domains.clone(),
+                excluded_domains: excluded_domains.clone(),
                 api_key_provider: None,
             },
         }
@@ -140,6 +154,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         assert!(config.is_enabled());
@@ -156,6 +172,8 @@ mod tests {
             extra_headers: headers,
             env_http_headers: Default::default(),
             alpha_test_key: Some("alpha-secret".to_string()),
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let redacted = config.redacted();
@@ -167,6 +185,8 @@ mod tests {
                 extra_headers,
                 env_http_headers,
                 alpha_test_key,
+                allowed_domains: _,
+                excluded_domains: _,
                 api_key_provider,
             } => {
                 assert_eq!(api_key.as_deref(), Some("***REDACTED***"));
@@ -193,6 +213,8 @@ mod tests {
             extra_headers: IndexMap::from([("Authorization".to_string(), sentinel.to_string())]),
             env_http_headers: Default::default(),
             alpha_test_key: Some(sentinel.to_string()),
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let rendered = format!("{config:?}");

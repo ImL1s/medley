@@ -486,6 +486,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                                 extra_headers: headers.clone(),
                                 zdr_video_output_s3: None,
                                 tier_restricted: false,
+                                zdr_restricted: false,
                             },
                             WebSearchConfig::Enabled {
                                 api_key: Some(token),
@@ -494,6 +495,8 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                                 extra_headers: headers,
                                 env_http_headers: Default::default(),
                                 alpha_test_key: None,
+                                allowed_domains: None,
+                                excluded_domains: None,
                                 api_key_provider: None,
                             },
                             AppBuilderDeployerConfig::default(),

@@ -217,11 +217,10 @@ impl ShellToolsetConfig {
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            endpoint_trust: None,
-            credential_source: None,
             api_backend: Default::default(),
             auth_scheme: Default::default(),
             extra_headers: indexmap::IndexMap::new(),
+            extra_response_includes: Vec::new(),
             query_params: indexmap::IndexMap::new(),
             env_http_headers: indexmap::IndexMap::new(),
             context_window: 256_000,
@@ -234,6 +233,9 @@ impl ShellToolsetConfig {
             client_identifier: None,
             deployment_id: None,
             user_id: None,
+            codex_wire: None,
+            credential_source: None,
+            endpoint_trust: Default::default(),
             origin_client: None,
             // Default base for the in-process web-search tool config.
             // Real `SamplerConfig`s (e.g. from `sampling_config_for_model`)
@@ -250,7 +252,6 @@ impl ShellToolsetConfig {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
-            codex_wire: None,
         };
         let mut toolset = base.unwrap_or_else(|| Self {
             bash: BashToolConfig::default(),

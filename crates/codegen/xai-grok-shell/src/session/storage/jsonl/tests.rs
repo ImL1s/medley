@@ -2,611 +2,10 @@
 use super::*;
 use crate::session::info::Info;
 use crate::session::persistence::default_model_id;
-use crate::session::storage::SessionUpdate;
+use crate::session::storage::{CopySessionOptions, SessionUpdate};
 use crate::tools::todo::TodoState;
 use agent_client_protocol as acp;
 use tempfile::TempDir;
-
-#[tokio::test]
-async fn restart_preserves_unique_route_identity_against_removed_key_reuse() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let writer = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    writer
-        .init_session(&info, acp::ModelId::new("removed-key"))
-        .await
-        .unwrap();
-    let identity = xai_chat_state::CatalogIdentity {
-        model_id: "removed-key".to_string(),
-        route: "retained-route".to_string(),
-        lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
-        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
-    };
-    writer
-        .commit_model_switch_with_identity(
-            &info,
-            &[ConversationItem::user("persist identity")],
-            &acp::ModelId::new("removed-key"),
-            Some(&identity),
-            Some("default"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    // Simulate a new process loading the JSONL session after the original key
-    // disappeared and was reused for an unrelated route.
-    let reader = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    let loaded = reader.load_session(&info).await.unwrap();
-    let restored = loaded
-        .summary
-        .catalog_identity
-        .expect("catalog identity must survive restart");
-    assert_eq!(restored, identity);
-
-    let endpoints = crate::agent::config::EndpointsConfig::default();
-    let mut reused = crate::agent::config::ModelEntry::fallback("attacker-route", &endpoints);
-    reused.info.model = "attacker-route".to_string();
-    let mut replacement =
-        crate::agent::config::ModelEntry::fallback("retained-route", &endpoints);
-    replacement.info.model = "retained-route".to_string();
-    let mut catalog = indexmap::IndexMap::from([
-        ("removed-key".to_string(), reused),
-        ("replacement-key".to_string(), replacement),
-    ]);
-    let resolved = crate::agent::models::reconcile_persisted_catalog_identity(
-        &catalog, &restored,
-    )
-    .expect("UniqueRoute lineage should remap by the retained route");
-    assert_eq!(resolved.model_id, "replacement-key");
-    assert_eq!(resolved.route, "retained-route");
-
-    let mut exact = restored.clone();
-    exact.lineage = xai_chat_state::CatalogResolutionLineage::ExactKey;
-    assert!(
-        crate::agent::models::reconcile_persisted_catalog_identity(&catalog, &exact).is_none(),
-        "ExactKey lineage must not follow a reused key or remap by route"
-    );
-    catalog.insert(
-        "second-replacement".to_string(),
-        crate::agent::config::ModelEntry::fallback("retained-route", &endpoints),
-    );
-    assert!(
-        crate::agent::models::reconcile_persisted_catalog_identity(&catalog, &restored).is_none(),
-        "UniqueRoute lineage must fail closed once the retained route is ambiguous"
-    );
-}
-
-#[tokio::test]
-async fn model_switch_recovers_new_generation_after_durable_intent_only() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
-        .await
-        .unwrap();
-
-    let crashing = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::Intent {
-                Err(std::io::Error::other("simulated process crash"))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    let error = crashing
-        .commit_model_switch(
-            &info,
-            &[ConversationItem::user("new-chat")],
-            &acp::ModelId::new("new-model"),
-            Some("new-agent"),
-            None,
-        )
-        .await
-        .expect_err("the crash seam must interrupt materialization");
-    assert!(error.is_committed(), "durable intent is the commit point");
-
-    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    let direct_chat = resumed
-        .load_chat_history_from_dir(&resumed.session_dir(&info))
-        .unwrap();
-    assert_eq!(
-        serde_json::to_value(direct_chat).unwrap(),
-        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap(),
-        "direct chat loads must recover pending model-switch intent first"
-    );
-    let loaded = resumed.load_session(&info).await.unwrap();
-    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "new-model");
-    assert_eq!(loaded.summary.agent_name.as_deref(), Some("new-agent"));
-    assert_eq!(
-        serde_json::to_value(loaded.chat_history).unwrap(),
-        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap()
-    );
-    assert!(
-        !resumed.model_switch_journal_file(&info).exists(),
-        "successful recovery must durably clear the intent"
-    );
-}
-
-#[tokio::test]
-async fn model_switch_interruption_before_intent_rename_keeps_previous_generation() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
-        .await
-        .unwrap();
-
-    let crashing = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::IntentBeforeRename {
-                Err(std::io::Error::other("simulated process crash before rename"))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    let error = crashing
-        .commit_model_switch(
-            &info,
-            &[ConversationItem::user("new-chat")],
-            &acp::ModelId::new("new-model"),
-            Some("new-agent"),
-            None,
-        )
-        .await
-        .expect_err("the crash seam must stop before installing durable intent");
-    assert!(
-        !error.is_committed(),
-        "pre-rename interruption must not report a committed switch"
-    );
-
-    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    let loaded = resumed.load_session_without_updates(&info).await.unwrap();
-    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "old-model");
-    assert_eq!(
-        serde_json::to_value(loaded.chat_history).unwrap(),
-        serde_json::to_value([ConversationItem::user("old-chat")]).unwrap()
-    );
-    assert!(
-        !resumed.model_switch_journal_file(&info).exists(),
-        "pre-rename interruption must not leave a pending intent journal"
-    );
-}
-
-#[tokio::test]
-async fn model_switch_interruption_after_intent_rename_still_recovers_new_generation() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
-        .await
-        .unwrap();
-
-    let crashing = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::IntentAfterRename {
-                Err(std::io::Error::other(
-                    "simulated crash after rename, before directory sync",
-                ))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    let error = crashing
-        .commit_model_switch(
-            &info,
-            &[ConversationItem::user("new-chat")],
-            &acp::ModelId::new("new-model"),
-            Some("new-agent"),
-            None,
-        )
-        .await
-        .expect_err("the crash seam must interrupt after rename");
-    assert!(
-        error.is_committed(),
-        "post-rename interruption must preserve a recoverable committed intent"
-    );
-
-    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    let loaded = resumed.load_session_without_updates(&info).await.unwrap();
-    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "new-model");
-    assert_eq!(loaded.summary.agent_name.as_deref(), Some("new-agent"));
-    assert_eq!(
-        serde_json::to_value(loaded.chat_history).unwrap(),
-        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap()
-    );
-}
-
-#[tokio::test]
-async fn model_switch_recovers_new_generation_after_chat_materialization() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
-        .await
-        .unwrap();
-
-    let crashing = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::Chat {
-                Err(std::io::Error::other("simulated process crash"))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    assert!(
-        crashing
-            .commit_model_switch(
-                &info,
-                &[ConversationItem::user("new-chat")],
-                &acp::ModelId::new("new-model"),
-                Some("new-agent"),
-                None,
-            )
-            .await
-            .expect_err("the crash seam must interrupt summary materialization")
-            .is_committed()
-    );
-
-    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    let loaded = resumed.load_session_without_updates(&info).await.unwrap();
-    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "new-model");
-    assert_eq!(
-        serde_json::to_value(loaded.chat_history).unwrap(),
-        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap()
-    );
-}
-
-#[tokio::test]
-async fn model_switch_recovers_new_generation_after_summary_materialization() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
-        .await
-        .unwrap();
-
-    let crashing = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::Summary {
-                Err(std::io::Error::other(
-                    "simulated process crash after summary materialization",
-                ))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    assert!(
-        crashing
-            .commit_model_switch(
-                &info,
-                &[ConversationItem::user("new-chat")],
-                &acp::ModelId::new("new-model"),
-                Some("new-agent"),
-                None,
-            )
-            .await
-            .expect_err("the crash seam must interrupt intent cleanup")
-            .is_committed()
-    );
-
-    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    let loaded = resumed.load_session_without_updates(&info).await.unwrap();
-    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "new-model");
-    assert_eq!(loaded.summary.agent_name.as_deref(), Some("new-agent"));
-    assert_eq!(
-        serde_json::to_value(loaded.chat_history).unwrap(),
-        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap()
-    );
-    assert!(
-        !resumed.model_switch_journal_file(&info).exists(),
-        "summary-step recovery must clear the pending intent once resumed"
-    );
-}
-
-#[tokio::test]
-async fn model_switch_recovers_pending_intent_before_installing_next_intent() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
-        .await
-        .unwrap();
-
-    let first = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::Intent {
-                Err(std::io::Error::other("leave first intent pending"))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    assert!(
-        first
-            .commit_model_switch(
-                &info,
-                &[ConversationItem::user("first-chat")],
-                &acp::ModelId::new("first-model"),
-                None,
-                None,
-            )
-            .await
-            .expect_err("the first intent must remain pending")
-            .is_committed()
-    );
-
-    let chat_file = base.session_dir(&info).join(super::super::CHAT_HISTORY_FILE);
-    let second = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        move |step| {
-            if step == ModelSwitchCommitStep::Intent {
-                let chat = std::fs::read_to_string(&chat_file)?;
-                if !chat.contains("first-chat") {
-                    return Err(std::io::Error::other(
-                        "pending first intent was not recovered before installing the second",
-                    ));
-                }
-            }
-            Ok(())
-        },
-    );
-    second
-        .commit_model_switch(
-            &info,
-            &[ConversationItem::user("second-chat")],
-            &acp::ModelId::new("second-model"),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-    let loaded = base.load_session_without_updates(&info).await.unwrap();
-    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "second-model");
-    assert_eq!(
-        serde_json::to_value(loaded.chat_history).unwrap(),
-        serde_json::to_value([ConversationItem::user("second-chat")]).unwrap()
-    );
-}
-
-#[tokio::test]
-async fn ordinary_chat_append_recovers_committed_model_switch_before_writing() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
-        .await
-        .unwrap();
-
-    let crashing = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::Intent {
-                Err(std::io::Error::other("leave committed intent pending"))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    assert!(
-        crashing
-            .commit_model_switch(
-                &info,
-                &[ConversationItem::user("switched-chat")],
-                &acp::ModelId::new("switched-model"),
-                Some("switched-agent"),
-                None,
-            )
-            .await
-            .expect_err("the committed intent must remain pending")
-            .is_committed()
-    );
-
-    base.append_chat_message(&info, &ConversationItem::assistant("ordinary-after-switch"))
-        .await
-        .unwrap();
-    assert!(
-        !base.model_switch_journal_file(&info).exists(),
-        "ordinary chat mutation must recover and clear the pending intent first"
-    );
-
-    let loaded = base.load_session_without_updates(&info).await.unwrap();
-    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "switched-model");
-    assert_eq!(loaded.summary.agent_name.as_deref(), Some("switched-agent"));
-    assert_eq!(loaded.summary.num_chat_messages, 2);
-    assert_eq!(
-        serde_json::to_value(loaded.chat_history).unwrap(),
-        serde_json::to_value([
-            ConversationItem::user("switched-chat"),
-            ConversationItem::assistant("ordinary-after-switch"),
-        ])
-        .unwrap(),
-        "later recovery must not replay the old intent over the ordinary append"
-    );
-}
-
-#[tokio::test]
-async fn ordinary_model_update_recovers_committed_model_switch_before_writing() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-
-    let crashing = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::Intent {
-                Err(std::io::Error::other("leave committed intent pending"))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    assert!(
-        crashing
-            .commit_model_switch(
-                &info,
-                &[],
-                &acp::ModelId::new("pending-model"),
-                Some("pending-agent"),
-                None,
-            )
-            .await
-            .expect_err("the committed intent must remain pending")
-            .is_committed()
-    );
-
-    base.update_current_model_and_agent(
-        &info,
-        &acp::ModelId::new("ordinary-model"),
-        Some("ordinary-agent"),
-        Some(None),
-    )
-    .await
-    .unwrap();
-
-    let loaded = base.load_session_without_updates(&info).await.unwrap();
-    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "ordinary-model");
-    assert_eq!(loaded.summary.agent_name.as_deref(), Some("ordinary-agent"));
-    assert!(
-        !base.model_switch_journal_file(&info).exists(),
-        "ordinary model mutation must recover and clear the pending intent first"
-    );
-}
-
-#[tokio::test]
-async fn list_sessions_recovers_pending_model_switch_intent_before_loading_summary() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
-        .await
-        .unwrap();
-
-    let crashing = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::Intent {
-                Err(std::io::Error::other("leave committed intent pending"))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    assert!(
-        crashing
-            .commit_model_switch(
-                &info,
-                &[ConversationItem::user("listed-chat")],
-                &acp::ModelId::new("listed-model"),
-                Some("listed-agent"),
-                None,
-            )
-            .await
-            .expect_err("the committed intent must remain pending")
-            .is_committed()
-    );
-
-    let listed = base.list_sessions(Some(&info.cwd)).await.unwrap();
-    let summary = listed
-        .iter()
-        .find(|summary| summary.info.id == info.id)
-        .expect("session summary should be listed after recovery");
-    assert_eq!(summary.current_model_id.0.as_ref(), "listed-model");
-    assert_eq!(summary.agent_name.as_deref(), Some("listed-agent"));
-    assert!(
-        !base.model_switch_journal_file(&info).exists(),
-        "listing must recover and clear the pending model-switch intent first"
-    );
-}
-
-#[tokio::test]
-async fn list_sessions_recent_recovers_pending_model_switch_intent_before_loading_summary() {
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    base.init_session(&info, acp::ModelId::new("old-model"))
-        .await
-        .unwrap();
-    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
-        .await
-        .unwrap();
-
-    let crashing = JsonlStorageAdapter::with_model_switch_probe(
-        temp_dir.path().to_path_buf(),
-        |step| {
-            if step == ModelSwitchCommitStep::Intent {
-                Err(std::io::Error::other("leave committed intent pending"))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    assert!(
-        crashing
-            .commit_model_switch(
-                &info,
-                &[ConversationItem::user("recent-chat")],
-                &acp::ModelId::new("recent-model"),
-                Some("recent-agent"),
-                None,
-            )
-            .await
-            .expect_err("the committed intent must remain pending")
-            .is_committed()
-    );
-
-    let listed = base.list_sessions_recent(10).await.unwrap();
-    let summary = listed
-        .iter()
-        .find(|summary| summary.info.id == info.id)
-        .expect("recent listing should include recovered summary");
-    assert_eq!(summary.current_model_id.0.as_ref(), "recent-model");
-    assert_eq!(summary.agent_name.as_deref(), Some("recent-agent"));
-    assert!(
-        !base.model_switch_journal_file(&info).exists(),
-        "recent listing must recover and clear the pending model-switch intent first"
-    );
-}
-
 fn create_test_info() -> Info {
     Info {
         id: acp::SessionId::new("test-session-123"),
@@ -652,7 +51,7 @@ async fn write_compaction_segment_numbers_and_indexes_resume_safely() {
     adapter.write_compaction_segment(&info, &seg("second")).await.unwrap();
     let base = adapter
         .session_dir(&info)
-        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+        .join(xai_compaction_transcript::COMPACTION_DIR);
     let read = |p: &str| std::fs::read_to_string(base.join(p)).unwrap();
     assert!(read("segment_000.md").contains("# HISTORICAL -- DO NOT EDIT"));
     assert!(read("segment_001.md").contains("second"));
@@ -773,94 +172,6 @@ async fn load_rebuilds_chat_history_from_updates() {
             "rebuilt cache carries the transcript text"
         );
 }
-
-/// #44 F1: persisted AttemptDiscarded must make rebuild_chat_history keep
-/// the retry text once (not hellohello) when both attempts are on disk.
-///
-/// Path covered: **chat_history rebuild** (`ChatReducer` via `load_session`),
-/// not subagent `stream_replay_updates_at` (see
-/// `attempt_discarded_persist_then_stream_replay_subagent_path` for that).
-/// Writer is the real `JsonlStorageAdapter::append_update`.
-#[tokio::test]
-async fn rebuild_chat_history_honors_attempt_discarded() {
-    use agent_client_protocol::{
-        ContentBlock, ContentChunk, SessionUpdate as Acp, TextContent,
-    };
-    use crate::extensions::notification::{
-        SessionNotification as XaiNotif, SessionUpdate as XaiUpdate,
-    };
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    adapter.init_session(&info, default_model_id()).await.unwrap();
-    let text = |s: &str| {
-        ContentChunk::new(ContentBlock::Text(TextContent::new(s.to_string())))
-    };
-    let notify = |u| {
-        SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
-            info.id.clone(),
-            u,
-        )))
-    };
-    adapter
-        .append_update(&info, &notify(Acp::UserMessageChunk(text("hi"))))
-        .await
-        .unwrap();
-    adapter
-        .append_update(&info, &notify(Acp::AgentMessageChunk(text("hello"))))
-        .await
-        .unwrap();
-    adapter
-        .append_update(
-            &info,
-            &SessionUpdate::Xai(Box::new(XaiNotif {
-                session_id: info.id.clone(),
-                update: XaiUpdate::AttemptDiscarded,
-                meta: None,
-            })),
-        )
-        .await
-        .unwrap();
-    adapter
-        .append_update(&info, &notify(Acp::AgentMessageChunk(text("hello"))))
-        .await
-        .unwrap();
-
-    // (a) raw file must double-stream the attempt text (fixture is load-bearing).
-    let updates_path = adapter.session_dir(&info).join("updates.jsonl");
-    let raw = std::fs::read_to_string(&updates_path).unwrap();
-    assert!(
-        raw.matches("hello").count() >= 2,
-        "updates.jsonl must contain both attempts; raw:\n{raw}"
-    );
-    assert!(
-        raw.contains("attempt_discarded"),
-        "updates.jsonl must contain the retraction; raw:\n{raw}"
-    );
-
-    // Force rebuild from updates alone.
-    let chat_path = adapter.session_dir(&info).join("chat_history.jsonl");
-    let _ = std::fs::remove_file(&chat_path);
-    let loaded = adapter.load_session(&info).await.unwrap();
-    let assistant_texts: Vec<String> = loaded
-        .chat_history
-        .iter()
-        .filter_map(|item| match item {
-            ConversationItem::Assistant(a) => Some(a.content.to_string()),
-            _ => None,
-        })
-        .collect();
-    // (b) rebuilt ConversationItem list keeps the text once.
-    assert_eq!(
-        assistant_texts,
-        vec!["hello".to_string()],
-        "ChatReducer must retract the abandoned attempt; got {assistant_texts:?}"
-    );
-    assert!(
-        !assistant_texts.iter().any(|t| t == "hellohello"),
-        "concatenated attempts must not appear in rebuilt history"
-    );
-}
 #[tokio::test]
 async fn workflow_run_manifest_round_trips_and_clear_tombstone_wins() {
     use crate::session::workflow::store::{
@@ -968,130 +279,6 @@ async fn workflow_restore_rejects_symlinks_and_caps_run_count() {
                 .iter()
                 .all(|run| run.manifest.state.run_id != "wf_symlink")
         );
-}
-/// Write a minimal valid workflow run directory. Returns the run id.
-#[cfg(test)]
-fn write_workflow_run(workflows: &std::path::Path, run_id: &str) -> String {
-    use crate::session::workflow::store::{
-        WORKFLOW_RUN_MANIFEST_VERSION, WorkflowRunManifest, script_revision_path,
-    };
-    use crate::session::workflow::tracker::WorkflowTracker;
-    let run_dir = workflows.join(run_id);
-    std::fs::create_dir_all(run_dir.join("scripts")).unwrap();
-    let mut tracker = WorkflowTracker::default();
-    let state = tracker.start_run(
-        run_id.to_string(),
-        "demo".into(),
-        "ship".into(),
-        Vec::new(),
-        None,
-        Some(format!("workflows/{run_id}/journal.jsonl")),
-    );
-    let manifest = WorkflowRunManifest {
-        version: WORKFLOW_RUN_MANIFEST_VERSION,
-        state,
-        script_revision: 0,
-    };
-    std::fs::write(
-        run_dir.join("state.json"),
-        serde_json::to_vec(&manifest).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(script_revision_path(&run_dir, 0), "complete(\"ok\");").unwrap();
-    std::fs::write(run_dir.join("args.json"), "{}").unwrap();
-    run_id.to_string()
-}
-/// Write a cleared tombstone: `remove()` deletes `state.json` and leaves the
-/// directory with a `cleared` marker, so these accumulate forever.
-#[cfg(test)]
-fn write_workflow_tombstone(workflows: &std::path::Path, run_id: &str) {
-    let run_dir = workflows.join(run_id);
-    std::fs::create_dir_all(&run_dir).unwrap();
-    std::fs::write(run_dir.join("cleared"), "").unwrap();
-}
-/// #162: the restore cap must keep the **newest** runs.
-///
-/// The pre-existing cap test asserts only the *count*, so deleting `.rev()`
-/// from production leaves it green -- even though `.rev()` is the entire fix
-/// for #154's "the cap kept the oldest runs" defect. Run ids are `wf_` + a
-/// UUIDv7 `simple()`, whose leading 48 bits are a big-endian millisecond
-/// timestamp in fixed-width hex, so lexicographic order is chronological; the
-/// zero-padded ids below stand in for that ordering.
-///
-/// Asserting the surviving ids **by name** is what makes the direction
-/// load-bearing.
-#[tokio::test]
-async fn workflow_restore_keeps_the_newest_runs_not_the_oldest() {
-    use crate::session::workflow::store::MAX_RESTORED_WORKFLOW_RUNS;
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    adapter.init_session(&info, default_model_id()).await.unwrap();
-    let workflows = adapter.session_dir(&info).join("workflows");
-    std::fs::create_dir_all(&workflows).unwrap();
-
-    let total = MAX_RESTORED_WORKFLOW_RUNS + 3;
-    for index in 0..total {
-        write_workflow_run(&workflows, &format!("wf_{index:04}"));
-    }
-
-    let loaded = adapter.load_session_without_updates(&info).await.unwrap();
-    let mut got: Vec<String> = loaded
-        .workflow_runs
-        .iter()
-        .map(|run| run.manifest.state.run_id.clone())
-        .collect();
-    got.sort();
-    let expected: Vec<String> = (total - MAX_RESTORED_WORKFLOW_RUNS..total)
-        .map(|index| format!("wf_{index:04}"))
-        .collect();
-    assert_eq!(
-        got, expected,
-        "the cap must keep the newest runs; keeping the oldest is #154's defect \
-         and a count-only assertion cannot tell the two apart"
-    );
-}
-/// #162: a wall of tombstones must not hide the valid runs behind it.
-///
-/// `remove()` leaves the directory, so a long-lived session accumulates
-/// tombstones at the newest end. The scan bound used to be a `.take()` on raw
-/// dirents, so those tombstones consumed the whole budget and the older valid
-/// runs were never reached -- with no warning, because the only one fired on
-/// the *restore* cap, which this path never reaches. A silent truncation then
-/// reads as "nothing to restore".
-///
-/// Cheap rejections now cost nothing against the manifest-read budget.
-#[tokio::test]
-async fn workflow_restore_sees_past_a_wall_of_tombstones() {
-    use crate::session::workflow::store::MAX_RESTORED_WORKFLOW_RUNS;
-    let temp_dir = TempDir::new().unwrap();
-    let info = create_test_info();
-    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
-    adapter.init_session(&info, default_model_id()).await.unwrap();
-    let workflows = adapter.session_dir(&info).join("workflows");
-    std::fs::create_dir_all(&workflows).unwrap();
-
-    // Sorts first, so it is reached last walking newest-first.
-    write_workflow_run(&workflows, "wf_0000_survivor");
-    // More tombstones than the old raw-dirent budget of
-    // `MAX_RESTORED_WORKFLOW_RUNS * 8`, all sorting after the survivor.
-    let wall = MAX_RESTORED_WORKFLOW_RUNS * 8 + 1;
-    for index in 0..wall {
-        write_workflow_tombstone(&workflows, &format!("wf_9{index:06}"));
-    }
-
-    let loaded = adapter.load_session_without_updates(&info).await.unwrap();
-    let ids: Vec<String> = loaded
-        .workflow_runs
-        .iter()
-        .map(|run| run.manifest.state.run_id.clone())
-        .collect();
-    assert_eq!(
-        ids,
-        vec!["wf_0000_survivor".to_string()],
-        "a valid run behind {wall} tombstones must still be restored; restoring \
-         nothing here is the silent truncation #162 describes"
-    );
 }
 /// `load_session_without_updates` always defers rewind points while the full
 /// `load_session` / `load_rewind_points` still return them.
@@ -1981,7 +1168,6 @@ fn write_test_summary(
         num_messages: 1,
         num_chat_messages: 1,
         current_model_id: default_model_id(),
-        catalog_identity: None,
         parent_session_id: None,
         forked_at: None,
         collection_id: None,
@@ -2772,6 +1958,73 @@ fn read_chat_history_quarantines_original_on_image_strip() {
             "pre-strip original must be preserved for recovery"
         );
 }
+/// The pre-strip backup copies the live file once; the first copy wins
+/// so a later strip cannot overwrite the earliest (fullest) backup.
+#[tokio::test]
+async fn backup_chat_history_before_strip_copies_once() {
+    let original = r#"{"type":"user","content":[{"type":"text","text":"with image"}]}"#;
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    let chat_path = adapter.chat_file(&info);
+    std::fs::create_dir_all(chat_path.parent().unwrap()).unwrap();
+    std::fs::write(&chat_path, original).unwrap();
+    adapter.backup_chat_history_before_strip(&info).await.unwrap();
+    let backup = chat_path.with_extension("jsonl.pre-strip");
+    assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            original,
+            "backup must capture the pre-strip file"
+        );
+    std::fs::write(&chat_path, "stripped").unwrap();
+    adapter.backup_chat_history_before_strip(&info).await.unwrap();
+    assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            original,
+            "first backup wins; a later strip must not overwrite it"
+        );
+}
+/// The gate itself: when the backup cannot be written, the destructive
+/// rewrite must not run: the live file keeps its images and the error
+/// surfaces to the caller.
+#[tokio::test]
+async fn strip_rewrite_gated_skips_rewrite_when_backup_fails() {
+    let original = r#"{"type":"user","content":[{"type":"text","text":"with image"}]}"#;
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    let chat_path = adapter.chat_file(&info);
+    std::fs::create_dir_all(chat_path.parent().unwrap()).unwrap();
+    std::fs::write(&chat_path, original).unwrap();
+    std::fs::create_dir(chat_path.with_extension("jsonl.pre-strip.tmp")).unwrap();
+    let result = crate::session::storage::strip_rewrite_gated(
+            &adapter,
+            &info,
+            &[ConversationItem::user("stripped")],
+        )
+        .await;
+    assert!(result.is_err(), "a failed backup must fail the strip");
+    assert_eq!(
+            std::fs::read_to_string(&chat_path).unwrap(),
+            original,
+            "the rewrite must not run when the backup failed"
+        );
+}
+/// A missing chat file (fresh session, strip before first write) must
+/// not error or create a backup.
+#[tokio::test]
+async fn backup_chat_history_before_strip_noops_without_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    adapter.backup_chat_history_before_strip(&info).await.unwrap();
+    assert!(
+            !adapter
+                .chat_file(&info)
+                .with_extension("jsonl.pre-strip")
+                .exists()
+        );
+}
 /// The exact incident shape: a partial record with the next record
 /// appended straight onto it (no newline in between — the log-and-continue
 /// append path pre-heal). The merged line fails with "expected `,` or `}`"
@@ -3005,7 +2258,6 @@ async fn retry_after_lost_ack_converges_memory_and_disk_to_authoritative_item() 
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            endpoint_trust: None,
             api_backend: Default::default(),
             extra_headers: Default::default(),
             query_params: Default::default(),
@@ -3150,5 +2402,90 @@ async fn load_session_without_updates_survives_merged_chat_line() {
             user_text(&loaded.chat_history),
             vec!["real turn"],
             "resume succeeds; only the merged record is dropped"
+        );
+}
+#[cfg(unix)]
+use crate::test_support::{set_unix_mode, unix_mode};
+#[tokio::test]
+#[cfg(unix)]
+async fn init_session_creates_owner_only_session_and_parent_dirs() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let session_dir = temp_dir
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(info.id.to_string());
+    assert_eq!(unix_mode(&session_dir), 0o700, "session dir must be 0700");
+    assert_eq!(
+            unix_mode(session_dir.parent().unwrap()),
+            0o700,
+            "<encoded-cwd> parent must be 0700"
+        );
+    assert_eq!(
+            unix_mode(&temp_dir.path().join("sessions")),
+            0o700,
+            "sessions root must be 0700"
+        );
+}
+/// Dirs loosened on disk (e.g. by an older grok) re-tighten on next touch.
+#[tokio::test]
+#[cfg(unix)]
+async fn init_session_retightens_loosened_existing_dirs() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let session_dir = temp_dir
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(info.id.to_string());
+    set_unix_mode(&session_dir, 0o755);
+    set_unix_mode(session_dir.parent().unwrap(), 0o755);
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    assert_eq!(unix_mode(&session_dir), 0o700);
+    assert_eq!(unix_mode(session_dir.parent().unwrap()), 0o700);
+}
+#[tokio::test]
+#[cfg(unix)]
+async fn copy_session_data_creates_owner_only_target_dir() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source = create_test_info();
+    adapter.init_session(&source, default_model_id()).await.unwrap();
+    let target = Info {
+        id: acp::SessionId::new("forked-session-456"),
+        cwd: source.cwd.clone(),
+    };
+    adapter
+        .copy_session_data(&source, &target, CopySessionOptions::default())
+        .await
+        .unwrap();
+    let target_dir = temp_dir
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&target.cwd))
+        .join(target.id.to_string());
+    assert_eq!(unix_mode(&target_dir), 0o700);
+}
+/// Explicit-mode parents are caller-owned (temp roots in tests): never chmod'd.
+#[tokio::test]
+#[cfg(unix)]
+async fn explicit_session_dir_does_not_tighten_parent() {
+    let temp_dir = TempDir::new().unwrap();
+    let parent = temp_dir.path().join("caller-owned");
+    std::fs::create_dir(&parent).unwrap();
+    set_unix_mode(&parent, 0o755);
+    let child = parent.join("child-session");
+    let adapter = JsonlStorageAdapter::with_explicit_session_dir(child.clone());
+    adapter.init_session(&create_test_info(), default_model_id()).await.unwrap();
+    assert_eq!(unix_mode(&child), 0o700, "explicit dir must be tightened");
+    assert_eq!(
+            unix_mode(&parent),
+            0o755,
+            "caller-owned parent must not be chmod'd in Explicit mode"
         );
 }

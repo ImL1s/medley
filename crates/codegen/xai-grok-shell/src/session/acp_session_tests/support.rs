@@ -1,44 +1,5 @@
 #![allow(dead_code)]
 use super::*;
-
-/// Run `f` on a thread with the same stack a real session thread gets.
-///
-/// Debug-built full-session turns compose futures larger than the default
-/// 2 MiB test-thread stack, and overflowing it aborts the whole test binary
-/// rather than failing one test. Measured floor for `handle_prompt` turns:
-/// 2.5 MiB still SIGABRTs, 3 MiB passes. Boxing the future does not help —
-/// it is built on the stack before the box moves it.
-///
-/// This borrows production's `SESSION_THREAD_STACK_SIZE` rather than naming
-/// its own number. A value tuned to today's measurement would leave under a
-/// MiB of headroom, and the next time the turn future grows the binary
-/// aborts again — the exact failure this exists to prevent. A suite-wide
-/// `RUST_MIN_STACK` would hide the same class of problem more thoroughly
-/// still.
-pub(crate) fn on_large_stack(f: impl FnOnce() + Send + 'static) {
-    let join = std::thread::Builder::new()
-        .name("handle_prompt_test".into())
-        .stack_size(SESSION_THREAD_STACK_SIZE)
-        .spawn(f)
-        .expect("spawn large-stack test thread");
-    match join.join() {
-        Ok(()) => {}
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
-}
-
-/// Current-thread tokio runtime + `LocalSet`, optional time pause.
-pub(crate) fn block_on_local(start_paused: bool, fut: impl std::future::Future<Output = ()>) {
-    let mut builder = tokio::runtime::Builder::new_current_thread();
-    builder.enable_all();
-    if start_paused {
-        builder.start_paused(true);
-    }
-    let rt = builder.build().expect("test runtime");
-    let local = tokio::task::LocalSet::new();
-    rt.block_on(local.run_until(fut));
-}
-
 /// Wrap `id` in a shared auth-method handle for `SessionActor` test literals
 /// (the field is now a shared live handle, not an owned id).
 pub(crate) fn test_auth_method_id(id: &str) -> crate::agent::auth_method::SharedAuthMethodId {
@@ -152,32 +113,18 @@ async fn test_agent_from_config(
     use xai_grok_tools::registry::types::SessionContext;
     let builder = crate::tools::bridge::ToolBridge::get_builder();
     let fs: std::sync::Arc<dyn AsyncFileSystem> = std::sync::Arc::new(LocalFs);
-    // Per-agent temp dir so `resources_state.json` cannot load a leftover
-    // `/tmp/resources_state.json` from other processes (that file can seed
-    // `ReportedTaskCompletions` and fail auto-wake "must not report" asserts).
-    //
-    // A raw path rather than `tempfile::tempdir()` on purpose: the `TempDir`
-    // guard would delete the directory at the end of *this* function, while the
-    // `SessionContext` built from it outlives the call. Named uniquely so it
-    // still cannot collide; the leftover is a bounded per-run directory rather
-    // than the shared `/tmp` file this fix is about.
-    let session_dir = std::env::temp_dir().join(format!("grok-test-{}", uuid::Uuid::new_v4()));
-    // `expect`, not `let _`: a swallowed failure here leaves the test running
-    // against a `state_path` under a directory that does not exist, and it
-    // dies somewhere far away from the cause.
-    std::fs::create_dir_all(&session_dir).expect("per-test session dir");
     let ctx = SessionContext {
         backend,
         fs,
         cwd: std::path::PathBuf::from("/tmp"),
-        session_folder: session_dir.clone(),
+        session_folder: std::env::temp_dir().join("grok-test"),
         session_env: std::sync::Arc::new(std::collections::HashMap::new()),
         notification_handle: ToolNotificationHandle::noop(),
         owner_session_id: None,
         subagent: None,
         parent_scheduler_handle: None,
         skills: vec![],
-        state_path: session_dir.join("tool_state.json"),
+        state_path: std::path::PathBuf::from("/tmp/tool_state.json"),
         memory_backend: None,
         web_search_config: Default::default(),
         web_fetch_config: Default::default(),
@@ -276,7 +223,7 @@ pub(crate) async fn create_test_actor_with_terminal(
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
-        combine_edit_holds: std::collections::HashSet::new(),
+        edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
@@ -288,17 +235,11 @@ pub(crate) async fn create_test_actor_with_terminal(
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
         vec![],
         xai_grok_sampling_types::SamplingConfig {
-            // A placeholder rather than a listening endpoint. It used to be
-            // `http://localhost`, which classified as first-party only because
-            // the old predicate accepted loopback; #110 made the attach-side
-            // check reject cleartext and loopback, which silently turned every
-            // session-token fixture built here into a third-party one.
-            base_url: "https://api.x.ai/v1".to_string(),
+            base_url: "http://localhost".to_string(),
             model: "test".to_string(),
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            endpoint_trust: None,
             api_backend: Default::default(),
             extra_headers: Default::default(),
             query_params: Default::default(),
@@ -328,14 +269,15 @@ pub(crate) async fn create_test_actor_with_terminal(
             gateway: GatewaySender::new(gateway_tx),
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
-            persistence_is_noop: false,
             disk_full: crate::session::notifications::idle_disk_full_rx(),
         },
         permissions: xai_grok_workspace::permission::PermissionHandle::allow_all(),
         tool_context,
         deny_read_globs: Vec::new(),
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
-        mcp_strategy: McpInitStrategy::Blocking,
+        mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
+        delivery_tools: std::cell::RefCell::new(Vec::new()),
+        attach_non_interactive: std::cell::Cell::new(false),
         chat_state_handle,
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -344,8 +286,6 @@ pub(crate) async fn create_test_actor_with_terminal(
         )),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
-        catalog_model_id: std::cell::Cell::new("test".to_string()),
-        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -453,7 +393,6 @@ pub(crate) async fn create_test_actor_with_terminal(
         pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
-        managed_mcp_expires_at: std::sync::Mutex::new(None),
         initial_client_mcp_servers: vec![],
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
         mcp_announced_servers: Mutex::new(HashMap::new()),
@@ -463,6 +402,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
         user_input_generation: std::sync::atomic::AtomicU64::new(0),
         laziness_debug_log: None,
+        last_live_orphan_reconcile: std::cell::Cell::new(None),
         deferred_prefix: TaskSlot::new(),
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
@@ -470,6 +410,9 @@ pub(crate) async fn create_test_actor_with_terminal(
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
+        turn_report: Default::default(),
+        turn_abort: Default::default(),
+        turn_end_tx: Default::default(),
         client_hooks: Default::default(),
         hook_resolved_workspace_root: String::new(),
         vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
@@ -488,11 +431,10 @@ pub(crate) async fn create_test_actor_with_terminal(
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
+        pending_image_strip: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-        image_description_model: std::cell::RefCell::new(
-            crate::test_support::TEST_MODEL.to_owned(),
-        ),
+        image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),

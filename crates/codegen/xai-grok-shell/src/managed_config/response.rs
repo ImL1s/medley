@@ -41,7 +41,9 @@ pub enum ManagedConfigError {
         "The deployment key was rejected. Confirm that GROK_DEPLOYMENT_KEY is set correctly and hasn't expired."
     )]
     DeploymentKeyRejected,
-    #[error("{}", team_auth_rejected_msg())]
+    #[error(
+        "Your team sign-in was rejected. It may have expired or lack access. Run `grok login` to sign in again."
+    )]
     TeamAuthRejected,
     #[error("The server returned an unexpected error (HTTP {status}). Try again in a few minutes.")]
     ServerError { status: u16 },
@@ -55,27 +57,10 @@ pub enum ManagedConfigError {
         "The server's response could not be verified as authentic managed policy, so nothing was installed. Try again; if this persists, contact your administrator."
     )]
     SignatureRejected,
-    // Resolved at construction rather than written literally: the directory
-    // is `~/.medley` on a fresh install, an existing `~/.grok` on a migrated
-    // one, and anywhere at all under `MEDLEY_HOME`. Naming the wrong one in a
-    // "make sure this directory is writable" message sends the user to fix a
-    // directory that was never the problem.
     #[error(
-        "Can't save the configuration to {home}. Make sure the directory exists and is writable.\n  ({0})",
-        home = xai_grok_config::display_grok_home_prefix()
+        "Can't save the configuration to ~/.grok. Make sure the directory exists and is writable.\n  ({0})"
     )]
     DiskWrite(#[from] std::io::Error),
-}
-
-fn team_auth_rejected_msg() -> String {
-    crate::auth::with_login_instruction(
-        |prog| {
-            format!(
-                "Your team sign-in was rejected. It may have expired or lack access. Run `{prog} login` to sign in again."
-            )
-        },
-        "Your team sign-in was rejected. It may have expired or lack access. Sign in again.",
-    )
 }
 
 impl ManagedConfigError {

@@ -108,7 +108,8 @@ pub async fn fetch_subagent_bundle(
     .await?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        return Err(BackendError::RequestFailed { status });
+        let body = response.text().await.unwrap_or_default();
+        return Err(BackendError::RequestFailed { status, body });
     }
     let bundle: SubagentBundle = parse_json_response(response).await?;
     tracing::debug!(
@@ -182,17 +183,16 @@ async fn fetch_bundle_inner(
         }
     }
     let archive_response = request.send().await.map_err(|e| match e {
-        reqwest_middleware::Error::Reqwest(e) => BackendError::from(e),
-        reqwest_middleware::Error::Middleware(_) => {
-            BackendError::Auth("Authentication middleware failed".to_string())
-        }
+        reqwest_middleware::Error::Reqwest(e) => BackendError::Network(e),
+        reqwest_middleware::Error::Middleware(e) => BackendError::Auth(e.to_string()),
     })?;
     if archive_response.status().is_success() {
         let bytes = archive_response.bytes().await?;
         return Ok(FetchedBundle::Archive(bytes.to_vec()));
     }
     if archive_response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(BackendError::RequestFailed { status: 401 });
+        let body = archive_response.text().await.unwrap_or_default();
+        return Err(BackendError::RequestFailed { status: 401, body });
     }
     tracing::debug!(
         status = %archive_response.status(),
@@ -259,45 +259,23 @@ pub struct SessionUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
-#[derive(thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum BackendError {
-    #[error("Network request failed")]
-    Network(#[source] reqwest::Error),
-    #[error("Request failed with status {status}")]
-    RequestFailed { status: u16 },
-    #[error("Response serialization failed")]
+    #[error("Network error: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("Request failed: {status} - {body}")]
+    RequestFailed { status: u16, body: String },
+    #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    #[error("Session not found")]
+    #[error("Session not found: {session_id}")]
     SessionNotFound { session_id: String },
-    #[error("Hydration I/O failed")]
+    #[error("Hydration I/O error at {path}: {source}")]
     Hydration {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
     #[error("Auth error: {0}")]
     Auth(String),
-}
-
-impl std::fmt::Debug for BackendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Network(_) => f.write_str("BackendError::Network"),
-            Self::RequestFailed { status } => f
-                .debug_struct("BackendError::RequestFailed")
-                .field("status", status)
-                .finish(),
-            Self::Serialization(_) => f.write_str("BackendError::Serialization"),
-            Self::SessionNotFound { .. } => f.write_str("BackendError::SessionNotFound"),
-            Self::Hydration { .. } => f.write_str("BackendError::Hydration"),
-            Self::Auth(_) => f.write_str("BackendError::Auth"),
-        }
-    }
-}
-
-impl From<reqwest::Error> for BackendError {
-    fn from(error: reqwest::Error) -> Self {
-        Self::Network(error.without_url())
-    }
 }
 pub struct BackendClient {
     reqwest_client: reqwest::Client,
@@ -453,10 +431,8 @@ impl BackendClient {
         );
         let request = builder.build()?;
         self.client.execute(request).await.map_err(|e| match e {
-            reqwest_middleware::Error::Reqwest(e) => BackendError::from(e),
-            reqwest_middleware::Error::Middleware(_) => {
-                BackendError::Auth("Authentication middleware failed".to_string())
-            }
+            reqwest_middleware::Error::Reqwest(e) => BackendError::Network(e),
+            reqwest_middleware::Error::Middleware(e) => BackendError::Auth(e.to_string()),
         })
     }
     pub async fn upsert_session(
@@ -480,7 +456,8 @@ impl BackendClient {
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            return Err(BackendError::RequestFailed { status });
+            let body = response.text().await.unwrap_or_default();
+            return Err(BackendError::RequestFailed { status, body });
         }
         Ok(())
     }
@@ -500,7 +477,8 @@ impl BackendClient {
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            return Err(BackendError::RequestFailed { status });
+            let body = response.text().await.unwrap_or_default();
+            return Err(BackendError::RequestFailed { status, body });
         }
         Ok(())
     }
@@ -510,7 +488,8 @@ impl BackendClient {
         let response = self.send_with_auth(self.reqwest_client.get(&url)).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            return Err(BackendError::RequestFailed { status });
+            let body = response.text().await.unwrap_or_default();
+            return Err(BackendError::RequestFailed { status, body });
         }
         #[derive(Deserialize)]
         struct ListResponse {
@@ -532,7 +511,8 @@ impl BackendClient {
         }
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            return Err(BackendError::RequestFailed { status });
+            let body = response.text().await.unwrap_or_default();
+            return Err(BackendError::RequestFailed { status, body });
         }
         let data: LoadDataResponse = response.json().await?;
         Ok(data)
@@ -545,7 +525,8 @@ impl BackendClient {
         let response = self.send_with_auth(self.reqwest_client.post(&url)).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            return Err(BackendError::RequestFailed { status });
+            let body = response.text().await.unwrap_or_default();
+            return Err(BackendError::RequestFailed { status, body });
         }
         let share_response: ShareResponse = response.json().await?;
         Ok(share_response)
@@ -557,7 +538,8 @@ impl BackendClient {
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            return Err(BackendError::RequestFailed { status });
+            let body = response.text().await.unwrap_or_default();
+            return Err(BackendError::RequestFailed { status, body });
         }
         Ok(())
     }
@@ -725,77 +707,11 @@ struct ModelsResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointAuth {
     ApiKey,
-    CustomApiKey,
     Session,
 }
 struct ListModelsEndpoint {
     url: String,
     auth: EndpointAuth,
-}
-const XAI_MODELS_API_KEY_REQUIRED: &str =
-    "xAI model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY).";
-const CUSTOM_MODELS_API_KEY_REQUIRED: &str =
-    "Custom model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY).";
-fn add_models_session_headers_blocking(
-    request: reqwest::blocking::RequestBuilder,
-    auth: &GrokAuth,
-) -> reqwest::blocking::RequestBuilder {
-    let mut request = request
-        .header("Authorization", format!("Bearer {}", &auth.key))
-        .header("X-XAI-Token-Auth", "xai-grok-cli")
-        .header("x-userid", &auth.user_id)
-        .header("x-grok-client-version", xai_grok_version::VERSION)
-        .header(
-            crate::http::CLIENT_MODE_HEADER,
-            crate::http::process_client_mode(),
-        );
-    if let Some(email) = &auth.email {
-        request = request.header("x-email", email);
-    }
-    request
-}
-/// Catalog requests carry credentials and therefore use a redirect-denying
-/// client. Keeping this policy catalog-local avoids changing unrelated startup
-/// requests while ensuring credentials cannot be replayed to another origin.
-pub fn models_catalog_blocking_client() -> reqwest::blocking::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            xai_grok_extra_ca::with_extra_root_certificates_blocking(
-                reqwest::blocking::Client::builder()
-                    .connect_timeout(crate::http::STARTUP_FETCH_TIMEOUT)
-                    .timeout(crate::http::STARTUP_FETCH_TIMEOUT)
-                    .user_agent(crate::http::process_user_agent_string())
-                    .pool_idle_timeout(Duration::from_secs(30))
-                    .tcp_keepalive(Duration::from_secs(30))
-                    .redirect(reqwest::redirect::Policy::none()),
-            )
-            .build()
-            .expect("failed to build model catalog HTTP client")
-        })
-        .clone()
-}
-/// Async counterpart used by resume-time catalog metadata refreshes. Catalog
-/// credentials must never be replayed to a redirect target.
-pub(crate) fn models_catalog_async_client() -> reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            xai_grok_extra_ca::with_extra_root_certificates(
-                reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(30))
-                    .user_agent(crate::http::process_user_agent_string())
-                    .pool_idle_timeout(Duration::from_secs(30))
-                    .http2_keep_alive_interval(Duration::from_secs(20))
-                    .http2_keep_alive_timeout(Duration::from_secs(10))
-                    .http2_keep_alive_while_idle(true)
-                    .tcp_keepalive(Duration::from_secs(30))
-                    .redirect(reqwest::redirect::Policy::none()),
-            )
-            .build()
-            .expect("failed to build async model catalog HTTP client")
-        })
-        .clone()
 }
 /// The `/v1/models` URL [`fetch_models_blocking`] hits for this
 /// endpoints/auth shape. Doubles as the models disk-cache origin key: cached
@@ -806,11 +722,7 @@ pub(crate) fn models_list_url(
     endpoints: &crate::agent::config::EndpointsConfig,
     fetch_auth: crate::agent::models::ModelFetchAuth,
 ) -> String {
-    if let Some(ref ep) = endpoints.catalog_auth.endpoint {
-        ep.clone()
-    } else {
-        ListModelsEndpoint::from_endpoints(endpoints, fetch_auth).url
-    }
+    ListModelsEndpoint::from_endpoints(endpoints, fetch_auth).url
 }
 impl ListModelsEndpoint {
     fn from_endpoints(
@@ -820,7 +732,7 @@ impl ListModelsEndpoint {
         if endpoints.has_custom_endpoint() {
             Self {
                 url: endpoints.resolve_models_list_url(),
-                auth: EndpointAuth::CustomApiKey,
+                auth: EndpointAuth::ApiKey,
             }
         } else if fetch_auth == crate::agent::models::ModelFetchAuth::ApiKey {
             Self {
@@ -828,183 +740,67 @@ impl ListModelsEndpoint {
                 auth: EndpointAuth::ApiKey,
             }
         } else {
-            let url = endpoints.resolve_models_list_url();
             Self {
-                auth: if crate::util::is_xai_api_bearer_url(&url) {
-                    EndpointAuth::Session
-                } else {
-                    EndpointAuth::CustomApiKey
-                },
-                url,
+                url: endpoints.resolve_models_list_url(),
+                auth: EndpointAuth::Session,
             }
-        }
-    }
-}
-/// Validate the credential required by the resolved catalog origin before the
-/// best-effort prefetch layer can turn an auth failure into an ordinary cache
-/// miss. This keeps startup configuration errors user-visible while preserving
-/// the intentional offline (`remote_fetch = false`) path.
-pub(crate) fn validate_models_catalog_auth(
-    endpoints: &crate::agent::config::EndpointsConfig,
-    fetch_auth: crate::agent::models::ModelFetchAuth,
-    remote_fetch_enabled: bool,
-) -> Result<(), String> {
-    if !remote_fetch_enabled {
-        return Ok(());
-    }
-
-    let catalog_auth = &endpoints.catalog_auth;
-
-    if let Some(ref scheme) = catalog_auth.auth_scheme {
-        for key in catalog_auth.headers.keys() {
-            let lower = key.to_lowercase();
-            if PROTECTED_HEADERS.contains(&lower.as_str()) {
-                return Err(format!(
-                    "header {:?} is protected and cannot be overridden",
-                    key
-                ));
-            }
-            if reqwest::header::HeaderName::from_bytes(key.as_bytes()).is_err() {
-                return Err(format!("invalid header name {:?}", key));
-            }
-            if let Some(val) = catalog_auth.headers.get(key)
-                && reqwest::header::HeaderValue::from_str(val).is_err()
-            {
-                return Err(format!("invalid header value for {:?}", key));
-            }
-        }
-        match scheme {
-            xai_grok_sampler::AuthScheme::None => Ok(()),
-            xai_grok_sampler::AuthScheme::Bearer | xai_grok_sampler::AuthScheme::XApiKey => {
-                let env_keys = catalog_auth.env_key.as_ref().ok_or_else(|| {
-                    format!(
-                        "catalog_auth_scheme is configured as {:?}, but catalog_env_key is missing",
-                        scheme
-                    )
-                })?;
-                let val = env_keys.resolve_value().ok_or_else(|| {
-                    let names = env_keys.names().join(", ");
-                    format!("catalog_env_key is configured ({}), but none of the environment variables are set or non-empty", names)
-                })?;
-                if val.trim().is_empty() {
-                    return Err(
-                        "catalog_env_key resolved to an empty or whitespace-only value".to_owned(),
-                    );
-                }
-                Ok(())
-            }
-        }
-    } else {
-        // Fallback to legacy validation
-        let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
-        let missing_api_key = crate::agent::auth_method::read_xai_api_key_env().is_err();
-        match source.auth {
-            EndpointAuth::ApiKey if missing_api_key => Err(XAI_MODELS_API_KEY_REQUIRED.to_owned()),
-            EndpointAuth::CustomApiKey if missing_api_key => {
-                Err(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned())
-            }
-            EndpointAuth::ApiKey | EndpointAuth::CustomApiKey | EndpointAuth::Session => Ok(()),
         }
     }
 }
 /// Fetch models from an OpenAI-compatible `/v1/models` endpoint.
 /// Fetch result: model entries + optional etag from response.
-#[derive(Debug)]
 pub struct FetchModelsResult {
     pub models: Vec<crate::agent::config::ModelEntryConfig>,
     pub etag: Option<String>,
 }
-const PROTECTED_HEADERS: &[&str] = &[
-    "authorization",
-    "x-xai-token-auth",
-    "x-userid",
-    "x-grok-client-version",
-    "x-email",
-    "client-mode",
-    "x-api-key",
-    "host",
-];
-
 pub(crate) fn fetch_models_blocking(
     endpoints: &crate::agent::config::EndpointsConfig,
     auth: Option<&GrokAuth>,
     fetch_auth: crate::agent::models::ModelFetchAuth,
 ) -> Result<FetchModelsResult, BackendError> {
-    let catalog_auth = &endpoints.catalog_auth;
-    let client = models_catalog_blocking_client();
-    let url = if let Some(ref ep) = catalog_auth.endpoint {
-        ep.clone()
-    } else if endpoints.has_custom_endpoint() {
-        endpoints.resolve_models_list_url()
-    } else if fetch_auth == crate::agent::models::ModelFetchAuth::ApiKey {
-        format!("{}/models", endpoints.xai_api_base_url)
-    } else {
-        endpoints.resolve_models_list_url()
-    };
+    let client = crate::http::shared_startup_blocking_client();
+    let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
     let inference_base_url = endpoints.resolve_inference_base_url();
-    tracing::info!("Fetching models from configured catalog endpoint");
-    let mut request = client.get(&url);
-    if let Some(timeout_secs) = catalog_auth.timeout_secs {
-        request = request.timeout(Duration::from_secs(timeout_secs));
-    }
-    if let Some(ref scheme) = catalog_auth.auth_scheme {
-        match scheme {
-            xai_grok_sampler::AuthScheme::None => {}
-            xai_grok_sampler::AuthScheme::Bearer => {
-                let env_keys = catalog_auth.env_key.as_ref().ok_or_else(|| {
+    tracing::info!("Fetching models from {}", source.url);
+    let mut request = client.get(&source.url);
+    match source.auth {
+        EndpointAuth::ApiKey => {
+            let api_key = crate::agent::auth_method::read_xai_api_key_env()
+                .or_else(|_| {
+                    auth.map(|a| a.key.clone())
+                        .ok_or(std::env::VarError::NotPresent)
+                })
+                .map_err(|_| {
                     BackendError::Auth(
-                        "catalog_auth_scheme is Bearer, but catalog_env_key is missing".to_owned(),
+                        "No API key for custom models endpoint. Set XAI_API_KEY.".into(),
                     )
                 })?;
-                let api_key = env_keys.resolve_value().ok_or_else(|| {
-                    BackendError::Auth("catalog_env_key is configured but empty".to_owned())
-                })?;
-                request = request.header("Authorization", format!("Bearer {}", api_key));
-            }
-            xai_grok_sampler::AuthScheme::XApiKey => {
-                let env_keys = catalog_auth.env_key.as_ref().ok_or_else(|| {
-                    BackendError::Auth(
-                        "catalog_auth_scheme is XApiKey, but catalog_env_key is missing".to_owned(),
-                    )
-                })?;
-                let api_key = env_keys.resolve_value().ok_or_else(|| {
-                    BackendError::Auth("catalog_env_key is configured but empty".to_owned())
-                })?;
-                request = request.header("x-api-key", api_key);
-            }
+            request = request.header("Authorization", format!("Bearer {}", api_key));
         }
-    } else {
-        let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
-        match source.auth {
-            EndpointAuth::ApiKey => {
-                let api_key = crate::agent::auth_method::read_xai_api_key_env()
-                    .map_err(|_| BackendError::Auth(XAI_MODELS_API_KEY_REQUIRED.to_owned()))?;
-                request = request.header("Authorization", format!("Bearer {}", api_key));
-            }
-            EndpointAuth::CustomApiKey => {
-                let api_key = crate::agent::auth_method::read_xai_api_key_env()
-                    .map_err(|_| BackendError::Auth(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned()))?;
-                request = request.header("Authorization", format!("Bearer {}", api_key));
-            }
-            EndpointAuth::Session => {
-                let auth = auth.ok_or_else(|| {
-                    BackendError::Auth("No auth credentials for cli-chat-proxy".into())
-                })?;
-                request = add_models_session_headers_blocking(request, auth);
+        EndpointAuth::Session => {
+            let auth = auth.ok_or_else(|| {
+                BackendError::Auth("No auth credentials for cli-chat-proxy".into())
+            })?;
+            request = request
+                .header("Authorization", format!("Bearer {}", &auth.key))
+                .header("X-XAI-Token-Auth", "xai-grok-cli")
+                .header("x-userid", &auth.user_id)
+                .header("x-grok-client-version", xai_grok_version::VERSION)
+                .header(
+                    crate::http::CLIENT_MODE_HEADER,
+                    crate::http::process_client_mode(),
+                );
+            if let Some(email) = &auth.email {
+                request = request.header("x-email", email);
             }
         }
     }
-    for (k, v) in &catalog_auth.headers {
-        let lower = k.to_lowercase();
-        if !PROTECTED_HEADERS.contains(&lower.as_str()) {
-            request = request.header(k, v);
-        }
-    }
-    let response = request.send().map_err(BackendError::from)?;
+    let response = request.send()?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        tracing::warn!(status, "Failed to fetch models");
-        return Err(BackendError::RequestFailed { status });
+        let body = response.text().unwrap_or_default();
+        tracing::warn!("Failed to fetch models: {} - {}", status, body);
+        return Err(BackendError::RequestFailed { status, body });
     }
     let etag = response
         .headers()
@@ -1012,7 +808,11 @@ pub(crate) fn fetch_models_blocking(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let models_response: ModelsResponse = response.json()?;
-    tracing::info!(count = models_response.data.len(), "Fetched models");
+    tracing::info!(
+        "Fetched {} models from {}",
+        models_response.data.len(),
+        source.url
+    );
     let mut models = Vec::with_capacity(models_response.data.len());
     for (idx, value) in models_response.data.into_iter().enumerate() {
         match parse_remote_model_value(&value, &inference_base_url) {
@@ -1113,16 +913,7 @@ pub(crate) fn parse_remote_model_value(
             .or_else(|| meta.and_then(|m| m.get("supportedInApi")))
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
-        auth_scheme: get_string(obj, "authScheme")
-            .or_else(|| get_string(obj, "auth_scheme"))
-            .or_else(|| meta.and_then(|m| get_string(m, "authScheme")))
-            .or_else(|| meta.and_then(|m| get_string(m, "auth_scheme")))
-            .and_then(|s| match s.as_str() {
-                "bearer" => Some(xai_grok_sampler::AuthScheme::Bearer),
-                "x_api_key" => Some(xai_grok_sampler::AuthScheme::XApiKey),
-                "none" => Some(xai_grok_sampler::AuthScheme::None),
-                _ => None,
-            }),
+        auth_scheme: None,
         reasoning_effort: get_string(obj, "reasoningEffort")
             .or_else(|| get_string(obj, "reasoning_effort"))
             .or_else(|| meta.and_then(|m| get_string(m, "reasoningEffort")))
@@ -1269,1511 +1060,5 @@ fn get_string_map(
         .unwrap_or_default()
 }
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{
-        Router,
-        extract::{Path, State},
-        http::{HeaderMap, StatusCode},
-        routing::get,
-    };
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    fn assert_no_secret_fragments(output: &str, secret: &str) {
-        assert!(!output.contains(secret), "full credential leaked: {output}");
-        for window in secret.as_bytes().windows(8) {
-            let fragment = std::str::from_utf8(window).expect("ASCII test sentinel");
-            assert!(
-                !output.contains(fragment),
-                "credential fragment {fragment:?} leaked: {output}"
-            );
-        }
-    }
-    #[test]
-    fn login_config_response_parses_tristate() {
-        let parse = |s: &str| {
-            serde_json::from_str::<LoginConfigResponse>(s)
-                .unwrap()
-                .device_flow
-        };
-        assert_eq!(parse(r#"{"device_flow": true}"#), Some(true));
-        assert_eq!(parse(r#"{"device_flow": false}"#), Some(false));
-        assert_eq!(parse(r#"{"device_flow": null}"#), None);
-        assert_eq!(parse("{}"), None, "absent flag must parse as unset");
-    }
-    #[test]
-    fn get_env_keys_parses_strings_and_rejects_non_strings() {
-        use crate::agent::config::EnvKeys;
-        let parse = |v: serde_json::Value| {
-            let obj = serde_json::json!({ "env_key": v });
-            get_env_keys(obj.as_object().unwrap(), "env_key")
-        };
-        assert_eq!(parse(serde_json::json!("A")), Some(EnvKeys::single("A")));
-        assert_eq!(
-            parse(serde_json::json!(["A", "B"])),
-            Some(EnvKeys::new(["A", "B"]))
-        );
-        assert_eq!(parse(serde_json::json!(["A", 123])), None);
-        assert_eq!(parse(serde_json::json!([])), None);
-    }
-    fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-    }
-    #[derive(Debug, Default, Clone)]
-    struct LoginConfigHeaders {
-        authorization: Option<String>,
-        user_id: Option<String>,
-        email: Option<String>,
-        agent_id: Option<String>,
-        client_identifier: Option<String>,
-        client_version: Option<String>,
-    }
-    #[derive(Clone)]
-    struct LoginConfigServerState {
-        status_code: StatusCode,
-        body: String,
-        seen: Arc<Mutex<Vec<LoginConfigHeaders>>>,
-    }
-    /// Mock cli-chat-proxy serving `GET /v1/login-config` with a fixed status +
-    /// raw body, recording the request headers it saw.
-    async fn start_login_config_server(
-        status_code: StatusCode,
-        body: String,
-    ) -> (
-        String,
-        Arc<Mutex<Vec<LoginConfigHeaders>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let state = LoginConfigServerState {
-            status_code,
-            body,
-            seen: seen.clone(),
-        };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let app = Router::new()
-            .route(
-                "/v1/login-config",
-                get(
-                    |State(state): State<LoginConfigServerState>, headers: HeaderMap| async move {
-                        state.seen.lock().unwrap().push(LoginConfigHeaders {
-                            authorization: header_str(&headers, "authorization"),
-                            user_id: header_str(&headers, "x-userid"),
-                            email: header_str(&headers, "x-email"),
-                            agent_id: header_str(&headers, "x-grok-agent-id"),
-                            client_identifier: header_str(&headers, "x-grok-client-identifier"),
-                            client_version: header_str(&headers, "x-grok-client-version"),
-                        });
-                        (state.status_code, state.body)
-                    },
-                ),
-            )
-            .with_state(state);
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("{base}/v1"), seen, handle)
-    }
-    #[tokio::test]
-    async fn fetch_login_device_flow_parses_2xx_bodies() {
-        for (body, expected) in [
-            (r#"{"device_flow": true}"#, Some(true)),
-            (r#"{"device_flow": false}"#, Some(false)),
-            (r#"{"device_flow": null}"#, None),
-            (r#"{}"#, None),
-            (r#"{"other": 1}"#, None),
-        ] {
-            let (base, _seen, server) =
-                start_login_config_server(StatusCode::OK, body.to_string()).await;
-            let got = fetch_login_device_flow(&base).await;
-            server.abort();
-            assert_eq!(got, expected, "body {body:?}");
-        }
-    }
-    #[tokio::test]
-    async fn fetch_login_device_flow_errors_return_none() {
-        for (status, body) in [
-            (StatusCode::NOT_FOUND, r#"{"device_flow": true}"#),
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                r#"{"device_flow": true}"#,
-            ),
-            (StatusCode::OK, "not json"),
-        ] {
-            let (base, _seen, server) = start_login_config_server(status, body.to_string()).await;
-            let got = fetch_login_device_flow(&base).await;
-            server.abort();
-            assert_eq!(got, None, "status {status}, body {body:?}");
-        }
-    }
-    #[tokio::test]
-    async fn fetch_login_device_flow_sends_only_unauthenticated_headers() {
-        let (base, seen, server) =
-            start_login_config_server(StatusCode::OK, r#"{"device_flow": true}"#.to_string()).await;
-        let got = fetch_login_device_flow(&base).await;
-        server.abort();
-        assert_eq!(got, Some(true));
-        let seen = seen.lock().unwrap();
-        let h = seen
-            .last()
-            .expect("server should have received one request");
-        assert!(
-            h.agent_id.as_deref().is_some_and(|v| !v.is_empty()),
-            "must send x-grok-agent-id (the bucketing key)"
-        );
-        assert!(
-            h.client_identifier.is_some(),
-            "must send x-grok-client-identifier"
-        );
-        assert!(
-            h.client_version.is_some(),
-            "must send x-grok-client-version"
-        );
-        assert_eq!(h.authorization, None, "must not send Authorization");
-        assert_eq!(h.user_id, None, "must not send x-userid");
-        assert_eq!(h.email, None, "must not send x-email");
-    }
-    /// Mock cli-chat-proxy serving `GET /settings` with a fixed status + body.
-    async fn start_settings_server(
-        status: StatusCode,
-        body: String,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let app = Router::new().route(
-            "/settings",
-            get(move || {
-                let body = body.clone();
-                async move { (status, body) }
-            }),
-        );
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (base, handle)
-    }
-    /// `fetch_settings_blocking` maps each HTTP outcome to the [`SettingsFetch`]
-    /// variant the external-OTEL gate relies on; 401 is the only outcome that
-    /// yields `Rejected`, everything else non-2xx fails closed as `Retry`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn settings_fetch_maps_status_to_outcome() {
-        let auth = GrokAuth::test_default();
-        let cases: [(StatusCode, &str, &str); 6] = [
-            (StatusCode::OK, "{}", "Fetched"),
-            (StatusCode::UNAUTHORIZED, "{}", "Rejected"),
-            (StatusCode::FORBIDDEN, "{}", "Retry"),
-            (StatusCode::TOO_MANY_REQUESTS, "{}", "Retry"),
-            (StatusCode::INTERNAL_SERVER_ERROR, "{}", "Retry"),
-            (StatusCode::OK, "not json", "Retry"),
-        ];
-        for (status, body, expected) in cases {
-            let (base, server) = start_settings_server(status, body.to_string()).await;
-            let a = auth.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                fetch_settings_blocking_with_attempts(&base, &a, None, 1)
-            })
-            .await
-            .unwrap();
-            server.abort();
-            let got = match outcome {
-                SettingsFetch::Fetched(_) => "Fetched",
-                SettingsFetch::Rejected => "Rejected",
-                SettingsFetch::Retry => "Retry",
-            };
-            assert_eq!(got, expected, "status {status}, body {body:?}");
-        }
-    }
-    #[derive(Debug, Default, Clone)]
-    struct SeenHeaders {
-        authorization: Option<String>,
-        token_auth: Option<String>,
-        user_id: Option<String>,
-        email: Option<String>,
-        alpha_test_key: Option<String>,
-        client_version: Option<String>,
-    }
-    #[derive(Clone)]
-    struct BundleServerState {
-        body: serde_json::Value,
-        status_code: StatusCode,
-        seen_headers: Arc<Mutex<Vec<SeenHeaders>>>,
-    }
-    async fn start_bundle_server(
-        status_code: StatusCode,
-        body: serde_json::Value,
-    ) -> (
-        String,
-        Arc<Mutex<Vec<SeenHeaders>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let seen_headers = Arc::new(Mutex::new(Vec::new()));
-        let state = BundleServerState {
-            body,
-            status_code,
-            seen_headers: seen_headers.clone(),
-        };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let app = Router::new()
-            .route(
-                "/v1/subagents/bundle",
-                get(
-                    |State(state): State<BundleServerState>, headers: HeaderMap| async move {
-                        state.seen_headers.lock().unwrap().push(SeenHeaders {
-                            authorization: headers
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                            token_auth: headers
-                                .get("x-xai-token-auth")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                            user_id: headers
-                                .get("x-userid")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                            email: headers
-                                .get("x-email")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                            alpha_test_key: {
-                                let _ = &headers;
-                                None
-                            },
-                            client_version: headers
-                                .get("x-grok-client-version")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                        });
-                        (state.status_code, axum::Json(state.body))
-                    },
-                ),
-            )
-            .route(
-                "/forward/{tail}",
-                get(
-                    |Path(_tail): Path<String>,
-                     State(state): State<BundleServerState>,
-                     headers: HeaderMap| async move {
-                        state.seen_headers.lock().unwrap().push(SeenHeaders {
-                            authorization: headers
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                            token_auth: headers
-                                .get("x-xai-token-auth")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                            user_id: headers
-                                .get("x-userid")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                            email: headers
-                                .get("x-email")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                            alpha_test_key: {
-                                let _ = &headers;
-                                None
-                            },
-                            client_version: headers
-                                .get("x-grok-client-version")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned),
-                        });
-                        (state.status_code, axum::Json(state.body))
-                    },
-                ),
-            )
-            .with_state(state);
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("{base}/v1"), seen_headers, handle)
-    }
-    fn test_auth() -> GrokAuth {
-        GrokAuth {
-            key: "token".to_string(),
-            auth_mode: crate::auth::AuthMode::Oidc,
-            create_time: chrono::Utc::now(),
-            user_id: "user-1".to_string(),
-            email: Some("test@example.com".to_string()),
-            first_name: None,
-            last_name: None,
-            profile_image_asset_id: None,
-            principal_type: None,
-            principal_id: None,
-            team_id: None,
-            team_name: None,
-            team_role: None,
-            organization_id: None,
-            organization_name: None,
-            organization_role: None,
-            user_blocked_reason: None,
-            team_blocked_reasons: vec![],
-            coding_data_retention_opt_out: false,
-            has_grok_code_access: None,
-            refresh_token: None,
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            oidc_issuer: None,
-            oidc_client_id: None,
-            id_token: None,
-            account_id: None,
-            chatgpt_account_is_fedramp: false,
-        }
-    }
-    fn test_auth_manager() -> Arc<crate::auth::AuthManager> {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = crate::auth::AuthManager::new(dir.path(), crate::auth::GrokComConfig::default());
-        mgr.hot_swap(test_auth());
-        std::mem::forget(dir);
-        Arc::new(mgr)
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_subagent_bundle_success() {
-        let body = serde_json::json!({
-            "version": "bundle-v1",
-            "personas": {"researcher": "persona"},
-            "roles": {"reviewer": "role"},
-            "agents": {"default": "agent"}
-        });
-        let (proxy_base_url, seen_headers, server) =
-            start_bundle_server(axum::http::StatusCode::OK, body).await;
-        let am = test_auth_manager();
-        let bundle = fetch_subagent_bundle(&proxy_base_url, Some(&am), None, None)
-            .await
-            .unwrap();
-        assert_eq!(bundle.version, "bundle-v1");
-        assert_eq!(
-            bundle.personas.get("researcher"),
-            Some(&"persona".to_string())
-        );
-        assert_eq!(bundle.roles.get("reviewer"), Some(&"role".to_string()));
-        assert_eq!(bundle.agents.get("default"), Some(&"agent".to_string()));
-        let headers = seen_headers.lock().unwrap();
-        let headers = headers.last().unwrap();
-        assert_eq!(headers.authorization.as_deref(), Some("Bearer token"));
-        assert_eq!(headers.token_auth.as_deref(), Some("xai-grok-cli"));
-        assert_eq!(headers.user_id.as_deref(), Some("user-1"));
-        assert_eq!(headers.email.as_deref(), Some("test@example.com"));
-        assert_eq!(headers.alpha_test_key, None);
-        assert!(headers.client_version.is_some());
-        server.abort();
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_subagent_bundle_uses_deployment_key_without_user_headers() {
-        let body = serde_json::json!({
-            "version": "bundle-v1",
-            "personas": {},
-            "roles": {},
-            "agents": {}
-        });
-        let (proxy_base_url, seen_headers, server) =
-            start_bundle_server(axum::http::StatusCode::OK, body).await;
-        let am = test_auth_manager();
-        let bundle = fetch_subagent_bundle(&proxy_base_url, Some(&am), Some("deploy-key"), None)
-            .await
-            .unwrap();
-        assert_eq!(bundle.version, "bundle-v1");
-        let headers = seen_headers.lock().unwrap();
-        let headers = headers.last().unwrap();
-        assert_eq!(headers.authorization.as_deref(), Some("Bearer deploy-key"));
-        assert_eq!(headers.token_auth, None);
-        assert_eq!(headers.user_id, None);
-        assert_eq!(headers.email, None);
-        server.abort();
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_subagent_bundle_http_failure() {
-        let (proxy_base_url, _seen_headers, server) = start_bundle_server(
-            axum::http::StatusCode::UNAUTHORIZED,
-            serde_json::json!({"error": "unauthorized"}),
-        )
-        .await;
-        let am = test_auth_manager();
-        let error = fetch_subagent_bundle(&proxy_base_url, Some(&am), None, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            BackendError::RequestFailed { status: 401, .. }
-        ));
-        server.abort();
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_subagent_bundle_parse_failure() {
-        let (proxy_base_url, _seen_headers, server) = start_bundle_server(
-            axum::http::StatusCode::OK,
-            serde_json::json!({"version": 42}),
-        )
-        .await;
-        let am = test_auth_manager();
-        let error = fetch_subagent_bundle(&proxy_base_url, Some(&am), None, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, BackendError::Serialization(_)));
-        server.abort();
-    }
-    #[test]
-    fn parse_openai_format_uses_id_field() {
-        let value = serde_json::json!({
-            "id": "grok-3",
-            "object": "model",
-            "owned_by": "xai",
-            "context_window": 131072
-        });
-        let result = parse_remote_model_value(&value, "https://api.x.ai/v1").unwrap();
-        assert_eq!(result.model, "grok-3");
-        assert_eq!(result.base_url, "https://api.x.ai/v1");
-        assert_eq!(result.name.as_deref(), Some("grok-3"));
-    }
-    #[test]
-    fn parse_model_field_takes_priority_over_id() {
-        let value = serde_json::json!({
-            "id": "display-key",
-            "model": "actual-model-id",
-            "name": "Display Name",
-            "context_window": 131072
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(result.model, "actual-model-id");
-        assert_eq!(result.name.as_deref(), Some("Display Name"));
-    }
-    #[test]
-    fn parse_reads_reasoning_effort_fields() {
-        use xai_grok_sampling_types::ReasoningEffort;
-        let value = serde_json::json!({
-            "model": "grok-4.5",
-            "context_window": 1_000_000,
-            "supports_reasoning_effort": true,
-            "reasoning_effort": "high"
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert!(result.supports_reasoning_effort);
-        assert_eq!(result.reasoning_effort, Some(ReasoningEffort::High));
-        let value = serde_json::json!({
-            "model": "grok-4.5",
-            "contextWindow": 1_000_000,
-            "supportsReasoningEffort": true,
-            "reasoningEffort": "xhigh"
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert!(result.supports_reasoning_effort);
-        assert_eq!(result.reasoning_effort, Some(ReasoningEffort::Xhigh));
-        let value = serde_json::json!({"model": "x", "context_window": 256_000});
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert!(!result.supports_reasoning_effort);
-        assert!(result.reasoning_effort.is_none());
-    }
-    #[test]
-    fn parse_reads_reasoning_efforts_list() {
-        use xai_grok_sampling_types::ReasoningEffort;
-        let value = serde_json::json!({
-            "model": "grok-4.5",
-            "context_window": 1_000_000,
-            "reasoning_efforts": [
-                { "id": "deep", "value": "xhigh", "label": "Deep" },
-                { "value": "quantum" },
-                "low",
-            ]
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(result.reasoning_efforts.len(), 2);
-        assert_eq!(result.reasoning_efforts[0].id, "deep");
-        assert_eq!(result.reasoning_efforts[0].value, ReasoningEffort::Xhigh);
-        assert_eq!(result.reasoning_efforts[1].value, ReasoningEffort::Low);
-        for value in [
-            serde_json::json!({
-                "model": "m", "context_window": 256_000,
-                "reasoningEfforts": [{ "value": "high" }]
-            }),
-            serde_json::json!({
-                "model": "m", "context_window": 256_000,
-                "_meta": { "reasoningEfforts": [{ "value": "high" }] }
-            }),
-        ] {
-            let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-            assert_eq!(result.reasoning_efforts.len(), 1);
-            assert_eq!(result.reasoning_efforts[0].value, ReasoningEffort::High);
-        }
-        let value = serde_json::json!({"model": "x", "context_window": 256_000});
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert!(result.reasoning_efforts.is_empty());
-    }
-    #[test]
-    fn parse_reads_meta_fallback_fields() {
-        let value = serde_json::json!({
-            "_meta": {
-                "model": "meta-model-id",
-                "contextWindow": 131072,
-                "agentType": "concise"
-            }
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(result.model, "meta-model-id");
-        assert_eq!(
-            result.context_window,
-            std::num::NonZeroU64::new(131072).unwrap()
-        );
-        assert_eq!(result.agent_type, "concise");
-    }
-    #[test]
-    fn parse_remote_model_value_no_laziness_detector_block_yields_default() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(
-            result.laziness_detector,
-            crate::agent::config::LazinessDetectorPerModelConfig::default()
-        );
-    }
-    #[test]
-    fn parse_remote_model_value_parses_camelcase_key() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "lazinessDetector": {
-                "enabled": true,
-                "max_nudges_per_session": 2,
-                "idle_threshold_ms": 12_000,
-                "min_confidence": 0.75,
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        let expected = crate::agent::config::LazinessDetectorPerModelConfig {
-            enabled: true,
-            max_nudges_per_session: 2,
-            idle_threshold_ms: Some(12_000),
-            min_confidence: Some(0.75),
-            include_reasoning: None,
-        };
-        assert_eq!(result.laziness_detector, expected);
-    }
-    #[test]
-    fn parse_remote_model_value_parses_snake_case_laziness_detector() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "laziness_detector": {
-                "enabled": true,
-                "max_nudges_per_session": 3,
-                "idle_threshold_ms": 8_000,
-                "min_confidence": 0.6,
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        let expected = crate::agent::config::LazinessDetectorPerModelConfig {
-            enabled: true,
-            max_nudges_per_session: 3,
-            idle_threshold_ms: Some(8_000),
-            min_confidence: Some(0.6),
-            include_reasoning: None,
-        };
-        assert_eq!(result.laziness_detector, expected);
-    }
-    #[test]
-    fn parse_remote_model_value_parses_meta_laziness_detector() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "_meta": {
-                "lazinessDetector": {
-                    "enabled": true,
-                    "max_nudges_per_session": 1,
-                    "idle_threshold_ms": 15_000,
-                    "min_confidence": 0.9,
-                },
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        let expected = crate::agent::config::LazinessDetectorPerModelConfig {
-            enabled: true,
-            max_nudges_per_session: 1,
-            idle_threshold_ms: Some(15_000),
-            min_confidence: Some(0.9),
-            include_reasoning: None,
-        };
-        assert_eq!(result.laziness_detector, expected);
-    }
-    #[test]
-    fn parse_remote_model_value_partial_block_uses_field_defaults() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "lazinessDetector": {
-                "enabled": true,
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        let expected = crate::agent::config::LazinessDetectorPerModelConfig {
-            enabled: true,
-            max_nudges_per_session: 0,
-            idle_threshold_ms: None,
-            min_confidence: None,
-            include_reasoning: None,
-        };
-        assert_eq!(result.laziness_detector, expected);
-    }
-    #[test]
-    fn parse_remote_model_value_malformed_block_falls_back_to_default() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "lazinessDetector": {
-                "enabled": true,
-                "max_nudges_per_session": "abc",
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(
-            result.laziness_detector,
-            crate::agent::config::LazinessDetectorPerModelConfig::default()
-        );
-    }
-    #[test]
-    fn parse_remote_model_value_non_object_value_falls_back_to_default() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "lazinessDetector": "not-an-object",
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(
-            result.laziness_detector,
-            crate::agent::config::LazinessDetectorPerModelConfig::default()
-        );
-    }
-    #[test]
-    fn parse_remote_model_value_top_level_camelcase_wins_over_snake_case() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "lazinessDetector": {
-                "enabled": true,
-                "max_nudges_per_session": 7,
-            },
-            "laziness_detector": {
-                "enabled": false,
-                "max_nudges_per_session": 99,
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        let expected = crate::agent::config::LazinessDetectorPerModelConfig {
-            enabled: true,
-            max_nudges_per_session: 7,
-            idle_threshold_ms: None,
-            min_confidence: None,
-            include_reasoning: None,
-        };
-        assert_eq!(result.laziness_detector, expected);
-    }
-    /// `include_reasoning: false` parses cleanly under the per-model
-    /// `lazinessDetector` block (camelCase wrapper, snake_case inner —
-    /// matching the existing field-naming convention used for the
-    /// sibling `min_confidence`, `idle_threshold_ms`, etc.).
-    #[test]
-    fn parse_remote_model_value_parses_include_reasoning_under_camelcase_wrapper() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "lazinessDetector": {
-                "enabled": true,
-                "include_reasoning": false,
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(result.laziness_detector.include_reasoning, Some(false));
-    }
-    #[test]
-    fn parse_remote_model_value_parses_include_reasoning_under_snake_case_wrapper() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "laziness_detector": {
-                "enabled": true,
-                "include_reasoning": true,
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(result.laziness_detector.include_reasoning, Some(true));
-    }
-    #[test]
-    fn parse_remote_model_value_omitted_include_reasoning_defaults_to_none() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "lazinessDetector": {
-                "enabled": true,
-                "max_nudges_per_session": 2,
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(
-            result.laziness_detector.include_reasoning, None,
-            "absent include_reasoning defers to harness default via None",
-        );
-    }
-    #[test]
-    fn parse_remote_model_value_top_level_wins_over_meta() {
-        let value = serde_json::json!({
-            "model": "grok-4",
-            "context_window": 256_000,
-            "lazinessDetector": {
-                "enabled": true,
-                "max_nudges_per_session": 5,
-            },
-            "_meta": {
-                "lazinessDetector": {
-                    "enabled": false,
-                    "max_nudges_per_session": 99,
-                },
-            },
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        let expected = crate::agent::config::LazinessDetectorPerModelConfig {
-            enabled: true,
-            max_nudges_per_session: 5,
-            idle_threshold_ms: None,
-            min_confidence: None,
-            include_reasoning: None,
-        };
-        assert_eq!(result.laziness_detector, expected);
-    }
-    #[test]
-    fn parse_reads_show_model_fingerprint_field() {
-        let value = serde_json::json!({
-            "model": "grok-build",
-            "context_window": 256_000,
-            "show_model_fingerprint": true
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert!(result.show_model_fingerprint);
-        let value = serde_json::json!({
-            "model": "grok-build",
-            "contextWindow": 256_000,
-            "showModelFingerprint": true
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert!(result.show_model_fingerprint);
-        let value = serde_json::json!({
-            "model": "grok-build",
-            "context_window": 256_000,
-            "_meta": { "showModelFingerprint": true }
-        });
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert!(result.show_model_fingerprint);
-        let value = serde_json::json!({"model": "x", "context_window": 256_000});
-        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert!(!result.show_model_fingerprint);
-    }
-    #[test]
-    fn get_object_returns_none_for_non_object_values() {
-        let value = serde_json::json!({
-            "string": "hello",
-            "number": 42,
-            "bool": true,
-            "array": [1, 2, 3],
-            "null": null,
-        });
-        let obj = value.as_object().unwrap();
-        assert!(get_object(obj, "string").is_none());
-        assert!(get_object(obj, "number").is_none());
-        assert!(get_object(obj, "bool").is_none());
-        assert!(get_object(obj, "array").is_none());
-        assert!(get_object(obj, "null").is_none());
-        assert!(get_object(obj, "missing").is_none());
-    }
-    #[test]
-    fn get_object_returns_some_for_actual_object() {
-        let value = serde_json::json!({
-            "nested": { "a": 1, "b": "two" },
-        });
-        let obj = value.as_object().unwrap();
-        let nested = get_object(obj, "nested").expect("nested key should resolve to object");
-        assert!(nested.is_object());
-        assert_eq!(nested["a"], serde_json::json!(1));
-        assert_eq!(nested["b"], serde_json::json!("two"));
-    }
-    fn endpoints(
-        proxy: &str,
-        models_base_url: Option<&str>,
-        models_list_url: Option<&str>,
-    ) -> crate::agent::config::EndpointsConfig {
-        crate::agent::config::EndpointsConfig {
-            cli_chat_proxy_base_url: Some(proxy.to_owned()),
-            models_base_url: models_base_url.map(|s| s.to_owned()),
-            models_list_url: models_list_url.map(|s| s.to_owned()),
-            ..Default::default()
-        }
-    }
-    #[test]
-    fn inference_url_defaults_to_proxy() {
-        let ep = endpoints("https://proxy.grok.com/v1", None, None);
-        assert_eq!(ep.resolve_inference_base_url(), "https://proxy.grok.com/v1");
-    }
-    #[test]
-    fn inference_url_uses_models_base_url() {
-        let ep = endpoints(
-            "https://proxy.grok.com/v1",
-            Some("https://enterprise.acme.com/v1"),
-            None,
-        );
-        assert_eq!(
-            ep.resolve_inference_base_url(),
-            "https://enterprise.acme.com/v1"
-        );
-    }
-    #[test]
-    fn inference_url_base_url_wins_over_proxy() {
-        let ep = endpoints(
-            "https://proxy.grok.com/v1",
-            Some("https://inference.acme.com/v1"),
-            Some("https://registry.acme.com/api/models"),
-        );
-        assert_eq!(
-            ep.resolve_inference_base_url(),
-            "https://inference.acme.com/v1"
-        );
-    }
-    #[test]
-    fn list_url_defaults_to_proxy_models() {
-        let ep = endpoints("https://proxy.grok.com/v1", None, None);
-        assert_eq!(
-            ep.resolve_models_list_url(),
-            "https://proxy.grok.com/v1/models"
-        );
-    }
-    #[test]
-    fn list_url_derived_from_base_url() {
-        let ep = endpoints(
-            "https://proxy.grok.com/v1",
-            Some("https://api.x.ai/v1"),
-            None,
-        );
-        assert_eq!(ep.resolve_models_list_url(), "https://api.x.ai/v1/models");
-    }
-    #[test]
-    fn list_url_explicit_overrides_derivation() {
-        let ep = endpoints(
-            "https://proxy.grok.com/v1",
-            Some("https://inference.acme.com/v1"),
-            Some("https://registry.acme.com/api/list-models"),
-        );
-        assert_eq!(
-            ep.resolve_models_list_url(),
-            "https://registry.acme.com/api/list-models"
-        );
-    }
-    /// INVARIANT: the `/models` fetch URL + auth scheme match the auth mode —
-    /// Session/Deployment → trusted xAI proxy (Session auth), while an untrusted
-    /// proxy override requires an explicit API key and can never receive GrokAuth;
-    /// ApiKey → `xai_api_base_url` (ApiKey, public default when unset); a custom
-    /// models endpoint → that URL verbatim.
-    #[test]
-    #[serial_test::serial]
-    fn catalog_security_endpoint_matches_auth_mode() {
-        use crate::agent::models::ModelFetchAuth;
-        let mut cfg = deterministic_catalog_endpoints();
-        cfg.xai_api_base_url = "https://inference.acme-corp.example/xai/v1".into();
-        let session = ListModelsEndpoint::from_endpoints(&cfg, ModelFetchAuth::Session);
-        assert_eq!(session.url, "https://cli-chat-proxy.grok.com/v1/models");
-        assert_eq!(session.auth, EndpointAuth::Session);
-        let deployment = ListModelsEndpoint::from_endpoints(&cfg, ModelFetchAuth::Deployment);
-        assert_eq!(deployment.url, "https://cli-chat-proxy.grok.com/v1/models");
-        assert_eq!(deployment.auth, EndpointAuth::Session);
-        let api = ListModelsEndpoint::from_endpoints(&cfg, ModelFetchAuth::ApiKey);
-        assert_eq!(api.url, "https://inference.acme-corp.example/xai/v1/models");
-        assert_eq!(api.auth, EndpointAuth::ApiKey);
-        let default = deterministic_catalog_endpoints();
-        assert_eq!(
-            ListModelsEndpoint::from_endpoints(&default, ModelFetchAuth::ApiKey).url,
-            "https://api.x.ai/v1/models"
-        );
-        let mut custom = deterministic_catalog_endpoints();
-        custom.models_base_url = Some("https://models.acme.com/v1".into());
-        let ep = ListModelsEndpoint::from_endpoints(&custom, ModelFetchAuth::Session);
-        assert_eq!(ep.url, "https://models.acme.com/v1/models");
-        assert_eq!(ep.auth, EndpointAuth::CustomApiKey);
-        let mut untrusted_proxy = deterministic_catalog_endpoints();
-        untrusted_proxy.cli_chat_proxy_base_url = Some("https://proxy.example.com/v1".into());
-        let ep = ListModelsEndpoint::from_endpoints(&untrusted_proxy, ModelFetchAuth::Session);
-        assert_eq!(ep.url, "https://proxy.example.com/v1/models");
-        assert_eq!(ep.auth, EndpointAuth::CustomApiKey);
-    }
-    fn deterministic_catalog_endpoints() -> crate::agent::config::EndpointsConfig {
-        crate::agent::config::EndpointsConfig {
-            cli_chat_proxy_base_url: None,
-            xai_api_base_url: "https://api.x.ai/v1".into(),
-            models_base_url: None,
-            models_list_url: None,
-            ..crate::agent::config::EndpointsConfig::default()
-        }
-    }
-    fn custom_catalog_endpoints(models_list_url: String) -> crate::agent::config::EndpointsConfig {
-        let mut endpoints = deterministic_catalog_endpoints();
-        endpoints.models_list_url = Some(models_list_url);
-        endpoints
-    }
-    struct LegacyApiKeyGuard(Option<String>);
-    impl LegacyApiKeyGuard {
-        fn remove() -> Self {
-            let key = crate::agent::auth_method::LEGACY_XAI_API_KEY_ENV_VAR;
-            let previous = std::env::var(key).ok();
-            // SAFETY: callers hold the test environment lock via EnvVarGuard
-            // and are annotated with serial_test because env mutation is global.
-            unsafe { std::env::remove_var(key) };
-            Self(previous)
-        }
-    }
-    impl Drop for LegacyApiKeyGuard {
-        fn drop(&mut self) {
-            let key = crate::agent::auth_method::LEGACY_XAI_API_KEY_ENV_VAR;
-            match self.0.take() {
-                // SAFETY: the matching EnvVarGuard still holds the test env lock.
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                // SAFETY: the matching EnvVarGuard still holds the test env lock.
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-    }
-    async fn start_catalog_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (base, handle)
-    }
-    /// A custom catalog is a separate trust boundary: an interactive grok.com
-    /// session token must never be used as its credential fallback.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
-    async fn catalog_security_requires_explicit_xai_api_key() {
-        let _api_key = crate::env::EnvVarGuard::remove("XAI_API_KEY");
-        let _legacy_api_key = LegacyApiKeyGuard::remove();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let seen = requests.clone();
-        let app = Router::new().route(
-            "/models",
-            get(move || {
-                seen.fetch_add(1, Ordering::SeqCst);
-                async { axum::Json(serde_json::json!({ "data": [] })) }
-            }),
-        );
-        let (base, server) = start_catalog_server(app).await;
-        let endpoints = custom_catalog_endpoints(format!("{base}/models"));
-        let auth = GrokAuth {
-            key: "grok-session-secret".into(),
-            ..GrokAuth::test_default()
-        };
-        let result = tokio::task::spawn_blocking(move || {
-            fetch_models_blocking(
-                &endpoints,
-                Some(&auth),
-                crate::agent::models::ModelFetchAuth::Session,
-            )
-        })
-        .await
-        .unwrap();
-        server.abort();
-        let Err(BackendError::Auth(message)) = result else {
-            panic!("expected custom catalog auth error");
-        };
-        assert!(!message.contains("grok-session-secret"));
-        assert_eq!(requests.load(Ordering::SeqCst), 0);
-    }
-    /// A proxy override is not an authorization grant. Non-xAI proxy URLs use
-    /// the custom-catalog credential boundary even when models_* are unset.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
-    async fn catalog_security_rejects_session_for_non_xai_proxy_override() {
-        let _api_key = crate::env::EnvVarGuard::remove("XAI_API_KEY");
-        let _legacy_api_key = LegacyApiKeyGuard::remove();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let seen = requests.clone();
-        let app = Router::new().route(
-            "/v1/models",
-            get(move || {
-                seen.fetch_add(1, Ordering::SeqCst);
-                async { axum::Json(serde_json::json!({ "data": [] })) }
-            }),
-        );
-        let (base, server) = start_catalog_server(app).await;
-        let mut endpoints = deterministic_catalog_endpoints();
-        endpoints.cli_chat_proxy_base_url = Some(format!("{base}/v1"));
-        let auth = GrokAuth {
-            key: "grok-session-secret".into(),
-            ..GrokAuth::test_default()
-        };
-        let result = tokio::task::spawn_blocking(move || {
-            fetch_models_blocking(
-                &endpoints,
-                Some(&auth),
-                crate::agent::models::ModelFetchAuth::Session,
-            )
-        })
-        .await
-        .unwrap();
-        server.abort();
-        let Err(BackendError::Auth(message)) = result else {
-            panic!("expected non-xAI proxy auth error");
-        };
-        assert!(!message.contains("grok-session-secret"));
-        assert_eq!(requests.load(Ordering::SeqCst), 0);
-    }
-    /// API-key mode also rejects ambient session credentials, including when
-    /// xai_api_base_url points at a non-xAI host.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
-    async fn catalog_security_api_key_mode_never_falls_back_to_session() {
-        let _api_key = crate::env::EnvVarGuard::remove("XAI_API_KEY");
-        let _legacy_api_key = LegacyApiKeyGuard::remove();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let seen = requests.clone();
-        let app = Router::new().route(
-            "/v1/models",
-            get(move || {
-                seen.fetch_add(1, Ordering::SeqCst);
-                async { axum::Json(serde_json::json!({ "data": [] })) }
-            }),
-        );
-        let (base, server) = start_catalog_server(app).await;
-        let mut endpoints = deterministic_catalog_endpoints();
-        endpoints.xai_api_base_url = format!("{base}/v1");
-        let auth = GrokAuth {
-            key: "grok-session-secret".into(),
-            ..GrokAuth::test_default()
-        };
-        let result = tokio::task::spawn_blocking(move || {
-            fetch_models_blocking(
-                &endpoints,
-                Some(&auth),
-                crate::agent::models::ModelFetchAuth::ApiKey,
-            )
-        })
-        .await
-        .unwrap();
-        server.abort();
-        let Err(BackendError::Auth(message)) = result else {
-            panic!("expected API-key catalog auth error");
-        };
-        assert!(!message.contains("grok-session-secret"));
-        assert_eq!(requests.load(Ordering::SeqCst), 0);
-    }
-    /// The trusted default proxy keeps the established session identity
-    /// headers; this inspects the constructed request without sending it.
-    #[test]
-    fn catalog_security_preserves_official_session_headers() {
-        let auth = GrokAuth {
-            key: "official-session-token".into(),
-            user_id: "official-user".into(),
-            email: Some("official@example.com".into()),
-            ..GrokAuth::test_default()
-        };
-        let request = add_models_session_headers_blocking(
-            reqwest::blocking::Client::new().get("https://cli-chat-proxy.grok.com/v1/models"),
-            &auth,
-        )
-        .build()
-        .unwrap();
-        let headers = request.headers();
-        assert_eq!(
-            header_str(headers, "authorization").as_deref(),
-            Some("Bearer official-session-token")
-        );
-        assert_eq!(
-            header_str(headers, "x-xai-token-auth").as_deref(),
-            Some("xai-grok-cli")
-        );
-        assert_eq!(
-            header_str(headers, "x-userid").as_deref(),
-            Some("official-user")
-        );
-        assert_eq!(
-            header_str(headers, "x-email").as_deref(),
-            Some("official@example.com")
-        );
-        assert_eq!(
-            header_str(headers, "x-grok-client-version").as_deref(),
-            Some(xai_grok_version::VERSION)
-        );
-        assert_eq!(
-            header_str(headers, crate::http::CLIENT_MODE_HEADER).as_deref(),
-            Some(crate::http::process_client_mode())
-        );
-    }
-    /// Explicit API-key catalog fetches send only their bearer credential, not
-    /// grok.com session identity metadata.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
-    async fn catalog_security_sends_api_key_without_session_identity_headers() {
-        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", "catalog-api-key");
-        let _legacy_api_key = LegacyApiKeyGuard::remove();
-        let seen = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
-        let recorded = seen.clone();
-        let app = Router::new().route(
-            "/models",
-            get(move |headers: HeaderMap| {
-                recorded.lock().unwrap().push(headers);
-                async { axum::Json(serde_json::json!({ "data": [] })) }
-            }),
-        );
-        let (base, server) = start_catalog_server(app).await;
-        let endpoints = custom_catalog_endpoints(format!("{base}/models"));
-        let auth = GrokAuth {
-            key: "grok-session-secret".into(),
-            user_id: "session-user".into(),
-            email: Some("session@example.com".into()),
-            ..GrokAuth::test_default()
-        };
-        tokio::task::spawn_blocking(move || {
-            fetch_models_blocking(
-                &endpoints,
-                Some(&auth),
-                crate::agent::models::ModelFetchAuth::Session,
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        server.abort();
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 1);
-        let headers = &seen[0];
-        assert_eq!(
-            header_str(headers, "authorization").as_deref(),
-            Some("Bearer catalog-api-key")
-        );
-        for name in ["x-xai-token-auth", "x-userid", "x-email"] {
-            assert_eq!(header_str(headers, name), None, "unexpected {name}");
-        }
-    }
-    /// Untrusted catalog error bodies can reflect bearer credentials and be
-    /// arbitrarily large; neither property reaches BackendError.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
-    async fn catalog_security_omits_reflected_oversized_error_body() {
-        let sentinel = "cred_SENTINEL_0123456789abcdef";
-        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", sentinel);
-        let _legacy_api_key = LegacyApiKeyGuard::remove();
-        let auth = GrokAuth {
-            key: sentinel.into(),
-            ..GrokAuth::test_default()
-        };
-        let reflected = format!("Bearer {sentinel} {}", "x".repeat(16_384));
-        let app = Router::new().route(
-            "/models",
-            get(move || {
-                let reflected = reflected.clone();
-                async move { (StatusCode::UNAUTHORIZED, reflected) }
-            }),
-        );
-        let (base, server) = start_catalog_server(app).await;
-        let endpoints = custom_catalog_endpoints(format!("{base}/models"));
-        let result = tokio::task::spawn_blocking(move || {
-            fetch_models_blocking(
-                &endpoints,
-                Some(&auth),
-                crate::agent::models::ModelFetchAuth::CustomEndpoint,
-            )
-        })
-        .await
-        .unwrap();
-        server.abort();
-        let Err(BackendError::RequestFailed { status }) = result else {
-            panic!("expected catalog request failure");
-        };
-        assert_eq!(status, 401);
-        let error = BackendError::RequestFailed { status };
-        for rendered in [error.to_string(), format!("{error:?}")] {
-            assert_no_secret_fragments(&rendered, sentinel);
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
-    async fn catalog_network_error_omits_configured_url_credentials() {
-        let sentinel = "cred_SENTINEL_0123456789abcdef";
-        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", sentinel);
-        let _legacy_api_key = LegacyApiKeyGuard::remove();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let endpoint =
-            format!("http://user:{sentinel}@127.0.0.1:{port}/models?access_token={sentinel}");
-        let endpoints = custom_catalog_endpoints(endpoint);
-        let result = tokio::task::spawn_blocking(move || {
-            fetch_models_blocking(
-                &endpoints,
-                None,
-                crate::agent::models::ModelFetchAuth::CustomEndpoint,
-            )
-        })
-        .await
-        .unwrap();
-        let error = result.expect_err("closed listener must reject the request");
-        for rendered in [error.to_string(), format!("{error:?}")] {
-            assert_no_secret_fragments(&rendered, sentinel);
-        }
-    }
-    /// Catalog credentials must not be replayed to a redirect target.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
-    async fn catalog_security_does_not_follow_redirects() {
-        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", "catalog-api-key");
-        let _legacy_api_key = LegacyApiKeyGuard::remove();
-        let target_requests = Arc::new(AtomicUsize::new(0));
-        let target_seen = target_requests.clone();
-        let target_app = Router::new().route(
-            "/stolen",
-            get(move || {
-                target_seen.fetch_add(1, Ordering::SeqCst);
-                async { axum::Json(serde_json::json!({ "data": [] })) }
-            }),
-        );
-        let (target_base, target_server) = start_catalog_server(target_app).await;
-        let source_requests = Arc::new(AtomicUsize::new(0));
-        let source_seen = source_requests.clone();
-        let location = format!("{target_base}/stolen");
-        let source_app = Router::new().route(
-            "/models",
-            get(move || {
-                source_seen.fetch_add(1, Ordering::SeqCst);
-                let location = location.clone();
-                async move { (StatusCode::FOUND, [("location", location)]) }
-            }),
-        );
-        let (source_base, source_server) = start_catalog_server(source_app).await;
-        let endpoints = custom_catalog_endpoints(format!("{source_base}/models"));
-        let result = tokio::task::spawn_blocking(move || {
-            fetch_models_blocking(
-                &endpoints,
-                None,
-                crate::agent::models::ModelFetchAuth::ApiKey,
-            )
-        })
-        .await
-        .unwrap();
-        source_server.abort();
-        target_server.abort();
-        assert!(matches!(
-            result,
-            Err(BackendError::RequestFailed { status: 302, .. })
-        ));
-        assert_eq!(source_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(target_requests.load(Ordering::SeqCst), 0);
-    }
-    /// REGRESSION: `grok setup` must send the deployment key to
-    /// the proxy, never the inference endpoint.
-    #[test]
-    #[serial_test::serial]
-    fn deployment_config_url_uses_cli_chat_proxy_when_not_overridden() {
-        use crate::agent::config::EndpointsConfig;
-        for k in [
-            "GROK_CLI_CHAT_PROXY_BASE_URL",
-            "GROK_MANAGED_CONFIG_URL",
-            "GROK_XAI_API_BASE_URL",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        unsafe { std::env::set_var("GROK_DEPLOYMENT_KEY", "xai-token-ENTERPRISE") };
-        let managed: toml::Value = toml::from_str(
-            r#"[endpoints]
-            deployment_key = "xai-token-ENTERPRISE"
-            xai_api_base_url = "https://inference.acme-corp.example/xai/v1""#,
-        )
-        .unwrap();
-        let url = EndpointsConfig::from_config_value(&managed).resolve_managed_config_url();
-        assert_eq!(url, "https://cli-chat-proxy.grok.com/v1/deployment/config");
-        assert!(
-            !url.contains("acme-corp"),
-            "deployment key would be sent to the inference host: {url}"
-        );
-        let pinned: toml::Value = toml::from_str(
-            r#"[endpoints]
-            xai_api_base_url = "https://inference.acme-corp.example/xai/v1"
-            cli_chat_proxy_base_url = "https://proxy.acme-corp.example/v1""#,
-        )
-        .unwrap();
-        assert_eq!(
-            EndpointsConfig::from_config_value(&pinned).resolve_managed_config_url(),
-            "https://proxy.acme-corp.example/v1/deployment/config"
-        );
-        unsafe { std::env::remove_var("GROK_DEPLOYMENT_KEY") };
-    }
-    #[derive(Clone)]
-    struct DualBundleServerState {
-        archive_status: StatusCode,
-        archive_bytes: Vec<u8>,
-        legacy_status: StatusCode,
-        legacy_body: serde_json::Value,
-    }
-    async fn start_dual_bundle_server(
-        state: DualBundleServerState,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let app = Router::new()
-            .route(
-                "/v1/bundle/archive",
-                get(|State(state): State<DualBundleServerState>| async move {
-                    (state.archive_status, state.archive_bytes)
-                }),
-            )
-            .route(
-                "/v1/subagents/bundle",
-                get(|State(state): State<DualBundleServerState>| async move {
-                    (state.legacy_status, axum::Json(state.legacy_body))
-                }),
-            )
-            .with_state(state);
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("{base}/v1"), handle)
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_bundle_returns_archive_on_success() {
-        let archive_bytes = b"fake-tar-gz-bytes".to_vec();
-        let (proxy_base_url, server) = start_dual_bundle_server(DualBundleServerState {
-            archive_status: StatusCode::OK,
-            archive_bytes: archive_bytes.clone(),
-            legacy_status: StatusCode::OK,
-            legacy_body: serde_json::json!({
-                "version": "v1", "personas": {}, "roles": {}, "agents": {}
-            }),
-        })
-        .await;
-        let am = test_auth_manager();
-        let result = fetch_bundle(&proxy_base_url, Some(&am), None, None)
-            .await
-            .unwrap();
-        match result {
-            FetchedBundle::Archive(bytes) => assert_eq!(bytes, archive_bytes),
-            FetchedBundle::Legacy(_) => panic!("expected Archive variant"),
-        }
-        server.abort();
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_bundle_falls_back_on_archive_404() {
-        let (proxy_base_url, server) = start_dual_bundle_server(DualBundleServerState {
-            archive_status: StatusCode::NOT_FOUND,
-            archive_bytes: Vec::new(),
-            legacy_status: StatusCode::OK,
-            legacy_body: serde_json::json!({
-                "version": "v1",
-                "personas": {"r": "p"},
-                "roles": {},
-                "agents": {}
-            }),
-        })
-        .await;
-        let am = test_auth_manager();
-        let result = fetch_bundle(&proxy_base_url, Some(&am), None, None)
-            .await
-            .unwrap();
-        match result {
-            FetchedBundle::Legacy(bundle) => {
-                assert_eq!(bundle.version, "v1");
-                assert_eq!(bundle.personas.get("r"), Some(&"p".to_string()));
-            }
-            FetchedBundle::Archive(_) => panic!("expected Legacy variant"),
-        }
-        server.abort();
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_bundle_falls_back_on_archive_503() {
-        let (proxy_base_url, server) = start_dual_bundle_server(DualBundleServerState {
-            archive_status: StatusCode::SERVICE_UNAVAILABLE,
-            archive_bytes: Vec::new(),
-            legacy_status: StatusCode::OK,
-            legacy_body: serde_json::json!({
-                "version": "v1", "personas": {}, "roles": {}, "agents": {}
-            }),
-        })
-        .await;
-        let am = test_auth_manager();
-        let result = fetch_bundle(&proxy_base_url, Some(&am), None, None)
-            .await
-            .unwrap();
-        match &result {
-            FetchedBundle::Legacy(bundle) => assert_eq!(bundle.version, "v1"),
-            FetchedBundle::Archive(_) => panic!("expected Legacy variant"),
-        }
-        server.abort();
-    }
-    /// `BackendClient::save_session_data` resolves auth from the attached
-    /// `AuthManager` and sends the token as `Bearer <key>` on the wire.
-    /// This is the writeback path used on every session flush.
-    #[tokio::test(flavor = "current_thread")]
-    async fn backend_client_resolves_auth_from_auth_manager() {
-        let captured_auth = Arc::new(Mutex::new(None::<String>));
-        let captured = captured_auth.clone();
-        let app = Router::new().route(
-            "/sessions/{id}/data",
-            axum::routing::post(move |headers: HeaderMap| async move {
-                *captured.lock().unwrap() = headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
-                StatusCode::OK
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let am = test_auth_manager();
-        let client = BackendClient::with_base_url(format!("http://{addr}")).with_auth_manager(am);
-        client
-            .save_session_data("test-session", &[], None)
-            .await
-            .unwrap();
-        let sent = captured_auth
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("server must receive Authorization header");
-        assert_eq!(sent, "Bearer token", "must use token from AuthManager");
-        server.abort();
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_bundle_propagates_legacy_error_after_fallback() {
-        let (proxy_base_url, server) = start_dual_bundle_server(DualBundleServerState {
-            archive_status: StatusCode::NOT_FOUND,
-            archive_bytes: Vec::new(),
-            legacy_status: StatusCode::UNAUTHORIZED,
-            legacy_body: serde_json::json!({"error": "unauthorized"}),
-        })
-        .await;
-        let am = test_auth_manager();
-        let error = fetch_bundle(&proxy_base_url, Some(&am), None, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            BackendError::RequestFailed { status: 401, .. }
-        ));
-        server.abort();
-    }
-    /// Regression: reqwest .header() appends — duplicate
-    /// or overlapping headers cause Cloudflare to reject the request.
-    #[tokio::test(flavor = "current_thread")]
-    async fn auth_headers_do_not_collide_with_json() {
-        let client =
-            BackendClient::with_base_url("http://localhost").with_auth_manager(test_auth_manager());
-        let auth_headers = client.auth_header_map().await.unwrap();
-        assert!(
-            !auth_headers.contains_key("content-type"),
-            "content-type in auth map would overwrite .json()"
-        );
-        let request = reqwest::Client::new()
-            .put("http://localhost/sessions/test")
-            .json(&serde_json::json!({"test": true}))
-            .headers(auth_headers)
-            .build()
-            .unwrap();
-        for name in request.headers().keys() {
-            let count = request.headers().get_all(name).iter().count();
-            assert_eq!(count, 1, "duplicate header {name}");
-        }
-    }
-}
+#[path = "client_tests.rs"]
+mod tests;

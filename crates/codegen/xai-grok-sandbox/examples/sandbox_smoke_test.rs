@@ -14,9 +14,17 @@
 //! cargo run -p xai-grok-sandbox --example sandbox_smoke_test -- read-only
 //! ```
 
+#[cfg(all(unix, feature = "enforce"))]
 use std::path::Path;
+#[cfg(all(unix, feature = "enforce"))]
 use xai_grok_sandbox::{ProfileName, SandboxManager};
 
+#[cfg(not(all(unix, feature = "enforce")))]
+fn main() {
+    println!("sandbox_smoke_test is only supported on Unix with the enforce feature enabled.");
+}
+
+#[cfg(all(unix, feature = "enforce"))]
 fn main() {
     // Parse profile from args (default: workspace).
     let profile_name = std::env::args()
@@ -124,6 +132,7 @@ fn main() {
     println!("\n✅ Smoke test complete");
 }
 
+#[cfg(all(unix, feature = "enforce"))]
 fn test_read(label: &str, path: &Path) {
     if path.is_file() {
         match std::fs::read(path) {
@@ -153,6 +162,7 @@ fn test_read(label: &str, path: &Path) {
     }
 }
 
+#[cfg(all(unix, feature = "enforce"))]
 fn test_write(label: &str, path: &Path) {
     match std::fs::write(path, b"sandbox-test") {
         Ok(()) => {

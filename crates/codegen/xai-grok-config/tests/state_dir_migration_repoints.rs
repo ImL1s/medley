@@ -21,6 +21,8 @@ fn migrating_then_pinning_makes_the_medley_dir_live_for_this_process() {
     }
     // Safety: single-threaded test binary, set before any other thread exists.
     unsafe { std::env::set_var("HOME", home.path()) };
+    #[cfg(windows)]
+    unsafe { std::env::set_var("USERPROFILE", home.path()) };
     unsafe { std::env::remove_var("MEDLEY_HOME") };
     unsafe { std::env::remove_var("GROK_HOME") };
 

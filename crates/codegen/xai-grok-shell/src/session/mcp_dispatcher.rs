@@ -6,7 +6,7 @@
 //! - the [`xai_grok_mcp::servers::GrokClientHandler`] (server-pushed
 //!   `tools/list_changed` and `resources/list_changed`),
 //! - the `ensure_initialized` success/failure path,
-//! - the session/managed-config diff path.
+//! - the session MCP config diff path (`UpdateMcpServers` / toggle).
 //!
 //! Coalesces events in a **50 ms tumbling window** keyed by
 //! `(server_name, McpClientEventKind)`. Two events with the same key
@@ -49,8 +49,7 @@ use xai_grok_mcp::servers::{
     McpClientEvent, McpClientEventKind, McpServerName, McpState, mcp_server_name, mcp_transport_str,
 };
 
-use crate::extensions::mcp::McpServerSource;
-use crate::session::managed_mcp::MANAGED_MCP_PREFIX;
+use crate::extensions::mcp::{MANAGED_GATEWAY_ENTRY_PREFIX, McpServerSource};
 
 /// Tumbling-window coalescing period. See module doc.
 pub(crate) const COALESCE_WINDOW: Duration = Duration::from_millis(50);
@@ -65,17 +64,17 @@ pub const SERVER_STATUS_METHOD: &str = "x.ai/mcp/server_status";
 pub struct McpServerStatusPayload {
     /// Owning session id.
     pub session_id: String,
-    /// MCP server name (`grok_com_linear`, `github`, ...).
+    /// MCP server name (`managed_gateway:linear`, `github`, ...).
     pub name: String,
-    /// `managed` (sourced from cli-chat-proxy / `grok_com_` prefix)
-    /// or `local` (user `.grok/config.toml`).
+    /// `managed` for gateway catalog ids (`managed_gateway:*`), else `local`.
     pub source: McpServerSource,
     /// Current status — see [`McpServerStatus`].
     pub status: McpServerStatus,
     /// What drove the status change. See [`McpServerStatusReason`].
     pub reason: McpServerStatusReason,
-    /// Optional human-readable detail. Provider-controlled transport and
-    /// handshake errors are never copied into this wire payload.
+    /// Optional human-readable detail. Surfaces the full handshake /
+    /// transport error reason to the UI verbatim — no sanitization or
+    /// truncation — so failures are easy to debug.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Reserved for future use; always `null` today; may fill
@@ -130,18 +129,14 @@ pub enum McpServerStatusReason {
     RestartSucceeded,
     /// The auto-restart path exhausted retries.
     RestartFailed,
-    /// A managed connector's reactive re-auth re-fetched a fresh token,
-    /// swapped the client, and re-handshook successfully. Distinct from
-    /// `RestartSucceeded` (reserved for the transport-close auto-restart
-    /// path) so a recovered managed token is observable on the wire.
+    /// Old leaders still emit this after reactive reauth. Not produced anymore.
     ManagedTokenRefreshed,
 }
 
-/// Build [`McpServerSource`] from a server name. Mirrors the
-/// existing convention used by `build_mcp_catalog` and friends:
-/// names with the `MANAGED_MCP_PREFIX` prefix are managed.
+/// Build [`McpServerSource`] from a server name. Live managed connectors are
+/// gateway catalog rows (`managed_gateway:*`); everything else is local.
 pub(crate) fn classify_source(name: &str) -> McpServerSource {
-    if name.starts_with(MANAGED_MCP_PREFIX) {
+    if name.starts_with(MANAGED_GATEWAY_ENTRY_PREFIX) {
         McpServerSource::Managed
     } else {
         McpServerSource::Local
@@ -201,14 +196,6 @@ pub(crate) struct ShutdownState {
     /// the spawned task's RAII guard on every exit path. Lives next to
     /// `shutting_down` so both share the one `SharedShutdownState` lock.
     in_flight_restart: HashSet<McpServerName>,
-    /// Per-server early-death budgets (issue #45). Handshake-OK then
-    /// transport-close within [`crate::session::mcp_restart::STABILITY_WINDOW`]
-    /// burns a cycle; after [`crate::session::mcp_restart::MAX_EARLY_DEATHS`]
-    /// consecutive early exits the server is parked. The park is
-    /// cleared by [`Self::note_recovery_ready`] — a `Ready` observed in
-    /// [`flush_window`] — so a user who fixes and re-adds the server
-    /// gets auto-restart back without restarting the session.
-    restart_budgets: HashMap<McpServerName, crate::session::mcp_restart::RestartBudget>,
 }
 
 impl ShutdownState {
@@ -234,43 +221,6 @@ impl ShutdownState {
     /// Release the in-flight restart claim taken by [`Self::begin_restart`].
     pub(crate) fn end_restart(&mut self, name: &str) {
         self.in_flight_restart.remove(name);
-    }
-
-    /// Record an [`crate::session::mcp_restart::auto_restart_stdio`]
-    /// handshake for the early-death budget. Starts the stability
-    /// window; does not clear a park (see `note_recovery_ready`).
-    pub(crate) fn note_ready(&mut self, name: &str) {
-        self.restart_budgets
-            .entry(name.to_string())
-            .or_default()
-            .note_ready(tokio::time::Instant::now());
-    }
-
-    /// Record a handshake the **dispatcher** observed on the client
-    /// event stream and clear any park — the documented recovery path
-    /// for a server whose early-death budget ran out. Called only from
-    /// [`flush_window`]'s `Ready` arm; see
-    /// [`crate::session::mcp_restart::RestartBudget::note_recovery_ready`]
-    /// for why a dispatcher `Ready` implies user-initiated recovery.
-    pub(crate) fn note_recovery_ready(&mut self, name: &str) {
-        self.restart_budgets
-            .entry(name.to_string())
-            .or_default()
-            .note_recovery_ready(tokio::time::Instant::now());
-    }
-
-    /// Classify a death event against the early-death budget. Only
-    /// `TransportClosed` feeds the counter — see
-    /// [`crate::session::mcp_restart::RestartBudget::classify_death`].
-    pub(crate) fn classify_death(
-        &mut self,
-        name: &str,
-        kind: McpClientEventKind,
-    ) -> crate::session::mcp_restart::DeathDisposition {
-        self.restart_budgets
-            .entry(name.to_string())
-            .or_default()
-            .classify_death(tokio::time::Instant::now(), kind)
     }
 }
 
@@ -420,14 +370,8 @@ fn kind_of(ev: &McpClientEvent) -> McpClientEventKind {
 /// Project an [`McpClientEvent`] + its coalescing key into a
 /// wire-ready [`McpServerStatusPayload`].
 ///
-/// Handshake error text is used only for local classification and is never
-/// copied into the wire payload.
-///
-/// Upstream's comment here says the opposite -- that `reason` is passed
-/// through verbatim as `detail`, unsanitized. It is not: every
-/// `HandshakeFailed` arm below yields `None` for `detail`. Kept ours on the
-/// sync because it describes the shared body correctly; the visibility change
-/// is upstream's and taken as-is.
+/// The `HandshakeFailed` `reason` is passed through verbatim as the
+/// `detail` field (full error, no sanitization) to ease debugging.
 pub(crate) fn build_payload(
     session_id: &str,
     key: &(McpServerName, McpClientEventKind),
@@ -442,27 +386,14 @@ pub(crate) fn build_payload(
             McpServerStatusReason::TransportClosed,
             None,
         ),
-        // A managed connector rejected for auth reasons surfaces as
-        // NeedsAuth ("visit grok.com"), not a generic Unavailable, so a
-        // client consuming only `server_status` (not the `mcp/list`
-        // `auth_required` boolean) shows the correct terminal state. Uses
-        // the same `is_auth_rejection_message` classifier the reroute and
-        // the reactive recovery path key on, so they cannot drift.
-        (McpClientEventKind::HandshakeFailed, McpClientEvent::HandshakeFailed { reason, .. })
-            if source == McpServerSource::Managed
-                && xai_grok_mcp::servers::is_auth_rejection_message(reason) =>
-        {
+        (McpClientEventKind::HandshakeFailed, McpClientEvent::HandshakeFailed { reason, .. }) => {
+            let detail = reason.clone();
             (
-                McpServerStatus::NeedsAuth,
-                McpServerStatusReason::AuthExpired,
-                None,
+                McpServerStatus::Unavailable,
+                McpServerStatusReason::HandshakeFailed,
+                Some(detail),
             )
         }
-        (McpClientEventKind::HandshakeFailed, McpClientEvent::HandshakeFailed { .. }) => (
-            McpServerStatus::Unavailable,
-            McpServerStatusReason::HandshakeFailed,
-            None,
-        ),
         (McpClientEventKind::HandshakeFailed, _) => (
             McpServerStatus::Unavailable,
             McpServerStatusReason::HandshakeFailed,
@@ -553,13 +484,6 @@ pub(crate) fn flush_window(
             }
             McpClientEventKind::Ready => {
                 shutdown_guard.forget(server);
-                // Starts the early-death stability window so a crash
-                // right after first init counts toward the budget, and
-                // clears any park — a handshake the dispatcher sees is
-                // never one auto-restart performed, so after a park it
-                // can only be the user fixing the server (Refresh /
-                // re-add / toggle-on). Issue #45.
-                shutdown_guard.note_recovery_ready(server);
             }
             _ => {}
         }
@@ -619,8 +543,7 @@ pub(crate) fn collect_close_candidates(
         .collect()
 }
 
-/// Names eligible for in-place HTTP recovery: HTTP/SSE config entries that
-/// are neither managed (`MANAGED_MCP_PREFIX`) nor disabled.
+/// Names eligible for in-place HTTP recovery: enabled HTTP/SSE config entries.
 ///
 /// MUST match the recovery gate (`SessionActor::is_http_server_configured`).
 /// If the two predicates diverge, a disabled HTTP server still present in
@@ -640,7 +563,7 @@ pub(crate) fn recoverable_http_servers(
             )
         })
         .map(|c| mcp_server_name(c).to_string())
-        .filter(|name| !name.starts_with(MANAGED_MCP_PREFIX) && !disabled.contains(name))
+        .filter(|name| !disabled.contains(name))
         .collect()
 }
 
@@ -766,11 +689,9 @@ pub(crate) async fn run_dispatcher(
         // Classify each configured server's transport (single lock).
         // `http_servers` decides recover-in-place vs evict; `transport_map`
         // feeds the disconnect telemetry below. `recoverable_http_servers`
-        // excludes managed (`MANAGED_MCP_PREFIX`, server-side rotating
-        // creds) AND disabled names so it stays in lockstep with the
+        // excludes disabled names so it stays in lockstep with the
         // recovery gate `is_http_server_configured` — otherwise a disabled
-        // HTTP server would be neither evicted nor recovered. Only
-        // non-managed, enabled HTTP (e.g. `http-mcp-server`) is recovered.
+        // HTTP server would be neither evicted nor recovered.
         let (http_servers, transport_map): (
             HashSet<McpServerName>,
             HashMap<McpServerName, &'static str>,
@@ -1017,83 +938,29 @@ mod tests {
         assert!(payload.tools.is_none());
     }
 
-    /// Contract: provider-controlled handshake reasons never cross the ACP
-    /// payload boundary.
+    /// Contract: HandshakeFailed `reason` is surfaced verbatim (full
+    /// error, no sanitization/truncation) so debugging is unobstructed.
     #[test]
-    fn payload_drops_full_handshake_reason() {
-        // Sentinel must not share an 8-byte window with the snake_case reason
-        // enum (`handshake_failed`) or the scan false-fails on the status field.
-        let secret = "GB002-mcp-proxy502-Q7w5E3r1T9y7";
+    fn payload_passes_full_handshake_reason() {
         let key = ("linear".to_string(), McpClientEventKind::HandshakeFailed);
         let ev = McpClientEvent::HandshakeFailed {
             server: "linear".to_string(),
-            reason: format!("cli-chat-proxy returned 502: {secret}"),
+            // Internal service names and full length must pass through
+            // untouched — the UI shows the raw error.
+            reason: "cli-chat-proxy returned 502".to_string(),
         };
         let payload = build_payload("sess1", &key, &ev);
         assert_eq!(payload.status, McpServerStatus::Unavailable);
         assert_eq!(payload.reason, McpServerStatusReason::HandshakeFailed);
-        assert_eq!(payload.detail, None);
-        let rendered = serde_json::to_string(&payload).unwrap();
-        assert!(!rendered.contains(secret));
-        for window in secret.as_bytes().windows(8) {
-            let window = std::str::from_utf8(window).expect("ASCII sentinel");
-            assert!(!rendered.contains(window), "leaked secret window: {window}");
-        }
-    }
-
-    /// Contract: a managed connector whose handshake is rejected for
-    /// auth reasons surfaces as `NeedsAuth`/`auth_expired` ("visit
-    /// grok.com"), NOT a generic `Unavailable`. Keys on the shared
-    /// `is_auth_rejection_message` classifier.
-    #[test]
-    fn managed_handshake_auth_rejection_maps_to_needs_auth() {
-        let key = (
-            "grok_com_notion".to_string(),
-            McpClientEventKind::HandshakeFailed,
+        let detail = payload.detail.expect("detail set on handshake failure");
+        assert_eq!(
+            detail, "cli-chat-proxy returned 502",
+            "reason must be passed through verbatim, got: {detail}",
         );
-        let ev = McpClientEvent::HandshakeFailed {
-            server: "grok_com_notion".to_string(),
-            reason: "Auth required, when send initialize request".to_string(),
-        };
-        let payload = build_payload("sess1", &key, &ev);
-        assert_eq!(payload.source, McpServerSource::Managed);
-        assert_eq!(payload.status, McpServerStatus::NeedsAuth);
-        assert_eq!(payload.reason, McpServerStatusReason::AuthExpired);
-        assert_eq!(payload.detail, None);
-        let json = serde_json::to_value(&payload).unwrap();
-        // `McpServerStatus` serializes lowercase (no underscore); the
-        // reason enum serializes snake_case.
-        assert_eq!(json["status"], "needsauth");
-        assert_eq!(json["reason"], "auth_expired");
     }
 
-    /// A managed handshake failure that is NOT an auth rejection (e.g. a
-    /// 403 policy denial or a 502) must stay `Unavailable` — the
-    /// `NeedsAuth` arm is auth-only.
-    #[test]
-    fn managed_handshake_non_auth_stays_unavailable() {
-        for reason in ["403 Forbidden", "cli-chat-proxy returned 502"] {
-            let key = (
-                "grok_com_slack".to_string(),
-                McpClientEventKind::HandshakeFailed,
-            );
-            let ev = McpClientEvent::HandshakeFailed {
-                server: "grok_com_slack".to_string(),
-                reason: reason.to_string(),
-            };
-            let payload = build_payload("sess1", &key, &ev);
-            assert_eq!(
-                payload.status,
-                McpServerStatus::Unavailable,
-                "non-auth managed failure must stay Unavailable: {reason}",
-            );
-            assert_eq!(payload.reason, McpServerStatusReason::HandshakeFailed);
-        }
-    }
-
-    /// The `NeedsAuth` arm is managed-only: a local (non-managed) server
-    /// whose handshake error happens to contain auth wording stays
-    /// `Unavailable` (local auth recovery is the OAuth path, not this one).
+    /// Handshake auth wording on a spawned local client stays `Unavailable`
+    /// (local recovery is the OAuth path, not `server_status` NeedsAuth).
     #[test]
     fn local_handshake_auth_rejection_stays_unavailable() {
         let key = ("github".to_string(), McpClientEventKind::HandshakeFailed);
@@ -1107,29 +974,14 @@ mod tests {
         assert_eq!(payload.reason, McpServerStatusReason::HandshakeFailed);
     }
 
-    /// Wire contract: the new `ManagedTokenRefreshed` reason (emitted by
-    /// the reactive re-auth success push) serializes to snake_case.
+    /// Gateway catalog ids are `Managed`; `grok_com_*` spawned names are not.
     #[test]
-    fn managed_token_refreshed_reason_serializes() {
-        let payload = McpServerStatusPayload {
-            session_id: "sess1".to_string(),
-            name: "grok_com_linear".to_string(),
-            source: McpServerSource::Managed,
-            status: McpServerStatus::Ready,
-            reason: McpServerStatusReason::ManagedTokenRefreshed,
-            detail: None,
-            tools: None,
-        };
-        let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["status"], "ready");
-        assert_eq!(json["reason"], "managed_token_refreshed");
-    }
-
-    /// Contract: managed server names (starting with `grok_com_`)
-    /// are classified as `Managed`; everything else as `Local`.
-    #[test]
-    fn classify_source_uses_managed_prefix() {
-        assert_eq!(classify_source("grok_com_linear"), McpServerSource::Managed);
+    fn classify_source_gateway_is_managed() {
+        assert_eq!(
+            classify_source("managed_gateway:linear"),
+            McpServerSource::Managed
+        );
+        assert_eq!(classify_source("grok_com_linear"), McpServerSource::Local);
         assert_eq!(classify_source("github"), McpServerSource::Local);
     }
 
@@ -1177,6 +1029,13 @@ mod tests {
         // Wire-level check: serializes to `"initialized"`.
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["reason"], "initialized");
+    }
+
+    #[test]
+    fn managed_token_refreshed_still_deserializes() {
+        let reason: McpServerStatusReason =
+            serde_json::from_str("\"managed_token_refreshed\"").unwrap();
+        assert_eq!(reason, McpServerStatusReason::ManagedTokenRefreshed);
     }
 
     /// A `TransportClosed` carrying the registered client's identity
@@ -1451,19 +1310,21 @@ mod tests {
         )
     }
 
-    /// `recoverable_http_servers` keeps only non-managed, non-disabled
-    /// HTTP/SSE entries — the same predicate as the recovery gate.
+    /// `recoverable_http_servers` keeps only non-disabled HTTP/SSE entries —
+    /// the same predicate as the recovery gate.
     #[test]
-    fn recoverable_http_servers_excludes_managed_stdio_and_disabled() {
+    fn recoverable_http_servers_excludes_stdio_and_disabled() {
         let configs = vec![
             http_cfg("http-mcp-server"),
-            http_cfg("grok_com_slack"), // managed
-            http_cfg("admin_off"),      // disabled
-            stdio_cfg("local_stdio"),   // stdio
+            http_cfg("grok_com_slack"),
+            http_cfg("admin_off"),    // disabled
+            stdio_cfg("local_stdio"), // stdio
         ];
         let disabled: HashSet<String> = ["admin_off".to_string()].into_iter().collect();
         let got = recoverable_http_servers(&configs, &disabled);
-        let want: HashSet<String> = ["http-mcp-server".to_string()].into_iter().collect();
+        let want: HashSet<String> = ["http-mcp-server".to_string(), "grok_com_slack".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(got, want);
     }
 
@@ -1577,41 +1438,9 @@ mod tests {
         }
         async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
             self.respawn_calls.borrow_mut().push(server.to_string());
-            self.shutdown
-                .lock()
-                .expect("ShutdownState mutex poisoned")
-                .note_ready(server);
             Ok(())
         }
         fn push_status(&self, _payload: &crate::session::mcp_dispatcher::McpServerStatusPayload) {}
-        fn begin_restart(&self, server: &str) -> bool {
-            self.shutdown
-                .lock()
-                .expect("ShutdownState mutex poisoned")
-                .begin_restart(server.to_string())
-        }
-        fn end_restart(&self, server: &str) {
-            self.shutdown
-                .lock()
-                .expect("ShutdownState mutex poisoned")
-                .end_restart(server);
-        }
-        fn note_ready(&self, server: &str) {
-            self.shutdown
-                .lock()
-                .expect("ShutdownState mutex poisoned")
-                .note_ready(server);
-        }
-        fn classify_death(
-            &self,
-            server: &str,
-            kind: McpClientEventKind,
-        ) -> crate::session::mcp_restart::DeathDisposition {
-            self.shutdown
-                .lock()
-                .expect("ShutdownState mutex poisoned")
-                .classify_death(server, kind)
-        }
     }
 
     /// End-to-end: a `TransportClosed` event flowing through
@@ -1838,71 +1667,6 @@ mod tests {
         assert!(
             !shutdown.lock().unwrap().is_shutting_down("removed"),
             "Ready must clear shutting_down",
-        );
-    }
-
-    /// Issue #45 recovery wiring: the early-death park is NOT
-    /// session-permanent. `flush_window` observing a `Ready` — the
-    /// event a Refresh / config re-add / toggle-on produces — must
-    /// clear it through `ShutdownState::note_recovery_ready`, so a user
-    /// who fixes the server's command gets auto-restart back.
-    ///
-    /// Drives the real `ShutdownState`, so it fails if `flush_window`
-    /// is ever reverted to the plain `note_ready` (which by design
-    /// cannot unpark).
-    #[tokio::test(start_paused = true)]
-    async fn flush_window_ready_clears_the_early_death_park() {
-        use crate::session::mcp_restart::{DeathDisposition, MAX_EARLY_DEATHS};
-
-        let shutdown = new_shutdown_state();
-        let gateway = discard_gateway();
-
-        // Drive "parky" to a park. The clock is paused and never
-        // advanced, so every death lands inside STABILITY_WINDOW.
-        {
-            let mut guard = shutdown.lock().unwrap();
-            guard.note_ready("parky");
-            for cycle in 0..MAX_EARLY_DEATHS {
-                assert!(
-                    matches!(
-                        guard.classify_death("parky", McpClientEventKind::TransportClosed),
-                        DeathDisposition::Proceed { .. }
-                    ),
-                    "cycle {cycle} is still within budget",
-                );
-            }
-            assert!(
-                matches!(
-                    guard.classify_death("parky", McpClientEventKind::TransportClosed),
-                    DeathDisposition::Exhausted
-                ),
-                "the death past the budget must park",
-            );
-            assert!(
-                matches!(
-                    guard.classify_death("parky", McpClientEventKind::TransportClosed),
-                    DeathDisposition::AlreadyParked
-                ),
-                "and stay parked",
-            );
-        }
-
-        let mut buf: HashMap<(McpServerName, McpClientEventKind), McpClientEvent> = HashMap::new();
-        buf.insert(
-            ("parky".to_string(), McpClientEventKind::Ready),
-            McpClientEvent::Ready {
-                server: "parky".to_string(),
-            },
-        );
-        flush_window("s", buf, &shutdown, &gateway);
-
-        let mut guard = shutdown.lock().unwrap();
-        assert!(
-            matches!(
-                guard.classify_death("parky", McpClientEventKind::TransportClosed),
-                DeathDisposition::Proceed { .. }
-            ),
-            "a dispatcher-observed Ready must clear the park",
         );
     }
 }

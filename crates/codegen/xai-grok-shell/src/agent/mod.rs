@@ -23,14 +23,11 @@ pub(crate) mod session_metrics;
 pub mod session_registry_client;
 pub(crate) mod subagent;
 pub(crate) mod subscription_check;
-pub(crate) mod trusted_origins;
 pub(crate) mod update_chunk_merge;
 
 pub use mvp_agent::MvpAgent;
 pub use relay::{RelayConfig, RelayHandle, spawn_relay_connection};
 pub use server::{MIN_REMOTE_SECRET_BYTES, ServerConfig, run_agent_server};
 
-#[cfg(test)]
-mod docs_examples_tests;
 #[cfg(test)]
 mod storage_client_tests;

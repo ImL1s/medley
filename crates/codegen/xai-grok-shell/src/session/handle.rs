@@ -40,43 +40,6 @@ pub(crate) enum SessionLiveState {
 /// `session/new` and `session/load` responses. Defined here so the shell that
 /// publishes it and the clients that read it share one spelling.
 pub const SCHEDULER_BACKGROUND_LOOPS_META_KEY: &str = "x.ai/schedulerBackgroundLoops";
-/// `_meta` key carrying [`WebSearchDisabledNotice`] on the `session/new` and
-/// `session/load` responses. Defined here for the same reason as
-/// [`SCHEDULER_BACKGROUND_LOOPS_META_KEY`]: the shell that publishes it and the
-/// clients that read it share one spelling.
-pub const WEB_SEARCH_DISABLED_META_KEY: &str = "x.ai/webSearchDisabled";
-/// Why `web_search` was withheld for a session (#57), carried on the
-/// `session/new` / `session/load` response `_meta` (#161).
-///
-/// It rides the **response** rather than an `x.ai/session_notification` because
-/// a notification cannot be delivered before the client has bound the session
-/// id, and because headless has no xAI-notification consumer at all — so a
-/// notification could never reach `medley -p`, which is where the silence this
-/// fixes is unconditional.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WebSearchDisabledNotice {
-    /// Model id that was tried (config / env / baked default).
-    pub model_id: String,
-    /// Actionable rejection reason (readiness, catalog miss, missing creds, …).
-    pub reason: String,
-    /// One-line user-facing notice naming the model and the reason.
-    pub message: String,
-}
-/// Spawn-time provenance for auxiliary model lanes.
-///
-/// Config reloads update the process-wide defaults, but an already-resident
-/// session must keep the inheritance policy with which its resources were
-/// created. Model switches consult this snapshot instead of the latest global
-/// config.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct AuxiliaryModelProvenance {
-    pub session_summary_follows_default: bool,
-    pub web_search_follows_default: bool,
-    pub web_search_model: String,
-    pub image_description_follows_default: bool,
-    pub image_description_model: String,
-}
 /// Handle for interacting with a session actor.
 /// Note: Permission event receivers are returned separately from `spawn_session_actor`
 /// and should be stored/managed by the caller.
@@ -101,9 +64,6 @@ pub struct SessionHandle {
     /// Resolved turn limit for this session; lets a spawned subagent inherit
     /// the parent's limit. `None` = unlimited.
     pub max_turns: Option<usize>,
-    /// Effective capability ceiling for nested subagents. `None` means the
-    /// session is unrestricted (`All`).
-    pub capability_mode: Option<xai_tool_types::SubagentCapabilityMode>,
     /// Configured cutoff a subagent inherits, published by the session actor. `None` when unset.
     pub resolved_tool_overrides:
         std::sync::Arc<arc_swap::ArcSwapOption<xai_grok_sampling_types::ToolOverrides>>,
@@ -156,9 +116,6 @@ pub struct SessionHandle {
     /// Per-session tracking prevents cross-client contamination in leader mode
     /// where `MvpAgent.current_model_id` is shared mutable state.
     pub model_id: acp::ModelId,
-    /// Spawn-time auxiliary lane inheritance policy and explicit web-search
-    /// pin. This remains stable across process-wide config reloads.
-    pub(crate) auxiliary_model_provenance: AuxiliaryModelProvenance,
     /// Whether this session's scheduled fires run as detached background
     /// subagents. Copied from the value the spawn resolved for the session's
     /// [`AgentRebuildSpec`](crate::session::agent_rebuild::AgentRebuildSpec), so
@@ -185,6 +142,10 @@ pub struct SessionHandle {
     /// (`_meta.askUserQuestion` / `--no-ask-user` and the remote settings / config /
     /// env gate). Stored per-session so subagents inherit it at spawn.
     pub ask_user_question_enabled: bool,
+    /// Whether this session was spawned non-interactive
+    /// (`startupHints.nonInteractive`, e.g. headless `-p` / SDK). Stored
+    /// per-session so subagents inherit it at spawn.
+    pub non_interactive: bool,
     /// Plan mode tracker — shared with the session actor via Arc.
     /// Exposed so the `x.ai/toggle_plan_mode` handler can toggle plan mode
     /// without going through the session command channel.
@@ -261,12 +222,14 @@ impl SessionHandle {
     pub(crate) async fn kill_background_task(
         &self,
         task_id: &str,
+        source: xai_grok_tools::types::KillSource,
     ) -> Result<xai_grok_tools::types::KillOutcome, String> {
         let (tx, rx) = oneshot::channel();
         if self
             .cmd_tx
             .send(SessionCommand::KillBackgroundTask {
                 task_id: task_id.to_string(),
+                source,
                 respond_to: tx,
             })
             .is_err()
@@ -392,29 +355,6 @@ impl SessionHandle {
             .send(SessionCommand::SnapshotMcpPool { respond_to: tx })
             .ok()?;
         rx.await.ok().flatten()
-    }
-    /// Snapshot all parent capabilities needed for subagent spawn in one RPC.
-    ///
-    /// Returns an error when the parent actor cannot produce a stable snapshot.
-    /// Spawn callers must surface that error and abort, never fall back to
-    /// stale bootstrap snapshots.
-    pub(crate) async fn snapshot_subagent_capabilities(
-        &self,
-    ) -> Result<crate::session::commands::SubagentCapabilitySnapshot, String> {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(SessionCommand::SnapshotSubagentCapabilities { respond_to: tx })
-            .is_err()
-        {
-            return Err(
-                "parent session actor unavailable while refreshing subagent capabilities"
-                    .to_string(),
-            );
-        }
-        rx.await.map_err(|_| {
-            "parent session actor dropped subagent capability refresh reply".to_string()
-        })?
     }
     /// Snapshot the session's client-registered hooks for subagent inheritance. A dead actor
     /// or dropped reply fails open to no hooks, warned since it drops the inherited deny gate.

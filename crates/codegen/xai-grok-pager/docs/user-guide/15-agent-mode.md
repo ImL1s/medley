@@ -110,6 +110,8 @@ ssh -N -L 2419:127.0.0.1:2419 user@agent-host
 The process keeps state across client reconnects. Permissions match other entry points;
 see [Permissions and safety](22-permissions-and-safety.md).
 
+This is a server you run yourself — Grok's hosted cloud sandboxes do not run `grok agent serve`.
+
 ---
 
 ## WebSocket relay

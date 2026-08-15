@@ -92,6 +92,7 @@ mod tests {
             credential_source: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
+            extra_response_includes: Vec::new(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: 8192,

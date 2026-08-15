@@ -30,7 +30,7 @@ mod tests {
             ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent,
         };
 
-        let auth = load_prod_auth().expect("No auth.json — run `grok login`"); // auth-instruction-guard: exempt — #[ignore] dev smoke test, developer-facing
+        let auth = load_prod_auth().expect("No auth.json — run `grok login`");
         let am = Arc::new(crate::auth::AuthManager::new(
             &crate::util::grok_home::grok_home(),
             crate::auth::GrokComConfig::default(),
@@ -47,8 +47,6 @@ mod tests {
             title: Some(test_title.into()),
             cwd: test_cwd.clone(),
             model_id: Some("grok-3".into()),
-            catalog_identity: None,
-            agent_name: None,
             created_at: Some(chrono::Utc::now().to_rfc3339()),
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
             total_messages: None,
@@ -59,6 +57,7 @@ mod tests {
             subagent_role: None,
             fork_context_source: None,
             subagent_depth: None,
+            title_is_manual: None,
         };
 
         let sync = RemoteSync::new(

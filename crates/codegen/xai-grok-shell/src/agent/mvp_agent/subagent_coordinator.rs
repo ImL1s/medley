@@ -7,15 +7,6 @@ use xai_grok_tools::implementations::grok_build::task::coordinator;
 struct ShellChildRunner {
     agent_ref: LocalRef<MvpAgent>,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RefreshedSubagentCapabilities {
-    pub mcp_generation: u64,
-    pub mcp_server_count: usize,
-    pub inherited_mcp_client_count: usize,
-    pub tool_definition_count: usize,
-    pub skill_count: usize,
-}
 impl coordinator::ChildRunner for ShellChildRunner {
     type Control = crate::agent::subagent::ShellChildRuntime;
     type CompletionData = crate::agent::subagent::ShellCompletionData;
@@ -29,90 +20,40 @@ impl coordinator::ChildRunner for ShellChildRunner {
     fn run(&self, run: coordinator::ChildRunRequest<Self::Control>) -> Self::RunFuture {
         let agent_ref = self.agent_ref.clone();
         Box::pin(async move {
-            let lifecycle_parent_sid = run.request.parent_session_id.clone();
-            let spawn_parent_session_id = run.spawn_parent_session_id.clone();
-            let subagent_id = run.request.id.clone();
             let this = agent_ref.get();
-            let Some((mut ctx, handle)) = this.try_build_subagent_spawn_context_for_run(
-                &lifecycle_parent_sid,
-                &spawn_parent_session_id,
-            ) else {
+            let parent_sid = run.request.parent_session_id.clone();
+            let Some(mut ctx) = this.try_build_subagent_spawn_context(&parent_sid) else {
                 tracing::warn!(
-                    lifecycle_parent_session_id = %lifecycle_parent_sid,
-                    spawn_parent_session_id = %spawn_parent_session_id,
-                    subagent_id = %subagent_id,
-                    "Spawn for unknown or evicted lifecycle/immediate parent session"
+                    parent_session_id = %parent_sid,
+                    subagent_id = %run.request.id,
+                    "Spawn for unknown or evicted parent session"
                 );
                 return coordinator::ChildRunOutput {
                     result: xai_grok_tools::implementations::grok_build::task::types::SubagentResult {
                         success: false,
                         error: Some(
-                            "Lifecycle or immediate parent session not found (evicted or torn down); cannot inherit subagent security ceiling."
+                            "Parent session not found (evicted or torn down); cannot spawn subagent."
                                 .to_owned(),
                         ),
-                        subagent_id: subagent_id.clone(),
-                        child_session_id: subagent_id,
+                        subagent_id: run.request.id.clone(),
+                        child_session_id: run.request.id,
                         ..Default::default()
                     },
                     completion_data: Default::default(),
                     snapshot_ref: None,
                 };
             };
-            // Discarded on purpose: a subagent inherits the parent's tools and
-            // has no scrollback of its own, so a disable notice here would be
-            // addressed to nobody. The parent already told the user.
-            if !ctx.web_search_follows_default {
-                let mut ignored_disable_reason = None;
-                ctx.web_search_sampling_config = this
-                    .prepare_web_search_sampling_config_for_model_preflight(
-                        &mut ignored_disable_reason,
-                        &ctx.web_search_model,
-                    )
-                    .await;
-            }
-            let refreshed = match this
-                .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
-                .await
-            {
-                Ok(refreshed) => refreshed,
-                Err(error) => {
-                    tracing::warn!(
-                        lifecycle_parent_session_id = %lifecycle_parent_sid,
-                        spawn_parent_session_id = %spawn_parent_session_id,
-                        subagent_id = %subagent_id,
-                        error = %error,
-                        "Failed to refresh parent capabilities at subagent spawn"
-                    );
-                    return coordinator::ChildRunOutput {
-                        result: xai_grok_tools::implementations::grok_build::task::types::SubagentResult {
-                            success: false,
-                            error: Some(format!(
-                                "Failed to refresh parent capabilities for subagent spawn: {error}"
-                            )),
-                            subagent_id: subagent_id.clone(),
-                            child_session_id: subagent_id,
-                            ..Default::default()
-                        },
-                        completion_data: Default::default(),
-                        snapshot_ref: None,
-                    };
-                }
+            let parent_handle = {
+                let parent_sid = acp::SessionId::new(parent_sid);
+                this.resident_handle(&parent_sid)
             };
-            tracing::info!(
-                subagent_id = %subagent_id,
-                mcp_generation = refreshed.mcp_generation,
-                mcp_server_count = refreshed.mcp_server_count,
-                inherited_mcp_client_count = refreshed.inherited_mcp_client_count,
-                tool_definition_count = refreshed.tool_definition_count,
-                skill_count = refreshed.skill_count,
-                "Refreshed parent capabilities for subagent spawn"
-            );
-            crate::agent::subagent::run_shell_child(
-                run,
-                ctx,
-                &this.gateway,
-            )
-            .await
+            if let Some(handle) = parent_handle {
+                ctx.parent_mcp_pool = handle.snapshot_mcp_pool().await;
+                ctx.client_hooks = handle.snapshot_client_hooks().await;
+                let definitions = handle.snapshot_tool_definitions().await;
+                ctx.parent_tool_definitions = (!definitions.is_empty()).then_some(definitions);
+            }
+            crate::agent::subagent::run_shell_child(run, ctx, &this.gateway).await
         })
     }
     fn validate_type(
@@ -255,33 +196,6 @@ impl MvpAgent {
             }
         });
     }
-    /// Refresh parent capabilities for one child spawn.
-    ///
-    /// This must succeed atomically before spawn continues; callers surface the
-    /// error and abort rather than falling back to stale bootstrap snapshots.
-    pub(super) async fn refresh_subagent_capabilities_for_spawn(
-        &self,
-        ctx: &mut crate::agent::subagent::SubagentSpawnContext,
-        handle: &crate::session::SessionHandle,
-    ) -> Result<RefreshedSubagentCapabilities, String> {
-        let snapshot = handle.snapshot_subagent_capabilities().await?;
-        let refreshed = RefreshedSubagentCapabilities {
-            mcp_generation: snapshot.mcp_generation,
-            mcp_server_count: snapshot.mcp_configs.len(),
-            inherited_mcp_client_count: snapshot.mcp_pool.as_ref().map_or(0, |pool| pool.len()),
-            tool_definition_count: snapshot.tool_definitions.len(),
-            skill_count: snapshot.skills.len(),
-        };
-        ctx.parent_mcp_configs = snapshot.mcp_configs;
-        ctx.parent_mcp_pool = snapshot.mcp_pool;
-        ctx.client_hooks = snapshot.client_hooks;
-        ctx.parent_tool_definitions = (!snapshot.tool_definitions.is_empty())
-            .then_some(snapshot.tool_definitions);
-        // `Some(empty)` means "refresh succeeded and parent currently has none";
-        // keeping `None` would trigger a stale disk/plugin rediscovery fallback.
-        ctx.parent_skills = Some(snapshot.skills);
-        Ok(refreshed)
-    }
     /// Lightweight context for the `SubagentEvent::ValidateType` drain arm;
     /// tolerates evicted parent sessions (returns built-in defaults + warns).
     pub(super) fn build_subagent_validation_context(
@@ -355,7 +269,6 @@ impl MvpAgent {
             parent_attribution_callback,
             parent_agent_name,
             parent_managed_mcp_proxy_base_url,
-            parent_capability_mode,
         ) = {
             let ps = parent_handle.as_ref();
             (
@@ -399,10 +312,9 @@ impl MvpAgent {
                 ps.as_ref()
                     .map(|h| h.tool_context.session_env.clone())
                     .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new())),
-                ps.and_then(|h| h.attribution_callback.clone()),
-                ps.map(|h| h.agent_name.clone()),
-                ps.map(|h| h.managed_mcp_proxy_base_url.clone()),
-                ps.and_then(|h| h.capability_mode),
+                ps.as_ref().and_then(|h| h.attribution_callback.clone()),
+                ps.as_ref().map(|h| h.agent_name.clone()),
+                ps.as_ref().map(|h| h.managed_mcp_proxy_base_url.clone()),
             )
         };
         let (
@@ -448,6 +360,10 @@ impl MvpAgent {
             .as_ref()
             .map(|h| h.ask_user_question_enabled)
             .unwrap_or_else(|| self.cfg.borrow().resolve_ask_user_question().value);
+        let parent_non_interactive = parent_handle
+            .as_ref()
+            .map(|h| h.non_interactive)
+            .unwrap_or(false);
         let (gcs_upload_method, gcs_bucket_url) = match self.trace_upload_config_snapshot() {
             Some(method) => {
                 let bucket = match &method {
@@ -468,48 +384,6 @@ impl MvpAgent {
             None => (None, None),
         };
         let project_trusted = crate::agent::folder_trust::project_scope_allowed(&parent_cwd);
-        let (web_search_model, web_search_follows_default) = parent_handle
-            .as_ref()
-            .map(|handle| {
-                (
-                    handle.auxiliary_model_provenance.web_search_model.clone(),
-                    handle
-                        .auxiliary_model_provenance
-                        .web_search_follows_default,
-                )
-            })
-            .unwrap_or_else(|| {
-                let cfg = self.cfg.borrow();
-                (cfg.web_search_model.clone(), cfg.web_search_follows_default)
-            });
-        let effective_web_search_model = crate::config::auxiliary_model_or_operative(
-            &web_search_model,
-            parent_model_id.0.as_ref(),
-            web_search_follows_default,
-        );
-        let (image_description_model, image_description_follows_default) = parent_handle
-            .as_ref()
-            .map(|handle| {
-                (
-                    handle
-                        .auxiliary_model_provenance
-                        .image_description_model
-                        .clone(),
-                    handle
-                        .auxiliary_model_provenance
-                        .image_description_follows_default,
-                )
-            })
-            .unwrap_or_else(|| {
-                let cfg = self.cfg.borrow();
-                (
-                    cfg.image_description_model
-                        .as_deref()
-                        .unwrap_or(crate::models::default_image_description_model())
-                        .to_owned(),
-                    cfg.image_description_follows_default,
-                )
-            });
         let (base_roles, base_personas, subagent_model_overrides, subagent_toggle) = {
             let cfg = self.cfg.borrow();
             (
@@ -534,7 +408,6 @@ impl MvpAgent {
             process_scope: parent_process_scope,
             client_hooks: Default::default(),
             sampling_config: self.sampling_config.borrow().clone(),
-            sampling_config_model_id: self.sampling_config_model_id.clone(),
             managed_mcp_proxy_base_url: parent_managed_mcp_proxy_base_url
                 .unwrap_or_else(|| self.cli_chat_proxy_base_url()),
             alpha_test_key: self.alpha_test_key(),
@@ -548,7 +421,6 @@ impl MvpAgent {
             auth: self.current_or_buffered_auth(),
             parent_cwd: parent_cwd.clone(),
             parent_session_id: parent_session_id.to_string(),
-            parent_capability_mode,
             inherited_tool_overrides,
             yolo_mode,
             subagent_event_tx: self.subagent_event_tx.clone(),
@@ -564,10 +436,7 @@ impl MvpAgent {
             terminal,
             session_env,
             memory_config: self.memory_config.clone(),
-            web_search_sampling_config: self
-                .prepare_web_search_sampling_config_for_model(&effective_web_search_model),
-            web_search_model,
-            web_search_follows_default,
+            web_search_sampling_config: self.prepare_web_search_sampling_config(),
             web_fetch_config: self.prepare_web_fetch_config(),
             image_gen_config: self.prepare_image_gen_config(),
             video_gen_config: self.prepare_video_gen_config(),
@@ -576,6 +445,7 @@ impl MvpAgent {
             goal_enabled: self.cfg.borrow().resolve_goal().value,
             background_workflows_enabled: self.cfg.borrow().resolve_workflows().value,
             ask_user_question_enabled,
+            parent_non_interactive,
             parent_cmd_tx: parent_cmd_tx.clone(),
             parent_session_info: parent_handle.as_ref().map(|h| crate::session::info::Info {
                 id: parent_sid.clone(),
@@ -617,8 +487,7 @@ impl MvpAgent {
             api_key_provider: Some(Arc::new(crate::auth::manager::SharedAuthKeyProvider(
                 am.clone(),
             ))),
-            image_description_model,
-            image_description_follows_default,
+            image_description_model: self.resolve_image_description_model(),
             workspace_ops: parent_workspace_ops.clone(),
             auth_manager: am.clone(),
             attribution_callback: parent_attribution_callback,
@@ -632,7 +501,6 @@ impl MvpAgent {
                 .map(|h| h.mcp_servers.clone())
                 .unwrap_or_default(),
             managed_mcp_state: self.managed_mcp_cache.clone(),
-            managed_gateway_child_sessions: Some(self.managed_gateway_child_sessions.clone()),
             parent_mcp_pool: None,
             parent_tool_definitions: None,
             parent_skills: None,
@@ -659,42 +527,5 @@ impl MvpAgent {
             parent_notification_handle: parent_notification_handle.clone(),
             parent_scheduler_handle: parent_scheduler_handle.clone(),
         })
-    }
-
-    /// Build the lifecycle-owned context while restoring security ceilings
-    /// from the session that directly emitted the spawn. Nested workflow
-    /// children may be reparented to the root for cancellation/completion, but
-    /// that lifecycle rewrite must not widen capability, depth, or tool-cutoff
-    /// inheritance.
-    pub(super) fn try_build_subagent_spawn_context_for_run(
-        &self,
-        lifecycle_parent_session_id: &str,
-        spawn_parent_session_id: &str,
-    ) -> Option<(
-        crate::agent::subagent::SubagentSpawnContext,
-        crate::session::handle::SessionHandle,
-    )> {
-        // Operational and security context belongs to the session that
-        // actually emitted this nested spawn. The coordinator may reparent
-        // lifecycle ownership to the root, but inheriting cwd/fs/terminal,
-        // permission state, YOLO, hooks, or workspace operations from that
-        // root would let a worktree-isolated child escape back into the main
-        // checkout by spawning a grandchild.
-        let mut ctx = self.try_build_subagent_spawn_context(spawn_parent_session_id)?;
-        let lifecycle_ctx = self.try_build_subagent_spawn_context(lifecycle_parent_session_id)?;
-        let spawn_parent_sid = acp::SessionId::new(spawn_parent_session_id);
-        let handle = self.resident_handle(&spawn_parent_sid)?;
-
-        // Keep only coordinator-owned lifecycle routing rooted at the
-        // reparented session. Conversation, persistence source, tool/runtime
-        // handles, and every permission-bearing field remain immediate-parent
-        // scoped above.
-        ctx.parent_session_id = lifecycle_ctx.parent_session_id;
-        ctx.parent_cmd_tx = lifecycle_ctx.parent_cmd_tx;
-        ctx.process_scope = lifecycle_ctx.process_scope;
-        ctx.parent_terminal_backend = lifecycle_ctx.parent_terminal_backend;
-        ctx.parent_notification_handle = lifecycle_ctx.parent_notification_handle;
-        ctx.parent_scheduler_handle = lifecycle_ctx.parent_scheduler_handle;
-        Some((ctx, handle))
     }
 }

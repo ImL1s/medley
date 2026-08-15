@@ -5,7 +5,6 @@
 //! [`super::super::AuthManager`] for credential persistence.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -30,25 +29,6 @@ use super::protocol::{
 /// 10 minutes is long enough for users who step away briefly during login.
 const AUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Return only fixed, low-cardinality OAuth callback codes. Both the error
-/// value and description are IdP-controlled and may reflect submitted input.
-fn safe_callback_error_code(value: Option<&str>) -> &'static str {
-    match value {
-        Some("access_denied") => "access_denied",
-        Some("invalid_request") => "invalid_request",
-        Some("unauthorized_client") => "unauthorized_client",
-        Some("unsupported_response_type") => "unsupported_response_type",
-        Some("invalid_scope") => "invalid_scope",
-        Some("server_error") => "server_error",
-        Some("temporarily_unavailable") => "temporarily_unavailable",
-        Some("interaction_required") => "interaction_required",
-        Some("login_required") => "login_required",
-        Some("consent_required") => "consent_required",
-        Some("account_selection_required") => "account_selection_required",
-        _ => "oauth_callback_error",
-    }
-}
-
 /// Parse user-pasted input into `(code, state)`.
 ///
 /// Accepts two formats:
@@ -69,10 +49,13 @@ fn parse_pasted_input(input: &str) -> Result<Callback, OidcError> {
                 state,
             });
         }
-        if params.contains_key("error") {
-            return Err(OidcError::CallbackAuthFailed(
-                safe_callback_error_code(params.get("error").map(String::as_str)).to_owned(),
-            ));
+        if let Some(error) = params.get("error") {
+            let desc = params.get("error_description").cloned().unwrap_or_default();
+            return Err(OidcError::CallbackAuthFailed(if desc.is_empty() {
+                error.clone()
+            } else {
+                format!("{error}: {desc}")
+            }));
         }
         return Err(OidcError::InvalidPastedInput(
             "URL has no 'code' query parameter".into(),
@@ -147,20 +130,8 @@ async fn handle_callback(
 ) -> (StatusCode, Html<String>) {
     let result = parse_callback_params(&params);
     let response = callback_response(&result);
-    if let Err(error) = tx.try_send(result) {
-        let (channel_state, result_kind) = match &error {
-            tokio::sync::mpsc::error::TrySendError::Full(result) => {
-                ("full", if result.is_ok() { "success" } else { "error" })
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(result) => {
-                ("closed", if result.is_ok() { "success" } else { "error" })
-            }
-        };
-        tracing::error!(
-            channel_state,
-            result_kind,
-            "OIDC: callback channel send failed; auth will time out"
-        );
+    if let Err(e) = tx.try_send(result) {
+        tracing::error!(?e, "OIDC: callback channel send failed; auth will time out");
     }
     response
 }
@@ -168,18 +139,20 @@ async fn handle_callback(
 fn parse_callback_params(params: &HashMap<String, String>) -> CallbackResult {
     if let Some(code) = params.get("code") {
         let state = params.get("state").cloned().unwrap_or_default();
-        tracing::debug!(
-            state_present = !state.is_empty(),
-            "OIDC: received code via loopback callback"
-        );
+        tracing::debug!(state = %state, "OIDC: received code via loopback callback");
         return Ok(Callback {
             code: code.clone(),
             state,
         });
     }
-    let error_code = safe_callback_error_code(params.get("error").map(String::as_str));
-    tracing::error!(error_code, "OIDC: IdP returned error");
-    Err(error_code.to_owned())
+    let error = params.get("error").cloned().unwrap_or_default();
+    let desc = params.get("error_description").cloned().unwrap_or_default();
+    tracing::error!(error = %error, desc = %desc, "OIDC: IdP returned error");
+    Err(if desc.is_empty() {
+        error
+    } else {
+        format!("{error}: {desc}")
+    })
 }
 
 fn callback_response(result: &CallbackResult) -> (StatusCode, Html<String>) {
@@ -401,11 +374,7 @@ pub async fn run_login_flow_with_config(
     auth_manager: &Arc<AuthManager>,
     channels: Option<super::super::flow::AuthChannels>,
 ) -> anyhow::Result<(GrokAuth, bool)> {
-    tracing::info!(
-        issuer_present = !oidc.issuer.is_empty(),
-        client_id_present = !oidc.client_id.is_empty(),
-        "OIDC: starting login flow"
-    );
+    tracing::info!(issuer = %oidc.issuer, client_id = %oidc.client_id, "OIDC: starting login flow");
 
     // Ensure jsonwebtoken CryptoProvider is installed (required for JWT validation).
     jsonwebtoken::crypto::CryptoProvider::install_default(
@@ -574,19 +543,10 @@ pub async fn run_login_flow_with_config(
 }
 
 /// Successful OIDC callback payload.
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct Callback {
     code: String,
     state: String,
-}
-
-impl fmt::Debug for Callback {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Callback")
-            .field("code_present", &!self.code.is_empty())
-            .field("state_present", &!self.state.is_empty())
-            .finish()
-    }
 }
 
 /// Result from the OIDC callback: either a [`Callback`] or an IdP error message.
@@ -596,53 +556,6 @@ type CallbackResult = Result<Callback, String>;
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
-
-    #[derive(Clone, Default)]
-    struct LogCapture(Arc<std::sync::Mutex<Vec<String>>>);
-
-    struct EventVisitor<'a>(&'a mut String);
-
-    impl tracing::field::Visit for EventVisitor<'_> {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            use std::fmt::Write;
-            let _ = write!(self.0, "{}={value:?} ", field.name());
-        }
-    }
-
-    impl tracing::Subscriber for LogCapture {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut rendered = String::new();
-            event.record(&mut EventVisitor(&mut rendered));
-            self.0.lock().expect("log capture lock").push(rendered);
-        }
-
-        fn enter(&self, _: &tracing::span::Id) {}
-
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
-        assert!(!rendered.contains(sentinel), "leaked full sentinel");
-        for window in sentinel.as_bytes().windows(8) {
-            let window = std::str::from_utf8(window).expect("ASCII sentinel window");
-            assert!(
-                !rendered.contains(window),
-                "leaked sentinel window: {window}"
-            );
-        }
-    }
 
     /// End-to-end test: mock IdP + full login flow with code arriving via loopback.
     /// Exercises discovery → PKCE → race_callback_and_stdin → token exchange → user info → persist.
@@ -784,64 +697,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn callback_errors_never_echo_provider_controlled_values() {
-        let sentinel = "cred_SENTINEL_0123456789abcdef";
-        let url = format!(
-            "http://127.0.0.1:54321/callback?error={sentinel}&error_description={sentinel}"
-        );
-        let err = parse_pasted_input(&url).expect_err("callback error must fail");
-        let rendered = format!("{err:?} {err}");
-        assert!(!rendered.contains(sentinel));
-        for window in sentinel.as_bytes().windows(8) {
-            let window = std::str::from_utf8(window).unwrap();
-            assert!(
-                !rendered.contains(window),
-                "leaked sentinel window: {window}"
-            );
-        }
-
-        let params = HashMap::from([
-            ("error".to_owned(), sentinel.to_owned()),
-            ("error_description".to_owned(), sentinel.to_owned()),
-        ]);
-        let err = parse_callback_params(&params).expect_err("callback error must fail");
-        assert_eq!(err, "oauth_callback_error");
-    }
-
-    #[test]
-    fn callback_debug_reports_presence_without_secret_material() {
-        let sentinel = "cred_SENTINEL_0123456789abcdef";
-        let callback = Callback {
-            code: sentinel.to_owned(),
-            state: sentinel.to_owned(),
-        };
-
-        let rendered = format!("{callback:?}");
-        assert!(rendered.contains("code_present: true"));
-        assert!(rendered.contains("state_present: true"));
-        assert_sentinel_absent(&rendered, sentinel);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn closed_callback_channel_logs_only_fixed_safe_facts() {
-        let sentinel = "cred_SENTINEL_0123456789abcdef";
-        let capture = LogCapture::default();
-        let _guard = tracing::subscriber::set_default(capture.clone());
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        drop(rx);
-
-        let params = HashMap::from([
-            ("code".to_owned(), sentinel.to_owned()),
-            ("state".to_owned(), sentinel.to_owned()),
-        ]);
-        let _ = handle_callback(State(tx), Query(params)).await;
-
-        let rendered = capture.0.lock().expect("log capture lock").join("\n");
-        assert!(rendered.contains("channel_state=\"closed\""));
-        assert!(rendered.contains("result_kind=\"success\""));
-        assert_sentinel_absent(&rendered, sentinel);
     }
 }

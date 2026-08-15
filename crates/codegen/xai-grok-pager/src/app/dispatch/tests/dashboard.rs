@@ -1317,7 +1317,6 @@ fn dashboard_effort_stash_refused_while_other_switch_in_flight_completes_once() 
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1390,7 +1389,6 @@ fn dashboard_effort_stash_admitted_when_slot_free() {
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1479,7 +1477,6 @@ fn dashboard_dispatch_refused_pick_mirrors_error_and_drops_cli_stash() {
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1709,6 +1706,72 @@ fn dashboard_peek_cycle_does_not_retire_the_nudge() {
             .current_key(),
         Some(crate::tips::plan_nudge::PLAN_NUDGE_KEY),
         "the dashboard peek must not retire (or attribute) the nudge",
+    );
+}
+#[test]
+fn dashboard_open_or_merges_session_is_worktree_when_probe_is_plain() {
+    let repo = crate::test_util::TempGitRepo::init("main");
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.cwd = repo.path.clone();
+        agent.session.is_worktree = true;
+        agent.is_worktree = false;
+        agent.current_branch = Some("stale".into());
+    }
+    app.active_view = ActiveView::Agent(id);
+    let _ = dispatch_open_dashboard(&mut app);
+    let agent = &app.agents[&id];
+    assert!(
+        agent.is_worktree,
+        "session.is_worktree must not be clobbered by a plain-repo probe"
+    );
+    assert_eq!(agent.current_branch.as_deref(), Some("main"));
+}
+#[test]
+fn dashboard_open_clears_stale_agent_is_worktree_when_probe_and_session_false() {
+    let repo = crate::test_util::TempGitRepo::init("main");
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.cwd = repo.path.clone();
+        agent.session.is_worktree = false;
+        agent.is_worktree = true;
+        agent.current_branch = Some("stale".into());
+    }
+    app.active_view = ActiveView::Agent(id);
+    let _ = dispatch_open_dashboard(&mut app);
+    let agent = &app.agents[&id];
+    assert!(
+        !agent.is_worktree,
+        "stale agent.is_worktree must clear when probe and session are false"
+    );
+    assert_eq!(agent.current_branch.as_deref(), Some("main"));
+}
+#[test]
+fn dashboard_open_detects_standalone_grok_worktree() {
+    let main = crate::test_util::TempGitRepo::init("main-only");
+    let clone = main.standalone_clone("wt-branch");
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.cwd = clone.path.clone();
+        agent.session.is_worktree = false;
+        agent.is_worktree = false;
+        agent.current_branch = Some("main-random".into());
+        agent.main_repo = None;
+    }
+    app.active_view = ActiveView::Agent(id);
+    let _ = dispatch_open_dashboard(&mut app);
+    let agent = &app.agents[&id];
+    assert!(agent.is_worktree);
+    assert_eq!(agent.current_branch.as_deref(), Some("wt-branch"));
+    assert_eq!(
+        agent.main_repo.as_deref(),
+        Some(crate::test_util::collapsed_path_display(&main.path).as_str())
     );
 }
 /// Leader-mode independence: opening the dashboard works even when NOT in
@@ -2580,7 +2643,6 @@ fn dashboard_deferred_plan_mode_applied_on_session_created() {
             session_id: session_id.clone(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -4223,8 +4285,10 @@ fn dashboard_rename_end_to_end_top_level_row() {
     assert!(
         effects.iter().any(|e| matches!(
             e,
-            Effect::RenameSession { agent_id, title, .. }
-                if *agent_id == id && title == "My renamed session"
+            Effect::RenameSession { agent_id, title, kind, .. }
+                if *agent_id == id
+                    && title == "My renamed session"
+                    && *kind == xai_grok_shell::session::unified_list::SessionKind::Build
         )),
         "commit must emit a RenameSession effect, got {effects:?}",
     );
@@ -4235,6 +4299,38 @@ fn dashboard_rename_end_to_end_top_level_row() {
     assert!(
         app.dashboard.as_ref().unwrap().rename.is_none(),
         "commit must clear the rename overlay",
+    );
+}
+/// Dashboard rename of a chat-kind agent must stamp `kind: Chat` so the
+/// shell takes the conversations fork.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_rename_chat_kind_stamps_kind_chat() {
+    let mut app = test_app_with_agent();
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    agent.chat_kind = true;
+    agent.conversation_entry = true;
+    open_dashboard(&mut app);
+    let id = AgentId(0);
+    if let Some(d) = app.dashboard.as_mut() {
+        d.selected = Some(crate::views::dashboard::DashboardRowId::TopLevel(id));
+    }
+    dispatch_dashboard_begin_rename(&mut app);
+    app.dashboard
+        .as_mut()
+        .and_then(|dashboard| dashboard.rename.as_mut())
+        .expect("rename draft")
+        .set_text("Chat title");
+    let effects = dispatch(Action::DashboardCommitRename, &mut app);
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::RenameSession { agent_id, title, kind, .. }
+                if *agent_id == id
+                    && title == "Chat title"
+                    && *kind == xai_grok_shell::session::unified_list::SessionKind::Chat
+        )),
+        "chat-lane dashboard rename must send kind=chat, got {effects:?}",
     );
 }
 /// `DashboardCancelRename` emits no effects and
@@ -6345,7 +6441,6 @@ fn dashboard_attach_roster_focuses_existing_local_agent() {
             session_id: "local-owned".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );

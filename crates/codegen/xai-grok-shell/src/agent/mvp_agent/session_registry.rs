@@ -32,18 +32,13 @@ pub(super) enum SessionPresence {
         thread: Option<SessionThread>,
         activity: Activity,
     },
-    /// A load/resume is building the actor. `active` is the newest load allowed
-    /// to use the during-load bypass; `waiters` keeps every in-flight load
-    /// visible to external waiters until each guard drops. `displaced` is what
-    /// the attach replaced and what a failed attach restores once *all*
-    /// waiters settle. A handle, thread, or `settled_activity` may land here
-    /// before the attach finishes; only the last [`SessionRegistry::settle_attach`]
-    /// retires this variant.
+    /// A load/resume is building the actor. `waiter` wakes racing requests;
+    /// `displaced` is what the attach replaced and what a failed attach
+    /// restores. A handle, thread, or `settled_activity` may land here before
+    /// the attach finishes; only [`SessionRegistry::settle_attach`] retires this
+    /// variant.
     Attaching {
-        /// Marker currently allowed to use the during-load bypass.
-        active: Option<tokio::sync::watch::Receiver<bool>>,
-        /// All in-flight load markers for waiter-side gating.
-        waiters: Vec<tokio::sync::watch::Receiver<bool>>,
+        waiter: tokio::sync::watch::Receiver<bool>,
         displaced: Option<Box<SessionPresence>>,
         handle: Option<SessionHandle>,
         thread: Option<SessionThread>,
@@ -107,8 +102,7 @@ impl SessionPresence {
             SessionLiveState::Attaching => {
                 let (_tx, waiter) = tokio::sync::watch::channel(false);
                 Self::Attaching {
-                    active: Some(waiter.clone()),
-                    waiters: vec![waiter],
+                    waiter,
                     displaced: None,
                     handle,
                     thread,
@@ -214,8 +208,6 @@ struct SessionResources {
     resident: Option<ResidentResources>,
     presence: Option<SessionPresence>,
     unavailable_model: Option<acp::ModelId>,
-    unavailable_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
-    unavailable_agent_name: Option<String>,
 }
 #[derive(Default)]
 pub(super) struct SessionCounts {
@@ -228,6 +220,7 @@ pub(super) struct SessionCounts {
     pub(super) session_live_state: usize,
     pub(super) model_unavailable_sessions: usize,
     pub(super) dispatch_locks: usize,
+    pub(super) live_orphan_heal_locks: usize,
     pub(super) session_turn_numbers: usize,
     pub(super) permission_event_receivers: usize,
     pub(super) session_index_claims: usize,
@@ -256,8 +249,6 @@ impl SessionRegistry {
                     retained: None,
                     resident: None,
                     unavailable_model: None,
-                    unavailable_catalog_identity: None,
-                    unavailable_agent_name: None,
                 },
             );
         }
@@ -484,9 +475,7 @@ impl SessionRegistry {
     }
     /// Start an attach. Current presence becomes `displaced` so a failed
     /// attach can restore it. An attach over a missing entry creates one,
-    /// which the last `settle_attach` removes. A concurrent attach over an
-    /// already-Attaching entry keeps every prior waiter visible and makes the
-    /// new marker the sole owner of the during-load bypass.
+    /// which `settle_attach` removes.
     pub(super) fn begin_attach(
         &self,
         id: &acp::SessionId,
@@ -497,65 +486,38 @@ impl SessionRegistry {
         let (tx, rx) = tokio::sync::watch::channel(false);
         self.edit(id, |e| {
             let previous = e.presence.take();
-            e.presence = match previous {
+            let (handle, thread, displaced) = match previous {
                 Some(SessionPresence::Attaching {
-                    mut waiters,
                     handle,
                     thread,
                     displaced,
-                    settled_activity,
                     ..
-                }) => {
-                    waiters.push(rx.clone());
-                    Some(SessionPresence::Attaching {
-                        active: Some(rx.clone()),
-                        waiters,
-                        displaced,
-                        handle,
-                        thread,
-                        settled_activity,
-                    })
-                }
+                }) => (handle, thread, displaced),
                 other => {
                     let handle = other
                         .as_ref()
                         .and_then(SessionPresence::hosted_handle)
                         .cloned();
-                    Some(SessionPresence::Attaching {
-                        active: Some(rx.clone()),
-                        waiters: vec![rx.clone()],
-                        displaced: other.map(Box::new),
-                        handle,
-                        thread: None,
-                        settled_activity: None,
-                    })
+                    (handle, None, other.map(Box::new))
                 }
             };
+            e.presence = Some(SessionPresence::Attaching {
+                waiter: rx.clone(),
+                displaced,
+                handle,
+                thread,
+                settled_activity: None,
+            });
         });
         (tx, rx)
     }
-    /// Clone of the newest in-flight attach waiter, if any. External waiters
-    /// re-check via this; when concurrent loads exist the gate stays shut until
-    /// every waiter has settled (see [`Self::settle_attach`]).
+    /// Clone of the in-flight attach waiter, if any.
     pub(super) fn attach_waiter(
         &self,
         id: &acp::SessionId,
     ) -> Option<tokio::sync::watch::Receiver<bool>> {
         self.with(id, |e| match &e.presence {
-            Some(SessionPresence::Attaching { waiters, .. }) => waiters.last().cloned(),
-            _ => None,
-        })
-        .flatten()
-    }
-    /// Clone of the load marker currently allowed to use the during-load
-    /// bypass. A superseded older load does not regain ownership when a newer
-    /// marker drops — `active` is cleared, not handed back.
-    pub(super) fn attach_active(
-        &self,
-        id: &acp::SessionId,
-    ) -> Option<tokio::sync::watch::Receiver<bool>> {
-        self.with(id, |e| match &e.presence {
-            Some(SessionPresence::Attaching { active, .. }) => active.clone(),
+            Some(SessionPresence::Attaching { waiter, .. }) => Some(waiter.clone()),
             _ => None,
         })
         .flatten()
@@ -573,11 +535,9 @@ impl SessionRegistry {
             .filter(|e| matches!(e.presence, Some(SessionPresence::Attaching { .. })))
             .count()
     }
-    /// Retire one in-flight attach marker. Every guard drop lands here.
-    /// `waiter` identifies the dropping guard; an unknown channel is a no-op.
-    /// When other waiters remain, the entry stays `Attaching` (and if this was
-    /// `active`, bypass stays closed for everyone). Only the last waiter
-    /// settles presence from the hosted handle or restores `displaced`.
+    /// Retire an attach: every guard drop lands here, success or failure.
+    /// `waiter` identifies the owning guard; a superseded one is a no-op.
+    /// Settles from the hosted handle when present, else restores `displaced`.
     pub(super) fn settle_attach(
         &self,
         id: &acp::SessionId,
@@ -587,27 +547,13 @@ impl SessionRegistry {
         let Some(entry) = entries.get_mut(id) else {
             return;
         };
-        let still_waiting = match &mut entry.presence {
+        let owns = match &entry.presence {
             Some(SessionPresence::Attaching {
-                active, waiters, ..
-            }) => {
-                let before = waiters.len();
-                waiters.retain(|rx| !rx.same_channel(waiter));
-                if waiters.len() == before {
-                    // Unknown / already-settled channel — no-op.
-                    return;
-                }
-                if active.as_ref().is_some_and(|rx| rx.same_channel(waiter)) {
-                    // A superseded older load must not regain bypass ownership
-                    // when the newer marker drops; owner-bound bypass remains
-                    // closed until a fresh begin_attach installs a new active.
-                    *active = None;
-                }
-                !waiters.is_empty()
-            }
-            _ => return,
+                waiter: current, ..
+            }) => current.same_channel(waiter),
+            _ => false,
         };
-        if still_waiting {
+        if !owns {
             return;
         }
         let Some(SessionPresence::Attaching {
@@ -705,48 +651,17 @@ impl SessionRegistry {
         self.clear(id, |e| e.resident = None);
     }
     pub(super) fn set_unavailable_model(&self, id: &acp::SessionId, model: acp::ModelId) {
-        self.edit(id, |e| {
-            e.unavailable_model = Some(model);
-            e.unavailable_catalog_identity = None;
-            e.unavailable_agent_name = None;
-        });
-    }
-    pub(super) fn set_unavailable_model_with_identity(
-        &self,
-        id: &acp::SessionId,
-        model: acp::ModelId,
-        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
-        agent_name: Option<String>,
-    ) {
-        self.edit(id, |e| {
-            e.unavailable_model = Some(model);
-            e.unavailable_catalog_identity = catalog_identity;
-            e.unavailable_agent_name = agent_name;
-        });
+        self.edit(id, |e| e.unavailable_model = Some(model));
     }
     pub(super) fn unavailable_model(&self, id: &acp::SessionId) -> Option<acp::ModelId> {
         self.with(id, |e| e.unavailable_model.clone()).flatten()
-    }
-    pub(super) fn unavailable_catalog_identity(
-        &self,
-        id: &acp::SessionId,
-    ) -> Option<xai_chat_state::CatalogIdentity> {
-        self.with(id, |e| e.unavailable_catalog_identity.clone())
-            .flatten()
-    }
-    pub(super) fn unavailable_agent_name(&self, id: &acp::SessionId) -> Option<String> {
-        self.with(id, |e| e.unavailable_agent_name.clone()).flatten()
     }
     pub(super) fn take_unavailable_model(&self, id: &acp::SessionId) -> Option<acp::ModelId> {
         let model = self
             .sessions
             .borrow_mut()
             .get_mut(id)
-            .and_then(|e| {
-                e.unavailable_catalog_identity = None;
-                e.unavailable_agent_name = None;
-                e.unavailable_model.take()
-            });
+            .and_then(|e| e.unavailable_model.take());
         self.drop_if_empty(id);
         model
     }
@@ -765,6 +680,18 @@ impl SessionRegistry {
                 .get_or_insert_default()
                 .dispatch_lock
                 .get_or_insert_with(Default::default)
+                .clone()
+        })
+    }
+    /// Per-parent heal mutex. Tray `list_running` and resume heal take this
+    /// from the registry; the session actor holds the same `Arc` on
+    /// `ToolContext` so overlapping ticks share one lock.
+    pub(super) fn live_orphan_heal_lock(&self, id: &acp::SessionId) -> Arc<tokio::sync::Mutex<()>> {
+        self.edit(id, |e| {
+            e.retained
+                .get_or_insert_default()
+                .live_orphan_heal_lock
+                .get_or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         })
     }
@@ -800,12 +727,6 @@ impl SessionRegistry {
             e.resident.get_or_insert_default().codebase_index = Some(index);
         });
     }
-    #[cfg(test)]
-    pub(super) fn mark_require_gateway(&self, id: &acp::SessionId) {
-        self.edit(id, |e| {
-            e.resident.get_or_insert_default().require_gateway = true;
-        });
-    }
     /// Destructured so a new field has to be counted, or go unmeasured.
     pub(super) fn counts(&self) -> SessionCounts {
         let mut counts = SessionCounts::default();
@@ -816,8 +737,6 @@ impl SessionRegistry {
                 resident,
                 presence,
                 unavailable_model,
-                unavailable_catalog_identity: _,
-                unavailable_agent_name: _,
             } = entry;
             counts.retained_resources += usize::from(retained.is_some());
             counts.resident_resources += usize::from(resident.is_some());
@@ -832,6 +751,8 @@ impl SessionRegistry {
             counts.model_unavailable_sessions += usize::from(unavailable_model.is_some());
             if let Some(retained) = retained {
                 counts.dispatch_locks += usize::from(retained.dispatch_lock.is_some());
+                counts.live_orphan_heal_locks +=
+                    usize::from(retained.live_orphan_heal_lock.is_some());
                 counts.session_turn_numbers += usize::from(retained.turn_number.is_some());
                 counts.permission_event_receivers +=
                     usize::from(retained.permission_event_receiver.is_some());
@@ -873,8 +794,6 @@ impl SessionResources {
             resident,
             presence,
             unavailable_model,
-            unavailable_catalog_identity: _,
-            unavailable_agent_name: _,
         } = self;
         let chat_vacant = true;
         let presence_vacant = match presence {

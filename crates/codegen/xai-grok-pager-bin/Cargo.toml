@@ -48,6 +48,8 @@ serde_json = { workspace = true }
 dunce = { workspace = true }
 semver = { workspace = true }
 xai-tty-utils = { workspace = true }
+# `collect_crashed()` for the startup crash notice.
+xai-grok-active-sessions = { workspace = true }
 xai-grok-config = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 rustls = { version = "0.23", default-features = false, features = [
@@ -81,6 +83,7 @@ serial_test = { workspace = true }
 # `PagerArgs::try_parse_from` in the CLI-parsing unit tests (needs the
 # `clap::Parser` trait in scope).
 clap = { workspace = true, features = ["derive"] }
+tempfile = { workspace = true }
 
 [features]
 default = [
@@ -95,4 +98,4 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "dep:tikv-jemalloc
 sandbox-enforce = ["xai-grok-pager/sandbox-enforce"]
 release-dist = ["xai-grok-pager/release-dist"]
 # Public PI toolset wiring (fd-backed glob backend in xai-grok-tools).
-pi = ["xai-grok-pager/pi", "xai-grok-shell/pi"]
+pi = ["xai-grok-pager/pi"]

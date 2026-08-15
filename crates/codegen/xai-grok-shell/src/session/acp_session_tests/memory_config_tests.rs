@@ -5,6 +5,13 @@ use xai_grok_paths::AbsPathBuf;
 use xai_grok_workspace::file_system::MockFs;
 use xai_grok_workspace::permission::PermissionHandle;
 #[test]
+fn first_turn_memory_visibility_matches_displayed_score() {
+    assert_eq!(
+        [true, true, false, false],
+        [0.90, 0.006, 0.004, 0.0].map(super::SessionActor::is_first_turn_memory_score_visible),
+    );
+}
+#[test]
 fn initial_injection_backend_params_use_override_min_score() {
     let params = crate::session::memory::MemoryBackendParams {
         session_id: "test-session".to_owned(),
@@ -86,7 +93,7 @@ async fn create_test_actor_with_memory(
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
-        combine_edit_holds: std::collections::HashSet::new(),
+        edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
@@ -103,7 +110,6 @@ async fn create_test_actor_with_memory(
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            endpoint_trust: None,
             api_backend: Default::default(),
             extra_headers: Default::default(),
             query_params: Default::default(),
@@ -137,14 +143,15 @@ async fn create_test_actor_with_memory(
             gateway: GatewaySender::new(gateway_tx),
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
-            persistence_is_noop: false,
             disk_full: crate::session::notifications::idle_disk_full_rx(),
         },
         permissions: PermissionHandle::allow_all(),
         tool_context,
         deny_read_globs: Vec::new(),
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
-        mcp_strategy: McpInitStrategy::Blocking,
+        mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
+        delivery_tools: std::cell::RefCell::new(Vec::new()),
+        attach_non_interactive: std::cell::Cell::new(false),
         chat_state_handle,
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -153,8 +160,6 @@ async fn create_test_actor_with_memory(
         )),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
-        catalog_model_id: std::cell::Cell::new("test".to_string()),
-        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -272,7 +277,6 @@ async fn create_test_actor_with_memory(
         pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
-        managed_mcp_expires_at: std::sync::Mutex::new(None),
         initial_client_mcp_servers: vec![],
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
         mcp_announced_servers: Mutex::new(HashMap::new()),
@@ -282,6 +286,7 @@ async fn create_test_actor_with_memory(
         mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
         user_input_generation: std::sync::atomic::AtomicU64::new(0),
         laziness_debug_log: None,
+        last_live_orphan_reconcile: std::cell::Cell::new(None),
         deferred_prefix: TaskSlot::new(),
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
@@ -289,6 +294,9 @@ async fn create_test_actor_with_memory(
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
+        turn_report: Default::default(),
+        turn_abort: Default::default(),
+        turn_end_tx: Default::default(),
         client_hooks: Default::default(),
         hook_resolved_workspace_root: String::new(),
         vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
@@ -307,11 +315,10 @@ async fn create_test_actor_with_memory(
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
+        pending_image_strip: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-        image_description_model: std::cell::RefCell::new(
-            crate::test_support::TEST_MODEL.to_owned(),
-        ),
+        image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
@@ -575,6 +582,44 @@ async fn test_first_turn_reminder_injects_without_persisted_block() {
                     .context_injected
                     .load(std::sync::atomic::Ordering::Relaxed),
                 "latch must be set after the injection decision runs"
+            );
+            assert_eq!(None, actor.first_turn_memory_reminder().await);
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn test_first_turn_reminder_skips_all_displayed_zero_results() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut actor = create_injection_ready_actor(vec![
+                xai_grok_sampling_types::ConversationItem::system("You are a helpful assistant."),
+                xai_grok_sampling_types::ConversationItem::user(
+                    "tell me about rust backend services conventions",
+                ),
+            ])
+            .await;
+            actor
+                .memory
+                .backend_params
+                .as_mut()
+                .unwrap()
+                .search_config
+                .source_weights
+                .insert("workspace".to_owned(), 0.0);
+            assert_eq!(None, actor.first_turn_memory_reminder().await);
+            assert_eq!(
+                0,
+                actor
+                    .memory
+                    .injection_count
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+            assert!(
+                actor
+                    .memory
+                    .context_injected
+                    .load(std::sync::atomic::Ordering::Relaxed)
             );
             assert_eq!(None, actor.first_turn_memory_reminder().await);
         })

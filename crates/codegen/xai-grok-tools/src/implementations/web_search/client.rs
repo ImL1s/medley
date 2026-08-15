@@ -157,6 +157,15 @@ pub struct WebSearchClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    /// Authoritative domain allowlist from `[toolset.web_search] allowed_domains`.
+    /// When set it governs the search and the model's per-call `allowed_domains`
+    /// is ignored (see [`Self::resolve_filters`]). Mutually exclusive with
+    /// `default_excluded_domains`.
+    default_allowed_domains: Option<Vec<String>>,
+    /// Authoritative domain blocklist from `[toolset.web_search] excluded_domains`.
+    /// The model cannot un-set it by naming a blocked domain in its own
+    /// `allowed_domains`. Mutually exclusive with `default_allowed_domains`.
+    default_excluded_domains: Option<Vec<String>>,
     api_key_provider: Option<SharedApiKeyProvider>,
     provider_scoped: bool,
     transport_profile: ApiTransportProfile,
@@ -180,6 +189,8 @@ impl WebSearchClient {
             extra_headers,
             env_http_headers,
             alpha_test_key,
+            allowed_domains,
+            excluded_domains,
             api_key_provider,
         } = config
         else {
@@ -328,11 +339,96 @@ impl WebSearchClient {
             http,
             base_url,
             model: model.clone(),
+            default_allowed_domains: allowed_domains.clone(),
+            default_excluded_domains: excluded_domains.clone(),
             api_key_provider: request_api_key_provider,
             provider_scoped,
             transport_profile,
             attribution_callback: None,
         })
+    }
+    /// Resolve the effective domain filters for a request.
+    ///
+    /// A configured `[toolset.web_search]` policy is **authoritative**: when the
+    /// user sets `allowed_domains` or `excluded_domains`, it governs and the
+    /// model's per-call `allowed_domains` is ignored. This is required for
+    /// `excluded_domains` to be a real block. Otherwise the model could bypass
+    /// the user's blocklist simply by naming the blocked domain in its own
+    /// `allowed_domains`. Only when no config policy is set does the model's
+    /// per-call allowlist apply. The two lists are mutually exclusive, so at
+    /// most one of the returned options is `Some`.
+    ///
+    /// The config source guarantees at most one list is set (the resolver drops
+    /// one, and deserialize rejects both), but should both ever be present the
+    /// allowlist wins, matching the resolver's tiebreak so the two paths agree.
+    fn resolve_filters(
+        &self,
+        model_allowed: Option<Vec<String>>,
+    ) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        if let Some(allowed) = self
+            .default_allowed_domains
+            .clone()
+            .filter(|d| !d.is_empty())
+        {
+            return (Some(allowed), None);
+        }
+        if let Some(excluded) = self
+            .default_excluded_domains
+            .clone()
+            .filter(|d| !d.is_empty())
+        {
+            return (None, Some(excluded));
+        }
+        (model_allowed.filter(|d| !d.is_empty()), None)
+    }
+    /// Build the serialized `/responses` request body for a single web search.
+    ///
+    /// async_openai's `WebSearchToolFilters` models only `allowed_domains`, so
+    /// `excluded_domains` is injected into the tool's `filters` after
+    /// serialization (the backend Responses API accepts it). The request always
+    /// carries exactly one tool (`web_search`) at index 0.
+    fn build_request_json(
+        &self,
+        query: &str,
+        allowed_domains: Option<Vec<String>>,
+        excluded_domains: Option<Vec<String>>,
+    ) -> Result<serde_json::Value, xai_tool_runtime::ToolError> {
+        let err = |msg: String| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                msg,
+            )
+        };
+        let web_search = rs::WebSearchToolArgs::default()
+            .filters(rs::WebSearchToolFilters { allowed_domains })
+            .build()
+            .map_err(|e| err(format!("Failed to build web search tool: {e}")))?;
+        let request = rs::CreateResponseArgs::default()
+            .model(self.model.clone())
+            .input(query.to_string())
+            .tools(vec![rs::Tool::WebSearch(web_search)])
+            .store(false)
+            .temperature(0.1)
+            .top_p(0.95)
+            .max_output_tokens(8192u32)
+            .build()
+            .map_err(|e| err(format!("Failed to build request: {e}")))?;
+        let mut body = serde_json::to_value(&request)
+            .map_err(|e| err(format!("Failed to serialize request: {e}")))?;
+        if let Some(excluded) = excluded_domains.filter(|d| !d.is_empty()) {
+            let tool = body
+                .get_mut("tools")
+                .and_then(|t| t.as_array_mut())
+                .and_then(|arr| arr.first_mut())
+                .and_then(|t| t.as_object_mut());
+            if let Some(tool) = tool {
+                let filters = tool
+                    .entry("filters")
+                    .or_insert_with(|| serde_json::json!({}));
+                filters["excluded_domains"] = serde_json::json!(excluded);
+            }
+        }
+        Ok(body)
     }
     /// Wire a 401-attribution callback into this client. Idempotent;
     /// safe to call before or after the first request.
@@ -889,6 +985,88 @@ mod tests {
     fn response_from_json(json: serde_json::Value) -> rs::Response {
         serde_json::from_value(json).expect("Failed to parse test Response JSON")
     }
+    /// Build a client with the given configured domain defaults.
+    fn client_with_defaults(
+        allowed: Option<Vec<String>>,
+        excluded: Option<Vec<String>>,
+    ) -> WebSearchClient {
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("test-key".to_string()),
+            base_url: "https://api.x.ai/v1".to_string(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            env_http_headers: IndexMap::new(),
+            alpha_test_key: None,
+            allowed_domains: allowed,
+            excluded_domains: excluded,
+            api_key_provider: None,
+        };
+        WebSearchClient::new(&config, None).expect("client should build")
+    }
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn resolve_filters_config_allowlist_wins_over_model() {
+        let client = client_with_defaults(Some(v(&["config.com"])), None);
+        let (allowed, excluded) = client.resolve_filters(Some(v(&["model.com"])));
+        assert_eq!(allowed, Some(v(&["config.com"])));
+        assert!(excluded.is_none());
+    }
+    #[test]
+    fn resolve_filters_uses_config_allowlist_when_model_silent() {
+        let client = client_with_defaults(Some(v(&["config.com"])), None);
+        let (allowed, excluded) = client.resolve_filters(None);
+        assert_eq!(allowed, Some(v(&["config.com"])));
+        assert!(excluded.is_none());
+    }
+    #[test]
+    fn resolve_filters_config_blocklist_applies_when_no_allowlist() {
+        let client = client_with_defaults(None, Some(v(&["reddit.com"])));
+        let (allowed, excluded) = client.resolve_filters(None);
+        assert!(allowed.is_none());
+        assert_eq!(excluded, Some(v(&["reddit.com"])));
+    }
+    #[test]
+    fn resolve_filters_config_blocklist_cannot_be_bypassed_by_model() {
+        let client = client_with_defaults(None, Some(v(&["github.com"])));
+        let (allowed, excluded) = client.resolve_filters(Some(v(&["github.com"])));
+        assert!(
+            allowed.is_none(),
+            "model allowlist must not override the block"
+        );
+        assert_eq!(excluded, Some(v(&["github.com"])));
+    }
+    #[test]
+    fn resolve_filters_no_config_honors_model_allowlist() {
+        let client = client_with_defaults(None, None);
+        let (allowed, excluded) = client.resolve_filters(Some(v(&["model.com"])));
+        assert_eq!(allowed, Some(v(&["model.com"])));
+        assert!(excluded.is_none());
+    }
+    #[test]
+    fn build_request_json_injects_excluded_domains() {
+        let client = client_with_defaults(None, None);
+        let body = client
+            .build_request_json("q", None, Some(v(&["reddit.com"])))
+            .expect("request json builds");
+        let filters = &body["tools"][0]["filters"];
+        assert_eq!(
+            filters["excluded_domains"],
+            serde_json::json!(["reddit.com"])
+        );
+        assert!(filters.get("allowed_domains").is_none());
+    }
+    #[test]
+    fn build_request_json_allowlist_only_has_no_excluded_key() {
+        let client = client_with_defaults(None, None);
+        let body = client
+            .build_request_json("q", Some(v(&["docs.x.ai"])), None)
+            .expect("request json builds");
+        let filters = &body["tools"][0]["filters"];
+        assert_eq!(filters["allowed_domains"], serde_json::json!(["docs.x.ai"]));
+        assert!(filters.get("excluded_domains").is_none());
+    }
     #[test]
     fn test_new_client_uses_configured_model() {
         let config = WebSearchConfig::Enabled {
@@ -898,6 +1076,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -934,6 +1114,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, None)
@@ -960,6 +1142,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -1206,6 +1390,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(std::sync::Arc::new(ScopedProvider)),
         }
     }
@@ -1637,6 +1823,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(scoped),
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -1937,6 +2125,8 @@ mod tests {
                 extra_headers: IndexMap::new(),
                 env_http_headers: Default::default(),
                 alpha_test_key: None,
+                allowed_domains: None,
+                excluded_domains: None,
                 api_key_provider: Some(scoped),
             };
             let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -1995,6 +2185,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(scoped),
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -2049,6 +2241,8 @@ mod tests {
             ]),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(std::sync::Arc::new(GenericScopedProvider)),
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -2109,6 +2303,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(NoneProvider);
@@ -2163,6 +2359,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2197,6 +2395,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(FreshProvider);
@@ -2260,6 +2460,8 @@ mod tests {
             )]),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let mut client =
@@ -2301,6 +2503,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(AmbientRedirectProvider);
@@ -2474,6 +2678,8 @@ mod tests {
             extra_headers,
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(scoped),
         };
         let client = WebSearchClient::new(&config, Some(default)).expect("client should build");
@@ -2514,6 +2720,8 @@ mod tests {
             )]),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(scoped),
         };
         let client = WebSearchClient::new(&config, Some(default)).expect("client should build");
@@ -2560,6 +2768,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(scoped),
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -2602,6 +2812,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -2643,6 +2855,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(scoped),
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -2704,6 +2918,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(provider),
         };
         let client = WebSearchClient::new(&config, None)
@@ -2731,6 +2947,8 @@ mod tests {
             extra_headers: IndexMap::new(),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, None).unwrap();

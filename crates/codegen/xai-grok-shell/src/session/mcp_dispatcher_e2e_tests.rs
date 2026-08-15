@@ -159,43 +159,11 @@ impl RestartActions for E2eActions {
                 .await
                 .owned_clients
                 .insert(server.to_string(), Arc::new(McpClient::stub(server)));
-            self.shutdown
-                .lock()
-                .expect("ShutdownState mutex poisoned")
-                .note_ready(server);
         }
         outcome
     }
     fn push_status(&self, payload: &McpServerStatusPayload) {
         self.pushes.borrow_mut().push(payload.clone());
-    }
-    fn begin_restart(&self, server: &str) -> bool {
-        self.shutdown
-            .lock()
-            .expect("ShutdownState mutex poisoned")
-            .begin_restart(server.to_string())
-    }
-    fn end_restart(&self, server: &str) {
-        self.shutdown
-            .lock()
-            .expect("ShutdownState mutex poisoned")
-            .end_restart(server);
-    }
-    fn note_ready(&self, server: &str) {
-        self.shutdown
-            .lock()
-            .expect("ShutdownState mutex poisoned")
-            .note_ready(server);
-    }
-    fn classify_death(
-        &self,
-        server: &str,
-        kind: xai_grok_mcp::servers::McpClientEventKind,
-    ) -> crate::session::mcp_restart::DeathDisposition {
-        self.shutdown
-            .lock()
-            .expect("ShutdownState mutex poisoned")
-            .classify_death(server, kind)
     }
     async fn is_http_server_configured(&self, server: &str) -> bool {
         self.http_configured.borrow().contains(server)
@@ -834,23 +802,22 @@ async fn e2e_burst_transport_closed_coalesces_to_single_restart() {
         .await;
 }
 
-/// Scenario 9 — occasional crash after a healthy stretch.
+/// Scenario 9 — flapping server: never reliably available.
 ///
-/// A server that stays up past [`crate::session::mcp_restart::STABILITY_WINDOW`]
-/// between crashes must keep getting independent restart cycles (budget
-/// reset). Rapid handshake-then-exit loops are covered by the unit tests
-/// in `mcp_restart` (issue #45); this e2e pins the non-regression that
-/// healthy occasional restarts are not mis-parked.
+/// A server that repeatedly crashes across SEPARATE coalesce windows
+/// (crash → restart succeeds → crash again → restart succeeds → …) must
+/// produce one independent restart cycle per crash. This is the
+/// canonical "MCP server is flapping / not always available" case: each
+/// crash is treated as a fresh transport death (the previous `Ready`
+/// cleared any shutdown mark), so every cycle drops the client and
+/// re-restarts.
 ///
-/// Models three crash→recover cycles with a full stability window between
-/// each. The mock's `respawn_stdio` re-inserts the recovered
-/// `Arc<McpClient>` into `owned_clients` on a scripted `Ok` (mirroring
-/// production), so each cycle starts from an "available" state with no
-/// manual re-seeding between cycles.
+/// Models three crash→recover cycles. The mock's `respawn_stdio` now
+/// re-inserts the recovered `Arc<McpClient>` into `owned_clients` on a
+/// scripted `Ok` (mirroring production), so each cycle starts from an
+/// "available" state with no manual re-seeding between cycles.
 #[tokio::test(start_paused = true, flavor = "current_thread")]
-async fn e2e_crash_after_stability_window_restarts_on_each_cycle() {
-    use crate::session::mcp_restart::STABILITY_WINDOW;
-
+async fn e2e_flapping_server_restarts_on_each_crash_cycle() {
     let mcp_state = Arc::new(TokioMutex::new(McpState::new(vec![])));
     seed_clients(&mcp_state, &["flappy"]).await;
     let shutdown = new_shutdown_state();
@@ -883,13 +850,6 @@ async fn e2e_crash_after_stability_window_restarts_on_each_cycle() {
             ));
 
             for cycle in 0..3 {
-                // Survive past the stability window so this crash is a
-                // healthy restart (budget reset), not an early death.
-                if cycle > 0 {
-                    tokio::time::advance(STABILITY_WINDOW).await;
-                    settle().await;
-                }
-
                 // Each cycle: client is up, then the transport dies.
                 send_transport_closed(&tx, &mcp_state, "flappy").await;
                 tokio::task::yield_now().await;
@@ -1240,126 +1200,6 @@ async fn e2e_http_transport_closed_recovers_in_place_not_evicted() {
             assert!(
                 !shutdown.lock().unwrap().is_shutting_down("http-mcp-server"),
                 "a transport drop is not an intentional teardown",
-            );
-
-            dispatcher.abort();
-        })
-        .await;
-}
-
-/// Scenario — issue #45 inter-cycle backoff, through the real dispatcher.
-///
-/// This is the ONLY test that exercises the production wiring of
-/// `CYCLE_BACKOFF` into a real restart: the `cycle_backoff` argument
-/// `maybe_schedule_restart` hands to `auto_restart_stdio`. Every other
-/// path reaches that spawn with `Duration::ZERO` — the `mcp_restart`
-/// unit tests call `auto_restart_stdio` directly, and every other
-/// dispatcher test crashes a server that never emitted `Ready`, so
-/// `last_ready_at` is `None` and the death classifies as healthy.
-///
-/// Here a genuine `McpClientEvent::Ready` goes through the dispatcher
-/// first (`flush_window` → `note_recovery_ready`), so the following
-/// `TransportClosed` is early death #1 and the respawn must wait
-/// `CYCLE_BACKOFF[0]` BEFORE the `BACKOFF[0]` attempt ladder.
-///
-/// Mutation-checked: hard-coding that argument to `Duration::ZERO`
-/// fires the respawn at `t = BACKOFF[0]` and fails the first assertion
-/// below. Without this test that mutation is silent — it restores the
-/// ~4.5 s restart storm for every cycle before the park while all other
-/// assertions (including "it eventually parks") still hold.
-#[tokio::test(start_paused = true, flavor = "current_thread")]
-async fn e2e_early_death_waits_cycle_backoff_before_attempt_ladder() {
-    use crate::session::mcp_restart::{BACKOFF, CYCLE_BACKOFF};
-
-    // The schedule below distinguishes the two delays only if the
-    // inter-cycle wait is longer than the first attempt wait.
-    assert!(
-        CYCLE_BACKOFF[0] > BACKOFF[0],
-        "test schedule assumes CYCLE_BACKOFF[0] > BACKOFF[0]",
-    );
-
-    let mcp_state = Arc::new(TokioMutex::new(McpState::new(vec![])));
-    seed_clients(&mcp_state, &["earlydie"]).await;
-    let shutdown = new_shutdown_state();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpClientEvent>();
-
-    let actions = Rc::new(E2eActions::new(
-        Arc::clone(&mcp_state),
-        Arc::clone(&shutdown),
-    ));
-    actions.configure("earlydie");
-    actions.script("earlydie", Ok(()));
-    let assert_actions = Rc::clone(&actions);
-    let restart_actions: Rc<dyn RestartActions> = actions;
-
-    let state_for_dispatcher = Arc::clone(&mcp_state);
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async move {
-            let dispatcher = tokio::task::spawn_local(run_dispatcher(
-                "sess-1".to_string(),
-                rx,
-                discard_gateway(),
-                state_for_dispatcher,
-                Arc::clone(&shutdown),
-                Some(restart_actions),
-                std::path::PathBuf::from("."),
-            ));
-
-            // Handshake lands: starts the stability window.
-            tx.send(McpClientEvent::Ready {
-                server: "earlydie".to_string(),
-            })
-            .unwrap();
-            tokio::task::yield_now().await;
-            tokio::time::advance(PAST_WINDOW).await;
-            settle().await;
-
-            // ... and the transport dies well inside it: early death #1.
-            send_transport_closed(&tx, &mcp_state, "earlydie").await;
-            tokio::task::yield_now().await;
-            tokio::time::advance(PAST_WINDOW).await; // drop + flush + schedule
-            settle().await;
-            assert!(
-                assert_actions.respawn_calls().is_empty(),
-                "no respawn before any backoff elapses",
-            );
-
-            // t = BACKOFF[0] after scheduling. Without the inter-cycle
-            // delay this is exactly when the respawn would fire.
-            tokio::time::advance(BACKOFF[0]).await;
-            settle().await;
-            assert!(
-                assert_actions.respawn_calls().is_empty(),
-                "an early death must wait CYCLE_BACKOFF[0] before the \
-                 attempt ladder even starts; a respawn at BACKOFF[0] \
-                 means the cycle backoff was dropped on the way to \
-                 auto_restart_stdio",
-            );
-
-            // t = CYCLE_BACKOFF[0]: inter-cycle wait done, attempt
-            // ladder now starting. Separate advances — a sleep created
-            // after an advance is not covered by the advance that woke
-            // its predecessor.
-            tokio::time::advance(CYCLE_BACKOFF[0] - BACKOFF[0]).await;
-            settle().await;
-            assert!(
-                assert_actions.respawn_calls().is_empty(),
-                "cycle backoff elapsed, but BACKOFF[0] has not",
-            );
-
-            // t = CYCLE_BACKOFF[0] + BACKOFF[0]: respawn.
-            tokio::time::advance(BACKOFF[0]).await;
-            settle().await;
-            assert_eq!(
-                assert_actions.respawn_calls(),
-                vec!["earlydie".to_string()],
-                "respawn fires once, after cycle backoff + attempt backoff",
-            );
-            assert_eq!(
-                assert_actions.pushes_with_reason(McpServerStatusReason::RestartSucceeded),
-                1,
-                "the delayed restart still recovers normally",
             );
 
             dispatcher.abort();

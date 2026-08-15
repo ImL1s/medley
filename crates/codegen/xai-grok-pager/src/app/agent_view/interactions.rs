@@ -1440,26 +1440,19 @@ mod cancel_turn_mouse_tests {
         assert!(matches!(outcome, InputOutcome::Unchanged));
     }
     #[test]
-    fn esc_confirm_refreshes_expired_rewind_grace() {
+    fn esc_dismisses_the_panel_without_cancelling_the_turn() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        use std::time::Instant;
         let mut agent = make_agent();
         agent.session.state = AgentState::TurnRunning;
         setup_panel(&mut agent);
-        agent.rewind_suppress_deadline = Some(Instant::now());
         let outcome =
             agent.handle_cancel_turn_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
-            matches!(
-                outcome,
-                InputOutcome::Action(Action::CancelTurnChoice(CancelTurnChoice::ContinueToRun))
-            ),
-            "panel Esc must confirm the parent-turn cancel, got {outcome:?}"
+            matches!(outcome, InputOutcome::Changed),
+            "panel Esc must keep the turn running, got {outcome:?}"
         );
-        assert!(
-            agent.rewind_arm_suppressed(Instant::now()),
-            "the Esc-confirmed cancel must refresh the post-cancel grace"
-        );
+        assert!(agent.cancel_turn_view.is_none());
+        assert!(agent.session.state.is_turn_running());
     }
 }
 #[cfg(test)]
@@ -1629,6 +1622,7 @@ mod permission_scope_key_tests {
             },
         );
         perm.bash_selection_count = 2;
+        perm.bash_deny_selection_count = 2;
         agent.permission_queue.push_back(perm);
     }
     /// ←/→ on the "Never allow" (RejectAlways) row must adjust the scope in
@@ -1645,7 +1639,98 @@ mod permission_scope_key_tests {
         assert!(matches!(outcome, InputOutcome::Changed));
         let perm = agent.permission_queue.front().unwrap();
         assert_eq!(perm.active_idx, 3, "cursor must stay on the deny row");
-        assert_eq!(perm.bash_selection_count, 1, "← must still narrow scope");
+        assert_eq!(
+            perm.bash_deny_selection_count, 1,
+            "← on the deny row narrows the deny scope"
+        );
+        assert_eq!(
+            perm.bash_selection_count, 2,
+            "the allow scope is untouched from the deny row"
+        );
+    }
+    /// Dangerous commands pin the scope to the full command: ← must not
+    /// narrow below it, since enforcement ignores dangerous prefix grants and
+    /// a narrowed selection would save a rule that never matches.
+    #[test]
+    fn scope_left_is_clamped_for_dangerous_commands() {
+        let mut agent = make_agent();
+        setup_bash_permission(&mut agent);
+        {
+            let perm = agent.permission_queue.front_mut().unwrap();
+            perm.bash_highlights = Some(
+                xai_grok_workspace::permission::bash_command_splitting::BashCommandHighlights {
+                    prefix: vec![],
+                    highlighted_words: vec!["git".into(), "push".into(), "origin".into()],
+                    suffix: vec![],
+                },
+            );
+            perm.bash_selection_count = 3;
+            perm.active_idx = 0;
+        }
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::empty());
+        agent.handle_permission_key(&left);
+        {
+            let perm = agent.permission_queue.front().unwrap();
+            assert_eq!(
+                perm.bash_selection_count, 3,
+                "← must not narrow a dangerous allow below the full scope"
+            );
+        }
+        {
+            let perm = agent.permission_queue.front_mut().unwrap();
+            perm.bash_deny_selection_count = 3;
+            perm.active_idx = 3;
+        }
+        agent.handle_permission_key(&left);
+        let perm = agent.permission_queue.front().unwrap();
+        assert_eq!(
+            perm.bash_deny_selection_count, 2,
+            "← on the deny row narrows even for dangerous commands"
+        );
+        assert!(
+            perm.has_adjustable_scope(),
+            "arrows stay advertised while the deny row is adjustable"
+        );
+    }
+    /// The allow arrow skips an argv-ambiguous intermediate scope (a quoted
+    /// arg with a space) that would persist nothing, landing on the next
+    /// scope that saves a working grant.
+    #[test]
+    fn allow_scope_skips_ambiguous_intermediate() {
+        let mut agent = make_agent();
+        setup_bash_permission(&mut agent);
+        {
+            let perm = agent.permission_queue.front_mut().unwrap();
+            perm.bash_highlights = Some(
+                xai_grok_workspace::permission::bash_command_splitting::BashCommandHighlights {
+                    prefix: vec![],
+                    highlighted_words: vec![
+                        "git".into(),
+                        "show".into(),
+                        "-e".into(),
+                        "A B".into(),
+                        "file".into(),
+                    ],
+                    suffix: vec![],
+                },
+            );
+            perm.bash_selection_count = 3;
+            perm.active_idx = 0;
+        }
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::empty());
+        agent.handle_permission_key(&right);
+        assert_eq!(
+            agent.permission_queue.front().unwrap().bash_selection_count,
+            5,
+            "→ must skip the argv-ambiguous scope 4"
+        );
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::empty());
+        agent.handle_permission_key(&left);
+        assert_eq!(
+            agent.permission_queue.front().unwrap().bash_selection_count,
+            3,
+            "← must skip the argv-ambiguous scope 4"
+        );
     }
     /// From a non-scoped row ←/→ still jump the cursor to the AllowAlways
     /// row (the discoverability affordance).

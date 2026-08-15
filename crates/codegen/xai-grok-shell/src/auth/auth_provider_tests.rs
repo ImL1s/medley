@@ -5,39 +5,6 @@
 use super::test_counting_provider as counting_provider;
 use super::*;
 
-async fn rotated_token(provider: &AuthProviderRef, current: Option<&str>, what: &str) -> String {
-    provider
-        .ensure_fresh_token(current)
-        .await
-        .expect_rotated(provider, what)
-}
-
-#[tokio::test]
-async fn provider_bearer_resolver_returns_atomic_codex_credential() {
-    use xai_grok_sampler::BearerResolver as _;
-
-    let provider = AuthProviderRef::new(
-        "test-structured-resolver".to_owned(),
-        AuthProviderConfig {
-            command: "printf '%s' '{\"access_token\":\"codex-token\",\"account_id\":\"acct-123\"}'"
-                .to_owned(),
-            token_ttl_secs: Some(3600),
-            ..Default::default()
-        },
-    );
-    let credential = provider
-        .current_credential_async()
-        .await
-        .expect("request-boundary resolution mints a structured credential atomically");
-    assert_eq!(credential.access_token, "codex-token");
-    assert_eq!(credential.account_id.as_deref(), Some("acct-123"));
-    let cached = provider
-        .current_credential()
-        .expect("request-boundary resolution warms the provider cache");
-    assert_eq!(cached.access_token, "codex-token");
-    assert_eq!(cached.account_id.as_deref(), Some("acct-123"));
-}
-
 #[tokio::test]
 async fn provider_token_is_cached_while_fresh() {
     let dir = tempfile::tempdir().unwrap();
@@ -47,8 +14,8 @@ async fn provider_token_is_cached_while_fresh() {
         None,
         "cache-only read must miss on a cold cache without running the command"
     );
-    let first = rotated_token(&provider, None, "first mint").await;
-    let second = rotated_token(&provider, None, "cached mint").await;
+    let first = provider.ensure_fresh_token(None).await.rotated().unwrap();
+    let second = provider.ensure_fresh_token(None).await.rotated().unwrap();
     assert_eq!(first, "tok-1");
     assert_eq!(second, "tok-1", "fresh token must be served from cache");
     assert_eq!(
@@ -62,7 +29,10 @@ async fn provider_token_is_cached_while_fresh() {
 async fn provider_token_reminted_when_expired() {
     let dir = tempfile::tempdir().unwrap();
     let provider = counting_provider("test-expiry", dir.path());
-    assert_eq!(rotated_token(&provider, None, "first mint").await, "tok-1");
+    assert_eq!(
+        provider.ensure_fresh_token(None).await.rotated().unwrap(),
+        "tok-1"
+    );
     test_expire_provider_token("test-expiry");
     assert_eq!(
         provider.cached_token(),
@@ -70,7 +40,7 @@ async fn provider_token_reminted_when_expired() {
         "cache-only read must not serve a stale token"
     );
     assert_eq!(
-        rotated_token(&provider, None, "expired remint").await,
+        provider.ensure_fresh_token(None).await.rotated().unwrap(),
         "tok-2",
         "expired token must be re-minted"
     );
@@ -80,7 +50,7 @@ async fn provider_token_reminted_when_expired() {
 async fn provider_pre_turn_refresh_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let provider = counting_provider("test-stale", dir.path());
-    let token = rotated_token(&provider, None, "first mint").await;
+    let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
 
     assert_eq!(
         provider.ensure_fresh_token(Some(&token)).await,
@@ -88,19 +58,22 @@ async fn provider_pre_turn_refresh_semantics() {
         "fresh matching token must not be re-minted pre-turn"
     );
     assert_eq!(
-        rotated_token(
-            &provider,
-            Some("lagging-chat-state-key"),
-            "lagging chat-state adopt"
-        )
-        .await,
-        "tok-1",
+        provider
+            .ensure_fresh_token(Some("lagging-chat-state-key"))
+            .await
+            .rotated()
+            .as_deref(),
+        Some("tok-1"),
         "chat-state lagging behind a rotation adopts the fresh cached token"
     );
     test_expire_provider_token("test-stale");
     assert_eq!(
-        rotated_token(&provider, Some(&token), "stale remint").await,
-        "tok-2",
+        provider
+            .ensure_fresh_token(Some(&token))
+            .await
+            .rotated()
+            .as_deref(),
+        Some("tok-2"),
         "stale token must be re-minted pre-turn"
     );
 }
@@ -109,7 +82,7 @@ async fn provider_pre_turn_refresh_semantics() {
 async fn provider_401_recovery_has_fresh_mint_guard() {
     let dir = tempfile::tempdir().unwrap();
     let provider = counting_provider("test-401", dir.path());
-    let token = rotated_token(&provider, None, "first mint").await;
+    let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
 
     assert_eq!(
         provider.recover_rejected_token(&token).await,
@@ -136,7 +109,7 @@ async fn provider_401_recovery_has_fresh_mint_guard() {
 async fn provider_removed_from_config_drops_cached_token() {
     let dir = tempfile::tempdir().unwrap();
     let provider = counting_provider("test-removed", dir.path());
-    let token = rotated_token(&provider, None, "first mint").await;
+    let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
 
     let removed = AuthProviderRef::new("test-removed".to_owned(), AuthProviderConfig::default());
     assert_eq!(
@@ -150,8 +123,12 @@ async fn provider_removed_from_config_drops_cached_token() {
     );
     let restored = counting_provider("test-removed", dir.path());
     assert_eq!(
-        rotated_token(&restored, Some(&token), "restored remint").await,
-        "tok-2",
+        restored
+            .ensure_fresh_token(Some(&token))
+            .await
+            .rotated()
+            .as_deref(),
+        Some("tok-2"),
         "the removed provider's token must not survive in the slot"
     );
 }
@@ -160,7 +137,10 @@ async fn provider_removed_from_config_drops_cached_token() {
 async fn provider_config_edit_invalidates_cached_token() {
     let dir = tempfile::tempdir().unwrap();
     let old = counting_provider("test-freshen", dir.path());
-    assert_eq!(rotated_token(&old, None, "first mint").await, "tok-1");
+    assert_eq!(
+        old.ensure_fresh_token(None).await.rotated().unwrap(),
+        "tok-1"
+    );
 
     let edited = AuthProviderRef::new(
         "test-freshen".to_owned(),
@@ -178,8 +158,12 @@ async fn provider_config_edit_invalidates_cached_token() {
         "the unexpired old token must not be served under the edited table"
     );
     assert_eq!(
-        rotated_token(&edited, Some("tok-1"), "edited remint").await,
-        "edited-token",
+        edited
+            .ensure_fresh_token(Some("tok-1"))
+            .await
+            .rotated()
+            .as_deref(),
+        Some("edited-token"),
         "refresh must run the edited command without waiting for expiry"
     );
 }
@@ -189,7 +173,7 @@ async fn provider_config_edit_invalidates_cached_token() {
 async fn provider_401_recovery_reminted_under_edited_config() {
     let dir = tempfile::tempdir().unwrap();
     let old = counting_provider("test-401-edited", dir.path());
-    let token = rotated_token(&old, None, "first mint").await;
+    let token = old.ensure_fresh_token(None).await.rotated().unwrap();
 
     let edited = AuthProviderRef::new(
         "test-401-edited".to_owned(),
@@ -214,7 +198,7 @@ async fn provider_401_recovery_reminted_under_edited_config() {
 async fn provider_timeout_edit_does_not_invalidate_token() {
     let dir = tempfile::tempdir().unwrap();
     let provider = counting_provider("test-timeout-edit", dir.path());
-    rotated_token(&provider, None, "first mint").await;
+    provider.ensure_fresh_token(None).await.rotated().unwrap();
 
     let retimed = AuthProviderRef::new(
         "test-timeout-edit".to_owned(),
@@ -239,7 +223,7 @@ async fn provider_timeout_edit_does_not_invalidate_token() {
 async fn provider_cwd_edit_invalidates_cached_token() {
     let dir = tempfile::tempdir().unwrap();
     let provider = counting_provider("test-cwd-edit", dir.path());
-    rotated_token(&provider, None, "first mint").await;
+    provider.ensure_fresh_token(None).await.rotated().unwrap();
 
     let moved = AuthProviderRef::new(
         "test-cwd-edit".to_owned(),
@@ -269,8 +253,8 @@ async fn attach_trusted_config_lets_a_revived_ref_mint() {
     );
     revived.attach_trusted_config(Some(&template.config));
     assert_eq!(
-        rotated_token(&revived, None, "revived ref first mint").await,
-        "tok-1",
+        revived.ensure_fresh_token(None).await.rotated().as_deref(),
+        Some("tok-1"),
         "a re-attached ref must be able to mint"
     );
 }
@@ -281,7 +265,7 @@ async fn attach_trusted_config_lets_a_revived_ref_mint() {
 async fn deserialized_ref_never_drops_the_shared_token() {
     let dir = tempfile::tempdir().unwrap();
     let resolved = counting_provider("test-unresolved", dir.path());
-    rotated_token(&resolved, None, "first mint").await;
+    resolved.ensure_fresh_token(None).await.rotated().unwrap();
 
     let revived: AuthProviderRef = serde_json::from_str(r#"{"name": "test-unresolved"}"#).unwrap();
     assert_eq!(
@@ -303,7 +287,7 @@ async fn deserialized_ref_never_drops_the_shared_token() {
 async fn provider_ref_serializes_name_only_and_drops_config() {
     let dir = tempfile::tempdir().unwrap();
     let provider = counting_provider("test-serde", dir.path());
-    rotated_token(&provider, None, "first mint").await;
+    provider.ensure_fresh_token(None).await.rotated().unwrap();
 
     let bytes = serde_json::to_string(&provider).unwrap();
     assert!(bytes.contains("test-serde"));
@@ -344,14 +328,14 @@ async fn provider_refresh_sets_expired_env() {
         },
     );
     assert_eq!(
-        rotated_token(&provider, None, "first mint").await,
-        "tok-0",
+        provider.ensure_fresh_token(None).await.rotated().as_deref(),
+        Some("tok-0"),
         "first mint runs without GROK_AUTH_EXPIRED"
     );
     test_expire_provider_token("test-expired-env");
     assert_eq!(
-        rotated_token(&provider, None, "expired remint").await,
-        "tok-1",
+        provider.ensure_fresh_token(None).await.rotated().as_deref(),
+        Some("tok-1"),
         "re-mints run with GROK_AUTH_EXPIRED=1"
     );
 }
@@ -377,13 +361,10 @@ async fn provider_concurrent_mints_single_flight() {
         provider.ensure_fresh_token(None),
         provider.ensure_fresh_token(None)
     );
+    assert_eq!(a.rotated().as_deref(), Some("tok-1"));
     assert_eq!(
-        a.expect_rotated(&provider, "concurrent first mint a"),
-        "tok-1"
-    );
-    assert_eq!(
-        b.expect_rotated(&provider, "concurrent first mint b"),
-        "tok-1",
+        b.rotated().as_deref(),
+        Some("tok-1"),
         "second caller adopts, never re-runs"
     );
     let runs = std::fs::read_to_string(&counter).unwrap().lines().count();
@@ -402,7 +383,6 @@ async fn provider_expiry_source_precedence() {
         jwt_with_exp(chrono::Utc::now().timestamp() + 7200)
     }
     fn jwt_with_exp(exp: i64) -> String {
-        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
         jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
             &serde_json::json!({ "exp": exp }),
@@ -426,7 +406,11 @@ async fn provider_expiry_source_precedence() {
                 cwd: None,
             },
         );
-        let first = rotated_token(&provider, None, "first mint").await;
+        let first = provider
+            .ensure_fresh_token(None)
+            .await
+            .rotated()
+            .expect("first mint");
         let _ = provider.ensure_fresh_token(Some(&first)).await;
         std::fs::read_to_string(counter).unwrap().lines().count()
     }
@@ -481,8 +465,8 @@ async fn provider_unusable_expiry_still_mints() {
         },
     );
     assert_eq!(
-        rotated_token(&provider, None, "overflow expiry mint").await,
-        "t",
+        provider.ensure_fresh_token(None).await.rotated().as_deref(),
+        Some("t"),
         "an unusable expiry still mints; the token just has no expiry"
     );
     assert_eq!(
@@ -506,8 +490,8 @@ async fn provider_args_run_without_a_shell() {
         },
     );
     assert_eq!(
-        rotated_token(&provider, None, "args mint").await,
-        "tok-$HOME;42",
+        provider.ensure_fresh_token(None).await.rotated().as_deref(),
+        Some("tok-$HOME;42"),
     );
 }
 
@@ -527,10 +511,6 @@ async fn provider_command_times_out() {
     assert_eq!(
         provider.ensure_fresh_token(None).await,
         ProviderRefreshOutcome::MintFailed
-    );
-    assert_eq!(
-        helper_mint_failure("test-timeout").map(|d| d.category),
-        Some(HelperExecCategory::Timeout)
     );
     assert!(
         start.elapsed().as_secs() < 5,
@@ -554,8 +534,8 @@ async fn provider_zero_timeout_clamps_to_one_second() {
         },
     );
     assert_eq!(
-        rotated_token(&fast, None, "zero-timeout fast mint").await,
-        "tok"
+        fast.ensure_fresh_token(None).await.rotated().as_deref(),
+        Some("tok")
     );
 
     // ...and clamps down from the 30s default: a helper that runs past 1s times
@@ -598,13 +578,6 @@ async fn mint_error_messages_distinguish_failure_modes() {
         .err()
         .expect("timeout must fail the mint");
     assert!(err.to_string().contains("timed out"), "got: {err}");
-    assert_eq!(
-        helper_mint_failure("test-classify-timeout"),
-        Some(HelperMintFailure {
-            category: HelperExecCategory::Timeout,
-            errno: None,
-        })
-    );
 
     let missing = AuthProviderRef::new(
         "test-classify-spawn".to_owned(),
@@ -621,14 +594,6 @@ async fn mint_error_messages_distinguish_failure_modes() {
         .err()
         .expect("spawn failure must fail the mint");
     assert!(err.to_string().contains("failed to start"), "got: {err}");
-    let spawn = helper_mint_failure("test-classify-spawn").expect("spawn records a category");
-    assert_eq!(spawn.category, HelperExecCategory::Spawn);
-    let spawn_rendered = spawn.to_string();
-    assert!(
-        spawn_rendered.starts_with("category=spawn"),
-        "got: {spawn_rendered}"
-    );
-    assert!(!spawn_rendered.contains("/nonexistent"));
 
     let empty_output = AuthProviderRef::new(
         "test-classify-permanent".to_owned(),
@@ -645,11 +610,6 @@ async fn mint_error_messages_distinguish_failure_modes() {
         .err()
         .expect("empty output must fail the mint");
     assert!(err.to_string().contains("no output"), "got: {err}");
-    assert_eq!(
-        helper_mint_failure("test-classify-permanent"),
-        None,
-        "parse-after-success is not an execution category"
-    );
 }
 
 /// On an in-session re-mint, the prior credential is handed back to the command
@@ -668,12 +628,16 @@ async fn re_mint_hands_the_prior_token_back_to_the_command() {
         },
     );
 
-    let first = rotated_token(&provider, None, "first mint").await;
+    let first = provider.ensure_fresh_token(None).await.rotated().unwrap();
     assert_eq!(first, "seen-none", "the first mint has no prior credential");
     test_expire_provider_token("test-handback");
     assert_eq!(
-        rotated_token(&provider, Some(&first), "handback remint").await,
-        "seen-seen-none",
+        provider
+            .ensure_fresh_token(Some(&first))
+            .await
+            .rotated()
+            .as_deref(),
+        Some("seen-seen-none"),
         "the re-mint must receive the prior access token via env"
     );
 }
@@ -700,7 +664,7 @@ async fn failed_401_remint_invalidates_the_cached_token() {
         },
     );
 
-    let token = rotated_token(&provider, None, "first mint").await;
+    let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
     assert_eq!(token, "tok-1");
     // Age past the fresh-mint guard so recovery attempts a re-mint.
     test_backdate_provider_mint("test-401-invalidate", PROVIDER_TOKEN_FRESH_MINT_GUARD * 2);
@@ -709,10 +673,6 @@ async fn failed_401_remint_invalidates_the_cached_token() {
         provider.recover_rejected_token(&token).await,
         None,
         "a failed re-mint surfaces the 401"
-    );
-    assert_eq!(
-        helper_mint_failure("test-401-invalidate").map(|d| d.category),
-        Some(HelperExecCategory::NonzeroExit)
     );
     assert_eq!(
         provider.cached_token(),
@@ -743,7 +703,7 @@ async fn failed_pre_turn_mint_does_not_serve_the_stale_token() {
         },
     );
 
-    let token = rotated_token(&provider, None, "first mint").await;
+    let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
     assert_eq!(token, "tok-1");
     // Make the cached token stale so the next pre-turn call re-mints (and fails).
     test_expire_provider_token("test-pre-turn-stale");
@@ -753,61 +713,9 @@ async fn failed_pre_turn_mint_does_not_serve_the_stale_token() {
         ProviderRefreshOutcome::MintFailed
     ));
     assert_eq!(
-        helper_mint_failure("test-pre-turn-stale").map(|d| d.category),
-        Some(HelperExecCategory::NonzeroExit)
-    );
-    assert_eq!(
         provider.cached_token(),
         None,
         "a stale token whose pre-turn re-mint failed must not be served"
-    );
-}
-
-fn assert_provider_secret_absent(rendered: &str, secret: &str) {
-    assert!(!rendered.contains(secret), "leaked full secret: {rendered}");
-    for window in secret.as_bytes().windows(8) {
-        let window = std::str::from_utf8(window).expect("ASCII sentinel window");
-        assert!(
-            !rendered.contains(window),
-            "leaked secret window {window}: {rendered}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn provider_failure_never_echoes_command_or_stderr() {
-    let command_secret = "M8k6J4h2G0f8Q2w4E6r8T0y2";
-    let stderr_secret = "P9o7I5u3Y1t9R3e5W7q9A1s3";
-    let provider = AuthProviderRef::new(
-        "test-provider-secret-safe-failure".to_owned(),
-        AuthProviderConfig {
-            command: format!("printf '%s' '{stderr_secret}' >&2; exit 9 # {command_secret}"),
-            args: None,
-            token_ttl_secs: None,
-            timeout_secs: Some(5),
-            cwd: None,
-        },
-    );
-
-    let error = mint_provider_token(&provider, false, None)
-        .await
-        .err()
-        .expect("nonzero helper must fail");
-    let rendered = format!("{error:?}\n{error}\n{provider:?}");
-    assert_provider_secret_absent(&rendered, command_secret);
-    assert_provider_secret_absent(&rendered, stderr_secret);
-    assert!(rendered.contains("command_present"));
-
-    let diag = helper_mint_failure("test-provider-secret-safe-failure")
-        .expect("nonzero helper records an execution category");
-    assert_eq!(diag.category, HelperExecCategory::NonzeroExit);
-    assert_eq!(diag.errno, Some(9));
-    let diag_rendered = format!("{diag:?}\n{diag}");
-    assert_provider_secret_absent(&diag_rendered, command_secret);
-    assert_provider_secret_absent(&diag_rendered, stderr_secret);
-    assert_eq!(
-        diag_rendered.lines().next(),
-        Some("category=nonzero errno=9")
     );
 }
 
@@ -833,10 +741,6 @@ async fn provider_output_over_cap_fails_closed() {
     assert!(
         err.to_string().contains("more than"),
         "an over-cap write must be reported as such, got: {err}"
-    );
-    assert_eq!(
-        helper_mint_failure("test-stdout-cap").map(|d| d.category),
-        Some(HelperExecCategory::Read)
     );
     assert_eq!(
         provider.ensure_fresh_token(None).await,
@@ -954,8 +858,8 @@ async fn provider_resolves_relative_program_against_cwd() {
         },
     );
     assert_eq!(
-        rotated_token(&provider, None, "cwd-relative mint").await,
-        "cwd-tok"
+        provider.ensure_fresh_token(None).await.rotated().as_deref(),
+        Some("cwd-tok")
     );
 }
 
@@ -978,12 +882,7 @@ async fn provider_command_runs_in_cwd() {
         },
     );
     assert_eq!(
-        rotated_token(&provider, None, "cwd-shell mint").await,
-        "file-tok"
+        provider.ensure_fresh_token(None).await.rotated().as_deref(),
+        Some("file-tok")
     );
-}
-
-#[test]
-fn helper_test_concurrency_is_four() {
-    assert_eq!(HELPER_TEST_CONCURRENCY, 4);
 }

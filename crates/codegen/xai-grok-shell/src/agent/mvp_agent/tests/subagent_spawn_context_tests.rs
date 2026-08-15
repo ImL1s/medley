@@ -128,6 +128,34 @@ async fn subagent_spawn_context_inherits_parent_ask_user_question_gate() {
     );
 }
 
+/// A subagent copies the parent's `non_interactive` flag, so a headless (`-p`)
+/// parent's children also get no-operator ask_user_question text instead of
+/// waiting on a user who does not exist.
+#[tokio::test]
+async fn subagent_spawn_context_copies_parent_non_interactive() {
+    let agent = build_minimal_agent_for_tests();
+
+    // Headless parent → child context is non-interactive.
+    let sid_headless = acp::SessionId::new("parent-headless");
+    let mut handle_headless = make_test_handle("test-model", false, None);
+    handle_headless.non_interactive = true;
+    agent.insert_resident(&sid_headless, handle_headless);
+    let ctx_headless = agent.build_subagent_spawn_context(sid_headless.0.as_ref());
+    assert!(
+        ctx_headless.parent_non_interactive,
+        "subagent must copy the parent's non_interactive flag (headless -p parent)"
+    );
+
+    // Interactive parent (the default) → child context stays interactive.
+    let sid_tui = acp::SessionId::new("parent-tui");
+    agent.insert_resident(&sid_tui, make_test_handle("test-model", false, None));
+    let ctx_tui = agent.build_subagent_spawn_context(sid_tui.0.as_ref());
+    assert!(
+        !ctx_tui.parent_non_interactive,
+        "an interactive parent must not mark its subagents non-interactive"
+    );
+}
+
 #[tokio::test]
 async fn subagent_spawn_context_inherits_parent_configured_cutoff() {
     let agent = build_minimal_agent_for_tests();
@@ -165,98 +193,6 @@ async fn subagent_spawn_context_inherits_parent_configured_cutoff() {
     );
 }
 
-#[tokio::test]
-async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting() {
-    use std::sync::Arc;
-    use xai_tool_types::SubagentCapabilityMode;
-
-    let agent = build_minimal_agent_for_tests();
-    let lifecycle_sid = acp::SessionId::new("root-lifecycle-parent");
-    let mut lifecycle = make_test_handle("root-model", true, None);
-    lifecycle.info.cwd = "/main-checkout".to_owned();
-    let lifecycle_scope = xai_tty_utils::ProcessScope::new();
-    let lifecycle_owner = Arc::new(xai_tty_utils::ProcessGroup::new().expect("process group"));
-    lifecycle_scope.register(&lifecycle_owner);
-    lifecycle.tool_context.process_scope = Some(lifecycle_scope);
-    agent
-        .session_registry
-        .put_resident(&lifecycle_sid, lifecycle);
-
-    let immediate_sid = acp::SessionId::new("execute-immediate-parent");
-    let mut immediate = make_test_handle("immediate-model", false, None);
-    let immediate_cwd = std::path::PathBuf::from("/isolated-worktree");
-    immediate.info.cwd = immediate_cwd.to_string_lossy().into_owned();
-    let immediate_terminal: Arc<dyn crate::terminal::AsyncTerminalRunner> =
-        Arc::new(crate::terminal::LocalTerminalRunner);
-    immediate.tool_context = crate::tools::ToolContext::new_local_context(
-        xai_grok_paths::AbsPathBuf::new(immediate_cwd.clone()).unwrap(),
-        Arc::new(xai_grok_workspace::file_system::LocalFs::new(
-            immediate_cwd.clone(),
-        )),
-        immediate_terminal.clone(),
-    );
-    immediate.tool_context.session_env = Arc::new(std::collections::HashMap::from([(
-        "SPAWN_SCOPE".to_owned(),
-        "immediate".to_owned(),
-    )]));
-    immediate.capability_mode = Some(SubagentCapabilityMode::Execute);
-    immediate.tool_context.subagent_depth = 1;
-    let cutoff = xai_grok_sampling_types::ToolOverrides {
-        x_search: None,
-        web_search: None,
-    };
-    immediate
-        .resolved_tool_overrides
-        .store(Some(std::sync::Arc::new(cutoff.clone())));
-    agent
-        .session_registry
-        .put_resident(&immediate_sid, immediate);
-
-    let (ctx, _) = agent
-        .try_build_subagent_spawn_context_for_run(
-            lifecycle_sid.0.as_ref(),
-            immediate_sid.0.as_ref(),
-        )
-        .expect("both lifecycle and immediate parent sessions exist");
-
-    assert_eq!(ctx.parent_session_id, lifecycle_sid.0.as_ref());
-    assert_eq!(ctx.model_id.0.as_ref(), "immediate-model");
-    assert_eq!(ctx.parent_cwd, immediate_cwd);
-    assert_eq!(
-        ctx.parent_session_info.as_ref().map(|info| info.cwd.as_str()),
-        Some("/isolated-worktree")
-    );
-    assert_eq!(ctx.fs.root(), std::path::Path::new("/isolated-worktree"));
-    assert!(Arc::ptr_eq(&ctx.terminal, &immediate_terminal));
-    assert_eq!(
-        ctx.session_env.get("SPAWN_SCOPE").map(String::as_str),
-        Some("immediate")
-    );
-    assert!(
-        !ctx.yolo_mode,
-        "a root YOLO setting must not widen an immediate parent's permissions"
-    );
-    assert_eq!(
-        ctx.process_scope
-            .as_ref()
-            .expect("lifecycle process scope must remain root-owned")
-            .live_count(),
-        1
-    );
-    assert_eq!(ctx.parent_capability_mode, Some(SubagentCapabilityMode::Execute));
-    assert_eq!(ctx.parent_depth, 1);
-    assert_eq!(ctx.inherited_tool_overrides, Some(cutoff));
-    assert_eq!(
-        xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
-            Some(SubagentCapabilityMode::All),
-            Some(SubagentCapabilityMode::All),
-            ctx.parent_capability_mode,
-        ),
-        Some(SubagentCapabilityMode::Execute),
-        "an All grandchild request must remain under the immediate Execute parent ceiling"
-    );
-}
-
 /// A subagent inherits the parent's `process_scope`, so an owner enrolled through it stays visible via the child.
 /// End-to-end reaping is covered by the spine's `process_scope_reclaim` tests.
 #[tokio::test]
@@ -282,146 +218,4 @@ async fn subagent_spawn_context_inherits_parent_process_scope() {
         1,
         "the child sees the owner enrolled through the parent scope"
     );
-}
-
-fn issue14_stdio_server(name: &str) -> acp::McpServer {
-    acp::McpServer::Stdio(acp::McpServerStdio::new(name.to_string(), "true"))
-}
-
-/// #14: spawn-time refresh must overwrite bootstrap snapshots so children see
-/// current capabilities, not the parent handle's stale copies.
-#[tokio::test]
-async fn issue14_spawn_refresh_replaces_stale_parent_capabilities() {
-    use crate::session::commands::SubagentCapabilitySnapshot;
-    use crate::session::{SessionCommand, mcp_servers::mcp_server_name};
-
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("issue14-refresh-parent");
-    let (mut handle, _cmd_tx, mut cmd_rx) = super::make_live_session_handle(&sid, None);
-    handle.mcp_servers = vec![issue14_stdio_server("stale-bootstrap-mcp")];
-    agent.session_registry.put_resident(&sid, handle);
-
-    tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            if let SessionCommand::SnapshotSubagentCapabilities { respond_to } = cmd {
-                let _ = respond_to.send(Ok(SubagentCapabilitySnapshot {
-                    mcp_configs: vec![issue14_stdio_server("fresh-live-mcp")],
-                    mcp_pool: None,
-                    client_hooks: Default::default(),
-                    tool_definitions: vec![xai_grok_sampling_types::ToolSpec {
-                        name: "issue14_fresh_tool".to_string(),
-                        description: Some("spawn-refresh tool".to_string()),
-                        parameters: serde_json::json!({
-                            "type": "object",
-                            "properties": {}
-                        }),
-                    }],
-                    skills: vec![xai_grok_tools::implementations::skills::types::SkillInfo {
-                        name: "issue14-fresh-skill".to_string(),
-                        description: "spawn-refresh skill".to_string(),
-                        ..Default::default()
-                    }],
-                    mcp_generation: 41,
-                }));
-                break;
-            }
-        }
-    });
-
-    let mut ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
-    assert_eq!(
-        ctx.parent_mcp_configs
-            .iter()
-            .map(mcp_server_name)
-            .collect::<Vec<_>>(),
-        vec!["stale-bootstrap-mcp"],
-        "precondition: bootstrap context starts from SessionHandle snapshot"
-    );
-    assert!(ctx.parent_skills.is_none());
-    assert!(ctx.parent_tool_definitions.is_none());
-
-    let handle = agent
-        .session_registry
-        .resident_handle(&sid)
-        .expect("parent handle should exist");
-    let refreshed = agent
-        .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
-        .await
-        .expect("capability refresh should succeed");
-
-    assert_eq!(refreshed.mcp_generation, 41);
-    assert_eq!(
-        ctx.parent_mcp_configs
-            .iter()
-            .map(mcp_server_name)
-            .collect::<Vec<_>>(),
-        vec!["fresh-live-mcp"],
-        "spawn refresh must replace stale MCP configs before child construction"
-    );
-    assert_eq!(
-        ctx.parent_tool_definitions
-            .as_ref()
-            .expect("refreshed tools should be set")
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["issue14_fresh_tool"]
-    );
-    assert_eq!(
-        ctx.parent_skills
-            .as_ref()
-            .expect("refreshed skills should be set")
-            .iter()
-            .map(|skill| skill.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["issue14-fresh-skill"]
-    );
-}
-
-/// #14: when the parent actor is unavailable, capability refresh must fail
-/// explicitly and leave the bootstrap snapshot untouched.
-#[tokio::test]
-async fn issue14_spawn_refresh_parent_actor_unavailable_is_actionable_error() {
-    use crate::session::mcp_servers::mcp_server_name;
-
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("issue14-refresh-unavailable");
-    let mut handle = make_test_handle("test-model", false, None);
-    handle.info = crate::session::info::Info {
-        id: sid.clone(),
-        cwd: "/tmp".to_string(),
-    };
-    handle.mcp_servers = vec![issue14_stdio_server("stale-bootstrap-mcp")];
-    agent.session_registry.put_resident(&sid, handle);
-
-    let mut ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
-    let original = ctx
-        .parent_mcp_configs
-        .iter()
-        .map(|server| mcp_server_name(server).to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(original, vec!["stale-bootstrap-mcp".to_string()]);
-
-    let handle = agent
-        .session_registry
-        .resident_handle(&sid)
-        .expect("parent handle should exist");
-    let err = agent
-        .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
-        .await
-        .expect_err("refresh must fail when parent actor channel is closed");
-    assert!(
-        err.contains("unavailable"),
-        "error should be actionable, got: {err}"
-    );
-    assert_eq!(
-        ctx.parent_mcp_configs
-            .iter()
-            .map(|server| mcp_server_name(server).to_string())
-            .collect::<Vec<_>>(),
-        original,
-        "failed refresh must not partially mutate capability snapshots"
-    );
-    assert!(ctx.parent_tool_definitions.is_none());
-    assert!(ctx.parent_skills.is_none());
 }

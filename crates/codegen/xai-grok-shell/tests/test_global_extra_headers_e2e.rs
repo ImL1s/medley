@@ -25,7 +25,7 @@ use xai_grok_test_support::*;
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn global_models_config_reaches_inference_request() {
-    let server = MockInferenceServer::start_keyless_local()
+    let server = MockInferenceServer::start()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -35,7 +35,6 @@ async fn global_models_config_reaches_inference_request() {
     std::fs::write(
         grok_home.join("config.toml"),
         r#"[models]
-catalog_auth_scheme = "none"
 extra_headers = { "X-Request-Tags" = "team=example,env=prod" }
 temperature = 0.5
 top_p = 0.25

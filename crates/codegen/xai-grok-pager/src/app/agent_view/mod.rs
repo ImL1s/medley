@@ -546,13 +546,14 @@ pub(super) fn app_should_open_link_on_click_with(
     }
     !link.looks_like_bare_url_text()
 }
-/// Whether double/triple-click performs terminal-like word/line text selection
-/// (and copy) instead of toggling a fold.
+/// Whether double/triple-click performs terminal-like word/paragraph text
+/// selection (and copy) instead of toggling a fold.
 ///
 /// Unified into the `keep_text_selection` setting (the `word_select` mode):
 /// reads the live appearance cache, so a Settings-panel change applies without
 /// a restart and can never drift from the highlight-persistence behavior. The
-/// default (`flash`) is fold-toggle, preserving backwards compatibility.
+/// compile-time default (`flash`) keeps double-click as a fold-toggle;
+/// `word_select` is a staged rollout via a remote flag.
 pub(super) fn is_text_selection_on_double_click() -> bool {
     crate::appearance::cache::load_keep_text_selection().selects_word()
 }
@@ -631,6 +632,12 @@ pub(crate) struct PendingForkBanner {
     /// Whether the fork created a new worktree.
     pub worktree: bool,
 }
+/// A finish held until its spawn arrives. Output is stripped at insert.
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredSubagentFinish {
+    pub notification: xai_grok_shell::extensions::notification::SessionNotification,
+    pub inserted_at: std::time::Instant,
+}
 /// In-flight reconnect session reload.
 ///
 /// Opened by [`AgentView::begin_session_reload`]: the pre-outage scrollback
@@ -666,6 +673,8 @@ pub(crate) struct SessionReload {
     /// Reconnect cursor as of window open, restored with the stash so a
     /// later reload doesn't skip events the restored transcript never got.
     last_seen_event_id: Option<String>,
+    /// Parsed counter of [`Self::last_seen_event_id`] (same restore rationale).
+    last_seen_event_seq: Option<u64>,
     /// Live dedup highwaters (ACP + xAI) as of window open (same restore
     /// rationale).
     last_applied_event_seq: Option<u64>,
@@ -676,6 +685,10 @@ pub(crate) struct SessionReload {
     /// Whether a Plan update applied during this window: the cursor-merge
     /// outcome then keeps the staging todo list (newer) instead of the stash.
     saw_todo_update: bool,
+    /// Expiry notices staged by replayed tombstones during this window. The keep-stash finalize
+    /// drops staged copies of a line only up to the count the stash already shows (two tasks can
+    /// share identical notice text).
+    replayed_expiry_notices: Vec<crate::scrollback::entry::EntryId>,
 }
 /// Lifecycle of the inline plugin CTA. `Hidden`/`Matched` cover the idle and
 /// prompt-matched states; `Installing`/`Installed`/`Error` cover an in-TUI
@@ -775,6 +788,7 @@ pub struct AgentView {
     pub(crate) session_binding_epoch: u32,
     pub scrollback: ScrollbackState,
     pub prompt: PromptWidget,
+    pub(crate) title_unpin_committed: bool,
     /// Sticky: once the user types in the prompt, hide the tip for the session.
     pub tip_typing_dismissed: bool,
     pub todo: TodoPane,
@@ -829,21 +843,39 @@ pub struct AgentView {
     /// chunks look stale (silent live-text loss).
     pub last_applied_event_seq: Option<u64>,
     /// xAI-stream sibling of [`Self::last_applied_event_seq`] (see there for
-    /// why the highwaters are split). Same drop rule, replay-exempt.
+    /// why the highwaters are split). Same drop rule, replay-exempt. Durable
+    /// subagent lifecycle events bypass that drop check but still lift this
+    /// highwater via `max` so later ordinary updates on the cursor tail stay
+    /// deduped.
     pub last_applied_xai_event_seq: Option<u64>,
     /// Raw `eventId` of the most recent update APPLIED to this root session —
     /// replay or live, on both the ACP and xAI paths; dropped updates (dedup,
     /// promptId gate, unexpected replay) don't move it. Sent as `_meta.cursor`
     /// on a reconnect `session/load` so the agent replays only the post-cursor
     /// tail. Why the full string: see
-    /// [`crate::acp::meta::NotificationMeta::event_id`].
+    /// [`crate::acp::meta::NotificationMeta::event_id`]. Forward-only: a later
+    /// applied lower-ID lifecycle update must not regress this cursor. All
+    /// writers go through [`Self::advance_last_seen_event_id`].
     pub last_seen_event_id: Option<String>,
+    /// Parsed counter for [`Self::last_seen_event_id`], kept in lockstep by
+    /// [`Self::advance_last_seen_event_id`] so forward-only compares do not
+    /// re-parse the id string at every writer.
+    pub last_seen_event_seq: Option<u64>,
+    /// Terminal lifecycle updates that arrived before their spawn. Bounded,
+    /// output-stripped, and cleared on session rebind; the spawn path drains
+    /// an entry before a later reconnect cursor can strand the finish.
+    pub(crate) deferred_subagent_finishes: HashMap<String, DeferredSubagentFinish>,
     /// Open reconnect reload window, if any. See [`SessionReload`].
     pub(crate) session_reload: Option<SessionReload>,
     /// Unexpected-replay drops since the last reload window opened. Gates the
     /// drop log to one `warn!` per incident (a late replay is one line per
     /// event — thousands for a large transcript).
     pub(crate) unexpected_replay_drops: u32,
+    /// After `SessionLoaded` clears `loading_replay`, keep accepting this-session
+    /// `isReplay` until this instant (or the first this-session live update).
+    /// The load barrier may release on an Unrelated firehose timeout while
+    /// remaining replay still sits behind the ACP peek.
+    pub(crate) late_replay_until: Option<std::time::Instant>,
     /// Prompt ids whose durable `TurnCompleted` terminal arrived during THIS
     /// load's replay window (`loading_replay`). The running turn is not adopted
     /// until replay finishes, so a terminal seen mid-replay can't be finalized
@@ -911,7 +943,14 @@ pub struct AgentView {
     /// Gateway light-frontend session (`kind: "chat"` / `--chat` / conversation
     /// resume). Suppresses Build credits / local sampler context telemetry so the
     /// status bar and prompt never imply remote usage from wrong metrics.
+    /// OR'd with sticky `--chat` for UI/focus matching — not the ACP rename
+    /// `kind` bit; see [`Self::conversation_entry`].
     pub chat_kind: bool,
+    /// Whether this session opened on the chat lane (ACP `kind=chat`).
+    /// True for conversation-entry loads, `/chat` create, and sticky
+    /// `--chat` gateway resumes. False for history-bypass local-disk
+    /// Build rows (those keep [`Self::chat_kind`] for UI only).
+    pub conversation_entry: bool,
     /// Process-wide `--chat` (mirrors `AppView::chat_mode`; set via
     /// [`Self::apply_app_scoped_gates`]). UI policy only: hides picker
     /// source filter / delete / deep search on a conversations-only list.
@@ -937,10 +976,8 @@ pub struct AgentView {
     pub cleared_workflow_runs: std::collections::HashSet<String>,
     pub show_workflows: bool,
     pub workflows_view: crate::views::workflows::WorkflowsViewState,
-    /// Live `stop`/`stop_failure` hook runs held for the turn's terminal
-    /// marker (driver order: the hooks arrive before the `PromptResponse`
-    /// that pushes it). Consumed or flushed by `push_turn_terminal_marker`;
-    /// dropped on every replay-window entry.
+    /// Turn-end hook runs waiting for the turn's marker, which they race. Consumed or flushed
+    /// by `push_turn_terminal_marker`; dropped on every replay-window entry.
     pub(crate) pending_stop_hooks: Option<PendingStopHooks>,
     /// Goal id of the most recently cleared goal, captured from the dropped
     /// state (the `cleared` event itself carries an empty id). Drops a late
@@ -1370,6 +1407,10 @@ pub struct AgentView {
     /// per-request — stashing happens on the `empty -> non-empty` transition
     /// and restoring on the `non-empty -> empty` transition.
     pub permission_stashed_prompt: Option<StashedPrompt>,
+    /// `exit_plan_mode` deferred freeform prefill because permission owned the
+    /// keyboard. Cleared when `restore_permission_stashes` applies it (or plan
+    /// review ends). Must not run on unrelated restore calls (e.g. YOLO).
+    pub plan_freeform_prefill_deferred: bool,
     /// Scrollback focus stolen for a permission prompt; restored when the queue empties.
     pub permission_stashed_pane: Option<AgentPane>,
     /// Free-form "Always allow" pattern editor buffer for the front request.
@@ -1511,7 +1552,7 @@ pub struct AgentView {
     /// from disk on resume (`TaskResult::SessionMetaFromDisk`). Drives the
     /// prompt-border inline title and wins precedence for the dashboard
     /// modal label and the OSC terminal title. The on-disk write is
-    /// best-effort (failure surfaces a toast through the existing
+    /// best-effort (failure surfaces a system block through the existing
     /// `RenameSessionFailed` arm).
     pub display_name: Option<String>,
     /// Short title from shell `SessionSummaryGenerated` or `summary.json` on load/resume.
@@ -2448,7 +2489,7 @@ pub(crate) mod test_fixtures {
         assert!(
             matches!(
                 activity,
-                Some(TurnActivity::Waiting(WaitingReason::Subagent))
+                Some(TurnActivity::Waiting(WaitingReason::Subagent { .. }))
             ),
             "expected Subagent wait, got {activity:?}"
         );

@@ -13,13 +13,12 @@
 //! This is distinct from the `AuthCredentialProvider` HTTP consumers in
 //! [`crate::auth::credential_provider`].
 
-use super::AuthManager;
 use super::token_output::{expiry_after_seconds, parse_token_output};
 
 /// One named `[auth_provider.<name>]` table, honored only from the trusted
 /// config layers (`parse_auth_providers`). A new field here needs a
 /// `parse_auth_providers` warning decision.
-#[derive(Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default)]
 pub struct AuthProviderConfig {
     /// Command to run; without `args` it uses the platform shell, with `args` it execs directly.
@@ -32,21 +31,6 @@ pub struct AuthProviderConfig {
     pub timeout_secs: Option<u64>,
     /// Working directory for the command; a leading `~` expands to home.
     pub cwd: Option<String>,
-}
-
-impl std::fmt::Debug for AuthProviderConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthProviderConfig")
-            .field("command_present", &(!self.command.trim().is_empty()))
-            .field("args_count", &self.args.as_ref().map(Vec::len))
-            .field("token_ttl_secs", &self.token_ttl_secs)
-            .field("timeout_secs", &self.timeout_secs)
-            .field(
-                "cwd_present",
-                &self.cwd.as_ref().is_some_and(|cwd| !cwd.trim().is_empty()),
-            )
-            .finish()
-    }
 }
 
 impl AuthProviderConfig {
@@ -67,9 +51,6 @@ pub struct AuthProviderRef {
     /// joins the shared slot for its name.
     resolved: bool,
     fail_closed: bool,
-    /// Built-in native provider. Skipped by serde and reattached from trusted
-    /// configuration after deserialization, like the command config above.
-    native_codex: Option<std::sync::Arc<AuthManager>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -109,7 +90,6 @@ impl AuthProviderRef {
             slot,
             resolved: true,
             fail_closed: false,
-            native_codex: None,
         }
     }
 
@@ -122,7 +102,6 @@ impl AuthProviderRef {
             slot: ProviderSlot::default(),
             resolved: false,
             fail_closed: false,
-            native_codex: None,
         }
     }
 
@@ -133,7 +112,6 @@ impl AuthProviderRef {
             slot: ProviderSlot::default(),
             resolved: true,
             fail_closed: true,
-            native_codex: None,
         }
     }
 
@@ -151,74 +129,6 @@ impl AuthProviderRef {
         self.config = config.cloned().unwrap_or_default();
         self.slot = provider_slot(&self.name);
         self.resolved = true;
-        self.native_codex = None;
-    }
-
-    /// Attach the built-in provider-scoped Codex credential manager.
-    pub fn attach_openai_codex(&mut self, manager: std::sync::Arc<AuthManager>) {
-        self.config = AuthProviderConfig::default();
-        self.slot = ProviderSlot::default();
-        self.resolved = true;
-        self.fail_closed = false;
-        self.native_codex = Some(manager);
-    }
-
-    /// Construct a resolved native Codex provider reference.
-    pub fn openai_codex(manager: std::sync::Arc<AuthManager>) -> Self {
-        let mut provider = Self::unresolved("openai-codex".to_owned());
-        provider.attach_openai_codex(manager);
-        provider
-    }
-
-    /// Dynamic sampler resolver over this provider's atomic credential view.
-    pub(crate) fn bearer_resolver(&self) -> xai_grok_sampler::SharedBearerResolver {
-        std::sync::Arc::new(self.clone())
-    }
-}
-
-impl xai_grok_sampler::BearerResolver for AuthProviderRef {
-    fn current_bearer(&self) -> Option<String> {
-        self.cached_token()
-    }
-
-    fn current_credential(&self) -> Option<xai_grok_sampler::config::ProviderCredentialSnapshot> {
-        self.cached_credential().map(|credential| {
-            xai_grok_sampler::config::ProviderCredentialSnapshot {
-                access_token: credential.access_token,
-                account_id: credential.account_id,
-                chatgpt_account_is_fedramp: credential.chatgpt_account_is_fedramp,
-            }
-        })
-    }
-
-    fn current_credential_async(
-        &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Option<xai_grok_sampler::config::ProviderCredentialSnapshot>,
-                > + Send
-                + '_,
-        >,
-    > {
-        Box::pin(async move {
-            let current = self.cached_token();
-            let _ = self.ensure_fresh_token(current.as_deref()).await;
-            self.cached_credential().map(|credential| {
-                xai_grok_sampler::config::ProviderCredentialSnapshot {
-                    access_token: credential.access_token,
-                    account_id: credential.account_id,
-                    chatgpt_account_is_fedramp: credential.chatgpt_account_is_fedramp,
-                }
-            })
-        })
-    }
-
-    fn recover_rejected_credential_async<'a>(
-        &'a self,
-        rejected_bearer: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        Box::pin(async move { self.recover_rejected_token(rejected_bearer).await.is_some() })
     }
 }
 
@@ -238,7 +148,6 @@ impl std::fmt::Debug for AuthProviderRef {
             .field("name", &self.name)
             .field("config", &self.config)
             .field("resolved", &self.resolved)
-            .field("native_codex", &self.native_codex.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -250,8 +159,6 @@ struct MintedProviderToken {
     /// Drives the 401 fresh-mint guard.
     minted_at: std::time::Instant,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    account_id: Option<String>,
-    issuer: Option<String>,
     /// The table version that minted the token; a different version reads as
     /// stale (see [`token_identity`]), so edits re-mint.
     minted_with: AuthProviderConfig,
@@ -289,9 +196,11 @@ const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 30;
 /// outside the range is honored up to the bound and draws a parse warning,
 /// since a turn waits on the mint.
 pub(crate) const PROVIDER_TIMEOUT_CEILING_SECS: u64 = 600;
-/// Cap on the helper's captured stdout so a runaway command can't exhaust
-/// memory before the timeout fires. Stderr is drained without being retained.
+/// Caps on the helper's captured output so a runaway command can't exhaust
+/// memory before the timeout fires. A bearer (even a large JWT) is far under
+/// the stdout cap; stderr only ever appears truncated in the failure log.
 const PROVIDER_STDOUT_CAP_BYTES: u64 = 1 << 20; // 1 MiB
+const PROVIDER_STDERR_CAP_BYTES: u64 = 64 << 10; // 64 KiB
 
 /// The table fields that shape the minted token; a cached token minted under a
 /// different set reads as stale, so a config edit re-mints. Destructured so a
@@ -359,188 +268,7 @@ fn scrub_first_party_credentials(cmd: &mut tokio::process::Command) {
     }
 }
 
-/// Why a shell-backed helper did not produce an [`std::process::Output`].
-/// Display is the operator-facing mint error and must stay free of command,
-/// env, token, and helper stderr.
-#[derive(Debug)]
-enum HelperExecError {
-    Spawn(std::io::Error),
-    GroupSetup(std::io::Error),
-    Read(std::io::Error),
-    Wait(std::io::Error),
-    Timeout { secs: u64 },
-    StdoutCap,
-    NonzeroExit { status: std::process::ExitStatus },
-}
-
-impl std::fmt::Display for HelperExecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Spawn(err) => write!(f, "command failed to start: {err}"),
-            Self::GroupSetup(err) => write!(f, "process group setup failed: {err}"),
-            Self::Read(err) => write!(f, "reading command stdout: {err}"),
-            Self::Wait(err) => write!(f, "waiting on command: {err}"),
-            Self::Timeout { secs } => write!(f, "command timed out after {secs}s"),
-            Self::StdoutCap => write!(
-                f,
-                "command wrote more than {PROVIDER_STDOUT_CAP_BYTES} bytes to stdout"
-            ),
-            Self::NonzeroExit { status } => write!(f, "exited with {status}"),
-        }
-    }
-}
-
-impl std::error::Error for HelperExecError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Spawn(err) | Self::GroupSetup(err) | Self::Read(err) | Self::Wait(err) => {
-                Some(err)
-            }
-            Self::Timeout { .. } | Self::StdoutCap | Self::NonzeroExit { .. } => None,
-        }
-    }
-}
-
-/// Test-only cap on concurrent helper subprocesses. Production minting is
-/// unchanged; this exists so `cargo test auth::` cannot stampede the host.
-#[cfg(test)]
-pub(crate) const HELPER_TEST_CONCURRENCY: usize = 4;
-
-#[cfg(test)]
-static HELPER_TEST_PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> =
-    std::sync::OnceLock::new();
-
-#[cfg(test)]
-async fn acquire_helper_test_permit() -> tokio::sync::SemaphorePermit<'static> {
-    HELPER_TEST_PERMITS
-        .get_or_init(|| tokio::sync::Semaphore::new(HELPER_TEST_CONCURRENCY))
-        .acquire()
-        .await
-        .expect("auth-provider helper test semaphore is never closed")
-}
-
-/// Execution-only mint failure for test assertions. Never carries command,
-/// env, token, refresh token, or helper stderr.
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HelperMintFailure {
-    pub(crate) category: HelperExecCategory,
-    pub(crate) errno: Option<i32>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HelperExecCategory {
-    Spawn,
-    Read,
-    Wait,
-    Timeout,
-    NonzeroExit,
-}
-
-#[cfg(test)]
-impl HelperExecCategory {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Spawn => "spawn",
-            Self::Read => "read",
-            Self::Wait => "wait",
-            Self::Timeout => "timeout",
-            Self::NonzeroExit => "nonzero",
-        }
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Display for HelperMintFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.errno {
-            Some(errno) => write!(f, "category={} errno={errno}", self.category.as_str()),
-            None => write!(f, "category={}", self.category.as_str()),
-        }
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for HelperMintFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
-    }
-}
-
-#[cfg(test)]
-impl HelperExecError {
-    fn diagnostic(&self) -> HelperMintFailure {
-        match self {
-            Self::Spawn(err) | Self::GroupSetup(err) => HelperMintFailure {
-                category: HelperExecCategory::Spawn,
-                errno: err.raw_os_error(),
-            },
-            Self::Read(err) => HelperMintFailure {
-                category: HelperExecCategory::Read,
-                errno: err.raw_os_error(),
-            },
-            Self::Wait(err) => HelperMintFailure {
-                category: HelperExecCategory::Wait,
-                errno: err.raw_os_error(),
-            },
-            Self::Timeout { .. } => HelperMintFailure {
-                category: HelperExecCategory::Timeout,
-                errno: None,
-            },
-            Self::StdoutCap => HelperMintFailure {
-                category: HelperExecCategory::Read,
-                errno: None,
-            },
-            Self::NonzeroExit { status } => HelperMintFailure {
-                category: HelperExecCategory::NonzeroExit,
-                errno: status.code(),
-            },
-        }
-    }
-}
-
-#[cfg(test)]
-static LAST_HELPER_MINT_FAILURES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, HelperMintFailure>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-fn record_helper_mint_failure(name: &str, failure: Option<HelperMintFailure>) {
-    let mut map = LAST_HELPER_MINT_FAILURES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match failure {
-        Some(failure) => {
-            map.insert(name.to_owned(), failure);
-        }
-        None => {
-            map.remove(name);
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn helper_mint_failure(name: &str) -> Option<HelperMintFailure> {
-    LAST_HELPER_MINT_FAILURES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(name)
-        .copied()
-}
-
-fn helper_exec_to_anyhow(
-    #[cfg_attr(not(test), allow(unused_variables))] name: &str,
-    err: HelperExecError,
-) -> anyhow::Error {
-    #[cfg(test)]
-    record_helper_mint_failure(name, Some(err.diagnostic()));
-    anyhow::Error::new(err)
-}
-
-/// Spawn `cmd`, capture stdout with a byte cap and discard stderr (reading both
+/// Spawn `cmd`, capture stdout/stderr with a byte cap (reading both
 /// concurrently so a full pipe on one can't deadlock the other; a runaway helper
 /// is drained to a sink past the cap so it can't wedge the wait), and bound the
 /// whole run by `timeout`. Exceeding the stdout cap is an error.
@@ -550,62 +278,59 @@ fn helper_exec_to_anyhow(
 /// grandchildren -- and the `GROK_AUTH_PROVIDER_*` credentials in their env --
 /// do not outlive the reported timeout; `kill_on_drop` alone would reap only the
 /// direct child.
-///
-/// Test builds acquire a global 4-permit before spawn so helper fixtures cannot
-/// stampede the host. Production has no permit and no extra serialization.
 async fn run_capped(
     cmd: &mut tokio::process::Command,
     timeout: std::time::Duration,
-) -> Result<std::process::Output, HelperExecError> {
-    #[cfg(test)]
-    let _permit = acquire_helper_test_permit().await;
+) -> anyhow::Result<std::process::Output> {
     #[allow(clippy::disallowed_methods)] // killed at the timeout this call reports
-    let mut child = cmd.spawn().map_err(HelperExecError::Spawn)?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("command failed to start: {e}"))?;
     // Enroll the child's process group so the timeout path can tear down the
     // whole tree. Best-effort: if enrollment fails, `kill_on_drop` still reaps
     // the direct child.
-    let mut group =
-        xai_grok_tools::util::ProcessGroup::new().map_err(HelperExecError::GroupSetup)?;
+    let mut group = xai_grok_tools::util::ProcessGroup::new()
+        .map_err(|e| anyhow::anyhow!("process group setup failed: {e}"))?;
     if let Err(e) = group.attach(&child) {
         tracing::debug!(error = %e, "auth provider: could not enroll helper process group");
     }
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
 
     // One extra stdout byte so an over-cap write is detectable, not truncated.
-    // Stderr is provider-controlled and may contain credentials, so it is
-    // drained only to prevent a full pipe from blocking the helper.
+    // The stderr read is advisory (it only feeds the failure log), so only
+    // stdout governs the mint.
     let capture = async {
-        let mut stderr = tokio::io::BufReader::new(stderr);
-        let mut stderr_sink = tokio::io::sink();
         let (out_res, err_res) = tokio::join!(
             read_capped(stdout, PROVIDER_STDOUT_CAP_BYTES + 1, &mut out_buf),
-            tokio::io::copy(&mut stderr, &mut stderr_sink),
+            read_capped(stderr, PROVIDER_STDERR_CAP_BYTES, &mut err_buf),
         );
-        if err_res.is_err() {
-            tracing::debug!("auth provider: stderr drain failed");
+        if let Err(e) = err_res {
+            tracing::debug!(error = %e, "auth provider: stderr capture failed (advisory)");
         }
-        out_res.map_err(HelperExecError::Read)?;
-        child.wait().await.map_err(HelperExecError::Wait)
+        out_res.map_err(|e| anyhow::anyhow!("reading command stdout: {e}"))?;
+        child
+            .wait()
+            .await
+            .map_err(|e| anyhow::anyhow!("waiting on command: {e}"))
     };
 
     let status = match tokio::time::timeout(timeout, capture).await {
         Ok(res) => res?,
         Err(_elapsed) => {
             let _ = group.kill();
-            return Err(HelperExecError::Timeout {
-                secs: timeout.as_secs(),
-            });
+            anyhow::bail!("command timed out after {}s", timeout.as_secs());
         }
     };
     if out_buf.len() as u64 > PROVIDER_STDOUT_CAP_BYTES {
-        return Err(HelperExecError::StdoutCap);
+        anyhow::bail!("command wrote more than {PROVIDER_STDOUT_CAP_BYTES} bytes to stdout");
     }
     Ok(std::process::Output {
         status,
         stdout: out_buf,
-        stderr: Vec::new(),
+        stderr: err_buf,
     })
 }
 
@@ -690,27 +415,18 @@ async fn mint_provider_token(
     // Scrub last so nothing above can reintroduce a first-party credential.
     scrub_first_party_credentials(&mut cmd);
 
-    let output = run_capped(&mut cmd, std::time::Duration::from_secs(timeout_secs))
-        .await
-        .map_err(|err| helper_exec_to_anyhow(name, err))?;
-    if !output.status.success() {
-        return Err(helper_exec_to_anyhow(
-            name,
-            HelperExecError::NonzeroExit {
-                status: output.status,
-            },
-        ));
-    }
+    let output = run_capped(&mut cmd, std::time::Duration::from_secs(timeout_secs)).await?;
+
     let parsed = match parse_token_output(&output) {
         Ok(parsed) => parsed,
-        Err(err) => {
-            #[cfg(test)]
-            record_helper_mint_failure(name, None);
-            return Err(err);
+        Err(e) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "{e} (stderr: {})",
+                crate::util::truncate(stderr.trim(), 300)
+            );
         }
     };
-    #[cfg(test)]
-    record_helper_mint_failure(name, None);
     let expires_at = parsed
         .expires_at
         .or_else(|| config.token_ttl_secs.and_then(expiry_after_seconds))
@@ -726,36 +442,8 @@ async fn mint_provider_token(
         refresh_token: parsed.refresh_token,
         minted_at: std::time::Instant::now(),
         expires_at,
-        account_id: parsed.account_id,
-        issuer: parsed.issuer,
         minted_with: config.clone(),
     })
-}
-
-/// Atomic request-time credential view. Only these allowlisted fields cross
-/// the provider boundary; refresh tokens and id_tokens never do.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ProviderCredentialSnapshot {
-    pub access_token: String,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub account_id: Option<String>,
-    pub chatgpt_account_is_fedramp: bool,
-    pub issuer: Option<String>,
-}
-
-impl std::fmt::Debug for ProviderCredentialSnapshot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProviderCredentialSnapshot")
-            .field("access_token_present", &!self.access_token.is_empty())
-            .field("expires_at", &self.expires_at)
-            .field("account_id_present", &self.account_id.is_some())
-            .field(
-                "chatgpt_account_is_fedramp",
-                &self.chatgpt_account_is_fedramp,
-            )
-            .field("issuer_present", &self.issuer.is_some())
-            .finish()
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -778,25 +466,6 @@ impl ProviderRefreshOutcome {
             Self::Unchanged | Self::Unusable | Self::MintFailed => None,
         }
     }
-
-    /// Setup helper for helper-backed tests: a mint failure includes the
-    /// execution category/errno instead of collapsing to `None`.
-    #[cfg(test)]
-    #[track_caller]
-    pub(crate) fn expect_rotated(self, provider: &AuthProviderRef, what: &str) -> String {
-        match self {
-            Self::Rotated(token) => token,
-            Self::MintFailed => {
-                let detail = helper_mint_failure(&provider.name)
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "unclassified".to_owned());
-                panic!("{what}: helper mint failed ({detail})")
-            }
-            Self::Unchanged => panic!("{what}: expected Rotated, got Unchanged"),
-            Self::Unusable => panic!("{what}: expected Rotated, got Unusable"),
-        }
-    }
 }
 
 impl AuthProviderRef {
@@ -806,7 +475,7 @@ impl AuthProviderRef {
     async fn locked_slot(
         &self,
     ) -> Option<tokio::sync::OwnedMutexGuard<Option<MintedProviderToken>>> {
-        if !self.resolved || self.native_codex.is_some() {
+        if !self.resolved {
             return None;
         }
         let mut slot = self.slot.clone().lock_owned().await;
@@ -829,24 +498,8 @@ impl AuthProviderRef {
     /// mutates. `None` for an unresolved ref, a cold or stale cache, or a mint
     /// in progress; minting happens pre-turn via [`AuthProviderRef::ensure_fresh_token`].
     pub(crate) fn cached_token(&self) -> Option<String> {
-        self.cached_credential()
-            .map(|credential| credential.access_token)
-    }
-
-    /// Cache-only atomic access-token/account snapshot for request assembly.
-    pub fn cached_credential(&self) -> Option<ProviderCredentialSnapshot> {
         if !self.resolved {
             return None;
-        }
-        if let Some(manager) = &self.native_codex {
-            let auth = manager.current()?;
-            return Some(ProviderCredentialSnapshot {
-                access_token: auth.key,
-                expires_at: auth.expires_at,
-                account_id: auth.account_id,
-                chatgpt_account_is_fedramp: auth.chatgpt_account_is_fedramp,
-                issuer: auth.oidc_issuer,
-            });
         }
         if !self.config.is_usable() {
             if !self.fail_closed {
@@ -863,20 +516,7 @@ impl AuthProviderRef {
         guard
             .as_ref()
             .filter(|m| !minted_token_is_stale(m, &self.config))
-            .map(|m| ProviderCredentialSnapshot {
-                access_token: m.token.clone(),
-                expires_at: m.expires_at,
-                account_id: m.account_id.clone(),
-                chatgpt_account_is_fedramp: false,
-                issuer: m.issuer.clone(),
-            })
-    }
-
-    /// Read-only readiness state for the built-in Codex provider.
-    pub fn openai_codex_status(&self) -> Option<crate::auth::openai_codex::CodexAuthStatus> {
-        self.native_codex
-            .as_deref()
-            .map(crate::auth::openai_codex::status)
+            .map(|m| m.token.clone())
     }
 
     /// The token that should replace `current_key` on the wire: serves the
@@ -887,18 +527,6 @@ impl AuthProviderRef {
         &self,
         current_key: Option<&str>,
     ) -> ProviderRefreshOutcome {
-        if let Some(manager) = &self.native_codex {
-            return match manager.auth().await {
-                Ok(auth) if current_key == Some(auth.key.as_str()) => {
-                    ProviderRefreshOutcome::Unchanged
-                }
-                Ok(auth) => ProviderRefreshOutcome::Rotated(auth.key),
-                Err(error) => {
-                    tracing::warn!(error = %error, "native Codex auth unavailable");
-                    ProviderRefreshOutcome::MintFailed
-                }
-            };
-        }
         let Some(mut slot) = self.locked_slot().await else {
             return ProviderRefreshOutcome::Unusable;
         };
@@ -934,21 +562,6 @@ impl AuthProviderRef {
     /// under the current table (the fresh-mint guard, which an edited table
     /// bypasses).
     pub(crate) async fn recover_rejected_token(&self, rejected_key: &str) -> Option<String> {
-        if let Some(manager) = &self.native_codex {
-            let current = manager.current_or_expired()?;
-            if current.key != rejected_key {
-                return Some(current.key);
-            }
-            let token_type = crate::auth::token_type::TokenType::from_auth(Some(&current));
-            return manager
-                .refresh_chain(
-                    token_type,
-                    crate::auth::manager::RefreshReason::ServerRejected,
-                )
-                .await
-                .ok()
-                .map(|auth| auth.key);
-        }
         let mut slot = self.locked_slot().await?;
         if let Some(ref minted) = *slot {
             if minted.token != rejected_key && !minted_token_is_stale(minted, &self.config) {

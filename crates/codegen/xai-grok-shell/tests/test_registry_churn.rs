@@ -27,6 +27,7 @@ struct Counts {
     resident_resources: usize,
     retained_resources: usize,
     dispatch_locks: usize,
+    live_orphan_heal_locks: usize,
     session_turn_numbers: usize,
     permission_event_receivers: usize,
     model_unavailable_sessions: usize,
@@ -79,15 +80,10 @@ async fn churn_one(conn: &acp::ClientSideConnection, cwd: &std::path::Path, labe
 }
 #[test]
 fn session_churn_returns_registry_snapshot_to_baseline() {
-    run_agent_test(|cwd, mock| async move {
-        let inference_base_url = mock.url();
-        let conn = connect_and_auth(
-            AutoApproveClient,
-            "registry-churn-test",
-            &inference_base_url,
-        )
-        .await
-        .0;
+    run_agent_test(|cwd, _mock| async move {
+        let conn = connect_and_auth(AutoApproveClient, "registry-churn-test")
+            .await
+            .0;
         churn_one(&conn, &cwd, 0).await;
         let baseline = settled_counts(&conn).await;
         assert_eq!(

@@ -25,6 +25,7 @@ pub struct ReposListReq {}
 
 impl WorkspaceRpc for ReposListReq {
     const METHOD: &'static str = "workspace.repos_list";
+    const ACTIVITY: super::RpcActivityClass = super::RpcActivityClass::Read;
     type Response = ReposListResponse;
 }
 
@@ -76,6 +77,17 @@ impl RepoManifest {
 
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec_pretty(self)
+    }
+
+    pub fn materialized_mounts(&self, workspace_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        if self.repos.is_empty() {
+            vec![workspace_root.to_path_buf()]
+        } else {
+            self.repos
+                .iter()
+                .map(|r| workspace_root.join(&r.mount_path))
+                .collect()
+        }
     }
 }
 

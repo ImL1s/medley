@@ -390,7 +390,7 @@ pub struct McpState {
     /// Stashed registrations for disabled tools so they can be re-enabled
     /// without a full MCP re-init (no need to call `list_tools` again).
     pub disabled_tool_registrations: HashMap<String, McpToolRegistration>,
-    event_writer: xai_file_utils::events::EventWriter,
+    event_writer: xai_grok_session_events::EventWriter,
     /// Sender wired by the session actor to its `StatusDispatcher`
     /// task.  When `Some`, the state — and every [`McpClient`] reached
     /// through [`Self::all_clients`] / [`Self::get_client`] — forwards
@@ -437,7 +437,7 @@ impl McpState {
             init_failed: HashMap::new(),
             disabled_tools: HashMap::new(),
             disabled_tool_registrations: HashMap::new(),
-            event_writer: xai_file_utils::events::EventWriter::noop(),
+            event_writer: xai_grok_session_events::EventWriter::noop(),
             client_event_tx: None,
         }
     }
@@ -481,11 +481,11 @@ impl McpState {
         self.client_event_tx.clone()
     }
 
-    pub fn set_event_writer(&mut self, writer: xai_file_utils::events::EventWriter) {
+    pub fn set_event_writer(&mut self, writer: xai_grok_session_events::EventWriter) {
         self.event_writer = writer;
     }
 
-    pub fn event_writer(&self) -> &xai_file_utils::events::EventWriter {
+    pub fn event_writer(&self) -> &xai_grok_session_events::EventWriter {
         &self.event_writer
     }
 
@@ -1169,8 +1169,8 @@ impl McpError {
         matches!(self, Self::Timeout { .. })
     }
 
-    pub fn error_category(&self) -> xai_file_utils::events::McpErrorCategory {
-        use xai_file_utils::events::McpErrorCategory;
+    pub fn error_category(&self) -> xai_grok_session_events::McpErrorCategory {
+        use xai_grok_session_events::McpErrorCategory;
         match self {
             Self::SpawnFailed { .. } => McpErrorCategory::SpawnFailed,
             Self::Timeout { .. } => McpErrorCategory::Timeout,
@@ -1462,7 +1462,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         let tool = &self.tool.name;
         let tool_timeout = client.tool_timeout_for(tool);
         let qualified_name = format!("{}{}{}", server, MCP_TOOL_NAME_DELIMITER, tool);
-        event_writer.emit(xai_file_utils::events::Event::McpToolCallStarted {
+        event_writer.emit(xai_grok_session_events::Event::McpToolCallStarted {
             server_name: server.clone(),
             tool_name: tool.clone(),
             call_id: qualified_name.clone(),
@@ -1481,7 +1481,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
             Err(first_err) if client.has_auth() => {
                 auth_retry_attempted = true;
                 let reauth_ok = client.force_reauth(false).await;
-                ew.emit(xai_file_utils::events::Event::McpAuthRetry {
+                ew.emit(xai_grok_session_events::Event::McpAuthRetry {
                     server_name: server.clone(),
                     trigger: "tool_call_failed".to_string(),
                     success: reauth_ok,
@@ -1502,7 +1502,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         let call_result = match dispatch_result {
             Ok(result) => result,
             Err(e) => {
-                ew.emit(xai_file_utils::events::Event::McpToolCallCompleted {
+                ew.emit(xai_grok_session_events::Event::McpToolCallCompleted {
                     server_name: server.clone(),
                     tool_name: tool.clone(),
                     call_id: qualified_name,
@@ -1568,7 +1568,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         } else {
             None
         };
-        event_writer.emit(xai_file_utils::events::Event::McpToolCallCompleted {
+        event_writer.emit(xai_grok_session_events::Event::McpToolCallCompleted {
             server_name: server.clone(),
             tool_name: tool.clone(),
             call_id: qualified_name.clone(),
@@ -1706,7 +1706,7 @@ impl McpErasedTool {
         raw: &serde_json::Value,
         reconnect_attempted: &mut bool,
         is_timeout: &mut bool,
-        ew: &xai_file_utils::events::EventWriter,
+        ew: &xai_grok_session_events::EventWriter,
     ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
         let mcp_service = client
             .ensure_initialized()
@@ -1775,7 +1775,7 @@ impl McpErasedTool {
         _original_err: ServiceError,
         reconnect_attempted: &mut bool,
         is_timeout: &mut bool,
-        ew: &xai_file_utils::events::EventWriter,
+        ew: &xai_grok_session_events::EventWriter,
     ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
         *reconnect_attempted = true;
         tracing::warn!(
@@ -1784,22 +1784,22 @@ impl McpErasedTool {
             error_class = "transport_error",
             "MCP transport error, attempting reconnect"
         );
-        ew.emit(xai_file_utils::events::Event::McpTransportError {
+        ew.emit(xai_grok_session_events::Event::McpTransportError {
             server_name: self.tool.server_name.clone(),
             tool_name: self.tool.name.clone(),
             error: "transport_error".to_string(),
         });
         let mcp_service = match client.recover().await {
             Ok(service) => {
-                ew.emit(xai_file_utils::events::Event::McpTransportReconnect {
+                ew.emit(xai_grok_session_events::Event::McpTransportReconnect {
                     server_name: self.tool.server_name.clone(),
                     success: true,
                     error: None,
                 });
                 service
             }
-            Err(_) => {
-                ew.emit(xai_file_utils::events::Event::McpTransportReconnect {
+            Err(e) => {
+                ew.emit(xai_grok_session_events::Event::McpTransportReconnect {
                     server_name: self.tool.server_name.clone(),
                     success: false,
                     error: Some("reconnect_failed".to_string()),
@@ -1999,7 +1999,7 @@ where
     /// drop the writer — mirrors rmcp's own `AsyncRwTransport`.
     write: Arc<Mutex<Option<W>>>,
     server_name: String,
-    event_writer: xai_file_utils::events::EventWriter,
+    event_writer: xai_grok_session_events::EventWriter,
 }
 
 /// A line that failed to deserialize but is a JSON *notification* (an object
@@ -2022,7 +2022,7 @@ where
         read: R,
         write: W,
         server_name: String,
-        event_writer: xai_file_utils::events::EventWriter,
+        event_writer: xai_grok_session_events::EventWriter,
     ) -> Self {
         Self {
             read: BufReader::new(read),
@@ -2042,7 +2042,7 @@ where
             "Skipping undecodable MCP stdout line; keeping transport alive",
         );
         self.event_writer
-            .emit(xai_file_utils::events::Event::McpTransportDecodeError {
+            .emit(xai_grok_session_events::Event::McpTransportDecodeError {
                 server_name: self.server_name.clone(),
                 error: "invalid_json_rpc".to_string(),
             });
@@ -2154,7 +2154,7 @@ impl SafeTokioChildProcess {
         mut cmd: Command,
         scope: Option<&ProcessScope>,
         server_name: String,
-        event_writer: xai_file_utils::events::EventWriter,
+        event_writer: xai_grok_session_events::EventWriter,
     ) -> std::io::Result<(Self, Option<ChildStderr>)> {
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -3674,10 +3674,10 @@ impl McpClient {
                 xai_grok_version::VERSION.to_string(),
             ),
         )
-        // rmcp's default `ProtocolVersion` tracks its LATEST; pin explicitly
-        // so the advertised protocol only changes deliberately, never as a
-        // side effect of an rmcp bump.
-        .with_protocol_version(rmcp::model::ProtocolVersion::V_2025_06_18)
+        // This pin currently equals rmcp 2.1 LATEST, but the explicit setter
+        // must remain so a future rmcp bump cannot silently move the wire
+        // (including to 2026-07-28).
+        .with_protocol_version(rmcp::model::ProtocolVersion::V_2025_11_25)
     }
 
     /// Build the [`GrokClientHandler`] that drives `client.serve(...)`.
@@ -4234,10 +4234,19 @@ fn stdio_path_override(env: &[acp::EnvVariable]) -> Option<&str> {
         .map(|e| e.value.as_str())
 }
 
+fn apply_stdio_env(cmd: &mut Command, env: &[acp::EnvVariable], session_id: Option<&str>) {
+    for env_variable in env {
+        cmd.env(&env_variable.name, &env_variable.value);
+    }
+    if let Some(session_id) = session_id {
+        cmd.env("GROK_SESSION_ID", session_id);
+    }
+}
+
 /// Borrowed cross-cutting spawn context whose `scope`, when set, enrolls the stdio child for session-close reaping.
 pub struct McpSpawnCtx<'a> {
     pub(crate) session_id: Option<&'a str>,
-    pub(crate) event_writer: &'a xai_file_utils::events::EventWriter,
+    pub(crate) event_writer: &'a xai_grok_session_events::EventWriter,
     pub(crate) mode: OauthInteractivity,
     pub(crate) scope: Option<&'a ProcessScope>,
 }
@@ -4245,7 +4254,7 @@ pub struct McpSpawnCtx<'a> {
 impl<'a> McpSpawnCtx<'a> {
     pub fn for_session(
         session_id: &'a str,
-        event_writer: &'a xai_file_utils::events::EventWriter,
+        event_writer: &'a xai_grok_session_events::EventWriter,
         mode: OauthInteractivity,
         scope: Option<&'a ProcessScope>,
     ) -> Self {
@@ -4257,7 +4266,7 @@ impl<'a> McpSpawnCtx<'a> {
         }
     }
 
-    pub fn session_less(event_writer: &'a xai_file_utils::events::EventWriter) -> Self {
+    pub fn session_less(event_writer: &'a xai_grok_session_events::EventWriter) -> Self {
         Self {
             session_id: None,
             event_writer,
@@ -4303,9 +4312,7 @@ pub async fn start_mcp_server(
             });
             let mut cmd = Command::new(&program);
             cmd.kill_on_drop(true).args(&spawn_args);
-            for env_variable in &env {
-                cmd.env(&env_variable.name, &env_variable.value);
-            }
+            apply_stdio_env(&mut cmd, &env, ctx.session_id);
             xai_grok_tools::util::detach_command(&mut cmd);
 
             let (transport, stderr_handle) = SafeTokioChildProcess::spawn(
@@ -4396,7 +4403,7 @@ pub async fn start_mcp_server(
                             "OAuth discovery timed out"
                         );
                         ctx.event_writer.emit(
-                            xai_file_utils::events::Event::McpOAuthDiscoveryTimeout {
+                            xai_grok_session_events::Event::McpOAuthDiscoveryTimeout {
                                 server_name: name.clone(),
                                 url: String::new(),
                             },
@@ -4701,7 +4708,7 @@ mod tests {
             client_in,
             tokio::io::sink(),
             "fwbuild".to_string(),
-            xai_file_utils::events::EventWriter::noop(),
+            xai_grok_session_events::EventWriter::noop(),
         );
 
         let valid = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
@@ -4734,7 +4741,7 @@ mod tests {
         let capture = LogCapture::default();
         let _guard = tracing::subscriber::set_default(capture.clone());
         let tmp = tempfile::tempdir().expect("temp event dir");
-        let event_writer = xai_file_utils::events::EventWriter::open(tmp.path());
+        let event_writer = xai_grok_session_events::EventWriter::open(tmp.path());
         let (mut server_out, client_in) = tokio::io::duplex(64 * 1024);
         let mut transport = ResilientRwTransport::new(
             client_in,
@@ -4803,7 +4810,7 @@ mod tests {
             "sentinel-server".to_owned(),
             projected.to_owned(),
         );
-        let event = xai_file_utils::events::Event::McpToolCallCompleted {
+        let event = xai_grok_session_events::Event::McpToolCallCompleted {
             server_name: "sentinel-server".to_owned(),
             tool_name: "sentinel-tool".to_owned(),
             call_id: "sentinel-call".to_owned(),
@@ -5036,7 +5043,7 @@ mod tests {
                 cmd,
                 None,
                 "test".to_string(),
-                xai_file_utils::events::EventWriter::noop(),
+                xai_grok_session_events::EventWriter::noop(),
             )
             .expect("spawn test child");
             let pid = transport.id().expect("spawned child pid");
@@ -5083,7 +5090,7 @@ mod tests {
             cmd,
             Some(&scope),
             "wedge-test".to_string(),
-            xai_file_utils::events::EventWriter::noop(),
+            xai_grok_session_events::EventWriter::noop(),
         )
         .expect("spawn enrolled MCP child");
         assert_eq!(
@@ -6492,7 +6499,7 @@ mod tests {
 
         let mut reconnect_attempted = false;
         let mut is_timeout = false;
-        let ew = xai_file_utils::events::EventWriter::noop();
+        let ew = xai_grok_session_events::EventWriter::noop();
 
         let err = tool
             .recover_and_retry(
@@ -6684,7 +6691,7 @@ mod tests {
         let client = fake_http_client(&url, 5);
         let tool = fake_echo_tool();
         let tmp = tempfile::tempdir().unwrap();
-        let ew = xai_file_utils::events::EventWriter::open(tmp.path());
+        let ew = xai_grok_session_events::EventWriter::open(tmp.path());
 
         let mut reconnect = false;
         let mut is_timeout = false;
@@ -6731,7 +6738,7 @@ mod tests {
             spawn_fake_mcp(CallToolBehavior::AlwaysError { code: -32603 }).await;
         let client = fake_http_client(&url, 5);
         let tool = fake_echo_tool();
-        let ew = xai_file_utils::events::EventWriter::noop();
+        let ew = xai_grok_session_events::EventWriter::noop();
 
         let mut reconnect = false;
         let mut is_timeout = false;
@@ -6758,7 +6765,7 @@ mod tests {
             spawn_fake_mcp(CallToolBehavior::AlwaysError { code: -32602 }).await;
         let client = fake_http_client(&url, 5);
         let tool = fake_echo_tool();
-        let ew = xai_file_utils::events::EventWriter::noop();
+        let ew = xai_grok_session_events::EventWriter::noop();
 
         let mut reconnect = false;
         let mut is_timeout = false;
@@ -6781,7 +6788,7 @@ mod tests {
             spawn_fake_mcp(CallToolBehavior::HangThenOk { hang_ms: 3000 }).await;
         let client = fake_http_client(&url, 1);
         let tool = fake_echo_tool();
-        let ew = xai_file_utils::events::EventWriter::noop();
+        let ew = xai_grok_session_events::EventWriter::noop();
 
         let mut reconnect = false;
         let mut is_timeout = false;
@@ -6833,7 +6840,7 @@ mod tests {
         .await;
         let client = fake_http_client(&url, 1);
         let tool = fake_echo_tool();
-        let ew = xai_file_utils::events::EventWriter::noop();
+        let ew = xai_grok_session_events::EventWriter::noop();
 
         let mut reconnect = false;
         let mut is_timeout = false;
@@ -7283,7 +7290,7 @@ mod tests {
         let raw = serde_json::json!({ "text": "after reconnect" });
         let mut reconnect_attempted = false;
         let mut is_timeout = false;
-        let ew = xai_file_utils::events::EventWriter::noop();
+        let ew = xai_grok_session_events::EventWriter::noop();
         let result = erased
             .try_call_tool(
                 &client,
@@ -7354,7 +7361,7 @@ mod tests {
         };
         assert!(matches!(
             err.error_category(),
-            xai_file_utils::events::McpErrorCategory::AuthRequired
+            xai_grok_session_events::McpErrorCategory::AuthRequired
         ));
     }
 

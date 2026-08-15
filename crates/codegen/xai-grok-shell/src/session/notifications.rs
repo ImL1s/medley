@@ -23,10 +23,6 @@ pub(crate) struct NotificationSender {
     pub gateway_enabled: Arc<AtomicBool>,
     /// Persistence channel for writing updates to disk.
     pub persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
-    /// True only when the session was explicitly constructed with
-    /// [`PersistenceHandle::noop`](crate::session::persistence::PersistenceHandle::noop).
-    /// A closed real persistence channel must not be mistaken for this case.
-    pub persistence_is_noop: bool,
     pub disk_full: watch::Receiver<bool>,
 }
 

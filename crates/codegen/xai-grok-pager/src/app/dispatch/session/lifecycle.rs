@@ -762,6 +762,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
     let chat_kind = consume_chat_kind(app);
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.chat_kind = chat_kind;
+        agent.conversation_entry = chat_kind;
         #[cfg(feature = "local-workspace")]
         {
             let local_intent = match &app.welcome_session_local_workspace {
@@ -930,6 +931,7 @@ pub(in crate::app::dispatch) fn dispatch_delete_current_session_answered(
             .map(|task_id| Effect::KillBgTask {
                 session_id: session_id.clone(),
                 task_id,
+                source: xai_grok_shell::extensions::task::TaskKillSource::Teardown,
             }),
     );
     app.show_toast("Deleting session\u{2026}");
@@ -1276,6 +1278,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             &app.tier_restricted_commands,
         );
         agent.chat_kind = chat_kind;
+        agent.conversation_entry = chat_kind;
         #[cfg(feature = "local-workspace")]
         {
             let local_intent = match &app.welcome_session_local_workspace {
@@ -1369,7 +1372,6 @@ pub(in crate::app::dispatch) fn handle_session_created(
     session_id: acp::SessionId,
     new_models: Option<acp::SessionModelState>,
     scheduler_background_loops: Option<bool>,
-    web_search_disabled: Option<xai_grok_shell::session::WebSearchDisabledNotice>,
 ) -> Vec<Effect> {
     let agent_count = app.agents.len();
     let app_chat_mode = app.chat_mode;
@@ -1383,18 +1385,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
         // client had bound the session id. Rendered through the same
         // `apply_session_event` arm the notification used, so the renderer and
         // its test stay live rather than orphaned by the sender's removal.
-        if let Some(notice) = web_search_disabled {
-            crate::app::acp_handler::apply_session_event(
-                &xai_grok_shell::extensions::notification::SessionUpdate::WebSearchDisabled {
-                    model_id: notice.model_id,
-                    reason: notice.reason,
-                    message: notice.message,
-                },
-                &mut agent.session,
-                &mut agent.scrollback,
-                is_api_key_auth,
-            );
-        }
+        // Notice is logged/rendered through the shared session update handler.
         let session_id_clone = session_id.clone();
         if agent.session.created_via_new
             && agent_count > 1
@@ -1629,6 +1620,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
+            nonce: 0,
         });
         if let Some(mode) = deferred_mode {
             effects.push(Effect::SetSessionMode {
@@ -1673,25 +1665,13 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
     session_cwd: std::path::PathBuf,
     new_models: Option<acp::SessionModelState>,
     scheduler_background_loops: Option<bool>,
-    web_search_disabled: Option<xai_grok_shell::session::WebSearchDisabledNotice>,
 ) -> Vec<Effect> {
     // Captured before the `agents` borrow, as in `handle_session_created`.
     let is_api_key_auth = app.is_api_key_auth;
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         // #161: same treatment as the non-worktree path — a worktree session is
         // still a fresh session whose response carries the notice.
-        if let Some(notice) = web_search_disabled {
-            crate::app::acp_handler::apply_session_event(
-                &xai_grok_shell::extensions::notification::SessionUpdate::WebSearchDisabled {
-                    model_id: notice.model_id,
-                    reason: notice.reason,
-                    message: notice.message,
-                },
-                &mut agent.session,
-                &mut agent.scrollback,
-                is_api_key_auth,
-            );
-        }
+        // Notice is logged/rendered through the shared session update handler.
         agent.session.finish_command();
         agent.mark_turn_finished();
         let session_id_clone = session_id.clone();
@@ -1779,6 +1759,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
+            nonce: 0,
         });
         if let Some(mode) = deferred_mode {
             effects.push(Effect::SetSessionMode {
@@ -2116,14 +2097,11 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 );
             }
             Err(SwitchModelError::HarnessUnavailable {
-                error,
                 prev_model_id: error_prev,
+                ..
             }) => {
                 let fallback = error_prev.as_ref().or(prev_model_id.as_ref());
-                let message = format!(
-                    "Couldn't switch to model '{}': required harness '{}' is unavailable ({}).",
-                    error.model_id, error.required_agent_type, error.reason,
-                );
+                let message = "Couldn't switch to model: required harness is unavailable.".to_string();
                 agent.scrollback.push_block(RenderBlock::system(message));
                 restore_model_switch_mirrors(
                     agent,

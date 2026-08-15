@@ -2,16 +2,15 @@
 //! with [`synth::prepare_session`], then confirm the production replay reader
 //! parses every persisted update back with the right per-kind counts.
 //!
-//! `load_updates_for_replay_at` is the typed reader and keeps every ACP update
-//! (plus `AttemptDiscarded`; other `Xai` updates are dropped); the
-//! redundant-ACU skip is a later line-based step in the client replay path,
-//! not asserted here.
+//! `load_updates_for_replay_at` is the typed reader and keeps every update
+//! (only `Xai` updates are dropped); the redundant-ACU skip is a later
+//! line-based step in the client replay path, not asserted here.
 
 use agent_client_protocol as acp;
 use tempfile::TempDir;
 
 use xai_grok_shell::session::storage::{
-    JsonlStorageAdapter, ReplayUpdate, StorageAdapter, load_updates_for_replay_at,
+    JsonlStorageAdapter, StorageAdapter, load_updates_for_replay_at,
 };
 use xai_grok_shell::session::testkit::synth::{self, SessionSpec};
 
@@ -38,14 +37,7 @@ async fn synth_replay_roundtrip_parses_every_persisted_update() {
         .expect("load_updates_for_replay_at")
         .unwrap_or_default();
 
-    let acp_only: Vec<&acp::SessionUpdate> = replayed
-        .iter()
-        .filter_map(|u| match u {
-            ReplayUpdate::Acp(a) => Some(a),
-            ReplayUpdate::AttemptDiscarded => None,
-        })
-        .collect();
-    let count = |pred: fn(&acp::SessionUpdate) -> bool| acp_only.iter().filter(|u| pred(u)).count();
+    let count = |pred: fn(&acp::SessionUpdate) -> bool| replayed.iter().filter(|u| pred(u)).count();
     let users = count(|u| matches!(u, acp::SessionUpdate::UserMessageChunk(_)));
     let acus = count(|u| matches!(u, acp::SessionUpdate::AvailableCommandsUpdate(_)));
     let agents = count(|u| matches!(u, acp::SessionUpdate::AgentMessageChunk(_)));
@@ -62,21 +54,21 @@ async fn synth_replay_roundtrip_parses_every_persisted_update() {
         "every agent chunk is preserved"
     );
     assert_eq!(
-        acp_only.len(),
+        replayed.len(),
         spec.turns * (1 + spec.acu_per_turn + spec.agent_chunks_per_turn),
-        "no ACP update is dropped or duplicated by the typed replay reader"
+        "no update is dropped or duplicated by the typed replay reader"
     );
 }
 
 /// The adapter-driven bench generator reaches its byte target and emits updates
-/// the production reader parses. Synchronous because `synthesize_to_target_bytes`
-/// drives the adapter on its own runtime.
+/// the production reader parses. Uses the blocking wrapper because this is a
+/// synchronous `#[test]` with no ambient runtime.
 #[test]
-fn synthesize_to_target_bytes_reaches_target_and_parses() {
+fn make_session_with_size_reaches_target_and_parses() {
     let root = TempDir::new().unwrap();
     let target: u64 = 8 * 1024;
 
-    let info = synth::synthesize_to_target_bytes(root.path(), target);
+    let info = synth::make_session_with_size_blocking(root.path(), target);
 
     let adapter = JsonlStorageAdapter::with_root(root.path().to_path_buf());
     let updates_path = adapter.updates_file_path(&info).expect("updates path");

@@ -1,71 +1,19 @@
 use std::borrow::Cow;
 
 use thiserror::Error;
-use xai_grok_config::program_name::program_name_for_instruction;
-
-/// Instruction to run login, or a command-free alternative when the invoked
-/// name is unusable (#117).
-pub(crate) fn with_login_instruction(
-    when_named: impl FnOnce(&str) -> String,
-    when_unnamed: &str,
-) -> String {
-    match program_name_for_instruction() {
-        Some(prog) => when_named(prog),
-        None => when_unnamed.to_owned(),
-    }
-}
-
-fn not_logged_in_msg() -> String {
-    with_login_instruction(
-        |prog| format!("Not logged in. Run `{prog} login`."),
-        "Not logged in. Sign in again.",
-    )
-}
-
-fn token_expired_msg() -> String {
-    with_login_instruction(
-        |prog| format!("Token expired. Run `{prog} login` to re-authenticate."),
-        "Token expired. Sign in again to re-authenticate.",
-    )
-}
-
-fn server_rejected_msg() -> String {
-    with_login_instruction(
-        |prog| format!("Authentication rejected by server. Run `{prog} login` to re-authenticate."),
-        "Authentication rejected by server. Sign in again to re-authenticate.",
-    )
-}
-
-fn pinned_team_suffix() -> String {
-    with_login_instruction(
-        |prog| format!(" Run `{prog} login` to sign in with the required team."),
-        " Sign in again with the required team.",
-    )
-}
-
-fn api_key_auth_disabled_msg() -> String {
-    with_login_instruction(
-        |prog| {
-            format!(
-                "API-key auth is disabled by your administrator. Run `{prog} login` to authenticate."
-            )
-        },
-        "API-key auth is disabled by your administrator. Sign in to authenticate.",
-    )
-}
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AuthError {
-    #[error("{}", not_logged_in_msg())]
+    #[error("Not logged in. Run `grok login`.")]
     NotLoggedIn,
 
     /// Token expired and no refresh authority available.
-    #[error("{}", token_expired_msg())]
+    #[error("Token expired. Run `grok login` to re-authenticate.")]
     TokenExpiredNoRefresh,
 
     /// Server rejected the token (401) with no recovery path.
-    #[error("{}", server_rejected_msg())]
+    #[error("Authentication rejected by server. Run `grok login` to re-authenticate.")]
     ServerRejectedNoRecovery,
 
     /// All recovery strategies exhausted.
@@ -74,11 +22,11 @@ pub enum AuthError {
 
     /// A session's team principal violates the `force_login_team_uuid` pin.
     /// `message` states which team is required vs. returned.
-    #[error("{}{}", .message, pinned_team_suffix())]
+    #[error("{message} Run `grok login` to sign in with the required team.")]
     PinnedTeamMismatch { message: String },
 
     /// Cached API-key session rejected because API-key auth is disabled.
-    #[error("{}", api_key_auth_disabled_msg())]
+    #[error("API-key auth is disabled by your administrator. Run `grok login` to authenticate.")]
     ApiKeyAuthDisabled,
 
     /// Outcome of a refresh-authority attempt. Recoverability (and, for
@@ -109,8 +57,65 @@ pub enum RefreshTokenError {
 /// don't surface bare; the permanent arm derives its copy from
 /// [`RefreshTokenFailedReason::user_message`] and is not prefixed.
 #[derive(Debug, Error)]
-#[error("auth refresh failed: {0}")]
-pub struct RefreshTransientError(#[source] Box<dyn std::error::Error + Send + Sync>);
+#[error("auth refresh failed: {source}")]
+pub struct RefreshTransientError {
+    #[source]
+    source: Box<dyn std::error::Error + Send + Sync>,
+    reason: TransientReason,
+}
+
+/// Why the refresh path returned a transient error — machine-readable so
+/// callers can branch and telemetry can count the deferral classes apart
+/// (they all share one `Transient` message otherwise). `Other` covers
+/// causes carried in the source error (network, 5xx, persist failures).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransientReason {
+    /// Deferred: system sleep imminent (sleep gate raised).
+    SleepGate,
+    /// Deferred: dark wake (background consumer, or user-facing within the
+    /// deferral budget).
+    DarkWakeDeferred,
+    /// Deferred: consumed-RT sentinel present; retrying only at full wake.
+    SentinelAwaitingWake,
+    /// This failure straddled a suspend and recorded the suspect-RT
+    /// sentinel; the retry goes through the gate's election.
+    StraddleSuspectRecorded,
+    /// Aborted: the `auth.json.lock` died between the sentinel election and
+    /// the retry stamp; retrying re-runs the election under a fresh lock.
+    SentinelLockLost,
+    /// Aborted: the sentinel retry stamp could not be written; a process
+    /// that cannot write the stamp must not present the suspect RT.
+    SentinelStampFailed,
+    /// Deferred: another process holds the sentinel retry election.
+    SentinelCooldown,
+    /// No refresher configured.
+    NoRefresher,
+    /// `auth.json.lock` could not be acquired (or re-acquired) in time.
+    LockTimeout,
+    /// A sibling rotated the credential mid-flight; adopt on retry.
+    SiblingRotation,
+    /// Cause lives in the error chain (network, 5xx, persist failure, …).
+    Other,
+}
+
+impl TransientReason {
+    /// Stable label for telemetry fields.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SleepGate => "sleep_gate",
+            Self::DarkWakeDeferred => "dark_wake_deferred",
+            Self::SentinelAwaitingWake => "sentinel_awaiting_wake",
+            Self::StraddleSuspectRecorded => "straddle_suspect_recorded",
+            Self::SentinelLockLost => "sentinel_lock_lost",
+            Self::SentinelStampFailed => "sentinel_stamp_failed",
+            Self::SentinelCooldown => "sentinel_cooldown",
+            Self::NoRefresher => "no_refresher",
+            Self::LockTimeout => "lock_timeout",
+            Self::SiblingRotation => "sibling_rotation",
+            Self::Other => "other",
+        }
+    }
+}
 
 /// A terminal refresh failure. `reason` is machine-readable; the user-facing
 /// copy is derived from it via [`RefreshTokenFailedReason::user_message`], so
@@ -172,32 +177,17 @@ impl RefreshTokenFailedReason {
     /// in logs.
     pub(crate) fn user_message(self) -> Cow<'static, str> {
         match self {
-            Self::RefreshTokenRejected => with_login_instruction(
-                |prog| {
-                    format!("Your session has expired. Run `{prog} login` to sign in again.")
-                },
-                "Your session has expired. Sign in again.",
-            )
-            .into(),
-            Self::ClientRejected => with_login_instruction(
-                |prog| {
-                    format!(
-                        "Authentication is temporarily unavailable. Run `{prog} login` if this persists."
-                    )
-                },
-                "Authentication is temporarily unavailable. Sign in again if this persists.",
-            )
-            .into(),
+            Self::RefreshTokenRejected => {
+                "Your session has expired. Run `grok login` to sign in again.".into()
+            }
+            Self::ClientRejected => {
+                "Authentication is temporarily unavailable. Run `grok login` if this persists."
+                    .into()
+            }
             Self::ProviderInteractiveRequired => provider_login_message(None),
-            Self::Other => with_login_instruction(
-                |prog| {
-                    format!(
-                        "Authentication could not be refreshed. Run `{prog} login` to sign in again."
-                    )
-                },
-                "Authentication could not be refreshed. Sign in again.",
-            )
-            .into(),
+            Self::Other => {
+                "Authentication could not be refreshed. Run `grok login` to sign in again.".into()
+            }
         }
     }
 }
@@ -217,11 +207,19 @@ pub(crate) fn provider_login_message(label: Option<&str>) -> Cow<'static, str> {
 }
 
 impl AuthError {
-    /// A retryable refresh failure with a message-only cause, for the genuinely
-    /// message-only sites (lock timeout, sleep/dark-wake defer, no refresher);
-    /// use [`Self::transient_source`] when a real error is in hand.
+    /// A retryable refresh failure with a message-only cause and
+    /// [`TransientReason::Other`]; prefer [`Self::transient_reason`] at the
+    /// refresh path's deferral/lock sites so telemetry can count them apart.
     pub(crate) fn transient(message: impl Into<String>) -> Self {
         Self::transient_source(message.into())
+    }
+
+    /// [`Self::transient`] with an explicit machine-readable reason.
+    pub(crate) fn transient_reason(reason: TransientReason, message: impl Into<String>) -> Self {
+        AuthError::Refresh(RefreshTokenError::Transient(RefreshTransientError {
+            source: message.into().into(),
+            reason,
+        }))
     }
 
     /// A retryable refresh failure that preserves `source` in the error chain
@@ -230,9 +228,18 @@ impl AuthError {
     pub(crate) fn transient_source(
         source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
     ) -> Self {
-        AuthError::Refresh(RefreshTokenError::Transient(RefreshTransientError(
-            source.into(),
-        )))
+        AuthError::Refresh(RefreshTokenError::Transient(RefreshTransientError {
+            source: source.into(),
+            reason: TransientReason::Other,
+        }))
+    }
+
+    /// The transient reason, `None` for non-transient errors.
+    pub(crate) fn transient_reason_kind(&self) -> Option<TransientReason> {
+        match self {
+            AuthError::Refresh(RefreshTokenError::Transient(t)) => Some(t.reason),
+            _ => None,
+        }
     }
 
     /// A terminal refresh failure for an already-classified `reason`.
@@ -244,19 +251,5 @@ impl AuthError {
     /// Permanent failures, NotLoggedIn, and policy rejects are not transient.
     pub(crate) fn is_transient(&self) -> bool {
         matches!(self, AuthError::Refresh(RefreshTokenError::Transient(_)))
-    }
-}
-
-#[cfg(test)]
-mod auth_instruction_guard_tests {
-    /// Scans this crate's own `src/`. A guard in the pager cannot see this
-    /// crate, and this crate holds the routine 401/expiry copy — the messages
-    /// a user is most likely to be reading when they are told to sign in.
-    #[test]
-    fn no_hardcoded_auth_instructions() {
-        xai_grok_config::auth_instruction_guard::assert_no_hardcoded_auth_instructions(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src"
-        ));
     }
 }

@@ -38,7 +38,8 @@ pub enum AuthMode {
     External,
     /// Plain API key (e.g. from grok-desktop login or `grok login --api-key`)
     ApiKey,
-    /// Native OpenAI Codex OAuth credential, scoped independently from xAI.
+    /// OpenAi Codex OAuth credential (Medley fork)
+    #[serde(alias = "openai_codex")]
     OpenAiCodex,
 }
 
@@ -108,14 +109,11 @@ pub struct GrokAuth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_client_id: Option<String>,
 
-    /// OAuth id_token retained for account metadata refresh. Never sent as the
-    /// API bearer and never included in Debug output.
+    /// OpenAi Codex ID token
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
 
-    /// ChatGPT account/workspace id used only for the allowlisted Codex header.
-    /// Extracted from an unverified JWT as a compatibility hint; the service
-    /// remains authoritative for access control.
+    /// OpenAi Codex account ID
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
 
@@ -128,19 +126,17 @@ pub struct GrokAuth {
 impl std::fmt::Debug for GrokAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrokAuth")
-            .field("key_present", &!self.key.is_empty())
+            .field("key", &bearer_suffix(&self.key))
             .field("auth_mode", &self.auth_mode)
-            .field("user_id_present", &!self.user_id.is_empty())
+            .field("user_id", &self.user_id)
             .field("expires_at", &self.expires_at)
-            .field("refresh_token_present", &self.refresh_token.is_some())
-            .field("oidc_issuer_present", &self.oidc_issuer.is_some())
-            .field("oidc_client_id_present", &self.oidc_client_id.is_some())
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_deref().map(bearer_suffix),
+            )
             .field("id_token_present", &self.id_token.is_some())
             .field("account_id_present", &self.account_id.is_some())
-            .field(
-                "chatgpt_account_is_fedramp",
-                &self.chatgpt_account_is_fedramp,
-            )
+            .field("chatgpt_account_is_fedramp", &self.chatgpt_account_is_fedramp)
             .finish_non_exhaustive()
     }
 }
@@ -326,38 +322,6 @@ pub(crate) struct UserInfo {
     pub(crate) subscription_tier: Option<String>,
 }
 
-#[cfg(test)]
-mod credential_debug_tests {
-    use super::*;
-
-    #[test]
-    fn grok_auth_debug_contains_presence_only() {
-        let access = "access-SENTINEL-0123456789";
-        let refresh = "refresh-SENTINEL-9876543210";
-        let auth = GrokAuth {
-            key: access.into(),
-            refresh_token: Some(refresh.into()),
-            user_id: "user-SENTINEL".into(),
-            oidc_issuer: Some("https://issuer.example/SENTINEL".into()),
-            oidc_client_id: Some("client-SENTINEL".into()),
-            ..GrokAuth::test_default()
-        };
-
-        let debug = format!("{auth:?}");
-        for secret in [
-            access,
-            refresh,
-            "user-SENTINEL",
-            "issuer.example",
-            "client-SENTINEL",
-        ] {
-            assert!(!debug.contains(secret), "debug leaked {secret:?}: {debug}");
-        }
-        assert!(debug.contains("key_present: true"));
-        assert!(debug.contains("refresh_token_present: true"));
-    }
-}
-
 /// Look up auth from the store by scope key.
 ///
 /// Legacy `WebLogin` tokens (from the pre-OIDC `grok login --legacy`
@@ -435,9 +399,6 @@ mod tests {
             expires_at: None,
             oidc_issuer: None,
             oidc_client_id: None,
-            id_token: None,
-            account_id: None,
-            chatgpt_account_is_fedramp: false,
         }
     }
 

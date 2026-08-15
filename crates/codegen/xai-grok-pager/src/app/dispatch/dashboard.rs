@@ -192,7 +192,7 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
             && let Some(agent) = app.agents.get_mut(&id)
         {
             agent.current_branch = info.branch;
-            agent.is_worktree = info.is_worktree;
+            agent.is_worktree = info.is_worktree || agent.session.is_worktree;
             agent.main_repo = info.main_repo;
             agent.worktree_label = info.worktree_label;
         }
@@ -2022,6 +2022,7 @@ pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect>
                 session_id,
                 title,
                 cwd,
+                kind: agent.rename_kind(),
             });
         } else {
             agent.display_name = Some(title);
@@ -2238,6 +2239,7 @@ fn stop_top_level_activity(agent: &mut crate::app::agent_view::AgentView) -> Opt
             effects.push(Effect::KillBgTask {
                 session_id: session_id.clone(),
                 task_id,
+                source: xai_grok_shell::extensions::task::TaskKillSource::Teardown,
             });
         }
         let scheduled: Vec<String> = agent.session.scheduled_tasks.keys().cloned().collect();

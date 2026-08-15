@@ -12,9 +12,6 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use xai_chat_state::StrictAppendAck;
 use xai_grok_workspace::session::file_state::RewindPoint;
-mod model_switch;
-#[cfg(test)]
-use model_switch::ModelSwitchCommitStep;
 mod copy;
 #[derive(Clone)]
 enum SessionDirMode {
@@ -32,13 +29,9 @@ pub struct JsonlStorageAdapter {
     dir_mode: SessionDirMode,
     #[cfg(test)]
     update_append_probe: Option<std::sync::Arc<AppendProbe>>,
-    #[cfg(test)]
-    model_switch_probe: Option<std::sync::Arc<ModelSwitchProbe>>,
 }
 #[cfg(test)]
 type AppendProbe = dyn Fn(AppendDurability) -> io::Result<()> + Send + Sync;
-#[cfg(test)]
-type ModelSwitchProbe = dyn Fn(ModelSwitchCommitStep) -> io::Result<()> + Send + Sync;
 impl Default for JsonlStorageAdapter {
     fn default() -> Self {
         Self::new()
@@ -50,8 +43,6 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::FromRoot(crate::util::grok_home::grok_home()),
             #[cfg(test)]
             update_append_probe: None,
-            #[cfg(test)]
-            model_switch_probe: None,
         }
     }
     pub fn with_root(root_dir: PathBuf) -> Self {
@@ -59,22 +50,17 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::FromRoot(root_dir),
             #[cfg(test)]
             update_append_probe: None,
-            #[cfg(test)]
-            model_switch_probe: None,
         }
     }
     /// Create an adapter that writes directly to `session_dir`, bypassing
-    /// the `{root}/sessions/{cwd}/{id}/` path computation.
-    ///
-    /// Used for subagent child sessions whose files live under the parent's
-    /// session directory: `{parent_session_dir}/subagents/{subagent_id}/`.
+    /// the `{root}/sessions/{cwd}/{id}/` path computation. Used for subagent
+    /// child sessions (top-level dirs; only their metadata nests under the
+    /// parent's session dir).
     pub fn with_explicit_session_dir(session_dir: PathBuf) -> Self {
         Self {
             dir_mode: SessionDirMode::Explicit(session_dir),
             #[cfg(test)]
             update_append_probe: None,
-            #[cfg(test)]
-            model_switch_probe: None,
         }
     }
     #[cfg(test)]
@@ -85,18 +71,6 @@ impl JsonlStorageAdapter {
         Self {
             dir_mode: SessionDirMode::Explicit(session_dir),
             update_append_probe: Some(std::sync::Arc::new(append_probe)),
-            model_switch_probe: None,
-        }
-    }
-    #[cfg(test)]
-    pub(crate) fn with_model_switch_probe(
-        root_dir: PathBuf,
-        probe: impl Fn(ModelSwitchCommitStep) -> io::Result<()> + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            dir_mode: SessionDirMode::FromRoot(root_dir),
-            update_append_probe: None,
-            model_switch_probe: Some(std::sync::Arc::new(probe)),
         }
     }
     /// Load chat history from a specific directory.
@@ -105,18 +79,27 @@ impl JsonlStorageAdapter {
         &self,
         dir: &std::path::Path,
     ) -> std::io::Result<Vec<ConversationItem>> {
-        self.recover_model_switch_in_dir_sync(dir)?;
         let chat_file = dir.join(super::CHAT_HISTORY_FILE);
         self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)
     }
     fn session_dir(&self, info: &Info) -> PathBuf {
         match &self.dir_mode {
-            SessionDirMode::FromRoot(root) => root
-                .join("sessions")
-                .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
-                .join(info.id.to_string()),
+            SessionDirMode::FromRoot(root) => {
+                crate::util::grok_home::sessions_cwd_dir_in(root, &info.cwd)
+                    .join(info.id.to_string())
+            }
             SessionDirMode::Explicit(dir) => dir.clone(),
         }
+    }
+    /// Create `info`'s session dir owner-only. `FromRoot` also ensures the
+    /// `<encoded-cwd>` shield + root; `Explicit` parents are caller-owned.
+    fn create_session_dir_owner_only(&self, info: &Info) -> io::Result<PathBuf> {
+        let dir = self.session_dir(info);
+        if let SessionDirMode::FromRoot(root) = &self.dir_mode {
+            let _ = crate::util::grok_home::ensure_sessions_cwd_dir_in(root, &info.cwd);
+        }
+        crate::util::grok_home::create_dir_all_owner_only(&dir)?;
+        Ok(dir)
     }
     pub(super) fn updates_file(&self, info: &Info) -> PathBuf {
         self.session_dir(info).join(super::UPDATES_FILE)
@@ -193,8 +176,16 @@ impl JsonlStorageAdapter {
         let session_dirs = self.scan_session_dirs(cwd)?;
         let mut summaries = Vec::new();
         for session_dir in session_dirs {
-            if let Some(summary) = self.read_summary_for_listing(&session_dir) {
-                summaries.push(summary);
+            let summary_path = session_dir.join(super::SUMMARY_FILE);
+            match std::fs::read(&summary_path) {
+                Ok(bytes) => {
+                    if let Ok(summary) = serde_json::from_slice::<Summary>(&bytes)
+                        && !summary.is_hidden()
+                    {
+                        summaries.push(summary);
+                    }
+                }
+                Err(_) => continue,
             }
         }
         summaries.sort_by_cached_key(|s| {
@@ -204,21 +195,6 @@ impl JsonlStorageAdapter {
             )
         });
         Ok(summaries)
-    }
-
-    fn read_summary_for_listing(&self, session_dir: &Path) -> Option<Summary> {
-        if let Err(error) = self.recover_model_switch_in_dir_sync(session_dir) {
-            tracing::warn!(
-                session_dir = %session_dir.display(),
-                ?error,
-                "failed recovering pending model-switch intent before listing session summary"
-            );
-            return None;
-        }
-        let summary_path = session_dir.join(super::SUMMARY_FILE);
-        let bytes = std::fs::read(&summary_path).ok()?;
-        let summary = serde_json::from_slice::<Summary>(&bytes).ok()?;
-        (!summary.is_hidden()).then_some(summary)
     }
     /// List the N most recently modified session summaries across all
     /// workspaces.
@@ -233,14 +209,6 @@ impl JsonlStorageAdapter {
         let mut candidates: Vec<(PathBuf, std::time::SystemTime)> =
             Vec::with_capacity(session_dirs.len());
         for session_dir in session_dirs {
-            if let Err(error) = self.recover_model_switch_in_dir_sync(&session_dir) {
-                tracing::warn!(
-                    session_dir = %session_dir.display(),
-                    ?error,
-                    "failed recovering pending model-switch intent before recent-session scan"
-                );
-                continue;
-            }
             let summary_path = session_dir.join(super::SUMMARY_FILE);
             if let Ok(meta) = std::fs::metadata(&summary_path)
                 && let Ok(mtime) = meta.modified()
@@ -310,6 +278,14 @@ impl JsonlStorageAdapter {
     /// the torn record is terminated as its own (single) corrupt line. This
     /// bounds the damage of any torn write to exactly one record, which the
     /// lenient readers (e.g. [`Self::read_chat_history_sync`]) then skip.
+    async fn sync_file_path_durable(path: PathBuf) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let file = OpenOptions::new().read(true).open(&path)?;
+            Self::sync_file_durable(&file)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
     fn append_jsonl_line_sync(
         path: &Path,
         line: Vec<u8>,
@@ -383,39 +359,40 @@ impl JsonlStorageAdapter {
                     "working-directory switch item must carry a nonzero generation",
                 ))
             })?;
-        let adapter = self.clone();
-        let info = info.clone();
-        tokio::task::spawn_blocking(move || {
-            let _model_switch_gate = adapter
-                .lock_model_switch_mutation_sync(&info)
-                .map_err(super::AppendCwdSwitchError::NotCommitted)?;
-            let disposition = Self::append_cwd_switch_line_sync_with(
+        let disposition = tokio::task::spawn_blocking(move || {
+            Self::append_cwd_switch_line_sync_with(
                 &path,
                 line,
                 generation,
                 Self::sync_file_durable,
                 || Self::sync_parent_directory(&path),
-            )?;
-            super::summary_write::apply_patch_locked_durable(
-                &adapter.summary_file(&info),
-                &adapter.summary_lock_file(&info),
-                &super::summary_write::SummaryPatch {
-                    record_activity: matches!(&disposition, StrictAppendAck::Appended),
-                    chat_messages: matches!(&disposition, StrictAppendAck::Appended)
-                        .then_some(super::summary_write::CounterOp::Increment(1)),
-                    chat_format_version: Some(CHAT_FORMAT_VERSION),
-                    cwd_switch_bookkeeping_generation: Some(generation),
-                    ..Default::default()
-                },
             )
+        })
+        .await
+        .map_err(|error| super::AppendCwdSwitchError::NotCommitted(io::Error::other(error)))??;
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                record_activity: matches!(&disposition, StrictAppendAck::Appended),
+                chat_messages: matches!(&disposition, StrictAppendAck::Appended)
+                    .then_some(super::summary_write::CounterOp::Increment(1)),
+                chat_format_version: Some(CHAT_FORMAT_VERSION),
+                cwd_switch_bookkeeping_generation: Some(generation),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|source| super::AppendCwdSwitchError::Committed {
+            acknowledgement: disposition.clone(),
+            source,
+        })?;
+        Self::sync_file_path_durable(self.summary_file(info))
+            .await
             .map_err(|source| super::AppendCwdSwitchError::Committed {
                 acknowledgement: disposition.clone(),
                 source,
             })?;
-            Ok(disposition)
-        })
-        .await
-        .map_err(|error| super::AppendCwdSwitchError::NotCommitted(io::Error::other(error)))?
+        Ok(disposition)
     }
     fn find_cwd_switch_generation(
         path: &Path,
@@ -640,7 +617,6 @@ impl JsonlStorageAdapter {
         super::write_bytes_atomic(&summary_path, &bytes)
     }
     fn read_summary_sync(&self, info: &Info) -> io::Result<Summary> {
-        self.recover_model_switch_sync(info)?;
         let path = self.summary_file(info);
         let bytes = std::fs::read(&path)?;
         if bytes.is_empty() {
@@ -695,63 +671,22 @@ impl JsonlStorageAdapter {
             }
             Err(error) => return Err(error),
         };
-        // Three bounds, in three different domains. Conflating them is #162:
-        // the scan bound used to be a `.take()` on raw dirents, so a run of
-        // cleared tombstones at the newest end consumed the whole budget and
-        // the older valid runs behind them were never reached -- silently,
-        // because the only warning fired on the *restore* cap, which that
-        // path never reaches.
-        //
-        // 1. `MAX_RESTORED_WORKFLOW_RUNS` bounds successfully restored runs.
-        //    A symlink or invalid sibling must not steal a slot from a valid
-        //    run (see workflow_restore_rejects_symlinks_and_caps_run_count).
-        //
-        // 2. `MAX_SCANNED_WORKFLOW_ENTRIES` bounds entries that cost a
-        //    *manifest read*. Cheap rejections -- symlink, non-directory,
-        //    tombstone -- are one `symlink_metadata` each and deliberately do
-        //    not consume it. `remove()` writes a `cleared` marker and deletes
-        //    `state.json` but leaves the directory, so tombstones accumulate
-        //    forever and are the expected bulk of a long-lived session.
-        //
-        // 3. `MAX_EXAMINED_WORKFLOW_ENTRIES` is the absolute stop, so the walk
-        //    still terminates on a pathological directory. It is generous
-        //    because the per-entry cost below it is one stat.
-        //
-        // Each bound warns distinctly when it is what stopped us short, so a
-        // truncated restore is never indistinguishable from an empty one.
-        const MAX_SCANNED_WORKFLOW_ENTRIES: usize = MAX_RESTORED_WORKFLOW_RUNS * 8;
-        const MAX_EXAMINED_WORKFLOW_ENTRIES: usize = MAX_RESTORED_WORKFLOW_RUNS * 64;
         let mut entries: Vec<_> = std::fs::read_dir(&workflows_dir)?
             .filter_map(Result::ok)
+            .take(MAX_RESTORED_WORKFLOW_RUNS.saturating_add(1))
             .collect();
+        let entries_truncated = entries.len() > MAX_RESTORED_WORKFLOW_RUNS;
+        entries.truncate(MAX_RESTORED_WORKFLOW_RUNS);
         entries.sort_by_key(|entry| entry.file_name());
+        if entries_truncated {
+            tracing::warn!(
+                path = %workflows_dir.display(),
+                limit = MAX_RESTORED_WORKFLOW_RUNS,
+                "workflow restore run-count cap reached; ignoring remaining entries"
+            );
+        }
         let mut restored = Vec::new();
-        let mut skipped_after_cap = false;
-        let mut hit_scan_cap = false;
-        let mut hit_examined_cap = false;
-        // `scanned` stays an explicit counter because it only advances past the
-        // cheap rejections; `examined` is every iteration, so it comes from
-        // `enumerate()` -- it is read before the increment point either way.
-        let mut scanned = 0usize;
-        // Newest first. Run ids are `wf_` + a UUIDv7 `simple()`, whose leading
-        // 48 bits are a big-endian millisecond timestamp rendered as
-        // fixed-width hex -- so lexicographic order *is* chronological order,
-        // and walking ascending would keep the oldest runs and silently drop
-        // everything recent. For a resume feature that is exactly backwards.
-        // Display order is unaffected: the consumer re-sorts by `history.first().at`.
-        for (examined, entry) in entries.into_iter().rev().enumerate() {
-            if restored.len() >= MAX_RESTORED_WORKFLOW_RUNS {
-                skipped_after_cap = true;
-                break;
-            }
-            if examined >= MAX_EXAMINED_WORKFLOW_ENTRIES {
-                hit_examined_cap = true;
-                break;
-            }
-            if scanned >= MAX_SCANNED_WORKFLOW_ENTRIES {
-                hit_scan_cap = true;
-                break;
-            }
+        for entry in entries {
             let run_dir = entry.path();
             let Ok(run_meta) = std::fs::symlink_metadata(&run_dir) else {
                 continue;
@@ -764,9 +699,6 @@ impl JsonlStorageAdapter {
             {
                 continue;
             }
-            // Past the cheap rejections: everything below costs a file read,
-            // so this is what `MAX_SCANNED_WORKFLOW_ENTRIES` bounds.
-            scanned += 1;
             let manifest_path = run_dir.join("state.json");
             let manifest = match read_bounded_nofollow(&manifest_path, MAX_WORKFLOW_MANIFEST_BYTES)
                 .and_then(|bytes| {
@@ -829,35 +761,6 @@ impl JsonlStorageAdapter {
                 script,
                 args,
             });
-        }
-        if skipped_after_cap {
-            tracing::warn!(
-                path = %workflows_dir.display(),
-                limit = MAX_RESTORED_WORKFLOW_RUNS,
-                "workflow restore run-count cap reached; ignoring remaining entries"
-            );
-        }
-        // These two say something different from the one above: there was room
-        // to restore more and we stopped looking anyway, so whatever is behind
-        // the cut is hidden rather than merely surplus. Reported separately for
-        // that reason -- #162 is exactly this case going unreported.
-        if hit_scan_cap {
-            tracing::warn!(
-                path = %workflows_dir.display(),
-                limit = MAX_SCANNED_WORKFLOW_ENTRIES,
-                restored = restored.len(),
-                "workflow restore stopped at the manifest-read budget with room left; \
-                 older runs behind the cut were not restored"
-            );
-        }
-        if hit_examined_cap {
-            tracing::warn!(
-                path = %workflows_dir.display(),
-                limit = MAX_EXAMINED_WORKFLOW_ENTRIES,
-                restored = restored.len(),
-                "workflow restore stopped at the absolute directory-scan bound with room \
-                 left; older runs behind the cut were not restored"
-            );
         }
         Ok(restored)
     }
@@ -1030,7 +933,8 @@ impl JsonlStorageAdapter {
         Ok(())
     }
     /// Like [`Self::apply_summary_patch`], but returns whether a
-    /// `generated_title_if_absent` was applied (see [`Summary::apply_patch`]).
+    /// `generated_title_if_absent` was applied or a manual pin was
+    /// cleared by `reset_title_to_auto` (see [`Summary::apply_patch`]).
     async fn apply_summary_patch_reporting(
         &self,
         info: &Info,
@@ -1072,7 +976,7 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
         if let Some(n) = entry
             .file_name()
             .to_str()
-            .and_then(xai_chat_state::compaction_transcript::parse_segment_index)
+            .and_then(xai_compaction_transcript::parse_segment_index)
         {
             next = next.max(n + 1);
         }
@@ -1082,12 +986,13 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
 #[async_trait]
 impl StorageAdapter for JsonlStorageAdapter {
     async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary> {
-        let dir = self.session_dir(info);
-        std::fs::create_dir_all(&dir)?;
+        self.create_session_dir_owner_only(info)?;
         let summary_path = self.summary_file(info);
         if Path::new(&summary_path).exists() {
             tracing::info!("Loading existing session from JSONL");
-            self.read_summary_sync(info)
+            let bytes = tokio::fs::read(&summary_path).await?;
+            serde_json::from_slice::<Summary>(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         } else {
             tracing::info!("Creating new session in JSONL");
             let mut summary = Summary::new(info, model_id)?;
@@ -1115,6 +1020,16 @@ impl StorageAdapter for JsonlStorageAdapter {
             info,
             super::summary_write::SummaryPatch {
                 generated_title_if_absent: Some(session_title),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    async fn reset_title_to_auto(&self, info: &Info) -> io::Result<bool> {
+        self.apply_summary_patch_reporting(
+            info,
+            super::summary_write::SummaryPatch {
+                reset_title_to_auto: true,
                 ..Default::default()
             },
         )
@@ -1156,29 +1071,17 @@ impl StorageAdapter for JsonlStorageAdapter {
             .await
     }
     async fn append_chat_message(&self, info: &Info, message: &ConversationItem) -> io::Result<()> {
-        let adapter = self.clone();
-        let info = info.clone();
-        let path = adapter.chat_file(&info);
-        let mut line = serde_json::to_vec(message)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        line.push(b'\n');
-        tokio::task::spawn_blocking(move || {
-            let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
-            Self::append_jsonl_line_sync(&path, line, AppendDurability::Buffered)?;
-            super::summary_write::apply_patch_locked(
-                &adapter.summary_file(&info),
-                &adapter.summary_lock_file(&info),
-                &super::summary_write::SummaryPatch {
-                    record_activity: true,
-                    chat_messages: Some(super::summary_write::CounterOp::Increment(1)),
-                    chat_format_version: Some(CHAT_FORMAT_VERSION),
-                    ..Default::default()
-                },
-            )?;
-            Ok(())
-        })
+        self.append_jsonl(self.chat_file(info), message).await?;
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                record_activity: true,
+                chat_messages: Some(super::summary_write::CounterOp::Increment(1)),
+                chat_format_version: Some(CHAT_FORMAT_VERSION),
+                ..Default::default()
+            },
+        )
         .await
-        .map_err(io::Error::other)?
     }
     async fn append_cwd_switch_commit_aware(
         &self,
@@ -1194,93 +1097,18 @@ impl StorageAdapter for JsonlStorageAdapter {
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<xai_grok_sampling_types::ReasoningEffort>>,
     ) -> io::Result<()> {
-        self.update_current_model_identity_and_agent(
+        self.apply_summary_patch(
             info,
-            model_id,
-            None,
-            agent_name,
-            reasoning_effort,
+            super::summary_write::SummaryPatch {
+                model: Some(super::summary_write::ModelPatch {
+                    model_id: model_id.clone(),
+                    agent_name: agent_name.map(String::from),
+                    reasoning_effort,
+                }),
+                ..Default::default()
+            },
         )
         .await
-    }
-    async fn update_current_model_identity_and_agent(
-        &self,
-        info: &Info,
-        model_id: &acp::ModelId,
-        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
-        agent_name: Option<&str>,
-        reasoning_effort: Option<Option<xai_grok_sampling_types::ReasoningEffort>>,
-    ) -> io::Result<()> {
-        let adapter = self.clone();
-        let info = info.clone();
-        let model_id = model_id.clone();
-        let catalog_identity = catalog_identity.cloned();
-        let agent_name = agent_name.map(String::from);
-        tokio::task::spawn_blocking(move || {
-            let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
-            super::summary_write::apply_patch_locked(
-                &adapter.summary_file(&info),
-                &adapter.summary_lock_file(&info),
-                &super::summary_write::SummaryPatch {
-                    model: Some(super::summary_write::ModelPatch {
-                        model_id,
-                        catalog_identity,
-                        agent_name,
-                        reasoning_effort,
-                    }),
-                    ..Default::default()
-                },
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(io::Error::other)?
-    }
-    async fn commit_model_switch(
-        &self,
-        info: &Info,
-        messages: &[ConversationItem],
-        model_id: &acp::ModelId,
-        agent_name: Option<&str>,
-        reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
-    ) -> Result<(), super::ModelSwitchCommitError> {
-        self.commit_model_switch_with_identity(
-            info,
-            messages,
-            model_id,
-            None,
-            agent_name,
-            reasoning_effort,
-        )
-        .await
-    }
-    async fn commit_model_switch_with_identity(
-        &self,
-        info: &Info,
-        messages: &[ConversationItem],
-        model_id: &acp::ModelId,
-        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
-        agent_name: Option<&str>,
-        reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
-    ) -> Result<(), super::ModelSwitchCommitError> {
-        let adapter = self.clone();
-        let info = info.clone();
-        let messages = messages.to_vec();
-        let model_id = model_id.clone();
-        let catalog_identity = catalog_identity.cloned();
-        let agent_name = agent_name.map(str::to_owned);
-        tokio::task::spawn_blocking(move || {
-            adapter.commit_model_switch_with_identity_sync(
-                &info,
-                &messages,
-                &model_id,
-                catalog_identity.as_ref(),
-                agent_name.as_deref(),
-                reasoning_effort,
-            )
-        })
-        .await
-        .map_err(|error| super::ModelSwitchCommitError::NotCommitted(io::Error::other(error)))?
     }
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()> {
         self.apply_summary_patch(
@@ -1624,41 +1452,39 @@ impl StorageAdapter for JsonlStorageAdapter {
         .await
         .map_err(io::Error::other)?
     }
+    async fn backup_chat_history_before_strip(&self, info: &Info) -> io::Result<()> {
+        let path = self.chat_file(info);
+        let backup = path.with_extension("jsonl.pre-strip");
+        if !tokio::fs::try_exists(&path).await? || tokio::fs::try_exists(&backup).await? {
+            return Ok(());
+        }
+        let staging = path.with_extension("jsonl.pre-strip.tmp");
+        tokio::fs::copy(&path, &staging).await?;
+        tokio::fs::rename(&staging, &backup).await?;
+        Ok(())
+    }
     async fn replace_chat_history(
         &self,
         info: &Info,
         messages: &[ConversationItem],
     ) -> io::Result<()> {
-        let adapter = self.clone();
-        let info = info.clone();
-        let messages = messages.to_vec();
+        self.write_jsonl(self.chat_file(info), messages).await?;
         let new_count = messages.len();
         let cwd_switch_bookkeeping_generation = messages
             .iter()
             .filter_map(ConversationItem::working_directory_switch_generation)
             .max()
             .unwrap_or(0);
-        tokio::task::spawn_blocking(move || {
-            let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
-            let chat_path = adapter.chat_file(&info);
-            let chat_lock = Self::lock_append(&chat_path)?;
-            let write_result = super::write_jsonl_atomic(&chat_path, &messages);
-            let _ = chat_lock.unlock();
-            write_result?;
-            super::summary_write::apply_patch_locked(
-                &adapter.summary_file(&info),
-                &adapter.summary_lock_file(&info),
-                &super::summary_write::SummaryPatch {
-                    chat_messages: Some(super::summary_write::CounterOp::Set(new_count)),
-                    chat_format_version: Some(CHAT_FORMAT_VERSION),
-                    cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
-                    ..Default::default()
-                },
-            )?;
-            Ok(())
-        })
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                chat_messages: Some(super::summary_write::CounterOp::Set(new_count)),
+                chat_format_version: Some(CHAT_FORMAT_VERSION),
+                cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
+                ..Default::default()
+            },
+        )
         .await
-        .map_err(io::Error::other)?
     }
     async fn copy_session_data(
         &self,
@@ -1783,7 +1609,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         segment: &crate::extensions::notification::CompactionSegmentFile,
     ) -> io::Result<()> {
         use tokio::io::AsyncWriteExt;
-        use xai_chat_state::compaction_transcript::{
+        use xai_compaction_transcript::{
             COMPACTION_DIR, INDEX_FILE, INDEX_HEADER, extract_keywords, render_index_row,
             render_segment_md, segment_filename,
         };

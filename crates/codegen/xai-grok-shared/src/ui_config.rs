@@ -172,6 +172,11 @@ pub struct UiConfig {
     /// Combine consecutive queued follow-ups into one turn. `None` = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub combine_queued_prompts: Option<bool>,
+    /// Mid-turn follow-up routing: `"queue"` (default) or `"steer"`. `None`
+    /// behaves as queue. Steer promotes server-queued follow-ups as
+    /// interjections at the next tool or model safe point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_behavior: Option<String>,
     /// Display-refresh probe + auto-cadence (`[ui.display_refresh]`). Per-field
     /// `None` inherits remote/default; skipped when untouched.
     #[serde(default, skip_serializing_if = "DisplayRefreshSettings::is_default")]
@@ -288,6 +293,7 @@ impl Default for UiConfig {
             double_click_action: None,
             contextual_hints: ContextualHints::default(),
             combine_queued_prompts: None,
+            follow_up_behavior: None,
             display_refresh: DisplayRefreshSettings::default(),
         }
     }

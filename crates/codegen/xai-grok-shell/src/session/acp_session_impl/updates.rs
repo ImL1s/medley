@@ -2,6 +2,128 @@
 //! its buffered/transient/direct variants, xAI-notification handling, and
 //! the gateway-bridge dispatch shims.
 use super::*;
+fn scrub_inbound_session_summary(
+    notification: &mut crate::extensions::notification::SessionNotification,
+) {
+    use crate::extensions::notification::{SessionUpdate, TITLE_IS_MANUAL_META_KEY};
+    use crate::session::persistence::sanitize_and_cap_title;
+    let SessionUpdate::SessionSummaryGenerated { session_summary } = &mut notification.update
+    else {
+        return;
+    };
+    *session_summary = sanitize_and_cap_title(session_summary).unwrap_or_default();
+    if let Some(serde_json::Value::Object(m)) = notification.meta.as_mut() {
+        m.remove(TITLE_IS_MANUAL_META_KEY);
+    }
+}
+#[cfg(test)]
+mod inbound_title_scrub_tests {
+    use super::scrub_inbound_session_summary;
+    use crate::extensions::notification::{
+        SessionNotification, SessionUpdate, TITLE_IS_MANUAL_META_KEY,
+    };
+    #[test]
+    fn strips_controls_caps_and_drops_manual_meta() {
+        use crate::session::persistence::MAX_TITLE_SCALARS;
+        let mut n = SessionNotification {
+            session_id: agent_client_protocol::SessionId::new("s"),
+            update: SessionUpdate::SessionSummaryGenerated {
+                session_summary: format!("\u{1b}]0;X\u{07}{}", "é".repeat(MAX_TITLE_SCALARS + 8)),
+            },
+            meta: Some(serde_json::json!({ TITLE_IS_MANUAL_META_KEY: true, "eventId": "keep" })),
+        };
+        scrub_inbound_session_summary(&mut n);
+        let SessionUpdate::SessionSummaryGenerated { session_summary } = &n.update else {
+            panic!("variant kept");
+        };
+        const PREFIX: &str = "]0;X";
+        let expected = format!(
+            "{PREFIX}{}",
+            "é".repeat(MAX_TITLE_SCALARS - PREFIX.chars().count())
+        );
+        assert_eq!(session_summary, &expected);
+        let meta = n.meta.as_ref().unwrap();
+        assert!(meta.get(TITLE_IS_MANUAL_META_KEY).is_none());
+        assert_eq!(meta.get("eventId").and_then(|v| v.as_str()), Some("keep"));
+    }
+    #[test]
+    fn leaves_other_variants_untouched() {
+        let mut n = SessionNotification {
+            session_id: agent_client_protocol::SessionId::new("s"),
+            update: SessionUpdate::MemoryFlushStarted,
+            meta: Some(serde_json::json!({ TITLE_IS_MANUAL_META_KEY: true })),
+        };
+        scrub_inbound_session_summary(&mut n);
+        assert_eq!(
+            n.meta
+                .as_ref()
+                .and_then(|m| m.get(TITLE_IS_MANUAL_META_KEY)),
+            Some(&serde_json::json!(true))
+        );
+    }
+}
+#[cfg(test)]
+mod inbound_summary_persist_scrub_tests {
+    use super::support::create_test_actor;
+    use super::*;
+    use crate::extensions::notification::TITLE_IS_MANUAL_META_KEY;
+    use crate::session::persistence::MAX_TITLE_SCALARS;
+    /// Drive inbound `_x.ai/session/update` through `handle_xai_session_notification`
+    /// so removing the `scrub_inbound_session_summary` call site fails.
+    #[tokio::test]
+    async fn persist_path_scrubs_title_and_drops_manual_meta() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, mut prx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                let dirty = format!("\u{1b}]0;X\u{07}{}", "é".repeat(MAX_TITLE_SCALARS + 8));
+                actor
+                    .handle_xai_session_notification(XaiSessionNotification {
+                        session_id: acp::SessionId::new("test-actor"),
+                        update: XaiSessionUpdate::SessionSummaryGenerated {
+                            session_summary: dirty,
+                        },
+                        meta: Some(serde_json::json!({
+                            TITLE_IS_MANUAL_META_KEY: true,
+                            "eventId": "keep"
+                        })),
+                    })
+                    .await;
+                const PREFIX: &str = "]0;X";
+                let expected = format!(
+                    "{PREFIX}{}",
+                    "é".repeat(MAX_TITLE_SCALARS - PREFIX.chars().count())
+                );
+                loop {
+                    match prx.try_recv().expect("inbound summary must be persisted") {
+                        PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(
+                            notif,
+                        )) => {
+                            let XaiSessionUpdate::SessionSummaryGenerated { session_summary } =
+                                &notif.update
+                            else {
+                                continue;
+                            };
+                            assert_eq!(session_summary, &expected);
+                            let meta = notif.meta.as_ref().expect("meta kept for eventId");
+                            assert!(
+                                meta.get(TITLE_IS_MANUAL_META_KEY).is_none(),
+                                "persist rail must drop forged titleIsManual"
+                            );
+                            assert_eq!(meta.get("eventId").and_then(|v| v.as_str()), Some("keep"));
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await;
+    }
+}
 /// Result of applying a subagent fold into parent ledgers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SubagentUsageApply {
@@ -205,71 +327,13 @@ impl SessionActor {
     ///   because the canonical `acp::SessionUpdate::ToolCall` (with
     ///   assembled `raw_input`) is persisted at end-of-turn and is the
     ///   source of truth for replay; (2) no hook dispatch.
-    /// - **xAI** (`AttemptDiscarded`) -> **persists** (with `eventId`)
-    ///   **and** gateway-forwards **from this buffered drain path**.
-    ///
-    ///   Why not switch to `send_xai_notification` (the direct path)? That
-    ///   also persists and stamps meta, and looks like the obvious fix.
-    ///   But it bypasses `event_tx` entirely, going straight to persistence
-    ///   plus gateway. With attempt chunks still queued and undrained, the
-    ///   retraction would reach the client **before** the text it retracts,
-    ///   apply against content that has not arrived, retract nothing, and
-    ///   the duplicate would survive -- #44 unfixed. Keeping
-    ///   the write on the buffered drain preserves delivery order relative to
-    ///   already-queued attempt chunks.
-    ///
-    ///   This is **not** about the client's dedup highwater dropping the
-    ///   retry's chunks -- it cannot. ACP and xAI keep separate highwaters
-    ///   (`agent_view/mod.rs`, `last_applied_xai_event_seq`) precisely so an
-    ///   xAI id can never make queued lower-id ACP chunks look stale. The
-    ///   hazard documented on `enqueue_current_mode_update` above does not
-    ///   transfer: `CurrentModeUpdate` is an **ACP** notification sharing the
-    ///   ACP highwater with the chunks, which is why *it* needs enqueue-time
-    ///   stamping; `AttemptDiscarded` is xAI, on the other highwater.
-    ///
-    ///   Stamping `eventId` via
-    ///   `ensure_event_id_meta` also makes a duplicate delivery dedupable
-    ///   (meta was `None` at enqueue). Without the persistence write,
-    ///   resume/rebuild would keep both attempt copies (#44).
-    ///
-    ///   Note: main-session resume already forwards xAI via
-    ///   `forward_raw_replay_line`. Subagent/export UI replay uses
-    ///   `stream_replay_updates_at` / `load_updates_for_replay`, which must
-    ///   also surface `AttemptDiscarded` (see `ReplayUpdate`).
     pub(super) async fn emit_buffered(&self, notification: SessionNotification) {
         match notification {
             SessionNotification::Acp(n) => {
                 self.emit_notification_direct(*n).await;
             }
-            SessionNotification::Xai(mut n) => {
+            SessionNotification::Xai(n) => {
                 self.log_outbound_xai_buffered(&n);
-                // AttemptDiscarded is a retraction, not a tool-delta: it must
-                // survive on disk so ChatReducer / helpers::replay can drop
-                // the abandoned attempt's text on resume. Stamp eventId so a
-                // duplicate delivery is dedupable (meta was None at enqueue).
-                // See the doc-comment above for why this lives on the
-                // "no persistence" buffered path rather than the direct path.
-                if matches!(n.update, XaiSessionUpdate::AttemptDiscarded) {
-                    let mut meta_map = n.meta.take().and_then(|v| match v {
-                        serde_json::Value::Object(m) => Some(m),
-                        _ => None,
-                    });
-                    crate::util::event_id::ensure_event_id_meta(
-                        &self.session_info.id.0,
-                        &mut meta_map,
-                    );
-                    n.meta = meta_map.map(serde_json::Value::Object);
-                    if self
-                        .notifications
-                        .persistence_tx
-                        .send(PersistenceMsg::Update(
-                            crate::session::storage::SessionUpdate::Xai(n.clone()),
-                        ))
-                        .is_err()
-                    {
-                        tracing::warn!("Failed to send AttemptDiscarded to persistence channel");
-                    }
-                }
                 if self
                     .notifications
                     .gateway_enabled
@@ -556,6 +620,7 @@ impl SessionActor {
             crate::util::event_id::ensure_event_id_meta(&self.session_info.id.0, &mut meta_map);
             notification.meta = meta_map.map(serde_json::Value::Object);
         }
+        scrub_inbound_session_summary(&mut notification);
         match &notification.update {
             XaiSessionUpdate::SubagentSpawned {
                 subagent_id,
@@ -799,6 +864,37 @@ impl SessionActor {
             &ctx,
         )
         .await;
+    }
+    pub(super) async fn dispatch_permission_prompt_notification(&self, message: &str) {
+        self.dispatch_notification_hook(
+            "permission_prompt",
+            Some(message.to_owned()),
+            None,
+            Some("info".into()),
+        )
+        .await;
+    }
+    /// Wire the manager's prompt-start signal to `permission_prompt`.
+    ///
+    /// Call only from the session that owns the manager (`owns_permission_manager`
+    /// at spawn). Inherited/cloned handles must not call this; first-writer-wins
+    /// on the handle is the backstop. A subagent that spawned its own manager
+    /// should wire — the user waits on that prompt. `Weak` so the listener
+    /// cannot keep a dropped session alive.
+    pub(super) fn wire_permission_prompt_notification(self: &std::sync::Arc<Self>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        self.permissions.set_user_prompt_notify(tx);
+        let session = std::sync::Arc::downgrade(self);
+        tokio::task::spawn_local(async move {
+            while rx.recv().await.is_some() {
+                let Some(session) = session.upgrade() else {
+                    break;
+                };
+                session
+                    .dispatch_permission_prompt_notification("Tool permission requested")
+                    .await;
+            }
+        });
     }
     /// Send an xAI extension notification to the client
     #[tracing::instrument(skip_all)]

@@ -13,89 +13,6 @@ use super::*;
 pub(super) fn yolo_toggle_report(was: bool, actual: bool) -> Option<bool> {
     (was != actual).then_some(actual)
 }
-
-async fn apply_opaque_model_name_override(
-    chat_state: &xai_chat_state::ChatStateHandle,
-    model_name: String,
-    extra_headers: indexmap::IndexMap<String, String>,
-    context_window: Option<std::num::NonZeroU64>,
-    context_window_is_pinned: bool,
-) -> Option<xai_grok_sampling_types::SamplingConfig> {
-    let (mut config, _catalog_identity, credentials) =
-        chat_state.get_prepared_model_state().await?;
-    let previous = config.clone();
-    config.model = model_name;
-    config.extra_headers.extend(extra_headers);
-    if let Some(context_window) = context_window
-        && !context_window_is_pinned
-    {
-        config.context_window = context_window;
-    }
-    // An opaque name override changes only wire routing. In particular, do not
-    // resolve credentials by the new name: a configured catalog key with the
-    // same string may belong to another endpoint/origin.
-    chat_state.update_sampling_config_and_credentials(config, credentials);
-    Some(previous)
-}
-
-#[cfg(test)]
-mod opaque_model_name_override_tests {
-    use super::apply_opaque_model_name_override;
-
-    #[tokio::test]
-    async fn keeps_endpoint_and_bound_secret_when_name_collides_with_an_external_model() {
-        let config = xai_grok_sampling_types::SamplingConfig::for_test(
-            "https://old.example.test/v1",
-            "old-route",
-        );
-        let credentials = xai_chat_state::Credentials::bound(
-            Some("old-origin-key".to_string()),
-            xai_chat_state::AuthType::ApiKey,
-            xai_grok_sampling_types::CredentialSource::ModelApiKey,
-        );
-        let mut colliding_entry = crate::agent::config::ModelEntry::fallback(
-            "configured-external-model",
-            &crate::agent::config::EndpointsConfig::default(),
-        );
-        colliding_entry.api_key = Some("foreign-model-key".to_string());
-        let foreign = crate::agent::config::resolve_credentials(&colliding_entry, None);
-        assert_eq!(foreign.api_key.as_deref(), Some("foreign-model-key"));
-
-        let (mock, _persistence_rx) = xai_chat_state::MockChatPersistence::new();
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let chat_state = xai_chat_state::ChatStateActor::spawn(
-            vec![],
-            config,
-            Box::new(mock),
-            event_tx,
-            tokio_util::sync::CancellationToken::new(),
-        );
-        chat_state.update_sampling_config_and_credentials(
-            xai_grok_sampling_types::SamplingConfig::for_test(
-                "https://old.example.test/v1",
-                "old-route",
-            ),
-            credentials,
-        );
-        apply_opaque_model_name_override(
-            &chat_state,
-            "configured-external-model".to_string(),
-            indexmap::IndexMap::from([("x-route-key".to_string(), "route-scoped-key".to_string())]),
-            None,
-            false,
-        )
-        .await
-        .expect("live chat state");
-        let (config, _, credentials) = chat_state
-            .get_prepared_model_state()
-            .await
-            .expect("live chat state");
-
-        assert_eq!(config.base_url, "https://old.example.test/v1");
-        assert_eq!(credentials.api_key(), Some("old-origin-key"));
-        assert_ne!(credentials.api_key(), Some("foreign-model-key"));
-    }
-}
 #[cfg(test)]
 mod yolo_toggle_report_tests {
     use super::yolo_toggle_report;
@@ -115,12 +32,13 @@ mod yolo_toggle_report_tests {
 fn cleanup_session_scratch(_session: &SessionActor) {}
 /// SessionEnd hooks + stop dispatch. Shared so channel-closed and Shutdown
 /// cannot drift on hook ordering (memory save still runs after this).
-async fn fire_session_end_hooks(session: &SessionActor, reason: &str) {
+pub(super) async fn fire_session_end_hooks(session: &SessionActor, reason: &str) {
     let envelope = session.fire_hook(
         xai_grok_hooks::event::HookEventName::SessionEnd,
         None,
         xai_grok_hooks::event::HookPayload::SessionEnd {
             reason: reason.to_string(),
+            subagent_type: session.subagent_type_label(),
             turn_count: None,
             tool_call_count: None,
         },
@@ -261,6 +179,7 @@ pub(super) async fn run_session(
 ) {
     let (completion_tx, mut completion_rx) =
         mpsc::unbounded_channel::<(String, PromptTurnResult)>();
+    let mut turn_end_queue = super::turn_end_hooks::TurnEndQueue::spawn(session.clone());
     tracing::debug!("fs_notify_config: {:?}", fs_notify_config);
     let mut replay_buffer = ReplayBuffer::new(session.buffering_settings.clone());
     let event_tx_for_flush_timer = session.event_tx.clone();
@@ -500,23 +419,6 @@ pub(super) async fn run_session(
                     if let Some(event) = maybe_event {
                         match event {
                             SessionEvent::Notification(notification) => {
-                                // Retraction for a discarded sampling attempt:
-                                // drop any still-buffered text/thought/tool-delta
-                                // chunks for that attempt (do NOT flush them to
-                                // clients — that would reintroduce the duplicate
-                                // this event exists to prevent), then forward the
-                                // retraction so already-emitted UI can unwind.
-                                if matches!(
-                                    &notification,
-                                    SessionNotification::Xai(n) if matches!(
-                                        n.update,
-                                        crate::extensions::notification::SessionUpdate::AttemptDiscarded
-                                    )
-                                ) {
-                                    let _ = replay_buffer.flush();
-                                    session.emit_buffered(notification).await;
-                                    continue;
-                                }
                                 let out = replay_buffer.consume_chunk(notification);
                                 match out {
                                     None => {}
@@ -541,95 +443,12 @@ pub(super) async fn run_session(
                         }
                     }
                 }
-                maybe_completion = completion_rx.recv() => {
-                    let Some((prompt_id, result)) = maybe_completion else {
-                        // Completion channel closed: full feedback teardown so
-                        // final signal sync + upload drain still run (cancel
-                        // alone no longer force-syncs — shutdown owns that).
-                        shutdown_workflows(&session).await;
-                        finish_session_exit_feedback(&session).await;
-                        return;
-                    };
-                    // Flush any buffered turn deltas before `handle_completion`
-                    // emits the durable `TurnCompleted`, so the terminal lands
-                    // in updates.jsonl strictly after the turn's last
-                    // `session/update` delta. Mirrors the Cancel / Shutdown /
-                    // FlushComplete arms.
-                    if let Some(notification) = replay_buffer.flush() {
-                        session.emit_buffered(notification).await;
-                    }
-                    let (turn_succeeded, suppress_goal_continuation, infra_pause_message) =
-                        SessionActor::post_turn_goal_degradation_plan(&result);
-                    // A `RemovedFromQueue` completion never started a turn, so
-                    // there is nothing to summarize below.
-                    let turn_ran = !matches!(
-                        &result,
-                        Ok(PromptTurnOk {
-                            completion_kind: PromptCompletionKind::RemovedFromQueue,
-                            ..
-                        })
-                    );
-                    let completed_prompt_id = prompt_id.clone();
-                    let owned_completion = session.handle_completion(prompt_id, result).await;
-                    // Drain any monitor events that were routed to the mid-turn buffer
-                    // but arrived after the turn ended (race between is_turn_active and buffer push).
-                    session.drain_monitor_buffer_to_pending().await;
-                    if let Some(message) = infra_pause_message {
-                        session.apply_infra_pause_after_turn_err(message).await;
-                    }
-                    // Goal continuation (success) or back-off (non-success).
-                    // Owns the streak-tracking and reminder-injection path.
-                    session
-                        .handle_turn_end(turn_succeeded, suppress_goal_continuation)
-                        .await;
-                    // Interjections that raced past the turn's final drain
-                    // (arrived during turn-end bookkeeping) have no turn left
-                    // to merge into — convert them to front-of-queue prompt
-                    // turns so the message runs instead of stranding.
-                    //
-                    // INVARIANT: this flush must only ever see interjections
-                    // aimed at the turn that just completed. That holds
-                    // because this arm runs in the same serialized actor loop
-                    // as `SessionCommand::Interject` (no live turn's buffer
-                    // can be stolen mid-stream), and both cancel paths drain
-                    // the buffer before their completion arrives.
-                    if session.flush_stranded_interjections().await > 0 {
-                        tracing::info!("Flushed stranded interjection(s) into prompt turns");
-                    }
-                    SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
-                    // If no user prompt started, check for pending notifications
-                    SessionActor::maybe_drain_notifications(session.clone(), completion_tx.clone()).await;
-                    session.emit_session_idle_if_idle().await;
-                    // Layer-3 LazinessDetector: spawn an idle-triggered
-                    // classifier dispatch. The method is a no-op when the
-                    // per-model `laziness_detector.enabled = false`
-                    // (the v1 default for every model), so no
-                    // classification cost is incurred without explicit
-                    // opt-in. Spawned via `spawn_local` so the actor
-                    // loop can continue accepting commands while the
-                    // classifier idle-waits.
-                    {
-                        let s = session.clone();
-                        tokio::task::spawn_local(async move {
-                            s.maybe_fire_laziness_check().await;
-                        });
-                    }
-                    // Per-turn dashboard summary (display-only side-call);
-                    // spawned so the actor loop keeps accepting commands.
-                    // `turn_succeeded` keeps cancelled/errored/refused turns
-                    // from triggering a fresh model call (a user who hit
-                    // Ctrl+C wants model activity to stop), and
-                    // `owned_completion` keeps a stale completion — a turn
-                    // the Cancel path already finalized — from summarizing
-                    // work the user aborted.
-                    if turn_ran && turn_succeeded && owned_completion {
-                        session.restart_turn_summary(completed_prompt_id);
-                    }
-                }
                 maybe_cmd = cmd_rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
                         // ── session_end (channel-closed path) ────────
-                        // Hooks fire BEFORE memory auto-save per plan contract.
+                        // Queued reports first, so an earlier turn's report precedes the
+                        // session-end `Stop`. Hooks fire BEFORE memory auto-save per plan contract.
+                        turn_end_queue.flush().await;
                         fire_session_end_hooks(&session, "channel_closed").await;
                         session
                             .run_session_end_memory_pipeline(
@@ -654,6 +473,7 @@ pub(super) async fn run_session(
                             }
                         }
                         shutdown_workflows(&session).await;
+                        turn_end_queue.drain().await;
                         finish_session_exit_feedback(&session).await;
                         return;
                     };
@@ -793,27 +613,24 @@ pub(super) async fn run_session(
                             session.handle_session_mode(session_mode).await;
                             let _ = responds_to.send(());
                         }
-                        SessionCommand::ApplyModelSwitch { prepared, responds_to } => {
-                            let outcome = session.handle_apply_model_switch(*prepared).await;
+                        SessionCommand::SetSessionModel { sampling_config, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, responds_to } => {
+                            let updated_model_id = session.handle_set_session_model(sampling_config, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).await;
+                            let _ = responds_to.send(updated_model_id);
+                        }
+                        SessionCommand::RebuildAgentForDefinition { definition, responds_to } => {
+                            let outcome = session.handle_rebuild_agent_for_definition(definition).await;
                             let _ = responds_to.send(outcome);
                         }
                         SessionCommand::OverrideModelName { model_name, extra_headers, context_window } => {
                             // Update the actor's SamplingConfig model + headers + context window.
-                            let extra_header_count = extra_headers.len();
-                            if let Some(previous) = apply_opaque_model_name_override(
-                                &session.chat_state_handle,
-                                model_name.clone(),
-                                extra_headers,
-                                context_window,
-                                session.compaction.context_window_override.is_some(),
-                            ).await {
+                            if let Some(mut cfg) = session.chat_state_handle.get_sampling_config().await {
                                 tracing::info!(
                                     target: SESSION_LOG,
                                     session_id = %session.session_info.id,
-                                    old_model = %previous.model,
+                                    old_model = %cfg.model,
                                     new_model = %model_name,
-                                    extra_header_count,
-                                    old_context_window = previous.context_window.get(),
+                                    extra_header_count = extra_headers.len(),
+                                    old_context_window = cfg.context_window.get(),
                                     new_context_window = ?context_window.map(|cw| cw.get()),
                                     "OVERRIDE_MODEL: changing model name in sampling config"
                                 );
@@ -822,7 +639,24 @@ pub(super) async fn run_session(
                                 // the agent-level default (e.g. "grok-4.5").
                                 // set_primary_model also adds to models_used.
                                 session.signals_handle().set_primary_model(&model_name);
-                                // Route headers changed under a possibly-unchanged model id.
+                                cfg.model = model_name.clone();
+                                cfg.extra_headers.extend(extra_headers);
+                                if let Some(cw) = context_window
+                                    && session.compaction.context_window_override.is_none()
+                                {
+                                    cfg.context_window = cw;
+                                }
+                                session.chat_state_handle.update_sampling_config(cfg);
+
+                                let existing = session.chat_state_handle.get_credentials().await;
+                                if let Some(r) = crate::agent::config::try_resolve_model_credentials(model_name.as_str(), existing.api_key().as_deref()) {
+                                    session.chat_state_handle.update_credentials(existing.rebind(
+                                        r.api_key,
+                                        r.auth_type,
+                                        xai_grok_sampling_types::CredentialSource::None,
+                                    ));
+                                }
+                                // Credentials changed under a possibly-unchanged model id.
                                 session.invalidate_model_auth_memo();
                             }
                         }
@@ -850,9 +684,9 @@ pub(super) async fn run_session(
                                 .await;
                             let _ = respond_to.send(result);
                         }
-                        SessionCommand::KillBackgroundTask { task_id, respond_to } => {
+                        SessionCommand::KillBackgroundTask { task_id, source, respond_to } => {
                             let result = session.agent.borrow().tool_bridge()
-                                .kill_background_task(&task_id)
+                                .kill_background_task(&task_id, source)
                                 .await
                                 .map_err(|e| e.to_string());
                             let _ = respond_to.send(result);
@@ -1031,23 +865,34 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::RemoveQueuedPrompt { id, expected_version, owner } => {
                             session.handle_remove_queued_prompt(&id, expected_version, owner.as_deref()).await;
+                            // Re-kick: delete-while-editing keeps the hold until remove clears it.
+                            SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
                         SessionCommand::ReorderQueue { ordered_ids } => {
                             session.handle_reorder_queue(&ordered_ids).await;
+                            SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
                         SessionCommand::ClearQueue { owner } => {
                             session.handle_clear_queue(owner.as_deref()).await;
+                            SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
                         SessionCommand::EditQueuedPrompt { id, new_text, editor } => {
+                            // Edit clears the hold; re-kick so a previously held front can start.
                             session.handle_edit_queued_prompt(&id, new_text, editor.as_deref()).await;
+                            SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
-                        SessionCommand::HoldCombineEdit { id } => {
-                            let mut state = session.state.lock().await;
-                            state.combine_edit_holds.insert(id);
+                        SessionCommand::HoldEdit { id } => {
+                            // insert (not entry/or_insert): re-entering edit after a
+                            // dropped release must refresh the TTL stamp.
+                            session.handle_hold_edit(id).await;
                         }
-                        SessionCommand::ReleaseCombineEdit { id } => {
-                            let mut state = session.state.lock().await;
-                            state.combine_edit_holds.remove(&id);
+                        SessionCommand::ReleaseEdit { id } => {
+                            {
+                                let mut state = session.state.lock().await;
+                                state.edit_holds.remove(&id);
+                            }
+                            // Unblocks a front that was parked under edit hold.
+                            SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
                         SessionCommand::InterjectQueuedPrompt { id, expected_version, owner, new_text } => {
                             // Send-now: the handler promoted the row; cancel the running turn and start it.
@@ -1078,8 +923,7 @@ pub(super) async fn run_session(
                             // that prior success. Cancel targets the current turn;
                             // under show-until-replaced the prior line should still
                             // finish. New real prompts and rewind abort separately.
-                            let barrier = session.cancel_running_task(options).await;
-
+                            let cancel = session.cancel_running_task(options).await;
                             // Auto-pause the active goal on any cancel so timers stop
                             // and the pager shows "paused" instead of "active".
                             // Shared with the doom-loop and back-off paths via
@@ -1096,12 +940,15 @@ pub(super) async fn run_session(
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                             // An armed barrier must outlive the cancel; only
                             // a clear one lets queued notifications drain.
-                            if barrier == super::tasks_cancel::WakeBarrier::Clear {
+                            if cancel.barrier == super::tasks_cancel::WakeBarrier::Clear {
                                 SessionActor::maybe_drain_notifications(
                                     session.clone(),
                                     completion_tx.clone(),
                                 )
                                 .await;
+                            }
+                            if cancel.turn_stopped {
+                                session.emit_session_idle_if_idle().await;
                             }
                         }
                         SessionCommand::CompactSession { user_context, respond_to } => {
@@ -1367,6 +1214,9 @@ pub(super) async fn run_session(
                                 .notifications.persistence_tx
                                 .send(PersistenceMsg::FlushAndAck { respond_to });
                         }
+                        SessionCommand::UpdateAttachPolicy { startup_hints } => {
+                            session.apply_attach_policy(&startup_hints);
+                        }
                         SessionCommand::UpdateMcpServers { mcp_servers, respond_to } => {
                             if session.startup_hints.is_subagent {
                                 tracing::debug!(
@@ -1456,7 +1306,7 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ToggleMcpServer { server_name, enabled, server_config, respond_to } => {
-                            session.events.emit(xai_file_utils::events::Event::McpServerToggled {
+                            session.events.emit(xai_grok_session_events::Event::McpServerToggled {
                                 server_name: server_name.clone(),
                                 enabled,
                             });
@@ -1762,61 +1612,6 @@ pub(super) async fn run_session(
                             };
                             let _ = respond_to.send(pool);
                         }
-                        SessionCommand::SnapshotSubagentCapabilities { respond_to } => {
-                            const MAX_ATTEMPTS: usize = 3;
-                            let mut attempts = 0usize;
-                            let snapshot_result = loop {
-                                attempts += 1;
-                                let (mcp_generation, mcp_configs, mcp_pool) = {
-                                    let mcp_state = session.mcp_state.lock().await;
-                                    let pool = if mcp_state.owned_clients.is_empty()
-                                        && mcp_state.shared_clients.is_empty()
-                                    {
-                                        None
-                                    } else {
-                                        Some(
-                                            crate::session::mcp_servers::SharedMcpPool::from_state(
-                                                &mcp_state,
-                                            ),
-                                        )
-                                    };
-                                    (mcp_state.generation(), mcp_state.configs.clone(), pool)
-                                };
-                                let client_hooks = session.client_hooks.borrow().clone();
-                                // Use the same helper as parent turns so child verbatim prefixes
-                                // cannot drift from the parent's exposed tool schema.
-                                let defs = session.prepare_tool_definitions_inner().await;
-                                let tool_definitions = session.turn_base_tool_specs(&defs);
-                                let skills = session.slash_skills_for_resolve().await;
-                                let mcp_generation_after = {
-                                    let mcp_state = session.mcp_state.lock().await;
-                                    mcp_state.generation()
-                                };
-                                if mcp_generation_after == mcp_generation {
-                                    break Ok(crate::session::commands::SubagentCapabilitySnapshot {
-                                        mcp_configs,
-                                        mcp_pool,
-                                        client_hooks,
-                                        tool_definitions,
-                                        skills,
-                                        mcp_generation,
-                                    });
-                                }
-                                if attempts >= MAX_ATTEMPTS {
-                                    break Err(format!(
-                                        "parent MCP generation changed during snapshot refresh \
-                                         (start={mcp_generation}, end={mcp_generation_after})"
-                                    ));
-                                }
-                                tracing::debug!(
-                                    attempt = attempts,
-                                    start_generation = mcp_generation,
-                                    end_generation = mcp_generation_after,
-                                    "retrying subagent capability snapshot after MCP generation changed",
-                                );
-                            };
-                            let _ = respond_to.send(snapshot_result);
-                        }
                         SessionCommand::SnapshotClientHooks { respond_to } => {
                             let _ = respond_to.send(session.client_hooks.borrow().clone());
                         }
@@ -1901,14 +1696,6 @@ pub(super) async fn run_session(
                                 let _ = respond_to.send(());
                             });
                         }
-                        SessionCommand::BeginManagedGatewayAdmission { respond_to } => {
-                            session
-                                .agent
-                                .borrow()
-                                .tool_bridge()
-                                .begin_managed_gateway_admission();
-                            let _ = respond_to.send(());
-                        }
                         SessionCommand::RefreshMcpSearchIndex => {
                             session.refresh_mcp_snapshot_and_schedule_reminder().await;
                         }
@@ -1960,9 +1747,6 @@ pub(super) async fn run_session(
                             tokio::task::spawn_local(async move {
                                 s.reload_skills_from_disk().await;
                             });
-                        }
-                        SessionCommand::InvalidateModelAuthMemo => {
-                            session.invalidate_model_auth_memo();
                         }
                         SessionCommand::DispatchSessionStartHook { source } => {
                             let envelope = session.fire_hook(
@@ -2275,8 +2059,8 @@ pub(super) async fn run_session(
                             // This arm returns; an unanswered turn would race
                             // teardown and report `EndTurn` for unfinished work.
                             if kind == crate::session::ShutdownKind::CancelRunningTurn {
-                                // Shutdown is not a stop gesture; the barrier
-                                // stays clear.
+                                // Shutdown is not a stop gesture: the
+                                // session-end `Stop` reports this teardown.
                                 let _ = session
                                     .cancel_running_task(crate::session::CancelOptions {
                                         cancel_subagents: true,
@@ -2299,15 +2083,108 @@ pub(super) async fn run_session(
 
                             // ── session_end (shutdown path) ────────────
                             // Hooks fire BEFORE memory auto-save per plan contract.
+                            turn_end_queue.flush().await;
                             fire_session_end_hooks(&session, "shutdown").await;
                             session
                                 .run_session_end_memory_pipeline("session summary saved")
                                 .await;
+                            turn_end_queue.drain().await;
                             finish_session_exit_feedback(&session).await;
                             return;
                         }
                     }
             }
+                // Prefer cmd_rx when both are already waiting so a queued
+                // hold/edit can land before turn-end promote (biased select).
+                maybe_completion = completion_rx.recv() => {
+                    let Some((prompt_id, result)) = maybe_completion else {
+                        // Completion channel closed: full feedback teardown so
+                        // final signal sync + upload drain still run (cancel
+                        // alone no longer force-syncs — shutdown owns that).
+                        // No session-end hooks here, but the flush still has to precede
+                        // `shutdown_workflows`, which makes a queued report's entry durable.
+                        turn_end_queue.flush().await;
+                        shutdown_workflows(&session).await;
+                        turn_end_queue.drain().await;
+                        finish_session_exit_feedback(&session).await;
+                        return;
+                    };
+                    // Flush any buffered turn deltas before `handle_completion`
+                    // emits the durable `TurnCompleted`, so the terminal lands
+                    // in updates.jsonl strictly after the turn's last
+                    // `session/update` delta. Mirrors the Cancel / Shutdown /
+                    // FlushComplete arms.
+                    if let Some(notification) = replay_buffer.flush() {
+                        session.emit_buffered(notification).await;
+                    }
+                    let (turn_succeeded, suppress_goal_continuation, infra_pause_message) =
+                        SessionActor::post_turn_goal_degradation_plan(&result);
+                    // A `RemovedFromQueue` completion never started a turn, so
+                    // there is nothing to summarize below.
+                    let turn_ran = !matches!(
+                        &result,
+                        Ok(PromptTurnOk {
+                            completion_kind: PromptCompletionKind::RemovedFromQueue,
+                            ..
+                        })
+                    );
+                    let completed_prompt_id = prompt_id.clone();
+                    let owned_completion = session.handle_completion(prompt_id, result).await;
+                    // Drain any monitor events that were routed to the mid-turn buffer
+                    // but arrived after the turn ended (race between is_turn_active and buffer push).
+                    session.drain_monitor_buffer_to_pending().await;
+                    if let Some(message) = infra_pause_message {
+                        session.apply_infra_pause_after_turn_err(message).await;
+                    }
+                    // Goal continuation (success) or back-off (non-success).
+                    // Owns the streak-tracking and reminder-injection path.
+                    session
+                        .handle_turn_end(turn_succeeded, suppress_goal_continuation)
+                        .await;
+                    // Interjections that raced past the turn's final drain
+                    // (arrived during turn-end bookkeeping) have no turn left
+                    // to merge into — convert them to front-of-queue prompt
+                    // turns so the message runs instead of stranding.
+                    //
+                    // INVARIANT: this flush must only ever see interjections
+                    // aimed at the turn that just completed. That holds
+                    // because this arm runs in the same serialized actor loop
+                    // as `SessionCommand::Interject` (no live turn's buffer
+                    // can be stolen mid-stream), and both cancel paths drain
+                    // the buffer before their completion arrives.
+                    if session.flush_stranded_interjections().await > 0 {
+                        tracing::info!("Flushed stranded interjection(s) into prompt turns");
+                    }
+                    SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
+                    // If no user prompt started, check for pending notifications
+                    SessionActor::maybe_drain_notifications(session.clone(), completion_tx.clone()).await;
+                    session.emit_session_idle_if_idle().await;
+                    // Layer-3 LazinessDetector: spawn an idle-triggered
+                    // classifier dispatch. The method is a no-op when the
+                    // per-model `laziness_detector.enabled = false`
+                    // (the v1 default for every model), so no
+                    // classification cost is incurred without explicit
+                    // opt-in. Spawned via `spawn_local` so the actor
+                    // loop can continue accepting commands while the
+                    // classifier idle-waits.
+                    {
+                        let s = session.clone();
+                        tokio::task::spawn_local(async move {
+                            s.maybe_fire_laziness_check().await;
+                        });
+                    }
+                    // Per-turn dashboard summary (display-only side-call);
+                    // spawned so the actor loop keeps accepting commands.
+                    // `turn_succeeded` keeps cancelled/errored/refused turns
+                    // from triggering a fresh model call (a user who hit
+                    // Ctrl+C wants model activity to stop), and
+                    // `owned_completion` keeps a stale completion — a turn
+                    // the Cancel path already finalized — from summarizing
+                    // work the user aborted.
+                    if turn_ran && turn_succeeded && owned_completion {
+                        session.restart_turn_summary(completed_prompt_id);
+                    }
+                }
         }
     }
 }

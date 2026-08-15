@@ -13,51 +13,9 @@ use external_refresher::ExternalBinaryRefresher;
 pub(crate) use oidc_refresher::OidcRefresher;
 
 /// Callback for diagnostic log upload on auth refresh failure.
-/// Args: `(log_bytes, user_id)` — path key is user id, never email.
+/// Args: `(log_bytes, auth_token_suffix, user_id)` — path key is user id, never email.
 pub(crate) type DiagnosticUploader =
-    Arc<dyn Fn(Vec<u8>, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
-/// Exhaustive relation between the credential an OIDC attempt used and the
-/// latest credential observed on disk. Access and refresh relations must be
-/// computed separately because either credential can rotate independently.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TriedDiskRelation {
-    BothMissing,
-    TriedMissing,
-    DiskMissing,
-    Same,
-    Different,
-}
-
-impl TriedDiskRelation {
-    pub(crate) fn compare(tried: Option<&str>, disk: Option<&str>) -> Self {
-        match (tried, disk) {
-            (None, None) => Self::BothMissing,
-            (None, Some(_)) => Self::TriedMissing,
-            (Some(_), None) => Self::DiskMissing,
-            (Some(tried), Some(disk)) if tried == disk => Self::Same,
-            (Some(_), Some(_)) => Self::Different,
-        }
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::BothMissing => "both_missing",
-            Self::TriedMissing => "tried_missing",
-            Self::DiskMissing => "disk_missing",
-            Self::Same => "same",
-            Self::Different => "different",
-        }
-    }
-
-    pub(crate) const fn tried_present(self) -> bool {
-        matches!(self, Self::DiskMissing | Self::Same | Self::Different)
-    }
-
-    pub(crate) const fn disk_present(self) -> bool {
-        matches!(self, Self::TriedMissing | Self::Same | Self::Different)
-    }
-}
+    Arc<dyn Fn(Vec<u8>, String, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Read-only view of `AuthManager` for refreshers. Enforces the
 /// no-mutation contract on *credential* state at the type level: refreshers
@@ -128,7 +86,49 @@ pub(crate) fn resolve_refresh_credential(
         })
 }
 
+/// Identity of a refresh token whose IdP-side fate is unknown: it was on the
+/// wire when the exchange straddled a system suspend past the rotation
+/// grace. Rides [`RefreshOutcome::TransientFailure`] so `refresh_chain` can
+/// persist the cross-process sentinel (see `manager::consumed_sentinel`).
+#[derive(Clone)]
+pub(crate) struct SuspectConsumedRt {
+    refresh_token: String,
+    suspended_ms: u64,
+}
+
+impl SuspectConsumedRt {
+    pub(crate) fn new(refresh_token: String, suspended_ms: u64) -> Self {
+        Self {
+            refresh_token,
+            suspended_ms,
+        }
+    }
+
+    pub(crate) fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+
+    pub(crate) fn suspended_ms(&self) -> u64 {
+        self.suspended_ms
+    }
+}
+
+/// Redacted: `RefreshOutcome` derives `Debug` and is formatted into logs and
+/// test panics; the full RT must never ride along.
+impl std::fmt::Debug for SuspectConsumedRt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuspectConsumedRt")
+            .field(
+                "rt_suffix",
+                &xai_grok_auth::bearer_suffix(&self.refresh_token),
+            )
+            .field("suspended_ms", &self.suspended_ms)
+            .finish()
+    }
+}
+
 /// Outcome of a refresh attempt. Data only -- `refresh_chain` handles mutations.
+#[derive(Debug)]
 #[must_use = "RefreshOutcome encodes a state transition; route it through refresh_chain"]
 pub(crate) enum RefreshOutcome {
     /// Authority returned a fresh token. Caller persists via `update()`.
@@ -156,39 +156,15 @@ pub(crate) enum RefreshOutcome {
         /// which RT it sent (external binary flow).
         tried_refresh_token: Option<String>,
     },
-    /// Transient / unknown failure. Caller may retry later. Message-only: the
-    /// underlying cause is logged structurally at the refresher, then flattened
-    /// here (the retry decision needs recoverability, not the source chain).
-    TransientFailure { message: String },
-}
-
-impl std::fmt::Debug for RefreshOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Success(auth) => f
-                .debug_struct("Success")
-                .field("access_token_present", &!auth.key.is_empty())
-                .field("refresh_token_present", &auth.refresh_token.is_some())
-                .finish(),
-            Self::PermanentFailure {
-                error,
-                tried_key,
-                tried_refresh_token,
-            } => f
-                .debug_struct("PermanentFailure")
-                .field("error", error)
-                .field("tried_key_present", &tried_key.is_some())
-                .field(
-                    "tried_refresh_token_present",
-                    &tried_refresh_token.is_some(),
-                )
-                .finish(),
-            Self::TransientFailure { .. } => f
-                .debug_struct("TransientFailure")
-                .field("message_redacted", &true)
-                .finish(),
-        }
-    }
+    /// Transient / unknown failure. Caller may retry later. The underlying
+    /// cause is logged structurally at the refresher, then flattened to
+    /// `message` (the retry decision needs recoverability, not the source
+    /// chain). A [`SuspectConsumedRt`] means `refresh_chain` must persist
+    /// the sentinel instead of letting any process blindly re-present it.
+    TransientFailure {
+        message: String,
+        suspect_consumed_rt: Option<SuspectConsumedRt>,
+    },
 }
 
 impl RefreshOutcome {
@@ -236,6 +212,20 @@ impl RefreshOutcome {
     pub(crate) fn transient(message: impl Into<String>) -> Self {
         Self::TransientFailure {
             message: message.into(),
+            suspect_consumed_rt: None,
+        }
+    }
+
+    /// A transient failure whose exchange straddled a suspend past the
+    /// rotation grace: the RT presented may already be consumed at the IdP.
+    /// `refresh_chain` persists the sentinel and stops — never a blind retry.
+    pub(crate) fn transient_suspect_consumed(
+        message: impl Into<String>,
+        suspect: SuspectConsumedRt,
+    ) -> Self {
+        Self::TransientFailure {
+            message: message.into(),
+            suspect_consumed_rt: Some(suspect),
         }
     }
 }
@@ -276,59 +266,6 @@ mod tests {
     use super::*;
     use crate::auth::{AuthMode, GrokAuth, GrokComConfig};
     use chrono::{Duration, Utc};
-
-    #[test]
-    fn tried_disk_relation_truth_table_is_exhaustive() {
-        assert_eq!(
-            TriedDiskRelation::compare(None, None),
-            TriedDiskRelation::BothMissing
-        );
-        assert_eq!(
-            TriedDiskRelation::compare(None, Some("disk")),
-            TriedDiskRelation::TriedMissing
-        );
-        assert_eq!(
-            TriedDiskRelation::compare(Some("tried"), None),
-            TriedDiskRelation::DiskMissing
-        );
-        assert_eq!(
-            TriedDiskRelation::compare(Some("same"), Some("same")),
-            TriedDiskRelation::Same
-        );
-        assert_eq!(
-            TriedDiskRelation::compare(Some("a"), Some("b")),
-            TriedDiskRelation::Different
-        );
-    }
-
-    #[test]
-    fn refresh_outcome_debug_redacts_secret_values() {
-        let access = "access-SENTINEL-0123456789";
-        let refresh = "refresh-SENTINEL-9876543210";
-        let auth = GrokAuth {
-            key: access.into(),
-            refresh_token: Some(refresh.into()),
-            ..GrokAuth::test_default()
-        };
-        let success = format!("{:?}", RefreshOutcome::success(auth.clone()));
-        let failure = format!(
-            "{:?}",
-            RefreshOutcome::permanent_for(
-                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
-                &auth,
-            )
-        );
-        for debug in [success, failure] {
-            assert!(
-                !debug.contains(access),
-                "debug leaked access token: {debug}"
-            );
-            assert!(
-                !debug.contains(refresh),
-                "debug leaked refresh token: {debug}"
-            );
-        }
-    }
 
     /// auth_token_ttl makes is_token_expired use create_time + ttl for
     /// External tokens without expires_at, instead of the 30-day fallback.

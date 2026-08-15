@@ -32,9 +32,9 @@ impl crate::auth::refresh::TokenRefresher for WakeGapRefresher {
     ) -> crate::auth::refresh::RefreshOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_pre_request && reason == crate::auth::refresh::RefreshReason::PreRequest {
-            return crate::auth::refresh::RefreshOutcome::TransientFailure {
-                message: "simulated post-wake network gap".to_string(),
-            };
+            return crate::auth::refresh::RefreshOutcome::transient(
+                "simulated post-wake network gap",
+            );
         }
         crate::auth::refresh::RefreshOutcome::success(GrokAuth {
             key: FRESH_TOKEN.to_string(),
@@ -125,13 +125,6 @@ async fn session_token_actor(
 ) -> (Arc<SessionActor>, XaiUpdates) {
     let sampling_cfg = xai_grok_sampler::SamplerConfig {
         base_url: server.url(),
-        // The mock serves plain HTTP on loopback, which the attach-side
-        // predicate refuses outright (#110) -- correctly, for a real endpoint.
-        // These tests are about the retry budget under session auth, so they
-        // say what they mean instead: this origin stands in for first-party
-        // xAI. Same field `resolve_endpoint_trust` already honours, so the
-        // shell gate and the sampler agree.
-        endpoint_trust: Some(xai_grok_sampler::EndpointTrustClass::FirstPartyXai),
         model: "test".to_string(),
         api_backend: xai_grok_sampler::ApiBackend::Responses,
         context_window: 256_000,
@@ -167,21 +160,13 @@ async fn session_token_actor(
         .await
         .expect("test actor has sampling config");
     cfg.base_url = server.url();
-    // Same declaration as the sampler config above, on the config the
-    // session-token gate actually reads (#110).
-    cfg.endpoint_trust = Some(xai_grok_sampling_types::EndpointTrustClass::FirstPartyXai);
     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
     cfg.model = "test".to_string();
     actor.chat_state_handle.update_sampling_config(cfg);
-    // `rebind`, not a fresh `bound(..)`: the old two-field assignment preserved
-    // `alpha_test_key` / `client_version`, and a new value would silently drop
-    // them. The other two migrated sites use `rebind` for the same reason.
-    let existing = actor.chat_state_handle.get_credentials().await;
-    actor.chat_state_handle.update_credentials(existing.rebind(
-        None,
-        xai_chat_state::AuthType::SessionToken,
-        xai_grok_sampler::CredentialSource::Missing,
-    ));
+    let mut creds = actor.chat_state_handle.get_credentials().await;
+    creds.api_key = None;
+    creds.auth_type = xai_chat_state::AuthType::SessionToken;
+    actor.chat_state_handle.update_credentials(creds);
 
     // Definite NotByok: the session-token gate must stay active against the
     // loopback mock URL (an `Unknown` would demand a first-party host).
@@ -192,10 +177,8 @@ async fn session_token_actor(
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::NotByok,
                 auth_scheme: Default::default(),
-                readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: None,
-            catalog_generation: 0,
         }));
 
     actor
@@ -240,6 +223,7 @@ async fn run_prompt(
             None,
             None,
             true,
+            /* send_now */ false,
             None,
             None,
             None,
@@ -252,10 +236,11 @@ async fn run_prompt(
 /// The wake sequence: the resolver has nothing wire-valid, the send goes
 /// out with no `Authorization` header, the server 401s it, recovery lands a
 /// fresh token. The turn must survive and resubmit with the fresh bearer.
-#[test]
-fn fail_closed_401_is_uncharged_and_turn_survives() {
-    on_large_stack(|| {
-        block_on_local(false, async {
+#[tokio::test(flavor = "current_thread")]
+async fn fail_closed_401_is_uncharged_and_turn_survives() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
             let server = MockInferenceServer::start_with_required_auth(
                 vec![MockModelEntry::new("test")],
                 FRESH_TOKEN,
@@ -303,18 +288,19 @@ fn fail_closed_401_is_uncharged_and_turn_survives() {
                 calls.load(Ordering::SeqCst) >= 2,
                 "both the failing pre-flight and the recovery refresh must run"
             );
-        });
-    });
+        })
+        .await;
 }
 
 /// Real credential rejections must still terminate: when every request
 /// carries a bearer the server rejects, the escalating budget exhausts after
 /// `MAX_RETRIES` and the failure names authenticated rejections — not a
 /// generic budget message. `start_paused` auto-advances the backoff ladder.
-#[test]
-fn authenticated_401s_still_exhaust_after_three_retries() {
-    on_large_stack(|| {
-        block_on_local(true, async {
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn authenticated_401s_still_exhaust_after_three_retries() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
             // The server only accepts a token the refresher never mints, so
             // every authenticated send is rejected.
             let server = MockInferenceServer::start_with_required_auth(
@@ -364,6 +350,6 @@ fn authenticated_401s_still_exhaust_after_three_retries() {
                 message.contains("authenticated inference requests were still rejected"),
                 "the notification must carry the same story as the error: {message}"
             );
-        });
-    });
+        })
+        .await;
 }

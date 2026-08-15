@@ -799,8 +799,7 @@ impl SessionActor {
                     xai_grok_sampler::stream_chat_completions(raw, meta, request_id, idle_timeout);
                 xai_grok_sampler::collect_response(events).await
             }
-            crate::sampling::ApiBackend::Responses
-            | crate::sampling::ApiBackend::CodexResponses => {
+            crate::sampling::ApiBackend::Responses => {
                 let (raw, meta, doom_loop) = sampling_client
                     .conversation_stream_responses(request)
                     .await
@@ -821,6 +820,9 @@ impl SessionActor {
                     .map_err(|e| format!("rewrite stream failed: {e}"))?;
                 let events = xai_grok_sampler::stream_messages(raw, meta, request_id, idle_timeout);
                 xai_grok_sampler::collect_response(events).await
+            }
+            _ => {
+                unreachable!("Backend not supported here");
             }
         };
 

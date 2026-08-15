@@ -95,7 +95,7 @@ fn seed_fixtures(home: &Path, cwd: &Path) {
 /// return every inference request body concatenated into one string for
 /// substring assertions (system prompt + skill listing + injected reminders).
 async fn run_scenario(env: &[(&str, &str)]) -> String {
-    let server = MockInferenceServer::start_keyless_local()
+    let server = MockInferenceServer::start()
         .await
         .expect("start mock server");
     let workdir = git_workdir();

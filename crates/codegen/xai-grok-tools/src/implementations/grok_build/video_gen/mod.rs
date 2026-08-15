@@ -33,8 +33,7 @@ use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::SessionFolder;
 use crate::types::tool::{ToolKind, ToolNamespace};
 
-const XAI_VIDEO_BASE_MODEL: &str = "grok-imagine-video";
-const XAI_VIDEO_QUALITY_MODEL: &str = "grok-imagine-video-1.5-preview";
+const XAI_VIDEO_MODEL: &str = "grok-imagine-video-1.5";
 const VIDEO_START_TIMEOUT_SECS: u64 = 60;
 const VIDEO_GEN_TIMEOUT_SECS: u64 = 300;
 const VIDEO_POLL_INTERVAL_SECS: u64 = 5;
@@ -50,7 +49,11 @@ const DEFAULT_VIDEO_DIR: &str = "videos";
 const DEFAULT_RESOLUTION: &str = "480p";
 const DEFAULT_IMAGINE_VIDEO_DURATION_SECS: u32 = 6;
 const MAX_R2V_REFERENCE_IMAGES: usize = 7;
-const VALID_IMAGINE_VIDEO_ASPECT_RATIOS: &[&str] = &["1:1", "16:9", "9:16", "3:2", "2:3"];
+const MAX_R2V_REFERENCE_VOICES: usize = 3;
+const MIN_R2V_DURATION_SECS: u32 = 1;
+const MAX_R2V_DURATION_SECS: u32 = 15;
+const VALID_IMAGINE_VIDEO_ASPECT_RATIOS: &[&str] =
+    &["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"];
 const VALID_VIDEO_RESOLUTIONS: &[&str] = &["480p", "720p"];
 const IMAGINE_VIDEO_DURATIONS_SECS: &[u32] = &[6, 10];
 
@@ -152,6 +155,8 @@ pub struct VideoGenClient {
     /// (free / X Basic). The video tools short-circuit before any HTTP call
     /// and return the SuperGrok upsell prose. See [`VideoGenClient::is_tier_restricted`].
     tier_restricted: bool,
+    /// See [`VideoGenConfig::Enabled`]'s `zdr_restricted`.
+    zdr_restricted: bool,
 }
 
 impl VideoGenClient {
@@ -165,6 +170,7 @@ impl VideoGenClient {
             extra_headers,
             zdr_video_output_s3,
             tier_restricted,
+            zdr_restricted,
         } = config
         else {
             return Err(xai_tool_runtime::ToolError::invalid_arguments(
@@ -224,6 +230,7 @@ impl VideoGenClient {
             api_key_provider,
             attribution_callback: None,
             tier_restricted: *tier_restricted,
+            zdr_restricted: *zdr_restricted,
         })
     }
 
@@ -232,6 +239,11 @@ impl VideoGenClient {
     /// SuperGrok upsell instead of issuing a doomed request.
     pub(crate) fn is_tier_restricted(&self) -> bool {
         self.tier_restricted
+    }
+
+    /// See [`VideoGenConfig::Enabled`]'s `zdr_restricted`.
+    pub(crate) fn is_zdr_restricted(&self) -> bool {
+        self.zdr_restricted
     }
 
     /// Wire a 401-attribution callback into this client. Idempotent;
@@ -276,6 +288,7 @@ impl VideoGenClient {
         resolution: &str,
         image: Option<String>,
         reference_images: Vec<String>,
+        reference_voices: Vec<String>,
     ) -> Result<VideoOutcome, xai_tool_runtime::ToolError> {
         let start_url = format!("{}/videos/generations", self.base_url.trim_end_matches('/'));
 
@@ -294,6 +307,10 @@ impl VideoGenClient {
             reference_images: reference_images
                 .into_iter()
                 .map(|url| VideoImageUrl { url })
+                .collect(),
+            reference_audios: reference_voices
+                .into_iter()
+                .map(|voice_id| VideoVoiceId { voice_id })
                 .collect(),
             output: presigned.as_ref().map(|urls| VideoOutput {
                 upload_url: urls.upload_url.clone(),
@@ -690,6 +707,11 @@ pub enum VideoGenConfig {
         /// at call time with the SuperGrok upsell prose. Set by the host from
         /// the subscription tier; always `false` for team / API-key / workspace.
         tier_restricted: bool,
+        /// `true` when `tools.disable_zdr_incompatible_tools` is set with no
+        /// valid `[tools.zdr_video_output_s3]` bucket. The video tools stay
+        /// advertised but fail at call time with [`ZDR_RESTRICTED_MESSAGE`]
+        /// instead of being silently dropped.
+        zdr_restricted: bool,
     },
 }
 
@@ -703,6 +725,7 @@ impl std::fmt::Debug for VideoGenConfig {
                 extra_headers,
                 zdr_video_output_s3,
                 tier_restricted,
+                zdr_restricted,
             } => f
                 .debug_struct("VideoGenConfig::Enabled")
                 .field("api_key_present", &!api_key.is_empty())
@@ -740,6 +763,21 @@ impl VideoGenConfig {
 /// modal instead.
 pub(crate) const TIER_RESTRICTED_UPSELL: &str = "Video generation is a SuperGrok feature and isn't available on the free or X Basic tier. Let the user know they can unlock image and video generation by upgrading to SuperGrok: https://grok.com/supergrok?referrer=grok-build. Do not retry this tool.";
 
+/// Error for video tool calls in a ZDR session with no output bucket.
+/// A verbatim tool *error* (unlike the [`TIER_RESTRICTED_UPSELL`] prose):
+/// paraphrasing a privacy-adjacent message risks distortion.
+pub(crate) const ZDR_RESTRICTED_MESSAGE: &str = "Video generation tools are unavailable under zero data retention (ZDR). To re-enable, either supply a user-hosted storage bucket (see https://docs.x.ai/build/settings/zdr-video-storage) or turn off /privacy mode to disable ZDR for all Grok Build requests (including code). Restart Grok after changing the config for it to take effect. Relay this message to the user verbatim; do not retry this tool.";
+
+/// The [`ZDR_RESTRICTED_MESSAGE`] as a structured tool error, with a stable
+/// details code for log/trace filtering.
+fn zdr_restricted_error() -> xai_tool_runtime::ToolError {
+    xai_tool_runtime::ToolError::new(
+        xai_tool_runtime::ToolErrorKind::Custom,
+        ZDR_RESTRICTED_MESSAGE,
+    )
+    .with_details(serde_json::json!({"code": "zdr_output_storage_required"}))
+}
+
 fn default_resolution_name() -> String {
     DEFAULT_RESOLUTION.to_owned()
 }
@@ -762,6 +800,8 @@ struct GenerateVideoPayload<'a> {
     resolution: &'a str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     reference_images: Vec<VideoImageUrl>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reference_audios: Vec<VideoVoiceId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<VideoOutput>,
 }
@@ -769,6 +809,11 @@ struct GenerateVideoPayload<'a> {
 #[derive(serde::Serialize)]
 struct VideoImageUrl {
     url: String,
+}
+
+#[derive(serde::Serialize)]
+struct VideoVoiceId {
+    voice_id: String,
 }
 
 #[derive(serde::Serialize)]
@@ -868,6 +913,17 @@ fn validate_imagine_duration(duration: Option<u32>) -> Result<(), xai_tool_runti
     Ok(())
 }
 
+fn validate_r2v_duration(duration: Option<u32>) -> Result<(), xai_tool_runtime::ToolError> {
+    if let Some(secs) = duration
+        && !(MIN_R2V_DURATION_SECS..=MAX_R2V_DURATION_SECS).contains(&secs)
+    {
+        return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+            "`duration` must be between {MIN_R2V_DURATION_SECS} and {MAX_R2V_DURATION_SECS} seconds. Got {secs}."
+        )));
+    }
+    Ok(())
+}
+
 fn duration_from_json<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -885,7 +941,7 @@ where
             .trim()
             .parse::<u32>()
             .map(Some)
-            .map_err(|_| serde::de::Error::custom("duration must be 6 or 10")),
+            .map_err(|_| serde::de::Error::custom("duration must be a whole number of seconds")),
         None => Ok(None),
     }
 }
@@ -927,13 +983,20 @@ pub struct ReferenceToVideoInput {
     )]
     pub prompt: String,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
-        description = "Reference images. Provide 2 to 7 entries; the images are used as style/content references for the generated video. Each entry may be an absolute filesystem path, HTTPS URL, or `data:image/...;base64,...` URL."
+        description = "Reference images, up to 7 entries; the images are used as style/content references for the generated video (people, objects, clothing, settings). Each entry may be an absolute filesystem path, HTTPS URL, or `data:image/...;base64,...` URL. Reference them in the prompt as `<IMAGE_0>`, `<IMAGE_1>`, ... May be empty when `voices` is provided."
     )]
     pub images: Vec<String>,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
-        description = "Aspect ratio of the generated video, decide it based on the user's request. 1:1 for square (icons, profiles), 16:9 for wide (landscapes, cinematic), 9:16 for tall (phone wallpapers, stories), 3:2 for horizontal photos, 2:3 for vertical (portraits, posters)."
+        description = "Optional preset voices the subject(s) speak in, up to 3 entries, each a voice identifier from the built-in roster (e.g. \"ara\", \"eve\", \"leo\", \"rex\"; same voices as the xAI text-to-speech API; an unknown identifier fails with the list of available voices). Reference them in the prompt as `<AUDIO_0>`, `<AUDIO_1>`, `<AUDIO_2>`. Usable alongside `images` or on their own."
+    )]
+    pub voices: Vec<String>,
+
+    #[schemars(
+        description = "Aspect ratio of the generated video, decide it based on the user's request. 1:1 for square (icons, profiles), 16:9 for wide (landscapes, cinematic), 9:16 for tall (phone wallpapers, stories), 4:3 or 3:2 for horizontal photos, 3:4 or 2:3 for vertical (portraits, posters)."
     )]
     pub aspect_ratio: String,
 
@@ -942,9 +1005,7 @@ pub struct ReferenceToVideoInput {
         deserialize_with = "duration_from_json",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(
-        description = "Duration of the video generation, either 6 or 10 seconds. Defaults to 6."
-    )]
+    #[schemars(description = "Duration of the video in seconds, between 1 and 15. Defaults to 6.")]
     pub duration: Option<u32>,
 
     #[serde(default = "default_resolution_name")]
@@ -1078,10 +1139,13 @@ impl xai_tool_runtime::Tool for ImageToVideoTool {
         if client.is_tier_restricted() {
             return Ok(ToolOutput::Text(TIER_RESTRICTED_UPSELL.into()));
         }
+        if client.is_zdr_restricted() {
+            return Err(zdr_restricted_error());
+        }
 
         let outcome = client
             .generate_with_images(
-                XAI_VIDEO_QUALITY_MODEL,
+                XAI_VIDEO_MODEL,
                 &prompt,
                 Some(
                     input
@@ -1091,6 +1155,7 @@ impl xai_tool_runtime::Tool for ImageToVideoTool {
                 None,
                 &input.resolution_name,
                 Some(image),
+                Vec::new(),
                 Vec::new(),
             )
             .await?;
@@ -1114,7 +1179,7 @@ impl crate::types::tool_metadata::ToolMetadata for ReferenceToVideoTool {
     }
 
     fn description_template(&self) -> &str {
-        r##"Generate a video from multiple reference images guided by a text prompt; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide `images` with 2 to 7 image references and a required `prompt` describing the desired video. Use this tool when the user wants a video using multiple images as style/content references. Example: reference_to_video(prompt="blend these into a cinematic fashion shot with slow dolly movement", images=["/Users/me/ref1.jpg", "/Users/me/ref2.jpg"], aspect_ratio="16:9", duration=6, resolution_name="480p")"##
+        r##"Generate a video from reference images and/or preset voices, guided by a required text prompt; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide up to 7 `images` (style/content references: people, objects, clothing, settings) and/or up to 3 `voices` (preset voice identifiers the subjects speak in); at least one of either is required. Tag references in the prompt as `<IMAGE_0>`, `<IMAGE_1>`, ... and `<AUDIO_0>`, `<AUDIO_1>`, ... Use this tool when the user wants a video referencing existing images without locking the first frame, or wants a speaking subject with a specific voice. Example: reference_to_video(prompt="The person from <IMAGE_0> presents the product from <IMAGE_1>, speaking with the voice from <AUDIO_0>", images=["/Users/me/host.jpg", "/Users/me/product.jpg"], voices=["eve"], aspect_ratio="16:9", duration=10, resolution_name="480p")"##
     }
 
     fn requires_expr(&self) -> Expr<ToolRequirement> {
@@ -1151,7 +1216,7 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
     #[tracing::instrument(
         name = "tool.reference_to_video",
         skip_all,
-        fields(prompt_len = input.prompt.len(), num_images = input.images.len(), aspect_ratio = %input.aspect_ratio, duration = ?input.duration, resolution = %input.resolution_name)
+        fields(prompt_len = input.prompt.len(), num_images = input.images.len(), num_voices = input.voices.len(), aspect_ratio = %input.aspect_ratio, duration = ?input.duration, resolution = %input.resolution_name)
     )]
     async fn run(
         &self,
@@ -1163,9 +1228,9 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
                 "`prompt` must not be empty.",
             ));
         }
-        if input.images.len() < 2 {
+        if input.images.is_empty() && input.voices.is_empty() {
             return Err(xai_tool_runtime::ToolError::invalid_arguments(
-                "`images` must contain at least two image references.",
+                "Provide at least one reference: `images` (up to 7) and/or `voices` (up to 3).",
             ));
         }
         if input.images.len() > MAX_R2V_REFERENCE_IMAGES {
@@ -1173,7 +1238,17 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
                 "`images` must contain at most {MAX_R2V_REFERENCE_IMAGES} image references."
             )));
         }
-        validate_imagine_duration(input.duration)?;
+        if input.voices.len() > MAX_R2V_REFERENCE_VOICES {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "`voices` must contain at most {MAX_R2V_REFERENCE_VOICES} preset voices."
+            )));
+        }
+        if input.voices.iter().any(|v| v.trim().is_empty()) {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                "`voices` entries must be non-empty voice identifiers (e.g. \"ara\").",
+            ));
+        }
+        validate_r2v_duration(input.duration)?;
         validate_one_of(
             "aspect_ratio",
             &input.aspect_ratio,
@@ -1197,10 +1272,13 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
         if client.is_tier_restricted() {
             return Ok(ToolOutput::Text(TIER_RESTRICTED_UPSELL.into()));
         }
+        if client.is_zdr_restricted() {
+            return Err(zdr_restricted_error());
+        }
 
         let outcome = client
             .generate_with_images(
-                XAI_VIDEO_BASE_MODEL,
+                XAI_VIDEO_MODEL,
                 &input.prompt,
                 Some(
                     input
@@ -1211,6 +1289,7 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
                 &input.resolution_name,
                 None,
                 reference_images,
+                input.voices,
             )
             .await?;
 
@@ -1262,6 +1341,7 @@ mod tests {
             )]),
             zdr_video_output_s3: Some(Box::new(storage)),
             tier_restricted: false,
+            zdr_restricted: false,
         };
         assert_no_secret_windows(&format!("{config:?}"), secret);
     }
@@ -1291,6 +1371,7 @@ mod tests {
             extra_headers: indexmap::IndexMap::new(),
             zdr_video_output_s3: None,
             tier_restricted: false,
+            zdr_restricted: false,
         };
         let error = match VideoGenClient::new(&config, None) {
             Ok(_) => panic!("invalid credential header must fail"),
@@ -1331,8 +1412,9 @@ mod tests {
             REFERENCE_TO_VIDEO_TOOL_NAME
         );
         let desc = crate::types::tool_metadata::ToolMetadata::description_template(&tool);
-        assert!(desc.contains("multiple reference images"));
+        assert!(desc.contains("reference images and/or preset voices"));
         assert!(desc.contains("reference_to_video"));
+        assert!(desc.contains("<AUDIO_0>"));
     }
 
     #[test]
@@ -1352,9 +1434,20 @@ mod tests {
         .unwrap();
         assert_eq!(input.prompt, "blend these");
         assert_eq!(input.images.len(), 2);
+        assert!(input.voices.is_empty());
         assert_eq!(input.aspect_ratio, "16:9");
         assert_eq!(input.duration, Some(10));
         assert_eq!(input.resolution_name, DEFAULT_RESOLUTION);
+    }
+
+    #[test]
+    fn reference_to_video_input_deserializes_voices() {
+        let input: ReferenceToVideoInput = serde_json::from_str(
+            r#"{"prompt":"the subject speaks","voices":["ara","eve"],"aspect_ratio":"16:9"}"#,
+        )
+        .unwrap();
+        assert!(input.images.is_empty());
+        assert_eq!(input.voices, vec!["ara", "eve"]);
     }
 
     #[test]
@@ -1368,7 +1461,7 @@ mod tests {
     #[test]
     fn image_and_reference_payload_fields_are_serialized() {
         let payload = GenerateVideoPayload {
-            model: XAI_VIDEO_QUALITY_MODEL,
+            model: XAI_VIDEO_MODEL,
             prompt: "animate",
             image: Some(VideoImageUrl {
                 url: "data:image/png;base64,a".to_owned(),
@@ -1377,6 +1470,7 @@ mod tests {
             aspect_ratio: None,
             resolution: DEFAULT_RESOLUTION,
             reference_images: Vec::new(),
+            reference_audios: Vec::new(),
             output: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -1385,7 +1479,7 @@ mod tests {
         assert!(json.get("output").is_none());
 
         let payload = GenerateVideoPayload {
-            model: XAI_VIDEO_BASE_MODEL,
+            model: XAI_VIDEO_MODEL,
             prompt: "blend",
             image: None,
             duration: Some(6),
@@ -1399,6 +1493,7 @@ mod tests {
                     url: "data:image/png;base64,b".to_owned(),
                 },
             ],
+            reference_audios: Vec::new(),
             output: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -1409,13 +1504,14 @@ mod tests {
     #[test]
     fn output_upload_url_serialized_when_present() {
         let payload = GenerateVideoPayload {
-            model: XAI_VIDEO_QUALITY_MODEL,
+            model: XAI_VIDEO_MODEL,
             prompt: "animate",
             image: None,
             duration: Some(6),
             aspect_ratio: Some("16:9"),
             resolution: DEFAULT_RESOLUTION,
             reference_images: Vec::new(),
+            reference_audios: Vec::new(),
             output: Some(VideoOutput {
                 upload_url: "https://bucket.example.com/signed-put".to_owned(),
             }),
@@ -1612,7 +1708,8 @@ mod tests {
             ReferenceToVideoInput {
                 prompt: "blend".into(),
                 images: vec!["/tmp/a.jpg".into(), "/tmp/b.jpg".into()],
-                aspect_ratio: "4:3".into(),
+                voices: Vec::new(),
+                aspect_ratio: "21:9".into(),
                 duration: None,
                 resolution_name: DEFAULT_RESOLUTION.into(),
             },
@@ -1642,7 +1739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_to_video_rejects_too_few_images() {
+    async fn reference_to_video_rejects_no_references() {
         let tool = ReferenceToVideoTool;
         let resources = crate::types::resources::Resources::new();
         let err = xai_tool_runtime::Tool::run(
@@ -1650,15 +1747,120 @@ mod tests {
             test_ctx_with_call_id(resources.into_shared(), "test-call"),
             ReferenceToVideoInput {
                 prompt: "blend".into(),
-                images: vec!["/tmp/a.jpg".into()],
+                images: Vec::new(),
+                voices: Vec::new(),
                 aspect_ratio: "16:9".into(),
                 duration: None,
                 resolution_name: DEFAULT_RESOLUTION.into(),
             },
         )
         .await
-        .expect_err("Expected image count error");
-        assert!(err.to_string().contains("at least two"));
+        .expect_err("Expected missing references error");
+        assert!(err.to_string().contains("at least one reference"));
+    }
+
+    #[tokio::test]
+    async fn reference_to_video_rejects_too_many_voices() {
+        let tool = ReferenceToVideoTool;
+        let resources = crate::types::resources::Resources::new();
+        let err = xai_tool_runtime::Tool::run(
+            &tool,
+            test_ctx_with_call_id(resources.into_shared(), "test-call"),
+            ReferenceToVideoInput {
+                prompt: "speak".into(),
+                images: Vec::new(),
+                voices: vec!["ara".into(), "eve".into(), "leo".into(), "rex".into()],
+                aspect_ratio: "16:9".into(),
+                duration: None,
+                resolution_name: DEFAULT_RESOLUTION.into(),
+            },
+        )
+        .await
+        .expect_err("Expected voice count error");
+        assert!(err.to_string().contains("at most 3 preset voices"));
+    }
+
+    #[tokio::test]
+    async fn reference_to_video_rejects_out_of_range_duration() {
+        let tool = ReferenceToVideoTool;
+        let resources = crate::types::resources::Resources::new();
+        let err = xai_tool_runtime::Tool::run(
+            &tool,
+            test_ctx_with_call_id(resources.into_shared(), "test-call"),
+            ReferenceToVideoInput {
+                prompt: "speak".into(),
+                images: Vec::new(),
+                voices: vec!["ara".into()],
+                aspect_ratio: "16:9".into(),
+                duration: Some(16),
+                resolution_name: DEFAULT_RESOLUTION.into(),
+            },
+        )
+        .await
+        .expect_err("Expected duration error");
+        assert!(err.to_string().contains("between 1 and 15"));
+    }
+
+    #[test]
+    fn non_numeric_duration_parse_error_is_range_agnostic() {
+        let err =
+            serde_json::from_str::<ImageToVideoInput>(r#"{"image":"/tmp/a.jpg","duration":"abc"}"#)
+                .expect_err("expected parse error");
+        assert!(err.to_string().contains("whole number of seconds"));
+
+        let err = serde_json::from_str::<ReferenceToVideoInput>(
+            r#"{"prompt":"x","voices":["ara"],"aspect_ratio":"16:9","duration":"abc"}"#,
+        )
+        .expect_err("expected parse error");
+        assert!(err.to_string().contains("whole number of seconds"));
+    }
+
+    #[test]
+    fn r2v_duration_validation_accepts_full_range() {
+        assert!(validate_r2v_duration(None).is_ok());
+        assert!(validate_r2v_duration(Some(1)).is_ok());
+        assert!(validate_r2v_duration(Some(15)).is_ok());
+        assert!(validate_r2v_duration(Some(0)).is_err());
+        assert!(validate_r2v_duration(Some(16)).is_err());
+    }
+
+    #[test]
+    fn reference_audios_serialized_as_voice_ids() {
+        let payload = GenerateVideoPayload {
+            model: XAI_VIDEO_MODEL,
+            prompt: "the subject speaks",
+            image: None,
+            duration: Some(10),
+            aspect_ratio: Some("16:9"),
+            resolution: DEFAULT_RESOLUTION,
+            reference_images: Vec::new(),
+            reference_audios: vec![
+                VideoVoiceId {
+                    voice_id: "ara".to_owned(),
+                },
+                VideoVoiceId {
+                    voice_id: "eve".to_owned(),
+                },
+            ],
+            output: None,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["reference_audios"][0]["voice_id"], "ara");
+        assert_eq!(json["reference_audios"][1]["voice_id"], "eve");
+
+        let payload = GenerateVideoPayload {
+            model: XAI_VIDEO_MODEL,
+            prompt: "no voices",
+            image: None,
+            duration: Some(6),
+            aspect_ratio: Some("16:9"),
+            resolution: DEFAULT_RESOLUTION,
+            reference_images: Vec::new(),
+            reference_audios: Vec::new(),
+            output: None,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json.get("reference_audios").is_none());
     }
 
     #[tokio::test]
@@ -1682,16 +1884,18 @@ mod tests {
             extra_headers: indexmap::IndexMap::new(),
             zdr_video_output_s3: None,
             tier_restricted: false,
+            zdr_restricted: false,
         };
         let client = VideoGenClient::new(&config, None).unwrap();
         let result = client
             .generate_with_images(
-                XAI_VIDEO_BASE_MODEL,
+                XAI_VIDEO_MODEL,
                 "prompt",
                 Some(6),
                 Some("16:9"),
                 "480p",
                 None,
+                Vec::new(),
                 Vec::new(),
             )
             .await;
@@ -1732,16 +1936,18 @@ mod tests {
             extra_headers: indexmap::IndexMap::new(),
             zdr_video_output_s3: None,
             tier_restricted: false,
+            zdr_restricted: false,
         };
         let client = VideoGenClient::new(&config, None).unwrap();
         let outcome = client
             .generate_with_images(
-                XAI_VIDEO_BASE_MODEL,
+                XAI_VIDEO_MODEL,
                 "prompt",
                 Some(6),
                 Some("16:9"),
                 "480p",
                 None,
+                Vec::new(),
                 Vec::new(),
             )
             .await;
@@ -1757,13 +1963,14 @@ mod tests {
         // Regression: an unset `duration` must not be serialized at all
         // (no `null`, no synthetic default) so the server's default applies.
         let payload = GenerateVideoPayload {
-            model: XAI_VIDEO_QUALITY_MODEL,
+            model: XAI_VIDEO_MODEL,
             prompt: "test",
             image: None,
             duration: None,
             aspect_ratio: Some("16:9"),
             resolution: DEFAULT_RESOLUTION,
             reference_images: Vec::new(),
+            reference_audios: Vec::new(),
             output: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -1776,13 +1983,14 @@ mod tests {
     #[test]
     fn explicit_duration_is_present_on_wire() {
         let payload = GenerateVideoPayload {
-            model: XAI_VIDEO_QUALITY_MODEL,
+            model: XAI_VIDEO_MODEL,
             prompt: "test",
             image: None,
             duration: Some(12),
             aspect_ratio: Some("16:9"),
             resolution: DEFAULT_RESOLUTION,
             reference_images: Vec::new(),
+            reference_audios: Vec::new(),
             output: None,
         };
         let json = serde_json::to_value(&payload).unwrap();

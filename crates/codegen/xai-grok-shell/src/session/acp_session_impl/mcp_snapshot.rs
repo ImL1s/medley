@@ -32,12 +32,6 @@ pub(super) fn gateway_tool_is_disabled(
             .is_some_and(|set| set.contains(&qualified_name))
 }
 
-#[cfg(test)]
-struct GatewaySnapshotTestGate {
-    snapshot_ready: tokio::sync::oneshot::Sender<()>,
-    continue_refresh: tokio::sync::oneshot::Receiver<()>,
-}
-
 pub(super) async fn refresh_mcp_snapshot_and_schedule_reminder_with(
     tool_bridge: Arc<crate::tools::bridge::ToolBridge>,
     mcp_state: Arc<TokioMutex<McpState>>,
@@ -51,134 +45,10 @@ pub(super) async fn refresh_mcp_snapshot_and_schedule_reminder_with(
     // servers become discoverable; `None` for other agent types (no-op).
     mcps_root: Option<std::path::PathBuf>,
 ) {
-    refresh_mcp_snapshot_and_schedule_reminder_inner(
-        tool_bridge,
-        mcp_state,
-        managed_mcp_handle,
-        tool_metadata_snapshot,
-        mcp_reminder_dirty,
-        mcp_initialized,
-        disabled_gateway_tools,
-        mcps_root,
-        #[cfg(test)]
-        None,
-    )
-    .await;
-}
-
-async fn refresh_mcp_snapshot_and_schedule_reminder_inner(
-    tool_bridge: Arc<crate::tools::bridge::ToolBridge>,
-    mcp_state: Arc<TokioMutex<McpState>>,
-    managed_mcp_handle: crate::session::managed_mcp::ManagedMcpStateHandle,
-    tool_metadata_snapshot: Arc<std::sync::Mutex<crate::session::tool_index::ToolMetadataSnapshot>>,
-    mcp_reminder_dirty: Arc<std::sync::atomic::AtomicBool>,
-    mcp_initialized: bool,
-    disabled_gateway_tools: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-    mcps_root: Option<std::path::PathBuf>,
-    #[cfg(test)] gateway_snapshot_test_gate: Option<GatewaySnapshotTestGate>,
-) {
     use crate::session::tool_index::{
         ServerMetadata, ToolMetadata, extract_parameter_names, split_qualified_name,
     };
 
-    let (gateway_catalog, mut gateway_connectors, gateway_epoch) = {
-        let state = managed_mcp_handle.lock().await;
-        if state.gateway_tools_active {
-            tool_bridge.begin_managed_gateway_admission();
-        } else {
-            tool_bridge.disable_managed_gateway_admission();
-        }
-        let catalog = if state.gateway_tools_active && !state.gateway_refresh_in_progress {
-            match &state.gateway_tool_cache {
-                crate::session::managed_mcp::GatewayToolCatalogCache::Ready(catalog) => {
-                    Some(catalog.clone())
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let connectors: Vec<String> = state.gateway_tool_connectors_seen.iter().cloned().collect();
-        (catalog, connectors, state.gateway_tool_epoch)
-    };
-
-    #[cfg(test)]
-    if let Some(gate) = gateway_snapshot_test_gate {
-        let _ = gate.snapshot_ready.send(());
-        let _ = gate.continue_refresh.await;
-    }
-
-    let gateway_catalog = if let Some(mut catalog) = gateway_catalog {
-        let state_catalog = catalog.clone();
-        // Exposure follows the same exact-ID capability decision as dispatch.
-        // Keep disabled entries only as non-exposed toggle state; every active
-        // unclassified/denied tool is absent from identity admission, search
-        // metadata, resources, and descriptors for this session.
-        catalog.tools.retain(|tool| {
-            gateway_tool_is_disabled(tool, disabled_gateway_tools)
-                || tool
-                    .validated_qualified_name()
-                    .is_some_and(|name| tool_bridge.external_tool_is_permitted(&name))
-        });
-        let bindings: Vec<_> = catalog
-            .tools
-            .iter()
-            .filter(|tool| !gateway_tool_is_disabled(tool, disabled_gateway_tools))
-            .filter_map(|tool| {
-                tool.validated_qualified_name()
-                    .map(|name| (name, tool.call_id.clone()))
-            })
-            .collect();
-        // Reconciliation completes the toolset's admission barrier, so it must
-        // commit while the exact agent-level state we snapshotted is still
-        // current. Holding the state lock across the synchronous identity
-        // commit prevents a concurrent disable/cache replacement from opening
-        // a stale gateway binding before its follow-up refresh is processed.
-        let state = managed_mcp_handle.lock().await;
-        let snapshot_is_current = state.gateway_tools_active
-            && !state.gateway_refresh_in_progress
-            && state.gateway_tool_epoch == gateway_epoch
-            && matches!(
-                &state.gateway_tool_cache,
-                crate::session::managed_mcp::GatewayToolCatalogCache::Ready(current)
-                    if current == &state_catalog
-            );
-        if snapshot_is_current {
-            let reconciliation = tool_bridge.reconcile_managed_gateway_identities(&bindings);
-            if !reconciliation.rejected.is_empty() {
-                tracing::warn!(
-                    rejected_count = reconciliation.rejected.len(),
-                    "Rejected managed gateway identities that collided or changed binding"
-                );
-            }
-            catalog.tools.retain(|tool| {
-                gateway_tool_is_disabled(tool, disabled_gateway_tools)
-                    || tool
-                        .validated_qualified_name()
-                        .is_some_and(|name| reconciliation.accepted.contains(&name))
-            });
-            // `ManagedMcpState` is agent-shared while capability/collision
-            // admission is session-scoped. Never write this filtered view
-            // back into the shared fetch cache; sibling All/restricted
-            // sessions must each derive their own admitted catalog.
-            Some(catalog)
-        } else {
-            // Do not let the stale snapshot complete admission. Active state
-            // remains pending for the current catalog's refresh; inactive
-            // state explicitly revokes the gateway.
-            if state.gateway_tools_active {
-                tool_bridge.begin_managed_gateway_admission();
-            } else {
-                tool_bridge.disable_managed_gateway_admission();
-            }
-            None
-        }
-    } else {
-        None
-    };
-
-    // Reconciliation may remove a local/MCP tool that collided with a gateway
-    // identity, so snapshot local definitions only after the atomic boundary.
     let all_defs = tool_bridge.tool_definitions().await;
     let mut seen_tools = std::collections::HashSet::new();
     let mut mcp_tools: Vec<ToolMetadata> = all_defs
@@ -197,6 +67,22 @@ async fn refresh_mcp_snapshot_and_schedule_reminder_inner(
             }
         })
         .collect();
+
+    let (gateway_catalog, mut gateway_connectors) = {
+        let state = managed_mcp_handle.lock().await;
+        let catalog = if state.gateway_tools_active {
+            match &state.gateway_tool_cache {
+                crate::session::managed_mcp::GatewayToolCatalogCache::Ready(catalog) => {
+                    Some(catalog.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let connectors: Vec<String> = state.gateway_tool_connectors_seen.iter().cloned().collect();
+        (catalog, connectors)
+    };
 
     if let Some(catalog) = gateway_catalog.as_ref() {
         gateway_connectors.extend(catalog.tools.iter().map(|tool| tool.connector_id.clone()));
@@ -349,32 +235,6 @@ pub(crate) async fn refresh_mcp_snapshot_for_test_with_disabled(
     .await;
 }
 
-#[cfg(test)]
-pub(crate) async fn refresh_mcp_snapshot_for_test_paused_after_gateway_snapshot(
-    tool_bridge: Arc<crate::tools::bridge::ToolBridge>,
-    mcp_state: Arc<TokioMutex<McpState>>,
-    managed_mcp_handle: crate::session::managed_mcp::ManagedMcpStateHandle,
-    tool_metadata_snapshot: Arc<std::sync::Mutex<crate::session::tool_index::ToolMetadataSnapshot>>,
-    snapshot_ready: tokio::sync::oneshot::Sender<()>,
-    continue_refresh: tokio::sync::oneshot::Receiver<()>,
-) {
-    refresh_mcp_snapshot_and_schedule_reminder_inner(
-        tool_bridge,
-        mcp_state,
-        managed_mcp_handle,
-        tool_metadata_snapshot,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        false,
-        &Default::default(),
-        None,
-        Some(GatewaySnapshotTestGate {
-            snapshot_ready,
-            continue_refresh,
-        }),
-    )
-    .await;
-}
-
 impl SessionActor {
     /// Block the templated user prefix until MCP handshakes have finished populating
     /// [`McpState::clients`], or until a timeout elapses.
@@ -497,14 +357,19 @@ impl SessionActor {
     /// Re-register MCP tools onto a freshly-built `ToolBridge` after a
     /// zero-turn harness rebuild.
     ///
-    /// Stage every live MCP registration on a freshly-built bridge before it
-    /// becomes session-visible. Unlike startup's best-effort reconciliation,
-    /// a model-switch rebuild is transactional: one missing server/tool aborts
-    /// the switch while the old bridge remains active.
-    pub(super) async fn stage_mcp_tools_on_bridge(
-        &self,
-        bridge: &std::sync::Arc<xai_grok_tools::bridge::ToolBridge>,
-    ) -> Result<(), acp::Error> {
+    /// Snapshots the live MCP `Client` connections from `mcp_state` and
+    /// (eventually) re-walks each client's `list_tools` to mirror its
+    /// tool registrations onto the new bridge. Best-effort: per-server
+    /// failures are logged but do not abort the rebuild.
+    ///
+    /// Re-register MCP tools from existing clients onto the rebuilt bridge.
+    ///
+    /// Iterates over all connected MCP clients, calls `list_tools` on each
+    /// to obtain tool registrations, and registers them on the new bridge.
+    /// Errors on individual servers are logged but don't abort the process.
+    /// After re-registration, refreshes the tool metadata snapshot so
+    /// `search_tool` returns accurate results.
+    pub(super) async fn re_register_mcp_tools_on_rebuilt_bridge(&self) {
         // Snapshot server names + client Arcs to avoid holding the lock
         // across async list_tools calls.
         let clients: Vec<(
@@ -518,7 +383,8 @@ impl SessionActor {
         };
 
         if clients.is_empty() {
-            return Ok(());
+            self.refresh_mcp_snapshot_and_schedule_reminder().await;
+            return;
         }
 
         tracing::info!(
@@ -528,44 +394,36 @@ impl SessionActor {
         );
 
         let mcp_state_arc = std::sync::Arc::clone(&self.mcp_state);
+        let mut all_ui_tools: std::collections::HashMap<
+            String,
+            Vec<crate::extensions::mcp::McpToolEntry>,
+        > = std::collections::HashMap::new();
+
         for (server_name, client) in &clients {
-            let registrations = client
+            let registrations = match client
                 .get_tool_registrations(std::sync::Arc::clone(&mcp_state_arc))
                 .await
-                .map_err(|e| {
-                    acp::Error::internal_error().data(format!(
-                        "rebuild_agent: failed to list MCP tools for server={server_name}: {e}"
-                    ))
-                })?;
+            {
+                Ok(regs) => regs,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        server = %server_name,
+                        error = %e,
+                        "re_register_mcp_tools_on_rebuilt_bridge: failed to list tools, skipping server"
+                    );
+                    continue;
+                }
+            };
 
             let tool_count = registrations.len();
+            let mut mcp_state = self.mcp_state.lock().await;
+
             for reg in registrations {
-                let unqualified = reg
-                    .name
-                    .strip_prefix(&format!(
-                        "{}{}",
-                        server_name,
-                        crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
-                    ))
-                    .unwrap_or(&reg.name)
-                    .to_owned();
-                let disabled = self
-                    .mcp_state
-                    .lock()
-                    .await
-                    .is_tool_disabled(server_name, &unqualified);
-                if reg.model_visible && !disabled {
-                    let qualified_name = reg.name.clone();
-                    bridge
-                        .register_mcp_tools(reg.name, reg.tool, Some(reg.input_schema))
-                        .await
-                        .map_err(|e| {
-                            acp::Error::internal_error().data(format!(
-                                "rebuild_agent: failed to register MCP tool={qualified_name} server={server_name}: {e}"
-                            ))
-                        })?;
-                }
+                self.register_mcp_tool(server_name, reg, &mut mcp_state, &mut all_ui_tools)
+                    .await;
             }
+            drop(mcp_state);
 
             tracing::info!(
                 session_id = %self.session_info.id.0,
@@ -574,6 +432,10 @@ impl SessionActor {
                 "re_register_mcp_tools_on_rebuilt_bridge: re-registered tools"
             );
         }
-        Ok(())
+
+        // Refresh the snapshot so search_tool returns accurate results
+        // against the newly-registered tools.
+        self.refresh_mcp_snapshot_and_schedule_reminder().await;
+        self.emit_mcp_tools_changed_notifications(all_ui_tools);
     }
 }

@@ -250,6 +250,23 @@ pub struct SlashState {
     inner: RefCell<SlashSnapshot>,
 }
 
+pub fn is_complete_builtin_invocation(text: &str, reg: &CommandRegistry) -> bool {
+    if !text.starts_with('/') {
+        return false;
+    }
+    let (name, args) = match text.split_once(' ') {
+        Some((n, a)) => (n, Some(a)),
+        None => (text.trim_end(), None),
+    };
+    if let Some(cmd) = reg.get(name) {
+        if cmd.args_required() && args.unwrap_or("").trim().is_empty() {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
 impl SlashState {
     /// Clone the current snapshot.
     pub fn snapshot(&self) -> SlashSnapshot {
@@ -309,6 +326,9 @@ pub struct SlashController {
     /// screen-mode-switcher commands' visibility through [`AppCtx`]. Defaults
     /// to `Fullscreen` (the process default) for tests and unwired surfaces.
     screen_mode: crate::app::ScreenMode,
+    /// Current session title for `/rename` ghost-prefill. Synced from the
+    /// agent view; `None` when the session has no title yet.
+    current_title: Option<String>,
     /// MRU/recency store. Owned by `AppView` in production and injected via
     /// [`Self::set_mru`] so agent prompts and the dashboard share one store;
     /// defaults to an isolated in-memory store (no disk I/O) for tests and any
@@ -347,6 +367,7 @@ impl SlashController {
             usage_command_visible: true,
             workflows_available: false,
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
             mru,
             command_tags: std::rc::Rc::new(std::cell::RefCell::new(
                 std::collections::HashMap::new(),
@@ -412,6 +433,18 @@ impl SlashController {
         self.screen_mode
     }
 
+    pub fn set_current_title(&mut self, title: Option<String>) {
+        let title = title.filter(|t| !t.trim().is_empty());
+        if self.current_title == title {
+            return;
+        }
+        self.current_title = title;
+    }
+
+    pub fn current_title(&self) -> Option<&str> {
+        self.current_title.as_deref()
+    }
+
     pub(crate) fn app_ctx<'a>(&'a self, models: &'a ModelState) -> AppCtx<'a> {
         AppCtx {
             models,
@@ -421,6 +454,7 @@ impl SlashController {
             usage_command_visible: self.usage_command_visible,
             workflows_available: self.workflows_available,
             screen_mode: self.screen_mode,
+            current_title: self.current_title.as_deref(),
         }
     }
 
@@ -1658,6 +1692,38 @@ mod tests {
     fn non_slash_is_not_complete() {
         let reg = test_registry();
         assert!(!is_command_complete("hello", &reg));
+    }
+
+    // Tests for is_complete_builtin_invocation
+
+    #[test]
+    fn is_complete_builtin_invocation_accepts_complete_builtin() {
+        let reg = test_registry();
+        assert!(is_complete_builtin_invocation("/btw why is it slow", &reg));
+        assert!(is_complete_builtin_invocation("  /compact  ", &reg));
+    }
+
+    #[test]
+    fn is_complete_builtin_invocation_rejects_incomplete_or_unowned_text() {
+        let reg = test_registry();
+        // Args required but missing: dispatch would not execute it either.
+        assert!(!is_complete_builtin_invocation("/btw", &reg));
+        // Unknown command: reserved for the agent's own pass-through.
+        assert!(!is_complete_builtin_invocation("/nope x", &reg));
+        // Not an invocation at position 0.
+        assert!(!is_complete_builtin_invocation("great /compact go", &reg));
+        assert!(!is_complete_builtin_invocation("plain prompt", &reg));
+        assert!(!is_complete_builtin_invocation("/", &reg));
+    }
+
+    #[test]
+    fn is_complete_builtin_invocation_rejects_restricted_builtin() {
+        let mut reg = test_registry();
+        reg.set_restricted_commands(&["usage".to_string()]);
+        assert!(
+            !is_complete_builtin_invocation("/usage", &reg),
+            "a tier-gated command must stay saved as text, not run from a queue row"
+        );
     }
 
     // -- Controller tests --

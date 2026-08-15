@@ -21,26 +21,6 @@ const DEFAULT_DEVICE_POLL_INTERVAL_SECS: i32 = 5;
 const DEVICE_SLOW_DOWN_INCREMENT_SECS: u64 = 5;
 const MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS: i64 = 10 * 60;
 
-fn device_code_not_enabled_msg() -> String {
-    crate::auth::with_login_instruction(
-        |prog| {
-            format!(
-                "Device-code login is not available for this deployment. \
-                 Try `{prog} login` or set XAI_API_KEY instead."
-            )
-        },
-        "Device-code login is not available for this deployment. \
-         Sign in another way or set XAI_API_KEY instead.",
-    )
-}
-
-fn device_code_expired_msg() -> String {
-    crate::auth::with_login_instruction(
-        |prog| format!("Device code expired. Run `{prog} login --device-auth` again."),
-        "Device code expired. Sign in again.",
-    )
-}
-
 /// Only the 404 "no device endpoint" case is typed, because the login flow
 /// matches on it to fall back to loopback. Every other device-code failure
 /// stays a plain `anyhow` error: wrapping one in a `#[error(transparent)]`
@@ -48,7 +28,10 @@ fn device_code_expired_msg() -> String {
 /// transparent forwards `source()` past the error it wraps.
 #[derive(Debug, Error)]
 pub(crate) enum DeviceCodeError {
-    #[error("{}", device_code_not_enabled_msg())]
+    #[error(
+        "Device-code login is not available for this deployment. \
+         Try `grok login` or set XAI_API_KEY instead."
+    )]
     NotEnabled,
 }
 
@@ -95,9 +78,7 @@ fn detect_cli_surface() -> ClientSurface {
 /// Result of requesting a device code from the server.
 /// Callers display `verification_uri` + `user_code` to the user,
 /// then pass this struct to `complete_device_code_login`.
-// No `Debug` in the derive: the manual impl below redacts `user_code` and
-// `device_code`. Upstream's derive would print both verbatim.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct DeviceCode {
     pub verification_uri: String,
     pub verification_uri_complete: Option<String>,
@@ -105,25 +86,6 @@ pub(crate) struct DeviceCode {
     device_code: String,
     interval: i32,
     expires_in: i64,
-}
-
-impl std::fmt::Debug for DeviceCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeviceCode")
-            .field(
-                "verification_uri_configured",
-                &(!self.verification_uri.is_empty()),
-            )
-            .field(
-                "verification_uri_complete_configured",
-                &self.verification_uri_complete.is_some(),
-            )
-            .field("user_code", &"<redacted>")
-            .field("device_code", &"<redacted>")
-            .field("interval", &self.interval)
-            .field("expires_in", &self.expires_in)
-            .finish()
-    }
 }
 
 // --- Wire types (serde) ---
@@ -151,6 +113,7 @@ struct TokenOk {
 #[derive(Deserialize)]
 struct TokenErr {
     error: String,
+    error_description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -192,18 +155,18 @@ pub(crate) async fn request_device_code(
         &url,
     )
     .send()
-    .await
-    .map_err(reqwest::Error::without_url)?;
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
         if status.as_u16() == 404 {
             anyhow::bail!(DeviceCodeError::NotEnabled);
         }
-        anyhow::bail!("Device code request failed (HTTP {status})");
+        anyhow::bail!("Device code request failed (HTTP {status}): {body}");
     }
 
-    let server_resp: DeviceCodeResponse = resp.json().await.map_err(reqwest::Error::without_url)?;
+    let server_resp: DeviceCodeResponse = resp.json().await?;
 
     // Defend against control characters from a malicious issuer.
     if !server_resp
@@ -263,7 +226,7 @@ pub(crate) async fn complete_device_code_login(
         tokio::time::sleep(poll_interval).await;
 
         if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("{}", device_code_expired_msg());
+            anyhow::bail!("Device code expired. Run `grok login --device-auth` again.");
         }
 
         let resp = with_alpha_test_key(
@@ -279,22 +242,16 @@ pub(crate) async fn complete_device_code_login(
             &token_url,
         )
         .send()
-        .await
-        .map_err(|_| anyhow::anyhow!("Device-code token request failed"))?;
+        .await?;
 
         if resp.status().is_success() {
-            let tokens: TokenOk = resp
-                .json()
-                .await
-                .map_err(|_| anyhow::anyhow!("Device-code token response was invalid"))?;
+            let tokens: TokenOk = resp.json().await?;
             let auth = build_auth(&tokens, issuer, client_id, auth_manager).await?;
             return Ok((auth, true));
         }
 
-        let err: TokenErr = resp
-            .json()
-            .await
-            .map_err(|_| anyhow::anyhow!("Device-code token error response was invalid"))?;
+        let err: TokenErr = resp.json().await?;
+        let detail = err.error_description.as_deref().unwrap_or(&err.error);
         match err.error.as_str() {
             "authorization_pending" => {
                 // User hasn't acted yet -- keep polling.
@@ -305,16 +262,20 @@ pub(crate) async fn complete_device_code_login(
                 continue;
             }
             "access_denied" => {
-                tracing::warn!("device auth authorization denied");
+                tracing::warn!(description = detail, "device auth authorization denied");
                 anyhow::bail!("Authorization denied. The user rejected the request.");
             }
             "expired_token" => {
-                tracing::warn!("device auth token expired");
-                anyhow::bail!("{}", device_code_expired_msg());
+                tracing::warn!(description = detail, "device auth token expired");
+                anyhow::bail!("Device code expired. Run `grok login --device-auth` again.");
             }
-            _ => {
-                tracing::warn!("device auth token exchange failed");
-                anyhow::bail!("Token exchange failed.");
+            other => {
+                tracing::warn!(
+                    error = other,
+                    description = detail,
+                    "device auth token exchange failed"
+                );
+                anyhow::bail!("Token exchange error: {detail}");
             }
         }
     }
@@ -572,36 +533,8 @@ fn validate_verification_uri(uri: &str) -> anyhow::Result<()> {
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use super::{AuthManager, DeviceCode, build_auth, validate_verification_uri};
+    use super::{AuthManager, build_auth, validate_verification_uri};
     use crate::auth::{AuthMode, GrokComConfig};
-
-    #[test]
-    fn device_code_debug_redacts_every_credential_value() {
-        let sentinel = "cred_SENTINEL_0123456789abcdef";
-        let code = DeviceCode {
-            verification_uri: format!("https://user:{sentinel}@example.test/device"),
-            verification_uri_complete: Some(format!(
-                "https://example.test/device?user_code={sentinel}"
-            )),
-            user_code: sentinel.into(),
-            device_code: sentinel.into(),
-            interval: 5,
-            expires_in: 600,
-        };
-
-        let rendered = format!("{code:?}");
-        assert!(!rendered.contains(sentinel));
-        for window in sentinel.as_bytes().windows(8) {
-            let secret = std::str::from_utf8(window).unwrap();
-            assert!(
-                !rendered.contains(secret),
-                "secret escaped Debug: {rendered}"
-            );
-        }
-        assert!(rendered.contains("<redacted>"));
-        assert!(rendered.contains("verification_uri_configured: true"));
-        assert!(rendered.contains("verification_uri_complete_configured: true"));
-    }
 
     #[test]
     fn validate_verification_uri_rejects_unsupported_scheme() {
@@ -718,7 +651,6 @@ pub(crate) mod tests {
     /// Team access token carrying `principal_id` (signature irrelevant — only
     /// the principal claims are peeked).
     fn team_access_token(principal_id: &str) -> super::TokenOk {
-        ensure_crypto_provider();
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
         let claims = serde_json::json!({
             "sub": "user-42",

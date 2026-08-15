@@ -435,16 +435,14 @@ async fn post_tool_use_and_failure_never_double_fire() {
         .await;
 }
 
-/// A `pre_tool_use` deny must NOT cancel the turn: `execute_tool_calls` feeds a
-/// closed, credential-safe denial marker back as the blocked tool's
-/// `tool_result` and returns `ToolLoop::Continue`, so the model can re-sample
-/// without observing provider-controlled text.
+/// A `pre_tool_use` deny must NOT cancel the turn: `execute_tool_calls` feeds the deny
+/// reason back as the blocked tool's `tool_result` and returns `ToolLoop::Continue`, so
+/// the model re-samples with the reason in context.
 ///
 /// Regression guard: the deny once surfaced as `ToolLoop::HookDenied`, which
 /// `execute_tool_calls` treated as a terminal result, cancelling the whole turn.
 #[tokio::test(flavor = "current_thread")]
 async fn pre_tool_use_deny_feeds_reason_back_and_continues_turn() {
-    const SECRET: &str = "GB002HOOKSECRETabcdefgh87654321";
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -462,7 +460,7 @@ async fn pre_tool_use_deny_feeds_reason_back_and_continues_turn() {
                 xai_grok_hooks::event::HookEventName::PreToolUse,
                 &["cb_0"],
             );
-            spawn_deny_responder(gateway_rx, SECRET);
+            spawn_deny_responder(gateway_rx, "use read_file instead");
 
             let call = ToolCallResponse {
                 id: "call_1".to_string(),
@@ -487,23 +485,11 @@ async fn pre_tool_use_deny_feeds_reason_back_and_continues_turn() {
             );
 
             let conv = actor.chat_state_handle.get_conversation().await;
-            let rendered = conv
-                .iter()
-                .map(|c| c.text_content())
-                .collect::<Vec<_>>()
-                .join("\n");
             assert!(
-                rendered.contains("hook denied (reason provided)"),
-                "the model must receive the closed denial category: {rendered}"
+                conv.iter()
+                    .any(|c| c.text_content().contains("use read_file instead")),
+                "the deny reason must be fed back as the tool_result"
             );
-            assert!(!rendered.contains(SECRET));
-            for fragment in SECRET.as_bytes().windows(8) {
-                let fragment = std::str::from_utf8(fragment).unwrap();
-                assert!(
-                    !rendered.contains(fragment),
-                    "denied-tool feedback leaked credential fragment: {fragment}"
-                );
-            }
         })
         .await;
 }
@@ -574,10 +560,7 @@ async fn stop_client_gate_collects_denies() {
 
             assert_eq!(result.blocks.len(), 1, "only the denying callback blocks");
             assert_eq!(result.blocks[0].hook_name, "client:cb_block");
-            assert_eq!(
-                result.blocks[0].reason,
-                "stop blocked by hook (reason provided)"
-            );
+            assert_eq!(result.blocks[0].reason, "finish the tests first");
             assert!(result.prevent_continuation.is_none());
             assert!(result.additional_context.is_empty());
         })
@@ -651,14 +634,8 @@ async fn stop_client_gate_carries_continue_false_and_context() {
                 .prevent_continuation
                 .expect("continue:false captured");
             assert_eq!(prevent.hook_name, "client:cb_stop");
-            assert_eq!(
-                prevent.reason,
-                "continuation prevented by hook (reason provided)"
-            );
-            assert_eq!(
-                result.additional_context,
-                ["hook provided additional context (content omitted)"]
-            );
+            assert_eq!(prevent.reason, "budget");
+            assert_eq!(result.additional_context, ["run the linter"]);
         })
         .await;
 }
@@ -667,7 +644,6 @@ async fn stop_client_gate_carries_continue_false_and_context() {
 /// allows the stop, and the consecutive-block cap overrides the gate.
 #[tokio::test(flavor = "current_thread")]
 async fn run_stop_gate_keep_working_and_cap() {
-    const SECRET: &str = "GB002STOPCLIENTSECRETabcdefgh87654321";
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -686,7 +662,7 @@ async fn run_stop_gate_keep_working_and_cap() {
                 &["cb_0"],
             );
 
-            spawn_deny_responder(gateway_rx, SECRET);
+            spawn_deny_responder(gateway_rx, "keep working");
 
             let decision = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -698,17 +674,9 @@ async fn run_stop_gate_keep_working_and_cap() {
                 StopGateDecision::KeepWorking { feedback } => {
                     assert!(
                         feedback.contains("Stop hook feedback:")
-                            && feedback.contains("stop blocked by hook (reason provided)"),
-                        "feedback must carry only the closed deny category, got: {feedback}"
+                            && feedback.contains("keep working"),
+                        "feedback must carry the deny message, got: {feedback}"
                     );
-                    assert!(!feedback.contains(SECRET));
-                    for fragment in SECRET.as_bytes().windows(8) {
-                        let fragment = std::str::from_utf8(fragment).unwrap();
-                        assert!(
-                            !feedback.contains(fragment),
-                            "stop model feedback leaked credential fragment: {fragment}"
-                        );
-                    }
                 }
                 _ => panic!("a client deny must keep the agent working"),
             }
@@ -724,9 +692,17 @@ async fn run_stop_gate_keep_working_and_cap() {
         .await;
 }
 
-fn file_registry_with_stop_spec(
+pub(super) fn file_registry_with_spec(
     event: xai_grok_hooks::event::HookEventName,
     script: &str,
+) -> xai_grok_hooks::discovery::HookRegistry {
+    file_registry(event, script, true)
+}
+
+fn file_registry(
+    event: xai_grok_hooks::event::HookEventName,
+    script: &str,
+    enabled: bool,
 ) -> xai_grok_hooks::discovery::HookRegistry {
     let (mut registry, _) = xai_grok_hooks::discovery::load_hooks(None, None);
     registry.append_specs(vec![xai_grok_hooks::config::HookSpec {
@@ -735,7 +711,7 @@ fn file_registry_with_stop_spec(
         handler_type: xai_grok_hooks::config::HandlerType::Command,
         configured_matcher: None,
         matcher: None,
-        enabled: true,
+        enabled,
         command: Some(std::path::PathBuf::from(script)),
         command_raw: Some(script.to_string()),
         url: None,
@@ -762,11 +738,10 @@ async fn file_force_stop_skips_client_gate_but_notifies() {
             let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
             actor.hook_resolved_workspace_root = "/tmp".to_string();
 
-            *actor.hook_registry.borrow_mut() =
-                Some(std::sync::Arc::new(file_registry_with_stop_spec(
-                    xai_grok_hooks::event::HookEventName::Stop,
-                    r#"echo '{"continue":false,"stopReason":"budget exhausted"}'"#,
-                )));
+            *actor.hook_registry.borrow_mut() = Some(std::sync::Arc::new(file_registry_with_spec(
+                xai_grok_hooks::event::HookEventName::Stop,
+                r#"echo '{"continue":false,"stopReason":"budget exhausted"}'"#,
+            )));
             install_client_hook(
                 &actor,
                 xai_grok_hooks::event::HookEventName::Stop,
@@ -820,6 +795,9 @@ async fn file_force_stop_skips_client_gate_but_notifies() {
                 1,
                 "client callbacks must still see the turn end as an observe event"
             );
+            // A forced stop still ran its hooks, so it spends the report: dropping the commit
+            // here would let a cancel during teardown file a second one.
+            assert!(actor.turn_report.claim_for_gate().is_none());
         })
         .await;
 }
@@ -901,10 +879,7 @@ async fn client_force_stop_attribution_is_registration_ordered() {
                 prevent.hook_name, "client:cb_first",
                 "attribution must follow registration order, not completion order"
             );
-            assert_eq!(
-                prevent.reason,
-                "continuation prevented by hook (reason provided)"
-            );
+            assert_eq!(prevent.reason, "from-first");
         })
         .await;
 }
@@ -913,7 +888,6 @@ async fn client_force_stop_attribution_is_registration_ordered() {
 /// payload.
 #[tokio::test(flavor = "current_thread")]
 async fn subagent_session_gates_on_subagent_stop() {
-    const SECRET: &str = "GB002SUBSTOP-Q7w5E3r1T9y7Z6x4C2v8";
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -925,11 +899,10 @@ async fn subagent_session_gates_on_subagent_stop() {
             actor.startup_hints.is_subagent = true;
             actor.hook_resolved_workspace_root = "/tmp".to_string();
 
-            *actor.hook_registry.borrow_mut() =
-                Some(std::sync::Arc::new(file_registry_with_stop_spec(
-                    xai_grok_hooks::event::HookEventName::SubagentStop,
-                    &format!(r#"echo '{{"decision":"block","reason":"{SECRET}"}}'"#),
-                )));
+            *actor.hook_registry.borrow_mut() = Some(std::sync::Arc::new(file_registry_with_spec(
+                xai_grok_hooks::event::HookEventName::SubagentStop,
+                r#"echo '{"decision":"block","reason":"verify the summary"}'"#,
+            )));
 
             tokio::task::spawn_local(async move {
                 while let Some(msg) = gateway_rx.recv().await {
@@ -947,17 +920,10 @@ async fn subagent_session_gates_on_subagent_stop() {
             .expect("the subagent stop gate must not hang");
             match decision {
                 StopGateDecision::KeepWorking { feedback } => {
-                    assert_eq!(
-                        feedback,
-                        "Stop hook feedback:\n- stop blocked by hook (reason provided)\n"
+                    assert!(
+                        feedback.contains("verify the summary"),
+                        "the SubagentStop block reason must become feedback, got: {feedback}"
                     );
-                    assert!(!feedback.contains(SECRET));
-                    for window in SECRET.as_bytes().windows(8) {
-                        assert!(
-                            !feedback.contains(std::str::from_utf8(window).unwrap()),
-                            "SubagentStop feedback leaked a secret window: {feedback}"
-                        );
-                    }
                 }
                 other => {
                     panic!("a SubagentStop block must keep the subagent working, got {other:?}")
@@ -995,6 +961,224 @@ async fn alias_envelope_serializes_canonical_event_name() {
             assert_eq!(value["hookEventName"], "subagent_stop");
             // The test actor runs yolo, so permissionMode pins that state.
             assert_eq!(value["permissionMode"], "bypassPermissions");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn client_force_stop_reports_the_turn() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, mut gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            install_client_hook(
+                &actor,
+                xai_grok_hooks::event::HookEventName::Stop,
+                &["cb_stop"],
+            );
+
+            tokio::task::spawn_local(async move {
+                while let Some(msg) = gateway_rx.recv().await {
+                    match msg {
+                        xai_acp_lib::AcpClientMessage::ExtMethod(args) => {
+                            let response =
+                                serde_json::json!({ "continue": false, "stopReason": "budget" });
+                            let params: Arc<serde_json::value::RawValue> =
+                                serde_json::value::to_raw_value(&response).unwrap().into();
+                            let _ = args.response_tx.send(Ok(acp::ExtResponse::new(params)));
+                        }
+                        xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            let decision = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                actor.run_stop_gate("prompt-1", 0),
+            )
+            .await
+            .expect("the stop gate must not hang");
+            assert!(matches!(decision, StopGateDecision::AllowStop));
+            assert!(actor.turn_report.claim_for_gate().is_none());
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_unanswered_client_gate_leaves_the_report_unspent() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, mut gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            install_client_hook(
+                &actor,
+                xai_grok_hooks::event::HookEventName::Stop,
+                &["cb_stop"],
+            );
+
+            // Drop the response channel unanswered: a transport error, not a decision.
+            tokio::task::spawn_local(async move {
+                while let Some(msg) = gateway_rx.recv().await {
+                    if let xai_acp_lib::AcpClientMessage::ExtMethod(args) = msg {
+                        drop(args.response_tx);
+                    }
+                }
+            });
+
+            let decision = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                actor.run_stop_gate("prompt-1", 0),
+            )
+            .await
+            .expect("the stop gate must not hang");
+
+            assert!(matches!(decision, StopGateDecision::AllowStop));
+            assert!(
+                actor.turn_report.claim_for_gate().is_some(),
+                "a gate whose only hook never answered must leave the turn reportable"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_reported_turn_skips_the_gate_entirely() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.hook_resolved_workspace_root = "/tmp".to_string();
+            *actor.hook_registry.borrow_mut() = Some(std::sync::Arc::new(file_registry_with_spec(
+                xai_grok_hooks::event::HookEventName::Stop,
+                "exit 2",
+            )));
+
+            let claim = actor
+                .turn_report
+                .claim_for_gate()
+                .expect("the turn is fresh");
+            assert_eq!(
+                claim.commit(),
+                super::turn_report_slot::CommitOutcome::Reported,
+                "an interrupt reported this turn"
+            );
+
+            let decision = actor.run_stop_gate("prompt-1", 0).await;
+            assert!(
+                matches!(decision, StopGateDecision::AllowStop),
+                "a hook that ran would have blocked the stop"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_completed_stop_hook_is_the_turns_report() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.hook_resolved_workspace_root = "/tmp".to_string();
+            // A report only counts once it reaches the queue, so the turn needs one.
+            let actor = std::sync::Arc::new(actor);
+            let _queue = super::turn_end_hooks::TurnEndQueue::spawn(actor.clone());
+            install_client_hook(
+                &actor,
+                xai_grok_hooks::event::HookEventName::StopFailure,
+                &["cb_fail"],
+            );
+            // Registered with nothing to deliver, so only the file hook can produce a result.
+            actor.client_hooks.borrow_mut().insert(
+                xai_grok_hooks::event::HookEventName::Stop,
+                vec![crate::extensions::hooks::ClientHookGroup {
+                    matcher: None,
+                    callback_ids: vec![],
+                    timeout: None,
+                }],
+            );
+
+            use super::turn_end_hooks::ReportOutcome;
+            for (case, script, enabled, reports_later) in [
+                (
+                    "disabled, so skipped",
+                    "exit 0",
+                    false,
+                    ReportOutcome::Queued,
+                ),
+                ("crashed", "exit 1", true, ReportOutcome::Queued),
+                ("ran", "exit 0", true, ReportOutcome::AlreadyReported),
+            ] {
+                actor.turn_report.start_next_turn();
+                *actor.hook_registry.borrow_mut() = Some(std::sync::Arc::new(file_registry(
+                    xai_grok_hooks::event::HookEventName::Stop,
+                    script,
+                    enabled,
+                )));
+
+                let decision = actor.run_stop_gate(case, 0).await;
+                assert!(matches!(decision, StopGateDecision::AllowStop), "{case}");
+                let reported = actor.claim_and_queue(
+                    case,
+                    actor.turn_report.epoch(),
+                    super::turn_end_hooks::TurnEnd::Failed {
+                        error: xai_grok_hooks::event::StopFailureKind::Unknown,
+                        error_details: None,
+                        last_assistant_message: None,
+                    },
+                );
+                assert_eq!(reported, reports_later, "{case}");
+            }
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_gate_that_keeps_working_releases_the_report() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            install_client_hook(
+                &actor,
+                xai_grok_hooks::event::HookEventName::Stop,
+                &["cb_block"],
+            );
+            spawn_deny_responder(gateway_rx, "keep working");
+
+            let decision = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                actor.run_stop_gate("prompt-1", 0),
+            )
+            .await
+            .expect("the stop gate must not hang");
+            assert!(matches!(decision, StopGateDecision::KeepWorking { .. }));
+            assert!(
+                actor.turn_report.claim_for_gate().is_some(),
+                "a gate that kept the agent working must leave the report slot free"
+            );
         })
         .await;
 }

@@ -11,8 +11,8 @@
 
 mod common;
 
-use common::test_sampler_config;
-use xai_grok_sampler::{EndpointTrustClass, RetryPolicy, SamplerConfig};
+use common::{create_test_client, test_sampler_config};
+use xai_grok_sampler::RetryPolicy;
 use xai_grok_sampling_types::doom_loop::{DoomLoopSignalKind, SAMPLE_CHECK_EVENT_DATA_CUMULATIVE};
 use xai_grok_shell::sampling::{
     ApiBackend, Client, ConversationItem, ConversationRequest, RequestId, SamplerActor,
@@ -27,20 +27,8 @@ use xai_grok_test_support::{MockInferenceServer, MockModelEntry, ScriptedRespons
 
 const MODEL: &str = "test-model";
 
-/// Make the loopback server stand in for the first-party xAI Responses API.
-/// Doom-loop checks are intentionally gated with xAI identity metadata in
-/// production; the bound fixture key is test-owned, not an ambient session
-/// credential.
-fn xai_mock_config(base_url: &str) -> SamplerConfig {
-    let mut config = test_sampler_config(base_url, ApiBackend::Responses, &[]);
-    config.endpoint_trust = Some(EndpointTrustClass::FirstPartyXai);
-    config
-}
-
-/// A sampling client with the doom-loop check enabled (default tunables:
-/// `max_threshold` 8, `max_retries` 2).
 fn doom_loop_client(base_url: &str) -> Client {
-    let mut config = xai_mock_config(base_url);
+    let mut config = test_sampler_config(base_url, ApiBackend::Responses, &[]);
     config.doom_loop_recovery = Some(Default::default());
     Client::new(config).unwrap()
 }
@@ -48,7 +36,7 @@ fn doom_loop_client(base_url: &str) -> Client {
 /// A sampler actor (the rung that owns retry/recovery) with the given
 /// doom-loop policy. Events are fire-and-forget, so the receiver is dropped.
 fn spawn_actor(base_url: &str, doom_loop_enabled: bool) -> SamplerHandle {
-    let mut config = xai_mock_config(base_url);
+    let mut config = test_sampler_config(base_url, ApiBackend::Responses, &[]);
     if doom_loop_enabled {
         config.doom_loop_recovery = Some(Default::default());
     }
@@ -284,7 +272,7 @@ async fn disabled_policy_leaves_terminal_field_unparsed() {
             MODEL,
         )),
     );
-    let client = Client::new(xai_mock_config(&server.url())).unwrap();
+    let client = create_test_client(&server.url(), ApiBackend::Responses);
 
     let response = client
         .conversation_collect(user_request("hello"))
@@ -298,8 +286,8 @@ async fn disabled_policy_leaves_terminal_field_unparsed() {
 // Recovery contract (the acceptance spec for the resample behavior)
 // ---------------------------------------------------------------------------
 
-/// A confident signal (`tail_repetition:8@thinking` at the default
-/// `max_threshold` 8) on a completed turn is resampled once: two requests,
+/// A confident signal (`tail_repetition:8@thinking` is confident under
+/// default `max_threshold` 32) on a completed turn is resampled once: two requests,
 /// the clean second script is the accepted response, and the resample
 /// request body is identical to the first — the poisoned turn's output never
 /// enters the conversation.
@@ -527,11 +515,13 @@ async fn doomed_then_reasoning_only_empty_coexist() {
 // Headless lifecycle lane
 // ---------------------------------------------------------------------------
 
-/// Even with `[doom_loop_recovery] enabled = true`, the real binary must not
-/// send the xAI-only opt-in or turn-correlation metadata to a Local endpoint.
-/// Positive first-party header and recovery behavior is covered by the
-/// explicit `FirstPartyXai` mock-HTTP suite above; the production trust gate
-/// deliberately has no TOML escape hatch for a loopback server.
+/// `[doom_loop_recovery] enabled = true` in `config.toml` reaches the wire
+/// through the real binary: the session TURN request (marked by
+/// `x-grok-turn-idx`) carries the opt-in header. Aux side-queries the binary
+/// also fires at `/v1/responses` (e.g. session-title generation) must NOT
+/// carry it — they collect without the actor's retry loop, so an armed
+/// abort there could only fail them, never resample. The recovery behavior
+/// itself is covered by the mock-HTTP suite above.
 ///
 /// `#[ignore]` (needs a built binary). Run locally (auto-builds the pager):
 /// ```bash
@@ -539,13 +529,9 @@ async fn doomed_then_reasoning_only_empty_coexist() {
 /// ```
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
-async fn headless_local_endpoint_suppresses_doom_loop_identity_headers() {
-    let models = vec![
-        MockModelEntry::new(MODEL)
-            .with_api_backend("responses")
-            .with_auth_scheme("none"),
-    ];
-    let server = MockInferenceServer::start_with_keyless_local_models(models)
+async fn headless_config_enables_doom_loop_check_header() {
+    let models = vec![MockModelEntry::new(MODEL).with_api_backend("responses")];
+    let server = MockInferenceServer::start_with_models(models)
         .await
         .expect("start mock server");
     let workdir = xai_grok_test_support::git_workdir();
@@ -556,29 +542,19 @@ async fn headless_local_endpoint_suppresses_doom_loop_identity_headers() {
     let grok_home = sandbox.grok_home().to_path_buf();
     std::fs::write(
         grok_home.join("config.toml"),
-        "[models]\ncatalog_auth_scheme = \"none\"\n\n[doom_loop_recovery]\nenabled = true\n",
+        "[doom_loop_recovery]\nenabled = true\n",
     )
     .expect("write config.toml");
 
     let mut cmd = tokio::process::Command::new(xai_grok_test_support::grok_binary());
-    cmd.args([
-        "-p",
-        "say hi",
-        "--yolo",
-        "--model",
-        MODEL,
-        "--max-turns",
-        "1",
-        "--output-format",
-        "json",
-    ])
-    .arg("--cwd")
-    .arg(workdir.workspace())
-    .current_dir(workdir.workspace())
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped())
-    .kill_on_drop(true);
+    cmd.args(["-p", "say hi", "--yolo", "--output-format", "json"])
+        .arg("--cwd")
+        .arg(workdir.workspace())
+        .current_dir(workdir.workspace())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
 
     let result = xai_grok_test_support::run_headless_in_sandbox(cmd, sandbox).await;
     xai_grok_test_support::assert_headless_success(&result, "doom-loop header e2e", Some(&server));
@@ -588,22 +564,29 @@ async fn headless_local_endpoint_suppresses_doom_loop_identity_headers() {
         .iter()
         .filter(|e| e.method == "POST" && e.path.contains("/responses"))
         .collect();
+    // The session turn carries `x-grok-turn-idx`; aux side-queries (session
+    // title, etc.) do not.
+    let (turns, aux): (Vec<_>, Vec<_>) = responses_posts
+        .into_iter()
+        .partition(|e| e.header("x-grok-turn-idx").is_some());
     assert!(
-        !responses_posts.is_empty(),
-        "no POST /v1/responses logged; requests:\n{}",
+        !turns.is_empty(),
+        "no session turn POST /v1/responses logged; requests:\n{}",
         server.request_log_summary()
     );
-    for request in responses_posts {
+    for turn in turns {
         assert_eq!(
-            request.header("x-grok-doom-loop-check"),
-            None::<&str>,
-            "Local endpoints must not receive the xAI doom-loop opt-in; requests:\n{}",
+            turn.header("x-grok-doom-loop-check"),
+            Some("1024"),
+            "[doom_loop_recovery] enabled must reach the turn request header; requests:\n{}",
             server.request_log_summary()
         );
+    }
+    for side_query in aux {
         assert_eq!(
-            request.header("x-grok-turn-idx"),
+            side_query.header("x-grok-doom-loop-check"),
             None::<&str>,
-            "Local endpoints must not receive xAI turn-correlation metadata; requests:\n{}",
+            "the session policy must not leak into aux side-query clients; requests:\n{}",
             server.request_log_summary()
         );
     }

@@ -14,9 +14,6 @@ pub async fn list_available_models(agent_config: &AgentConfig) -> Result<()> {
         AuthStatus::ModelCredentials(model) => {
             println!("Model '{model}' is using its own API key.");
         }
-        AuthStatus::OpenAiCodex => {
-            println!("You are signed in to OpenAI Codex (no xAI credential).");
-        }
         AuthStatus::DeploymentKey => println!("You are authenticated via deployment key."),
         AuthStatus::NotAuthenticated => println!("You are not authenticated."),
     }

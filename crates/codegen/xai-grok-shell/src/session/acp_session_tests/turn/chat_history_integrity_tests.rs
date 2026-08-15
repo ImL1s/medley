@@ -95,15 +95,17 @@ fn tool_results_by_call_id(conv: &[ConversationItem]) -> HashMap<String, Vec<Str
 /// Pre-fix this failed: the nudge was pushed after the assistant `tool_use`
 /// was committed and before `execute_tool_calls`, so integrity repair wrote
 /// a cancel result and the real result landed beside it under the same id.
-#[test]
-fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_use_id() {
-    on_large_stack(|| {
-        block_on_local(false, async {
-            let server = MockInferenceServer::start()
-                .await
-                .expect("mock inference server");
+#[tokio::test(flavor = "current_thread")]
+async fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_use_id() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = MockInferenceServer::start().await.expect("mock inference server");
             for i in 1..=IDENTICAL_CALLS_TO_TRIP_NUDGE {
-                server.enqueue_response("/v1/responses", tool_call_sse(&format!("stat-call-{i}")));
+                server.enqueue_response(
+                    "/v1/responses",
+                    tool_call_sse(&format!("stat-call-{i}")),
+                );
             }
             server.enqueue_response(
                 "/v1/responses",
@@ -144,24 +146,6 @@ fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_use_id()
             actor.sampler_handle = sampler_handle;
             *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
 
-            // #159: the turn path consults ModelsManager. Without a catalog
-            // entry, a synthetic "test" model used to be misclassified as
-            // NotInCatalog (config-only miss) which stripped credentials and
-            // let this mock-only fixture limp through unauthenticated. With
-            // the fix that miss is CatalogUnavailable / a real Ready hit;
-            // bind a non-ambient key and seed the runtime catalog so the
-            // mock endpoint is not refused as ambient-on-external.
-            let mut entry = crate::agent::config::ModelEntry::fallback(
-                "test",
-                &crate::agent::config::EndpointsConfig::default(),
-            );
-            entry.info.base_url = server.url();
-            entry.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
-            entry.info.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
-            // Own key → BYOK readiness on a non-xAI mock origin (#110).
-            entry.api_key = Some("test-key".to_string());
-            actor.models_manager.insert_test_entry("test", entry);
-
             let mut cfg = actor
                 .chat_state_handle
                 .get_sampling_config()
@@ -171,13 +155,9 @@ fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_use_id()
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
             cfg.model = "test".to_string();
             actor.chat_state_handle.update_sampling_config(cfg);
-            actor
-                .chat_state_handle
-                .update_credentials(xai_chat_state::Credentials::bound(
-                    Some("test-key".to_string()),
-                    xai_chat_state::AuthType::ApiKey,
-                    xai_grok_sampler::CredentialSource::ModelApiKey,
-                ));
+            let mut creds = actor.chat_state_handle.get_credentials().await;
+            creds.api_key = Some("test-key".to_string());
+            actor.chat_state_handle.update_credentials(creds);
 
             actor
                 .workspace_ops
@@ -215,6 +195,7 @@ fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_use_id()
                     None,
                     None,
                     true,
+                    /* send_now */ false,
                     None,
                     None,
                     None,
@@ -222,7 +203,10 @@ fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_use_id()
             )
             .await
             .expect("turn must finish within timeout");
-            assert!(outcome.is_ok(), "turn must not error: {outcome:?}");
+            assert!(
+                outcome.is_ok(),
+                "turn must not error: {outcome:?}"
+            );
 
             let conv = actor.chat_state_handle.get_conversation().await;
             let by_id = tool_results_by_call_id(&conv);
@@ -264,6 +248,6 @@ fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_use_id()
                  run; deleting the nudge is not a valid fix for chat-history corruption. \
                  conversation={conv:#?}"
             );
-        });
-    });
+        })
+        .await;
 }

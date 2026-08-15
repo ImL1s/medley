@@ -23,6 +23,26 @@ fn item_kind_str(item: &ConversationItem) -> &'static str {
     }
 }
 
+/// The derived-state matrix for in-place history rewrites: each kind picks
+/// its turn-capture handling and persistence flavor here instead of
+/// hand-rolling the sequence. Item-count-CHANGING rewrites (compaction,
+/// rewind, …) use [`ChatStateActor::replace_conversation`] instead, which
+/// also reseeds token totals.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum HistoryRewrite {
+    /// Dedup / dangling-tool-call repair: may add or remove items ahead of
+    /// an active capture's boundary → snapshot + rebase. Token totals
+    /// untouched.
+    IntegrityRepair,
+    /// Old tool-result hard-clear: content shrinks, item count and ordering
+    /// unchanged → capture offsets stay valid. Token totals untouched.
+    RetainedPrune,
+    /// Server-confirmed image strip: parts replaced in place
+    /// (`strip_images_by_url`'s invariant), token totals untouched so the
+    /// provider-reported total survives. Backup-gated, disk-acked persist.
+    ImageStrip,
+}
+
 impl ChatStateActor {
     /// Apply the active model's catalog policy at the single tool-result
     /// history boundary, then estimate and persist the bounded item (#263).
@@ -32,51 +52,55 @@ impl ChatStateActor {
         truncation_policy: Option<TruncationPolicyConfig>,
         trusted_suffix: Option<TrustedPromptSuffix>,
     ) {
-        if let ConversationItem::ToolResult(result) = &mut item {
-            match (
-                truncation_policy.and_then(truncation_policy_byte_limit),
-                trusted_suffix,
-            ) {
-                (Some(max_bytes), Some(suffix)) => {
-                    if result.content.len().saturating_add(suffix.exact.len()) <= max_bytes {
-                        // Compatibility and quality fast path: an already
-                        // fitting result remains byte-for-byte identical.
-                        append_tool_result_suffix(&mut result.content, &suffix.exact);
-                    } else if suffix.reminders.is_empty() {
-                        // Legacy proxy payload: provenance has only the exact
-                        // suffix boundary, so retain the established bounded
-                        // split without attempting to parse its text.
-                        let mut exact = suffix.exact;
-                        let suffix_budget = if result.content.is_empty() {
-                            max_bytes
-                        } else {
-                            max_bytes.div_ceil(2)
-                        };
-                        truncate_owned_text(&mut exact, suffix_budget);
-                        truncate_tool_result_content(
-                            &mut result.content,
-                            max_bytes.saturating_sub(exact.len()),
-                        );
-                        append_tool_result_suffix(&mut result.content, &exact);
-                    } else {
-                        let bounded = bound_structured_tool_result(
-                            result.content.as_ref(),
-                            suffix.reminders,
-                            max_bytes,
-                        );
-                        result.content = bounded.into();
-                    }
-                }
-                (Some(max_bytes), None) => {
-                    truncate_tool_result_content(&mut result.content, max_bytes);
-                }
-                (None, Some(suffix)) => {
-                    append_tool_result_suffix(&mut result.content, &suffix.exact);
-                }
-                (None, None) => {}
-            }
+        if let (ConversationItem::ToolResult(result), Some(policy)) = (&mut item, truncation_policy)
+            && let Some(max_bytes) = truncation_policy_byte_limit(policy)
+        {
+            truncate_tool_result_content(&mut result.content, max_bytes);
+        }
+        if let (ConversationItem::ToolResult(result), Some(suffix)) = (&mut item, trusted_suffix) {
+            let mut combined = String::with_capacity(result.content.len() + suffix.exact.len());
+            combined.push_str(&result.content);
+            combined.push_str(&suffix.exact);
+            result.content = combined.into();
         }
         self.push_message(item);
+    }
+
+    /// Apply `mutate` to the conversation and drive the derived-state matrix
+    /// for `kind` (see [`HistoryRewrite`]). Persists only when `mutate`
+    /// reports a nonzero change count. Returns that count plus, for the
+    /// strip flavor, the disk acknowledgement.
+    pub(super) fn rewrite_history(
+        &mut self,
+        kind: HistoryRewrite,
+        mutate: impl FnOnce(&mut Vec<ConversationItem>) -> usize,
+    ) -> (
+        usize,
+        Option<tokio::sync::oneshot::Receiver<std::io::Result<()>>>,
+    ) {
+        let snapshots_capture = matches!(kind, HistoryRewrite::IntegrityRepair);
+        if snapshots_capture {
+            self.snapshot_turn_slice();
+        }
+        let changed = mutate(&mut self.state.conversation);
+        let mut disk_ack = None;
+        if changed > 0 {
+            match kind {
+                HistoryRewrite::IntegrityRepair | HistoryRewrite::RetainedPrune => {
+                    self.persistence.replace_history(&self.state.conversation);
+                }
+                HistoryRewrite::ImageStrip => {
+                    disk_ack = Some(
+                        self.persistence
+                            .replace_history_for_strip_and_ack(&self.state.conversation),
+                    );
+                }
+            }
+        }
+        if snapshots_capture {
+            self.rebase_turn_capture_offset();
+        }
+        (changed, disk_ack)
     }
 
     /// Repair any dangling tool calls in the conversation and persist the fix.
@@ -104,25 +128,23 @@ impl ChatStateActor {
         &mut self,
         reason: DanglingToolCallReason,
     ) {
-        // In-place integrity repair can add/remove items ahead of an active capture's
-        // boundary, so snapshot + rebase the offset like the replace/restore paths.
-        self.snapshot_turn_slice();
-        let deduped = dedup_duplicate_tool_results(&mut self.state.conversation);
-        if deduped > 0 {
-            tracing::info!(
-                deduped_count = deduped,
-                "Removed duplicate tool results in conversation"
-            );
-        }
-        let repaired = repair_dangling_tool_calls(&mut self.state.conversation, reason);
-        if repaired > 0 || deduped > 0 {
-            tracing::info!(
-                repaired_count = repaired,
-                "Repaired dangling tool calls in conversation"
-            );
-            self.persistence.replace_history(&self.state.conversation);
-        }
-        self.rebase_turn_capture_offset();
+        self.rewrite_history(HistoryRewrite::IntegrityRepair, |conversation| {
+            let deduped = dedup_duplicate_tool_results(conversation);
+            if deduped > 0 {
+                tracing::info!(
+                    deduped_count = deduped,
+                    "Removed duplicate tool results in conversation"
+                );
+            }
+            let repaired = repair_dangling_tool_calls(conversation, reason);
+            if repaired > 0 || deduped > 0 {
+                tracing::info!(
+                    repaired_count = repaired,
+                    "Repaired dangling tool calls in conversation"
+                );
+            }
+            repaired + deduped
+        });
     }
 
     /// Repair dangling tool calls after a harness-initiated halt.
@@ -162,6 +184,26 @@ impl ChatStateActor {
             self.state.conversation = items;
         }
         report
+    }
+
+    /// Same URL-scoped strip as the request's, as [`HistoryRewrite::ImageStrip`].
+    /// `None` when nothing matched, else occurrence count + disk ack.
+    pub(super) fn strip_conversation_images(
+        &mut self,
+        urls: &[std::sync::Arc<str>],
+    ) -> Option<(usize, tokio::sync::oneshot::Receiver<std::io::Result<()>>)> {
+        let (stripped, disk_ack) =
+            self.rewrite_history(HistoryRewrite::ImageStrip, |conversation| {
+                let stripped = xai_grok_sampling_types::strip_images_by_url(conversation, urls);
+                if stripped > 0 {
+                    tracing::warn!(
+                        stripped,
+                        "stripped server-rejected image(s) from stored conversation"
+                    );
+                }
+                stripped
+            });
+        disk_ack.map(|ack| (stripped, ack))
     }
 
     /// Make memory match the disk-authoritative switch for one generation.
@@ -322,32 +364,35 @@ impl ChatStateActor {
             .saturating_add(synthetic_count);
 
         let before_bytes = self.conversation_content_bytes();
-        let mut cleared = 0usize;
-        let mut turn_from_end: usize = 0;
-        let mut seen_first_user = false;
+        let (cleared, _) = self.rewrite_history(HistoryRewrite::RetainedPrune, |conversation| {
+            let mut cleared = 0usize;
+            let mut turn_from_end: usize = 0;
+            let mut seen_first_user = false;
 
-        for i in (0..self.state.conversation.len()).rev() {
-            if matches!(&self.state.conversation[i], ConversationItem::User(_)) {
-                if seen_first_user {
-                    turn_from_end += 1;
+            for i in (0..conversation.len()).rev() {
+                if matches!(&conversation[i], ConversationItem::User(_)) {
+                    if seen_first_user {
+                        turn_from_end += 1;
+                    }
+                    seen_first_user = true;
+                    continue;
                 }
-                seen_first_user = true;
-                continue;
-            }
 
-            let ConversationItem::ToolResult(tr) = &mut self.state.conversation[i] else {
-                continue;
-            };
+                let ConversationItem::ToolResult(tr) = &mut conversation[i] else {
+                    continue;
+                };
 
-            if turn_from_end < effective_threshold {
-                continue;
-            }
+                if turn_from_end < effective_threshold {
+                    continue;
+                }
 
-            if tr.content.as_ref() != HARD_CLEAR_PLACEHOLDER {
-                tr.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
-                cleared += 1;
+                if tr.content.as_ref() != HARD_CLEAR_PLACEHOLDER {
+                    tr.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
+                    cleared += 1;
+                }
             }
-        }
+            cleared
+        });
 
         if cleared > 0 {
             let after_bytes = self.conversation_content_bytes();
@@ -357,7 +402,6 @@ impl ChatStateActor {
                 conversation_len = self.state.conversation.len(),
                 "ChatState: in-memory tool-result prune"
             );
-            self.persistence.replace_history(&self.state.conversation);
         }
 
         cleared
@@ -618,6 +662,7 @@ impl ChatStateActor {
     }
 }
 
+
 fn truncation_policy_byte_limit(policy: TruncationPolicyConfig) -> Option<usize> {
     let limit = u64::try_from(policy.limit)
         .ok()
@@ -637,133 +682,17 @@ fn truncation_policy_byte_limit(policy: TruncationPolicyConfig) -> Option<usize>
     Some(usize::try_from(bytes).unwrap_or(usize::MAX))
 }
 
-fn completion_manifest(message: &TrustedReminderMessage) -> String {
-    message
-        .completion_ids
-        .iter()
-        .map(|id| format!("[completion:{id}]\n"))
-        .collect()
-}
-
-/// Bound raw output plus structured reminders under one hard byte cap.
-/// Completion identity and producer framing are mandatory; payload bytes are
-/// shared fairly only after that manifest fits. If even the compact manifest
-/// cannot fit, the cap wins and an explicit overflow marker is emitted.
-fn bound_structured_tool_result(
-    raw: &str,
-    reminders: Vec<TrustedReminderMessage>,
-    max_bytes: usize,
-) -> String {
-    let manifests: Vec<String> = reminders.iter().map(completion_manifest).collect();
-    let required_bytes = reminders
-        .iter()
-        .zip(&manifests)
-        .map(|(message, manifest)| message.prefix.len() + manifest.len() + message.suffix.len())
-        .sum::<usize>();
-
-    if required_bytes > max_bytes {
-        let ids = reminders
-            .iter()
-            .flat_map(|message| &message.completion_ids)
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(",");
-        let compact = format!("[completions:{ids}]\n[completion manifest overflow]");
-        return truncate_text(&compact, max_bytes, "[completion manifest overflow]")
-            .unwrap_or(compact);
-    }
-
-    let remaining = max_bytes - required_bytes;
-    let mut payload_lengths = Vec::with_capacity(reminders.len() + 1);
-    payload_lengths.push(raw.len());
-    payload_lengths.extend(reminders.iter().map(|message| message.payload.len()));
-    let budgets = fair_payload_budgets(&payload_lengths, remaining);
-
-    let mut bounded = String::with_capacity(max_bytes);
-    if let Some(truncated) = truncate_text(raw, budgets[0], "[truncated]") {
-        bounded.push_str(&truncated);
-    } else {
-        bounded.push_str(raw);
-    }
-    for ((message, manifest), budget) in reminders
-        .into_iter()
-        .zip(manifests)
-        .zip(budgets.into_iter().skip(1))
-    {
-        bounded.push_str(&message.prefix);
-        bounded.push_str(&manifest);
-        if let Some(truncated) = truncate_text(&message.payload, budget, "[truncated]") {
-            bounded.push_str(&truncated);
-        } else {
-            bounded.push_str(&message.payload);
-        }
-        bounded.push_str(&message.suffix);
-    }
-    debug_assert!(bounded.len() <= max_bytes);
-    bounded
-}
-
-fn fair_payload_budgets(lengths: &[usize], total: usize) -> Vec<usize> {
-    let mut budgets = vec![0; lengths.len()];
-    let mut remaining = total;
-    let mut active: Vec<usize> = (0..lengths.len()).collect();
-    while !active.is_empty() {
-        let share = remaining / active.len();
-        let mut next = Vec::new();
-        let mut consumed = 0usize;
-        for index in active {
-            if lengths[index] <= share {
-                budgets[index] = lengths[index];
-                consumed += lengths[index];
-            } else {
-                next.push(index);
-            }
-        }
-        remaining = remaining.saturating_sub(consumed);
-        if next.is_empty() {
-            break;
-        }
-        if consumed == 0 {
-            let base = remaining / next.len();
-            let extra = remaining % next.len();
-            for (position, index) in next.into_iter().enumerate() {
-                budgets[index] = base + usize::from(position < extra);
-            }
-            break;
-        }
-        active = next;
-    }
-    budgets
-}
-
 fn truncate_tool_result_content(content: &mut std::sync::Arc<str>, max_bytes: usize) {
     if content.len() <= max_bytes {
         return;
     }
-    let marker = format!(
+
+    let full_marker = format!(
         "\n... tool output truncated: {} bytes total ...\n",
         content.len()
     );
-    if let Some(truncated) = truncate_text(content, max_bytes, &marker) {
-        *content = truncated.into();
-    }
-}
-
-fn truncate_owned_text(content: &mut String, max_bytes: usize) {
-    // Keep reminder framing useful at modest budgets. The raw-output marker
-    // includes the original byte count, but that metadata is not worth
-    // consuming most of a reminder's reserved share.
-    if let Some(truncated) = truncate_text(content, max_bytes, "[truncated]") {
-        *content = truncated;
-    }
-}
-
-fn truncate_text(content: &str, max_bytes: usize, preferred_marker: &str) -> Option<String> {
-    if content.len() <= max_bytes {
-        return None;
-    }
-    let marker = if preferred_marker.len() <= max_bytes {
-        preferred_marker.to_owned()
+    let marker = if full_marker.len() <= max_bytes {
+        full_marker
     } else if "[truncated]".len() <= max_bytes {
         "[truncated]".to_owned()
     } else {
@@ -786,12 +715,5 @@ fn truncate_text(content: &str, max_bytes: usize, preferred_marker: &str) -> Opt
     truncated.push_str(&content[..head_end]);
     truncated.push_str(&marker);
     truncated.push_str(&content[tail_start..]);
-    Some(truncated)
-}
-
-fn append_tool_result_suffix(content: &mut std::sync::Arc<str>, suffix: &str) {
-    let mut combined = String::with_capacity(content.len() + suffix.len());
-    combined.push_str(content);
-    combined.push_str(suffix);
-    *content = combined.into();
+    *content = truncated.into();
 }

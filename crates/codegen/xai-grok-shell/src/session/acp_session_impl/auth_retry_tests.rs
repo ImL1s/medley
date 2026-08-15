@@ -2,45 +2,7 @@ use std::time::Duration;
 
 use xai_grok_sampling_types::SentCredential;
 
-use super::{
-    AuthRetryDecision, AuthRetrySchedule, Codex401RetryBudget, Provider401RecoveryAction,
-    provider_401_recovery_action,
-};
-
-#[test]
-fn codex_401_budget_allows_exactly_one_retry_per_turn() {
-    let mut budget = Codex401RetryBudget::new();
-
-    assert!(budget.available());
-    assert!(budget.consume(), "the first 401 may consume the retry");
-    assert!(!budget.available());
-    assert!(
-        !budget.consume(),
-        "a refreshed credential rejected again must not trigger another refresh"
-    );
-}
-
-/// Regression for chat-state A / live provider B: the resolver put B on the
-/// request and the server rejected B, so recovery must force-refresh B. The
-/// stale chat-state value is deliberately absent from this API and therefore
-/// cannot make recovery merely re-adopt the already-rejected B.
-#[test]
-fn codex_401_for_live_provider_credential_forces_server_rejected_refresh() {
-    assert_eq!(
-        provider_401_recovery_action(SentCredential::SameAsCurrent, true),
-        Provider401RecoveryAction::RefreshServerRejected,
-    );
-    assert_eq!(
-        provider_401_recovery_action(SentCredential::DifferentFromCurrent, true),
-        Provider401RecoveryAction::AdoptCached,
-        "a request that really used older A may adopt already-rotated B",
-    );
-    assert_eq!(
-        provider_401_recovery_action(SentCredential::SameAsCurrent, false),
-        Provider401RecoveryAction::EnsureFresh,
-        "a concurrent cache loss must mint instead of panicking or replaying",
-    );
-}
+use super::{AuthRetryDecision, AuthRetrySchedule};
 use crate::util::dual_clock::DualClock;
 
 /// `now` shifted `wall_ahead` on the wall clock only — the signature a

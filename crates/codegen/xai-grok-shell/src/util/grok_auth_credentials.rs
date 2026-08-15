@@ -3,8 +3,9 @@ use std::sync::Arc;
 /// Credentials for authenticating with grok backend services.
 ///
 /// Two construction modes:
-/// - `with_auth_manager(am)` — live mode. `resolve_async()` drives
-///   `AuthManager::get_valid_token()` (memory -> disk -> OIDC refresh).
+/// - `with_auth_manager(am)` — live mode, a background-consumer surface:
+///   `resolve_async()` drives `AuthManager::get_valid_token_background()`
+///   (memory -> disk -> OIDC refresh, deferred during dark wake).
 /// - `new(token)` — static mode. For one-shot callers that don't have
 ///   an `AuthManager` (visibility checks, bundle fetches, tests).
 ///
@@ -23,9 +24,14 @@ pub struct GrokAuthCredentials {
 impl std::fmt::Debug for GrokAuthCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrokAuthCredentials")
-            .field("user_token_present", &self.user_token.is_some())
-            .field("deployment_key_present", &self.deployment_key.is_some())
-            .field("alpha_test_key_present", &self.alpha_test_key.is_some())
+            .field(
+                "user_token",
+                &self.user_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "deployment_key",
+                &self.deployment_key.as_ref().map(|_| "<redacted>"),
+            )
             .field(
                 "mode",
                 &if self.auth_manager.is_some() {
@@ -59,21 +65,13 @@ impl GrokAuthCredentials {
         self.auth_manager.as_ref()
     }
     /// Error hint for 401 responses, based on which credential was sent.
-    pub fn auth_error_hint(&self) -> String {
+    pub fn auth_error_hint(&self) -> &'static str {
         if self.deployment_key.is_some() {
             "Your GROK_DEPLOYMENT_KEY is invalid or expired. Please contact a team admin."
-                .to_owned()
         } else if self.user_token.is_some() {
-            crate::auth::with_login_instruction(
-                |prog| {
-                    format!(
-                        "Your auth token is invalid or expired. Run `{prog} login` to re-authenticate."
-                    )
-                },
-                "Your auth token is invalid or expired. Sign in again to re-authenticate.",
-            )
+            "Your auth token is invalid or expired. Run `grok login` to re-authenticate."
         } else {
-            "Not authenticated.".to_owned()
+            "Not authenticated."
         }
     }
     /// Return a snapshot with the live token from the internal `AuthManager`
@@ -96,15 +94,18 @@ impl GrokAuthCredentials {
             self.clone()
         }
     }
-    /// Async resolve via the internal `AuthManager::get_valid_token()`
-    /// (memory -> disk -> active OIDC refresh). Falls back to sync
-    /// `resolve()` on error so transient refresh failures don't drop
-    /// the bearer.
+    /// Async resolve via `AuthManager::get_valid_token_background()`
+    /// (memory -> disk -> active OIDC refresh). **Background urgency**: every
+    /// live-mode holder of this type is a background loop (FeedbackClient
+    /// signals sync, SessionRegistryClient) — user-facing paths resolve
+    /// through `AuthManager::auth()` directly. Falls back to sync
+    /// `resolve()` on error so transient refresh failures don't drop the
+    /// bearer.
     pub async fn resolve_async(&self) -> GrokAuthCredentials {
         let Some(ref am) = self.auth_manager else {
             return self.clone();
         };
-        match am.get_valid_token().await {
+        match am.get_valid_token_background().await {
             Ok(key) => {
                 let mut creds = self.clone();
                 creds.user_token = Some(key);
@@ -136,10 +137,6 @@ impl GrokAuthCredentials {
 impl xai_grok_auth::HttpAuth for GrokAuthCredentials {
     fn apply(&self, builder: RequestBuilder, base_url: &str) -> RequestBuilder {
         GrokAuthCredentials::apply(self, builder, base_url)
-    }
-
-    fn needs_token_auth_header(&self) -> bool {
-        self.deployment_key.is_none()
     }
 }
 #[cfg(test)]
@@ -192,39 +189,5 @@ mod tests {
         let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
         let creds = GrokAuthCredentials::new(None).with_auth_manager(mgr);
         assert!(creds.resolve().user_token.is_none());
-    }
-
-    #[test]
-    fn debug_reports_only_credential_presence_and_mode() {
-        let user_token = "GB002USER-Q7w5E3r1T9y7Z6x4C2v8";
-        let deployment_key = "GB002DEPLOY-A7s5D3f1G9h7J6k4L2m8";
-        let alpha_test_key = "GB002ALPHA-P8o6I4u2Y0t9R7e5W3q1";
-        let creds = GrokAuthCredentials {
-            user_token: Some(user_token.into()),
-            deployment_key: Some(deployment_key.into()),
-            alpha_test_key: Some(alpha_test_key.into()),
-            auth_manager: None,
-        };
-
-        let debug = format!("{creds:?}");
-        assert!(debug.contains("user_token_present: true"));
-        assert!(debug.contains("deployment_key_present: true"));
-        assert!(debug.contains("alpha_test_key_present: true"));
-        assert!(debug.contains("mode: \"static\""));
-
-        for secret in [user_token, deployment_key, alpha_test_key] {
-            assert!(!debug.contains(secret));
-            for window in secret.as_bytes().windows(8) {
-                let window = std::str::from_utf8(window).unwrap();
-                assert!(
-                    !debug.contains(window),
-                    "debug output leaked credential window: {window}"
-                );
-            }
-        }
-
-        let (mgr, _dir) = make_manager_with_token(Utc::now() + Duration::hours(1));
-        let live_debug = format!("{:?}", creds.with_auth_manager(mgr));
-        assert!(live_debug.contains("mode: \"live\""));
     }
 }

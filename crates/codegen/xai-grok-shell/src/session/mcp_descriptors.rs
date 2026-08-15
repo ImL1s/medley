@@ -67,7 +67,6 @@ pub(crate) async fn materialize_descriptors_for_gateway_tools(
             "name": tool.tool_id,
             "description": tool.description,
             "inputSchema": tool.json_schema,
-            "x-grok-managed-gateway": true,
         });
         match serde_json::to_vec_pretty(&descriptor) {
             Ok(bytes) => {
@@ -289,7 +288,6 @@ mod tests {
         .unwrap();
         assert_eq!(linear["name"], "list_issues");
         assert_eq!(linear["description"], "List issues");
-        assert_eq!(linear["x-grok-managed-gateway"], true);
         assert_eq!(
             linear["inputSchema"]["properties"]["limit"]["type"],
             "number"
@@ -311,25 +309,25 @@ mod tests {
     #[tokio::test]
     async fn gateway_descriptor_collision_prunes_only_gateway_owned_files() {
         let temp = tempfile::tempdir().unwrap();
-        materialize_descriptors_for_gateway_tools(
-            temp.path(),
-            vec![GatewayToolDescriptor {
-                connector_id: "linear".into(),
-                tool_id: "gateway_tool".into(),
-                description: "Gateway tool".into(),
-                json_schema: serde_json::json!({"type": "object"}),
-            }],
-            vec!["linear".into()],
-            HashSet::new(),
-        )
-        .await;
         let tools_dir = temp.path().join("linear/tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
         std::fs::write(
             tools_dir.join("local_tool.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "name": "local_tool",
                 "description": "Local tool",
                 "inputSchema": {"type": "object"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            tools_dir.join("gateway_tool.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "gateway_tool",
+                "description": "Gateway tool",
+                "inputSchema": {"type": "object"},
+                "x-grok-managed-gateway": true,
             }))
             .unwrap(),
         )

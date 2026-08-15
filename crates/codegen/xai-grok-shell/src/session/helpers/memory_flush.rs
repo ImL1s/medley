@@ -149,8 +149,10 @@ pub enum FlushResult {
 pub fn process_flush_response(response: &str, config: &MemoryFlushConfig) -> FlushResult {
     let trimmed = response.trim();
     let len = trimmed.len();
+    let preview: String = trimmed.chars().take(200).collect();
 
-    tracing::info!(target: LOG, "MEMORY_FLUSH_RESPONSE: len={len}");
+    tracing::info!(target: LOG,
+        "MEMORY_FLUSH_RESPONSE: len={len} preview=\"{preview}\"");
 
     // Check for empty
     if trimmed.is_empty() {

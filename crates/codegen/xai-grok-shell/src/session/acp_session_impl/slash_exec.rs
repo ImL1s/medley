@@ -139,10 +139,9 @@ impl SessionActor {
             }
             BuiltinAction::HooksAdd { path } => {
                 if path.is_empty() {
-                    self.send_host_turn_slash_command_output(&format!(
-                        "Usage: /hooks add <path>\nProvide a path to a hook JSON file or directory under {}/.",
-                        xai_grok_config::display_grok_home_prefix()
-                    ))
+                    self.send_host_turn_slash_command_output(
+                        "Usage: /hooks add <path>\nProvide a path to a hook JSON file or directory under ~/.grok/.",
+                    )
                     .await;
                 } else {
                     // CWE-427: Use shared add_hooks_path() which validates
@@ -980,7 +979,7 @@ impl SessionActor {
         );
         let model_id = sampling_config.map(|c| c.model);
         let resolved_model_id = model_metadata.resolved_model_id;
-        let client_version = credentials.client_version_cloned();
+        let client_version = credentials.client_version().map(String::from);
 
         use crate::session::feedback_manager::{SessionFeedbackData, SubmitOutcome};
         let outcome = self

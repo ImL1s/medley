@@ -362,15 +362,17 @@ pub(super) fn dispatch_send_btw(app: &mut AppView, question: String) -> Vec<Effe
                 agent
                     .scrollback
                     .push_block(crate::scrollback::block::RenderBlock::system(
-                        "No active session",
+                        NO_SESSION_NOTICE,
                     ));
             } else {
-                agent.show_toast("No active session");
+                agent.show_toast(NO_SESSION_NOTICE);
             }
             return vec![];
         };
 
-        agent.prompt.set_text("");
+        // Composer clearing belongs to the submit funnel: `dispatch_send_prompt_inner` clears it
+        // when `consume_input` is set, so draft-preserving callers (palette, edited
+        // queue row) keep theirs.
         let minimal_request_id = if minimal {
             Some(crate::minimal_api::start_minimal_btw(
                 agent,
@@ -445,7 +447,7 @@ pub(super) fn dispatch_send_recap(app: &mut AppView, auto: bool) -> Vec<Effect> 
 
     let Some(session_id) = agent.session.session_id.clone() else {
         if !auto {
-            agent.show_toast("No active session");
+            agent.show_toast(NO_SESSION_NOTICE);
         }
         return vec![];
     };

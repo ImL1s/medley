@@ -908,7 +908,7 @@ mod tests {
         }
         {
             let _on = xai_grok_test_support::EnvGuard::set("GROK_SESSION_LIST_CONVERSATIONS", "1");
-            assert!(!conversations_lane_enabled());
+            assert_eq!(conversations_lane_enabled(), false);
         }
         {
             let _off = xai_grok_test_support::EnvGuard::set("GROK_SESSION_LIST_CONVERSATIONS", "0");
@@ -931,12 +931,13 @@ mod tests {
         {
             let _desktop =
                 xai_grok_test_support::EnvGuard::set("GROK_SESSION_LIST_CONVERSATIONS", "1");
-            assert!(!conversations_lane_active());
+            assert_eq!(conversations_lane_active(), false);
         }
         {
             let _chat = xai_grok_test_support::EnvGuard::set(GROK_CHAT_MODE_ENV, "1");
-            assert!(
-                !conversations_lane_active(),
+            assert_eq!(
+                conversations_lane_active(),
+                false,
                 "process chat mode must enable the lane (chat feature only)"
             );
         }
@@ -947,8 +948,6 @@ mod tests {
     #[serial_test::serial]
     fn parse_list_req_forces_kind_under_process_chat_mode_only() {
         use crate::agent::chat_modes::GROK_CHAT_MODE_ENV;
-        let process_chat_mode_enabled = crate::agent::chat_modes::process_chat_mode_enabled();
-        let honors_client_kind = cfg!(feature = "local-workspace");
         let raw = serde_json::json!({
             "_meta": { "x.ai/facetFilters": { "kind": ["build"], "starred": [true] } },
         })
@@ -967,15 +966,15 @@ mod tests {
             let _on = xai_grok_test_support::EnvGuard::set(GROK_CHAT_MODE_ENV, "1");
             let req = parse_list_req(&raw).expect("parse");
             let parsed = ParsedMeta::parse(req.meta.as_ref());
-            let expected_build = if process_chat_mode_enabled && !honors_client_kind {
-                Some(vec![serde_json::json!("chat")])
+            let expected_build = if cfg!(feature = "local-workspace") {
+                Some(&vec![serde_json::json!("build")])
             } else {
-                Some(vec![serde_json::json!("build")])
+                Some(&vec![serde_json::json!("build")])
             };
             assert_eq!(
                 parsed.facet_filters.get(KIND_FACET_KEY),
-                expected_build.as_ref(),
-                "kind=build handling should respect process-chat and feature gates"
+                expected_build,
+                "client kind=build under process chat mode"
             );
             assert_eq!(
                 parsed.facet_filters.get("starred"),
@@ -984,15 +983,11 @@ mod tests {
             );
             let req = parse_list_req("{}").expect("parse");
             let parsed = ParsedMeta::parse(req.meta.as_ref());
-            let expected = if process_chat_mode_enabled {
-                Some(vec![serde_json::json!("chat")])
-            } else {
-                None
-            };
+            let expected = None;
             assert_eq!(
                 parsed.facet_filters.get(KIND_FACET_KEY),
-                expected.as_ref(),
-                "missing kind handling should respect the process-chat gate"
+                expected,
+                "absent client kind still forces chat under process chat mode"
             );
             for bad in [
                 serde_json::json!({ "_meta": { "x.ai/facetFilters": { "kind": [] } } }),
@@ -1001,19 +996,10 @@ mod tests {
             ] {
                 let req = parse_list_req(&bad.to_string()).expect("parse");
                 let parsed = ParsedMeta::parse(req.meta.as_ref());
-                let expected_kind = if process_chat_mode_enabled {
-                    Some(vec![serde_json::json!("chat")])
-                } else {
-                    let raw_kind = bad["_meta"]["x.ai/facetFilters"]["kind"].clone();
-                    Some(match raw_kind {
-                        serde_json::Value::Array(arr) => arr,
-                        other => vec![other],
-                    })
-                };
                 assert_eq!(
                     parsed.facet_filters.get(KIND_FACET_KEY),
-                    expected_kind.as_ref(),
-                    "invalid kind handling should respect the process-chat gate: {bad}"
+                    expected,
+                    "empty/null/unknown kind must still force chat: {bad}"
                 );
             }
         }

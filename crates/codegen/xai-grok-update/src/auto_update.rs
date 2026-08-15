@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -17,6 +17,10 @@ use crate::version::{
 };
 use xai_grok_shell::util::config;
 use xai_grok_shell::util::grok_home::{grok_application, grok_home};
+pub use xai_grok_telemetry::events::CliUpdateTrigger;
+use xai_grok_telemetry::events::{
+    CliUpdate, CliUpdateChannel, CliUpdateErrorKind, CliUpdateInstaller, CliUpdateOutcome,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum UpdateRunMode {
@@ -27,12 +31,45 @@ pub enum UpdateRunMode {
 const PROMPT_UPDATE_NOW: &str = "Update now? [Y/n/d]";
 const MSG_AUTO_UPDATE_BACKGROUND: &str = "Auto-update running in background.";
 const MSG_RUN_UPDATE_MANUAL: &str = "Run `grok update` to get the latest version.";
+/// An empty or `"stable"` channel means stable — the installers' default
+/// (`CHANNEL="${GROK_CHANNEL:-stable}"` in install.sh).
+fn is_stable_channel(channel: &str) -> bool {
+    channel.is_empty() || channel == "stable"
+}
+
 /// Manual-install one-liner for this platform's bootstrap installer.
-fn manual_install_cmd() -> &'static str {
+///
+/// On Unix the variable must prefix `bash` (which runs install.sh), not
+/// `curl`: in `VAR=x curl … | bash` the assignment applies to `curl` only
+/// and install.sh would fall back to stable.
+fn manual_install_cmd(channel: &str) -> String {
+    // Only interpolate a well-formed channel ([A-Za-z0-9._-]) into the
+    // shell one-liner; anything else falls back to stable (a working
+    // installer beats a broken quoted command).
+    let channel = channel.trim();
+    let safe = !channel.is_empty()
+        && channel
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if channel == "enterprise" {
+        // Enterprise has its own bootstrap script; it needs no channel env.
+        return if cfg!(windows) {
+            "irm https://x.ai/cli/enterprise-install.ps1 | iex".to_string()
+        } else {
+            "curl -fsSL https://x.ai/cli/enterprise-install.sh | bash".to_string()
+        };
+    }
+    if is_stable_channel(channel) || !safe {
+        return if cfg!(windows) {
+            "irm https://x.ai/cli/install.ps1 | iex".to_string()
+        } else {
+            "curl -fsSL https://x.ai/cli/install.sh | bash".to_string()
+        };
+    }
     if cfg!(windows) {
-        "irm https://x.ai/cli/install.ps1 | iex"
+        format!("$env:GROK_CHANNEL='{channel}'; irm https://x.ai/cli/install.ps1 | iex")
     } else {
-        "curl -fsSL https://x.ai/cli/install.sh | bash"
+        format!("curl -fsSL https://x.ai/cli/install.sh | GROK_CHANNEL='{channel}' bash")
     }
 }
 
@@ -43,14 +80,14 @@ fn manual_install_cmd() -> &'static str {
 /// no distribution identity — gets pointed at the medley installer, because
 /// telling a fork user to run `npm i -g @xai-official/grok` is the same
 /// silent-replacement failure this module exists to prevent.
-fn reinstall_hint(installer: &str) -> String {
-    reinstall_hint_for(installer, dist_channel::self_update_refusal().is_some())
+fn reinstall_hint(installer: &str, channel: &str) -> String {
+    reinstall_hint_for(installer, channel, dist_channel::self_update_refusal().is_some())
 }
 
 /// Pure half of [`reinstall_hint`]. `self_update_disabled` is the distribution
 /// decision, passed in so both branches are testable without touching the
 /// process environment.
-fn reinstall_hint_for(installer: &str, self_update_disabled: bool) -> String {
+fn reinstall_hint_for(installer: &str, channel: &str, self_update_disabled: bool) -> String {
     if self_update_disabled {
         let install_command = dist_channel::medley_install_command();
         return format!(
@@ -61,7 +98,103 @@ fn reinstall_hint_for(installer: &str, self_update_disabled: bool) -> String {
     match installer {
         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
         "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
-        _ => format!("Please reinstall via:\n  {}", manual_install_cmd()),
+        _ => format!("Please reinstall via:\n  {}", manual_install_cmd(channel)),
+    }
+}
+
+/// True when this process is an x86_64 build translated by Rosetta on an
+/// Apple Silicon host. `hw.optional.arm64` is 1 on Apple Silicon — including
+/// from a translated process, where the compile-time arch says x86_64.
+///
+/// Read in-process via `sysctlbyname`: no spawn, no stdout parse, and no
+/// dependence on the `sysctl` binary being on PATH. A missing key (genuine
+/// Intel Mac) or any error means not Apple Silicon — the probe fails open
+/// to the compile-time arch. Cached: fixed host property, read from async
+/// paths via [`detect_platform`].
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn running_under_rosetta_on_apple_silicon() -> bool {
+    static ROSETTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ROSETTA.get_or_init(|| {
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        // SAFETY: the name is a valid NUL-terminated C string; `val`/`len`
+        // describe a properly sized c_int; sysctlbyname writes at most
+        // `len` bytes into `val`.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"hw.optional.arm64".as_ptr(),
+                (&raw mut val).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        rc == 0 && val == 1
+    })
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+fn running_under_rosetta_on_apple_silicon() -> bool {
+    false
+}
+
+/// Arch to download artifacts for, given the compile-time arch and whether
+/// the host is Apple Silicon running this build under Rosetta. Separated
+/// from [`detect_platform`] so the decision is unit-testable.
+fn corrected_arch(
+    os: &'static str,
+    arch: &'static str,
+    rosetta_on_apple_silicon: bool,
+) -> &'static str {
+    if os == "macos" && arch == "x86_64" && rosetta_on_apple_silicon {
+        "aarch64"
+    } else {
+        arch
+    }
+}
+
+/// Artifact platform from [`detect_platform`]; compile-time values for
+/// combos the updater does not support.
+fn platform_label() -> String {
+    detect_platform()
+        .map(|(os, arch)| format!("{os}-{arch}"))
+        .unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+/// Typed phase marker for telemetry classification. Deliberately no
+/// `source()`, so anyhow's `{:#}` does not print the chain twice.
+#[derive(Debug, thiserror::Error)]
+enum InstallPhaseError {
+    #[error("{0:#}")]
+    Download(anyhow::Error),
+    #[error("{0:#}")]
+    Activate(anyhow::Error),
+}
+
+/// Smoke failures stay unwrapped — already typed, and the base-retry abort
+/// in [`install_internal_from_bases`] must still downcast them.
+fn wrap_download_err(e: anyhow::Error) -> anyhow::Error {
+    if e.is::<SmokeTestFailure>() {
+        e
+    } else {
+        InstallPhaseError::Download(e).into()
+    }
+}
+
+#[doc(hidden)]
+pub fn classify_install_error(err: &anyhow::Error) -> CliUpdateErrorKind {
+    if let Some(smoke) = err.downcast_ref::<SmokeTestFailure>() {
+        return match smoke {
+            SmokeTestFailure::Timeout => CliUpdateErrorKind::SmokeTimeout,
+            SmokeTestFailure::Spawn(_) => CliUpdateErrorKind::SmokeSpawn,
+            SmokeTestFailure::NonZero { .. } => CliUpdateErrorKind::SmokeNonzero,
+        };
+    }
+    match err.downcast_ref::<InstallPhaseError>() {
+        Some(InstallPhaseError::Download(_)) => CliUpdateErrorKind::Download,
+        Some(InstallPhaseError::Activate(_)) => CliUpdateErrorKind::Activate,
+        // npm / gh-release failures carry no phase marker.
+        None => CliUpdateErrorKind::Other,
     }
 }
 
@@ -363,7 +496,18 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
     )
     .unwrap_or(false)
     {
-        run_install_script(installer, Some(&target), update_config).await?;
+        run_install_script(
+            installer,
+            Some(&target),
+            update_config,
+            CliUpdateTrigger::LeaderConverge,
+        )
+        .await?;
+        // The leader relaunches right after a successful converge and would
+        // die with the event still in flight (failures keep it alive, so
+        // successes would under-report). The install is already done.
+        xai_grok_telemetry::session_ctx::drain_pending(xai_grok_telemetry::session_ctx::CLI_DRAIN)
+            .await;
         outcome.installed = Some(target.clone());
     }
 
@@ -576,7 +720,9 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
     // Kick off a non-blocking download so the binary is ready when the
     // user restarts (or accepts the in-TUI restart prompt).
     let download = if disk_needs_download {
-        match run_update_subcommand(UpdateRunMode::NonBlocking).await {
+        match run_update_subcommand(UpdateRunMode::NonBlocking, CliUpdateTrigger::AutoBackground)
+            .await
+        {
             Ok(child) => child,
             Err(e) => {
                 tracing::warn!("Background update download failed to start: {e}");
@@ -603,6 +749,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
 pub async fn run_update_if_available(
     run_mode: UpdateRunMode,
     interactive: bool,
+    trigger: CliUpdateTrigger,
     update_config: &UpdateConfig,
 ) -> Result<bool> {
     if let Some(reason) = dist_channel::self_update_refusal() {
@@ -673,7 +820,7 @@ pub async fn run_update_if_available(
             current_version, latest_version, channel_label
         );
         if interactive {
-            if let Err(e) = run_update_subcommand(run_mode).await {
+            if let Err(e) = run_update_subcommand(run_mode, trigger).await {
                 eprintln!("Update failed: {}", e);
             } else if matches!(run_mode, UpdateRunMode::Blocking) {
                 return Ok(true);
@@ -681,7 +828,7 @@ pub async fn run_update_if_available(
                 eprintln!("{}", MSG_AUTO_UPDATE_BACKGROUND);
                 return Ok(false);
             }
-        } else if let Err(e) = run_update_subcommand(run_mode).await {
+        } else if let Err(e) = run_update_subcommand(run_mode, trigger).await {
             eprintln!("Update failed: {}", e);
         } else if matches!(run_mode, UpdateRunMode::Blocking) {
             return Ok(true);
@@ -706,7 +853,10 @@ pub async fn run_update_if_available(
             if io::stdin().read_line(&mut line).is_ok() {
                 let ans = line.trim().to_ascii_lowercase();
                 if ans.is_empty() || ans == "y" || ans == "yes" {
-                    if let Err(e) = run_update_subcommand(run_mode).await {
+                    // Accepted prompt = consent, whatever the caller was.
+                    if let Err(e) =
+                        run_update_subcommand(run_mode, CliUpdateTrigger::UserCommand).await
+                    {
                         eprintln!("Update failed: {}", e);
                     } else if matches!(run_mode, UpdateRunMode::Blocking) {
                         return Ok(true);
@@ -739,7 +889,10 @@ pub async fn run_update_if_available(
 /// quit-for-update path) instead of blind-spawning a second downloader.
 /// Dropping the handle does not kill the child (`kill_on_drop` is off), so
 /// callers that don't care can ignore it. `Blocking` mode returns `None`.
-async fn run_update_subcommand(run_mode: UpdateRunMode) -> Result<Option<tokio::process::Child>> {
+async fn run_update_subcommand(
+    run_mode: UpdateRunMode,
+    trigger: CliUpdateTrigger,
+) -> Result<Option<tokio::process::Child>> {
     // Choke point: spawning `grok update` is how every automatic path starts a
     // download. The child would refuse anyway, so this only saves a process —
     // but it keeps the guarantee local to the primitive that does the spawning.
@@ -748,7 +901,18 @@ async fn run_update_subcommand(run_mode: UpdateRunMode) -> Result<Option<tokio::
     }
     let exe = std::env::current_exe()?;
     let mut cmd = tokio::process::Command::new(exe);
+    // One trigger representation end to end: the enum crosses the process
+    // boundary as --trigger=<value> (FromStr on the other side).
     cmd.arg("update");
+    cmd.arg(format!("--trigger={}", trigger.as_str()));
+    // Hand the resolved telemetry mode to the child, which cannot see the
+    // remote-settings layer (requirement pins still beat env). None at the
+    // startup spawns — they run before the settings prefetch, when this
+    // process knows no more than the child; waiting would let telemetry
+    // delay an update.
+    if let Some(mode) = xai_grok_telemetry::client::current_mode() {
+        cmd.env("GROK_TELEMETRY_ENABLED", mode.to_string());
+    }
     match run_mode {
         UpdateRunMode::Blocking => {
             // stderr must be null, not piped: `.status()` does not drain
@@ -841,7 +1005,10 @@ pub async fn run_install_script(
     installer: &str,
     target: Option<&str>,
     update_config: &UpdateConfig,
+    trigger: CliUpdateTrigger,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
+    let from_version = xai_grok_version::installed();
     // Refuses on its own authority rather than trusting that every caller
     // remembered to ask. It is not the last line of defence — the public
     // `install_internal_from_base*` and `install_npm_for_test` entry points
@@ -855,23 +1022,54 @@ pub async fn run_install_script(
             target,
             &update_config.channel,
             update_config.npm_registry.as_deref(),
-        ),
-        "gh-release" => install_gh_release(target).await,
-        _ => install_internal(target, update_config).await,
+        )
+        .map(|()| None),
+        "gh-release" => install_gh_release(target).await.map(|()| None),
+        _ => install_internal(target, update_config).await.map(Some),
     };
+    // Before the success-only cache sweep, so it cannot inflate successes.
+    let duration_ms = started.elapsed().as_millis() as u64;
     if result.is_ok() {
         remove_stale_models_cache().await;
     }
-    result.map_err(|e| {
+    let (outcome, error_kind) = match &result {
+        Ok(_) => (CliUpdateOutcome::Success, None),
+        Err(e) => (CliUpdateOutcome::Failed, Some(classify_install_error(e))),
+    };
+    let to_version = match &result {
+        Ok(Some(installed)) => Some(installed.clone()),
+        _ => target.map(str::to_string),
+    };
+    xai_grok_telemetry::session_ctx::log_event(CliUpdate {
+        outcome,
+        trigger,
+        from_version,
+        to_version,
+        channel: CliUpdateChannel::from_channel_str(&update_config.channel),
+        installer: CliUpdateInstaller::from_installer_str(installer),
+        platform: platform_label(),
+        rosetta: running_under_rosetta_on_apple_silicon(),
+        duration_ms,
+        error_kind,
+    });
+    result.map(|_| ()).map_err(|e| {
         anyhow::anyhow!(
             "Auto-update failed: {:#}\n\n{}",
             e,
-            reinstall_hint(installer)
+            reinstall_hint(installer, &update_config.channel)
         )
     })
 }
 
-/// Detect the current platform (os, arch) for binary downloads.
+/// Detect the platform (os, arch) to download binaries for.
+///
+/// Arch is the compile-time arch with one correction: an x86_64 build on an
+/// Apple Silicon host (Rosetta) selects `aarch64`, so every update path —
+/// interactive `grok update`, background `--auto` children, the leader's
+/// hourly converge, and forced minimum-version installs — converges to the
+/// native build instead of perpetuating the translated one. This mirrors
+/// install.sh's `hw.optional.arm64` probe; without it, a lingering x86_64
+/// process would reinstall x86_64 right over a fresh native install.
 pub(crate) fn detect_platform() -> Result<(&'static str, &'static str)> {
     let os = if cfg!(target_os = "macos") {
         "macos"
@@ -889,7 +1087,10 @@ pub(crate) fn detect_platform() -> Result<(&'static str, &'static str)> {
     } else {
         anyhow::bail!("Unsupported architecture");
     };
-    Ok((os, arch))
+    Ok((
+        os,
+        corrected_arch(os, arch, running_under_rosetta_on_apple_silicon()),
+    ))
 }
 
 /// Age past which a leftover `.tmp` download file (or a freshly-renamed
@@ -1255,8 +1456,11 @@ async fn download_cli_artifact_from_gcs(
     }
 }
 
-async fn install_internal(target: Option<&str>, update_config: &UpdateConfig) -> Result<()> {
-    install_internal_from_bases(target, update_config, crate::version::CLI_BASE_URLS).await
+/// Returns the version that was actually activated.
+async fn install_internal(target: Option<&str>, update_config: &UpdateConfig) -> Result<String> {
+    let bases = crate::version::cli_base_urls();
+    let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
+    install_internal_from_bases(target, update_config, &base_refs).await
 }
 
 /// Try the base-dependent install phase ([`download_verified_from_base`]:
@@ -1267,16 +1471,18 @@ async fn install_internal(target: Option<&str>, update_config: &UpdateConfig) ->
 ///
 /// Download-phase side effects (download dir creation, binary fetch) are
 /// idempotent, so retrying with a different base after a partial failure is
-/// safe. Local activation ([`activate_verified_download`]: link swap,
-/// cleanup, config persist) runs once after the first successful download —
-/// its failures are not base-dependent, so they abort the install instead of
+/// safe. Smoke-test failures ([`SmokeTestFailure`]) are a property of the
+/// published artifact, not the CDN — retrying another base will not help.
+/// Local activation ([`activate_verified_download`]: link swap, cleanup,
+/// config persist) runs once after the first successful download — its
+/// failures are not base-dependent, so they abort the install instead of
 /// triggering a pointless re-download from the next base.
 #[doc(hidden)]
 pub async fn install_internal_from_bases(
     target: Option<&str>,
     update_config: &UpdateConfig,
     bases: &[&str],
-) -> Result<()> {
+) -> Result<String> {
     // Before the download, not after it. `download_verified_from_base` writes
     // the artifact into ~/.grok/downloads and `smoke_test_binary` *executes* it
     // to check it runs — so refusing later would still have fetched and run an
@@ -1287,8 +1493,20 @@ pub async fn install_internal_from_bases(
     let mut last_err: Option<anyhow::Error> = None;
     for (i, base) in bases.iter().enumerate() {
         match download_verified_from_base(target, update_config, base).await {
-            Ok(download) => return activate_verified_download(&download).await,
+            Ok(download) => {
+                return activate_verified_download(&download)
+                    .await
+                    .map(|()| download.version)
+                    .map_err(|e| InstallPhaseError::Activate(e).into());
+            }
+            Err(e) if e.is::<SmokeTestFailure>() => {
+                // Same published artifact on every base — retrying will not
+                // change a --version timeout or crash. Left unwrapped so
+                // telemetry classification sees the typed failure.
+                return Err(e);
+            }
             Err(e) => {
+                let e = wrap_download_err(e);
                 if i + 1 < bases.len() {
                     tracing::warn!(
                         "install via {} failed ({:#}); trying next base URL",
@@ -1303,7 +1521,9 @@ pub async fn install_internal_from_bases(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no CLI base URLs to try")))
 }
 
-const SMOKE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// First-launch of a freshly downloaded macOS binary can exceed 10s (Rosetta
+/// AOT + Gatekeeper on ~140MB). A short cap false-fails a good artifact.
+const SMOKE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Retry budget for exec attempts refused with ETXTBSY. The failure window
 /// is normally the microseconds another spawn in this process sits between
@@ -1313,7 +1533,49 @@ const SMOKE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const SMOKE_TEST_ETXTBSY_ATTEMPTS: u32 = 8;
 const SMOKE_TEST_ETXTBSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
 
-async fn smoke_test_binary(binary_path: &std::path::Path) -> bool {
+fn truncate_err(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max.saturating_sub(3);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SmokeTestFailure {
+    #[error(
+        "downloaded binary failed to run (--version timed out after {}s).\n\
+         Your current version is unchanged.",
+        SMOKE_TEST_TIMEOUT.as_secs()
+    )]
+    Timeout,
+    #[error(
+        "downloaded binary failed to run (could not start: {0}).\n\
+         Your current version is unchanged."
+    )]
+    Spawn(String),
+    #[error("{}", nonzero_message(status, stderr))]
+    NonZero { status: String, stderr: String },
+}
+
+/// `--version` exited nonzero; include stderr only when there is any.
+fn nonzero_message(status: &str, stderr: &str) -> String {
+    let stderr_line = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("stderr: {stderr}\n")
+    };
+    format!(
+        "downloaded binary failed to run (--version exited {status}).\n\
+         {stderr_line}Your current version is unchanged."
+    )
+}
+
+async fn smoke_test_binary(binary_path: &std::path::Path) -> Result<(), SmokeTestFailure> {
     // ETXTBSY race: while a concurrent updater in this process is between
     // fork and exec (pre_exec in detach_command forces the fork/exec path),
     // its child briefly holds every open fd — including the write-side fd of
@@ -1321,25 +1583,39 @@ async fn smoke_test_binary(binary_path: &std::path::Path) -> bool {
     // binary whose inode is still open for write fails with ETXTBSY even
     // though the file is complete and healthy, so retry instead of failing
     // the install (and deleting a racer's freshly installed binary).
+    let mut last_spawn = String::new();
     for attempt in 1..=SMOKE_TEST_ETXTBSY_ATTEMPTS {
         let mut cmd = tokio::process::Command::new(binary_path);
         cmd.arg("--version")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
         xai_grok_tools::util::detach_command(&mut cmd);
-        match tokio::time::timeout(SMOKE_TEST_TIMEOUT, cmd.status()).await {
-            Ok(Ok(status)) => return status.success(),
-            Ok(Err(e))
-                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
-                    && attempt < SMOKE_TEST_ETXTBSY_ATTEMPTS =>
-            {
-                tokio::time::sleep(SMOKE_TEST_ETXTBSY_BACKOFF * attempt).await;
+        match tokio::time::timeout(SMOKE_TEST_TIMEOUT, cmd.output()).await {
+            Err(_) => return Err(SmokeTestFailure::Timeout),
+            Ok(Ok(output)) if output.status.success() => return Ok(()),
+            Ok(Ok(output)) => {
+                let status = output
+                    .status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| output.status.to_string());
+                let stderr = truncate_err(&String::from_utf8_lossy(&output.stderr), 400);
+                return Err(SmokeTestFailure::NonZero { status, stderr });
             }
-            _ => return false,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                last_spawn = e.to_string();
+                if attempt < SMOKE_TEST_ETXTBSY_ATTEMPTS {
+                    tokio::time::sleep(SMOKE_TEST_ETXTBSY_BACKOFF * attempt).await;
+                }
+            }
+            Ok(Err(e)) => return Err(SmokeTestFailure::Spawn(e.to_string())),
         }
     }
-    false
+    // Reached only when every attempt hit ETXTBSY; `last_spawn` holds the
+    // final spawn error.
+    Err(SmokeTestFailure::Spawn(last_spawn))
 }
 
 /// Test-only entry point: same as [`install_internal`] but reads from
@@ -1351,9 +1627,14 @@ pub async fn install_internal_from_base(
     target: Option<&str>,
     update_config: &UpdateConfig,
     gcs_base_url: &str,
-) -> Result<()> {
-    let download = download_verified_from_base(target, update_config, gcs_base_url).await?;
-    activate_verified_download(&download).await
+) -> Result<String> {
+    let download = download_verified_from_base(target, update_config, gcs_base_url)
+        .await
+        .map_err(wrap_download_err)?;
+    activate_verified_download(&download)
+        .await
+        .map(|()| download.version)
+        .map_err(|e| InstallPhaseError::Activate(e).into())
 }
 
 /// A downloaded and smoke-tested binary in `~/.grok/downloads/`, not yet
@@ -1364,8 +1645,9 @@ struct VerifiedDownload {
 }
 
 /// Base-dependent install phase: resolve the version (per base when no
-/// target is pinned), download the binary, and smoke-test it. Failures here
-/// are worth retrying against another base URL.
+/// target is pinned), download the binary, and smoke-test it. Network /
+/// fetch failures here are worth retrying against another base URL.
+/// [`SmokeTestFailure`] is not — see [`install_internal_from_bases`].
 async fn download_verified_from_base(
     target: Option<&str>,
     update_config: &UpdateConfig,
@@ -1407,15 +1689,10 @@ async fn download_verified_from_base(
 
     // Smoke-test: run the binary before activating it. A truncated or
     // corrupt download is caught here and never becomes the active grok.
-    if !smoke_test_binary(&binary_path).await {
+    if let Err(fail) = smoke_test_binary(&binary_path).await {
         let _ = tokio::fs::remove_file(&binary_path).await;
         // No prefix: run_install_script's wrap adds "Auto-update failed:".
-        anyhow::bail!(
-            "downloaded binary failed to run.\n\
-             Your current version is unchanged.\n\
-             To update manually: {}",
-            manual_install_cmd()
-        );
+        return Err(fail.into());
     }
 
     Ok(VerifiedDownload {
@@ -2488,6 +2765,7 @@ pub async fn run_update(
     pinned_version: Option<&str>,
     channel_switch: Option<&str>,
     update_config: &mut UpdateConfig,
+    trigger: CliUpdateTrigger,
 ) -> Result<Option<String>> {
     // The user asked for this explicitly, so say why it is not happening —
     // including for `--force` and `--version`, which are still requests to
@@ -2504,7 +2782,6 @@ pub async fn run_update(
             return Ok(None);
         }
     };
-
     // Persist installer if not already saved
     let cfg = config::load_config().await;
     if cfg.cli.installer.is_none() {
@@ -2529,7 +2806,7 @@ pub async fn run_update(
             version, current_version
         );
         eprintln!();
-        run_install_script(installer, Some(version), update_config).await?;
+        run_install_script(installer, Some(version), update_config, trigger).await?;
         refresh_deployment_config().await;
         if let Err(e) = config::update_config(|st| {
             st.cli.auto_update = Some(false);
@@ -2661,7 +2938,7 @@ pub async fn run_update(
     };
 
     eprintln!();
-    run_install_script(installer, Some(target_version), update_config).await?;
+    run_install_script(installer, Some(target_version), update_config, trigger).await?;
     // Fetch the stable pointer now so the new binary has it immediately
     // for channel_label() display, rather than waiting for the next
     // TTL-gated update check (~30 min).

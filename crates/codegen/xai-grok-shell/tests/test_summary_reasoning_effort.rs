@@ -51,7 +51,7 @@ fn read_summary(home: &std::path::Path, session_id: &str) -> serde_json::Value {
 #[ignore] // requires pre-built binary
 async fn test_fresh_session_persists_reasoning_effort() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start_keyless_local()
+        let server = MockInferenceServer::start()
             .await
             .expect("start mock server");
         let workdir = git_workdir();
@@ -96,7 +96,7 @@ reasoning_effort = "high"
 #[ignore] // requires pre-built binary
 async fn test_fresh_session_without_effort_omits_field() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start_keyless_local()
+        let server = MockInferenceServer::start()
             .await
             .expect("start mock server");
         let workdir = git_workdir();

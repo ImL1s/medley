@@ -4,7 +4,6 @@
 
 use chrono::{Duration, Utc};
 use parking_lot::RwLock;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -12,6 +11,8 @@ use xai_grok_auth::bearer_suffix;
 
 use tokio_util::sync::CancellationToken;
 
+#[path = "manager/consumed_sentinel.rs"]
+mod consumed_sentinel;
 #[path = "manager/enrichment.rs"]
 mod enrichment;
 #[path = "manager/lock.rs"]
@@ -22,35 +23,35 @@ pub(crate) use remedy::{AuthRemedy, SilentRefresh};
 #[path = "manager/sleep_gate.rs"]
 mod sleep_gate;
 
-use lock::{try_lock_auth_file_async, try_lock_auth_file_async_with_heartbeat};
+use lock::try_lock_auth_file_async;
 use sleep_gate::{InFlightGuard, SleepGate};
 
 use crate::util::dual_clock::DualClock;
 
 use crate::auth::config::GrokComConfig;
-use crate::auth::error::AuthError;
+use crate::auth::error::{AuthError, TransientReason};
 use crate::auth::token_type::TokenType;
 use xai_grok_telemetry::events::ManualAuthSurface;
 
 #[cfg(test)]
 use super::model::UserInfo;
 use super::model::{
-    AuthMode, AuthStore, GrokAuth, early_invalidation, is_expired, is_expired_with_buffer,
-    lookup_auth,
+    AuthMode, GrokAuth, early_invalidation, is_expired, is_expired_with_buffer, lookup_auth,
 };
 use super::refresh::{RefreshOutcome, TokenRefresher, resolve_refresh_credential};
 use super::storage::{
-    AuthFileLock, ensure_auth_json_owner_only, read_auth_json,
-    read_auth_json_or_empty_recovering_corrupt, read_auth_json_owner_only,
-    read_auth_json_owner_only_or_empty_recovering_corrupt, write_auth_json, write_auth_json_strict,
+    AuthFileLock, read_auth_json, read_auth_json_or_empty_recovering_corrupt, write_auth_json,
 };
 
+#[cfg(test)]
 use super::storage::read_auth_json_or_empty;
 #[cfg(test)]
 use chrono::DateTime;
 #[cfg(test)]
 use enrichment::apply_user_info_enrichment;
 
+#[cfg(test)]
+use super::model::AuthStore;
 use super::model::LEGACY_SCOPE;
 
 /// Why a token refresh is being requested.
@@ -62,62 +63,22 @@ pub(crate) enum RefreshReason {
     ServerRejected,
 }
 
-/// First-party session half of ambient xAI eligibility for #303 (Pro P1).
-///
-/// Classified from **one** memory-or-disk observation — never split
-/// `has_usable_token()` vs `current()`.
+/// Who needs the refreshed token — orthogonal to [`RefreshReason`] (which
+/// says *why*), this says *for whom*, and it decides how much straddle risk
+/// `refresh_chain` may take in a dark wake (an exchange started there can
+/// straddle the re-suspend and lose the rotated RT — see
+/// `manager::consumed_sentinel`). Nobody waits on background work, so it
+/// gains nothing from taking that risk; the next full wake refreshes the
+/// never-presented disk RT cleanly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FirstPartySessionEligibility {
-    /// No first-party session, or hard-expired without complete refresh surface.
-    None,
-    /// Hard-valid (incl. soft early-invalidation buffer) session auth.
-    WireUsable,
-    /// Hard-expired session that still has complete OIDC refresh metadata and
-    /// can self-heal without re-login.
-    Refreshable,
-}
-
-impl FirstPartySessionEligibility {
-    /// Whether this session classification alone should keep first-party Grok
-    /// precedence over an implicit Codex default.
-    pub(crate) fn preserves_ambient_precedence(self) -> bool {
-        matches!(self, Self::WireUsable | Self::Refreshable)
-    }
-}
-
-/// Complete OIDC refresh surface for ambient "self-healing" classification.
-///
-/// Requires the mode's complete refresh authority. A bare
-/// `refresh_token.is_some()` (empty string / missing IdP fields) is **not**
-/// enough — those must not pin Grok over ready Codex (Pro P1).
-///
-/// External auth refreshes by re-running its configured provider command, so
-/// it requires a nonblank command instead of OIDC metadata (#316).
-fn session_has_complete_refresh_surface(
-    auth: &GrokAuth,
-    auth_provider_command: Option<&str>,
-) -> bool {
-    if !auth.is_session_auth() {
-        return false;
-    }
-    match auth.auth_mode {
-        AuthMode::Oidc => {
-            auth.refresh_token
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty())
-                && auth
-                    .oidc_issuer
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                && auth
-                    .oidc_client_id
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-        }
-        AuthMode::External => super::has_nonblank_auth_provider_command(auth_provider_command),
-        // WebLogin is not OIDC-refreshable for ambient classification.
-        AuthMode::WebLogin | AuthMode::ApiKey | AuthMode::OpenAiCodex => false,
-    }
+pub(crate) enum RefreshUrgency {
+    /// A user is waiting. May force an exchange through the dark-wake
+    /// deferral budget.
+    UserFacing,
+    /// A background loop. Fail-soft: never starts an IdP exchange during a
+    /// dark wake — the deferral surfaces as a transient error and the
+    /// consumer retries at the next full wake.
+    Background,
 }
 
 /// Timeout for acquiring the advisory `auth.json.lock` file lock.
@@ -204,9 +165,6 @@ pub struct AuthManager {
     inner: Arc<RwLock<Option<GrokAuth>>>,
     path: PathBuf,
     scope: String,
-    /// xAI-only policy and `/user` enrichment are forbidden for provider
-    /// credentials such as OpenAI Codex.
-    xai_session: bool,
     grok_com_config: GrokComConfig,
     proxy_base_url: String,
     refresher: RwLock<Option<Arc<dyn TokenRefresher>>>,
@@ -271,12 +229,13 @@ pub struct AuthManager {
     /// First-party env key may advertise after initialize probe (default true).
     /// Lives here (not on `MvpAgent`) so the probe verdict is auth-owned.
     first_party_env_api_key_ok: std::sync::atomic::AtomicBool,
-    /// When the current unbroken run of dark-wake refresh deferrals began, on
-    /// two clocks (see [`DualClock`]); `None` outside such a run. Bounds the
-    /// deferral to [`sleep_gate::DARK_WAKE_DEFER_MAX`] so a machine stuck
-    /// reporting dark wake can't defer refresh forever — see
-    /// [`AuthManager::should_defer_for_dark_wake`].
-    dark_wake_defer_since: parking_lot::RwLock<Option<DualClock>>,
+    /// The general dark-wake deferral run ([`sleep_gate::DarkWakeBudget`]);
+    /// see [`AuthManager::should_defer_for_dark_wake`].
+    dark_wake_defer_since: sleep_gate::DarkWakeBudget,
+    /// The consumed-RT sentinel gate's own run — deliberately separate from
+    /// `dark_wake_defer_since`; see
+    /// `consumed_sentinel::should_defer_sentinel_for_dark_wake` for why.
+    sentinel_dark_wake_defer_since: sleep_gate::DarkWakeBudget,
     /// Test-only override for [`AuthManager::is_dark_wake`]. `Some(_)` forces
     /// the dark-wake decision so the refresh-deferral path is unit-testable
     /// without a real macOS dark wake. `None` = consult the OS.
@@ -384,7 +343,6 @@ impl AuthManager {
                     grok_com_config,
                     proxy_base_url,
                     None,
-                    true,
                 );
             }
             tracing::warn!("GROK_AUTH set but failed to parse as JSON, falling back to file");
@@ -422,8 +380,7 @@ impl AuthManager {
                     "found": found.is_some(),
                     "auth_mode": found.as_ref().map(|a| format!("{:?}", a.auth_mode)),
                     "is_expired": found.as_ref().map(is_expired),
-                    "access_token_present": found.as_ref().is_some_and(|a| !a.key.is_empty()),
-                    "refresh_token_present": found.as_ref().is_some_and(|a| a.refresh_token.is_some()),
+                    "key_prefix": found.as_ref().map(|a| bearer_suffix(&a.key).to_owned()),
                 });
                 let state = if found.is_some() {
                     DiskAuthState::Ok
@@ -460,7 +417,6 @@ impl AuthManager {
             grok_com_config,
             proxy_base_url,
             Some(initial_disk_state),
-            true,
         );
         // Clear a wrong-team session left on disk before the pin was deployed,
         // so the first launch forces a compliant login.
@@ -468,27 +424,18 @@ impl AuthManager {
         manager
     }
 
-    /// Construct a manager for the provider-scoped OpenAI Codex credential.
-    ///
-    /// This deliberately ignores `GROK_AUTH` so an inline xAI credential can
-    /// never be adopted as a Codex bearer. It shares the normal auth.json path
-    /// (including `GROK_AUTH_PATH`) so atomic multi-scope writes and locking are
-    /// reused without replacing the active xAI entry.
+    /// Construct a dedicated AuthManager for OpenAI Codex OAuth credentials.
     pub fn new_openai_codex(grok_home: &Path) -> Self {
         let path = std::env::var("GROK_AUTH_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| grok_home.join("auth.json"));
         let scope = crate::auth::openai_codex::AUTH_SCOPE.to_owned();
-        let (auth, disk_state) = match read_auth_json_owner_only(&path) {
+        let (auth, disk_state) = match read_auth_json(&path) {
             Ok(map) => {
                 let auth = map
                     .get(&scope)
                     .filter(|auth| crate::auth::openai_codex::is_codex_credential(auth))
-                    .cloned()
-                    .map(|mut auth| {
-                        crate::auth::openai_codex::normalize_workspace_metadata(&mut auth);
-                        auth
-                    });
+                    .cloned();
                 let state = if auth.is_some() {
                     DiskAuthState::Ok
                 } else {
@@ -508,7 +455,6 @@ impl AuthManager {
             GrokComConfig::default(),
             String::new(),
             Some(disk_state),
-            false,
         )
     }
 
@@ -523,13 +469,11 @@ impl AuthManager {
         grok_com_config: GrokComConfig,
         proxy_base_url: String,
         disk_state: Option<DiskAuthState>,
-        xai_session: bool,
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(inner)),
             path,
             scope,
-            xai_session,
             grok_com_config,
             proxy_base_url,
             refresher: RwLock::new(None),
@@ -554,30 +498,12 @@ impl AuthManager {
             power_listener: parking_lot::Mutex::new(None),
             manual_auth: Default::default(),
             first_party_env_api_key_ok: std::sync::atomic::AtomicBool::new(true),
-            dark_wake_defer_since: parking_lot::RwLock::new(None),
+            dark_wake_defer_since: sleep_gate::DarkWakeBudget::default(),
+            sentinel_dark_wake_defer_since: sleep_gate::DarkWakeBudget::default(),
             #[cfg(test)]
             dark_wake_override: parking_lot::Mutex::new(None),
             #[cfg(test)]
             devbox_override: parking_lot::Mutex::new(None),
-        }
-    }
-
-    /// Codex credentials are usable only while their backing store is proven
-    /// owner-only. xAI keeps its historical best-effort repair policy.
-    fn credential_store_is_safe(&self) -> bool {
-        if self.xai_session {
-            return true;
-        }
-        match ensure_auth_json_owner_only(&self.path) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %error,
-                    "auth: Codex credential hidden because auth.json permissions are unsafe"
-                );
-                false
-            }
         }
     }
 
@@ -616,22 +542,13 @@ impl AuthManager {
         self.remove_scope(&self.scope)
     }
 
-    /// Durably remove the current scope, waiting up to `timeout` for the
-    /// auth-file lock. Unlike [`Self::clear`], this never reports success or
-    /// clears memory while the on-disk credential may still be present.
+    /// Durably remove the current scope from auth.json and in-memory cache.
     pub(crate) async fn clear_durable(&self, timeout: StdDuration) -> std::io::Result<()> {
         self.clear_durable_with_current_scope(timeout, |_| async {})
             .await
     }
 
     /// Durably remove the current scope as one auth-file transaction.
-    ///
-    /// The callback receives the current durable scoped credential, not a
-    /// potentially stale in-memory snapshot. The auth-file lock remains held
-    /// (with a heartbeat) across the callback so a sibling process cannot
-    /// rotate the credential between remote revocation and durable removal.
-    /// Memory is cleared only after the lock is revalidated and disk removal
-    /// succeeds.
     pub(crate) async fn clear_durable_with_current_scope<F, Fut>(
         &self,
         timeout: StdDuration,
@@ -639,37 +556,20 @@ impl AuthManager {
     ) -> std::io::Result<()>
     where
         F: FnOnce(Option<GrokAuth>) -> Fut,
-        Fut: Future<Output = ()>,
+        Fut: std::future::Future<Output = ()>,
     {
-        let Some(lock) = try_lock_auth_file_async_with_heartbeat(&self.path, timeout).await else {
+        let Some(lock) = self.try_lock_auth_file_async(timeout).await else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "auth credential store is busy",
             ));
         };
-        if !lock.still_live(&self.path) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "auth credential store lock is no longer live",
-            ));
-        }
 
-        let current_auth = match self.read_auth_store() {
-            Ok(store) => self.lookup_scoped_auth(&store),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
+        let current_auth = self.read_disk_auth_silent();
         before_remove(current_auth).await;
 
-        if !lock.still_live(&self.path) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "auth credential store lock was lost during durable removal",
-            ));
-        }
-
-        let disk_mutation = self.write_scope_removal_durable(&self.scope)?;
-        self.finish_scope_removal(&self.scope, disk_mutation);
+        let disk_mutation = self.write_scope_removal(&self.scope)?;
+        self.note_scope_removed(disk_mutation, Some(&lock));
         Ok(())
     }
 
@@ -685,16 +585,12 @@ impl AuthManager {
     }
 
     fn remove_scope_impl(&self, scope: &str) -> std::io::Result<()> {
-        let disk_mutation = if let Some(_lock) = lock::try_lock_auth_file_nonblocking(&self.path) {
-            self.write_scope_removal(scope)? // lock released on drop
-        } else {
-            ScopeRemoval::SkippedLockUnavailable
+        // The lock outlives the sentinel clear in `note_scope_removed`.
+        let file_lock = lock::try_lock_auth_file_nonblocking(&self.path);
+        let disk_mutation = match &file_lock {
+            Some(_) => self.write_scope_removal(scope)?,
+            None => ScopeRemoval::SkippedLockUnavailable,
         };
-        self.finish_scope_removal(scope, disk_mutation);
-        Ok(())
-    }
-
-    fn finish_scope_removal(&self, scope: &str, disk_mutation: ScopeRemoval) {
         // Intentional removal must be attributable from unified.jsonl:
         // downstream, a deliberately deleted auth.json is indistinguishable
         // from accidental loss (corruption, external deletion).
@@ -709,11 +605,9 @@ impl AuthManager {
             })),
         );
         if scope == self.scope {
-            self.clear_inner();
-            // Intentional logout/scope removal: drop sticky permanent so the
-            // next state is NotLoggedIn, not a retained invalid_grant verdict.
-            *self.permanent_failure.write() = None;
+            self.note_scope_removed(disk_mutation, file_lock.as_ref());
         }
+        Ok(())
     }
 
     /// Drop `scope` from auth.json and persist, deleting the file when the last
@@ -729,37 +623,6 @@ impl AuthManager {
             Ok(ScopeRemoval::FileDeleted)
         } else {
             write_auth_json(&self.path, &auth_store)?;
-            Ok(ScopeRemoval::EntryRemoved)
-        }
-    }
-
-    /// Strict counterpart used by provider logout: missing auth.json is an
-    /// already-logged-out success, while unreadable data and write failures
-    /// are surfaced so memory cannot diverge from durable state.
-    fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<ScopeRemoval> {
-        let mut auth_store = if self.xai_session {
-            read_auth_json_or_empty(&self.path)?
-        } else {
-            match read_auth_json_owner_only(&self.path) {
-                Ok(store) => store,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthStore::new(),
-                Err(error) => return Err(error),
-            }
-        };
-        auth_store.remove(scope);
-        if auth_store.is_empty() {
-            match std::fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            Ok(ScopeRemoval::FileDeleted)
-        } else {
-            if self.xai_session {
-                write_auth_json(&self.path, &auth_store)?;
-            } else {
-                write_auth_json_strict(&self.path, &auth_store)?;
-            }
             Ok(ScopeRemoval::EntryRemoved)
         }
     }
@@ -847,8 +710,7 @@ impl AuthManager {
                 None,
                 Some(serde_json::json!({
                     "disk_state": format!("{last_state:?}"),
-                    "access_token_present": !a.key.is_empty(),
-                    "refresh_token_present": a.refresh_token.is_some(),
+                    "retained_key_prefix": bearer_suffix(&a.key),
                     "was_expired": is_expired(&a),
                 })),
             );
@@ -874,15 +736,14 @@ impl AuthManager {
                 None,
                 Some(serde_json::json!({
                     "reason": reason,
-                    "access_token_present": !d.key.is_empty(),
+                    "dropped_key_prefix": bearer_suffix(&d.key),
                     "had_refresh_token": d.refresh_token.is_some(),
                     "was_expired": is_expired(&d),
                     "disk_state": (*self.disk_state.read()).map(|s| format!("{s:?}")),
                 })),
             );
         }
-        self.clear_inner();
-        *self.permanent_failure.write() = None;
+        self.note_credentials_dropped();
     }
 
     // ── Read methods ─────────────────────────────────────────────────
@@ -909,9 +770,6 @@ impl AuthManager {
     /// authoritative). An API-key session is rejected under the kill switch,
     /// else allowed.
     pub(crate) fn cached_token_policy_error(&self, auth: &GrokAuth) -> Option<AuthError> {
-        if !self.xai_session {
-            return None;
-        }
         if auth.auth_mode == AuthMode::ApiKey {
             // Else enforce_disable_api_key_auth swaps the key for itself (no-op).
             return self
@@ -960,9 +818,6 @@ impl AuthManager {
 
     /// Cached in-memory token if outside the early-invalidation buffer.
     pub(crate) fn current(&self) -> Option<GrokAuth> {
-        if !self.credential_store_is_safe() {
-            return None;
-        }
         let auth = self
             .inner
             .read()
@@ -989,9 +844,6 @@ impl AuthManager {
 
     /// Returns true if credentials exist but have expired.
     pub(crate) fn is_expired(&self) -> bool {
-        if !self.credential_store_is_safe() {
-            return false;
-        }
         self.inner
             .read()
             .as_ref()
@@ -1008,9 +860,6 @@ impl AuthManager {
     /// ignoring the early-invalidation buffer. For sync callers that cannot
     /// refresh and must not demote a still-accepted token.
     pub(crate) fn current_wire_valid(&self) -> Option<GrokAuth> {
-        if !self.credential_store_is_safe() {
-            return None;
-        }
         let auth = self
             .inner
             .read()
@@ -1045,9 +894,6 @@ impl AuthManager {
 
     /// Expired in-memory entry (for its `refresh_token`).
     pub(crate) fn expired_auth(&self) -> Option<GrokAuth> {
-        if !self.credential_store_is_safe() {
-            return None;
-        }
         let auth = self
             .inner
             .read()
@@ -1099,9 +945,26 @@ impl AuthManager {
     /// Returns the input `GrokAuth` BEFORE enrichment lands; callers
     /// needing the post-enrichment view re-read `current()`.
     pub(crate) async fn update(self: &Arc<Self>, auth: GrokAuth) -> std::io::Result<GrokAuth> {
-        if !self.xai_session {
-            return self.save_provider_strict(auth).await;
-        }
+        self.update_inner(auth, None).await
+    }
+
+    /// [`Self::update`] for the refresh path, which already holds the
+    /// `auth.json` file lock: the witness reaches the sentinel clear (a
+    /// refresh success is the IdP's verdict on the suspect RT — see
+    /// [`Self::note_credential_persisted`]).
+    async fn update_locked(
+        self: &Arc<Self>,
+        auth: GrokAuth,
+        lock: &AuthFileLock,
+    ) -> std::io::Result<GrokAuth> {
+        self.update_inner(auth, Some(lock)).await
+    }
+
+    async fn update_inner(
+        self: &Arc<Self>,
+        auth: GrokAuth,
+        refresh_lock: Option<&AuthFileLock>,
+    ) -> std::io::Result<GrokAuth> {
         let update_started = std::time::Instant::now();
         let map = match read_auth_json_or_empty_recovering_corrupt(&self.path) {
             Ok(map) => map,
@@ -1114,9 +977,7 @@ impl AuthManager {
                     Some(serde_json::json!({ "error": e.to_string() })),
                 );
                 self.with_inner_write(|inner| *inner = Some(auth.clone()));
-                if self.xai_session {
-                    self.spawn_user_info_enrichment(auth.clone());
-                }
+                self.spawn_user_info_enrichment(auth.clone());
                 return Ok(auth);
             }
         };
@@ -1131,8 +992,8 @@ impl AuthManager {
                 "auth update disk written",
                 None,
                 Some(serde_json::json!({
-                    "refresh_token_present": auth.refresh_token.is_some(),
-                    "access_token_present": !auth.key.is_empty(),
+                    "rt_prefix": auth.refresh_token.as_deref().map(bearer_suffix),
+                    "key_prefix": bearer_suffix(&auth.key),
                     "elapsed_ms": elapsed_ms,
                 })),
             ),
@@ -1145,19 +1006,17 @@ impl AuthManager {
                 })),
             ),
         }
+        self.note_credential_persisted(&auth, write_result.is_ok(), refresh_lock);
         // Always update in-memory, even if disk write failed. This lets the
         // current session work with fresh credentials while the user fixes the
         // filesystem (e.g. read-only disk). Without this, a disk failure leaves
         // the stale/dead token in memory and the user is completely stuck.
-        *self.permanent_failure.write() = None;
         self.with_inner_write(|inner| *inner = Some(auth.clone()));
 
         // Fire-and-forget enrichment. Off the critical path -- a slow
         // `/user` would otherwise widen the sibling-process
         // `invalid_grant` race window.
-        if self.xai_session {
-            self.spawn_user_info_enrichment(auth.clone());
-        }
+        self.spawn_user_info_enrichment(auth.clone());
 
         write_result?;
         Ok(auth)
@@ -1169,9 +1028,6 @@ impl AuthManager {
         &self,
         auth: GrokAuth,
     ) -> std::io::Result<GrokAuth> {
-        if !self.xai_session {
-            return self.save_provider_strict(auth).await;
-        }
         let started = std::time::Instant::now();
         let map = match read_auth_json_or_empty_recovering_corrupt(&self.path) {
             Ok(map) => map,
@@ -1197,8 +1053,8 @@ impl AuthManager {
                 "auth update disk written (no enrichment)",
                 None,
                 Some(serde_json::json!({
-                    "refresh_token_present": auth.refresh_token.is_some(),
-                    "access_token_present": !auth.key.is_empty(),
+                    "rt_prefix": auth.refresh_token.as_deref().map(bearer_suffix),
+                    "key_prefix": bearer_suffix(&auth.key),
                     "elapsed_ms": elapsed_ms,
                 })),
             ),
@@ -1211,25 +1067,80 @@ impl AuthManager {
                 })),
             ),
         }
+        self.note_credential_persisted(&auth, write_result.is_ok(), None);
         // Always update in-memory, even if disk write failed (see update()).
-        *self.permanent_failure.write() = None;
         self.with_inner_write(|inner| *inner = Some(auth.clone()));
         write_result?;
         Ok(auth)
     }
 
-    /// Persist a rotating provider credential atomically before publishing it
-    /// to memory. No ENOSPC in-place fallback is permitted because losing a
-    /// rotated refresh token can invalidate the whole token family.
-    async fn save_provider_strict(&self, mut auth: GrokAuth) -> std::io::Result<GrokAuth> {
-        debug_assert!(!self.xai_session);
-        crate::auth::openai_codex::normalize_workspace_metadata(&mut auth);
-        let mut map = read_auth_json_owner_only_or_empty_recovering_corrupt(&self.path)?;
-        map.insert(self.scope.clone(), auth.clone());
-        write_auth_json_strict(&self.path, &map)?;
+    /// Single choke point for the credential-scoped side state — the sticky
+    /// permanent-failure verdict and the consumed-RT sentinel — when this
+    /// scope's credential changes. Every clear derives from comparing the
+    /// incoming state against the recorded state, never from a write merely
+    /// succeeding (re-saving the *same* credential, e.g. a privacy-flag
+    /// toggle, must keep both records). `note_scope_removed` and
+    /// `note_credentials_dropped` below are the removal-side transitions.
+    fn note_credential_persisted(
+        &self,
+        persisted: &GrokAuth,
+        disk_written: bool,
+        refresh_lock: Option<&AuthFileLock>,
+    ) {
+        // Sentinel: only a *persisted* credential can supersede the suspect
+        // RT (an in-memory-only update leaves it on disk for siblings).
+        if disk_written {
+            match refresh_lock {
+                // Refresh outcome: the gate only admits an exchange that
+                // presents the suspect RT, so a success is the IdP's verdict
+                // on it — clear regardless of whether the RT rotated.
+                Some(lock) => self.clear_consumed_sentinel("credential_persisted", lock),
+                // Standalone persist (login, enrichment merge, settings
+                // re-save): proves nothing about the suspect; clear only
+                // when superseded. Best-effort lock — flock doesn't nest, so
+                // a busy lock skips the clear and the gate's rotated-past
+                // clear catches up.
+                None => {
+                    if let Some(lock) = lock::try_lock_auth_file_nonblocking(&self.path) {
+                        self.clear_consumed_sentinel_if_superseded(persisted, &lock);
+                    }
+                }
+            }
+        }
+        // Verdict: about a credential key, so a *different* persisted key
+        // supersedes it (even when the disk write failed — memory now serves
+        // the new credential). A same-key re-save keeps it: nothing changed,
+        // and dropping a sticky verdict here would re-try a dead RT.
+        let mut verdict = self.permanent_failure.write();
+        if verdict
+            .as_ref()
+            .is_some_and(|pf| pf.token_key != persisted.key)
+        {
+            *verdict = None;
+        }
+    }
+
+    /// Logout / scope-removal transition: the verdict drops with the scope
+    /// (next state is NotLoggedIn), the sentinel only when the removal
+    /// persisted — a skipped disk write leaves the suspect RT in auth.json
+    /// for siblings, who still need the gate.
+    fn note_scope_removed(&self, disk_mutation: ScopeRemoval, lock: Option<&AuthFileLock>) {
+        if matches!(
+            disk_mutation,
+            ScopeRemoval::EntryRemoved | ScopeRemoval::FileDeleted
+        ) && let Some(lock) = lock
+        {
+            self.clear_consumed_sentinel("logout", lock);
+        }
+        self.note_credentials_dropped();
+    }
+
+    /// In-memory drop (scope verifiably gone from a readable disk, or
+    /// logout): the verdict follows the credential out; the sentinel is
+    /// untouched — nothing changed on disk.
+    fn note_credentials_dropped(&self) {
+        self.clear_inner();
         *self.permanent_failure.write() = None;
-        self.with_inner_write(|inner| *inner = Some(auth.clone()));
-        Ok(auth)
     }
 
     /// Spawn the `/user` enrichment task; body in the `enrichment` submodule.
@@ -1239,9 +1150,7 @@ impl AuthManager {
 
     /// Blocking `/user` enrichment for login flows that exit before the background task lands.
     pub(crate) async fn enrich_auth_inline(&self, auth: &mut GrokAuth) {
-        if self.xai_session {
-            enrichment::enrich_inline(self, auth).await;
-        }
+        enrichment::enrich_inline(self, auth).await;
     }
 
     /// Path to the `auth.json` this manager reads/writes (respects
@@ -1350,16 +1259,18 @@ impl AuthManager {
         // the in-memory bearer: reading it afterwards always yielded `None` /
         // `key_changed: true`, corrupting the prev/adopted attribution this
         // log exists to capture.
-        let prev = self.current_or_expired().map(|a| a.key);
+        let prev = self
+            .current_or_expired()
+            .map(|a| bearer_suffix(&a.key).to_owned());
         let refreshed = self.try_use_disk_token(disk_auth.as_ref(), reason)?;
-        let access_token_changed = prev.as_deref() != Some(&refreshed.key);
+        let adopted = bearer_suffix(&refreshed.key);
         xai_grok_telemetry::unified_log::info(
             msg,
             None,
             Some(serde_json::json!({
-                "access_token_present": !refreshed.key.is_empty(),
-                "previous_access_token_present": prev.is_some(),
-                "access_token_changed": access_token_changed,
+                "adopted_key_prefix": adopted,
+                "prev_key_prefix": prev,
+                "key_changed": prev.as_deref() != Some(adopted),
             })),
         );
         Some(refreshed)
@@ -1450,31 +1361,9 @@ impl AuthManager {
     /// getters like [`Self::attempted_verdict_key`]; prefer [`Self::read_disk_auth`]
     /// when the read should drive transition logging.
     fn read_disk_auth_silent(&self) -> Option<GrokAuth> {
-        self.read_auth_store()
+        read_auth_json(&self.path)
             .ok()
-            .and_then(|map| self.lookup_scoped_auth(&map))
-    }
-
-    fn read_auth_store(&self) -> std::io::Result<AuthStore> {
-        if self.xai_session {
-            read_auth_json(&self.path)
-        } else {
-            read_auth_json_owner_only(&self.path)
-        }
-    }
-
-    fn lookup_scoped_auth(&self, map: &AuthStore) -> Option<GrokAuth> {
-        if self.xai_session {
-            lookup_auth(map, &self.scope)
-        } else {
-            map.get(&self.scope)
-                .filter(|auth| crate::auth::openai_codex::is_codex_credential(auth))
-                .cloned()
-                .map(|mut auth| {
-                    crate::auth::openai_codex::normalize_workspace_metadata(&mut auth);
-                    auth
-                })
-        }
+            .and_then(|map| lookup_auth(&map, &self.scope))
     }
 
     /// Wire-valid token present in on-disk `auth.json`, judged by actual expiry
@@ -1495,75 +1384,14 @@ impl AuthManager {
             || self.has_usable_disk_token()
     }
 
-    /// Single-observation snapshot: is there a **wire-usable first-party session**
-    /// (WebLogin / OIDC / first-party External) in memory or on disk?
-    ///
-    /// Used for #303 ambient xAI selection so usability and session-kind are
-    /// derived from the **same** credential observation — never
-    /// `has_usable_token() && current().is_session_auth()` which can disagree
-    /// when a soft-expiry buffer token is hard-valid (`current()` is None) or a
-    /// usable sibling-rotated disk token is not yet adopted into memory
-    /// (Pro P0). Hard expiry only (matches [`Self::has_usable_token`]); soft
-    /// early-invalidation buffer still counts as usable.
-    pub(crate) fn has_usable_first_party_session(&self) -> bool {
-        matches!(
-            self.first_party_session_eligibility(),
-            FirstPartySessionEligibility::WireUsable
-        )
-    }
-
-    /// One observation classifying first-party session for #303 ambient selection
-    /// (Pro P1): hard-valid wire session vs hard-expired-but-self-healing.
-    ///
-    /// `Refreshable` requires the mode's complete refresh authority: OIDC
-    /// needs a non-empty refresh_token + issuer + client_id; External needs a
-    /// configured nonblank provider command (#316). Malformed/incomplete
-    /// credentials must not pin Grok.
-    pub(crate) fn first_party_session_eligibility(&self) -> FirstPartySessionEligibility {
-        if !self.credential_store_is_safe() {
-            return FirstPartySessionEligibility::None;
-        }
-        let observe = |a: &GrokAuth| -> FirstPartySessionEligibility {
-            if !a.is_session_auth() {
-                return FirstPartySessionEligibility::None;
-            }
-            if !self.is_token_hard_expired(a) {
-                return FirstPartySessionEligibility::WireUsable;
-            }
-            if session_has_complete_refresh_surface(
-                a,
-                self.grok_com_config.auth_provider_command.as_deref(),
-            ) {
-                return FirstPartySessionEligibility::Refreshable;
-            }
-            FirstPartySessionEligibility::None
-        };
-        if let Some(a) = self.current_or_expired() {
-            let e = observe(&a);
-            if e != FirstPartySessionEligibility::None {
-                return e;
-            }
-        }
-        self.read_disk_auth()
-            .map(|a| observe(&a))
-            .unwrap_or(FirstPartySessionEligibility::None)
-    }
-
-    /// Wire-usable **or** complete-refreshable first-party session — the session
-    /// half of ambient xAI eligibility for #303 (keeps Grok over Codex).
-    pub(crate) fn has_ambient_first_party_session(&self) -> bool {
-        self.first_party_session_eligibility()
-            .preserves_ambient_precedence()
-    }
-
     /// Like [`read_disk_auth`] but also returns the [`DiskAuthState`] so callers
     /// can tell a transient disk anomaly (`FileMissing`/`Unreadable`) apart from
     /// a genuine logout (`EntryMissing`). Observes the state for transition
     /// logging, exactly like `read_disk_auth`.
     pub(crate) fn read_disk_auth_with_state(&self) -> (Option<GrokAuth>, DiskAuthState) {
-        let (auth, state, err_detail) = match self.read_auth_store() {
+        let (auth, state, err_detail) = match read_auth_json(&self.path) {
             Ok(map) => {
-                let found = self.lookup_scoped_auth(&map);
+                let found = lookup_auth(&map, &self.scope);
                 let state = if found.is_some() {
                     DiskAuthState::Ok
                 } else {
@@ -1612,7 +1440,7 @@ impl AuthManager {
             "path": self.path.display().to_string(),
             "scope": &self.scope,
             "error": err_detail,
-            "access_token_present": auth.is_some_and(|a| !a.key.is_empty()),
+            "key_prefix": auth.map(|a| bearer_suffix(&a.key).to_owned()),
             "has_refresh_token": auth.map(|a| a.refresh_token.is_some()),
             "is_expired": auth.map(is_expired),
         });
@@ -1708,13 +1536,31 @@ impl AuthManager {
     // ── Pre-request dispatch ──────────────────────────────────────────
 
     /// Pre-request entry point: per-`TokenType` dispatch. For just the key:
-    /// [`Self::get_valid_token`].
+    /// [`Self::get_valid_token`]. User-facing urgency — background loops must
+    /// use [`Self::auth_background`] instead (see [`RefreshUrgency`]).
     ///
     /// Also the team-pin gate: a cached/refreshed wrong-team session is cleared
     /// and rejected here, never handed to a consumer.
-    #[tracing::instrument(skip(self), fields(token_type = tracing::field::Empty))]
     pub async fn auth(self: &Arc<Self>) -> Result<GrokAuth, AuthError> {
-        let auth = self.auth_dispatch().await?;
+        self.auth_as(RefreshUrgency::UserFacing).await
+    }
+
+    /// [`Self::auth`] for background consumers: identical except that a
+    /// needed refresh is deferred, fail-soft, during a dark wake (see
+    /// [`RefreshUrgency::Background`]). `pub` to mirror [`Self::auth`].
+    ///
+    /// **Decision rule** — awaited by a user-visible path ⇒ [`Self::auth`];
+    /// unawaited / fire-and-forget, timer-driven, or recovery-driven ⇒ this.
+    /// Corollary: when a user is actually present the machine is not in dark
+    /// wake, so background urgency costs interactive callers nothing — when
+    /// in doubt, use this.
+    pub async fn auth_background(self: &Arc<Self>) -> Result<GrokAuth, AuthError> {
+        self.auth_as(RefreshUrgency::Background).await
+    }
+
+    #[tracing::instrument(skip(self), fields(?urgency, token_type = tracing::field::Empty))]
+    async fn auth_as(self: &Arc<Self>, urgency: RefreshUrgency) -> Result<GrokAuth, AuthError> {
+        let auth = self.auth_dispatch(urgency).await?;
         if let Some(e) = self.cached_token_policy_error(&auth) {
             self.reject_and_clear(&e);
             return Err(e);
@@ -1722,10 +1568,10 @@ impl AuthManager {
         Ok(auth)
     }
 
-    async fn auth_dispatch(self: &Arc<Self>) -> Result<GrokAuth, AuthError> {
-        if !self.credential_store_is_safe() {
-            return Err(AuthError::NotLoggedIn);
-        }
+    async fn auth_dispatch(
+        self: &Arc<Self>,
+        urgency: RefreshUrgency,
+    ) -> Result<GrokAuth, AuthError> {
         // Snapshot inner ONCE for dispatch atomicity (closes a TOCTOU
         // where a concurrent `clear()` raced `token_type()` + `inner.read()`).
         let snapshot: Option<GrokAuth> = self.with_inner_read(|inner| inner.cloned());
@@ -1762,8 +1608,7 @@ impl AuthManager {
             }
             // On devboxes, try minting fresh credentials before giving up.
             // preferred_method=api_key forbids automatic OIDC mint.
-            if self.xai_session
-                && !self.grok_com_config.blocks_automatic_oidc()
+            if !self.grok_com_config.blocks_automatic_oidc()
                 && self.is_devbox_environment()
                 && let Ok(auth) = self.try_devbox_recovery(snapshot_key.as_deref()).await
             {
@@ -1801,7 +1646,7 @@ impl AuthManager {
             }
             TokenType::OidcSession | TokenType::ExternalBinary => {
                 match self
-                    .refresh_chain(token_type, RefreshReason::PreRequest)
+                    .refresh_chain(token_type, RefreshReason::PreRequest, urgency)
                     .await
                 {
                     Ok(auth) => Ok(auth),
@@ -1837,8 +1682,7 @@ impl AuthManager {
         // the remote devbox login helper. Purges existing auth.json and writes only
         // the new OIDC entry so we start from a clean state.
         // preferred_method=api_key forbids automatic OIDC mint.
-        if self.xai_session
-            && result.is_err()
+        if result.is_err()
             && !self.grok_com_config.blocks_automatic_oidc()
             && self.is_devbox_environment()
             && let Ok(auth) = self.try_devbox_recovery(snapshot_key.as_deref()).await
@@ -1881,14 +1725,6 @@ impl AuthManager {
         self: &Arc<Self>,
         unusable: Option<&str>,
     ) -> Result<GrokAuth, AuthError> {
-        // Fork guard, kept ahead of upstream's config check: a devbox
-        // credential *is* an xAI session credential. This fork can be signed
-        // in to a provider that is not xAI, or to none, and minting one then
-        // recovers nothing the caller can use. Upstream has no such state, so
-        // it has no reason to ask.
-        if !self.xai_session {
-            return Err(AuthError::NotLoggedIn);
-        }
         if self.grok_com_config.blocks_automatic_oidc() {
             tracing::debug!(
                 "auth: devbox recovery skipped (preferred_method=api_key blocks automatic OIDC)"
@@ -1952,9 +1788,15 @@ impl AuthManager {
         Ok(auth)
     }
 
-    /// Return the current valid token string, or an error.
+    /// Return the current valid token string, or an error. User-facing
+    /// urgency — background loops use [`Self::get_valid_token_background`].
     pub(crate) async fn get_valid_token(self: &Arc<Self>) -> Result<String, AuthError> {
         self.auth().await.map(|a| a.key)
+    }
+
+    /// [`Self::get_valid_token`] via [`Self::auth_background`].
+    pub(crate) async fn get_valid_token_background(self: &Arc<Self>) -> Result<String, AuthError> {
+        self.auth_background().await.map(|a| a.key)
     }
 
     // ── Refresh chain (single mutation point) ─────────────────────────
@@ -1969,15 +1811,13 @@ impl AuthManager {
     /// has already recorded one for this credential, avoiding refresh requests
     /// we know will fail (e.g. from per-401 `unauthorized_recovery().next()`
     /// invocations that bypass `auth()`'s own permanent-failure check).
-    #[tracing::instrument(skip(self), fields(?token_type, ?reason))]
+    #[tracing::instrument(skip(self), fields(?token_type, ?reason, ?urgency))]
     pub(crate) async fn refresh_chain(
         self: &Arc<Self>,
         token_type: TokenType,
         reason: RefreshReason,
+        urgency: RefreshUrgency,
     ) -> Result<GrokAuth, AuthError> {
-        if !self.credential_store_is_safe() {
-            return Err(AuthError::NotLoggedIn);
-        }
         // 0. Sticky permanent-failure short-circuit, checked BEFORE acquiring
         //    the refresh lock so a backed-off chain doesn't block concurrent
         //    traffic. Mirrors `auth()` so callers routing through
@@ -2047,7 +1887,10 @@ impl AuthManager {
         let refresher = self.refresher.read().clone();
         let Some(refresher) = refresher else {
             tracing::warn!("auth: no refresher configured");
-            return Err(AuthError::transient("no refresher configured"));
+            return Err(AuthError::transient_reason(
+                TransientReason::NoRefresher,
+                "no refresher configured",
+            ));
         };
 
         // Fallback verdict key, used only when the outcome carries no
@@ -2057,7 +1900,7 @@ impl AuthManager {
         let attempted_key = self.attempted_verdict_key(reason);
 
         // 3a. Pre-IdP deferral guards (sleep / dark wake).
-        self.check_refresh_deferral(reason)?;
+        self.check_refresh_deferral(reason, urgency)?;
 
         // 3b. Re-validate (and if needed re-acquire) the live lock before the
         //     irreversible IdP call; adopt a sibling token if one landed.
@@ -2065,6 +1908,12 @@ impl AuthManager {
             LockOutcome::Adopted(auth) => return Ok(*auth),
             LockOutcome::Held(lock) => lock,
         };
+
+        // 3b'. Cross-process "RT possibly consumed" gate (see
+        //      `manager::consumed_sentinel`). A won election stays unstamped
+        //      until every 3c pre-IdP re-check has passed.
+        let sentinel_election =
+            self.check_consumed_sentinel_gate(token_type, reason, &file_lock)?;
 
         // 3c. Send the refresh token to the IdP and apply the outcome (the only
         //     mutation point). `file_lock` stays held across both.
@@ -2098,11 +1947,40 @@ impl AuthManager {
                         "reason": format!("{reason:?}"),
                         "has_live_token": self.current().is_some(),
                         "stage": "pre_idp",
+                        "transient_reason": TransientReason::SleepGate.as_str(),
                     })),
                 );
-                return Err(AuthError::transient(
+                return Err(AuthError::transient_reason(
+                    TransientReason::SleepGate,
                     "refresh deferred: system sleep imminent",
                 ));
+            }
+            // Mirror of the 3a background dark-wake deferral, for a dark wake
+            // that began while we awaited the file lock in 3b.
+            if urgency == RefreshUrgency::Background && self.is_dark_wake() {
+                xai_grok_telemetry::unified_log::warn(
+                    "auth.dark_wake.refresh_deferred",
+                    None,
+                    Some(serde_json::json!({
+                        "reason": format!("{reason:?}"),
+                        "urgency": "background",
+                        "stage": "pre_idp",
+                        "transient_reason": TransientReason::DarkWakeDeferred.as_str(),
+                    })),
+                );
+                return Err(AuthError::transient_reason(
+                    TransientReason::DarkWakeDeferred,
+                    "refresh deferred: dark wake (background consumer; \
+                     retry at next full wake)",
+                ));
+            }
+            // Every deterministic pre-IdP abort has passed: stamp the 3b'
+            // election, still under the file lock and strictly before the
+            // IdP call (see `SentinelRetryElection` for the invariants). A
+            // dead lock aborts — a suspend in the election-to-stamp window
+            // lets a sibling elect and present the same RT.
+            if let Some(election) = sentinel_election {
+                self.stamp_sentinel_election_or_abort(election, reason, &file_lock)?;
             }
             // A dark wake can re-sleep within seconds and sends no `WillSleep`
             // first, so the ack hold above never runs there. Hold the system
@@ -2154,7 +2032,8 @@ impl AuthManager {
                 return Ok(LockOutcome::Adopted(Box::new(refreshed)));
             }
             tracing::warn!("auth: returning transient to avoid RT reuse");
-            return Err(AuthError::transient(
+            return Err(AuthError::transient_reason(
+                TransientReason::LockTimeout,
                 "could not acquire auth.json.lock within timeout; \
                  sibling may be mid-refresh",
             ));
@@ -2168,7 +2047,11 @@ impl AuthManager {
 
     /// Step 3a: defer the not-yet-started refresh on sleep / dark wake. Safe and
     /// retryable because the refresh token was never sent.
-    fn check_refresh_deferral(&self, reason: RefreshReason) -> Result<(), AuthError> {
+    fn check_refresh_deferral(
+        &self,
+        reason: RefreshReason,
+        urgency: RefreshUrgency,
+    ) -> Result<(), AuthError> {
         if self.is_sleep_gated() {
             // `has_live_token == false` is the dangerous defer: with no valid
             // token to fall back on, the caller's request 401s until the gate
@@ -2181,16 +2064,42 @@ impl AuthManager {
                 Some(serde_json::json!({
                     "reason": format!("{reason:?}"),
                     "has_live_token": has_live_token,
+                    "transient_reason": TransientReason::SleepGate.as_str(),
                 })),
             );
-            return Err(AuthError::transient(
+            return Err(AuthError::transient_reason(
+                TransientReason::SleepGate,
                 "refresh deferred: system sleep imminent",
             ));
         }
 
-        // Dark wake: an exchange risks straddling a re-sleep, so defer — but
-        // only while deferring is free (a *wire-valid* token can still be
-        // served). With a hard-expired token, or on `ServerRejected`,
+        // Background consumers never start an exchange during a dark wake —
+        // no reason, dead token, or exhausted budget forces one through (see
+        // [`RefreshUrgency::Background`]). Deliberately outside the
+        // `should_defer_for_dark_wake` budget: that bound rescues a
+        // *user-facing* refresh on a machine stuck reporting dark wake;
+        // background loops there simply adopt whatever it rotates in.
+        if urgency == RefreshUrgency::Background && self.is_dark_wake() {
+            xai_grok_telemetry::unified_log::warn(
+                "auth.dark_wake.refresh_deferred",
+                None,
+                Some(serde_json::json!({
+                    "reason": format!("{reason:?}"),
+                    "urgency": "background",
+                    "has_live_token": self.current().is_some(),
+                    "transient_reason": TransientReason::DarkWakeDeferred.as_str(),
+                })),
+            );
+            return Err(AuthError::transient_reason(
+                TransientReason::DarkWakeDeferred,
+                "refresh deferred: dark wake (background consumer; \
+                 retry at next full wake)",
+            ));
+        }
+
+        // User-facing dark wake: an exchange risks straddling a re-sleep, so
+        // defer — but only while deferring is free (a *wire-valid* token can
+        // still be served). With a hard-expired token, or on `ServerRejected`,
         // deferring converts a delay into a guaranteed 401. Dark-wake
         // exchanges are protected by the `hold_awake` power assertion and
         // the suspend probe (the ack hold can't cover them: macOS sends no
@@ -2202,16 +2111,21 @@ impl AuthManager {
             xai_grok_telemetry::unified_log::warn(
                 "auth.dark_wake.refresh_deferred",
                 None,
-                Some(serde_json::json!({ "reason": format!("{reason:?}") })),
+                Some(serde_json::json!({
+                    "reason": format!("{reason:?}"),
+                    "urgency": "user_facing",
+                    "transient_reason": TransientReason::DarkWakeDeferred.as_str(),
+                })),
             );
-            return Err(AuthError::transient(
+            return Err(AuthError::transient_reason(
+                TransientReason::DarkWakeDeferred,
                 "refresh deferred: dark wake (display off; system may re-sleep)",
             ));
         }
         // Not deferring: end any deferral run so a leftover budget can't report
         // a spurious exhaustion on the next one (the lazy clear inside
         // `should_defer_for_dark_wake` is no longer always reached).
-        *self.dark_wake_defer_since.write() = None;
+        self.dark_wake_defer_since.reset();
         Ok(())
     }
 
@@ -2238,7 +2152,8 @@ impl AuthManager {
         );
         drop(file_lock);
         let Some(relock) = self.try_lock_auth_file_async(REFRESH_LOCK_TIMEOUT).await else {
-            return Err(AuthError::transient(
+            return Err(AuthError::transient_reason(
+                TransientReason::LockTimeout,
                 "refresh lock lost across suspend and re-acquire \
                  timed out; retrying avoids refresh-token double-spend",
             ));
@@ -2255,29 +2170,28 @@ impl AuthManager {
     /// Step 3c outcome handling: the only mutation point, persisting on success
     /// and recording the verdict on permanent failure. `attempted_key` is the
     /// fallback verdict scope (used when the outcome carries no `tried_key`).
-    /// `_lock` is the held `auth.json` file lock: unused at runtime, threaded in
-    /// to type-enforce that the persisting `update()` runs while the lock is held
-    /// (so a future refactor can't drop it before persisting).
+    /// `lock` is the held `auth.json` file lock, threaded through the
+    /// persisting `update_locked()` and the sentinel record/clear witnesses.
     async fn apply_refresh_outcome(
         self: &Arc<Self>,
         outcome: RefreshOutcome,
         reason: RefreshReason,
         attempted_key: Option<String>,
-        _lock: &AuthFileLock,
+        lock: &AuthFileLock,
     ) -> Result<GrokAuth, AuthError> {
-        let attempted_key_present = attempted_key.is_some();
+        let pre_key_suffix = attempted_key.as_deref().map(bearer_suffix);
         match outcome {
-            RefreshOutcome::Success(new_auth) => match self.update(*new_auth).await {
+            RefreshOutcome::Success(new_auth) => match self.update_locked(*new_auth, lock).await {
                 Ok(auth) => {
-                    let access_token_changed = attempted_key.as_deref() != Some(&auth.key);
+                    let new_suffix = bearer_suffix(&auth.key);
                     xai_grok_telemetry::unified_log::info(
                         "auth.refresh.success",
                         None,
                         Some(serde_json::json!({
                             "expires_at": auth.expires_at.map(|e| e.to_rfc3339()),
-                            "previous_access_token_present": attempted_key_present,
-                            "access_token_present": !auth.key.is_empty(),
-                            "access_token_changed": access_token_changed,
+                            "old_key_prefix": pre_key_suffix,
+                            "new_key_prefix": new_suffix,
+                            "key_changed": pre_key_suffix != Some(new_suffix),
                         })),
                     );
                     tracing::info!(expires_at = ?auth.expires_at, "auth.refresh.success");
@@ -2343,14 +2257,6 @@ impl AuthManager {
                     // Re-reading per use lets the decision and the line that
                     // explains it disagree about what disk held.
                     let disk_rt = disk.as_ref().and_then(|d| d.refresh_token.as_deref());
-                    let access_relation = crate::auth::refresh::TriedDiskRelation::compare(
-                        tried_key.as_deref(),
-                        disk.as_ref().map(|d| d.key.as_str()),
-                    );
-                    let refresh_relation = crate::auth::refresh::TriedDiskRelation::compare(
-                        tried_refresh_token.as_deref(),
-                        disk_rt,
-                    );
                     let sibling_rotated = match tried_refresh_token.as_deref() {
                         Some(tried_rt) => Self::refresh_token_superseded(disk_rt, tried_rt),
                         None => {
@@ -2364,17 +2270,16 @@ impl AuthManager {
                             None,
                             Some(serde_json::json!({
                                 "reason": format!("{failed_reason:?}"),
-                                "access_relation": access_relation.as_str(),
-                                "access_tried_present": access_relation.tried_present(),
-                                "access_disk_present": access_relation.disk_present(),
-                                "refresh_relation": refresh_relation.as_str(),
-                                "refresh_tried_present": refresh_relation.tried_present(),
-                                "refresh_disk_present": refresh_relation.disk_present(),
+                                "tried_rt_prefix": tried_refresh_token
+                                    .as_deref()
+                                    .map(bearer_suffix),
+                                "disk_rt_prefix": disk_rt.map(bearer_suffix),
                             })),
                         );
-                        return Err(AuthError::transient(format!(
-                            "sibling-rotation: {failed_reason:?}"
-                        )));
+                        return Err(AuthError::transient_reason(
+                            TransientReason::SiblingRotation,
+                            format!("sibling-rotation: {failed_reason:?}"),
+                        ));
                     }
                     let (clear_mem, clear_disk) = match (tried_key.as_ref(), &mem, &disk) {
                         (Some(tk), m, d) => {
@@ -2407,6 +2312,9 @@ impl AuthManager {
                     if clear_mem {
                         self.clear_inner();
                     }
+                    // The RT is now *known* dead; the sticky verdict takes
+                    // over from any lingering sentinel.
+                    self.clear_consumed_sentinel("refresh_token_rejected", lock);
                     xai_grok_telemetry::unified_log::warn(
                         "auth: cleared credentials after permanent refresh failure",
                         None,
@@ -2422,14 +2330,54 @@ impl AuthManager {
                 }
                 Err(AuthError::permanent(failed_reason))
             }
-            RefreshOutcome::TransientFailure { message } => {
+            RefreshOutcome::TransientFailure {
+                message,
+                suspect_consumed_rt,
+            } => {
+                // A straddled failed exchange is poison: re-read disk first
+                // (a sibling may have rotated past the suspect while our
+                // flock was broken as "stuck" across the suspend), else
+                // persist the sentinel and stop — no in-process retry.
+                let mut transient_reason = TransientReason::Other;
+                if let Some(suspect) = suspect_consumed_rt {
+                    if let Some(adopted) = self.try_adopt_disk_token(
+                        reason,
+                        "auth: adopted sibling token after straddled exchange",
+                    ) {
+                        return Ok(adopted);
+                    }
+                    transient_reason = TransientReason::StraddleSuspectRecorded;
+                    // The straddle is the case that kills flocks, so the
+                    // record needs a live one: re-prove ours, else take the
+                    // advisory lock. A busy lock means a sibling is
+                    // mid-refresh and its outcome supersedes the suspect.
+                    let fallback;
+                    let live = match lock.live(&self.path) {
+                        Some(live) => Some(live),
+                        None => {
+                            fallback = lock::try_lock_auth_file_nonblocking(&self.path);
+                            fallback.as_ref().and_then(|l| l.live(&self.path))
+                        }
+                    };
+                    match live {
+                        Some(live) => self.record_consumed_sentinel(&suspect, &message, &live),
+                        None => xai_grok_telemetry::unified_log::warn(
+                            "auth.refresh.consumed_sentinel_skipped_lock_lost",
+                            None,
+                            Some(serde_json::json!({ "message": &message })),
+                        ),
+                    }
+                }
                 tracing::warn!(%message, "auth.refresh.transient_failure");
                 xai_grok_telemetry::unified_log::warn(
                     "auth.refresh.transient_failure",
                     None,
-                    Some(serde_json::json!({ "message": &message })),
+                    Some(serde_json::json!({
+                        "message": &message,
+                        "transient_reason": transient_reason.as_str(),
+                    })),
                 );
-                Err(AuthError::transient(message))
+                Err(AuthError::transient_reason(transient_reason, message))
             }
         }
     }
@@ -2444,8 +2392,8 @@ impl AuthManager {
     /// all along, and made the proactive-refresh log actively misleading when
     /// reconstructing a rotation chain after an incident.
     pub(crate) fn pick_up_sibling_token(&self) -> bool {
-        let auth = match self.read_auth_store() {
-            Ok(map) => self.lookup_scoped_auth(&map),
+        let auth = match read_auth_json(&self.path) {
+            Ok(map) => lookup_auth(&map, &self.scope),
             _ => None,
         };
         if let Some(ref a) = auth
@@ -2457,9 +2405,9 @@ impl AuthManager {
                 "auth: pick_up_sibling_token adopted",
                 None,
                 Some(serde_json::json!({
-                    "access_token_present": !a.key.is_empty(),
+                    "adopted_key_prefix": bearer_suffix(&a.key),
                     "expires_at": a.expires_at.map(|e| e.to_rfc3339()),
-                    "refresh_token_present": a.refresh_token.is_some(),
+                    "rt_prefix": a.refresh_token.as_deref().map(bearer_suffix),
                 })),
             );
             self.with_inner_write(|inner| *inner = Some(a.clone()));
@@ -2649,7 +2597,6 @@ impl AuthManager {
         rejected: Option<GrokAuth>,
         source: crate::auth::recovery::RecoverySource,
     ) -> crate::auth::recovery::UnauthorizedRecovery {
-        let rejected = rejected.filter(|_| self.credential_store_is_safe());
         crate::auth::recovery::UnauthorizedRecovery::new(self.clone(), rejected, source)
     }
 
@@ -2671,11 +2618,7 @@ impl AuthManager {
         /// `Other`.
         const MAX_TRANSIENT_ATTEMPTS: u32 = 2;
 
-        let cached = if self.xai_session {
-            self.with_inner_read(|inner| inner.cloned())
-        } else {
-            self.current_or_expired()
-        };
+        let cached = self.with_inner_read(|inner| inner.cloned());
         let mut delay = StdDuration::from_millis(500);
         for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
             match self
@@ -2818,7 +2761,7 @@ impl AuthManager {
                 // refreshes; later processes adopt the result here.
                 let adopted_from_sibling = this.pick_up_sibling_token();
                 if this.current().is_some() {
-                    let access_token_present = this.current().is_some_and(|a| !a.key.is_empty());
+                    let adopted = this.current().map(|a| bearer_suffix(&a.key).to_owned());
                     let expires_at = this
                         .inner
                         .read()
@@ -2842,7 +2785,7 @@ impl AuthManager {
                         None,
                         Some(serde_json::json!({
                             "adopted_from_sibling": adopted_from_sibling,
-                            "access_token_present": access_token_present,
+                            "key_prefix": adopted,
                             "expires_at": expires_at,
                         })),
                     );
@@ -2851,7 +2794,7 @@ impl AuthManager {
                 }
 
                 tracing::info!("auth: proactive refresh starting");
-                match this.auth().await {
+                match this.auth_background().await {
                     Ok(auth) => {
                         consecutive_failures = 0;
                         tracing::info!("auth: proactive refresh succeeded");
@@ -2860,7 +2803,7 @@ impl AuthManager {
                             None,
                             Some(serde_json::json!({
                                 "result": "success",
-                                "access_token_present": !auth.key.is_empty(),
+                                "key_prefix": bearer_suffix(&auth.key),
                                 "expires_at": auth.expires_at.map(|e| e.to_rfc3339()),
                             })),
                         );
@@ -2877,6 +2820,9 @@ impl AuthManager {
                                 "backoff_ms": proactive_failure_backoff(consecutive_failures)
                                     .as_millis() as u64,
                                 "error": format!("{e}"),
+                                "transient_reason": e
+                                    .transient_reason_kind()
+                                    .map(TransientReason::as_str),
                             })),
                         );
                     }
@@ -2945,11 +2891,11 @@ pub(crate) fn compute_proactive_sleep(this: &AuthManager) -> StdDuration {
         // clears on wake or auto-expires (`SLEEP_GATE_MAX`).
         return BACKOFF_INTERVAL;
     }
-    // Dark wake with a wire-valid token: `refresh_chain` would defer, so
-    // back off instead of busy-looping against the deferral. With nothing
-    // usable to serve it no longer defers — fall through to the expiry
-    // schedule rather than strand the session for a full interval.
-    if this.current_wire_valid().is_some() && this.is_dark_wake() {
+    // Dark wake: the loop is a background consumer, so `refresh_chain`
+    // defers every attempt — back off instead of busy-looping against the
+    // deferral. Not stranding: the wake nudge re-arms the loop on full wake,
+    // and a user-facing request with a dead token still refreshes.
+    if this.is_dark_wake() {
         return BACKOFF_INTERVAL;
     }
     match this.inner.read().as_ref().and_then(|a| a.expires_at) {

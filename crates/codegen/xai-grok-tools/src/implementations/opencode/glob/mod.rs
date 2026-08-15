@@ -500,6 +500,45 @@ mod tests {
         assert!(output.tool_output_for_prompt.contains("No files found"));
     }
 
+    /// One unreadable subdir must not lose sibling results or report
+    /// truncation (rg's warnings go to a null stderr, not a droppable pipe).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_survives_unreadable_subdir() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return; // chmod 0o000 doesn't bar root
+        }
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.ts"), "x").unwrap();
+        std::fs::write(tmp.path().join("b.ts"), "y").unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("c.ts"), "z").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let tool = GlobTool;
+        let resources = test_resources(tmp.path());
+        let output = xai_tool_runtime::Tool::run(
+            &tool,
+            test_ctx(resources.into_shared()),
+            GlobInput {
+                pattern: "*.ts".to_string(),
+                path: None,
+            },
+        )
+        .await;
+
+        // Restore before asserting so TempDir cleanup works even on failure.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = output.unwrap();
+        assert_eq!(output.count, 2, "visible files must all be returned");
+        assert!(!output.truncated);
+        assert!(output.tool_output_for_prompt.contains("a.ts"));
+        assert!(output.tool_output_for_prompt.contains("b.ts"));
+    }
+
     #[tokio::test]
     async fn glob_with_subdirectory_path() {
         let tmp = TempDir::new().unwrap();

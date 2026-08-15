@@ -121,20 +121,12 @@ fn resolve_config(cfg: &AgentConfig, auth_manager: &AuthManager) -> AgentConfig 
         }
     }
 
-    let managed_enforced = crate::config::apply_managed_settings_features(&mut cfg);
-    let requirements_enforced = crate::config::apply_requirements(&mut cfg);
-
-    for e in managed_enforced.iter().chain(&requirements_enforced) {
-        tracing::info!(field = %e.path, value = %e.value, source = %e.source, "policy override");
-    }
+    crate::config::apply_policy(&mut cfg);
 
     // Idempotent: bootstrap may already have fetched + applied side effects for the gate.
     // Full prefetch (with managed-config sync when stale) is allowed after the gate.
     ensure_remote_settings_side_effects(&mut cfg, true);
     crate::util::config::sync_campaign_fields(&mut cfg);
-    let effective_default =
-        crate::agent::models::configured_preference(&cfg).map(|value| value.value);
-    cfg.rebind_unset_auxiliary_models_to_default(effective_default.as_deref());
 
     // env var > remote settings > Local. Skip remote settings for Generic (grok -p, subagents).
     let has_xai_auth = auth_manager.current().is_some_and(|a| a.is_xai_auth());
@@ -181,6 +173,10 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
 
         let grok_home = crate::util::grok_home::grok_home();
         crate::builtin::extract_builtin_files(&grok_home);
+        if !cfg!(test) {
+            // Deletes dirs; must never touch a unit-test process's real home.
+            crate::builtin::purge_stale_extracted_skills(&grok_home);
+        }
 
         crate::extensions::marketplace::purge_default_skills_installs(&grok_home);
 
@@ -194,11 +190,15 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
         let telemetry_mode = cfg.resolve_telemetry_mode();
         let trace_upload = cfg.resolve_trace_upload();
         let feedback = cfg.resolve_feedback();
+        let feedback_url = cfg.endpoints.resolve_feedback_base_url();
+        let trace_upload_url = cfg.endpoints.resolve_trace_upload_url();
         tracing::info!(
             telemetry = %telemetry_mode,
             trace_upload = %trace_upload,
             feedback = %feedback,
+            feedback_url = %feedback_url,
             feedback_url_custom = cfg.endpoints.feedback_base_url.is_some(),
+            trace_upload_url = %trace_upload_url,
             trace_upload_url_custom = cfg.endpoints.trace_upload_url.is_some(),
             trace_upload_bucket = cfg.endpoints.trace_upload_bucket.as_deref().unwrap_or("none"),
             trace_upload_region = cfg.endpoints.trace_upload_region.as_deref().unwrap_or("none"),
@@ -219,6 +219,15 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
 /// Apply current telemetry config + auth identity. Tears down the client
 /// when telemetry is disabled, so it's safe to call repeatedly.
 pub fn update_telemetry_config(config: &AgentConfig, auth_manager: &AuthManager) {
+    // shared_client() aborts (panic = "abort") on an invalid user agent,
+    // and that string comes from the GROK_CLIENT_NAME env var. Telemetry
+    // init must never take down its caller — `grok update` is a repair
+    // command — so validate the one user-controlled input first.
+    let user_agent = crate::http::process_user_agent_string();
+    if reqwest::header::HeaderValue::from_str(&user_agent).is_err() {
+        tracing::warn!("telemetry init skipped: GROK_CLIENT_NAME yields an invalid user agent");
+        return;
+    }
     let grok_auth = auth_manager.current().filter(|a| a.is_xai_auth());
     let user_id = grok_auth.as_ref().map(|a| a.user_id.clone());
     let team_id = grok_auth.as_ref().and_then(|a| a.team_id.clone());
@@ -234,7 +243,7 @@ pub fn update_telemetry_config(config: &AgentConfig, auth_manager: &AuthManager)
         config.resolve_telemetry_mode().value,
         user_id,
         team_id,
-        crate::managed_config::resolve_deployment_id(config.endpoints.deployment_key.as_deref()),
+        config.endpoints.deployment_key.clone(),
         crate::http::origin_client_info_from_env(),
         xai_grok_version::VERSION.to_owned(),
         subscription_tier,

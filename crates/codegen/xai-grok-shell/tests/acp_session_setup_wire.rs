@@ -419,11 +419,9 @@ async fn assert_close_frees_the_session(
 fn acp_session_setup_conformance() {
     run_agent_test(|cwd, mock| async move {
         let log = UpdateLog::default();
-        let inference_base_url = mock.url();
         let (conn, init) = connect_and_auth(
             RecordingClient { log: log.clone() },
             "acp-session-setup-test",
-            &inference_base_url,
         )
         .await;
         let capabilities = &init.agent_capabilities.session_capabilities;

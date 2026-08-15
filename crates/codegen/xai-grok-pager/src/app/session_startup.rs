@@ -28,7 +28,7 @@ pub enum DeferredSessionStartup {
     },
     /// Fresh plain Grok session whose first prompt resumes a foreign tool session.
     ForeignResume {
-        tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool,
+        tool: xai_grok_shell::foreign_sessions::ForeignSessionTool,
         native_id: String,
     },
 }
@@ -1122,6 +1122,7 @@ async fn restore_session_from_remote(
         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {}", e))?;
     use xai_grok_shell::agent::session_registry_client::SessionRegistryClient;
     use xai_grok_shell::auth::{AuthManager, ensure_authenticated_or_noninteractive};
+    use xai_grok_shell::foreign_sessions;
     use xai_grok_shell::session::restore::{RestoreSessionOpts, restore_session_with_storage};
     use xai_grok_shell::util::grok_home::grok_home;
     let deployment_key = agent_config.endpoints.deployment_key.clone();

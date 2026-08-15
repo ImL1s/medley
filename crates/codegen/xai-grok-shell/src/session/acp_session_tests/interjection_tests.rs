@@ -14,10 +14,9 @@ async fn drain_interjections_pushes_synthetic_user_message_after_tool_result() {
             let (actor, _gateway_rx) = build_actor().await;
 
             const TOOL_RESULT_CONTENT: &str = "file contents: fn main() {}";
-            actor.chat_state_handle.push_tool_result(
-                ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT),
-                None,
-            );
+            actor
+                .chat_state_handle
+                .push_tool_result(ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT));
             actor.pending_interjections.push(PendingInterjection {
                 text: "please also add tests".to_string(),
                 attachments: vec![],
@@ -82,10 +81,9 @@ async fn drain_multiple_interjections_pushes_one_user_message_each_in_order() {
             let (actor, _gateway_rx) = build_actor().await;
 
             const TOOL_RESULT_CONTENT: &str = "tool output";
-            actor.chat_state_handle.push_tool_result(
-                ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT),
-                None,
-            );
+            actor
+                .chat_state_handle
+                .push_tool_result(ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT));
             actor.pending_interjections.push(PendingInterjection {
                 text: "first steer".to_string(),
                 attachments: vec![],
@@ -176,20 +174,18 @@ mod interjection_format_tests {
         );
     }
 
-    /// The interjection is a real user message: no deferral instruction
-    /// telling the model to finish its current task first (the model weighs
-    /// the steering itself, like common mid-turn injection semantics). The
-    /// wrapped query must be the final content of the message.
     #[test]
-    fn interjection_has_no_deferral_instruction() {
+    fn interjection_reminds_to_finish_previous_work() {
         let wrapped = format_interjection("please also add tests".to_string());
         assert!(
             !wrapped.contains("After completing your current task"),
             "interjection must not defer the user's message, got: {wrapped}"
         );
         assert!(
-            wrapped.trim_end().ends_with("</user_query>"),
-            "nothing may follow the wrapped user query, got: {wrapped}"
+            wrapped.trim_end().ends_with(
+                "</user_query>\nMake sure to complete any unfinished tasks from previous turns."
+            ),
+            "unfinished-task reminder must follow the wrapped query, got: {wrapped}"
         );
     }
 }

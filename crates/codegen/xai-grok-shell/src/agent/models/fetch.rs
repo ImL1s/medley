@@ -17,7 +17,6 @@ pub(crate) fn build_prefetched_map(
             env_key: None,
             auth_provider: None,
             api_base_url: m.api_base_url.clone().or(api_base_url_override.clone()),
-            config_validation_errors: Vec::new(),
         };
         map.insert(key, entry);
     }
@@ -208,7 +207,8 @@ fn start_early_prefetch_impl(
 fn spawn_prefetch_thread(env: PrefetchEnv) -> EarlyPrefetchHandle {
     std::thread::spawn(move || {
         let mut timer = crate::instrumentation_timer!("startup.early_prefetch");
-        timer.with_field("endpoint_configured", "true");
+        let proxy_endpoint = env.endpoints.proxy_url();
+        timer.with_field("endpoint", proxy_endpoint.as_str());
         let (models, settings) = prefetch_models_and_settings_blocking(
             &env.endpoints,
             env.auth.as_ref(),

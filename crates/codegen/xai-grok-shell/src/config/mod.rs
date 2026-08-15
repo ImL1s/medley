@@ -1,5 +1,4 @@
 pub mod reloader;
-pub mod tool_capabilities;
 pub mod watcher;
 use crate::bundle;
 use serde::Deserialize;
@@ -717,16 +716,10 @@ impl ManagedMcpsConfig {
 #[serde(default)]
 pub(crate) struct ModelOverrideConfig {
     pub web_search: String,
-    pub web_search_explicit: bool,
-    pub web_search_follows_default: bool,
     /// `None` = current model.
     pub session_summary: Option<String>,
-    pub session_summary_explicit: bool,
-    pub session_summary_follows_default: bool,
     /// Compiled default (`grok-build`) when unset locally, remotely, and via env.
     pub image_description: Option<String>,
-    pub image_description_explicit: bool,
-    pub image_description_follows_default: bool,
     /// Next-prompt suggestion model pin. Unlike the other overrides this does
     /// NOT fill a compiled default — see [`PromptSuggestModelPin`].
     #[serde(skip)]
@@ -736,14 +729,8 @@ impl Default for ModelOverrideConfig {
     fn default() -> Self {
         Self {
             web_search: crate::models::default_web_search_model().to_owned(),
-            web_search_explicit: false,
-            web_search_follows_default: false,
             session_summary: None,
-            session_summary_explicit: false,
-            session_summary_follows_default: false,
             image_description: None,
-            image_description_explicit: false,
-            image_description_follows_default: false,
             prompt_suggestion: PromptSuggestModelPin::Unpinned,
         }
     }
@@ -787,21 +774,10 @@ fn non_empty_model_override(value: Option<&str>) -> Option<String> {
         }
     })
 }
-pub(crate) fn auxiliary_model_or_operative(
-    configured: &str,
-    operative: &str,
-    follows_default: bool,
-) -> String {
-    if follows_default {
-        operative.to_owned()
-    } else {
-        configured.to_owned()
-    }
-}
 impl ModelOverrideConfig {
-    /// CLI flag > env var > lane-specific config.toml > lane-specific remote
-    /// setting > configured default model > compiled default.
-    /// `image_description` and `session_summary` always resolve to `Some(_)`.
+    /// CLI flag > env var > config.toml > remote settings > compiled default.
+    /// `image_description` and `session_summary` always resolve to `Some(_)`
+    /// (default `grok-build`), never the session model.
     /// `prompt_suggestion` resolves to a [`PromptSuggestModelPin`] instead of
     /// a model string (no CLI flag; the default and the catalog guard live at
     /// the consumer, `handle_suggest_prompt`).
@@ -811,35 +787,20 @@ impl ModelOverrideConfig {
         config: &toml::Value,
         remote: Option<&crate::util::config::RemoteSettings>,
     ) -> Self {
-        Self::resolve_with_default_model(
-            None,
-            cli_web_search_model,
-            cli_session_summary_model,
-            config,
-            remote,
-        )
-    }
-
-    pub(crate) fn resolve_with_default_model(
-        cli_default_model: Option<&str>,
-        cli_web_search_model: Option<&str>,
-        cli_session_summary_model: Option<&str>,
-        config: &toml::Value,
-        remote: Option<&crate::util::config::RemoteSettings>,
-    ) -> Self {
         let models_table = config.get("models");
         let parsed_models: crate::agent::config::ModelsConfig = models_table
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default();
-        let mut web_search = non_empty_model_override(parsed_models.web_search.as_deref());
-        let mut session_summary =
-            non_empty_model_override(parsed_models.session_summary.as_deref());
-        let mut image_description =
-            non_empty_model_override(parsed_models.image_description.as_deref());
-        let mut prompt_suggestion =
-            non_empty_model_override(parsed_models.prompt_suggestion.as_deref())
+        let mut result = Self {
+            web_search: parsed_models
+                .web_search
+                .unwrap_or_else(|| crate::models::default_web_search_model().to_owned()),
+            session_summary: non_empty_model_override(parsed_models.session_summary.as_deref()),
+            image_description: non_empty_model_override(parsed_models.image_description.as_deref()),
+            prompt_suggestion: non_empty_model_override(parsed_models.prompt_suggestion.as_deref())
                 .map(PromptSuggestModelPin::Pinned)
-                .unwrap_or_default();
+                .unwrap_or_default(),
+        };
         let has_local_ws = models_table.and_then(|m| m.get("web_search")).is_some();
         let has_local_ss = models_table
             .and_then(|m| m.get("session_summary"))
@@ -848,103 +809,55 @@ impl ModelOverrideConfig {
             .and_then(|m| m.get("image_description"))
             .is_some();
         if let Some(remote) = remote {
-            if !has_local_ws {
-                web_search = non_empty_model_override(remote.web_search_model.as_deref());
+            if !has_local_ws && let Some(ref v) = remote.web_search_model {
+                result.web_search = v.clone();
             }
             if !has_local_ss {
-                session_summary = non_empty_model_override(remote.session_summary_model.as_deref());
+                result.session_summary =
+                    non_empty_model_override(remote.session_summary_model.as_deref());
             }
             if !has_local_id {
-                image_description =
+                result.image_description =
                     non_empty_model_override(remote.image_description_model.as_deref());
             }
-            if prompt_suggestion == PromptSuggestModelPin::Unpinned
+            if result.prompt_suggestion == PromptSuggestModelPin::Unpinned
                 && let Some(v) = non_empty_model_override(remote.prompt_suggestion_model.as_deref())
             {
-                prompt_suggestion = PromptSuggestModelPin::Pinned(v);
+                result.prompt_suggestion = PromptSuggestModelPin::Pinned(v);
             }
         }
         if let Ok(v) = std::env::var("GROK_WEB_SEARCH_MODEL") {
             let v = v.trim();
             if !v.is_empty() {
-                web_search = Some(v.to_owned());
+                result.web_search = v.to_owned();
             }
         }
         if let Ok(v) = std::env::var("GROK_SESSION_SUMMARY_MODEL") {
-            session_summary = non_empty_model_override(Some(v.as_str()));
+            result.session_summary = non_empty_model_override(Some(v.as_str()));
         }
         if let Ok(v) = std::env::var("GROK_IMAGE_DESCRIPTION_MODEL") {
-            image_description = non_empty_model_override(Some(v.as_str()));
+            result.image_description = non_empty_model_override(Some(v.as_str()));
         }
         if let Ok(v) = std::env::var("GROK_PROMPT_SUGGESTIONS_MODEL")
             && let Some(v) = non_empty_model_override(Some(v.as_str()))
         {
-            prompt_suggestion = PromptSuggestModelPin::Env(v);
+            result.prompt_suggestion = PromptSuggestModelPin::Env(v);
         }
         if let Some(v) = cli_web_search_model {
-            web_search = non_empty_model_override(Some(v));
+            result.web_search = v.to_owned();
         }
         if let Some(v) = cli_session_summary_model {
-            session_summary = non_empty_model_override(Some(v));
+            result.session_summary = non_empty_model_override(Some(v));
         }
-        // One rule for every auxiliary lane: an unset lane follows the
-        // configured default model before it falls back to a compiled
-        // constant. `web_search` already did this (above); these two jumped
-        // straight to `default_models.json`, every entry of which is xAI, so
-        // a Codex-only user silently routed summaries and image descriptions
-        // to a provider they may hold no credential for (#269).
-        //
-        // `prompt_suggestion` is deliberately not included, for a reason
-        // its own lane already documents: it is "deliberately NOT a
-        // session-model fallback" (`helpers::prompt_suggest`) and "the
-        // session model is never used: a per-turn background call must stay
-        // on the small model" (`acp_session_impl::recap`). Feeding the
-        // configured default into it would do exactly what both forbid, on
-        // every turn.
-        //
-        // It also does not have this bug to fix. The gate is
-        // `helpers::prompt_suggest::effective_suggest_model`, which drops
-        // the request entirely when the model is not in the catalog, and
-        // `grok-build-0.1` only reaches the catalog through the xAI
-        // prefetch — which a user without xAI credentials never runs. So a
-        // Codex-only user is already silent here rather than misrouted.
-        let configured_default = crate::agent::config::resolve_string_flag(
-            cli_default_model,
-            "GROK_DEFAULT_MODEL",
-            parsed_models.default.as_deref(),
-            remote.and_then(|r| r.default_model.as_deref()),
-        )
-        .map(|resolved| resolved.value);
-        let web_search_follows_default = web_search.is_none() && configured_default.is_some();
-        let session_summary_follows_default =
-            session_summary.is_none() && configured_default.is_some();
-        let image_description_follows_default =
-            image_description.is_none() && configured_default.is_some();
-        let web_search_explicit = web_search.is_some();
-        let session_summary_explicit = session_summary.is_some();
-        let image_description_explicit = image_description.is_some();
-        Self {
-            web_search: web_search
-                .or_else(|| configured_default.clone())
-                .unwrap_or_else(|| crate::models::default_web_search_model().to_owned()),
-            web_search_explicit,
-            web_search_follows_default,
-            session_summary: Some(
-                session_summary
-                    .or_else(|| configured_default.clone())
-                    .unwrap_or_else(|| crate::models::default_session_summary_model().to_owned()),
-            ),
-            session_summary_explicit,
-            session_summary_follows_default,
-            image_description: Some(
-                image_description
-                    .or(configured_default)
-                    .unwrap_or_else(|| crate::models::default_image_description_model().to_owned()),
-            ),
-            image_description_explicit,
-            image_description_follows_default,
-            prompt_suggestion,
+        if result.session_summary.is_none() {
+            result.session_summary =
+                Some(crate::models::default_session_summary_model().to_owned());
         }
+        if result.image_description.is_none() {
+            result.image_description =
+                Some(crate::models::default_image_description_model().to_owned());
+        }
+        result
     }
 }
 /// Tool behavior configuration (`[tools]` in config.toml).
@@ -962,8 +875,10 @@ pub struct ToolsConfig {
     /// When `true`, all tools (including `read_file`) filter gitignored
     /// files. When `false` (default), each tool picks its own default.
     pub respect_gitignore: bool,
-    /// Drop tools whose xAI API requires server-side artifact storage
-    /// (currently just `video_gen`). Intended for ZDR-bound teams via
+    /// Restrict tools whose xAI API requires server-side artifact storage
+    /// (currently just the video tools): without a valid
+    /// `[tools.zdr_video_output_s3]` bucket they stay advertised but return
+    /// setup guidance at call time. Intended for ZDR-bound teams via
     /// `~/.grok/managed_config.toml`. Defaults to `false`.
     pub disable_zdr_incompatible_tools: bool,
     /// Optional S3 bucket config for ZDR video output. When present (and
@@ -1093,14 +1008,13 @@ impl StorageMode {
 }
 pub use xai_grok_config::ConfigLayers;
 pub use xai_grok_config::{
-    MDM_REQUIREMENTS_SOURCE, RequirementsLayer, RequirementsLayerLoad, RequirementsSource,
-    ServingIdentity, SyncMarker, claude_managed_settings_probe_path, confirmed_team_switch,
-    confirmed_team_switch_at, is_managed_config_hard_stale_for, is_managed_config_stale_for,
-    load_config_file, load_from_disk, load_managed_config, load_merged_requirements,
-    load_system_managed_config, load_toml_file, managed_config_identity_changed_at,
-    managed_deployment_id, managed_policy_compromised_for, mark_managed_config_synced,
-    mark_managed_config_synced_at, normalize_identity, requirements_layers, system_config_dir,
-    try_requirements_layers, user_grok_home,
+    MDM_REQUIREMENTS_SOURCE, RequirementsLayer, RequirementsSource, ServingIdentity, SyncMarker,
+    claude_managed_settings_probe_path, confirmed_team_switch, confirmed_team_switch_at,
+    is_managed_config_hard_stale_for, is_managed_config_stale_for, load_config_file,
+    load_from_disk, load_managed_config, load_merged_requirements, load_system_managed_config,
+    load_toml_file, managed_config_identity_changed_at, managed_deployment_id,
+    managed_policy_compromised_for, mark_managed_config_synced, mark_managed_config_synced_at,
+    normalize_identity, requirements_layers, system_config_dir, user_grok_home,
 };
 /// Map of "dotted.path" to which config file the value came from.
 pub(crate) fn config_origins(
@@ -1245,78 +1159,43 @@ fn apply_managed_settings_features_inner(
     }
     enforced
 }
+/// Display text naming the setting that turned session search off, or `None` while it is on.
+/// One source of truth: the latch records the setting that closed it, which a later resolve of a
+/// lower tier cannot change.
+pub fn session_search_turned_off_by() -> Option<&'static str> {
+    let source = crate::session::storage::search_gate::closed_by()?;
+    Some(crate::session::storage::search_gate::session_search_off_reason(source))
+}
+/// Resolve the session search setting and latch it for the process. Call after every rewrite of
+/// `remote_settings`, and before anything can reach the index.
+pub fn apply_session_search_gate(config: &crate::agent::config::Config) {
+    crate::session::storage::search_gate::apply_gate(&config.resolve_session_search());
+}
+/// Load the on-disk config for a one-shot command and clamp it with policy. Without the clamp a
+/// pinned value reads as an ordinary config value, which the environment outranks.
+pub fn load_agent_config_disk_only() -> Result<crate::agent::config::Config, String> {
+    let effective = load_effective_config_disk_only().map_err(|e| e.to_string())?;
+    let mut config = crate::agent::config::Config::new_from_toml_cfg(&effective)?;
+    apply_policy(&mut config);
+    Ok(config)
+}
+/// Clamp a config with managed settings and then requirements pins, logging each field a policy
+/// took over. Requirements run second so a pin wins a conflict.
+pub(crate) fn apply_policy(config: &mut crate::agent::config::Config) {
+    let managed = apply_managed_settings_features(config);
+    let pinned = apply_requirements(config);
+    for field in managed.iter().chain(&pinned) {
+        tracing::info!(
+            field = %field.path, value = %field.value, source = %field.source,
+            "policy override"
+        );
+    }
+}
 /// Clamp `AgentConfig` fields per `requirements.toml`. No-op if absent.
 /// System pins win over user pins on conflict.
 pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> Vec<EnforcedField> {
-    apply_loaded_requirements(config, try_requirements_layers())
-}
-
-fn apply_loaded_requirements(
-    config: &mut crate::agent::config::Config,
-    loads: Vec<RequirementsLayerLoad>,
-) -> Vec<EnforcedField> {
-    use crate::agent::config::AuxiliaryModelPins;
-
-    fn requirement_source(source: &RequirementsSource) -> RequirementSource {
-        RequirementSource::Requirements {
-            path: std::path::PathBuf::from(source.label().as_ref()),
-        }
-    }
-    fn auxiliary_pins(layer: &RequirementsLayer) -> AuxiliaryModelPins {
-        let model = |key| {
-            layer
-                .value
-                .get("models")?
-                .get(key)?
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        };
-        AuxiliaryModelPins {
-            source: requirement_source(&layer.source),
-            web_search: model("web_search"),
-            session_summary: model("session_summary"),
-            image_description: model("image_description"),
-        }
-    }
-
-    let previous_layers = config.requirements.auxiliary_model_layers.clone();
-    let mut next_layers = Vec::new();
-    for load in &loads {
-        match load {
-            RequirementsLayerLoad::Absent(_) => {}
-            RequirementsLayerLoad::Loaded(layer) => next_layers.push(auxiliary_pins(layer)),
-            RequirementsLayerLoad::Rejected(source) => {
-                let source = requirement_source(source);
-                if let Some(previous) = previous_layers.iter().find(|pins| pins.source == source) {
-                    next_layers.push(previous.clone());
-                }
-            }
-        }
-    }
-    let last_rejection = loads
-        .iter()
-        .rposition(|load| matches!(load, RequirementsLayerLoad::Rejected(_)));
-    if last_rejection.is_some() {
-        tracing::warn!(
-            "requirements reload partially rejected; preserving last-known-good auxiliary model \
-             pins and applying only higher-priority accepted layers"
-        );
-    }
-    config.requirements.clear_auxiliary_model_pins();
-    let mut enforced: Vec<_> = loads
+    requirements_layers()
         .into_iter()
-        .enumerate()
-        .filter_map(|(index, load)| {
-            if last_rejection.is_some_and(|rejected| index <= rejected) {
-                return None;
-            }
-            match load {
-                RequirementsLayerLoad::Loaded(layer) => Some(layer),
-                RequirementsLayerLoad::Absent(_) | RequirementsLayerLoad::Rejected(_) => None,
-            }
-        })
         .flat_map(|layer| {
             apply_requirements_inner(
                 config,
@@ -1326,52 +1205,7 @@ fn apply_loaded_requirements(
                 },
             )
         })
-        .collect();
-
-    // Recompute the winning auxiliary pins from the per-layer cache. This can
-    // reveal a retained lower layer that was previously shadowed by a higher
-    // layer which has now removed its pin.
-    config.requirements.clear_auxiliary_model_pins();
-    for pins in &next_layers {
-        macro_rules! restore_auxiliary_pin {
-            ($value:ident, $requirement:ident, $model:ident, $path:literal) => {
-                if let Some(value) = &pins.$value {
-                    config
-                        .requirements
-                        .$requirement
-                        .pin(value.clone(), pins.source.clone());
-                    if config.models.$model.as_deref() != Some(value) {
-                        config.models.$model = Some(value.clone());
-                        enforced.push(EnforcedField {
-                            path: $path,
-                            value: value.clone(),
-                            source: pins.source.clone(),
-                        });
-                    }
-                }
-            };
-        }
-        restore_auxiliary_pin!(
-            web_search,
-            web_search_model,
-            web_search,
-            "models.web_search"
-        );
-        restore_auxiliary_pin!(
-            session_summary,
-            session_summary_model,
-            session_summary,
-            "models.session_summary"
-        );
-        restore_auxiliary_pin!(
-            image_description,
-            image_description_model,
-            image_description,
-            "models.image_description"
-        );
-    }
-    config.requirements.auxiliary_model_layers = next_layers;
-    enforced
+        .collect()
 }
 fn apply_requirements_inner(
     config: &mut crate::agent::config::Config,
@@ -1451,6 +1285,7 @@ fn apply_requirements_inner(
     pin_feature!(video_gen);
     pin_feature!(write_file);
     pin_feature!(voice_mode);
+    pin_feature!(session_search);
     pin_requirement_only!(remote_fetch);
     if let Some(val) = req_bool(req, "telemetry", "trace_upload") {
         config.requirements.trace_upload.pin(val, source.clone());
@@ -1501,35 +1336,7 @@ fn apply_requirements_inner(
         };
     }
     enforce_str!("models", "default", config.models.default);
-    macro_rules! enforce_auxiliary_model {
-        ($key:expr, $field:expr, $requirement:expr) => {
-            if let Some(val) = req_str(req, "models", $key)
-                .map(str::trim)
-                .filter(|val| !val.is_empty())
-            {
-                $requirement.pin(val.to_owned(), source.clone());
-                if $field.as_deref() != Some(val) {
-                    $field = Some(val.to_owned());
-                    push(concat!("models.", $key), val.to_owned());
-                }
-            }
-        };
-    }
-    enforce_auxiliary_model!(
-        "web_search",
-        config.models.web_search,
-        config.requirements.web_search_model
-    );
-    enforce_auxiliary_model!(
-        "session_summary",
-        config.models.session_summary,
-        config.requirements.session_summary_model
-    );
-    enforce_auxiliary_model!(
-        "image_description",
-        config.models.image_description,
-        config.requirements.image_description_model
-    );
+    enforce_str!("models", "web_search", config.models.web_search);
     enforce_str!("cli", "channel", config.cli.channel);
     enforce_str!("cli", "minimum_version", config.cli.minimum_version);
     enforce_str!("cli", "maximum_version", config.cli.maximum_version);
@@ -1804,138 +1611,6 @@ pub fn apply_sandbox(
     }
 }
 pub use xai_grok_workspace::project_config::find_project_configs;
-const PROJECT_MODEL_SECTION_KEYS: [&str; 2] = ["models", "model"];
-/// Project model sections that are merged when a workspace is trusted.
-///
-/// Merge order is global effective config first, then project configs from git
-/// root to `cwd` (later/closer paths win). The folder-trust gate decides
-/// whether project model sections are allowed to contribute at all.
-pub(crate) fn merge_project_model_sections(
-    base: &toml::Value,
-    cwd: &std::path::Path,
-    project_trusted: bool,
-) -> toml::Value {
-    fn project_model_overlay(root: &toml::Value) -> Option<toml::Value> {
-        let table = root.as_table()?;
-        let mut overlay = toml::map::Map::new();
-        for key in PROJECT_MODEL_SECTION_KEYS {
-            if let Some(value) = table.get(key) {
-                overlay.insert(key.to_string(), value.clone());
-            }
-        }
-        (!overlay.is_empty()).then_some(toml::Value::Table(overlay))
-    }
-
-    let mut merged = base.clone();
-    if !project_trusted {
-        return merged;
-    }
-    for config_path in find_project_configs(cwd) {
-        if let Ok(project_root) = load_config_file(&config_path)
-            && let Some(overlay) = project_model_overlay(&project_root)
-        {
-            deep_merge_toml(&mut merged, &overlay);
-        }
-    }
-    merged
-}
-/// Config sections a project `.grok/config.toml` still never contributes.
-///
-/// `[models]` and `[model.*]` are loaded from *trusted* project configs via
-/// [`merge_project_model_sections`] (#56); `[model_providers.*]` remains
-/// global-only.
-///
-/// `trusted_xai_origins` (#123) is inert **by design, not by omission**, and
-/// folder trust is not sufficient for it. Trusting a repository enough to run
-/// its code and take its model routes is a different decision from letting it
-/// name an origin that receives your ambient xAI credential — the second is a
-/// decision only the local user tier can make, and it cannot arrive with a
-/// clone. That distinction got sharper when #56 made project model sections
-/// loadable, not weaker.
-pub const PROJECT_INERT_MODEL_SECTIONS: [(&str, &str); 2] = [
-    ("model_providers", "[model_providers.*]"),
-    (
-        crate::agent::trusted_origins::TRUSTED_XAI_ORIGINS_KEY,
-        "[trusted_xai_origins]",
-    ),
-];
-/// One entry per project `.grok/config.toml` at or above `cwd` that declares a
-/// section from [`PROJECT_INERT_MODEL_SECTIONS`], naming the sections it
-/// declares. Empty when every project config stays within the sections the
-/// project tier actually loads.
-pub fn inert_project_model_sections(
-    cwd: &std::path::Path,
-) -> Vec<(std::path::PathBuf, Vec<&'static str>)> {
-    find_project_configs(cwd)
-        .into_iter()
-        .filter_map(|path| {
-            let root = load_config_file(&path).ok()?;
-            let declared: Vec<&'static str> = PROJECT_INERT_MODEL_SECTIONS
-                .into_iter()
-                .filter(|(key, _)| root.get(key).is_some())
-                .map(|(key, _)| key)
-                .collect();
-            (!declared.is_empty()).then_some((path, declared))
-        })
-        .collect()
-}
-/// Human-readable warning for one [`inert_project_model_sections`] finding.
-pub fn inert_project_model_sections_message(
-    path: &std::path::Path,
-    declared: &[&'static str],
-) -> String {
-    let sections = declared
-        .iter()
-        .map(|declared_key| {
-            PROJECT_INERT_MODEL_SECTIONS
-                .into_iter()
-                .find_map(|(key, label)| (key == *declared_key).then_some(label))
-                .unwrap_or(declared_key)
-        })
-        .collect::<Vec<_>>()
-        .join(" and ");
-    let global = user_grok_home()
-        .map(|home| home.join("config.toml").display().to_string())
-        .unwrap_or_else(|| "$GROK_HOME/config.toml".to_owned());
-    format!(
-        "{sections} in {} is ignored: a project config contributes [models], \
-         [model.*], MCP servers, plugins, and permissions only. Move these entries \
-         to {global} for them to load.",
-        path.display()
-    )
-}
-/// Logs [`inert_project_model_sections`] once per distinct finding, so a
-/// persistently misplaced `[model.*]` warns once per process rather than once
-/// per config reload. Returns the findings so callers can surface them too.
-pub fn warn_inert_project_model_sections(
-    cwd: &std::path::Path,
-) -> Vec<(std::path::PathBuf, Vec<&'static str>)> {
-    use std::hash::{Hash as _, Hasher as _};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    let findings = inert_project_model_sections(cwd);
-    static LAST_LOGGED: AtomicU64 = AtomicU64::new(0);
-    // 0 means "nothing found"; real hashes are clamped to nonzero.
-    let hash = if findings.is_empty() {
-        0
-    } else {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        findings.hash(&mut hasher);
-        hasher.finish().max(1)
-    };
-    if LAST_LOGGED.swap(hash, Ordering::Relaxed) == hash {
-        return findings;
-    }
-    for (path, declared) in &findings {
-        tracing::warn!(
-            config = %path.display(),
-            sections = ?declared,
-            "{}",
-            inert_project_model_sections_message(path, declared)
-        );
-    }
-    findings
-}
 /// Resolve the effective `[plugins]` config for a working directory the same
 /// way a session does at reload time: global/user config
 /// ([`load_effective_config`]) plus every ancestor project `.grok/config.toml`
@@ -2221,12 +1896,8 @@ pub(crate) fn validate_hooks_path(path: &str) -> Result<(), Box<dyn std::error::
         .map_err(|e: std::io::Error| format!("Cannot resolve hook path: {e}"))?;
     let canonical_home = dunce::canonicalize(&grok_home).unwrap_or_else(|_| grok_home.clone());
     if !canonical.starts_with(&canonical_home) {
-        // The label has to come from the resolved home like the path below it
-        // does. Written literally it said "must be under ~/.grok/" and then
-        // printed `~/.medley` in the same sentence.
         return Err(format!(
-            "Hook path must be under {}/ ({}). Got: {}",
-            xai_grok_config::display_grok_home_prefix(),
+            "Hook path must be under ~/.grok/ ({}). Got: {}",
             canonical_home.display(),
             canonical.display()
         )

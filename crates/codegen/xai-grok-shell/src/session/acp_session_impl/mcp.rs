@@ -17,229 +17,6 @@ impl SessionActor {
         }
         self.ensure_mcp_tools_initialized().await;
     }
-    /// If managed tokens are near expiry, swap clients using the agent-level cache.
-    pub(super) async fn refresh_managed_mcp_if_stale(&self) {
-        use crate::session::managed_mcp::ManagedMcpCache;
-        let is_stale = crate::session::managed_mcp::managed_token_is_stale(
-            *self.managed_mcp_expires_at.lock().unwrap(),
-            chrono::Utc::now(),
-        );
-        if !is_stale {
-            return;
-        }
-        let fresh_configs = match &self.managed_mcp_handle.lock().await.cache {
-            ManagedMcpCache::Ready(c) if !c.is_empty() => c.clone(),
-            _ => return,
-        };
-        self.mcp_state.lock().await.refresh_managed_clients(
-            fresh_configs
-                .iter()
-                .map(|c| (c.endpoint.as_str(), &c.headers)),
-        );
-        *self.managed_mcp_expires_at.lock().unwrap() = fresh_configs
-            .iter()
-            .filter_map(|c| c.token_expires_at)
-            .min();
-    }
-    /// Reactive managed re-auth: cache-bypassing config re-fetch, swap in fresh
-    /// headers, re-handshake once. `Ok(())` if the server is `Ready` afterward.
-    ///
-    /// Owner-scoped — only the session owning the client in `owned_clients` swaps
-    /// (`refresh_managed_clients` ignores a subagent's shared Arc, which recovers
-    /// via the leader on its next pool snapshot). The shared `ManagedMcpState`
-    /// cooldown coalesces concurrent failures and bounds a revoked connector.
-    /// Shared by both reactive entry points; locks are taken sequentially, never
-    /// nested (acquire `managed_mcp_handle` before `mcp_state` if that changes).
-    ///
-    /// Emits `metrics.mcp.managed.reauth.{triggered,outcome,cooldown_terminal}`
-    /// tracing targets, plus an `mcp.server_connection` span (`connected` with
-    /// `tool_count` on recovery, `failed`/`error_type=auth` on terminal exhaustion).
-    pub(super) async fn reactive_managed_reauth(&self, server_name: &str) -> Result<(), String> {
-        if !self
-            .mcp_state
-            .lock()
-            .await
-            .owned_clients
-            .contains_key(server_name)
-        {
-            return Err(format!(
-                "session does not own managed client '{server_name}'"
-            ));
-        }
-        let now = chrono::Utc::now();
-        if !self
-            .managed_mcp_handle
-            .lock()
-            .await
-            .reauth_allowed(server_name, now)
-        {
-            return Err(format!(
-                "managed reactive re-auth for '{server_name}' is in cooldown"
-            ));
-        }
-        tracing::info!(target: "metrics.mcp.managed.reauth.triggered", server = %server_name);
-        tracing::info!(
-            server = %server_name,
-            "managed MCP auth rejection detected, attempting reactive re-fetch"
-        );
-        let scope = || {
-            crate::util::config::mcp_server_scope(
-                server_name,
-                std::path::Path::new(self.session_info.cwd.as_str()),
-            )
-        };
-        let started = std::time::Instant::now();
-        match self.reactive_managed_reauth_inner(server_name).await {
-            Ok(tool_count) => {
-                let elapsed_ms = started.elapsed().as_millis() as i64;
-                self.managed_mcp_handle
-                    .lock()
-                    .await
-                    .record_reauth_success(server_name);
-                tracing::info!(
-                    target: "metrics.mcp.managed.reauth.outcome",
-                    server = %server_name,
-                    result = "recovered",
-                );
-                tracing::info!(server = %server_name, "managed MCP reactive re-auth recovered");
-                crate::session::telemetry::emit_mcp_connection_span(
-                    "connected",
-                    server_name,
-                    "http",
-                    scope(),
-                    Some(elapsed_ms),
-                    Some(tool_count as i64),
-                    None,
-                );
-                let payload = crate::session::mcp_dispatcher::McpServerStatusPayload {
-                    session_id: self.session_id_string(),
-                    name: server_name.to_string(),
-                    source: crate::session::mcp_dispatcher::classify_source(server_name),
-                    status: crate::session::mcp_dispatcher::McpServerStatus::Ready,
-                    reason:
-                        crate::session::mcp_dispatcher::McpServerStatusReason::ManagedTokenRefreshed,
-                    detail: None,
-                    tools: None,
-                };
-                crate::session::mcp_restart::forward_status(&self.notifications.gateway, &payload);
-                Ok(())
-            }
-            Err(e) => {
-                let elapsed_ms = started.elapsed().as_millis() as i64;
-                let failed_at = chrono::Utc::now();
-                let terminal = {
-                    let mut st = self.managed_mcp_handle.lock().await;
-                    st.record_reauth_failure(server_name, failed_at);
-                    st.reauth_is_terminal(server_name)
-                };
-                if terminal {
-                    self.mcp_state
-                        .lock()
-                        .await
-                        .record_init_failure(server_name, true, None);
-                    let payload = crate::session::mcp_dispatcher::McpServerStatusPayload {
-                        session_id: self.session_id_string(),
-                        name: server_name.to_string(),
-                        source: crate::session::mcp_dispatcher::classify_source(server_name),
-                        status: crate::session::mcp_dispatcher::McpServerStatus::NeedsAuth,
-                        reason: crate::session::mcp_dispatcher::McpServerStatusReason::AuthExpired,
-                        detail: None,
-                        tools: None,
-                    };
-                    crate::session::mcp_restart::forward_status(
-                        &self.notifications.gateway,
-                        &payload,
-                    );
-                    tracing::warn!(
-                        target: "metrics.mcp.managed.reauth.cooldown_terminal",
-                        server = %server_name,
-                    );
-                    tracing::warn!(
-                        server = %server_name,
-                        "managed MCP reactive re-auth exhausted; surfacing NeedsAuth"
-                    );
-                    crate::session::telemetry::emit_mcp_connection_span(
-                        "failed",
-                        server_name,
-                        "http",
-                        scope(),
-                        Some(elapsed_ms),
-                        None,
-                        Some(xai_grok_telemetry::events::McpErrorType::Auth.as_str()),
-                    );
-                    self.unregister_server_tools(server_name);
-                    self.refresh_mcp_snapshot_and_schedule_reminder().await;
-                }
-                tracing::info!(
-                    target: "metrics.mcp.managed.reauth.outcome",
-                    server = %server_name,
-                    result = if terminal { "failed" } else { "cooldown" },
-                );
-                Err(e)
-            }
-        }
-    }
-    /// Inner half of [`Self::reactive_managed_reauth`]: snapshot inputs, force
-    /// a fresh proxy fetch, swap clients, re-handshake, and register tools.
-    /// Split out so the caller owns the cooldown gate and the status push.
-    /// Returns the number of tools registered after recovery, so the caller can
-    /// stamp the recovered `mcp.server_connection` span with a `tool_count`.
-    async fn reactive_managed_reauth_inner(&self, server_name: &str) -> Result<usize, String> {
-        let auth_manager = self.auth_manager.clone();
-        let proxy_url = self.models_manager.endpoints().proxy_url();
-        let Some(am) = auth_manager else {
-            return Err("no auth manager; cannot re-fetch managed configs".into());
-        };
-        crate::session::managed_mcp::invalidate_managed_config_cache(&self.managed_mcp_handle)
-            .await;
-        let fresh_configs = crate::session::managed_mcp::fetch_managed_mcp_configs(
-            &self.managed_mcp_handle,
-            &proxy_url,
-            &am,
-        )
-        .await;
-        if fresh_configs.is_empty() {
-            return Err("managed re-fetch returned no configs".into());
-        }
-        {
-            let mut st = self.mcp_state.lock().await;
-            st.refresh_managed_clients(
-                fresh_configs
-                    .iter()
-                    .map(|c| (c.endpoint.as_str(), &c.headers)),
-            );
-        }
-        *self.managed_mcp_expires_at.lock().unwrap() = fresh_configs
-            .iter()
-            .filter_map(|c| c.token_expires_at)
-            .min();
-        let client = {
-            let st = self.mcp_state.lock().await;
-            st.get_client(server_name)
-                .cloned()
-                .ok_or_else(|| format!("client '{server_name}' missing after refresh"))?
-        };
-        let registrations = client
-            .get_tool_registrations(self.mcp_state.clone())
-            .await
-            .map_err(|e| format!("re-handshake failed: {e}"))?;
-        let mut mcp_state = self.mcp_state.lock().await;
-        mcp_state.auth_required.remove(server_name);
-        mcp_state.clear_init_failed(server_name);
-        let tool_count = registrations.len();
-        let mut ui_tools: std::collections::HashMap<
-            String,
-            Vec<crate::extensions::mcp::McpToolEntry>,
-        > = std::collections::HashMap::new();
-        for reg in registrations {
-            self.register_mcp_tool(server_name, reg, &mut mcp_state, &mut ui_tools)
-                .await;
-        }
-        drop(mcp_state);
-        self.refresh_mcp_snapshot_and_schedule_reminder().await;
-        self.emit_mcp_tools_changed_notifications(ui_tools);
-        Ok(tool_count)
-    }
     /// Register tools from shared (inherited) MCP clients on this session's ToolBridge.
     ///
     /// Shared clients are already connected (Arc-shared from parent), so
@@ -412,9 +189,6 @@ impl SessionActor {
     /// Runs force_reauth (browser flow), then re-initializes the server
     /// and registers its tools.
     pub(super) async fn handle_mcp_auth_trigger(&self, server_name: &str) -> Result<(), String> {
-        if server_name.starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX) {
-            return Err("To authenticate, visit grok.com".to_string());
-        }
         let client = match self.mcp_state.lock().await.get_client(server_name).cloned() {
             Some(c) if c.has_auth() => c,
             _ => self.recreate_http_client_with_oauth(server_name).await?,
@@ -705,8 +479,7 @@ impl SessionActor {
                         "connection failed".to_string()
                     };
                     let retries_on_use = !mcp_state.auth_required.contains(name)
-                        && matches!(cfg, acp::McpServer::Http(_) | acp::McpServer::Sse(_))
-                        && !name.starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX);
+                        && matches!(cfg, acp::McpServer::Http(_) | acp::McpServer::Sse(_));
                     let reason = if retries_on_use {
                         format!("{base} — retries automatically on next tool call")
                     } else {
@@ -796,14 +569,9 @@ impl SessionActor {
         !disabled.contains(server)
     }
     /// HTTP analog of [`Self::is_stdio_server_configured`]: `true` iff
-    /// `server` has an enabled, **non-managed** `Http` / `Sse` config entry.
+    /// `server` has an enabled `Http` / `Sse` config entry.
     /// Gates [`crate::session::mcp_restart::maybe_schedule_http_recovery`].
-    /// Managed connectors (`MANAGED_MCP_PREFIX`) are excluded — out of scope
-    /// for in-place recovery; this mirrors the dispatcher's filter.
     pub(crate) async fn is_http_server_configured(&self, server: &str) -> bool {
-        if server.starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX) {
-            return false;
-        }
         let mcp_state = self.mcp_state.lock().await;
         let is_http_in_configs = mcp_state
             .configs
@@ -957,17 +725,6 @@ impl SessionActor {
     /// SIGKILLs the spawned child — and returns an explicit error so
     /// the auto-restart loop can emit `Reason::Disabled`.
     pub(crate) async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
-        self.respawn_stdio_then(server, || {}).await
-    }
-
-    pub(crate) async fn respawn_stdio_then<F>(
-        &self,
-        server: &str,
-        note_ready: F,
-    ) -> Result<(), String>
-    where
-        F: FnOnce(),
-    {
         let (server_config, meta_config, event_tx) = {
             let mcp_state = self.mcp_state.lock().await;
             let server_config = mcp_state
@@ -991,7 +748,7 @@ impl SessionActor {
         let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
             session_id,
             &event_writer,
-            OauthInteractivity::from_non_interactive(self.startup_hints.non_interactive),
+            OauthInteractivity::from_non_interactive(self.attach_non_interactive.get()),
             self.tool_context.process_scope.as_ref(),
         );
         let new_client = crate::session::mcp_servers::start_mcp_server(
@@ -1043,40 +800,15 @@ impl SessionActor {
             });
         }
         let arc_client = std::sync::Arc::new(new_client);
-        // Insert BEFORE arming the watcher, and arm as the last thing this
-        // function does. `tokio::time::interval` ticks immediately (see
-        // `xai-grok-mcp/src/liveness.rs`), so a server that exits at handshake
-        // can have its `TransportClosed` emitted the instant the watcher is
-        // armed. Arming first left two windows open; this order closes both:
-        //
-        // - The `mcp_state` lock is an `.await`, and the dispatcher takes that
-        //   same lock every coalesce window. A death classified inside that
-        //   window is measured against the PREVIOUS client's `last_ready_at`,
-        //   and once that is older than `STABILITY_WINDOW` the not-early
-        //   branch resets the early-death counter — refunding the budget of a
-        //   crash-looping server, which is issue #45 returning.
-        // - A `TransportClosed` for a client not yet in `owned_clients` is one
-        //   `drop_dead_clients` cannot find in order to evict it.
-        //
-        // The window this opens instead — a live client that is briefly
-        // unwatched — is strictly the lesser problem: an unwatched live client
-        // is merely not yet monitored, whereas an unfindable dead one cannot
-        // be cleaned up at all. That asymmetry is why the swap goes this way
-        // round rather than the other.
-        //
-        // `note_ready` is passed as a callback into
-        // `arm_liveness_watcher_then` so readiness bookkeeping is wired into
-        // the same call chain that installs the watcher. Keep this tail
-        // yield-free: a scheduler handoff before that callback reopens #45.
+        let _ = arc_client
+            .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
+            .await;
         {
             let mut mcp_state = self.mcp_state.lock().await;
             mcp_state
                 .owned_clients
-                .insert(server.to_string(), std::sync::Arc::clone(&arc_client));
+                .insert(server.to_string(), arc_client);
         }
-        let _ = arc_client
-            .arm_liveness_watcher_then(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL, note_ready)
-            .await;
         Ok(())
     }
     pub(super) async fn maybe_inject_mcp_connecting_reminder(&self) {
@@ -1093,21 +825,40 @@ impl SessionActor {
             return;
         }
         self.mcp_connecting_reminder_injected.set(true);
-        let mut text =
-            "MCP servers currently connecting (tools will become available shortly):\n".to_string();
-        for name in &connecting {
-            text.push_str(&format!("- {name}\n"));
-        }
-        text.push_str(
-            "\nDo not attempt to use tools from these servers yet. \
-             If the user's request likely requires one of these servers, \
-             mention that the server is still connecting and proceed with \
-             what you can do in the meantime.",
-        );
+        let delivery_tools = self.delivery_tools.borrow().clone();
+        let text = format_mcp_connecting_reminder(&connecting, &delivery_tools);
         self.push_system_reminder(&text);
         tracing::info!(
             servers = ?connecting,
+            ?delivery_tools,
             "Injected MCP connecting system-reminder"
+        );
+    }
+    /// Re-apply the attaching client's per-attachment policy. Sent by the
+    /// resident `session/load` rail when the request carries explicit
+    /// `startupHints`, so an actor spawned under one client's policy serves a
+    /// later-attaching client under *its* policy (a headless attachment gets
+    /// Blocking MCP init and its delivery-tool guidance even when the actor
+    /// was spawned by an interactive client, and vice versa). Only policy
+    /// fields are touched — structural spawn-time hints (subagent identity,
+    /// inherited prefix, preserved system head) stay frozen.
+    pub(super) fn apply_attach_policy(&self, hints: &crate::session::StartupHints) {
+        let strategy = hints.resolve_mcp_strategy();
+        let changed = self.mcp_strategy.get() != strategy
+            || self.attach_non_interactive.get() != hints.non_interactive
+            || *self.delivery_tools.borrow() != hints.delivery_tools;
+        self.mcp_strategy.set(strategy);
+        self.attach_non_interactive.set(hints.non_interactive);
+        *self.delivery_tools.borrow_mut() = hints.delivery_tools.clone();
+        if changed {
+            self.mcp_connecting_reminder_injected.set(false);
+        }
+        tracing::info!(
+            ?strategy,
+            non_interactive = hints.non_interactive,
+            delivery_tools = ?hints.delivery_tools,
+            changed,
+            "apply_attach_policy: updated per-attachment policy from session request startupHints"
         );
     }
     /// Ensure MCP tools are initialized (spawns processes and performs handshakes on first call)
@@ -1155,7 +906,7 @@ impl SessionActor {
             } else {
                 mcp_state.cancel_init();
                 self.events
-                    .emit(xai_file_utils::events::Event::McpInitCancelled {
+                    .emit(xai_grok_session_events::Event::McpInitCancelled {
                         reason: MCP_INIT_CANCELLED_CONFIG_CHANGED.to_string(),
                     });
             }
@@ -1184,17 +935,6 @@ impl SessionActor {
                     &mcp_server_configs,
                     cwd,
                 ));
-            let managed_count = mcp_server_configs
-                .iter()
-                .filter(|c| {
-                    mcp_server_name(c).starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX)
-                })
-                .count() as u32;
-            self.events
-                .emit(xai_file_utils::events::Event::McpManagedConfigResult {
-                    server_count: managed_count,
-                    error: None,
-                });
         }
         let configs_to_start: Vec<_> = mcp_server_configs
             .iter()
@@ -1238,7 +978,7 @@ impl SessionActor {
             } else {
                 mcp_state.cancel_init();
                 self.events
-                    .emit(xai_file_utils::events::Event::McpInitCancelled {
+                    .emit(xai_grok_session_events::Event::McpInitCancelled {
                         reason: MCP_INIT_CANCELLED_CONFIG_CHANGED.to_string(),
                     });
             }
@@ -1267,7 +1007,7 @@ impl SessionActor {
             "Starting MCP initialization ({} new servers, {} already initialized, strategy: {:?})",
             configs_to_start.len(),
             existing_client_names.len(),
-            self.mcp_strategy
+            self.mcp_strategy.get()
         );
         let session_id = self.session_info.id.0.as_ref();
         tokio::task::yield_now().await;
@@ -1288,7 +1028,7 @@ impl SessionActor {
         let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
             session_id,
             &spawn_writer,
-            OauthInteractivity::from_non_interactive(self.startup_hints.non_interactive),
+            OauthInteractivity::from_non_interactive(self.attach_non_interactive.get()),
             self.tool_context.process_scope.as_ref(),
         );
         let mcp_results = build_pending_clients(
@@ -1319,7 +1059,7 @@ impl SessionActor {
                         .iter()
                         .find(|c| mcp_server_name(c) == sname.as_str());
                     self.events
-                        .emit(xai_file_utils::events::Event::McpServerFailed {
+                        .emit(xai_grok_session_events::Event::McpServerFailed {
                             server_name: sname,
                             transport: cfg.map(|c| mcp_transport_str(c).to_string()),
                             target: cfg.map(mcp_target_str),
@@ -1341,7 +1081,7 @@ impl SessionActor {
             if mcp_state.generation() != generation {
                 mcp_state.cancel_init();
                 self.events
-                    .emit(xai_file_utils::events::Event::McpInitCancelled {
+                    .emit(xai_grok_session_events::Event::McpInitCancelled {
                         reason: MCP_INIT_CANCELLED_CONFIG_CHANGED.to_string(),
                     });
                 return;
@@ -1406,7 +1146,7 @@ impl SessionActor {
             })
             .collect();
         let server_count = (mcp_server_configs.len() + acp_pending_names.len()) as u32;
-        let mcp_strategy = self.mcp_strategy;
+        let mcp_strategy = self.mcp_strategy.get();
         let is_reinit = !existing_client_names.is_empty();
         let event_writer = self.events.writer();
         let init_total_bg = init_total;
@@ -1432,7 +1172,7 @@ impl SessionActor {
                     let server_name = client.server_name().to_string();
                     let server_start = std::time::Instant::now();
                     let timeout_sec = client.startup_timeout_sec();
-                    ew.emit(xai_file_utils::events::Event::McpServerStarting {
+                    ew.emit(xai_grok_session_events::Event::McpServerStarting {
                         server_name: server_name.clone(),
                         transport: transport.clone(),
                         target,
@@ -1461,13 +1201,7 @@ impl SessionActor {
                             Ok((server_name, handles, server_start.elapsed(), timeout_sec))
                         }
                         Err(e) => {
-                            let needs_auth = if server_name
-                                .starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX)
-                            {
-                                e.is_auth_rejection()
-                            } else {
-                                client.has_auth()
-                            };
+                            let needs_auth = client.has_auth();
                             tracing::warn!(
                                 server = server_name.as_str(),
                                 elapsed_ms = server_start.elapsed().as_millis() as u64,
@@ -1514,7 +1248,7 @@ impl SessionActor {
                         generation,
                         mcp_state.generation()
                     );
-                    event_writer.emit(xai_file_utils::events::Event::McpInitCancelled {
+                    event_writer.emit(xai_grok_session_events::Event::McpInitCancelled {
                         reason: MCP_INIT_CANCELLED_CONFIG_CHANGED.to_string(),
                     });
                     return;
@@ -1606,7 +1340,7 @@ impl SessionActor {
                                             e
                                         );
                                         event_writer
-                                            .emit(xai_file_utils::events::Event::McpToolRegistrationFailed {
+                                            .emit(xai_grok_session_events::Event::McpToolRegistrationFailed {
                                                 server_name: server_name.clone(),
                                                 tool_name: qualified_name.clone(),
                                                 error: e.to_string(),
@@ -1641,7 +1375,7 @@ impl SessionActor {
                                 .get(server_name.as_str())
                                 .copied()
                                 .unwrap_or("unknown");
-                            event_writer.emit(xai_file_utils::events::Event::McpServerConnected {
+                            event_writer.emit(xai_grok_session_events::Event::McpServerConnected {
                                 server_name: server_name.clone(),
                                 transport: transport_str.to_string(),
                                 tool_count,
@@ -1666,15 +1400,15 @@ impl SessionActor {
                         }
                         Err((server_name, ref e, needs_auth, elapsed, timeout_sec)) => {
                             let error_cat = if needs_auth {
-                                xai_file_utils::events::McpErrorCategory::AuthRequired
+                                xai_grok_session_events::McpErrorCategory::AuthRequired
                             } else {
                                 e.error_category()
                             };
                             let error_type_label = match error_cat {
-                                xai_file_utils::events::McpErrorCategory::AuthRequired => {
+                                xai_grok_session_events::McpErrorCategory::AuthRequired => {
                                     xai_grok_telemetry::events::McpErrorType::Auth
                                 }
-                                xai_file_utils::events::McpErrorCategory::Timeout => {
+                                xai_grok_session_events::McpErrorCategory::Timeout => {
                                     xai_grok_telemetry::events::McpErrorType::Timeout
                                 }
                                 _ => xai_grok_telemetry::events::McpErrorType::HandshakeFailed,
@@ -1703,7 +1437,7 @@ impl SessionActor {
                                 None,
                                 Some(error_type_label.as_str()),
                             );
-                            event_writer.emit(xai_file_utils::events::Event::McpServerFailed {
+                            event_writer.emit(xai_grok_session_events::Event::McpServerFailed {
                                 server_name: server_name.clone(),
                                 transport: Some(transport_str.to_string()),
                                 target: server_target_map.get(server_name.as_str()).cloned(),
@@ -1732,21 +1466,6 @@ impl SessionActor {
                     .collect();
                 for c in mcp_clients {
                     let arc = std::sync::Arc::new(c);
-                    // Arms BEFORE inserting — deliberately the opposite of
-                    // `respawn_stdio`, which must insert first. Both are
-                    // correct, for a reason specific to this site: the
-                    // `mcp_state` guard taken above is held across this whole
-                    // loop, so the dispatcher cannot acquire the lock and
-                    // observe a client that is watched but not yet in
-                    // `owned_clients`. `respawn_stdio` re-locks between the
-                    // two, which is exactly the window it has to avoid.
-                    //
-                    // The early-death budget is safe here too: this is the
-                    // initial handshake, so `ensure_initialized` already
-                    // emitted `Ready` before this loop, and `flush_window`
-                    // applies it (`note_recovery_ready`) before
-                    // `maybe_schedule_restart` classifies any death from the
-                    // same coalesce window.
                     let _ = arc
                         .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
                         .await;
@@ -1775,7 +1494,7 @@ impl SessionActor {
                         is_reinit,
                     },
                 );
-                event_writer.emit(xai_file_utils::events::Event::McpInitCompleted {
+                event_writer.emit(xai_grok_session_events::Event::McpInitCompleted {
                     total_servers: server_count,
                     succeeded: servers_succeeded,
                     failed: servers_failed,
@@ -1940,112 +1659,50 @@ pub(super) struct McpAnnouncementSnapshot {
     pub(super) text: String,
     pub(super) server_count: usize,
 }
-
-/// Source-scanning guards for the `respawn_stdio_then` arm/insert ordering
-/// invariant (issue #173). The invariant exists to keep the #45
-/// early-death budget refund closed: once the liveness watcher is armed,
-/// the post-arm tail must contain no scheduler-yield shapes before
-/// returning, and the new client must already be in `owned_clients` so a
-/// same-window
-/// `TransportClosed` is classified against the NEW client's
-/// `last_ready_at`, not the previous one's. A runtime test for this is a
-/// timing race this crate has no harness for, so — like
-/// `no_clap_doc_comment_hardcodes_the_state_directory` in the pager —
-/// the shape is asserted against the source text instead. The comment
-/// above the insert in `respawn_stdio_then` explains WHY the shape matters;
-/// these tests prove the shape itself. `arm_liveness_watcher_then`'s
-/// post-spawn tail guard lives in `xai-grok-mcp`'s `servers.rs` tests.
-#[cfg(test)]
-mod respawn_ordering_guard_tests {
-    /// Returns the body (outermost braces included) of the first function
-    /// whose signature contains `sig`.
-    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
-        let start = src
-            .find(sig)
-            .unwrap_or_else(|| panic!("signature `{sig}` not found in scanned source"));
-        let after_sig = &src[start..];
-        let open = after_sig
-            .find('{')
-            .unwrap_or_else(|| panic!("no body braces after `{sig}`"));
-        let mut depth = 0usize;
-        for (offset, ch) in after_sig.char_indices().skip(open) {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &after_sig[open..=offset];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("unbalanced braces scanning the body of `{sig}`");
+/// Render the "MCP servers currently connecting" system reminder
+/// (pure rendering — see `maybe_inject_mcp_connecting_reminder`).
+///
+/// Sessions that declared `startupHints.deliveryTools` get different
+/// guidance. On surfaces that declare delivery tools the user sees output
+/// ONLY through those MCP tools (e.g. a message-posting tool), and the
+/// servers providing them are exactly the ones listed as still connecting.
+/// The default wording ("proceed with what you can do in the meantime")
+/// steers the model into answering in plain text and ending the turn, i.e.
+/// replying into a void on such surfaces. Keying on the explicit opt-in —
+/// not on `nonInteractive` — keeps the default for every other client
+/// (SDK/stdio consumers DO read plain-text responses; subagents report to
+/// their parent). Declaring sessions typically also run
+/// `McpInitStrategy::Blocking`, so handshakes are awaited at turn start and
+/// the servers are expected to become ready while the model works — the
+/// right guidance is to keep working and deliver through the tool, not to
+/// skip it.
+pub(super) fn format_mcp_connecting_reminder(
+    connecting: &[String],
+    delivery_tools: &[String],
+) -> String {
+    let mut text =
+        "MCP servers currently connecting (tools will become available shortly):\n".to_string();
+    for name in connecting {
+        text.push_str(&format!("- {name}\n"));
     }
-
-    #[test]
-    fn respawn_stdio_then_inserts_before_arming_and_has_no_post_arm_yields() {
-        let body = fn_body(include_str!("mcp.rs"), "async fn respawn_stdio_then");
-        let insert = body
-            .find(".insert(server.to_string()")
-            .expect("owned_clients insert not found in respawn_stdio_then");
-        // The call, not the comment above it (the comment says
-        // `arm_liveness_watcher_then` without the `.` receiver).
-        let arm = body
-            .find(".arm_liveness_watcher_then(")
-            .expect("arm_liveness_watcher_then call not found in respawn_stdio_then");
-        assert!(
-            insert < arm,
-            "respawn_stdio_then arms the liveness watcher BEFORE the owned_clients \
-             insert. That reopens the #45 budget-refund race the insert-first \
-             order was chosen to close (#168): a TransportClosed emitted in the \
-             same dispatcher window would be classified against the PREVIOUS \
-             client's last_ready_at, and once that is older than \
-             STABILITY_WINDOW the not-early branch resets the early-death \
-             counter. Insert first, arm last; see the comment above the insert \
-             in respawn_stdio_then and issue #173."
+    if delivery_tools.is_empty() {
+        text.push_str(
+            "\nDo not attempt to use tools from these servers yet. \
+             If the user's request likely requires one of these servers, \
+             mention that the server is still connecting and proceed with \
+             what you can do in the meantime.",
         );
-        let arm_tail = &body[arm..];
-        assert!(
-            arm_tail.contains("note_ready"),
-            "respawn_stdio_then must pass note_ready into \
-             arm_liveness_watcher_then so readiness bookkeeping happens in the \
-             same call chain that arms the watcher."
-        );
-        // The arm's own `.await` is the awaited spawn-and-callback return;
-        // everything after it must run straight through.
-        let arm_await_end = body[arm..]
-            .find(".await;")
-            .map(|i| arm + i + ".await;".len())
-            .expect("arm_liveness_watcher_then call is not awaited in respawn_stdio_then");
-        let ok = body
-            .rfind("Ok(())")
-            .expect("closing Ok(()) not found in respawn_stdio_then");
-        assert!(
-            arm_await_end <= ok,
-            "respawn_stdio_then's closing Ok(()) moved above \
-             arm_liveness_watcher_then; the watcher must be armed as the LAST \
-             thing this function does (#45 / #173)."
-        );
-        let between = &body[arm_await_end..ok];
-        for forbidden in [
-            ".await",
-            "select!",
-            "join!",
-            "try_join!",
-            "yield_now",
-            "block_in_place",
-            "tokio::spawn(",
-            "spawn_local(",
-        ] {
-            assert!(
-                !between.contains(forbidden),
-                "respawn_stdio_then contains `{forbidden}` between \
-                 arm_liveness_watcher_then and Ok(()): `{between}`. That \
-                 scheduling point can let the dispatcher classify a new \
-                 client's death against the previous client's last_ready_at and \
-                 refund the early-death budget (#45/#173)."
-            );
-        }
+    } else {
+        text.push_str(&format!(
+            "\nThese servers are being awaited and their tools are expected \
+             to become available as you work — use them normally, and if a \
+             call reports the tool as unavailable, retry it after your other \
+             work rather than giving up. User-visible output from this \
+             session is delivered ONLY through: {}. Do NOT end the turn \
+             without delivering your answer through the appropriate \
+             delivery tool.",
+            delivery_tools.join(", ")
+        ));
     }
+    text
 }

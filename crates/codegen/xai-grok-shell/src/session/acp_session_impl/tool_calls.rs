@@ -115,9 +115,9 @@ fn interrupted_wait_tool_result_with_msg(args: &serde_json::Value, msg: &str) ->
     ToolRunResult {
         output: ToolsToolOutput::TaskOutput(TaskOutputOutput::Result(result)),
         prompt_text: msg.to_string(),
-        trusted_prompt_suffix: String::new(),
-        trusted_prompt_reminders: Vec::new(),
         effective_tool_name: None,
+        trusted_prompt_reminders: vec![],
+        trusted_prompt_suffix: String::new(),
     }
 }
 /// Clears `awaiting_plan_approval` (and re-persists) when the
@@ -394,7 +394,7 @@ impl SessionActor {
                 self.chat_state_handle.push_user_message(chat);
             }
         }
-        self.drain_pending_interjections().await;
+        self.drain_interjections_at_safe_point().await;
         self.flush_pending_skill_reminders().await;
         if let Some(final_result) = final_result {
             return Ok(final_result);
@@ -408,6 +408,10 @@ impl SessionActor {
         deferred_followups: &mut Vec<ConversationItem>,
         final_result: &mut Option<ToolLoop>,
     ) -> Result<(), acp::Error> {
+        if self.permissions.is_auto_mode() {
+            let conversation = self.chat_state_handle.get_conversation().await;
+            super::refresh_classifier_transcript(&self.permissions, &conversation);
+        }
         let mut approved: Vec<PreparedToolCall> = Vec::new();
         for call in tool_calls.into_iter() {
             if final_result.is_some() {
@@ -434,10 +438,8 @@ impl SessionActor {
                         format!("Tool execution cancelled for tool `{}`", call.function.name)
                     }
                 };
-                self.chat_state_handle.push_tool_result(
-                    ConversationItem::tool_result(call.id.clone(), message),
-                    self.tool_result_truncation_policy(),
-                );
+                self.chat_state_handle
+                    .push_tool_result(ConversationItem::tool_result(call.id.clone(), message), None);
                 continue;
             }
             self.emit_event(crate::session::events::Event::ToolStarted {
@@ -469,7 +471,7 @@ impl SessionActor {
                             }
                             other => format!("{other:?}"),
                         };
-                        self.emit_event(xai_file_utils::events::Event::McpToolCallCompleted {
+                        self.emit_event(xai_grok_session_events::Event::McpToolCallCompleted {
                             server_name: server.to_string(),
                             tool_name: tool.to_string(),
                             call_id: format!(
@@ -634,7 +636,7 @@ impl SessionActor {
             .in_current_span(),
         );
         let _drainer_guard = crate::util::AbortOnDrop(drainer);
-        while let Some((idx, mut result, mut duration_ms)) = dispatch_rx.recv().await {
+        while let Some((idx, result, duration_ms)) = dispatch_rx.recv().await {
             let prepared = approved_slots[idx]
                 .take()
                 .expect("dispatch index should match an approved slot exactly once");
@@ -655,42 +657,6 @@ impl SessionActor {
                 duration_ms,
             );
             let mut post_tool_use_result: Option<serde_json::Value> = None;
-            if let Some((server, _)) =
-                crate::session::mcp_servers::parse_mcp_tool_name(&prepared.tool_name)
-                && server.starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX)
-            {
-                let auth_rejected = match &result {
-                    Err(err) => xai_grok_mcp::servers::is_auth_rejection_message(&err.to_string()),
-                    Ok(tool_result) => {
-                        tool_result.output.is_error()
-                            && xai_grok_mcp::servers::is_auth_rejection_message(
-                                &tool_result.prompt_text,
-                            )
-                    }
-                };
-                if auth_rejected && self.reactive_managed_reauth(&server).await.is_ok() {
-                    let retry_start = std::time::Instant::now();
-                    let retry_span = tool_execution_span(
-                        &tracing::Span::current(),
-                        &self.session_info.id.0,
-                        &prepared,
-                        &tool_call_id,
-                        true,
-                    );
-                    let retry_span_for_record = retry_span.clone();
-                    result = dispatch_tool(&self.workspace_ops, &prepared, &self.session_info.id.0)
-                        .instrument(retry_span)
-                        .await;
-                    duration_ms =
-                        duration_ms.saturating_add(retry_start.elapsed().as_millis() as u64);
-                    record_tool_span_outcome(retry_span_for_record, &result);
-                    self.events.tool_started(
-                        prepared.tool_name.clone(),
-                        tool_call_id.clone(),
-                        duration_ms,
-                    );
-                }
-            }
             let tool_result_size_bytes = match &result {
                 Ok(tool_result) => tool_result.prompt_text.len() as i64,
                 Err(_) => 0,
@@ -708,7 +674,7 @@ impl SessionActor {
                         .unwrap_or_else(|| prepared.tool_name.clone());
                     let drained = DrainedToolSuccess::new(tool_result);
                     post_tool_use_result = self
-                        .hook_event_active(xai_grok_hooks::event::HookEventName::PostToolUse)
+                        .may_have_hooks_for(xai_grok_hooks::event::HookEventName::PostToolUse)
                         .then(|| {
                             serde_json::to_value(drained.output())
                                 .unwrap_or(serde_json::Value::Null)
@@ -746,9 +712,9 @@ impl SessionActor {
                         )
                         .await;
                     deferred_followups.extend(err_followups);
-                    if self
-                        .hook_event_active(xai_grok_hooks::event::HookEventName::PostToolUseFailure)
-                    {
+                    if self.may_have_hooks_for(
+                        xai_grok_hooks::event::HookEventName::PostToolUseFailure,
+                    ) {
                         let raw_input: serde_json::Value =
                             serde_json::from_str(&prepared.raw_arguments)
                                 .unwrap_or(serde_json::Value::Null);
@@ -912,17 +878,14 @@ impl SessionActor {
             let _span = tracing::info_span!("tool.register").entered();
             let early_raw_input =
                 serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok();
-            let subagent_background = matches!(
-                call.function.name.as_str(),
-                "task" | "Task" | "spawn_subagent"
-            )
-            .then(|| {
-                early_raw_input
-                    .as_ref()
-                    .and_then(|v| v.get("run_in_background").or_else(|| v.get("background")))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true)
-            });
+            let subagent_background =
+                xai_grok_tools::implementations::grok_build::task::is_task_tool_id(&call.function.name).then(|| {
+                    early_raw_input
+                        .as_ref()
+                        .and_then(|v| v.get("run_in_background").or_else(|| v.get("background")))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true)
+                });
             let mut meta = self.stamp_tool_meta(None, &call.function.name, None);
             if let Some(bg) = subagent_background {
                 meta.get_or_insert_with(serde_json::Map::new).insert(
@@ -944,14 +907,8 @@ impl SessionActor {
         }
         let mcp_parts = parse_mcp_tool_name(&call.function.name);
         let is_mcp_tool = mcp_parts.is_some();
-        if let Some((ref server, _)) = mcp_parts
-            && server.starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX)
-        {
-            let _span = tracing::info_span!("tool.refresh_managed_mcp").entered();
-            self.refresh_managed_mcp_if_stale().await;
-        }
         if is_mcp_tool && !self.mcp_state.lock().await.is_initialized() {
-            match self.mcp_strategy {
+            match self.mcp_strategy.get() {
                 McpInitStrategy::Blocking => {
                     let _span = tracing::info_span!("tool.wait_mcp_init").entered();
                     self.wait_for_mcp_initialized().await;
@@ -980,7 +937,7 @@ impl SessionActor {
         );
         let parse_result = serde_json::from_str::<serde_json::Value>(args_str);
         let mut concatenated_json_count: usize = 0;
-        let raw_input = match &parse_result {
+        let mut raw_input = match &parse_result {
             Ok(value) => value.clone(),
             Err(e) => {
                 if let Some(objects) = crate::session::helpers::tool_input_parsing::try_extract_concatenated_json_objects(
@@ -1028,13 +985,11 @@ impl SessionActor {
                 }
             }
         };
-        let tool_input = match self
-            .agent
-            .borrow()
-            .tool_bridge()
+        let parsed = self
+            .tool_bridge_handle()
             .try_parse(&call.function.name, raw_input.clone())
-            .await
-        {
+            .await;
+        let mut tool_input = match parsed {
             Ok(input) => input,
             Err(err) => {
                 self.handle_tool_parse_error(
@@ -1049,49 +1004,19 @@ impl SessionActor {
                 return Ok(Err(ToolLoop::ToolParsingError));
             }
         };
-        let access_kind = AccessKind::from(&tool_input);
-        let plan_gate = plan_mode_edit_gate(&self.plan_mode.lock(), &tool_input, &access_kind);
-        if plan_gate != PlanEditGate::Allow {
-            tracing::info_span!(
-                "tool.decision",
-                tool_name = %call.function.name,
-                tool_use_id = %call.id,
-                decision = "deny",
-                source = "plan_mode",
-                wait_ms = 0_i64,
-            )
-            .in_scope(|| {});
-            let msg = self.plan_mode_edit_rejected_message().await;
-            self.handle_tool_not_executed(&call.id, &tool_call_id, msg)
-                .await?;
-            return Ok(Err(ToolLoop::Continue));
-        }
-        let tool_call_display = self
-            .send_tool_call_start(&tool_call_id, &call.function.name, tool_input.clone())
-            .await;
         let _recovered_raw_input = if concatenated_json_count > 0 {
             Some(raw_input.clone())
         } else {
             None
         };
-        let dispatch_target_name = tool_input.dispatch_target_name();
-        let resolved_tool_name = dispatch_target_name
+        let mut dispatch_target_name = tool_input.dispatch_target_name();
+        let mut resolved_tool_name = dispatch_target_name
             .clone()
             .unwrap_or_else(|| call.function.name.clone());
-        if self.hook_event_active(xai_grok_hooks::event::HookEventName::PreToolUse) {
-            let (hook_tool_input, hook_tool_input_truncated) =
-                xai_grok_hooks::event::truncate_payload(raw_input.clone());
-            let envelope = self.make_hook_envelope(
-                xai_grok_hooks::event::HookEventName::PreToolUse,
-                None,
-                xai_grok_hooks::event::HookPayload::PreToolUse {
-                    tool_name: resolved_tool_name.clone(),
-                    tool_use_id: call.id.clone(),
-                    tool_input: hook_tool_input,
-                    tool_input_truncated: hook_tool_input_truncated,
-                    subagent_type: self.subagent_type_label(),
-                },
-            );
+        let mut raw_arguments = call.function.arguments.clone();
+        if self.may_have_hooks_for(xai_grok_hooks::event::HookEventName::PreToolUse) {
+            let mut envelope =
+                self.make_pre_tool_use_envelope(&resolved_tool_name, &call.id, &raw_input);
             let hook_registry_snapshot = self.hook_registry.borrow().clone();
             if let Some(registry) = hook_registry_snapshot {
                 let ctx = self.hook_run_ctx();
@@ -1124,6 +1049,35 @@ impl SessionActor {
                         )
                         .await?));
                 }
+                if let Some(rewrite) = pre_result.updated_input {
+                    let updated = rewrite.input;
+                    let updated_args = updated.to_string();
+                    let parsed = self
+                        .tool_bridge_handle()
+                        .try_parse(&call.function.name, updated.clone())
+                        .await;
+                    tool_input = match parsed {
+                        Ok(input) => input,
+                        Err(err) => {
+                            let msg = format!(
+                                "PreToolUse hook '{}' returned an invalid updatedInput: {err}",
+                                rewrite.hook_name
+                            );
+                            self.handle_tool_not_executed(&call.id, &tool_call_id, msg)
+                                .await?;
+                            return Ok(Err(ToolLoop::ToolParsingError));
+                        }
+                    };
+                    dispatch_target_name = tool_input.dispatch_target_name();
+                    resolved_tool_name = dispatch_target_name
+                        .clone()
+                        .unwrap_or_else(|| call.function.name.clone());
+                    raw_arguments = updated_args;
+                    raw_input = updated;
+                    concatenated_json_count = 0;
+                    envelope =
+                        self.make_pre_tool_use_envelope(&resolved_tool_name, &call.id, &raw_input);
+                }
             }
             if let Some(denied) = self
                 .run_pre_tool_use_client_hook(&call, &tool_call_id, &envelope)
@@ -1132,6 +1086,26 @@ impl SessionActor {
                 return Ok(Err(denied));
             }
         }
+        let access_kind = AccessKind::from(&tool_input);
+        let plan_gate = plan_mode_edit_gate(&self.plan_mode.lock(), &tool_input, &access_kind);
+        if plan_gate != PlanEditGate::Allow {
+            tracing::info_span!(
+                "tool.decision",
+                tool_name = %call.function.name,
+                tool_use_id = %call.id,
+                decision = "deny",
+                source = "plan_mode",
+                wait_ms = 0_i64,
+            )
+            .in_scope(|| {});
+            let msg = self.plan_mode_edit_rejected_message().await;
+            self.handle_tool_not_executed(&call.id, &tool_call_id, msg)
+                .await?;
+            return Ok(Err(ToolLoop::Continue));
+        }
+        let tool_call_display = self
+            .send_tool_call_start(&tool_call_id, &call.function.name, tool_input.clone())
+            .await;
         let plan_file_auto_approve = if let AccessKind::Edit(ref path) = access_kind {
             self.plan_mode
                 .lock()
@@ -1214,22 +1188,6 @@ impl SessionActor {
                 !self.session_info.id.0.is_empty(),
                 "permission reverse-request must carry a non-empty sessionId (design §5.4)"
             );
-            if !self.permissions.is_yolo_mode() {
-                self.dispatch_notification_hook(
-                    "permission_prompt",
-                    Some("Tool permission requested".into()),
-                    None,
-                    Some("info".into()),
-                )
-                .await;
-            }
-            if self.permissions.is_auto_mode() {
-                let conv = self.chat_state_handle.get_conversation().await;
-                let turns = super::build_classifier_turns(&conv, super::CLASSIFIER_REFRESH_TURNS);
-                if !turns.is_empty() {
-                    self.permissions.set_classifier_transcript(turns);
-                }
-            }
             let path_context = Some(xai_grok_workspace::permission::types::RequestPathContext {
                 real_cwd: std::path::PathBuf::from(self.session_info.cwd.as_str()),
                 display_cwd: self
@@ -1263,16 +1221,16 @@ impl SessionActor {
                 &call.function.name,
                 match &decision {
                     Decision::Allow | Decision::Ask => {
-                        xai_file_utils::events::types::PermissionDecision::Allow
+                        xai_grok_session_events::types::PermissionDecision::Allow
                     }
                     Decision::Reject(_) | Decision::PolicyDeny(_) => {
-                        xai_file_utils::events::types::PermissionDecision::Deny
+                        xai_grok_session_events::types::PermissionDecision::Deny
                     }
                     Decision::Cancelled => {
-                        xai_file_utils::events::types::PermissionDecision::Cancelled
+                        xai_grok_session_events::types::PermissionDecision::Cancelled
                     }
                     Decision::FollowupMessage(_) => {
-                        xai_file_utils::events::types::PermissionDecision::Followup
+                        xai_grok_session_events::types::PermissionDecision::Followup
                     }
                 },
                 perm_start,
@@ -1426,8 +1384,7 @@ impl SessionActor {
                         self.send_update(acp::SessionUpdate::ToolCallUpdate(tool_update), None)
                             .await;
                         let tool_chat = ConversationItem::tool_result(call.id.clone(), message);
-                        self.chat_state_handle
-                            .push_tool_result(tool_chat, self.tool_result_truncation_policy());
+                        self.chat_state_handle.push_tool_result(tool_chat, None);
                         return Ok(Err(ToolLoop::Continue));
                     }
                     PlanApprovalOutcome::Cancelled => {
@@ -1449,8 +1406,7 @@ impl SessionActor {
                         self.send_update(acp::SessionUpdate::ToolCallUpdate(tool_update), None)
                             .await;
                         let tool_chat = ConversationItem::tool_result(call.id.clone(), message);
-                        self.chat_state_handle
-                            .push_tool_result(tool_chat, self.tool_result_truncation_policy());
+                        self.chat_state_handle.push_tool_result(tool_chat, None);
                         return Ok(Err(ToolLoop::Continue));
                     }
                     PlanApprovalOutcome::Approved => {
@@ -1509,7 +1465,7 @@ impl SessionActor {
             call_id: call.id.clone(),
             tool_call_id,
             tool_name: call.function.name.clone(),
-            raw_arguments: call.function.arguments.clone(),
+            raw_arguments,
             parsed_args: raw_input.clone(),
             model_id: model_id_str,
             concatenated_json_count,
@@ -1549,13 +1505,8 @@ impl SessionActor {
                 .expect("ExitPlanModeExtRequest serialization should not fail")
                 .into(),
         );
-        self.dispatch_notification_hook(
-            "permission_prompt",
-            Some("Plan approval requested".into()),
-            None,
-            Some("info".into()),
-        )
-        .await;
+        self.dispatch_permission_prompt_notification("Plan approval requested")
+            .await;
         self.plan_mode.lock().set_awaiting_plan_approval(true);
         self.persist_plan_mode_state();
         let clear_awaiting = AwaitingApprovalGuard(self);
@@ -2093,6 +2044,26 @@ impl SessionActor {
             trigger: xai_grok_telemetry::events::SkillTrigger::SkillMdRead,
         });
     }
+    fn make_pre_tool_use_envelope(
+        &self,
+        resolved_tool_name: &str,
+        call_id: &str,
+        input: &serde_json::Value,
+    ) -> xai_grok_hooks::event::HookEventEnvelope {
+        let (tool_input, tool_input_truncated) =
+            xai_grok_hooks::event::truncate_payload(input.clone());
+        self.make_hook_envelope(
+            xai_grok_hooks::event::HookEventName::PreToolUse,
+            None,
+            xai_grok_hooks::event::HookPayload::PreToolUse {
+                tool_name: resolved_tool_name.to_string(),
+                tool_use_id: call_id.to_string(),
+                tool_input,
+                tool_input_truncated,
+                subagent_type: self.subagent_type_label(),
+            },
+        )
+    }
     async fn handle_tool_parse_error(
         &self,
         tool_call_id: &acp::ToolCallId,
@@ -2125,8 +2096,7 @@ impl SessionActor {
         )
         .await;
         let tool_chat = ConversationItem::tool_result(call_id.to_string(), message);
-        self.chat_state_handle
-            .push_tool_result(tool_chat, self.tool_result_truncation_policy());
+        self.chat_state_handle.push_tool_result(tool_chat, None);
         Ok(())
     }
     /// Sweep `pending_inputs` and `pending_notifications` for entries
@@ -2367,68 +2337,29 @@ impl SessionActor {
             self.send_update(acp::SessionUpdate::Plan(acp_plan), None)
                 .await;
         }
-        let ToolRunResult {
-            output,
-            prompt_text,
-            mut trusted_prompt_suffix,
-            mut trusted_prompt_reminders,
-            ..
-        } = result;
         #[allow(unused_mut)]
-        let mut prompt_text = if trusted_prompt_suffix.is_empty() {
-            // Structured metadata cannot authenticate itself without the exact
-            // suffix compatibility field and boundary.
-            trusted_prompt_reminders.clear();
-            prompt_text
-        } else {
-            match split_and_rewrite_trusted_reminders(
-                prompt_text,
-                &trusted_prompt_suffix,
-                std::mem::take(&mut trusted_prompt_reminders),
-                path_rewriter.as_ref(),
-            ) {
-                Ok((raw, rewritten_suffix, rewritten_reminders)) => {
-                    trusted_prompt_suffix = rewritten_suffix;
-                    trusted_prompt_reminders = rewritten_reminders;
-                    raw
-                }
-                Err(prompt_text) => {
-                    tracing::error!(
-                        session_id = %self.session_info.id,
-                        tool = requested_tool_name,
-                        "trusted tool reminder suffix did not match prompt text; treating all text as untrusted"
-                    );
-                    trusted_prompt_suffix.clear();
-                    trusted_prompt_reminders.clear();
-                    prompt_text
-                }
-            }
-        };
-        if concatenated_json_count > 0 && !self.is_cursor_harness() {
+        let mut prompt_text = if concatenated_json_count > 0 && !self.is_cursor_harness() {
             let remaining = concatenated_json_count - 1;
-            let reminder = format!(
-                "<system-reminder>\nIMPORTANT: Your tool call contained {} concatenated JSON \
+            format!(
+                "{}\n\n<system-reminder>\nIMPORTANT: Your tool call contained {} concatenated JSON \
                  objects, but only the best-matching one was executed. The remaining {} \
                  were ignored. You MUST use separate tool calls (one per operation) \
                  instead of concatenating multiple JSON objects in a single call's \
                  arguments. Make {} individual tool call{} for the remaining \
                  operations.\n</system-reminder>",
+                result.prompt_text,
                 concatenated_json_count,
                 remaining,
                 remaining,
                 if remaining == 1 { "" } else { "s" },
-            );
-            append_trusted_prompt_reminder(
-                &mut trusted_prompt_suffix,
-                &mut trusted_prompt_reminders,
-                !prompt_text.is_empty(),
-                reminder,
-            );
-        }
+            )
+        } else {
+            result.prompt_text
+        };
         let mut inline_images: Vec<ContentPart> = Vec::new();
         let extraction = if !self.is_cursor_harness()
             && !matches!(
-                output,
+                result.output,
                 ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(_))
                     | ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(_))
             ) {
@@ -2448,7 +2379,7 @@ impl SessionActor {
         let mut prompt_text = maybe_rewrite(path_rewriter.as_ref(), extraction.text);
         if !self.is_cursor_harness()
             && let ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(ref image_content)) =
-                output
+                result.output
         {
             let path = tool_parsed_args
                 .get("target_file")
@@ -2480,7 +2411,7 @@ impl SessionActor {
             }
         }
         if !self.is_cursor_harness()
-            && let ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(ref pdf)) = output
+            && let ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(ref pdf)) = result.output
         {
             for page in &pdf.pages {
                 let url = format!("data:{};base64,{}", page.mime_type, page.data);
@@ -2508,26 +2439,7 @@ impl SessionActor {
                 inline_images,
             )
         };
-        let trusted_suffix = (!trusted_prompt_suffix.is_empty()).then(|| {
-            xai_chat_state::types::TrustedPromptSuffix {
-                exact: trusted_prompt_suffix,
-                reminders: trusted_prompt_reminders
-                    .into_iter()
-                    .map(|message| xai_chat_state::types::TrustedReminderMessage {
-                        prefix: message.prefix,
-                        payload: message.payload,
-                        suffix: message.suffix,
-                        completion_ids: message.completion_ids,
-                    })
-                    .collect(),
-            }
-        });
-        self.chat_state_handle
-            .push_tool_result_with_structured_suffix(
-                tool_chat,
-                self.tool_result_truncation_policy(),
-                trusted_suffix,
-            );
+        self.chat_state_handle.push_tool_result(tool_chat, None);
         let mut deferred_followups = Vec::new();
         if !extracted_images.is_empty() {
             let count = extracted_images.len();
@@ -2558,14 +2470,14 @@ impl SessionActor {
                 std::mem::take(&mut norm_result.dropped),
                 is_cursor_for_tool_result,
             ) {
-                deferred_followups.push(ConversationItem::user(notice));
+                deferred_followups.push(ConversationItem::system_reminder(notice));
                 self.send_xai_notification(XaiSessionUpdate::ImageDropped { notes })
                     .await;
             }
             for norm in norm_result.images {
                 let url = format!("data:{};base64,{}", norm.mime_type, norm.data);
                 let mut image_msg =
-                    ConversationItem::user("[Image extracted from tool result above]");
+                    ConversationItem::system_reminder("[Image extracted from tool result above]");
                 image_msg.add_image(url);
                 deferred_followups.push(image_msg);
             }
@@ -2626,8 +2538,7 @@ impl SessionActor {
         )
         .await;
         let tool_chat = ConversationItem::tool_result(call_id.to_string(), message);
-        self.chat_state_handle
-            .push_tool_result(tool_chat, self.tool_result_truncation_policy());
+        self.chat_state_handle.push_tool_result(tool_chat, None);
         vec![]
     }
     async fn send_thought_chunk(&self, text: String, chunk_index: u64) {
@@ -2770,12 +2681,20 @@ impl SessionActor {
                 })
                 .await;
             }
+            SamplingEvent::AttemptDiscarded { .. } => {}
             SamplingEvent::Completed {
-                response, metrics, ..
+                request_id,
+                response,
+                metrics,
             } => {
                 if let Some(tx) = self.turn_stream_drained.lock().take() {
                     let _ = tx.send(());
                 }
+                let session = Arc::clone(self);
+                let rid = request_id.clone();
+                tokio::task::spawn_local(async move {
+                    session.apply_pending_image_strip(&rid).await;
+                });
                 if let Some(policy) = self.doom_loop_recovery {
                     let triggers = policy.confident_triggers(&response.doom_loop_signals);
                     if !triggers.is_empty() {
@@ -2810,13 +2729,12 @@ impl SessionActor {
             SamplingEvent::ModelMetadata { metadata, .. } => {
                 self.handle_model_metadata_update(metadata).await;
             }
-            SamplingEvent::AttemptDiscarded { .. } => {
-                // Ordered through the high-frequency event pipeline so any
-                // already-queued ChannelToken / ToolCallDelta notifications
-                // for this attempt drain first; the run loop then drops the
-                // ReplayBuffer pending slot without flushing those chunks to
-                // clients, and finally forwards this retraction.
-                self.send_buffered_xai_update(XaiSessionUpdate::AttemptDiscarded)
+            SamplingEvent::ImagesStripped {
+                request_id,
+                stripped_urls,
+                reason,
+            } => {
+                self.handle_images_stripped(request_id, stripped_urls, reason)
                     .await;
             }
             SamplingEvent::Retrying {
@@ -2868,6 +2786,7 @@ impl SessionActor {
                 .await;
             }
             SamplingEvent::Failed { request_id, error } => {
+                self.drop_pending_image_strip(&request_id);
                 xai_grok_telemetry::unified_log::error(
                     "shell.turn.inference_failed",
                     Some(self.session_info.id.0.as_ref()),
@@ -2975,125 +2894,9 @@ impl SessionActor {
         self.send_update(acp::SessionUpdate::ToolCallUpdate(tool_update), None)
             .await;
         let tool_chat = ConversationItem::tool_result(model_call_id.to_owned(), reason);
-        self.chat_state_handle
-            .push_tool_result(tool_chat, self.tool_result_truncation_policy());
+        self.chat_state_handle.push_tool_result(tool_chat, None);
         Ok(())
     }
-}
-fn split_and_rewrite_trusted_suffix(
-    mut prompt_text: String,
-    trusted_suffix: &str,
-    path_rewriter: Option<&crate::session::acp_conversion::PathRewriter>,
-) -> Result<(String, String), String> {
-    let Some(raw_len) = prompt_text.strip_suffix(trusted_suffix).map(str::len) else {
-        return Err(prompt_text);
-    };
-    prompt_text.truncate(raw_len);
-    Ok((
-        prompt_text,
-        crate::session::acp_conversion::maybe_rewrite(path_rewriter, trusted_suffix.to_owned()),
-    ))
-}
-
-fn split_and_rewrite_trusted_reminders(
-    prompt_text: String,
-    trusted_suffix: &str,
-    mut reminders: Vec<xai_grok_tools::types::output::ReminderMessage>,
-    path_rewriter: Option<&crate::session::acp_conversion::PathRewriter>,
-) -> Result<
-    (
-        String,
-        String,
-        Vec<xai_grok_tools::types::output::ReminderMessage>,
-    ),
-    String,
-> {
-    let (raw, rewritten_suffix) =
-        split_and_rewrite_trusted_suffix(prompt_text, trusted_suffix, path_rewriter)?;
-    if reminders.is_empty() {
-        return Ok((raw, rewritten_suffix, reminders));
-    }
-    if !reminder_messages_match_suffix(&reminders, trusted_suffix) {
-        tracing::warn!(
-            "structured trusted-reminder metadata did not match exact suffix; using opaque legacy boundary"
-        );
-        return Ok((raw, rewritten_suffix, Vec::new()));
-    }
-    for reminder in &mut reminders {
-        reminder.prefix = crate::session::acp_conversion::maybe_rewrite(
-            path_rewriter,
-            std::mem::take(&mut reminder.prefix),
-        );
-        reminder.payload = crate::session::acp_conversion::maybe_rewrite(
-            path_rewriter,
-            std::mem::take(&mut reminder.payload),
-        );
-        reminder.suffix = crate::session::acp_conversion::maybe_rewrite(
-            path_rewriter,
-            std::mem::take(&mut reminder.suffix),
-        );
-    }
-    if !reminder_messages_match_suffix(&reminders, &rewritten_suffix) {
-        tracing::warn!(
-            "rewritten trusted-reminder metadata diverged from exact suffix; using opaque legacy boundary"
-        );
-        return Ok((raw, rewritten_suffix, Vec::new()));
-    }
-    Ok((raw, rewritten_suffix, reminders))
-}
-
-fn reminder_messages_match_suffix(
-    reminders: &[xai_grok_tools::types::output::ReminderMessage],
-    suffix: &str,
-) -> bool {
-    let mut rest = suffix;
-    for reminder in reminders {
-        let Some(after_prefix) = rest.strip_prefix(&reminder.prefix) else {
-            return false;
-        };
-        let Some(after_payload) = after_prefix.strip_prefix(&reminder.payload) else {
-            return false;
-        };
-        let Some(after_suffix) = after_payload.strip_prefix(&reminder.suffix) else {
-            return false;
-        };
-        rest = after_suffix;
-    }
-    rest.is_empty()
-}
-
-fn append_trusted_prompt_reminder(
-    exact_suffix: &mut String,
-    reminders: &mut Vec<xai_grok_tools::types::output::ReminderMessage>,
-    follows_raw_output: bool,
-    reminder: String,
-) {
-    // Promote an opaque legacy suffix to one structured, truncatable payload
-    // before appending locally-authored metadata. Otherwise chat state would
-    // have to truncate the combined suffix as one blob and could erase the
-    // newer warning entirely.
-    if !exact_suffix.is_empty() && reminders.is_empty() {
-        reminders.push(xai_grok_tools::types::output::ReminderMessage {
-            prefix: String::new(),
-            payload: exact_suffix.clone(),
-            suffix: String::new(),
-            completion_ids: Vec::new(),
-        });
-    }
-    let separator = if exact_suffix.is_empty() {
-        if follows_raw_output { "\n\n" } else { "" }
-    } else {
-        "\n\n"
-    };
-    exact_suffix.push_str(separator);
-    exact_suffix.push_str(&reminder);
-    reminders.push(xai_grok_tools::types::output::ReminderMessage {
-        prefix: separator.to_owned(),
-        payload: reminder,
-        suffix: String::new(),
-        completion_ids: Vec::new(),
-    });
-    debug_assert!(reminder_messages_match_suffix(reminders, exact_suffix));
 }
 /// Execute tool-call display parts. The title peels a redundant leading
 /// `cd <cwd>` for chrome only; `raw_input` is serialized separately and stays full.
@@ -3116,137 +2919,6 @@ fn execute_tool_call_parts(
             acp::TextContent::new(description.unwrap_or_default().to_string()),
         ))],
     )
-}
-#[cfg(test)]
-mod trusted_suffix_path_rewrite_tests {
-    use super::{
-        append_trusted_prompt_reminder, split_and_rewrite_trusted_reminders,
-        split_and_rewrite_trusted_suffix,
-    };
-    use crate::session::acp_conversion::{PathRewriter, maybe_rewrite};
-
-    #[test]
-    fn trusted_reminder_suffix_uses_display_cwd_without_losing_provenance() {
-        let real_cwd = "/tmp/.grok/worktrees/project/fork-123";
-        let display_cwd = "/Users/me/project";
-        let reminder = format!(
-            "\n\n<system-reminder>\nCommand: cd {real_cwd} && cargo test\nOutput file: {real_cwd}/task.log\n</system-reminder>"
-        );
-        let prompt_text = format!("raw tool output from {real_cwd}{reminder}");
-        let rewriter = PathRewriter::new(real_cwd, Some(display_cwd)).unwrap();
-
-        let (raw, trusted_suffix) =
-            split_and_rewrite_trusted_suffix(prompt_text, &reminder, Some(&rewriter)).unwrap();
-        let rewritten_raw = maybe_rewrite(Some(&rewriter), raw);
-
-        assert!(rewritten_raw.contains(display_cwd));
-        assert!(trusted_suffix.contains(display_cwd));
-        assert!(!trusted_suffix.contains(real_cwd));
-        assert!(trusted_suffix.starts_with("\n\n<system-reminder>"));
-    }
-
-    #[test]
-    fn trusted_reminder_suffix_is_split_without_cloning_oversized_prompt() {
-        let reminder = "\n\n<system-reminder>trusted</system-reminder>";
-        let mut prompt_text = String::with_capacity(1024 * 1024);
-        prompt_text.push_str(&"x".repeat(128 * 1024));
-        prompt_text.push_str(reminder);
-        let original_ptr = prompt_text.as_ptr();
-        let original_capacity = prompt_text.capacity();
-
-        let (raw, trusted_suffix) =
-            split_and_rewrite_trusted_suffix(prompt_text, reminder, None).unwrap();
-
-        assert_eq!(raw.as_ptr(), original_ptr);
-        assert_eq!(raw.capacity(), original_capacity);
-        assert_eq!(raw.len(), 128 * 1024);
-        assert_eq!(trusted_suffix, reminder);
-    }
-
-    #[test]
-    fn structured_reminder_parts_use_display_cwd_and_retain_exact_suffix() {
-        let real_cwd = "/tmp/.grok/worktrees/project/fork-456";
-        let display_cwd = "/Users/me/project";
-        let message = xai_grok_tools::types::output::ReminderMessage {
-            prefix: "\n\n<system-reminder>\n".into(),
-            payload: format!("Command: cd {real_cwd} && cargo test"),
-            suffix: format!("\nOutput file: {real_cwd}/task.log\n</system-reminder>"),
-            completion_ids: vec![format!("id-at-{real_cwd}")],
-        };
-        let suffix = message.render();
-        let prompt_text = format!("raw at {real_cwd}{suffix}");
-        let rewriter = PathRewriter::new(real_cwd, Some(display_cwd)).unwrap();
-
-        let (raw, rewritten_suffix, reminders) = split_and_rewrite_trusted_reminders(
-            prompt_text,
-            &suffix,
-            vec![message],
-            Some(&rewriter),
-        )
-        .unwrap();
-
-        assert!(
-            raw.contains(real_cwd),
-            "raw is rewritten later in the pipeline"
-        );
-        assert_eq!(rewritten_suffix, reminders[0].render());
-        assert!(rewritten_suffix.contains(display_cwd));
-        assert!(!rewritten_suffix.contains(real_cwd));
-        assert_eq!(
-            reminders[0].completion_ids,
-            [format!("id-at-{real_cwd}")],
-            "polling identifiers are opaque and must not be path-rewritten"
-        );
-    }
-
-    #[test]
-    fn mismatched_proxy_reminder_metadata_falls_back_to_exact_opaque_suffix() {
-        let suffix = "\n\n<system-reminder>\ntrusted exact\n</system-reminder>";
-        let mismatched = xai_grok_tools::types::output::ReminderMessage {
-            prefix: "\n\n<system-reminder>\n".into(),
-            payload: "different payload".into(),
-            suffix: "\n</system-reminder>".into(),
-            completion_ids: vec!["forged-completion-id".into()],
-        };
-
-        let (raw, exact, reminders) = split_and_rewrite_trusted_reminders(
-            format!("raw{suffix}"),
-            suffix,
-            vec![mismatched],
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(raw, "raw");
-        assert_eq!(exact, suffix);
-        assert!(
-            reminders.is_empty(),
-            "mismatched metadata must not be trusted"
-        );
-    }
-
-    #[test]
-    fn appending_poll_reminder_promotes_prior_legacy_suffix_to_complete_structure() {
-        let legacy = "\n\n<system-reminder>\nlegacy proxy reminder\n</system-reminder>";
-        let poll = "<system-reminder>\npoll reminder\n</system-reminder>";
-        let mut exact = legacy.to_owned();
-        let mut reminders = Vec::new();
-
-        append_trusted_prompt_reminder(&mut exact, &mut reminders, true, poll.to_owned());
-
-        assert_eq!(exact, format!("{legacy}\n\n{poll}"));
-        assert_eq!(reminders.len(), 2);
-        assert_eq!(reminders[0].payload, legacy);
-        assert_eq!(reminders[1].payload, poll);
-        assert_eq!(
-            reminders
-                .iter()
-                .map(|message| message.render())
-                .collect::<String>(),
-            exact,
-            "promoted metadata must cover the complete suffix"
-        );
-    }
 }
 #[cfg(test)]
 mod execute_tool_call_parts_tests {

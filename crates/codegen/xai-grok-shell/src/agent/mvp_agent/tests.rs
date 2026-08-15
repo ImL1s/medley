@@ -67,35 +67,6 @@ fn auth_with_mode(mode: crate::auth::AuthMode, key: &str) -> crate::auth::GrokAu
         expires_at: None,
         oidc_issuer: None,
         oidc_client_id: None,
-        id_token: None,
-        account_id: None,
-        chatgpt_account_is_fedramp: false,
-    }
-}
-#[test]
-fn auth_init_before_and_after_disk_reload_diagnostics_are_secret_free() {
-    let access_before = "GB002-access-before-Q7w5E3r1T9y7";
-    let refresh_before = "GB002-refresh-before-A7s5D3f1G9h7";
-    let access_after = "GB002-access-after-Z9x7C5v3B1n9";
-    let refresh_after = "GB002-refresh-after-M8k6J4h2G0f8";
-    let mut pre = auth_with_mode(crate::auth::AuthMode::Oidc, access_before);
-    pre.refresh_token = Some(refresh_before.to_string());
-    let mut post = auth_with_mode(crate::auth::AuthMode::Oidc, access_after);
-    post.refresh_token = Some(refresh_after.to_string());
-
-    let context = acp_agent::auth_init_disk_refresh_context(Some(&pre), Some(&post));
-    assert_eq!(context["access_relation"], "different");
-    assert_eq!(context["refresh_relation"], "different");
-    assert_eq!(context["access_pre_present"], true);
-    assert_eq!(context["access_post_present"], true);
-    assert_eq!(context["refresh_pre_present"], true);
-    assert_eq!(context["refresh_post_present"], true);
-    let rendered = context.to_string();
-    for secret in [access_before, refresh_before, access_after, refresh_after] {
-        assert!(!rendered.contains(secret));
-        for window in secret.as_bytes().windows(8) {
-            assert!(!rendered.contains(std::str::from_utf8(window).unwrap()));
-        }
     }
 }
 #[test]
@@ -386,85 +357,6 @@ async fn broadcast_refresh_skill_baseline_tolerates_dropped_receiver() {
         rx_alive.try_recv(),
         Ok(crate::session::SessionCommand::RefreshSkillBaseline)
     ));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn invalidate_model_auth_memo_all_sessions_sends_to_each_session() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let agent = build_minimal_agent_for_tests();
-            let sid_a = acp::SessionId::new("sess-memo-a");
-            let sid_b = acp::SessionId::new("sess-memo-b");
-            let (handle_a, _tx_a, mut rx_a) = make_live_session_handle(&sid_a, None);
-            let (handle_b, _tx_b, mut rx_b) = make_live_session_handle(&sid_b, None);
-            agent.session_registry.put_resident(&sid_a, handle_a);
-            agent.session_registry.put_resident(&sid_b, handle_b);
-
-            let n = agent.invalidate_model_auth_memo_all_sessions();
-            assert_eq!(n, 2);
-
-            let cmd_a = tokio::time::timeout(std::time::Duration::from_secs(1), rx_a.recv())
-                .await
-                .expect("timeout waiting for InvalidateModelAuthMemo on A")
-                .expect("channel open");
-            let cmd_b = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
-                .await
-                .expect("timeout waiting for InvalidateModelAuthMemo on B")
-                .expect("channel open");
-            assert!(matches!(
-                cmd_a,
-                crate::session::SessionCommand::InvalidateModelAuthMemo
-            ));
-            assert!(matches!(
-                cmd_b,
-                crate::session::SessionCommand::InvalidateModelAuthMemo
-            ));
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn authenticate_local_none_succeeds_without_credentials() {
-    use acp::Agent as _;
-    let agent = build_minimal_agent_for_tests();
-    assert!(agent.auth_manager.current().is_none());
-    assert!(agent.auth_method_id.load().is_none());
-
-    let resp = agent
-        .authenticate(acp::AuthenticateRequest::new(acp::AuthMethodId::new(
-            crate::agent::auth_method::LOCAL_NONE_METHOD_ID,
-        )))
-        .await
-        .expect("local.none must authenticate without a key");
-    let _ = resp;
-
-    let method = agent.auth_method_id.load();
-    assert_eq!(
-        method.as_ref().map(|m| m.0.as_ref()),
-        Some(crate::agent::auth_method::LOCAL_NONE_METHOD_ID)
-    );
-    assert!(
-        agent.auth_manager.current().is_none(),
-        "local.none must not store a session credential"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn authenticate_local_none_rejected_when_preferred_oidc() {
-    use acp::Agent as _;
-    let agent = build_minimal_agent_for_tests();
-    agent.cfg.borrow_mut().grok_com_config.preferred_method =
-        Some(crate::auth::PreferredAuthMethod::Oidc);
-
-    let err = agent
-        .authenticate(acp::AuthenticateRequest::new(acp::AuthMethodId::new(
-            crate::agent::auth_method::LOCAL_NONE_METHOD_ID,
-        )))
-        .await
-        .expect_err("oidc pin must reject local.none");
-    assert_eq!(err.code, acp::Error::auth_required().code);
-    assert!(agent.auth_method_id.load().is_none());
 }
 /// The monotonic turn counter must never wrap on the DB-bound i32 path.
 /// `allocate_turn_number` returns u64; the AB submission casts to i32.
@@ -901,110 +793,6 @@ fn resolve_agent_definition_acp_profile_wins_for_explicit_grok_build_family() {
         unsafe { std::env::set_var("GROK_AGENT", v) }
     }
 }
-/// A model-declared Markdown definition carries an exact prompt/source
-/// identity even when it otherwise uses the stock wire template and toolset.
-#[test]
-#[serial_test::serial]
-fn resolve_agent_definition_model_selects_nonstrict_custom_prompt() {
-    let prev = std::env::var("GROK_AGENT").ok();
-    unsafe {
-        std::env::remove_var("GROK_AGENT");
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let agents_dir = tmp.path().join(".grok").join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
-    std::fs::write(
-        agents_dir.join("issue-nine-reviewer.md"),
-        "---\nname: issue-nine-reviewer\ndescription: exact custom prompt\n---\nReview issue nine.\n",
-    )
-    .unwrap();
-
-    let acp_profile = xai_grok_agent::AgentDefinition::from_json(&serde_json::json!({
-        "name": "client-profile",
-        "description": "must not replace the model-declared custom harness",
-    }))
-    .unwrap();
-    let def = MvpAgent::resolve_agent_definition(
-        tmp.path(),
-        None,
-        &config::AgentSelectionConfig::default(),
-        Some(acp_profile),
-        Some("issue-nine-reviewer"),
-    );
-
-    assert_eq!(def.name, "issue-nine-reviewer");
-    assert_eq!(def.prompt_body.as_deref(), Some("Review issue nine."));
-    assert!(def.source_path.is_some());
-    assert!(!def.is_strict_harness());
-    match prev {
-        Some(v) => unsafe { std::env::set_var("GROK_AGENT", v) },
-        None => unsafe { std::env::remove_var("GROK_AGENT") },
-    }
-}
-/// Both qualified and unambiguous bare plugin names must resolve to the same
-/// exact non-strict plugin definition rather than the ambient default/profile.
-#[test]
-#[serial_test::serial]
-fn resolve_agent_definition_model_selects_nonstrict_plugin_bare_and_qualified() {
-    let prev = std::env::var("GROK_AGENT").ok();
-    unsafe {
-        std::env::remove_var("GROK_AGENT");
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let plugin_root = tmp.path().join("plugin-one");
-    let agents_dir = plugin_root.join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
-    std::fs::write(plugin_root.join("plugin.json"), r#"{"name":"plugin-one"}"#).unwrap();
-    std::fs::write(
-        agents_dir.join("issue-nine-plugin-reviewer.md"),
-        "---\nname: issue-nine-plugin-reviewer\ndescription: plugin prompt\n---\nReview from plugin one.\n",
-    )
-    .unwrap();
-    let discovery = xai_grok_agent::plugins::discovery::DiscoveryConfig {
-        cli_plugin_dirs: vec![plugin_root],
-        ..Default::default()
-    };
-    let discovered = xai_grok_agent::plugins::discover_plugins(
-        Some(tmp.path()),
-        &discovery,
-        &xai_grok_agent::plugins::TrustStore::load_from(tmp.path().join("trust")),
-        true,
-    );
-    let registry = xai_grok_agent::plugins::PluginRegistry::from_discovered(
-        discovered,
-        &[],
-        &["plugin-one".to_owned()],
-    );
-    let acp_profile = xai_grok_agent::AgentDefinition::from_json(&serde_json::json!({
-        "name": "client-profile",
-        "description": "must not replace the model-declared plugin harness",
-    }))
-    .unwrap();
-
-    for required in [
-        "issue-nine-plugin-reviewer",
-        "plugin-one:issue-nine-plugin-reviewer",
-    ] {
-        let def = MvpAgent::resolve_agent_definition_with_plugins(
-            tmp.path(),
-            None,
-            &config::AgentSelectionConfig::default(),
-            Some(acp_profile.clone()),
-            Some(required),
-            Some(&registry),
-        );
-        assert_eq!(def.name, "issue-nine-plugin-reviewer");
-        assert_eq!(def.plugin_name.as_deref(), Some("plugin-one"));
-        assert_eq!(def.prompt_body.as_deref(), Some("Review from plugin one."));
-        assert!(def.source_path.is_some());
-        assert!(!def.is_strict_harness());
-        assert!(harnesses_are_compatible(&def, required, Some(&def)));
-    }
-    match prev {
-        Some(v) => unsafe { std::env::set_var("GROK_AGENT", v) },
-        None => unsafe { std::env::remove_var("GROK_AGENT") },
-    }
-}
 /// A non-strict (stock / vision-capable) model leaves the template alone, so
 /// such models keep native image input.
 #[test]
@@ -1151,6 +939,32 @@ fn read_session_or_init_meta_str_ignores_non_string_values() {
     );
 }
 #[test]
+fn startup_hints_from_meta_prefers_session_request_over_init() {
+    let session = serde_json::json!({
+        "startupHints": { "nonInteractive": true, "deliveryTools": ["srv__post"] }
+    });
+    let init = serde_json::json!({ "startupHints": { "nonInteractive": false } });
+    let hints = startup_hints_from_meta(session.as_object(), init.as_object());
+    assert!(hints.non_interactive);
+    assert_eq!(hints.delivery_tools, vec!["srv__post"]);
+    assert!(startup_hints_from_meta(None, session.as_object()).non_interactive);
+}
+#[test]
+fn startup_hints_from_meta_session_object_wins_whole_not_merged() {
+    let session = serde_json::json!({ "startupHints": { "skipGitStatus": true } });
+    let init = serde_json::json!({ "startupHints": { "nonInteractive": true } });
+    let hints = startup_hints_from_meta(session.as_object(), init.as_object());
+    assert!(hints.skip_git_status);
+    assert!(!hints.non_interactive);
+}
+#[test]
+fn startup_hints_from_meta_unparseable_falls_through_then_defaults() {
+    let bad = serde_json::json!({ "startupHints": "yes" });
+    let init = serde_json::json!({ "startupHints": { "nonInteractive": true } });
+    assert!(startup_hints_from_meta(bad.as_object(), init.as_object()).non_interactive);
+    assert!(!startup_hints_from_meta(None, None).non_interactive);
+}
+#[test]
 fn system_prompt_override_from_meta_prefers_session_and_rejects_empty() {
     let session = serde_json::json!({ "systemPromptOverride": "from session" });
     let init = serde_json::json!({ "systemPromptOverride": "from init" });
@@ -1205,407 +1019,22 @@ fn enqueue_replace_system_prompt_override_noop_when_absent_or_empty() {
 /// custom prompt body is preserved.
 #[test]
 fn harnesses_are_compatible_for_stock_family_pairs() {
-    let stock = |name: &str| {
-        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
-        definition.name = name.to_owned();
-        definition
-    };
-    let grok_build = stock("grok-build");
-    let grok_build_plan = stock("grok-build-plan");
-    let grok_build_concise = stock("grok-build-concise");
-    let remote_sidebar = stock("remote-sidebar");
+    assert!(harnesses_are_compatible("grok-build", "grok-build-plan"));
+    assert!(harnesses_are_compatible("grok-build-plan", "grok-build"));
+    assert!(harnesses_are_compatible("grok-build", "grok-build"));
     assert!(harnesses_are_compatible(
-        &grok_build,
-        "grok-build-plan",
-        Some(&grok_build_plan),
+        "grok-build-concise",
+        "grok-build-plan"
     ));
     assert!(harnesses_are_compatible(
-        &grok_build_plan,
-        "grok-build",
-        Some(&grok_build),
-    ));
-    assert!(harnesses_are_compatible(&grok_build, "grok-build", None));
-    assert!(harnesses_are_compatible(
-        &grok_build_concise,
-        "grok-build-plan",
-        Some(&grok_build_plan),
-    ));
-    assert!(harnesses_are_compatible(
-        &remote_sidebar,
-        "grok-build-plan",
-        Some(&grok_build_plan),
+        "remote-sidebar",
+        "grok-build-plan"
     ));
 }
 #[test]
 fn harnesses_are_compatible_rejects_strict_mismatches() {
-    let codex = xai_grok_agent::AgentDefinition::codex();
-    let stock = xai_grok_agent::AgentDefinition::grok_build_plan();
-    assert!(harnesses_are_compatible(&codex, "codex", None));
-    assert!(!harnesses_are_compatible(
-        &stock,
-        "codex",
-        Some(&codex),
-    ));
-    assert!(!harnesses_are_compatible(
-        &stock,
-        "missing-custom-harness",
-        None,
-    ));
-}
-
-fn ready_fallback_entry(model_id: &str, agent_type: &str) -> ModelEntry {
-    let mut entry = ModelEntry::fallback(model_id, &config::EndpointsConfig::default());
-    entry.info.agent_type = agent_type.to_owned();
-    entry
-}
-
-#[test]
-fn ready_compatible_fallback_skips_incompatible_candidate_in_catalog_order() {
-    let active = xai_grok_agent::AgentDefinition::codex();
-    let candidates = [
-        acp::ModelId::new("first-ready-incompatible"),
-        acp::ModelId::new("second-ready-compatible"),
-    ];
-
-    let selected = first_ready_compatible_model(
-        candidates.clone(),
-        &active,
-        |id| match id.0.as_ref() {
-            "first-ready-incompatible" => Some(ready_fallback_entry(id.0.as_ref(), "cursor")),
-            "second-ready-compatible" => Some(ready_fallback_entry(id.0.as_ref(), "codex")),
-            _ => None,
-        },
-        |agent_type| {
-            xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
-        },
-    );
-
-    assert_eq!(selected, Some(candidates[1].clone()));
-}
-
-#[test]
-fn ready_compatible_fallback_returns_none_without_compatible_candidate() {
-    let active = xai_grok_agent::AgentDefinition::codex();
-    let candidates = [
-        acp::ModelId::new("ready-cursor"),
-        acp::ModelId::new("ready-grok-build"),
-    ];
-
-    let selected = first_ready_compatible_model(
-        candidates,
-        &active,
-        |id| match id.0.as_ref() {
-            "ready-cursor" => Some(ready_fallback_entry(id.0.as_ref(), "cursor")),
-            "ready-grok-build" => Some(ready_fallback_entry(id.0.as_ref(), "grok-build")),
-            _ => None,
-        },
-        |agent_type| {
-            xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
-        },
-    );
-
-    assert_eq!(selected, None);
-}
-
-#[test]
-fn cold_spawn_reconciled_route_rejects_incompatible_harness() {
-    let active = xai_grok_agent::AgentDefinition::codex();
-    let endpoints = config::EndpointsConfig::default();
-    let mut removed = ModelEntry::fallback("retained-route", &endpoints);
-    removed.info.agent_type = "codex".to_owned();
-    let mut replacement = ModelEntry::fallback("retained-route", &endpoints);
-    replacement.info.agent_type = "cursor".to_owned();
-    let catalog = indexmap::IndexMap::from([
-        ("removed-key".to_owned(), removed),
-        ("replacement-key".to_owned(), replacement),
-    ]);
-    let identity = xai_chat_state::CatalogIdentity {
-        model_id: "removed-key".to_owned(),
-        route: "retained-route".to_owned(),
-        lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
-        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
-    };
-    let reconciled = crate::agent::models::reconcile_persisted_catalog_identity(
-        &indexmap::IndexMap::from([(
-            "replacement-key".to_owned(),
-            catalog["replacement-key"].clone(),
-        )]),
-        &identity,
-    )
-    .expect("route remaps to the replacement key");
-
-    let selected = first_ready_compatible_model(
-        [acp::ModelId::new(reconciled.model_id)],
-        &active,
-        |id| catalog.get(id.0.as_ref()).cloned(),
-        |agent_type| {
-            xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
-        },
-    );
-
-    assert_eq!(selected, None, "cold spawn must reject the remapped key");
-}
-
-#[test]
-fn cold_spawn_unresolved_model_uses_catalog_compatible_fallback_without_latch() {
-    let persisted = acp::ModelId::new("persisted-unresolved");
-    let compatible = acp::ModelId::new("second-ready-compatible");
-
-    let selection =
-        cold_spawn_fallback_selection(&persisted, Some(compatible.clone()), None);
-
-    assert_eq!(selection.model_id, compatible);
-    assert_eq!(selection.unavailable_model, None);
-}
-
-#[test]
-fn cold_spawn_restore_preserves_unavailable_latch_without_compatible_fallback() {
-    let persisted = acp::ModelId::new("persisted-unavailable");
-
-    let selection = cold_spawn_fallback_selection(&persisted, None, None);
-
-    assert_eq!(selection.model_id, persisted.clone());
-    assert_eq!(selection.unavailable_model, Some(persisted));
-}
-
-#[test]
-fn empty_catalog_keeps_persisted_identity_pending_instead_of_rejecting_load() {
-    let models = indexmap::IndexMap::new();
-    let identity = xai_chat_state::CatalogIdentity {
-        model_id: "pending-key".to_owned(),
-        route: "pending-route".to_owned(),
-        lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
-        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
-    };
-
-    assert!(!should_reject_unresolved_persisted_identity(
-        &models,
-        Some(&identity),
-        None,
-    ));
-}
-
-#[test]
-fn prompt_recovery_rejects_a_remapped_model_with_an_incompatible_harness() {
-    run_local_for_bridge_test(|| async {
-        let agent = build_agent_with_model_for_tests("replacement", "replacement-route");
-        let mut model = agent.models_manager.models()["replacement"].clone();
-        model.info.agent_type = "codex".to_owned();
-        let active = xai_grok_agent::AgentDefinition::default_grok_build();
-        let required = xai_grok_agent::AgentDefinition::codex();
-
-        assert!(!recovered_model_harness_is_compatible(
-            &active,
-            &model,
-            Some(&required),
-        ));
-    });
-}
-
-#[test]
-fn identity_backed_prompt_recovery_requires_persisted_harness_evidence() {
-    let identity = xai_chat_state::CatalogIdentity {
-        model_id: "persisted-key".to_owned(),
-        route: "persisted-route".to_owned(),
-        lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
-        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
-    };
-
-    assert!(!latched_recovery_has_required_harness(
-        Some(&identity),
-        None,
-    ));
-    assert!(latched_recovery_has_required_harness(
-        Some(&identity),
-        Some("grok-build"),
-    ));
-}
-
-#[test]
-fn cold_spawn_current_only_fallback_keeps_persisted_model_latched() {
-    let persisted = acp::ModelId::new("persisted-unready");
-    let current = acp::ModelId::new("current-compatible-but-not-selectable");
-
-    let selection =
-        cold_spawn_fallback_selection(&persisted, None, Some(current.clone()));
-
-    assert_eq!(selection.model_id, current);
-    assert_eq!(selection.unavailable_model, Some(persisted));
-}
-
-#[test]
-fn cold_spawn_usable_fallback_clears_stale_unavailable_latch() {
-    let registry = SessionRegistry::default();
-    let session_id = acp::SessionId::new("cold-spawn-stale-latch");
-    let persisted = acp::ModelId::new("persisted-unavailable");
-    registry.set_unavailable_model(&session_id, persisted.clone());
-
-    let selection = cold_spawn_fallback_selection(
-        &persisted,
-        Some(acp::ModelId::new("ready-compatible")),
-        None,
-    );
-    selection.replace_unavailable_latch(&registry, &session_id, None, None);
-
-    assert_eq!(registry.unavailable_model(&session_id), None);
-}
-
-#[test]
-fn harnesses_are_compatible_matches_bare_and_qualified_plugin_identity() {
-    let source = std::path::PathBuf::from("/plugins/one/agents/reviewer.md");
-    let mut active = xai_grok_agent::AgentDefinition::default_grok_build();
-    active.name = "reviewer".to_owned();
-    active.plugin_name = Some("plugin-one".to_owned());
-    active.source_path = Some(source.clone());
-    active.prompt_body = Some("Review from plugin one".to_owned());
-    let required = active.clone();
-
-    assert!(harnesses_are_compatible(
-        &active,
-        "plugin-one:reviewer",
-        Some(&required),
-    ));
-    assert!(harnesses_are_compatible(
-        &active,
-        "reviewer",
-        Some(&required),
-    ));
-}
-#[test]
-fn harnesses_are_compatible_rejects_different_plugin_and_custom_prompt_sources() {
-    let plugin = |owner: &str| {
-        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
-        definition.name = "reviewer".to_owned();
-        definition.plugin_name = Some(owner.to_owned());
-        definition.source_path = Some(std::path::PathBuf::from(format!(
-            "/plugins/{owner}/agents/reviewer.md"
-        )));
-        definition.prompt_body = Some(format!("Review from {owner}"));
-        definition
-    };
-    let plugin_one = plugin("plugin-one");
-    let plugin_two = plugin("plugin-two");
-    assert!(!harnesses_are_compatible(
-        &plugin_one,
-        "plugin-two:reviewer",
-        Some(&plugin_two),
-    ));
-
-    let custom = |path: &str, body: &str| {
-        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
-        definition.name = "reviewer".to_owned();
-        definition.source_path = Some(std::path::PathBuf::from(path));
-        definition.prompt_body = Some(body.to_owned());
-        definition
-    };
-    let project = custom("/repo/.grok/agents/reviewer.md", "Project review prompt");
-    let user = custom("/home/.grok/agents/reviewer.md", "User review prompt");
-    assert!(!harnesses_are_compatible(
-        &project,
-        "reviewer",
-        Some(&user),
-    ));
-
-    let mut inline = xai_grok_agent::AgentDefinition::default_grok_build();
-    inline.name = "grok-build".to_owned();
-    inline.prompt_body = Some("Client-provided prompt".to_owned());
-    assert!(harnesses_are_compatible(
-        &inline,
-        "grok-build",
-        Some(&inline),
-    ));
-    let built_in = xai_grok_agent::AgentDefinition::default_grok_build();
-    assert!(!harnesses_are_compatible(
-        &inline,
-        "grok-build",
-        Some(&built_in),
-    ));
-}
-
-#[test]
-fn harnesses_are_compatible_rejects_changed_external_runtime_contract() {
-    let mut active = xai_grok_agent::AgentDefinition::default_grok_build();
-    active.name = "reviewer".to_owned();
-    active.plugin_name = Some("plugin-one".to_owned());
-    active.source_path = Some(std::path::PathBuf::from(
-        "/plugins/plugin-one/agents/reviewer.md",
-    ));
-    active.prompt_body = Some("Review from plugin one".to_owned());
-
-    let mut required = active.clone();
-    required.permission_mode = xai_grok_agent::config::PermissionMode::BypassPermissions;
-
-    assert!(!harnesses_are_compatible(
-        &active,
-        "plugin-one:reviewer",
-        Some(&required),
-    ));
-}
-
-#[test]
-fn model_switch_cli_clamps_do_not_false_mismatch_external_harness() {
-    let mut raw = xai_grok_agent::AgentDefinition::default_grok_build();
-    raw.name = "reviewer".to_owned();
-    raw.plugin_name = Some("plugin-one".to_owned());
-    raw.source_path = Some(std::path::PathBuf::from(
-        "/plugins/plugin-one/agents/reviewer.md",
-    ));
-    raw.prompt_body = Some("Review from plugin one".to_owned());
-
-    let overrides = crate::agent::config::CliAgentOverrides {
-        tools: Some(vec!["Read".to_owned(), "Grep".to_owned()]),
-        disallowed_tools: Some(vec!["Bash".to_owned()]),
-        permission_mode: Some(xai_grok_agent::config::PermissionMode::DontAsk),
-        ..Default::default()
-    };
-    let mut active = raw.clone();
-    overrides.apply_to_definition(&mut active);
-    let required = apply_session_cli_clamps(Some(raw), &overrides).unwrap();
-
-    assert!(harnesses_are_compatible(
-        &active,
-        "plugin-one:reviewer",
-        Some(&required),
-    ));
-}
-
-#[test]
-fn model_switch_rebuilt_definition_retains_session_cli_clamps() {
-    let mut raw = xai_grok_agent::AgentDefinition::codex();
-    raw.tools = vec!["HarnessOwnedTool".to_owned()];
-    raw.disallowed_tools = vec!["HarnessOwnedDeny".to_owned()];
-    raw.permission_mode = xai_grok_agent::config::PermissionMode::Default;
-    let overrides = crate::agent::config::CliAgentOverrides {
-        tools: Some(vec!["Read".to_owned()]),
-        disallowed_tools: Some(vec!["Bash".to_owned(), "Write".to_owned()]),
-        permission_mode: Some(xai_grok_agent::config::PermissionMode::Plan),
-        ..Default::default()
-    };
-
-    let rebuilt = apply_session_cli_clamps(Some(raw), &overrides).unwrap();
-
-    assert_eq!(rebuilt.tools, vec!["Read"]);
-    assert_eq!(rebuilt.disallowed_tools, vec!["Bash", "Write"]);
-    assert_eq!(
-        rebuilt.permission_mode,
-        xai_grok_agent::config::PermissionMode::Plan
-    );
-    assert_eq!(rebuilt.name, "codex", "harness identity must be preserved");
-}
-
-#[test]
-fn harnesses_are_compatible_rejects_changed_strict_system_prompt() {
-    let active = xai_grok_agent::AgentDefinition::codex();
-    let mut required = active.clone();
-    required.system_prompt = xai_grok_agent::prompt::context::TemplateOverride::Custom(
-        "Different strict system prompt".to_owned(),
-    );
-
-    assert!(!harnesses_are_compatible(
-        &active,
-        "codex",
-        Some(&required),
-    ));
+    assert!(harnesses_are_compatible("codex", "codex"));
+    assert!(!harnesses_are_compatible("grok-build-plan", "codex"));
 }
 #[test]
 fn explicit_agent_type_wins_over_session_default() {
@@ -1754,7 +1183,6 @@ fn make_test_handle(
             cwd: "/tmp".to_string(),
         },
         max_turns: None,
-        capability_mode: None,
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         hunk_tracker_handle,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
@@ -1776,7 +1204,6 @@ fn make_test_handle(
             std::sync::Arc::new(crate::terminal::LocalTerminalRunner),
         ),
         model_id: acp::ModelId::new(model),
-        auxiliary_model_provenance: crate::session::AuxiliaryModelProvenance::default(),
         scheduler_background_loops: true,
         reasoning_effort: None,
         yolo_mode: yolo,
@@ -1786,6 +1213,7 @@ fn make_test_handle(
         }),
         code_nav_enabled: false,
         ask_user_question_enabled: true,
+        non_interactive: false,
         plan_mode: std::sync::Arc::new(parking_lot::Mutex::new(
             crate::session::plan_mode::PlanModeTracker::new(std::path::PathBuf::from("/tmp")),
         )),
@@ -1862,49 +1290,12 @@ async fn set_session_model_does_not_cross_contaminate() {
     );
 }
 #[tokio::test]
-async fn unresolved_empty_current_model_uses_live_fail_closed_sampling_config() {
-    use crate::agent::config::{EndpointsConfig, ModelEntry};
-
-    let agent = build_minimal_agent_for_tests();
-    assert!(
-        !agent.sampling_config.borrow().base_url.is_empty(),
-        "the fixture must retain a usable startup route to expose a stale fallback"
-    );
-
-    let mut oauth_only = ModelEntry::fallback("oauth-only", &EndpointsConfig::default());
-    oauth_only.info.supported_in_api = false;
-    agent
-        .models_manager
-        .apply_catalog_for_test(indexmap::IndexMap::from([(
-            "oauth-only".to_owned(),
-            oauth_only,
-        )]));
-
-    let current = agent.models_manager.current_model_id();
-    assert!(current.0.is_empty());
-    let sampling = agent.resolve_sampling_config_for_model(&current, None);
-    assert!(
-        sampling.base_url.is_empty(),
-        "an empty current id must not fall back to the stale startup endpoint"
-    );
-    assert_eq!(sampling.api_key, None);
-}
-#[tokio::test]
 async fn model_state_prefers_session_reasoning_effort_over_global() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
-    use xai_grok_sampling_types::{
-        REASONING_EFFORT_META_KEY, ReasoningEffort, ReasoningEffortOption,
-    };
+    use xai_grok_sampling_types::{REASONING_EFFORT_META_KEY, ReasoningEffort};
     let agent = build_minimal_agent_for_tests();
     let mut entry = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
     entry.info.supports_reasoning_effort = true;
-    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
-        id: "low".into(),
-        value: ReasoningEffort::Low,
-        label: "Low".into(),
-        description: None,
-        default: true,
-    }];
     agent
         .models_manager
         .insert_test_entry("effort-model", entry);
@@ -1925,18 +1316,10 @@ async fn model_state_prefers_session_reasoning_effort_over_global() {
     let mut handle = make_test_handle("effort-model", false, None);
     handle.reasoning_effort = Some(ReasoningEffort::Xhigh);
     agent.insert_resident(&pinned, handle);
-    let pinned_state = agent.model_state(Some(&pinned));
     assert_eq!(
-        read_effort(&pinned_state).as_deref(),
+        read_effort(&agent.model_state(Some(&pinned))).as_deref(),
         Some("xhigh"),
-        "model_state must report the running session's actual effort even after the catalog menu removes it",
-    );
-    let pinned_options = agent.session_config_options(Some(&pinned), &pinned_state);
-    assert!(
-        pinned_options
-            .iter()
-            .any(|option| option.category == "mode" && option.id == "xhigh" && option.selected),
-        "session config must synthesize a selected option for the immutable actor's active tier"
+        "model_state must report the session's own restored effort",
     );
     let unset = acp::SessionId::new("sess-unset");
     agent.insert_resident(&unset, make_test_handle("effort-model", false, None));
@@ -1945,34 +1328,6 @@ async fn model_state_prefers_session_reasoning_effort_over_global() {
         Some("low"),
         "absent session effort falls back to the global default",
     );
-}
-
-#[tokio::test]
-async fn session_config_preserves_resident_effort_after_catalog_disables_reasoning() {
-    use crate::agent::config::{EndpointsConfig, ModelEntry};
-    use xai_grok_sampling_types::ReasoningEffort;
-
-    let agent = build_minimal_agent_for_tests();
-    let mut enabled = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
-    enabled.info.supports_reasoning_effort = true;
-    agent
-        .models_manager
-        .insert_test_entry("effort-model", enabled);
-    let session_id = acp::SessionId::new("resident-effort-after-disable");
-    let mut handle = make_test_handle("effort-model", false, None);
-    handle.reasoning_effort = Some(ReasoningEffort::Xhigh);
-    agent.insert_resident(&session_id, handle);
-
-    let disabled = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
-    agent
-        .models_manager
-        .insert_test_entry("effort-model", disabled);
-
-    let state = agent.model_state(Some(&session_id));
-    let options = agent.session_config_options(Some(&session_id), &state);
-    assert!(options.iter().any(|option| {
-        option.category == "mode" && option.id == "xhigh" && option.selected
-    }));
 }
 /// A session persisted under a routing *slug* (not the catalog map key) must
 /// still get reasoning modes and a selected model from
@@ -2273,81 +1628,205 @@ async fn ext_method_routes_auth_cleared_and_refreshes_resident_sessions() {
                 ))
                 .await
                 .expect("auth_cleared must route through session-admin");
-            let barrier = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+            let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
                 .await
-                .expect("admission barrier should be sent")
+                .expect("refresh command should be sent")
                 .expect("channel should stay open until command is received");
-            let SessionCommand::BeginManagedGatewayAdmission { respond_to } = barrier else {
-                panic!("expected gateway admission barrier before disable");
-            };
-            respond_to.send(()).expect("barrier acknowledgement");
-            let refresh = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
-                .await
-                .expect("refresh command should follow barrier")
-                .expect("channel should stay open until command is received");
-            assert!(matches!(refresh, SessionCommand::RefreshMcpSearchIndex));
+            assert!(matches!(cmd, SessionCommand::RefreshMcpSearchIndex));
             assert!(!agent.managed_mcp_cache.lock().await.gateway_tools_active);
         })
         .await;
 }
-/// Fresh managed catalog sync must push UpdateMcpServers with the injected
-/// managed connector. The `search_tool` rebuild is a SEPARATE broadcast
-/// (`refresh_mcp_search_index_in_sessions`), so it is not asserted here.
+fn empty_gateway_catalog() -> crate::session::managed_mcp::GatewayToolCatalog {
+    crate::session::managed_mcp::GatewayToolCatalog {
+        tools: vec![],
+        total_tools: 0,
+        connectors_needing_reauth: vec![],
+    }
+}
+fn assert_no_update_mcp_servers(cmds: &[SessionCommand]) {
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, SessionCommand::UpdateMcpServers { .. })),
+        "mcp/list must not push UpdateMcpServers"
+    );
+}
+/// `mcp/list` refresh: two resident sessions, cache=false + committed catalog
+/// fans `RefreshMcpSearchIndex`; failed catalog and cache=true do not.
 #[tokio::test(flavor = "current_thread")]
-async fn sync_fresh_managed_mcp_pushes_update() {
+async fn mcp_list_gateway_refresh_fans_only_on_committed_uncached_catalog() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let agent = build_agent_with_auth(crate::auth::GrokAuth {
-                key: "eligible".into(),
-                auth_mode: crate::auth::AuthMode::WebLogin,
-                ..crate::auth::GrokAuth::test_default()
-            });
-            let sid = acp::SessionId::new("sess-managed-sync");
+            use crate::session::managed_mcp::GatewayToolCatalogCache;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let list_hits = std::sync::Arc::new(AtomicUsize::new(0));
+            let list_hits_route = list_hits.clone();
+            let app = axum::Router::new().route(
+                "/mcp/tools/list",
+                axum::routing::get(move || {
+                    list_hits_route.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        axum::Json(serde_json::json!({
+                            "tools": [{
+                                "connector_id": "gmail",
+                                "connector_name": "Gmail",
+                                "tool_id": "search",
+                                "tool_name": "Search",
+                                "call_id": "gmail_search",
+                                "description": "d",
+                                "json_schema": {"type": "object"}
+                            }],
+                            "total_tools": 1,
+                            "connectors_needing_reauth": []
+                        }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let (agent, _rx) = build_agent_with_auth_and_proxy(
+                crate::auth::GrokAuth {
+                    key: "eligible".into(),
+                    auth_mode: crate::auth::AuthMode::WebLogin,
+                    ..crate::auth::GrokAuth::test_default()
+                },
+                proxy_url,
+                crate::agent::config::AgentMode::Generic,
+            );
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+            let sid_a = acp::SessionId::new("sess-list-a");
+            let sid_b = acp::SessionId::new("sess-list-b");
+            let (handle_a, _tx_a, mut cmd_rx_a) = make_live_session_handle(&sid_a, None);
+            let (handle_b, _tx_b, mut cmd_rx_b) = make_live_session_handle(&sid_b, None);
+            agent.insert_resident(&sid_a, handle_a);
+            agent.insert_resident(&sid_b, handle_b);
+            {
+                let mut state = agent.managed_mcp_cache.lock().await;
+                state.enable_gateway_tools();
+                let epoch = state.start_gateway_tool_fetch().unwrap();
+                assert!(state.complete_gateway_tool_fetch(epoch, empty_gateway_catalog()));
+            }
+            let cached = agent.fetch_gateway_catalog_for_mcp_list(true).await;
+            let cached = cached.expect("cache=true should hit Ready catalog");
+            assert!(
+                cached.tools.is_empty() && cached.total_tools == 0,
+                "cache=true must return the seeded empty catalog, not a mock refetch"
+            );
+            assert_eq!(
+                list_hits.load(Ordering::SeqCst),
+                0,
+                "cache=true must not hit /mcp/tools/list"
+            );
+            assert!(
+                cmd_rx_a.try_recv().is_err() && cmd_rx_b.try_recv().is_err(),
+                "cache=true must not fan RefreshMcpSearchIndex"
+            );
+            match &agent.managed_mcp_cache.lock().await.gateway_tool_cache {
+                GatewayToolCatalogCache::Ready(catalog) => {
+                    assert!(
+                        catalog.tools.is_empty() && catalog.total_tools == 0,
+                        "in-memory cache must stay the seeded empty Ready catalog"
+                    );
+                }
+                GatewayToolCatalogCache::NotFetched => {
+                    panic!("expected Ready(empty), got NotFetched")
+                }
+                GatewayToolCatalogCache::Fetching(_) => {
+                    panic!("expected Ready(empty), got Fetching")
+                }
+            }
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = false;
+            let failed = agent.fetch_gateway_catalog_for_mcp_list(false).await;
+            assert!(failed.is_none(), "gateway off after invalidate is None");
+            assert!(
+                cmd_rx_a.try_recv().is_err() && cmd_rx_b.try_recv().is_err(),
+                "failed catalog must not fan RefreshMcpSearchIndex"
+            );
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+            let fresh = agent.fetch_gateway_catalog_for_mcp_list(false).await;
+            assert!(
+                fresh.is_some_and(|c| !c.tools.is_empty()),
+                "cache=false should refetch a non-empty catalog"
+            );
+            assert!(
+                list_hits.load(Ordering::SeqCst) >= 1,
+                "cache=false refetch must hit /mcp/tools/list"
+            );
+            let cmd_a = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx_a.recv())
+                .await
+                .expect("session A RefreshMcpSearchIndex")
+                .expect("channel open");
+            let cmd_b = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx_b.recv())
+                .await
+                .expect("session B RefreshMcpSearchIndex")
+                .expect("channel open");
+            assert!(matches!(cmd_a, SessionCommand::RefreshMcpSearchIndex));
+            assert!(matches!(cmd_b, SessionCommand::RefreshMcpSearchIndex));
+            assert_no_update_mcp_servers(&[cmd_a, cmd_b]);
+            assert!(cmd_rx_a.try_recv().is_err() && cmd_rx_b.try_recv().is_err());
+            server.abort();
+        })
+        .await;
+}
+/// mcp/list with gateway off must disable the cache, same as initialize.
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_list_gateway_off_disables_cached_catalog() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::session::managed_mcp::GatewayToolCatalogCache;
+            let (agent, _rx) = build_agent_with_auth_and_proxy(
+                crate::auth::GrokAuth {
+                    key: "eligible".into(),
+                    auth_mode: crate::auth::AuthMode::WebLogin,
+                    ..crate::auth::GrokAuth::test_default()
+                },
+                "http://127.0.0.1:1".into(),
+                crate::agent::config::AgentMode::Generic,
+            );
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+            let sid = acp::SessionId::new("sess-list-off");
             let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
             agent.insert_resident(&sid, handle);
-            let managed = vec![crate::session::managed_mcp::ManagedMcpConfig {
-                name: "Linear".into(),
-                endpoint: "https://mcp.example.com/linear".into(),
-                headers: std::collections::HashMap::from([(
-                    "Authorization".into(),
-                    "Bearer tok".into(),
-                )]),
-                token_expires_at: None,
-                scope: None,
-                scope_id: None,
-                scope_name: None,
-            }];
-            agent.sync_fresh_managed_mcp_to_sessions(&managed);
-            let first = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
-                .await
-                .expect("UpdateMcpServers should be sent")
-                .expect("channel should stay open");
-            let SessionCommand::UpdateMcpServers { mcp_servers, .. } = first else {
-                panic!("expected UpdateMcpServers as the first synced command");
-            };
-            let managed_name = crate::session::managed_mcp::to_managed_name("Linear");
-            let linear = mcp_servers
-                .iter()
-                .find_map(|s| match s {
-                    acp::McpServer::Http(http) if http.name == managed_name => Some(http),
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    panic!("merged catalog must contain managed HTTP server {managed_name}")
-                });
+            {
+                let mut state = agent.managed_mcp_cache.lock().await;
+                state.enable_gateway_tools();
+                let epoch = state.start_gateway_tool_fetch().unwrap();
+                assert!(state.complete_gateway_tool_fetch(epoch, empty_gateway_catalog()));
+            }
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = false;
             assert!(
-                linear
-                    .headers
-                    .iter()
-                    .any(|h| h.name == "Authorization" && h.value == "Bearer tok"),
-                "managed server must carry the injected Authorization header"
+                agent
+                    .fetch_gateway_catalog_for_mcp_list(true)
+                    .await
+                    .is_none(),
+                "gateway off must return None"
+            );
+            let state = agent.managed_mcp_cache.lock().await;
+            assert!(
+                !state.gateway_tools_active,
+                "gateway off must disable the cache"
+            );
+            assert!(
+                matches!(
+                    state.gateway_tool_cache,
+                    GatewayToolCatalogCache::NotFetched
+                ),
+                "disable must clear a Ready catalog"
+            );
+            drop(state);
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "disable via mcp/list must not fan RefreshMcpSearchIndex"
             );
         })
         .await;
 }
-/// The gateway-catalog refresh broadcast pushes `RefreshMcpSearchIndex` to every
-/// live session (independent of the legacy managed-connector sync).
+/// Gateway tools live on the agent catalog, so sessions only rebuild
+/// `search_tool`.
 #[tokio::test(flavor = "current_thread")]
 async fn refresh_mcp_search_index_broadcasts_to_sessions() {
     let agent = build_minimal_agent_for_tests();
@@ -2361,408 +1840,6 @@ async fn refresh_mcp_search_index_broadcasts_to_sessions() {
         .expect("channel should stay open");
     assert!(matches!(cmd, SessionCommand::RefreshMcpSearchIndex));
 }
-/// Live gateway enablement must close restricted external dispatch before the
-/// asynchronous auth refresh or catalog fetch can yield.
-#[tokio::test(flavor = "current_thread")]
-async fn gateway_catalog_fetch_begins_session_admission_synchronously() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let agent = build_agent_with_auth(crate::auth::GrokAuth {
-                key: "eligible".into(),
-                auth_mode: crate::auth::AuthMode::WebLogin,
-                ..crate::auth::GrokAuth::test_default()
-            });
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
-            let sid = acp::SessionId::new("sess-gateway-admission");
-            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
-            agent.session_registry.put_resident(&sid, handle);
-
-            agent.spawn_managed_gateway_tool_catalog_fetch();
-
-            let first = cmd_rx
-                .recv()
-                .await
-                .expect("gateway admission command should be queued");
-            let SessionCommand::BeginManagedGatewayAdmission { respond_to } = first else {
-                panic!("expected BeginManagedGatewayAdmission first");
-            };
-            assert!(
-                !agent.managed_mcp_cache.lock().await.gateway_tools_active,
-                "catalog activation/fetch must wait until every session applies the barrier"
-            );
-            respond_to
-                .send(())
-                .expect("test barrier acknowledgement should be received");
-        })
-        .await;
-}
-#[tokio::test(flavor = "current_thread")]
-async fn warm_gateway_catalog_does_not_reopen_session_admission() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
-        key: "eligible".into(),
-        auth_mode: crate::auth::AuthMode::WebLogin,
-        ..crate::auth::GrokAuth::test_default()
-    });
-    agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
-    {
-        let mut state = agent.managed_mcp_cache.lock().await;
-        state.enable_gateway_tools();
-        let epoch = state.start_gateway_tool_fetch().unwrap();
-        assert!(state.complete_gateway_tool_fetch(
-            epoch,
-            crate::session::managed_mcp::GatewayToolCatalog {
-                tools: vec![],
-                total_tools: 0,
-                connectors_needing_reauth: vec![],
-            },
-        ));
-    }
-    let sid = acp::SessionId::new("sess-warm-gateway");
-    let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
-    agent.session_registry.put_resident(&sid, handle);
-
-    assert!(
-        agent
-            .get_managed_mcp_gateway_tool_catalog()
-            .await
-            .is_some(),
-        "ready gateway catalog should use the warm cache"
-    );
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), cmd_rx.recv())
-            .await
-            .is_err(),
-        "a warm cache read must not queue a barrier with no matching refresh"
-    );
-}
-#[tokio::test(flavor = "current_thread")]
-async fn explicit_gateway_cache_invalidation_waits_for_all_session_admissions() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let agent = std::rc::Rc::new(build_agent_with_auth(crate::auth::GrokAuth {
-                key: "eligible".into(),
-                auth_mode: crate::auth::AuthMode::WebLogin,
-                ..crate::auth::GrokAuth::test_default()
-            }));
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
-            {
-                let mut state = agent.managed_mcp_cache.lock().await;
-                state.enable_gateway_tools();
-                let epoch = state.start_gateway_tool_fetch().unwrap();
-                assert!(state.complete_gateway_tool_fetch(
-                    epoch,
-                    crate::session::managed_mcp::GatewayToolCatalog {
-                        tools: vec![],
-                        total_tools: 0,
-                        connectors_needing_reauth: vec![],
-                    },
-                ));
-            }
-            let sid = acp::SessionId::new("sess-explicit-gateway-refresh");
-            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
-            agent.session_registry.put_resident(&sid, handle);
-
-            let cache = agent.managed_mcp_cache.clone();
-            let invalidate_agent = agent.clone();
-            let invalidate = tokio::task::spawn_local(async move {
-                invalidate_agent
-                    .invalidate_gateway_tool_cache_after_session_admission()
-                    .await
-            });
-
-            let first = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
-                .await
-                .expect("first admission must be queued before cache invalidation")
-                .expect("session command channel must remain open");
-            let SessionCommand::BeginManagedGatewayAdmission {
-                respond_to: first_ack,
-            } = first
-            else {
-                panic!("expected first gateway admission barrier");
-            };
-            assert!(!invalidate.is_finished());
-            {
-                let state = cache.lock().await;
-                assert!(state.gateway_refresh_in_progress);
-                assert!(matches!(
-                    &state.gateway_tool_cache,
-                    crate::session::managed_mcp::GatewayToolCatalogCache::Ready(_)
-                ));
-            }
-
-            let sid_second = acp::SessionId::new("sess-explicit-gateway-refresh-late");
-            let (second_handle, _second_tx, mut second_rx) =
-                make_live_session_handle(&sid_second, None);
-            agent.session_registry.put_resident(&sid_second, second_handle);
-            first_ack.send(()).expect("first barrier receiver remains live");
-
-            let second = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                second_rx.recv(),
-            )
-            .await
-            .expect("session added during the wait must receive admission")
-            .expect("second session command channel must remain open");
-            let SessionCommand::BeginManagedGatewayAdmission {
-                respond_to: second_ack,
-            } = second
-            else {
-                panic!("expected second gateway admission barrier");
-            };
-            assert!(!invalidate.is_finished());
-            {
-                let state = cache.lock().await;
-                assert!(state.gateway_refresh_in_progress);
-                assert!(matches!(
-                    &state.gateway_tool_cache,
-                    crate::session::managed_mcp::GatewayToolCatalogCache::Ready(_)
-                ));
-            }
-            second_ack
-                .send(())
-                .expect("second barrier receiver remains live");
-
-            invalidate.await.expect("cache invalidation task must finish");
-            let state = cache.lock().await;
-            assert!(state.gateway_refresh_in_progress);
-            assert!(matches!(
-                &state.gateway_tool_cache,
-                crate::session::managed_mcp::GatewayToolCatalogCache::NotFetched
-            ));
-        })
-        .await;
-}
-#[tokio::test(flavor = "current_thread")]
-async fn issue39_gateway_invalidation_includes_registered_child_sessions() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let agent = std::rc::Rc::new(build_agent_with_auth(crate::auth::GrokAuth {
-                key: "eligible".into(),
-                auth_mode: crate::auth::AuthMode::WebLogin,
-                ..crate::auth::GrokAuth::test_default()
-            }));
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
-            {
-                let mut state = agent.managed_mcp_cache.lock().await;
-                state.enable_gateway_tools();
-                let epoch = state.start_gateway_tool_fetch().unwrap();
-                assert!(state.complete_gateway_tool_fetch(
-                    epoch,
-                    crate::session::managed_mcp::GatewayToolCatalog {
-                        tools: vec![],
-                        total_tools: 0,
-                        connectors_needing_reauth: vec![],
-                    },
-                ));
-            }
-
-            let sid = acp::SessionId::new("sess-issue39-parent");
-            let (handle, _tx, mut parent_rx) = make_live_session_handle(&sid, None);
-            agent.session_registry.put_resident(&sid, handle);
-
-            let child_sid = acp::SessionId::new("sess-issue39-child");
-            let (child_tx, mut child_rx) = tokio::sync::mpsc::unbounded_channel();
-            agent
-                .managed_gateway_child_sessions
-                .borrow_mut()
-                .insert(child_sid, child_tx);
-
-            let invalidate_agent = agent.clone();
-            let invalidate = tokio::task::spawn_local(async move {
-                invalidate_agent
-                    .invalidate_gateway_tool_cache_after_session_admission()
-                    .await
-            });
-
-            let parent = tokio::time::timeout(std::time::Duration::from_secs(1), parent_rx.recv())
-                .await
-                .expect("parent admission must be queued")
-                .expect("parent channel must remain open");
-            let SessionCommand::BeginManagedGatewayAdmission {
-                respond_to: parent_ack,
-            } = parent
-            else {
-                panic!("expected parent gateway admission barrier");
-            };
-
-            let child = tokio::time::timeout(std::time::Duration::from_secs(1), child_rx.recv())
-                .await
-                .expect("child admission must be queued")
-                .expect("child channel must remain open");
-            let SessionCommand::BeginManagedGatewayAdmission {
-                respond_to: child_ack,
-            } = child
-            else {
-                panic!("expected child gateway admission barrier");
-            };
-
-            parent_ack
-                .send(())
-                .expect("parent barrier receiver remains live");
-            assert!(
-                !invalidate.is_finished(),
-                "refresh invalidation must wait for child-session admission too"
-            );
-            child_ack
-                .send(())
-                .expect("child barrier receiver remains live");
-
-            invalidate
-                .await
-                .expect("cache invalidation should finish after both barriers");
-            let state = agent.managed_mcp_cache.lock().await;
-            assert!(state.gateway_refresh_in_progress);
-            assert!(matches!(
-                state.gateway_tool_cache,
-                crate::session::managed_mcp::GatewayToolCatalogCache::NotFetched
-            ));
-        })
-        .await;
-}
-#[tokio::test(flavor = "current_thread")]
-async fn ineligible_gateway_auth_queues_barrier_before_revoking_catalog() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
-            {
-                let mut state = agent.managed_mcp_cache.lock().await;
-                state.enable_gateway_tools();
-                let epoch = state.start_gateway_tool_fetch().unwrap();
-                assert!(state.complete_gateway_tool_fetch(
-                    epoch,
-                    crate::session::managed_mcp::GatewayToolCatalog {
-                        tools: vec![],
-                        total_tools: 0,
-                        connectors_needing_reauth: vec![],
-                    },
-                ));
-            }
-            let sid = acp::SessionId::new("sess-ineligible-gateway");
-            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
-            agent.session_registry.put_resident(&sid, handle);
-
-            assert!(
-                agent
-                    .get_managed_mcp_gateway_tool_catalog()
-                    .await
-                    .is_none(),
-                "API-key auth is not eligible for managed gateway tools"
-            );
-            let barrier = cmd_rx.recv().await.expect("revocation barrier");
-            let SessionCommand::BeginManagedGatewayAdmission { respond_to } = barrier else {
-                panic!("expected gateway admission barrier before revocation");
-            };
-            respond_to.send(()).expect("barrier acknowledgement");
-            assert!(matches!(
-                cmd_rx.recv().await,
-                Some(SessionCommand::RefreshMcpSearchIndex)
-            ));
-            assert!(!agent.managed_mcp_cache.lock().await.gateway_tools_active);
-        })
-        .await;
-}
-#[tokio::test(flavor = "current_thread")]
-async fn issue39_aborted_explicit_gateway_refresh_recovers_waiters() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let hold_fetch = std::sync::Arc::new(tokio::sync::Notify::new());
-            let app_hold = hold_fetch.clone();
-            let app = axum::Router::new().route(
-                "/mcp/tools/list",
-                axum::routing::get(move || {
-                    let hold = app_hold.clone();
-                    async move {
-                        hold.notified().await;
-                        axum::Json(serde_json::json!({
-                            "tools": [],
-                            "total_tools": 0,
-                            "connectors_needing_reauth": []
-                        }))
-                    }
-                }),
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("listener");
-            let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-            let auth = crate::auth::GrokAuth {
-                key: "eligible".into(),
-                auth_mode: crate::auth::AuthMode::WebLogin,
-                ..crate::auth::GrokAuth::test_default()
-            };
-            let (agent, _rx) =
-                build_agent_with_auth_and_proxy(auth, base_url, crate::agent::config::AgentMode::Leader);
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
-            let sid = acp::SessionId::new("sess-issue39-refresh-cancel");
-            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
-            agent.session_registry.put_resident(&sid, handle);
-
-            let agent = std::rc::Rc::new(agent);
-            let refresh_agent = agent.clone();
-            let refresh = tokio::task::spawn_local(async move {
-                refresh_agent.refresh_managed_mcp_gateway_tool_catalog().await
-            });
-
-            let barrier = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
-                .await
-                .expect("admission barrier should be queued")
-                .expect("session command channel should stay open");
-            let SessionCommand::BeginManagedGatewayAdmission { respond_to } = barrier else {
-                panic!("expected gateway admission barrier before fetch");
-            };
-            respond_to
-                .send(())
-                .expect("test barrier acknowledgement should be received");
-
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                loop {
-                    if matches!(
-                        agent.managed_mcp_cache.lock().await.gateway_tool_cache,
-                        crate::session::managed_mcp::GatewayToolCatalogCache::Fetching(_)
-                    ) {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("refresh must reach Fetching before cancellation");
-
-            let waiter_cache = agent.managed_mcp_cache.clone();
-            let waiter = tokio::task::spawn_local(async move {
-                crate::session::managed_mcp::get_or_fetch_gateway_tool_catalog(
-                    &waiter_cache,
-                    "http://127.0.0.1:0",
-                    None,
-                )
-                .await
-            });
-
-            refresh.abort();
-            let _ = refresh.await;
-
-            let waiter_result =
-                tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-                    .await
-                    .expect("aborted refresh must wake gateway waiters")
-                    .expect("waiter task should not panic");
-            assert!(
-                waiter_result.is_none(),
-                "auth-less waiter should wake and fail closed instead of hanging"
-            );
-            assert!(matches!(
-                agent.managed_mcp_cache.lock().await.gateway_tool_cache,
-                crate::session::managed_mcp::GatewayToolCatalogCache::NotFetched
-            ));
-
-            hold_fetch.notify_waiters();
-            server.abort();
-        })
-        .await;
-}
 /// Build a minimal MvpAgent suitable for testing extension methods.
 fn build_minimal_agent_for_tests() -> MvpAgent {
     use crate::agent::config::Config as AgentConfig;
@@ -2774,535 +1851,6 @@ fn build_minimal_agent_for_tests() -> MvpAgent {
     let gateway = GatewaySender::new(tx);
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
-}
-
-fn build_agent_with_model_for_tests(
-    model_id: &str,
-    agent_type: &str,
-) -> MvpAgent {
-    use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
-    use crate::auth::{AuthManager, GrokComConfig};
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let auth_manager =
-        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let gateway = GatewaySender::new(tx);
-    let mut cfg = AgentConfig::default();
-    cfg.models.default = Some(model_id.to_owned());
-    cfg.config_models.insert(
-        model_id.to_owned(),
-        ConfigModelOverride {
-            model: Some(model_id.to_owned()),
-            base_url: Some("http://localhost".to_owned()),
-            auth_scheme: Some(xai_grok_sampler::AuthScheme::None),
-            agent_type: Some(agent_type.to_owned()),
-            ..Default::default()
-        },
-    );
-    let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
-    agent
-        .models_manager
-        .set_current_model_id(acp::ModelId::new(model_id));
-    agent
-}
-
-fn build_cross_provider_agent_for_tests(target_api_key: Option<&str>) -> MvpAgent {
-    use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
-    use crate::auth::{AuthManager, GrokComConfig};
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let auth_manager =
-        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let gateway = GatewaySender::new(tx);
-    let mut cfg = AgentConfig::default();
-    cfg.models.default = Some("source-provider".to_owned());
-    for (id, wire_model, base_url, api_key) in [
-        (
-            "source-provider",
-            "source-wire-model",
-            "https://source.invalid/v1",
-            Some("source-test-key"),
-        ),
-        (
-            "target-provider",
-            "target-wire-model",
-            "https://target.invalid/v1",
-            target_api_key,
-        ),
-    ] {
-        cfg.config_models.insert(
-            id.to_owned(),
-            ConfigModelOverride {
-                model: Some(wire_model.to_owned()),
-                base_url: Some(base_url.to_owned()),
-                api_key: api_key.map(str::to_owned),
-                api_backend: Some(xai_grok_sampling_types::ApiBackend::Responses),
-                auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
-                agent_type: Some("grok-build".to_owned()),
-                ..Default::default()
-            },
-        );
-    }
-    let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
-    agent
-        .models_manager
-        .set_current_model_id(acp::ModelId::new("source-provider"));
-    agent
-}
-
-#[test]
-fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes() {
-    run_local_for_bridge_test(|| async {
-        let agent = build_cross_provider_agent_for_tests(Some("target-test-key"));
-        let sid = acp::SessionId::new("cross-provider-auxiliary-switch");
-        let mut handle = make_test_handle("source-provider", false, None);
-        handle.info.id = sid.clone();
-        handle.agent_name = "grok-build".to_owned();
-        handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
-            session_summary_follows_default: true,
-            web_search_follows_default: true,
-            web_search_model: "source-provider".to_owned(),
-            image_description_follows_default: true,
-            image_description_model: "source-provider".to_owned(),
-        };
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        handle.cmd_tx = cmd_tx;
-        agent.insert_resident(&sid, handle);
-        agent.web_search_disabled.borrow_mut().insert(
-            sid.clone(),
-            crate::session::WebSearchDisabledNotice {
-                model_id: "source-provider".to_owned(),
-                reason: "stale test reason".to_owned(),
-                message: "stale test notice".to_owned(),
-            },
-        );
-        {
-            // A config refresh after spawn must not rewrite this resident
-            // session's inheritance provenance.
-            let mut cfg = agent.cfg.borrow_mut();
-            cfg.session_summary_follows_default = false;
-            cfg.web_search_follows_default = false;
-            cfg.web_search_model = "source-provider".to_owned();
-            cfg.image_description_follows_default = false;
-        }
-
-        tokio::task::spawn_local(async move {
-            while let Some(command) = cmd_rx.recv().await {
-                match command {
-                    TestSessionCommand::GetActiveAgent { responds_to } => {
-                        let _ = responds_to.send(Some("grok-build".to_owned()));
-                    }
-                    TestSessionCommand::ApplyModelSwitch {
-                        prepared,
-                        responds_to,
-                    } => {
-                        assert_eq!(
-                            prepared
-                                .summary_sampling_config
-                                .as_ref()
-                                .map(|config| config.model.as_str()),
-                            Some("target-wire-model")
-                        );
-                        assert!(prepared.replace_inherited_web_search);
-                        assert_eq!(
-                            prepared
-                                .web_search_sampling_config
-                                .as_ref()
-                                .map(|config| config.model.as_str()),
-                            Some("target-wire-model")
-                        );
-                        assert!(prepared.web_search_disable_notice.is_none());
-                        assert_eq!(
-                            prepared.image_description_model.as_deref(),
-                            Some("target-provider")
-                        );
-                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
-                            previous_model_id: acp::ModelId::new("source-provider"),
-                            catalog_model_id: acp::ModelId::new(
-                                prepared.catalog_identity.model_id.clone(),
-                            ),
-                            did_rebuild: false,
-                            active_agent_type: Some("grok-build".to_owned()),
-                            web_search: Some(crate::session::AppliedWebSearchState {
-                                enabled: false,
-                                disable_notice: None,
-                            }),
-                        }));
-                    }
-                    _ => panic!("unexpected cross-provider model-switch command"),
-                }
-            }
-        });
-
-        crate::agent::handlers::model_switch::apply(
-            &agent,
-            acp::SetSessionModelRequest::new(
-                sid.clone(),
-                acp::ModelId::new("target-provider"),
-            ),
-        )
-        .await
-        .expect("cross-provider model switch");
-        assert_eq!(agent.resident_handle(&sid).unwrap().model_id.0.as_ref(), "target-provider");
-        assert!(
-            !agent.web_search_disabled.borrow().contains_key(&sid),
-            "an applied policy-disabled state must clear the prior availability notice"
-        );
-    });
-}
-
-#[test]
-fn model_overrides_global_web_search_disable_skips_live_replacement() {
-    run_local_for_bridge_test(|| async {
-        let agent = build_cross_provider_agent_for_tests(Some("target-test-key"));
-        agent.cfg.borrow_mut().disable_web_search = true;
-        let sid = acp::SessionId::new("globally-disabled-web-search-switch");
-        let mut handle = make_test_handle("source-provider", false, None);
-        handle.info.id = sid.clone();
-        handle.agent_name = "grok-build".to_owned();
-        handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
-            session_summary_follows_default: true,
-            web_search_follows_default: true,
-            web_search_model: "source-provider".to_owned(),
-            image_description_follows_default: true,
-            image_description_model: "source-provider".to_owned(),
-        };
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        handle.cmd_tx = cmd_tx;
-        agent.insert_resident(&sid, handle);
-
-        tokio::task::spawn_local(async move {
-            while let Some(command) = cmd_rx.recv().await {
-                match command {
-                    TestSessionCommand::GetActiveAgent { responds_to } => {
-                        let _ = responds_to.send(Some("grok-build".to_owned()));
-                    }
-                    TestSessionCommand::ApplyModelSwitch {
-                        prepared,
-                        responds_to,
-                    } => {
-                        assert!(!prepared.replace_inherited_web_search);
-                        assert!(prepared.web_search_sampling_config.is_none());
-                        assert!(prepared.web_search_disable_notice.is_none());
-                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
-                            previous_model_id: acp::ModelId::new("source-provider"),
-                            catalog_model_id: acp::ModelId::new(
-                                prepared.catalog_identity.model_id.clone(),
-                            ),
-                            did_rebuild: false,
-                            active_agent_type: Some("grok-build".to_owned()),
-                            web_search: None,
-                        }));
-                    }
-                    _ => panic!("unexpected globally-disabled model-switch command"),
-                }
-            }
-        });
-
-        crate::agent::handlers::model_switch::apply(
-            &agent,
-            acp::SetSessionModelRequest::new(sid, acp::ModelId::new("target-provider")),
-        )
-        .await
-        .expect("global disable must not prevent the primary model switch");
-    });
-}
-
-#[test]
-fn model_overrides_cold_web_search_notice_describes_operative_session_model() {
-    run_local_for_bridge_test(|| async {
-        let agent = build_cross_provider_agent_for_tests(None);
-
-        let disabled = agent
-            .web_search_disable_details_for_model("target-provider")
-            .expect("missing target credential must be described");
-
-        assert_eq!(disabled.model_id, "target-provider");
-        assert!(disabled.user_notice().contains("target-provider"));
-        assert!(!disabled.user_notice().contains("source-provider"));
-
-        // The handler must trust the actor receipt rather than re-preflighting.
-        // Use a locally usable target, then return a disabled applied outcome;
-        // a second preflight would incorrectly clear this notice.
-        let agent = build_cross_provider_agent_for_tests(Some("target-test-key"));
-        let sid = acp::SessionId::new("cross-provider-disabled-auxiliary-switch");
-        let mut handle = make_test_handle("source-provider", false, None);
-        handle.info.id = sid.clone();
-        handle.agent_name = "grok-build".to_owned();
-        handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
-            session_summary_follows_default: true,
-            web_search_follows_default: true,
-            web_search_model: "source-provider".to_owned(),
-            image_description_follows_default: true,
-            image_description_model: "source-provider".to_owned(),
-        };
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        handle.cmd_tx = cmd_tx;
-        agent.insert_resident(&sid, handle);
-
-        tokio::task::spawn_local(async move {
-            while let Some(command) = cmd_rx.recv().await {
-                match command {
-                    TestSessionCommand::GetActiveAgent { responds_to } => {
-                        let _ = responds_to.send(Some("grok-build".to_owned()));
-                    }
-                    TestSessionCommand::ApplyModelSwitch {
-                        prepared,
-                        responds_to,
-                    } => {
-                        assert!(prepared.web_search_sampling_config.is_some());
-                        assert!(prepared.web_search_disable_notice.is_none());
-                        let disable_notice = crate::session::WebSearchDisabledNotice {
-                            model_id: "target-provider".to_owned(),
-                            reason: "actor-applied unavailable state".to_owned(),
-                            message:
-                                "web_search target-provider is unavailable after actor commit"
-                                    .to_owned(),
-                        };
-                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
-                            previous_model_id: acp::ModelId::new("source-provider"),
-                            catalog_model_id: acp::ModelId::new(
-                                prepared.catalog_identity.model_id.clone(),
-                            ),
-                            did_rebuild: false,
-                            active_agent_type: Some("grok-build".to_owned()),
-                            web_search: Some(crate::session::AppliedWebSearchState {
-                                enabled: false,
-                                disable_notice: Some(disable_notice),
-                            }),
-                        }));
-                    }
-                    _ => panic!("unexpected disabled model-switch command"),
-                }
-            }
-        });
-
-        crate::agent::handlers::model_switch::apply(
-            &agent,
-            acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new("target-provider")),
-        )
-        .await
-        .expect("disabled cross-provider model switch");
-        let notice = &agent.web_search_disabled.borrow()[&sid];
-        assert_eq!(notice.model_id, "target-provider");
-        assert!(notice.message.contains("target-provider"));
-        assert!(!notice.message.contains("source-provider"));
-    });
-}
-
-#[test]
-fn acp_model_switch_validation_and_apply_handoff_emit_one_failure_event() {
-    run_local_for_bridge_test(|| async {
-        for rejection in ["unknown", "disallowed", "unready", "unknown-session"] {
-            let model_id = format!("validation-{rejection}-model");
-            let session_id = acp::SessionId::new(format!("validation-{rejection}-session"));
-            let agent = build_agent_with_model_for_tests(&model_id, "grok-build");
-            let requested_model = if rejection == "unknown" {
-                acp::ModelId::new(format!("{model_id}-missing"))
-            } else if matches!(rejection, "disallowed" | "unready") {
-                let mut entry = agent
-                    .models_manager
-                    .models()
-                    .shift_remove(&model_id)
-                    .expect("test model");
-                if rejection == "disallowed" {
-                    entry.info.user_selectable = false;
-                } else {
-                    entry
-                        .config_validation_errors
-                        .push("injected readiness failure".to_owned());
-                }
-                agent
-                    .models_manager
-                    .insert_test_entry(model_id.clone(), entry);
-                acp::ModelId::new(model_id.clone())
-            } else {
-                acp::ModelId::new(model_id.clone())
-            };
-
-            let error = <MvpAgent as acp::Agent>::set_session_model(
-                &agent,
-                acp::SetSessionModelRequest::new(session_id.clone(), requested_model.clone()),
-            )
-            .await
-            .expect_err("public ACP validation must reject the request");
-            assert_eq!(error.code, acp::ErrorCode::InvalidParams, "{rejection}");
-
-            let events = crate::agent::handlers::model_switch::take_captured_failure_telemetry(
-                session_id.0.as_ref(),
-            );
-            assert_eq!(events.len(), 1, "{rejection}: {events:?}");
-            let event = &events[0];
-            assert_eq!(event["session_id"], session_id.0.as_ref(), "{rejection}");
-            assert_eq!(event["new_model_id"], requested_model.0.as_ref(), "{rejection}");
-            assert_eq!(event["success"], false, "{rejection}");
-            assert_eq!(
-                event["error_code"],
-                crate::agent::config::MODEL_SWITCH_VALIDATION_FAILED,
-                "{rejection}"
-            );
-            assert!(event.get("required_agent_type").is_none(), "{rejection}");
-            assert!(event.get("current_agent_type").is_none(), "{rejection}");
-        }
-    });
-}
-
-#[test]
-fn zero_turn_model_switch_fails_closed_when_required_harness_is_unresolved() {
-    run_local_for_bridge_test(|| async {
-        let model_id = "unresolved-harness-model";
-        let agent = build_agent_with_model_for_tests(model_id, "missing-custom-harness");
-        let sid = acp::SessionId::new("zero-turn-unresolved-harness");
-        let mut handle = make_test_handle("previous-model", false, None);
-        handle.info.id = sid.clone();
-        handle.agent_name = "grok-build".to_owned();
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        handle.cmd_tx = cmd_tx;
-        agent.session_registry.put_resident(&sid, handle);
-
-        tokio::task::spawn_local(async move {
-            while let Some(command) = cmd_rx.recv().await {
-                match command {
-                    TestSessionCommand::GetActiveAgent { responds_to } => {
-                        let _ = responds_to.send(Some("grok-build".to_owned()));
-                    }
-                    TestSessionCommand::ApplyModelSwitch {
-                        prepared,
-                        responds_to,
-                    } => {
-                        assert!(
-                            prepared.required_definition.is_none(),
-                            "the missing required harness must stay unresolved"
-                        );
-                        let _ = responds_to.send(Err(
-                            crate::agent::config::ModelSwitchHarnessError {
-                                code: crate::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
-                                active_agent_type: "grok-build".to_owned(),
-                                required_agent_type: "missing-custom-harness".to_owned(),
-                                model_id: prepared.catalog_identity.model_id.clone(),
-                                reason: "agent_definition_unresolved".to_owned(),
-                            }
-                            .into_acp_error(),
-                        ));
-                    }
-                    _ => panic!("unexpected model-switch command"),
-                }
-            }
-        });
-
-        let err = crate::agent::handlers::model_switch::apply(
-            &agent,
-            acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(model_id)),
-        )
-        .await
-        .expect_err("an unresolved required harness must fail the whole switch");
-        assert_eq!(
-            err.data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(|code| code.as_str()),
-            Some(crate::agent::config::MODEL_SWITCH_REBUILD_FAILED),
-        );
-        let handle = agent.resident_handle(&sid).expect("session remains registered");
-        assert_eq!(handle.model_id.0.as_ref(), "previous-model");
-        assert_eq!(handle.agent_name, "grok-build");
-    });
-}
-
-#[test]
-fn new_session_explicit_model_fails_before_spawn_when_harness_is_unresolved() {
-    run_local_for_bridge_test(|| async {
-        let model_id = "unresolved-default-harness-model";
-        let agent = build_agent_with_model_for_tests(model_id, "missing-custom-harness");
-        agent
-            .auth_manager
-            .hot_swap(crate::auth::GrokAuth::test_default());
-        agent.set_auth_method(acp::AuthMethodId::new(
-            crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
-        ));
-        let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
-            acp::ClientCapabilities::new()
-                .fs(acp::FileSystemCapabilities::new())
-                .terminal(false),
-        );
-        agent
-            .initialize_request
-            .set(init)
-            .expect("test initialize request should be set once");
-        let cwd = tempfile::tempdir().expect("temporary session cwd");
-
-        let err = <MvpAgent as acp::Agent>::new_session(
-            &agent,
-            acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
-                serde_json::json!({ "modelId": model_id })
-                    .as_object()
-                    .cloned(),
-            ),
-        )
-        .await
-        .expect_err("an unresolved explicit-model harness must fail before spawn");
-        let payload = crate::agent::config::ModelSwitchHarnessError::from_acp_error(&err)
-            .unwrap_or_else(|| panic!("expected structured harness error, got {err:?}"));
-        assert_eq!(payload.model_id, model_id);
-        assert_eq!(payload.required_agent_type, "missing-custom-harness");
-        assert_eq!(payload.reason, "agent_definition_unresolved");
-        assert!(
-            agent.resident_ids().is_empty(),
-            "failed harness preflight must not register a session"
-        );
-    });
-}
-
-#[test]
-fn new_session_unknown_model_fallback_still_preflights_default_harness() {
-    run_local_for_bridge_test(|| async {
-        let default_model_id = "unresolved-fallback-harness-model";
-        let agent = build_agent_with_model_for_tests(
-            default_model_id,
-            "missing-default-custom-harness",
-        );
-        agent
-            .auth_manager
-            .hot_swap(crate::auth::GrokAuth::test_default());
-        agent.set_auth_method(acp::AuthMethodId::new(
-            crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
-        ));
-        let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
-            acp::ClientCapabilities::new()
-                .fs(acp::FileSystemCapabilities::new())
-                .terminal(false),
-        );
-        agent
-            .initialize_request
-            .set(init)
-            .expect("test initialize request should be set once");
-        let cwd = tempfile::tempdir().expect("temporary session cwd");
-
-        let err = <MvpAgent as acp::Agent>::new_session(
-            &agent,
-            acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
-                serde_json::json!({ "modelId": "unknown-explicit-model" })
-                    .as_object()
-                    .cloned(),
-            ),
-        )
-        .await
-        .expect_err("fallback default harness must be checked before spawn");
-        let payload = crate::agent::config::ModelSwitchHarnessError::from_acp_error(&err)
-            .unwrap_or_else(|| panic!("expected structured harness error, got {err:?}"));
-        assert_eq!(payload.model_id, default_model_id);
-        assert_eq!(
-            payload.required_agent_type,
-            "missing-default-custom-harness"
-        );
-        assert_eq!(payload.reason, "agent_definition_unresolved");
-        assert!(
-            agent.resident_ids().is_empty(),
-            "failed fallback harness preflight must not register a session"
-        );
-    });
 }
 fn session_usage_request(session_id: &str) -> acp::ExtRequest {
     acp::ExtRequest::new(
@@ -3355,270 +1903,6 @@ async fn session_meta_publishes_the_sessions_pinned_scheduler_background_loops()
         "session meta must carry the handle's pinned value"
     );
 }
-/// #161: the disable notice is published on the session responses, per session.
-///
-/// This is what makes the `insert_session_config_meta` block load-bearing —
-/// without it, deleting that block breaks nothing anywhere, and it is where the
-/// whole design lives: the notice rides the response precisely because a
-/// notification could not be routed before the client bound the session id, and
-/// because headless has no xAI-notification consumer at all.
-#[tokio::test(flavor = "current_thread")]
-async fn session_meta_publishes_the_web_search_disable_notice_per_session() {
-    let agent = build_minimal_agent_for_tests();
-    let told = acp::SessionId::new("ws-disabled-sess");
-    let untold = acp::SessionId::new("ws-fine-sess");
-    for sid in [&told, &untold] {
-        let mut handle = make_test_handle("test-model", false, None);
-        handle.info.id = (*sid).clone();
-        agent.session_registry.put_resident(sid, handle);
-    }
-    agent.web_search_disabled.borrow_mut().insert(
-        told.clone(),
-        crate::session::WebSearchDisabledNotice {
-            model_id: "grok-4-fast".into(),
-            reason: "no API key or session credential available".into(),
-            message: "web_search is unavailable: model \"grok-4-fast\" could not be used (no API key or session credential available)".into(),
-        },
-    );
-
-    let model_state = agent.model_state(Some(&told));
-    let mut meta = serde_json::Map::new();
-    agent.insert_session_config_meta(&mut meta, &told, "/tmp".to_string(), None, &model_state);
-    let published = meta
-        .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
-        .expect("session with a notice must publish it");
-    let round_tripped: crate::session::WebSearchDisabledNotice =
-        serde_json::from_value(published.clone()).expect("published shape must be the shared type");
-    assert_eq!(round_tripped.model_id, "grok-4-fast");
-    assert!(round_tripped.message.contains("web_search is unavailable"));
-
-    // Control: absent key == available. A blanket "always publish" would pass
-    // the assertion above and fail here.
-    let mut other = serde_json::Map::new();
-    agent.insert_session_config_meta(&mut other, &untold, "/tmp".to_string(), None, &model_state);
-    assert!(
-        other.get(crate::session::WEB_SEARCH_DISABLED_META_KEY).is_none(),
-        "a session with no notice must publish no key"
-    );
-}
-/// #201 warm-load seam: a resident session must recompute from current
-/// auth/catalog state, not keep spawn's one-time snapshot.
-///
-/// Covers the three user-visible states:
-/// - Ready: key absent (web_search available)
-/// - Unusable: key present with reason
-/// - Unknown(CatalogUnavailable): key absent (silent, "not enough information")
-#[tokio::test(flavor = "current_thread")]
-#[serial_test::serial]
-async fn session_load_recompute_updates_web_search_notice_for_ready_unusable_and_unknown() {
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use crate::agent::config::{Config as AgentConfig, ModelEntry, ModelInfo};
-    use crate::auth::{AuthManager, GrokComConfig};
-    use indexmap::IndexMap;
-    use xai_grok_test_support::EnvGuard;
-
-    const WS_MODEL: &str = "ws-runtime-only-201";
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let temp_dir = tempfile::tempdir().expect("temporary auth root");
-    let auth_manager =
-        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let gateway = GatewaySender::new(tx);
-    let cfg = AgentConfig {
-        web_search_model: WS_MODEL.to_owned(),
-        ..AgentConfig::default()
-    };
-
-    let mut info = ModelInfo::fallback(WS_MODEL);
-    info.base_url = "https://vendor.example/v1".to_owned();
-    let mut runtime_catalog = IndexMap::new();
-    runtime_catalog.insert(
-        WS_MODEL.to_owned(),
-        ModelEntry {
-            info,
-            api_key: Some("runtime-only-test-key".to_owned()),
-            env_key: None,
-            auth_provider: None,
-            api_base_url: None,
-            config_validation_errors: Vec::new(),
-        },
-    );
-    let agent =
-        MvpAgent::new(gateway, &cfg, auth_manager, Some(runtime_catalog)).expect("valid test config");
-
-    let sid = acp::SessionId::new("ws-warm-201");
-    let mut handle = make_test_handle("test-model", false, None);
-    handle.info.id = sid.clone();
-    handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
-        web_search_follows_default: false,
-        web_search_model: WS_MODEL.to_owned(),
-        ..Default::default()
-    };
-    agent.session_registry.put_resident(&sid, handle);
-
-    // Ready route: web_search remains available, so `_meta` must stay silent.
-    agent
-        .recompute_web_search_disable_notice_for_session(&sid)
-        .await;
-    let ready_state = agent.model_state(Some(&sid));
-    let mut ready_meta = serde_json::Map::new();
-    agent.insert_session_config_meta(
-        &mut ready_meta,
-        &sid,
-        "/tmp".to_string(),
-        None,
-        &ready_state,
-    );
-    assert!(
-        ready_meta
-            .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
-            .is_none(),
-        "ready web_search route must publish no disable key"
-    );
-
-    // Becomes unusable while resident: the next warm load must publish notice.
-    let mut unusable = agent
-        .models_manager
-        .models()
-        .get(WS_MODEL)
-        .cloned()
-        .expect("runtime model exists");
-    unusable.api_key = None;
-    unusable
-        .config_validation_errors
-        .push("injected readiness failure".to_owned());
-    agent.models_manager.insert_test_entry(WS_MODEL, unusable);
-
-    agent
-        .recompute_web_search_disable_notice_for_session(&sid)
-        .await;
-    let unusable_state = agent.model_state(Some(&sid));
-    let mut unusable_meta = serde_json::Map::new();
-    agent.insert_session_config_meta(
-        &mut unusable_meta,
-        &sid,
-        "/tmp".to_string(),
-        None,
-        &unusable_state,
-    );
-    let published = unusable_meta
-        .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
-        .expect("resident session that became unusable must publish a disable notice");
-    let notice: crate::session::WebSearchDisabledNotice =
-        serde_json::from_value(published.clone()).expect("shared notice schema");
-    assert_eq!(notice.model_id, WS_MODEL);
-    assert!(
-        notice.reason.contains("injected readiness failure"),
-        "notice reason must come from readiness failure"
-    );
-
-    // Catalog unavailable (unknown): stay silent instead of reporting disabled.
-    agent.models_manager.apply_catalog_for_test(IndexMap::new());
-    agent
-        .recompute_web_search_disable_notice_for_session(&sid)
-        .await;
-    let unknown_state = agent.model_state(Some(&sid));
-    let mut unknown_meta = serde_json::Map::new();
-    agent.insert_session_config_meta(
-        &mut unknown_meta,
-        &sid,
-        "/tmp".to_string(),
-        None,
-        &unknown_state,
-    );
-    assert!(
-        unknown_meta
-            .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
-            .is_none(),
-        "Unknown(CatalogUnavailable) must stay silent on warm load"
-    );
-}
-/// #161: the per-session entry dies with the session, so a long-lived process
-/// cannot accumulate them. `take_session` is the single funnel for a handle
-/// leaving `self.sessions`, which is why cleaning there is sufficient.
-#[tokio::test(flavor = "current_thread")]
-async fn take_session_drops_the_web_search_notice() {
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("ws-cleanup-sess");
-    let mut handle = make_test_handle("test-model", false, None);
-    handle.info.id = sid.clone();
-    agent.session_registry.put_resident(&sid, handle);
-    agent.web_search_disabled.borrow_mut().insert(
-        sid.clone(),
-        crate::session::WebSearchDisabledNotice {
-            model_id: "m".into(),
-            reason: "r".into(),
-            message: "msg".into(),
-        },
-    );
-    assert!(agent.web_search_disabled.borrow().contains_key(&sid));
-    let _ = agent.take_session(&sid);
-    assert!(
-        !agent.web_search_disabled.borrow().contains_key(&sid),
-        "take_session must drop the session-scoped notice"
-    );
-}
-/// #161: the latch is per-session, not process-wide. Two sessions disabled for
-/// *different* reasons must each publish their own notice on their own
-/// response `_meta`. The pre-#185 `Cell<bool>` latch swallowed every notice
-/// after the first, and a "first wins" / "last wins" read of the map would
-/// still pass the told/untold pair above while collapsing these two. Reading
-/// the entry for a second response (a reconnect-driven reload) must not
-/// consume it either -- the notice is not a one-shot.
-#[tokio::test(flavor = "current_thread")]
-async fn session_meta_keeps_web_search_notices_session_scoped() {
-    let agent = build_minimal_agent_for_tests();
-    let first = acp::SessionId::new("ws-first-sess");
-    let second = acp::SessionId::new("ws-second-sess");
-    for sid in [&first, &second] {
-        let mut handle = make_test_handle("test-model", false, None);
-        handle.info.id = (*sid).clone();
-        agent.session_registry.put_resident(sid, handle);
-    }
-    let notice_for = |model: &str, reason: &str| crate::session::WebSearchDisabledNotice {
-        model_id: model.into(),
-        reason: reason.into(),
-        message: format!(
-            "web_search is unavailable: model \"{model}\" could not be used ({reason})"
-        ),
-    };
-    agent.web_search_disabled.borrow_mut().insert(
-        first.clone(),
-        notice_for("grok-4-fast", "no API key or session credential available"),
-    );
-    agent
-        .web_search_disabled
-        .borrow_mut()
-        .insert(second.clone(), notice_for("vendor-large", "model is not ready"));
-
-    let published_for = |sid: &acp::SessionId| {
-        let model_state = agent.model_state(Some(sid));
-        let mut meta = serde_json::Map::new();
-        agent.insert_session_config_meta(&mut meta, sid, "/tmp".to_string(), None, &model_state);
-        let raw = meta
-            .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
-            .expect("each disabled session must publish its own notice");
-        serde_json::from_value::<crate::session::WebSearchDisabledNotice>(raw.clone())
-            .expect("shared notice schema")
-    };
-    let first_notice = published_for(&first);
-    assert_eq!(first_notice.model_id, "grok-4-fast");
-    assert!(first_notice.reason.contains("no API key"));
-    let second_notice = published_for(&second);
-    assert_eq!(second_notice.model_id, "vendor-large");
-    assert!(second_notice.reason.contains("model is not ready"));
-
-    // A reconnect-driven reload rebuilds the response `_meta`; the entry must
-    // survive being read, or the reload silently re-latches like the old
-    // process-wide flag did.
-    let republished = published_for(&first);
-    assert_eq!(
-        republished, first_notice,
-        "re-reading the response meta must not consume the notice"
-    );
-}
 /// Build a minimal MvpAgent with pre-loaded auth for gate tests.
 fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
     use crate::agent::config::Config as AgentConfig;
@@ -3631,128 +1915,6 @@ fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
     let gateway = GatewaySender::new(tx);
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
-}
-/// #180: `seed_client_config_auth_if_available` must not reinject ambient
-/// credentials into a post-strip header-auth route.
-///
-/// `sampling_config_for_model` treats `ExplicitHeader` as a **post-strip**
-/// label: for a model that authenticates by a header the user declared, it
-/// sets `credentials.api_key = None` and *then* writes `ExplicitHeader`, so
-/// the label means "the ambient credential has been removed". The seed's
-/// `api_key.is_none()` gate is satisfied by exactly that strip; without the
-/// early return it would put the ambient session bytes back.
-///
-/// The property is stronger than "do not leave the inconsistent pair": the
-/// seed must not reinject ambient bytes **at all**. Stamping `XaiSession` on
-/// reinjection would make the pair consistent and L3-refuse the route, while
-/// an assertion that only checks `!(api_key.is_some() && ExplicitHeader)`
-/// would stay green. See the sampler-side companion
-/// `ambient_token_labelled_explicit_header_must_not_reach_an_external_origin`.
-#[tokio::test(flavor = "current_thread")]
-async fn seeded_ambient_key_must_not_keep_a_post_strip_explicit_header_label() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(seeded_ambient_key_body())
-        .await;
-}
-
-async fn seeded_ambient_key_body() {
-    use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
-    use crate::auth::{AuthManager, GrokComConfig};
-
-    const VENDOR_MODEL: &str = "vendor-header-auth";
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let auth_manager =
-        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
-    // A live ambient xAI session, as any signed-in user has.
-    auth_manager.hot_swap(crate::auth::GrokAuth {
-        key: "ambient-xai-session-jwt".into(),
-        auth_mode: crate::auth::AuthMode::WebLogin,
-        ..crate::auth::GrokAuth::test_default()
-    });
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let gateway = GatewaySender::new(tx);
-
-    // An ordinary third-party provider: external origin, authenticated by a
-    // declared `x-api-key`, with no `api_key` / `env_key` of its own.
-    let mut cfg = AgentConfig::default();
-    cfg.models.default = Some(VENDOR_MODEL.to_owned());
-    let mut extra_headers = indexmap::IndexMap::new();
-    extra_headers.insert("x-api-key".to_owned(), "sk-vendor-declared".to_owned());
-    cfg.config_models.insert(
-        VENDOR_MODEL.to_owned(),
-        ConfigModelOverride {
-            model: Some(VENDOR_MODEL.to_owned()),
-            base_url: Some("https://vendor.example/v1".to_owned()),
-            extra_headers,
-            ..Default::default()
-        },
-    );
-    let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
-    agent
-        .models_manager
-        .set_current_model_id(acp::ModelId::new(VENDOR_MODEL));
-
-    // `MvpAgent::new` resolves the agent-level config once, and which model
-    // wins there depends on default-model resolution rather than on anything
-    // this test is about. Recompute it through the production path now that
-    // the vendor model is current: `ModelsManager::sampling_config()` is the
-    // same function `new` calls, so this is the state a user whose default is
-    // the vendor model starts with — not a hand-built config.
-    *agent.sampling_config.borrow_mut() = agent.models_manager.sampling_config();
-
-    // Precondition: the strip ran and labelled the route honestly. If this
-    // fails the fixture no longer reaches the seam under test.
-    {
-        let seeded = agent.sampling_config.borrow();
-        assert!(
-            seeded.api_key.is_none(),
-            "precondition: the ambient strip must have cleared the key for a \
-             header-authenticated model on an external origin. \
-             model={:?} base_url={:?} source={:?} auth_scheme={:?} \
-             extra_header_names={:?}",
-            seeded.model,
-            seeded.base_url,
-            seeded.credential_source,
-            seeded.auth_scheme,
-            seeded.extra_headers.keys().collect::<Vec<_>>(),
-        );
-        assert!(
-            matches!(
-                seeded.credential_source,
-                Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
-            ),
-            "precondition: the strip labels the route ExplicitHeader; got {:?}",
-            seeded.credential_source
-        );
-    }
-
-    agent.seed_client_config_auth_if_available();
-
-    let seeded = agent.sampling_config.borrow();
-    // Property: the seed must not reinject ambient bytes into a post-strip
-    // header-auth route *at all* — not merely avoid leaving the inconsistent
-    // pair. Removing only the ExplicitHeader early-return while keeping the
-    // XaiSession stamp reinjects ambient under a consistent ambient label;
-    // the old `!(api_key.is_some() && ExplicitHeader)` assertion stayed green
-    // on that mutation while the route became ambient-labelled and L3-refused.
-    assert!(
-        seeded.api_key.is_none(),
-        "the seed reinjected a credential into a post-strip header-auth \
-         route. That route authenticates by the user's declared header on an \
-         external origin; ambient bytes must stay absent under every label. \
-         (Value withheld.)"
-    );
-    assert!(
-        matches!(
-            seeded.credential_source,
-            Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
-        ),
-        "post-strip header-auth label must remain ExplicitHeader after seed; \
-         got {:?}",
-        seeded.credential_source
-    );
 }
 /// Regression: boot-time plugin discovery is deferred past ACP
 /// `initialize`, so the shared plugin registry starts empty.
@@ -3809,8 +1971,10 @@ async fn ensure_plugin_registry_lazily_populates_snapshot() {
         "repeat call must keep the populated snapshot"
     );
 }
+mod list_running_heal_tests;
 #[cfg(unix)]
 mod process_scope_reclaim;
+mod session_rename_tests;
 mod session_resume_close_tests;
 mod subagent_spawn_context_tests;
 /// No load in flight and no session → the wait returns immediately
@@ -3863,343 +2027,6 @@ async fn wait_for_in_flight_load_blocks_until_load_completes() {
         })
         .await;
 }
-
-/// Registration happens before `session/load` finishes restoring its persisted
-/// model. A racing request must therefore remain behind the load marker even
-/// after the handle becomes visible, or it can observe the older model and run
-/// before the restore's fallback wins.
-#[tokio::test]
-async fn registered_session_stays_gated_until_restored_model_is_final() {
-    use std::task::Poll;
-
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("sess-registered-while-loading");
-    let persisted = acp::ModelId::new("persisted-model");
-    let fallback = acp::ModelId::new("ready-fallback");
-    let guard = agent.begin_session_load(&sid);
-    let mut handle = make_test_handle(persisted.0.as_ref(), false, None);
-    handle.info.id = sid.clone();
-    agent.session_registry.put_resident(&sid, handle);
-
-    let mut racing_request = Box::pin(agent.session_handle_waiting_for_load(&sid));
-    assert!(
-        matches!(futures::poll!(racing_request.as_mut()), Poll::Pending),
-        "a registered handle must remain gated until persisted restoration completes"
-    );
-
-    agent.with_resident_mut(&sid, |h| h.model_id = fallback.clone());
-    drop(guard);
-
-    let observed = racing_request.await.expect("restored session handle");
-    assert_eq!(
-        observed.model_id, fallback,
-        "the racing request must observe the restored fallback, never the persisted model"
-    );
-    assert_eq!(
-        agent.resident_handle(&sid).unwrap().model_id, observed.model_id,
-        "the registered handle and racing request must agree on the final model ordering"
-    );
-}
-
-#[test]
-fn attach_restore_unique_route_ignores_reused_key_endpoint_and_secret() {
-    run_local_for_bridge_test(|| async {
-        let agent = build_agent_with_model_for_tests("removed-key", "grok-build");
-        let mut reused = agent.models_manager.models()["removed-key"].clone();
-        reused.info.model = "foreign-route".to_owned();
-        reused.info.base_url = "https://foreign.example/v1".to_owned();
-        reused.api_key = Some("foreign-secret".to_owned());
-        reused.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
-        agent
-            .models_manager
-            .insert_test_entry("removed-key", reused);
-        let mut replacement = agent.models_manager.models()["removed-key"].clone();
-        replacement.info.model = "retained-route".to_owned();
-        replacement.info.base_url = "https://retained.example/v1".to_owned();
-        replacement.api_key = Some("retained-secret".to_owned());
-        let mut refreshed_reuse = replacement.clone();
-        refreshed_reuse.info.model = "refreshed-foreign-route".to_owned();
-        refreshed_reuse.info.base_url = "https://refreshed-foreign.example/v1".to_owned();
-        refreshed_reuse.api_key = Some("refreshed-foreign-secret".to_owned());
-        agent
-            .models_manager
-            .insert_test_entry("replacement-key", replacement);
-
-        let sid = acp::SessionId::new("resume-catalog-lineage");
-        let mut handle = make_test_handle("removed-key", false, None);
-        handle.info.id = sid.clone();
-        handle.agent_name = "grok-build".to_owned();
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        handle.cmd_tx = cmd_tx;
-        agent.session_registry.put_resident(&sid, handle);
-        let models_manager = agent.models_manager.clone();
-        tokio::task::spawn_local(async move {
-            while let Some(command) = cmd_rx.recv().await {
-                match command {
-                    TestSessionCommand::GetActiveAgent { responds_to } => {
-                        // Simulate an etag refresh after restore reconciled the
-                        // persisted route but before the actor switch commits.
-                        models_manager
-                            .insert_test_entry("replacement-key", refreshed_reuse.clone());
-                        let _ = responds_to.send(Some("grok-build".to_owned()));
-                    }
-                    TestSessionCommand::ApplyModelSwitch {
-                        prepared,
-                        responds_to,
-                    } => {
-                        assert_eq!(prepared.catalog_identity.model_id, "replacement-key");
-                        assert_eq!(prepared.catalog_identity.route, "retained-route");
-                        assert_eq!(
-                            prepared.sampling_config.base_url,
-                            "https://retained.example/v1"
-                        );
-                        assert_eq!(
-                            prepared.sampling_config.api_key.as_deref(),
-                            Some("retained-secret")
-                        );
-                        assert_ne!(
-                            prepared.sampling_config.api_key.as_deref(),
-                            Some("foreign-secret")
-                        );
-                        assert_ne!(
-                            prepared.sampling_config.api_key.as_deref(),
-                            Some("refreshed-foreign-secret")
-                        );
-                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
-                            previous_model_id: acp::ModelId::new("removed-key"),
-                            catalog_model_id: acp::ModelId::new("replacement-key"),
-                            did_rebuild: false,
-                            active_agent_type: Some("grok-build".to_owned()),
-                            web_search: None,
-                        }));
-                    }
-                    _ => panic!("unexpected command during persisted model restore"),
-                }
-            }
-        });
-
-        let info = crate::session::info::Info {
-            id: sid.clone(),
-            cwd: "/tmp/resume-catalog-lineage".to_owned(),
-        };
-        let mut summary = crate::session::persistence::Summary::new(
-            &info,
-            acp::ModelId::new("removed-key"),
-        )
-        .unwrap();
-        summary.catalog_identity = Some(xai_chat_state::CatalogIdentity {
-            model_id: "removed-key".to_owned(),
-            route: "retained-route".to_owned(),
-            lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
-            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
-        });
-        let guard = agent.begin_session_load(&sid);
-        agent.restore_persisted_model(&sid, &summary, &guard).await;
-        assert_eq!(
-            agent.resident_handle(&sid).unwrap().model_id.0.as_ref(),
-            "replacement-key"
-        );
-        drop(guard);
-    });
-}
-
-#[test]
-fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
-    run_local_for_bridge_test(|| async {
-        for (label, lineage, replacement_count) in [
-            (
-                "exact-reuse",
-                xai_chat_state::CatalogResolutionLineage::ExactKey,
-                1usize,
-            ),
-            (
-                "unique-route-ambiguity",
-                xai_chat_state::CatalogResolutionLineage::UniqueRoute,
-                2usize,
-            ),
-        ] {
-            let agent = build_agent_with_model_for_tests("removed-key", "grok-build");
-            let mut reused = agent.models_manager.models()["removed-key"].clone();
-            reused.info.model = "foreign-route".to_owned();
-            reused.info.base_url = "https://foreign.example/v1".to_owned();
-            reused.api_key = Some("foreign-secret".to_owned());
-            reused.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
-            agent
-                .models_manager
-                .insert_test_entry("removed-key", reused.clone());
-            for index in 0..replacement_count {
-                let mut replacement = reused.clone();
-                replacement.info.model = "retained-route".to_owned();
-                replacement.info.base_url = format!("https://retained-{index}.example/v1");
-                replacement.api_key = Some(format!("retained-secret-{index}"));
-                agent
-                    .models_manager
-                    .insert_test_entry(format!("replacement-{index}"), replacement);
-            }
-
-            let sid = acp::SessionId::new(format!("resume-{label}"));
-            let mut handle = make_test_handle("removed-key", false, None);
-            handle.info.id = sid.clone();
-            let resident_agent_name = handle.agent_name.clone();
-            let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-            handle.cmd_tx = cmd_tx;
-            agent.session_registry.put_resident(&sid, handle);
-            let info = crate::session::info::Info {
-                id: sid.clone(),
-                cwd: format!("/tmp/{label}"),
-            };
-            let mut summary = crate::session::persistence::Summary::new(
-                &info,
-                acp::ModelId::new("removed-key"),
-            )
-            .unwrap();
-            summary.catalog_identity = Some(xai_chat_state::CatalogIdentity {
-                model_id: "removed-key".to_owned(),
-                route: "retained-route".to_owned(),
-                lineage,
-                auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
-            });
-            summary.agent_name = (label != "exact-reuse").then(|| "grok-build".to_owned());
-            let guard = agent.begin_session_load(&sid);
-            agent.restore_persisted_model(&sid, &summary, &guard).await;
-            assert_eq!(
-                agent.session_registry.unavailable_model(&sid),
-                Some(acp::ModelId::new("removed-key")),
-                "{label} must latch instead of selecting any credential"
-            );
-            assert_eq!(
-                agent.session_registry.unavailable_catalog_identity(&sid),
-                summary.catalog_identity,
-                "{label} must retain identity for fail-closed prompt recovery"
-            );
-            assert_eq!(
-                agent.session_registry.unavailable_agent_name(&sid),
-                Some(resident_agent_name),
-                "{label} must retain explicit persisted or resident harness evidence"
-            );
-            assert!(
-                reconcile_latched_catalog_snapshot(
-                    &agent.models_manager.models(),
-                    &agent.models_manager.available(),
-                    agent
-                        .session_registry
-                        .unavailable_catalog_identity(&sid)
-                        .as_ref()
-                        .unwrap(),
-                )
-                .is_none(),
-                "{label} prompt recovery must not accept a reused key or ambiguous route"
-            );
-            assert!(
-                cmd_rx.try_recv().is_err(),
-                "{label} must not send a model switch that could attach a secret"
-            );
-            drop(guard);
-        }
-    });
-}
-
-/// The production `session/load` restore entry point must bypass only its own
-/// load marker. A real registered session is restored while an ordinary model
-/// switch remains gated; after the guard drops, that later request commits last.
-#[test]
-fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
-    use std::task::Poll;
-
-    let local = tokio::task::LocalSet::new();
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime")
-        .block_on(local.run_until(async {
-            let restored_model = "restored-model";
-            let later_model = "later-model";
-            let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
-                restored_model,
-                "grok-build",
-            ));
-            let mut later_entry = agent
-                .models_manager
-                .models()
-                .get(restored_model)
-                .expect("restored model entry")
-                .clone();
-            later_entry.info.model = later_model.to_owned();
-            agent
-                .models_manager
-                .insert_test_entry(later_model, later_entry);
-
-            let sid = acp::SessionId::new("sess-load-restore-order");
-            let guard = agent.begin_session_load(&sid);
-            let mut handle = make_test_handle("persisted-model", false, None);
-            handle.info.id = sid.clone();
-            let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-            handle.cmd_tx = cmd_tx;
-            agent.session_registry.put_resident(&sid, handle);
-
-            tokio::task::spawn_local(async move {
-                while let Some(command) = cmd_rx.recv().await {
-                    match command {
-                        TestSessionCommand::GetActiveAgent { responds_to } => {
-                            let _ = responds_to.send(Some("grok-build".to_owned()));
-                        }
-                        TestSessionCommand::ApplyModelSwitch {
-                            prepared,
-                            responds_to,
-                        } => {
-                            let model_id = acp::ModelId::new(prepared.catalog_identity.model_id);
-                            let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
-                                previous_model_id: acp::ModelId::new("previous-model"),
-                                catalog_model_id: model_id,
-                                did_rebuild: false,
-                                active_agent_type: Some("grok-build".to_owned()),
-                                web_search: None,
-                            }));
-                        }
-                        _ => panic!("unexpected command during model restore"),
-                    }
-                }
-            });
-
-            let mut later_request = Box::pin(crate::agent::handlers::model_switch::apply(
-                &agent,
-                acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(later_model)),
-            ));
-            assert!(
-                matches!(futures::poll!(later_request.as_mut()), Poll::Pending),
-                "an external switch must remain gated while session/load owns the marker"
-            );
-
-            acp_agent::restore_registered_session_model(
-                &agent,
-                acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(restored_model)),
-                &guard,
-                None,
-            )
-            .await
-            .expect("session/load restore must not wait on its own marker");
-            assert_eq!(
-                agent.resident_handle(&sid).unwrap().model_id.0.as_ref(),
-                restored_model,
-                "the load restore must commit before the load marker is released"
-            );
-            assert!(
-                matches!(futures::poll!(later_request.as_mut()), Poll::Pending),
-                "the external request must still be gated until load completion"
-            );
-
-            drop(guard);
-            later_request
-                .await
-                .expect("the gated external switch must run after load completion");
-            assert_eq!(
-                agent.resident_handle(&sid).unwrap().model_id.0.as_ref(),
-                later_model,
-                "the later external request must be the final committed model"
-            );
-        }));
-}
-
 /// A failed load (guard dropped WITHOUT registering the session) also
 /// wakes waiters — they re-check, find nothing, and the caller surfaces
 /// the regular "unknown session id" error rather than hanging.
@@ -4247,97 +2074,6 @@ async fn concurrent_load_guards_do_not_clobber_each_other() {
     assert!(
         agent.session_registry.attaching_count() == 0,
         "all markers removed once every load finished"
-    );
-}
-/// Dropping a newer duplicate load while an older load is still restoring must
-/// keep the older marker visible to waiters. Otherwise an external
-/// `session_handle_waiting_for_load` sees no marker and releases early while the
-/// older restore is still in flight.
-#[tokio::test(start_paused = true)]
-async fn dropping_newer_duplicate_load_keeps_older_wait_marker_alive() {
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("sess-concurrent-newer-drops-first");
-    let guard_one = agent.begin_session_load(&sid);
-    let guard_two = agent.begin_session_load(&sid);
-
-    // Superseded load finishes first.
-    drop(guard_two);
-    assert!(
-        agent.session_registry.is_attaching(&sid),
-        "dropping the newer guard must not clear the older in-flight load marker"
-    );
-    assert_eq!(
-        agent.wait_for_in_flight_session_load(&sid).await,
-        SessionLoadWait::TimedOut,
-        "with the older load still active, waiter-side lookup must fail closed"
-    );
-    drop(guard_one);
-}
-/// The load-restore bypass is owner-bound: with duplicate loads of the same
-/// session, the second `begin_session_load` replaces the marker, so the older
-/// load must NOT resolve a handle through the newer load's marker — only the
-/// load that owns the live marker may bypass.
-#[tokio::test]
-async fn older_load_cannot_borrow_newer_loads_marker() {
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("sess-duplicate-load");
-    let guard_one = agent.begin_session_load(&sid);
-    let mut handle = make_test_handle("test-model", false, None);
-    handle.info.id = sid.clone();
-    agent.session_registry.put_resident(&sid, handle);
-
-    // The only live marker is guard_one's: its own restore may bypass.
-    assert!(
-        agent.session_handle_during_load(&sid, &guard_one).is_some(),
-        "the load that owns the live marker must resolve its registered handle"
-    );
-
-    // A duplicate load begins and replaces the marker.
-    let guard_two = agent.begin_session_load(&sid);
-    assert!(
-        agent.session_handle_during_load(&sid, &guard_one).is_none(),
-        "the older load must not ride the newer load's marker"
-    );
-    assert!(
-        agent.session_handle_during_load(&sid, &guard_two).is_some(),
-        "the newer load owns the live marker and may bypass"
-    );
-
-    // Once the newer load's guard drops, its marker is gone; the older load's
-    // bypass stays refused (its own marker was replaced, never restored).
-    drop(guard_two);
-    assert!(
-        agent.session_handle_during_load(&sid, &guard_one).is_none(),
-        "no live marker owned by the older load means no bypass"
-    );
-    drop(guard_one);
-}
-/// The bounded load wait must fail closed: when it expires with the load
-/// guard still alive, the caller gets `None` — never the registered
-/// mid-restore handle, which is not ready. Driven by paused tokio time, so
-/// no real waiting occurs.
-#[tokio::test(start_paused = true)]
-async fn load_wait_timeout_fails_closed_on_mid_restore_handle() {
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("sess-load-timeout");
-    let _guard = agent.begin_session_load(&sid);
-    // Registration lands before restoration finishes — the exact window the
-    // timeout must not expose.
-    let mut handle = make_test_handle("test-model", false, None);
-    handle.info.id = sid.clone();
-    agent.session_registry.put_resident(&sid, handle);
-
-    // Paused time auto-advances past the 60s load-wait deadline while the
-    // guard is alive, expiring the bounded wait.
-    let resolved = agent.session_handle_waiting_for_load(&sid).await;
-    assert!(
-        resolved.is_none(),
-        "a timed-out load wait must fail closed, not hand out the mid-restore handle"
-    );
-    assert!(
-        agent.resident_handle(&sid).is_some(),
-        "the handle IS registered — `None` above is the fail-closed timeout, \
-         not an absent session"
     );
 }
 /// `resident_activity` returns `NeedsInput` whenever the session's
@@ -4671,14 +2407,11 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             show_model_fingerprint: false,
             stream_tool_calls: None,
             laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
-            codex_wire: None,
-            catalog_degraded_reason: None,
         },
         api_key: None,
         env_key: None,
         auth_provider: None,
         api_base_url: None,
-        config_validation_errors: Vec::new(),
     };
     let mut models = indexmap::IndexMap::new();
     models.insert("a".to_string(), entry("target"));
@@ -5036,7 +2769,10 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = true;
     assert!(matches!(
         agent.prepare_video_gen_config(),
-        VideoGenConfig::Disabled
+        VideoGenConfig::Enabled {
+            zdr_restricted: true,
+            ..
+        }
     ));
     agent.cfg.borrow_mut().zdr_video_output_s3 = Some(zdr_s3());
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = false;
@@ -5054,12 +2790,14 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = true;
     let VideoGenConfig::Enabled {
         zdr_video_output_s3,
+        zdr_restricted,
         ..
     } = agent.prepare_video_gen_config()
     else {
         panic!("expected Enabled");
     };
     assert!(zdr_video_output_s3.as_ref().is_some_and(|c| c.is_valid()));
+    assert!(!zdr_restricted);
 }
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_video_gen_config_respects_feature_flag() {
@@ -5311,7 +3049,7 @@ async fn diagnostic_upload_skipped_for_opted_out_user() {
     let uploader = agent
         .diagnostic_upload_config()
         .expect("uploader is wired whenever trace upload config is on");
-    uploader(b"log".to_vec(), "user-id-1".into()).await;
+    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -5327,7 +3065,7 @@ async fn diagnostic_upload_sent_for_normal_user() {
     let uploader = agent
         .diagnostic_upload_config()
         .expect("uploader is wired whenever trace upload config is on");
-    uploader(b"log".to_vec(), "user-id-1".into()).await;
+    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
     assert!(
         count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
         "positive control: diagnostics upload reaches the proxy for a \
@@ -5346,7 +3084,7 @@ async fn diagnostic_upload_skipped_without_credentials() {
     let uploader = agent
         .diagnostic_upload_config()
         .expect("uploader is wired whenever trace upload config is on");
-    uploader(b"log".to_vec(), "user-id-1".into()).await;
+    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -5372,12 +3110,34 @@ async fn diagnostic_upload_skipped_after_mid_session_trace_upload_kill_switch() 
         cfg.telemetry.trace_upload = Some(false);
     }
     agent.sync_collection_config_gate();
-    uploader(b"log".to_vec(), "user-id-1".into()).await;
+    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "an already-wired diagnostics uploader must honor a mid-session \
          trace-upload kill switch"
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn session_search_stops_on_a_mid_session_kill_switch() {
+    use crate::session::storage::search_gate;
+    let _env = xai_grok_test_support::EnvGuard::unset("GROK_SESSION_SEARCH");
+    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let _gate = search_gate::IndexGateGuard::open();
+    agent.apply_session_search_gate();
+    assert!(
+        search_gate::is_index_enabled(),
+        "precondition: nothing has turned the index off"
+    );
+    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
+        session_search: Some(false),
+        ..Default::default()
+    });
+    agent.apply_session_search_gate();
+    assert!(
+        !search_gate::is_index_enabled(),
+        "a remote kill switch must reach the indexer without a new session"
     );
 }
 /// The live collection gate reads a `Send` mirror of the config-level
@@ -5841,7 +3601,6 @@ fn chat_session_spawn_options_matches_thin_profile() {
     assert!(!opts.client_fs_read);
     assert!(!opts.client_fs_write);
     assert!(opts.chat_history.is_empty());
-    assert!(opts.managed_mcp_expires_at.is_none());
     assert!(!opts.session_auto_mode);
     assert!(
         opts.persistence.is_noop(),
@@ -5879,7 +3638,14 @@ async fn remove_session_releases_workspace_binding_and_side_maps() {
     agent
         .session_registry
         .set_permission_receiver(&sid, permission_rx);
+    let _ = agent.session_registry.live_orphan_heal_lock(&sid);
+    assert_eq!(agent.session_registry.counts().live_orphan_heal_locks, 1);
     agent.remove_session(&sid);
+    assert_eq!(
+        agent.session_registry.counts().live_orphan_heal_locks,
+        0,
+        "remove_session must evict the live-orphan heal mutex"
+    );
     assert!(
         toolset_weak.upgrade().is_none(),
         "the workspace binding must release the toolset"
@@ -6196,10 +3962,10 @@ async fn ext_notification_forwards_each_queue_method_to_session_actor() {
                 assert_eq!(owner.as_deref(), Some("grok-tui"));
                 assert_eq!(new_text.as_deref(), Some("now"));
             }
-            ("x.ai/queue/hold_edit", SessionCommand::HoldCombineEdit { id }) => {
+            ("x.ai/queue/hold_edit", SessionCommand::HoldEdit { id }) => {
                 assert_eq!(id, "p-hold");
             }
-            ("x.ai/queue/release_edit", SessionCommand::ReleaseCombineEdit { id }) => {
+            ("x.ai/queue/release_edit", SessionCommand::ReleaseEdit { id }) => {
                 assert_eq!(id, "p-release");
             }
             (method, _) => {
@@ -6893,11 +4659,6 @@ fn post_auth_settings_not_coalesced_by_in_flight_reapply() {
 }
 /// Agent with pre-loaded auth, a gateway receiver (to assert emitted
 /// notifications), and the proxy URL pointed at a mock `/v1/settings`.
-///
-/// Bootstrap must stay self-contained: a custom proxy URL also changes model
-/// catalog credential selection, which is unrelated to these settings tests.
-/// Seed an empty settings snapshot through bootstrap, then restore the exact
-/// post-auth state (no settings yet + mock proxy URL) on the constructed agent.
 fn build_agent_with_auth_and_proxy(
     auth: crate::auth::GrokAuth,
     proxy_url: String,
@@ -6918,18 +4679,8 @@ fn build_agent_with_auth_and_proxy(
         mode,
         ..Default::default()
     };
-    // Keep these tests independent from developer-local catalog endpoint env
-    // overrides. They exercise the authenticated proxy settings path, not a
-    // custom API-key model catalog.
-    cfg.endpoints.models_base_url = None;
-    cfg.endpoints.models_list_url = None;
-    cfg.remote_settings = Some(Default::default());
+    cfg.endpoints.cli_chat_proxy_base_url = Some(proxy_url);
     let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
-    {
-        let mut cfg = agent.cfg.borrow_mut();
-        cfg.remote_settings = None;
-        cfg.endpoints.cli_chat_proxy_base_url = Some(proxy_url);
-    }
     (agent, rx)
 }
 /// Drain the gateway, returning `true` if any `x.ai/settings/update`
@@ -7309,35 +5060,6 @@ fn folder_trust_on() -> crate::util::config::RemoteSettings {
         folder_trust_enabled: Some(true),
         ..Default::default()
     }
-}
-#[test]
-fn subagent_spawn_context_uses_parent_auxiliary_provenance_after_config_reload() {
-    run_local_for_bridge_test(|| async {
-        let (agent, _rx) = build_agent_with_gateway_rx();
-        let sid = acp::SessionId::new("subagent-parent-auxiliary-provenance");
-        let (mut handle, _tx, _cmd_rx) = make_live_session_handle(&sid, None);
-        handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
-            web_search_follows_default: true,
-            web_search_model: "spawn-default-search".to_owned(),
-            image_description_follows_default: true,
-            image_description_model: "spawn-default-image".to_owned(),
-            ..Default::default()
-        };
-        agent.insert_resident(&sid, handle);
-        {
-            let mut cfg = agent.cfg.borrow_mut();
-            cfg.web_search_follows_default = false;
-            cfg.web_search_model = "reloaded-explicit-search".to_owned();
-            cfg.image_description_follows_default = false;
-            cfg.image_description_model = Some("reloaded-explicit-image".to_owned());
-        }
-
-        let ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
-        assert!(ctx.web_search_follows_default);
-        assert_eq!(ctx.web_search_model, "spawn-default-search");
-        assert!(ctx.image_description_follows_default);
-        assert_eq!(ctx.image_description_model, "spawn-default-image");
-    });
 }
 #[test]
 #[serial_test::serial]
@@ -8339,63 +6061,6 @@ mod direct_hub_cloud_removed {
         assert_eq!(from_legacy.url.as_deref(), Some("wss://hub.example/ws"));
     }
 }
-mod local_workspace_removed {
-    use super::super::{
-        LOCAL_WORKSPACE_REMOVED_MSG, reject_removed_local_workspace_meta,
-    };
-    fn assert_local_workspace_removed_error(err: agent_client_protocol::Error) {
-        assert_eq!(
-            err.code,
-            agent_client_protocol::ErrorCode::InvalidParams,
-            "must be invalid_params, got: {err:?}"
-        );
-        assert_eq!(
-            err.data
-                .as_ref()
-                .and_then(|d| d.get("code"))
-                .and_then(|v| v.as_str()),
-            Some("local_workspace_removed"),
-            "error code must identify removed local-workspace surface"
-        );
-        assert_eq!(
-            err.data
-                .as_ref()
-                .and_then(|d| d.get("message"))
-                .and_then(|v| v.as_str()),
-            Some(LOCAL_WORKSPACE_REMOVED_MSG),
-            "error message must preserve the removed-surface guidance"
-        );
-    }
-    #[test]
-    fn local_workspace_removed_meta_rejected_fail_closed_matrix() {
-        let cases: &[(&str, serde_json::Value, bool)] = &[
-            (
-                "present_object",
-                serde_json::json!({ "x.ai/local_workspace": { "mode": "attach", "server_id": "srv-1" } }),
-                true,
-            ),
-            (
-                "present_null",
-                serde_json::json!({ "x.ai/local_workspace": null }),
-                true,
-            ),
-            (
-                "absent_key",
-                serde_json::json!({ "envId": "env-1" }),
-                false,
-            ),
-        ];
-        for (label, meta, expect_error) in cases {
-            let outcome = reject_removed_local_workspace_meta(meta.as_object());
-            match (expect_error, outcome) {
-                (true, Err(err)) => assert_local_workspace_removed_error(err),
-                (false, Ok(())) => {}
-                (true, Ok(())) => panic!("[{label}] expected local-workspace rejection"),
-                (false, Err(err)) => panic!("[{label}] unexpected rejection: {err:?}"),
-            }
-        }
-    }
-}
 mod soft_default_settings_emit {
     use super::*;
     #[tokio::test]
@@ -8453,147 +6118,5 @@ mod soft_default_settings_emit {
             .await;
     }
 }
-
-#[test]
-fn initialize_advertises_only_nonblank_external_auth_provider_commands() {
-    let advertised = |command: Option<&str>| {
-        let config = crate::auth::GrokComConfig {
-            auth_provider_command: command.map(str::to_owned),
-            ..Default::default()
-        };
-        super::acp_agent::has_advertised_auth_provider_command(&config)
-    };
-
-    assert!(!advertised(None));
-    assert!(!advertised(Some("")));
-    assert!(!advertised(Some(" \t\n")));
-    assert!(advertised(Some("acme-auth --token")));
-}
-
-/// #131 B3: the deliverable is the `initialize` response `_meta` key, not the
-/// in-memory lock. Deleting the insert in `AcpAgent::initialize` must fail
-/// this test; asserting only on `substituted_preference()` would not.
-#[test]
-fn initialize_publishes_substituted_default_model_meta() {
-    run_local_for_bridge_test(|| async {
-        use crate::agent::config::{Config as AgentConfig, ModelEntry, ModelInfo};
-        use crate::auth::{AuthManager, GrokComConfig};
-        use indexmap::IndexMap;
-
-        // CLI override beats disk/campaign `models.default` so this assertion
-        // is about the wire path, not about whoever last wrote ~/.medley.
-        let temp_dir = tempfile::tempdir().unwrap();
-        let auth_manager =
-            std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let gateway = GatewaySender::new(tx);
-        let cfg = AgentConfig {
-            default_model_override: Some("typo-provider-131".to_owned()),
-            ..AgentConfig::default()
-        };
-
-        let mut catalog = IndexMap::new();
-        let mut info = ModelInfo::fallback("grok-4");
-        info.base_url = "https://api.x.ai/v1".to_string();
-        catalog.insert(
-            "grok-4".to_string(),
-            ModelEntry {
-                info,
-                api_key: None,
-                env_key: None,
-                auth_provider: None,
-                api_base_url: None,
-                config_validation_errors: Vec::new(),
-            },
-        );
-
-        let agent =
-            MvpAgent::new(gateway, &cfg, auth_manager, Some(catalog)).expect("valid test config");
-
-        let reported_pref = agent
-            .models_manager
-            .substituted_preference()
-            .expect("precondition: in-memory verdict is set — this test still asserts the wire");
-        assert_eq!(reported_pref.configured, "typo-provider-131");
-
-        let resp = <MvpAgent as acp::Agent>::initialize(
-            &agent,
-            acp::InitializeRequest::new(acp::ProtocolVersion::V1),
-        )
-        .await
-        .expect("initialize must succeed");
-
-        let meta = resp.meta.as_ref().expect("initialize must carry _meta");
-        let reported = meta
-            .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
-            .unwrap_or_else(|| {
-                panic!(
-                    "initialize _meta must publish {SUBSTITUTED_DEFAULT_MODEL_META_KEY} when the configured default was substituted"
-                )
-            });
-        assert_eq!(
-            reported.get("configuredModelId").and_then(|v| v.as_str()),
-            Some("typo-provider-131"),
-        );
-        assert_eq!(reported.get("source").and_then(|v| v.as_str()), Some("cli"),);
-    });
-}
-
-/// #131 B3 counterweight: when the preference was honoured, initialize `_meta`
-/// must omit the key — absent-vs-present is the whole contract.
-#[test]
-fn initialize_omits_substituted_default_model_meta_when_honoured() {
-    run_local_for_bridge_test(|| async {
-        use crate::agent::config::{Config as AgentConfig, ModelEntry, ModelInfo};
-        use crate::auth::{AuthManager, GrokComConfig};
-        use indexmap::IndexMap;
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let auth_manager =
-            std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let gateway = GatewaySender::new(tx);
-        let cfg = AgentConfig {
-            default_model_override: Some("honoured-131".to_owned()),
-            ..AgentConfig::default()
-        };
-
-        let mut catalog = IndexMap::new();
-        let mut info = ModelInfo::fallback("honoured-131");
-        info.base_url = "https://api.x.ai/v1".to_string();
-        catalog.insert(
-            "honoured-131".to_string(),
-            ModelEntry {
-                info,
-                api_key: None,
-                env_key: None,
-                auth_provider: None,
-                api_base_url: None,
-                config_validation_errors: Vec::new(),
-            },
-        );
-
-        let agent =
-            MvpAgent::new(gateway, &cfg, auth_manager, Some(catalog)).expect("valid test config");
-        assert!(
-            agent.models_manager.substituted_preference().is_none(),
-            "precondition: preference is honoured"
-        );
-
-        let resp = <MvpAgent as acp::Agent>::initialize(
-            &agent,
-            acp::InitializeRequest::new(acp::ProtocolVersion::V1),
-        )
-        .await
-        .expect("initialize must succeed");
-
-        let meta = resp.meta.as_ref().expect("initialize must carry _meta");
-        assert!(
-            meta.get(SUBSTITUTED_DEFAULT_MODEL_META_KEY).is_none(),
-            "honoured preference must omit {SUBSTITUTED_DEFAULT_MODEL_META_KEY}, not send null"
-        );
-    });
-}
-
 #[cfg(feature = "dhat-heap")]
 mod dhat_soak;

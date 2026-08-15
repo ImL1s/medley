@@ -20,7 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::RefreshTokenFailedReason;
 use super::oidc::OidcRefreshResult;
-use super::{AuthManager, AuthMode, GrokAuth, ProviderCredentialSnapshot};
+use super::{AuthManager, AuthMode, GrokAuth};
+use xai_grok_sampler::config::ProviderCredentialSnapshot;
 
 pub const AUTH_SCOPE: &str = "openai::codex";
 pub const ISSUER: &str = "https://auth.openai.com";
@@ -802,10 +803,8 @@ pub fn credential_snapshot(manager: &AuthManager) -> Option<ProviderCredentialSn
     let auth = manager.current()?;
     Some(ProviderCredentialSnapshot {
         access_token: auth.key,
-        expires_at: auth.expires_at,
         account_id: auth.account_id,
         chatgpt_account_is_fedramp: auth.chatgpt_account_is_fedramp,
-        issuer: auth.oidc_issuer,
     })
 }
 
@@ -862,11 +861,13 @@ pub(crate) async fn refresh_auth(auth: &GrokAuth) -> OidcRefreshResult {
     if !is_codex_credential(auth) {
         return OidcRefreshResult::Failed {
             network_unreachable: false,
+            suspected_consumed_rt: None,
         };
     }
     let Some(refresh_token) = auth.refresh_token.as_deref() else {
         return OidcRefreshResult::Failed {
             network_unreachable: false,
+            suspected_consumed_rt: None,
         };
     };
     match refresh_at(TOKEN_ENDPOINT, refresh_token).await {
@@ -874,6 +875,7 @@ pub(crate) async fn refresh_auth(auth: &GrokAuth) -> OidcRefreshResult {
             Ok(new_auth) => OidcRefreshResult::Success(Box::new(new_auth)),
             Err(_) => OidcRefreshResult::Failed {
                 network_unreachable: false,
+                suspected_consumed_rt: None,
             },
         },
         Err(error) => {
@@ -882,6 +884,7 @@ pub(crate) async fn refresh_auth(auth: &GrokAuth) -> OidcRefreshResult {
                 Some(reason) => OidcRefreshResult::TerminalError { reason },
                 None => OidcRefreshResult::Failed {
                     network_unreachable: error.network_unreachable,
+                    suspected_consumed_rt: None,
                 },
             }
         }

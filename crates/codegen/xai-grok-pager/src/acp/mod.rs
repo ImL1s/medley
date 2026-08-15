@@ -813,13 +813,24 @@ pub fn select_eager_auth_method(
         .iter()
         .find(|m| AuthMethodKind::from_id(m.id()) == AuthMethodKind::CachedToken);
     cached_token_method
-        .or_else(|| auth_methods.first())
         .map(|m| m.id().clone())
+}
+
+pub fn is_session_update_ext_method(method: &str) -> bool {
+    method == "x.ai/session_notification" || method == "x.ai/session/update"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_session_update_ext_method_covers_both_carriers() {
+        assert!(is_session_update_ext_method("x.ai/session_notification"));
+        assert!(is_session_update_ext_method("x.ai/session/update"));
+        assert!(!is_session_update_ext_method("x.ai/task_completed"));
+        assert!(!is_session_update_ext_method("session/update"));
+    }
 
     #[test]
     fn parse_available_commands_from_meta() {

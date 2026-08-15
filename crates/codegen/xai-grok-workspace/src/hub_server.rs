@@ -7,12 +7,13 @@ use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::handle::WorkspaceHandle;
 use crate::hub_ids::WORKSPACE_RPC_TOOL_ID;
 use crate::rpc_envelope::{RpcEnvelope, envelope_err};
-use crate::workspace_ops::WorkspaceOp;
+use crate::workspace_ops::{RpcActivityClass, WorkspaceOp, WorkspaceRpc};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
 use serde_json::Value;
 use xai_computer_hub_sdk::ToolServerHandler;
+use xai_grok_tools::computer::types::KillOutcome;
 use xai_grok_tools::computer::types::TaskKind;
 use xai_grok_tools::implementations::grok_build::scheduler::interval::interval_to_human;
 use xai_grok_tools::implementations::grok_build::scheduler::types::{
@@ -21,7 +22,7 @@ use xai_grok_tools::implementations::grok_build::scheduler::types::{
 use xai_grok_tools::registry::types::FinalizedToolset;
 use xai_grok_tools::types::resources::Terminal;
 use xai_grok_workspace_types::rpc::workspace::{
-    BackgroundTaskSnapshotWire, ScheduledTaskSnapshotWire, TasksSnapshotResponse,
+    BackgroundTaskSnapshotWire, KillTaskOutcome, ScheduledTaskSnapshotWire, TasksSnapshotResponse,
 };
 use xai_tool_protocol::{HookEvent, HookFrame, SessionId, ToolId, ToolServerEvictParams};
 use xai_tool_runtime::{
@@ -192,12 +193,20 @@ fn ensure_client_fs_queries_enabled() -> WorkspaceResult<()> {
         ))
     }
 }
+/// Stamp client-RPC activity for mutation-classed methods. Called before
+/// param validation so a malformed call from a live client still counts.
+fn note_mutation<Op: WorkspaceRpc>(ws: &WorkspaceHandle) {
+    if Op::ACTIVITY == RpcActivityClass::Mutation {
+        ws.activity_tracker().note_client_rpc_activity();
+    }
+}
 /// Generic dispatch helper: deserialize params, execute, serialize result.
 async fn dispatch_op<Op: WorkspaceOp>(
     params: Value,
     ws: &WorkspaceHandle,
     session_id: Option<&str>,
 ) -> WorkspaceResult<Value> {
+    note_mutation::<Op>(ws);
     let req: Op = serde_json::from_value(params)
         .map_err(|e| WorkspaceError::HubError(format!("invalid params for {}: {e}", Op::METHOD)))?;
     let result = req.execute(ws, session_id).await?;
@@ -246,6 +255,22 @@ async fn list_outstanding_background_tasks(
             }
         })
         .collect()
+}
+/// Kill a background terminal task via the session toolset's `TerminalBackend`.
+/// Returns `NotFound` when the session has no terminal backend.
+async fn kill_background_task(toolset: &FinalizedToolset, task_id: &str) -> KillTaskOutcome {
+    let terminal = {
+        let res = toolset.resources.lock().await;
+        res.get::<Terminal>().map(|t| t.0.clone())
+    };
+    let Some(terminal) = terminal else {
+        return KillTaskOutcome::NotFound;
+    };
+    match terminal.kill_task(task_id).await {
+        KillOutcome::Killed => KillTaskOutcome::Killed,
+        KillOutcome::AlreadyExited => KillTaskOutcome::AlreadyExited,
+        KillOutcome::NotFound => KillTaskOutcome::NotFound,
+    }
 }
 /// Incomplete backgrounded terminal tasks + live scheduled tasks (client tray rebuild).
 async fn tasks_snapshot(toolset: &FinalizedToolset) -> TasksSnapshotResponse {
@@ -363,13 +388,15 @@ impl WorkspaceRpcHandler {
         use crate::workspace_ops::*;
         use crate::worktree::{ApplyWorktreeRequest, CreateWorktreeRequest, RemoveWorktreeRequest};
         use xai_grok_workspace_types::rpc::git::{GitBranchInfoReq, GitMetadataReq};
+        use xai_grok_workspace_types::rpc::presence::PresenceNoteReq;
         use xai_grok_workspace_types::rpc::search::FuzzyStatusReq;
         use xai_grok_workspace_types::rpc::skills::DiscoverPluginsReq;
         use xai_grok_workspace_types::rpc::workspace::{
-            ConfigureMcpReq, DropSessionReq, InstallPluginReq, ListBackgroundTasksReq,
-            ListBackgroundTasksResponse, ListTodosReq, ListTodosResponse, LoadEnvrcReq,
-            LoadPermissionsReq, LoadProjectConfigReq, RefreshPluginsReq, ResolveFileReferencesReq,
-            TasksSnapshotReq, ToolDefinitionsReq, UpdateToolConfigReq,
+            ConfigureMcpReq, DropSessionReq, InstallPluginReq, KillTaskReq, KillTaskResponse,
+            ListBackgroundTasksReq, ListBackgroundTasksResponse, ListTodosReq, ListTodosResponse,
+            LoadEnvrcReq, LoadPermissionsReq, LoadProjectConfigReq, RefreshPluginsReq,
+            ResolveFileReferencesReq, TasksSnapshotReq, ToolDefinitionsReq, UpdateToolConfigReq,
+            WorkspaceInfo,
         };
         use xai_grok_workspace_types::rpc::worktree::WorktreeCreateSyncReq;
         tracing::debug!(method, "workspace rpc dispatch");
@@ -381,8 +408,6 @@ impl WorkspaceRpcHandler {
         match method {
             <WorkspaceInfoReq as WorkspaceRpc>::METHOD => {
                 let cwd = self.workspace.root_cwd()?;
-                let cwd_str = cwd.to_string_lossy().to_string();
-                let os = std::env::consts::OS;
                 let shell = std::env::var("SHELL")
                     .ok()
                     .and_then(|s| {
@@ -391,11 +416,13 @@ impl WorkspaceRpcHandler {
                             .map(|n| n.to_string_lossy().to_string())
                     })
                     .unwrap_or_else(|| "sh".to_string());
-                Ok(serde_json::json!({
-                    "os": os,
-                    "shell": shell,
-                    "cwd": cwd_str,
-                }))
+                let info = WorkspaceInfo {
+                    os: std::env::consts::OS.to_owned(),
+                    shell,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    version: Some(xai_grok_version::VERSION.to_owned()),
+                };
+                serde_json::to_value(info).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
             <GitStatusReq as WorkspaceRpc>::METHOD => {
                 static DEPRECATION_WARNING: std::sync::Once = std::sync::Once::new();
@@ -458,6 +485,26 @@ impl WorkspaceRpcHandler {
                 let snapshot = tasks_snapshot(toolset.as_ref()).await;
                 serde_json::to_value(snapshot).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
+            <KillTaskReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<KillTaskReq>(&self.workspace);
+                let session_id = params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| WorkspaceError::HubError("missing session_id".into()))?;
+                let task_id = params
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| WorkspaceError::HubError("missing task_id".into()))?
+                    .to_owned();
+                let session = self
+                    .workspace
+                    .session(session_id)
+                    .ok_or_else(|| WorkspaceError::SessionNotFound(session_id.into()))?;
+                let toolset = session.toolset();
+                let outcome = kill_background_task(toolset.as_ref(), &task_id).await;
+                serde_json::to_value(KillTaskResponse { task_id, outcome })
+                    .map_err(|e| WorkspaceError::HubError(e.to_string()))
+            }
             <ListTodosReq as WorkspaceRpc>::METHOD => {
                 let session_id = params
                     .get("session_id")
@@ -473,6 +520,7 @@ impl WorkspaceRpcHandler {
                     .map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
             <UpdateToolConfigReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<UpdateToolConfigReq>(&self.workspace);
                 let caller = resolve_mutation_caller(
                     "update_tool_config",
                     bound_session,
@@ -522,7 +570,7 @@ impl WorkspaceRpcHandler {
                     .get("refs")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
-                let cwd = self.workspace.root_cwd()?;
+                let cwd = self.workspace.client_fs_base(bound_session).await?.base;
                 let mut results = Vec::new();
                 for ref_path in &refs {
                     let requested_path = if std::path::Path::new(ref_path).is_absolute() {
@@ -530,23 +578,20 @@ impl WorkspaceRpcHandler {
                     } else {
                         cwd.join(ref_path)
                     };
-                    let full_path = match self
-                        .workspace
-                        .confine_to_workspace_root(&requested_path)
-                        .await
-                    {
-                        Ok((confined, _)) => confined,
-                        Err(e) => {
-                            results.push(serde_json::json!({
-                                "path": requested_path.to_string_lossy(),
-                                "ref": ref_path,
-                                "exists": false,
-                                "content": Value::Null,
-                                "error": e.to_string(),
-                            }));
-                            continue;
-                        }
-                    };
+                    let full_path =
+                        match self.workspace.confine_to_root(&requested_path, &cwd).await {
+                            Ok((confined, _)) => confined,
+                            Err(e) => {
+                                results.push(serde_json::json!({
+                                    "path": requested_path.to_string_lossy(),
+                                    "ref": ref_path,
+                                    "exists": false,
+                                    "content": Value::Null,
+                                    "error": e.to_string(),
+                                }));
+                                continue;
+                            }
+                        };
                     let exists = full_path.exists();
                     let content = if exists {
                         tokio::fs::read_to_string(&full_path).await.ok()
@@ -563,10 +608,10 @@ impl WorkspaceRpcHandler {
                 Ok(Value::Array(results))
             }
             <PutFilesReq as WorkspaceRpc>::METHOD => {
-                dispatch_op::<PutFilesReq>(params, &self.workspace, None).await
+                dispatch_op::<PutFilesReq>(params, &self.workspace, bound_session).await
             }
             <GetFilesReq as WorkspaceRpc>::METHOD => {
-                dispatch_op::<GetFilesReq>(params, &self.workspace, None).await
+                dispatch_op::<GetFilesReq>(params, &self.workspace, bound_session).await
             }
             <FsListReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<FsListReq>(params, &self.workspace, None).await
@@ -585,15 +630,15 @@ impl WorkspaceRpcHandler {
             }
             <ClientFsListReq as WorkspaceRpc>::METHOD => {
                 ensure_client_fs_queries_enabled()?;
-                dispatch_op::<ClientFsListReq>(params, &self.workspace, None).await
+                dispatch_op::<ClientFsListReq>(params, &self.workspace, bound_session).await
             }
             <ClientFsStatReq as WorkspaceRpc>::METHOD => {
                 ensure_client_fs_queries_enabled()?;
-                dispatch_op::<ClientFsStatReq>(params, &self.workspace, None).await
+                dispatch_op::<ClientFsStatReq>(params, &self.workspace, bound_session).await
             }
             <ClientFsReadFileReq as WorkspaceRpc>::METHOD => {
                 ensure_client_fs_queries_enabled()?;
-                dispatch_op::<ClientFsReadFileReq>(params, &self.workspace, None).await
+                dispatch_op::<ClientFsReadFileReq>(params, &self.workspace, bound_session).await
             }
             <DiscoverSkillsReq as WorkspaceRpc>::METHOD => {
                 let cwd = self.workspace.root_cwd()?;
@@ -633,10 +678,11 @@ impl WorkspaceRpcHandler {
             }
             <LoadEnvrcReq as WorkspaceRpc>::METHOD => {
                 let cwd = self.workspace.root_cwd()?;
-                let env = crate::envrc::load_envrc_or_empty(&cwd);
+                let env = crate::envrc::spawn_envrc_load(cwd, true).join().await;
                 serde_json::to_value(env).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
             <InstallPluginReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<InstallPluginReq>(&self.workspace);
                 let _ = params;
                 Ok(Value::Null)
             }
@@ -651,6 +697,7 @@ impl WorkspaceRpcHandler {
                 Ok(Value::Array(plugins))
             }
             <ConfigureMcpReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<ConfigureMcpReq>(&self.workspace);
                 let session_id = bound_session.ok_or_else(|| {
                     WorkspaceError::HubError("configure_mcp requires a bound session".into())
                 })?;
@@ -703,6 +750,7 @@ impl WorkspaceRpcHandler {
                 dispatch_op::<PrepareWorktreeFromWorktreeReq>(params, &self.workspace, None).await
             }
             <WorktreeCreateSyncReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<WorktreeCreateSyncReq>(&self.workspace);
                 let req: crate::worktree::CreateWorktreeRequest = serde_json::from_value(params)
                     .map_err(|e| {
                         WorkspaceError::HubError(format!("invalid create_sync params: {e}"))
@@ -742,6 +790,15 @@ impl WorkspaceRpcHandler {
             }
             <GitCheckoutReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<GitCheckoutReq>(params, &self.workspace, None).await
+            }
+            <GitEnsureBindingReq as WorkspaceRpc>::METHOD => {
+                dispatch_op::<GitEnsureBindingReq>(params, &self.workspace, None).await
+            }
+            <GitMergeToMainReq as WorkspaceRpc>::METHOD => {
+                dispatch_op::<GitMergeToMainReq>(params, &self.workspace, None).await
+            }
+            <GitPushReq as WorkspaceRpc>::METHOD => {
+                dispatch_op::<GitPushReq>(params, &self.workspace, None).await
             }
             <GitStashReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<GitStashReq>(params, &self.workspace, None).await
@@ -897,7 +954,20 @@ impl WorkspaceRpcHandler {
                     .await;
                 serde_json::to_value(points).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
+            <PresenceNoteReq as WorkspaceRpc>::METHOD => {
+                let req: PresenceNoteReq = serde_json::from_value(params).map_err(|e| {
+                    WorkspaceError::HubError(format!("invalid params for presence.note: {e}"))
+                })?;
+                self.workspace
+                    .session(&req.session_id)
+                    .ok_or_else(|| WorkspaceError::SessionNotFound(req.session_id.clone()))?;
+                self.workspace
+                    .activity_tracker()
+                    .apply_presence_note(req.visible, req.seq);
+                Ok(Value::Null)
+            }
             <RewindToReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<RewindToReq>(&self.workspace);
                 let req: RewindToReq = serde_json::from_value(params).map_err(|e| {
                     WorkspaceError::HubError(format!("invalid params for rewind_to: {e}"))
                 })?;
@@ -1111,8 +1181,9 @@ impl ToolServerHandler for WorkspaceRpcHandler {
         let (became_empty, start_drain) = {
             let mut sessions = self.workspace.shared.sessions.write();
             if let Some(session) = sessions.remove(sid) {
-                session.abort_system_notify_forwarder();
+                session.abort_system_notify_producers();
                 session.shutdown_terminal_backend();
+                session.shutdown_browser_service();
                 session.cancel_hunk_tracker();
             }
             let empty = sessions.is_empty();

@@ -68,6 +68,7 @@ async fn copy_session_data_fork_truncates_live_branch_inclusive() {
         .init_session(&source_info, default_model_id())
         .await
         .unwrap();
+
     // Prompt 1 was rewound and retried: P1-dead/A1-dead is the dead branch.
     for update in [
         fork_user_chunk(sid, "P0", 0),
@@ -381,7 +382,7 @@ async fn copy_session_data_copies_compaction_segments_when_enabled() {
 
     let dst = adapter
         .session_dir(&target_info)
-        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+        .join(xai_compaction_transcript::COMPACTION_DIR);
     assert!(dst.join("segment_000.md").is_file());
     assert!(dst.join("segment_001.md").is_file());
     assert!(dst.join("INDEX.md").is_file());
@@ -403,7 +404,7 @@ async fn copy_session_data_copies_compaction_segments_when_enabled() {
     assert!(
         !adapter
             .session_dir(&target2)
-            .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+            .join(xai_compaction_transcript::COMPACTION_DIR)
             .exists()
     );
 }
@@ -1016,10 +1017,6 @@ async fn copy_session_data_with_model_override() {
         .init_session(&source_info, default_model_id())
         .await
         .unwrap();
-    adapter
-        .update_current_model_and_agent(&source_info, &default_model_id(), Some("grok-build"), None)
-        .await
-        .unwrap();
 
     let target_info = Info {
         id: acp::SessionId::new("fork-model-test"),
@@ -1039,10 +1036,6 @@ async fn copy_session_data_with_model_override() {
 
     let loaded = adapter.load_session(&target_info).await.unwrap();
     assert_eq!(loaded.summary.current_model_id.0.as_ref(), "grok-3");
-    assert_eq!(
-        loaded.summary.agent_name, None,
-        "an explicit model override must not inherit the source harness"
-    );
     assert_eq!(
         loaded.summary.parent_session_id,
         Some("source-model-test".to_string())

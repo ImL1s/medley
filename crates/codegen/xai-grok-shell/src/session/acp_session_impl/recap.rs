@@ -543,8 +543,7 @@ impl SessionActor {
                     xai_grok_sampler::stream_chat_completions(raw, meta, request_id, idle_timeout);
                 xai_grok_sampler::collect_response(events).await
             }
-            crate::sampling::ApiBackend::Responses
-            | crate::sampling::ApiBackend::CodexResponses => {
+            crate::sampling::ApiBackend::Responses => {
                 let (raw, meta, doom_loop) = sampling_client
                     .conversation_stream_responses(request)
                     .await
@@ -565,6 +564,9 @@ impl SessionActor {
                     .ok()?;
                 let events = xai_grok_sampler::stream_messages(raw, meta, request_id, idle_timeout);
                 xai_grok_sampler::collect_response(events).await
+            }
+            _ => {
+                return None;
             }
         };
 
@@ -672,11 +674,8 @@ impl SessionActor {
 
         let response = match sampling_client.conversation_collect(request).await {
             Ok(r) => r,
-            Err(_) => {
-                tracing::debug!(
-                    error_class = "sampling_request",
-                    "prompt suggest inference failed"
-                );
+            Err(e) => {
+                tracing::debug!(error = %e, "prompt suggest inference failed");
                 return None;
             }
         };
@@ -693,8 +692,7 @@ impl SessionActor {
             suggestion = None;
         }
         tracing::debug!(
-            response_present = !raw.trim().is_empty(),
-            response_len = raw.len(),
+            raw_preview = %xai_grok_tools::util::truncate_str(raw.trim(), 60),
             accepted = suggestion.is_some(),
             "prompt suggest: response"
         );
@@ -713,6 +711,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry,
+            error_code: None,
         }
     }
 
@@ -723,6 +722,7 @@ mod tests {
         assert!(should_retry_side_question(&SamplingError::StreamError {
             error_type: "overloaded_error".into(),
             message: "Overloaded".into(),
+            code: None,
         }));
         assert!(should_retry_side_question(&api(
             500,
@@ -772,6 +772,7 @@ mod tests {
             Err(SamplingError::StreamError {
                 error_type: "overloaded_error".into(),
                 message: "Overloaded".into(),
+                code: None,
             })
         })
         .retry(side_question_retry_policy())

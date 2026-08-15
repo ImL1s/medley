@@ -35,6 +35,21 @@ pub struct WorkflowAgentInfo {
     pub duration_ms: u64,
 }
 
+/// `_meta` key on rename fan-out (`SessionSummaryGenerated` + ACP
+/// `SessionInfoUpdate`). Old clients ignore unknown meta.
+pub const TITLE_IS_MANUAL_META_KEY: &str = "x.ai/titleIsManual";
+
+/// `_meta` object carried on a manual-rename fan-out.
+pub fn title_is_manual_meta() -> serde_json::Value {
+    serde_json::json!({ TITLE_IS_MANUAL_META_KEY: true })
+}
+
+/// `_meta` object carried on `/rename --auto` fan-out. Distinct from
+/// *absent* meta (auto title — must not clobber `display_name`).
+pub fn title_is_unpinned_meta() -> serde_json::Value {
+    serde_json::json!({ TITLE_IS_MANUAL_META_KEY: false })
+}
+
 /// xAI-specific session notification (parallel to acp::SessionNotification)
 /// This wraps an XaiSessionUpdate with session context for persistence and replay.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -544,9 +559,7 @@ pub enum SessionUpdate {
         event_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_name: Option<String>,
-        /// The prompt turn this batch belongs to, when known; lets the
-        /// client keep a delayed `stop`/`stop_failure` batch off the wrong
-        /// turn's marker.
+        /// Keeps a delayed turn-end batch off the wrong turn's marker.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
         runs: Vec<HookRunEntryDto>,
@@ -793,7 +806,12 @@ pub enum SessionUpdate {
         subagent_id: Option<String>,
     },
     /// A scheduled task was deleted/cancelled.
-    ScheduledTaskDeleted { task_id: String },
+    ScheduledTaskDeleted {
+        task_id: String,
+        /// `Unknown` on rows persisted before the reason field existed.
+        #[serde(default)]
+        reason: xai_grok_tools::notification::ScheduledTaskRemovedReason,
+    },
     /// A monitor event (stdout line from a monitor background process).
     MonitorEvent {
         task_id: String,
@@ -850,13 +868,6 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments_delta: Option<String>,
     },
-    /// A streamed sampling attempt was abandoned for retry.
-    ///
-    /// Clients must drop any agent-message / thought / partial tool-call
-    /// UI produced for the abandoned attempt so a successful retry does
-    /// not show duplicated output. Mirrors
-    /// [`xai_grok_sampler::SamplingEvent::AttemptDiscarded`].
-    AttemptDiscarded,
     /// One or more prompt images were resized to fit within API limits.
     ImageCompressed {
         images: Vec<ImageCompressedEntry>,
@@ -866,17 +877,6 @@ pub enum SessionUpdate {
     /// Prompt images dropped before send (integrity / upscale-cap). The
     /// model is told via a system-reminder; this surfaces them to the UI.
     ImageDropped { notes: Vec<String> },
-    /// `web_search` was withheld from the toolset because its model could not
-    /// be resolved or was not ready (#57). Shown once as a system scrollback
-    /// line so the silent disable is legible.
-    WebSearchDisabled {
-        /// Model id that was tried.
-        model_id: String,
-        /// Actionable rejection reason.
-        reason: String,
-        /// Pre-formatted user-facing notice (model + reason).
-        message: String,
-    },
     /// Memory file listing for the pager's /memory modal.
     MemoryFiles { files: Vec<MemoryFileInfo> },
     WorkflowUpdated {
@@ -1727,27 +1727,6 @@ mod tests {
 
         let json = serde_json::to_value(&update).unwrap();
         assert_eq!(json["tokens_used"], 75_000);
-    }
-
-    /// #44: wire shape for the sampling-attempt retraction.
-    #[test]
-    fn attempt_discarded_round_trips_on_wire() {
-        let update = SessionUpdate::AttemptDiscarded;
-        let json = serde_json::to_value(&update).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({"sessionUpdate": "attempt_discarded"})
-        );
-        let parsed: SessionUpdate = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed, SessionUpdate::AttemptDiscarded);
-
-        let envelope = r#"{
-            "sessionId": "sess-1",
-            "update": {"sessionUpdate": "attempt_discarded"}
-        }"#;
-        let notification: SessionNotification = serde_json::from_str(envelope).unwrap();
-        assert_eq!(notification.session_id.0.as_ref(), "sess-1");
-        assert_eq!(notification.update, SessionUpdate::AttemptDiscarded);
     }
 
     #[test]

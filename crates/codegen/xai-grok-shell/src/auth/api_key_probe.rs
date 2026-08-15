@@ -19,6 +19,13 @@ use serde::Deserialize;
 /// Wall-clock budget for the entire probe (all attempts + backoff).
 pub(crate) const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 
+/// Last 12 chars of a key for diagnostic logs (never the full secret).
+/// Local copy avoids a Bazel-visible import cycle with `auth::model`.
+fn key_suffix(t: &str) -> &str {
+    let len = t.len();
+    if len > 12 { &t[len - 12..] } else { t }
+}
+
 /// Whether `initialize` should HTTP-probe the first-party env key.
 ///
 /// Skip (and treat as usable) when:
@@ -185,6 +192,7 @@ async fn probe_xai_api_key_at_url(key: &str, url: &str, timeout: Duration) -> Ap
             "elapsed_ms": elapsed_ms,
             "timeout_ms": timeout.as_millis() as u64,
             "attempts": attempts,
+            "key_suffix": key_suffix(key),
         })),
     );
 

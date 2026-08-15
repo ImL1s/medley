@@ -42,7 +42,7 @@ impl StopHookRun {
 /// `respond`. `$n` holds the 1-based invocation number when `respond` runs.
 async fn run_with_stop_hook(respond: &str) -> StopHookRun {
     let state_dir = tempfile::TempDir::new().expect("create state dir");
-    let server = MockInferenceServer::start_keyless_local()
+    let server = MockInferenceServer::start()
         .await
         .expect("start mock server");
     let sandbox = TestSandbox::builder().mock_url(server.url()).git().build();

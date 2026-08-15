@@ -12,6 +12,7 @@ use crate::appearance::TextSelection;
 use crate::appearance::permission_cursor::DefaultSelectedPermission;
 
 use xai_grok_shell::agent::config::UiConfig;
+use xai_grok_shell::util::config::DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED;
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
@@ -217,6 +218,21 @@ const PLAN_MODE_CHOICES: &[EnumChoice] = &[
     },
 ];
 
+// Mid-turn follow-up routing. SHARED-owned, persisted to
+// `[ui].follow_up_behavior`. Canonicals match `FollowUpBehavior::as_canonical`.
+const FOLLOW_UP_BEHAVIOR_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "queue",
+        display: "Queue",
+        description: "Hold follow-ups until the current turn finishes.",
+    },
+    EnumChoice {
+        canonical: "steer",
+        display: "Steer",
+        description: "Inject follow-ups mid-turn at the next tool or model step.",
+    },
+];
+
 // ---------------------------------------------------------------------------
 // Mermaid-rendering catalog.
 //
@@ -277,7 +293,7 @@ const TEXT_SELECTION_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         canonical: TextSelection::WordSelect.as_canonical(),
         display: "Word select (terminal-like)",
-        description: "Double-click selects & copies a word, triple-click a line; selection stays until dismissed.",
+        description: "Double-click selects & copies a word, triple-click a paragraph; selection stays until dismissed.",
     },
 ];
 
@@ -1031,10 +1047,11 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 "high", "120", "144",
             ],
             kind: SettingKind::Bool {
+                // Nested Option: None inherits DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED.
                 default: ui_default
                     .display_refresh
                     .auto_cadence_enabled
-                    .unwrap_or(false),
+                    .unwrap_or(DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED),
             },
             restart_required: true,
             hidden_in_minimal: true,
@@ -1125,7 +1142,9 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
-        // SHELL-owned `flash` | `hold` on `[ui].keep_text_selection`.
+        // SHELL-owned `flash` | `hold` | `word_select` on `[ui].keep_text_selection`. Compile-time
+        // default `flash`; the default can be set remotely via the `keep_text_selection_default`
+        // soft-default (a staged rollout applied at startup, not in this static default).
         SettingMeta {
             key: "keep_text_selection",
             category: SettingCategory::Mouse,

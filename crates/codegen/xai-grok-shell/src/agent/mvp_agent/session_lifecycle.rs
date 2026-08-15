@@ -8,6 +8,13 @@ pub(super) const CLOSE_INTAKE_WAIT: std::time::Duration = std::time::Duration::f
 const CLOSE_ATTACH_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Cap on the sum of every close wait.
 pub(super) const CLOSE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+/// Bound on delete's wait for the subagent coordinator to drain a session's
+/// children. Separate from [`DRAIN_OLD_THREAD_WAIT`] (which bounds waiting out
+/// a flushing actor thread) so the two budgets can move independently.
+const DRAIN_SUBAGENTS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Cap on the sum of every delete wait (subagent drain + old-thread drain),
+/// mirroring [`CLOSE_TOTAL_BUDGET`] so the delete toast cannot outlast it.
+const DELETE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 /// `cap`, shrunk to what remains under `deadline`.
 fn stage_budget(deadline: tokio::time::Instant, cap: std::time::Duration) -> std::time::Duration {
     cap.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
@@ -88,14 +95,28 @@ impl MvpAgent {
             .send(SessionCommand::Shutdown(ShutdownKind::CancelRunningTurn));
         true
     }
-    /// Hard-stop before wiping history, waiting briefly for flush so delete
-    /// can remove the session directory without the actor rewriting it.
+    /// Hard-stop before wiping history so delete cannot race live writers.
+    ///
+    /// Order matches [`Self::close_active_session`]: drop residency *before*
+    /// any await (the supervisor treats a finished still-resident actor as a
+    /// crash; awaiting subagent drain while resident races that sweep), and
+    /// every wait spends from a shared [`DELETE_TOTAL_BUDGET`] so the two
+    /// drains cannot stack into a toast twice as long as close's.
     pub(crate) async fn teardown_live_session_before_delete(&self, id: &acp::SessionId) {
-        if !self.hard_stop_resident(id, CancelTrigger::SessionDelete) {
-            return;
+        let deadline = tokio::time::Instant::now() + DELETE_TOTAL_BUDGET;
+        let resident = self.hard_stop_resident(id, CancelTrigger::SessionDelete);
+        if resident {
+            self.remove_session_terminal(id, SessionLiveState::Completed);
         }
-        self.remove_session_terminal(id, SessionLiveState::Completed);
-        self.drain_old_session_thread(id).await;
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
+            self.subagent_event_tx.clone(),
+        )
+        .teardown_session_and_drain(&id.0, stage_budget(deadline, DRAIN_SUBAGENTS_WAIT))
+        .await;
+        if resident {
+            self.drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
+                .await;
+        }
     }
     /// Move the replica `active` -> `completed`. A hosting signal, not a
     /// conversation ending: only an explicit close sends it.
@@ -156,9 +177,6 @@ impl MvpAgent {
     /// wedged session's tree is still reclaimed.
     pub(super) fn take_session(&self, id: &acp::SessionId) -> Option<SessionHandle> {
         let handle = self.session_registry.take_resident(id);
-        // Session-scoped side tables die with the session here, so this funnel
-        // is the reason they cannot leak (#161).
-        self.web_search_disabled.borrow_mut().remove(id);
         if let Some(handle) = &handle
             && let Some(scope) = &handle.tool_context.process_scope
         {
@@ -172,6 +190,7 @@ impl MvpAgent {
             .subagent_event_tx
             .send(xai_grok_tools::implementations::grok_build::task::types::SubagentEvent::TeardownSession {
                 parent_session_id: id.0.to_string(),
+                respond_to: None,
             });
         self.take_session(id);
         self.session_registry.release(id);
@@ -182,7 +201,7 @@ impl MvpAgent {
     }
     /// Per-session prompt-intake lock: prompts land in submission order and a
     /// cancel cannot overtake the prompt it targets. Keep preambles lean.
-    pub(crate) fn dispatch_lock(&self, id: &acp::SessionId) -> std::rc::Rc<tokio::sync::Mutex<()>> {
+    pub(super) fn dispatch_lock(&self, id: &acp::SessionId) -> std::rc::Rc<tokio::sync::Mutex<()>> {
         self.session_registry.dispatch_lock(id)
     }
     /// Record the coarse lifecycle state for a session.
@@ -462,6 +481,7 @@ impl MvpAgent {
             resident_resources: counts.resident_resources,
             retained_resources: counts.retained_resources,
             dispatch_locks: counts.dispatch_locks,
+            live_orphan_heal_locks: counts.live_orphan_heal_locks,
             session_turn_numbers: counts.session_turn_numbers,
             permission_event_receivers: counts.permission_event_receivers,
             model_unavailable_sessions: counts.model_unavailable_sessions,
@@ -490,6 +510,7 @@ pub(crate) struct RegistrySnapshot {
     pub resident_resources: usize,
     pub retained_resources: usize,
     pub dispatch_locks: usize,
+    pub live_orphan_heal_locks: usize,
     pub session_turn_numbers: usize,
     pub permission_event_receivers: usize,
     pub model_unavailable_sessions: usize,

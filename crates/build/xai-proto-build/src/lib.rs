@@ -179,9 +179,11 @@ impl XaiProtoBuilder {
         // Can only process one input file when using --dependency_out=FILE.
         for proto in protos {
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
+            let dependency_out = tempfile::NamedTempFile::new()?;
+            let descriptor_set_out = if cfg!(windows) { "NUL" } else { "/dev/null" };
             command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+                .arg(format!("--dependency_out={}", dependency_out.path().display()))
+                .arg(format!("--descriptor_set_out={}", descriptor_set_out));
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -209,18 +211,21 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let mut lines = output.stdout.split(|&b| b == b'\n');
+            let file_contents = std::fs::read(dependency_out.path()).context("failed to read dependency_out")?;
+
+            let mut lines = file_contents.split(|&b| b == b'\n');
             let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = b"/dev/null:";
+            let prefix_str = format!("{descriptor_set_out}:");
+            let prefix = prefix_str.as_bytes();
             let rem = if first_line.starts_with(prefix) {
                 &first_line[prefix.len()..]
             } else {
                 return Err(anyhow::anyhow!(
-                    "protoc command output must start with /dev/null: {:?}",
+                    "protoc command output must start with {prefix_str}: {:?}",
                     String::from_utf8_lossy(first_line)
                 ));
             };
-            for line in iter::once(rem).chain(lines) {
+            for line in std::iter::once(rem).chain(lines) {
                 let mut line = trim_ascii(line);
                 if line.is_empty() {
                     continue;

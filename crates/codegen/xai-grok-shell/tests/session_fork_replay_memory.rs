@@ -12,7 +12,7 @@ use agent_client_protocol as acp;
 use tempfile::TempDir;
 
 use xai_grok_shell::session::storage::{
-    ReplayEmission, ReplayUpdate, SessionUpdate, UpdatesIterator, filter_rewind_updates,
+    ReplayEmission, SessionUpdate, UpdatesIterator, filter_rewind_updates,
     stream_replay_updates_at, strip_context_wrappers,
 };
 use xai_grok_shell::session::testkit::synth::{self, SessionSpec};
@@ -70,7 +70,7 @@ fn fork_replay_spec() -> SessionSpec {
     )
 }
 
-fn reference_load_all(updates_path: &Path) -> Vec<ReplayUpdate> {
+fn reference_load_all(updates_path: &Path) -> Vec<acp::SessionUpdate> {
     let iter = UpdatesIterator::open(updates_path)
         .expect("open updates")
         .expect("updates file exists");
@@ -79,27 +79,17 @@ fn reference_load_all(updates_path: &Path) -> Vec<ReplayUpdate> {
     filtered
         .into_iter()
         .filter_map(|u| match u {
-            SessionUpdate::Acp(notif) => {
-                Some(ReplayUpdate::Acp(strip_context_wrappers(notif.update)))
-            }
-            SessionUpdate::Xai(n)
-                if matches!(
-                    n.update,
-                    xai_grok_shell::extensions::notification::SessionUpdate::AttemptDiscarded
-                ) =>
-            {
-                Some(ReplayUpdate::AttemptDiscarded)
-            }
+            SessionUpdate::Acp(notif) => match notif.update {
+                acp::SessionUpdate::AvailableCommandsUpdate(_) => None,
+                other => Some(strip_context_wrappers(other)),
+            },
             SessionUpdate::Xai(_) => None,
         })
         .collect()
 }
 
-fn serialize(u: &ReplayUpdate) -> String {
-    match u {
-        ReplayUpdate::Acp(a) => serde_json::to_string(a).expect("serialize replayed ACP update"),
-        ReplayUpdate::AttemptDiscarded => "attempt_discarded".into(),
-    }
+fn serialize(u: &acp::SessionUpdate) -> String {
+    serde_json::to_string(u).expect("serialize replayed update")
 }
 
 /// Streaming holds one `read_to_string` copy (~1x) plus transient per-update

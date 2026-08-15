@@ -91,7 +91,7 @@ fn collect_events_jsonl(root: &Path) -> Vec<(std::path::PathBuf, String)> {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn sleep_tool_records_multi_second_dispatch_duration() {
-    let server = MockInferenceServer::start_keyless_local()
+    let server = MockInferenceServer::start()
         .await
         .expect("start mock server");
     enqueue_sleep_tool_turn(&server);

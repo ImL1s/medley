@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
@@ -70,20 +70,9 @@ pub(crate) fn task_model_error_for_catalog(
     let is_available = |entry: &ModelEntry| {
         entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
     };
-    if resolve_catalog_identity(available, &acp::ModelId::new(requested))
-        .and_then(|identity| available.get(identity.model_id.as_str()))
-        .is_some_and(&is_available)
-    {
+    if config::find_model_by_id(available, requested).is_some_and(&is_available) {
         return None;
     }
-
-    let ambiguous_route = !available.contains_key(requested)
-        && available
-            .values()
-            .filter(|entry| entry.info().model == requested)
-            .take(2)
-            .count()
-            > 1;
 
     let mut slugs = available
         .iter()
@@ -100,13 +89,7 @@ pub(crate) fn task_model_error_for_catalog(
             slugs.join(", ")
         )
     };
-    if ambiguous_route {
-        Some(format!(
-            "Ambiguous Task.model slug '{requested}'. Use an exact catalog key. {guidance}"
-        ))
-    } else {
-        Some(format!("Unknown Task.model slug '{requested}'. {guidance}"))
-    }
+    Some(format!("Unknown Task.model slug '{requested}'. {guidance}"))
 }
 
 /// Thread-safe model manager.
@@ -115,19 +98,12 @@ pub struct ModelsManager {
     inner: Arc<Inner>,
 }
 
-#[derive(Clone)]
-pub(crate) struct ResolvedModelCapabilities {
-    pub model_id: acp::ModelId,
-    pub byok: crate::agent::auth_method::ModelByok,
-    pub agent_type: String,
-    pub auth_scheme: xai_grok_sampler::AuthScheme,
-    pub supports_reasoning_effort: bool,
-    pub reasoning_efforts: Vec<ReasoningEffortOption>,
-    pub supports_backend_search: bool,
-    pub auto_compact_threshold_percent: Option<u8>,
-    pub compactions_remaining: Option<xai_grok_sampling_types::CompactionsRemaining>,
-    pub compaction_at_tokens: Option<xai_grok_sampling_types::CompactionAtTokens>,
-    pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
+/// Progress of the first real-catalog load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogProgress {
+    Pending,
+    Failed,
+    Ready,
 }
 
 /// Catalog fields written together under one lock, so readers never see a torn mix.
@@ -140,22 +116,14 @@ struct CatalogState {
     has_fetched_real_catalog: bool,
     /// `allowed_models` matched nothing; the prompt path blocks instead.
     allowlist_excludes_all: bool,
+    /// Bumped on identity change; a fetch captured before it must not apply.
+    generation: u64,
 }
 
 struct Inner {
     catalog: RwLock<CatalogState>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
-    /// Set when the user's configured default was not seated and a substitute
-    /// was used (#131). Refreshed at every `resolve_default_model` call site —
-    /// including the early-return of `reselect_current_model_if_missing` — so a
-    /// catalog that arrives late corrects a verdict taken against an emptier
-    /// one rather than leaving it stale. On the warm-cache path that correction
-    /// also reseats the preference when it becomes honourable (unless the user
-    /// already picked via `/model`), so clearing the verdict cannot disagree
-    /// with `current_model_id`. Republished on `x.ai/models/update` via
-    /// [`Self::notify_models_updated`].
-    substituted_preference: RwLock<Option<resolution::SubstitutedPreference>>,
     // ── Owned context for self-contained refresh ────────────────
     auth_manager: Arc<AuthManager>,
     cfg: RwLock<config::Config>,
@@ -167,14 +135,11 @@ struct Inner {
     retry_in_flight: AtomicBool,
     /// Single-flight for the etag-triggered background refresh (`spawn_fetch`).
     refresh_in_flight: AtomicBool,
+    fetches_in_flight: AtomicUsize,
     /// Model-switch signal: a generation counter bumped when the current model id changes.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
-    /// Catalog-content generation: bumped whenever `cat.models` is wholesale
-    /// replaced or mutated by a publish path (`apply_catalog`, `apply_config`,
-    /// test pokes). Session auth memos key on this so a transient miss that
-    /// freezes `NotInCatalog` cannot outlive the refresh that restores the
-    /// model (#159 / F1).
-    catalog_generation: AtomicU64,
+    /// Progress of the first real-catalog load, watched by bounded waits.
+    catalog_progress: tokio::sync::watch::Sender<CatalogProgress>,
     /// Set once the user explicitly picks a model (`/model`); guards the
     /// first-catalog reselect from clobbering that choice.
     user_selected_model: AtomicBool,
@@ -191,6 +156,53 @@ struct RefreshInFlightGuard(Arc<Inner>);
 impl Drop for RefreshInFlightGuard {
     fn drop(&mut self) {
         self.0.refresh_in_flight.store(false, Ordering::Release);
+    }
+}
+
+/// One fetch attempt (or retry sequence), counted for bounded waiters.
+/// Begin before spawning the task; beginning supersedes an earlier `Failed`.
+struct FetchAttemptGuard {
+    inner: Arc<Inner>,
+    generation: u64,
+}
+impl FetchAttemptGuard {
+    fn begin(inner: &Arc<Inner>) -> Self {
+        // Count first: a waiter that sees `Pending` must also see the attempt.
+        inner.fetches_in_flight.fetch_add(1, Ordering::AcqRel);
+        inner.catalog_progress.send_if_modified(|p| {
+            let supersede = *p == CatalogProgress::Failed;
+            if supersede {
+                *p = CatalogProgress::Pending;
+            }
+            supersede
+        });
+        let generation = inner.catalog.read().generation;
+        Self {
+            inner: inner.clone(),
+            generation,
+        }
+    }
+}
+impl Drop for FetchAttemptGuard {
+    fn drop(&mut self) {
+        if self.inner.fetches_in_flight.fetch_sub(1, Ordering::AcqRel) > 1 {
+            return;
+        }
+        // Last attempt out with no outcome: latch so waiters return. The
+        // lock makes the generation check atomic against `clear()`.
+        let cat = self.inner.catalog.read();
+        if cat.generation != self.generation
+            || self.inner.fetches_in_flight.load(Ordering::Acquire) > 0
+        {
+            return;
+        }
+        self.inner.catalog_progress.send_if_modified(|p| {
+            let unresolved = *p == CatalogProgress::Pending;
+            if unresolved {
+                *p = CatalogProgress::Failed;
+            }
+            unresolved
+        });
     }
 }
 
@@ -253,11 +265,7 @@ impl ModelsManagerBuilder {
     pub(crate) fn build(self) -> ModelsManager {
         let has_session = self.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&self.cfg.endpoints, has_session);
-        let current_reasoning_effort = self.cfg.models.default_reasoning_effort.filter(|effort| {
-            resolve_catalog_key(&self.models, &self.current_model_id)
-                .and_then(|model_id| self.models.get(model_id.0.as_ref()))
-                .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, *effort))
-        });
+        let current_reasoning_effort = self.cfg.models.default_reasoning_effort;
         ModelsManager {
             inner: Arc::new(Inner {
                 catalog: RwLock::new(CatalogState {
@@ -267,7 +275,6 @@ impl ModelsManagerBuilder {
                 }),
                 current_model_id: RwLock::new(self.current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
-                substituted_preference: RwLock::new(None),
                 auth_manager: self.auth_manager,
                 cfg: RwLock::new(self.cfg),
                 fetch_auth: RwLock::new(fetch_auth),
@@ -276,90 +283,16 @@ impl ModelsManagerBuilder {
                 endpoint: self.endpoint,
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
+                fetches_in_flight: AtomicUsize::new(0),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
-                catalog_generation: AtomicU64::new(0),
+                catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
                 user_selected_model: AtomicBool::new(false),
             }),
         }
     }
 }
 
-pub(crate) fn capabilities_for_route_in(
-    models: &IndexMap<String, ModelEntry>,
-    preferred_id: Option<&str>,
-    routing_model: &str,
-    preferred_id_must_exist: bool,
-    alternate_preferred_route: Option<&str>,
-) -> Option<ResolvedModelCapabilities> {
-    if preferred_id_must_exist && preferred_id.is_some_and(|id| !models.contains_key(id)) {
-        return None;
-    }
-    let preferred = preferred_id
-        .filter(|id| models.contains_key(*id))
-        .map(acp::ModelId::new)
-        .and_then(|key| {
-            models
-                .get(key.0.as_ref())
-                .filter(|entry| {
-                    entry.info().model == routing_model
-                        || alternate_preferred_route == Some(entry.info().model.as_str())
-                })
-                .map(|entry| (key.0.to_string(), entry))
-        });
-    let (model_id, entry) = if preferred_id_must_exist {
-        preferred?
-    } else if let Some(preferred) = preferred {
-        preferred
-    } else {
-        let mut matches = models
-            .iter()
-            .filter(|(_, entry)| entry.info().model == routing_model);
-        let first = matches.next()?;
-        if matches.next().is_some() {
-            return None;
-        }
-        (first.0.clone(), first.1)
-    };
-    let info = entry.info();
-    Some(ResolvedModelCapabilities {
-        model_id: acp::ModelId::new(model_id),
-        byok: if entry.has_own_credentials() {
-            crate::agent::auth_method::ModelByok::Byok
-        } else {
-            crate::agent::auth_method::ModelByok::NotByok
-        },
-        agent_type: info.agent_type.clone(),
-        auth_scheme: info.auth_scheme,
-        supports_reasoning_effort: info.supports_reasoning_effort,
-        reasoning_efforts: info.reasoning_efforts.clone(),
-        supports_backend_search: info.supports_backend_search,
-        auto_compact_threshold_percent: info.auto_compact_threshold_percent,
-        compactions_remaining: info.compactions_remaining,
-        compaction_at_tokens: info.compaction_at_tokens,
-        codex_wire: info.codex_wire.clone(),
-    })
-}
-
 impl ModelsManager {
-    /// Resolve one routing model and copy all request-shaping facts while
-    /// holding a single catalog read lock. An exact key that routes elsewhere
-    /// never shadows a unique routing-model match.
-    pub(crate) fn capabilities_for_route(
-        &self,
-        preferred_id: Option<&str>,
-        routing_model: &str,
-        preferred_id_must_exist: bool,
-        alternate_preferred_route: Option<&str>,
-    ) -> Option<ResolvedModelCapabilities> {
-        let catalog = self.inner.catalog.read();
-        capabilities_for_route_in(
-            &catalog.models,
-            preferred_id,
-            routing_model,
-            preferred_id_must_exist,
-            alternate_preferred_route,
-        )
-    }
     pub(crate) fn new(
         prefetched: Option<IndexMap<String, ModelEntry>>,
         models: IndexMap<String, ModelEntry>,
@@ -380,48 +313,18 @@ impl ModelsManager {
         *self.inner.model_switch_watch.borrow()
     }
 
-    /// Cheap snapshot of the catalog-content generation (see
-    /// [`Inner::catalog_generation`]). Auth memos compare against this.
-    pub(crate) fn catalog_generation(&self) -> u64 {
-        self.inner.catalog_generation.load(Ordering::Acquire)
-    }
-
-    fn bump_catalog_generation(&self) {
-        self.inner
-            .catalog_generation
-            .fetch_add(1, Ordering::Release);
-    }
-
     /// Build from a resolved config. Falls back to bundled default if no models available.
     pub(crate) fn from_config(
         cfg: &config::Config,
         prefetched_models: Option<IndexMap<String, ModelEntry>>,
         auth_manager: Arc<AuthManager>,
     ) -> Result<Self, String> {
-        Self::from_config_with_remote_fetch(
-            cfg,
-            prefetched_models,
-            auth_manager,
-            crate::util::config::resolve_remote_fetch_enabled(),
-        )
-    }
-
-    fn from_config_with_remote_fetch(
-        cfg: &config::Config,
-        prefetched_models: Option<IndexMap<String, ModelEntry>>,
-        auth_manager: Arc<AuthManager>,
-        remote_fetch_enabled: bool,
-    ) -> Result<Self, String> {
         let has_session = auth_manager.current_or_expired().is_some();
         let is_session_auth = auth_manager
             .current_or_expired()
             .is_some_and(|a| a.is_session_auth());
         let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
-        crate::remote::validate_models_catalog_auth(
-            &cfg.endpoints,
-            fetch_auth,
-            remote_fetch_enabled,
-        )?;
+        let mut cached_etag = None;
         let prefetched_models = prefetched_models.or_else(|| {
             let cache = ModelsCacheManager::new();
             cache
@@ -429,7 +332,10 @@ impl ModelsManager {
                     &fetch_auth.cache_auth_method(),
                     &crate::remote::models_list_url(&cfg.endpoints, fetch_auth),
                 )
-                .map(|c| c.models)
+                .map(|c| {
+                    cached_etag = c.etag;
+                    c.models
+                })
         });
         let has_prefetched = prefetched_models.is_some();
         let catalog = resolve_model_catalog(cfg, prefetched_models.clone());
@@ -438,37 +344,14 @@ impl ModelsManager {
             validate_selectable(cfg, &catalog)?;
         }
 
-        let usable_xai = {
-            // One AuthManager observation → full ambient eligibility (Pro P1).
-            resolution::classify_ambient_xai_auth(
-                cfg,
-                auth_manager.first_party_session_eligibility(),
-            )
-            .is_usable()
-        };
-        let (current_model_key, current_model, model_source, unready_default_reason) =
-            resolve_default_model_for_catalog_with_usable_xai(
-                cfg,
-                &catalog,
-                is_session_auth,
-                has_prefetched,
-                usable_xai,
-            );
+        let (current_model_key, current_model, model_source) =
+            resolve_default_model(cfg, &catalog, is_session_auth);
 
-        if let Some(reason) = &unready_default_reason {
-            tracing::error!(
-                model_id = %current_model.model,
-                source = %model_source,
-                %reason,
-                "default model resolved to an unusable catalog entry"
-            );
-        } else {
-            tracing::info!(
-                model_id = %current_model.model,
-                source = %model_source,
-                "default model resolved"
-            );
-        }
+        tracing::info!(
+            model_id = %current_model.model,
+            source = %model_source,
+            "default model resolved"
+        );
 
         let current_model_id = acp::ModelId::new(Arc::from(current_model_key));
 
@@ -479,9 +362,14 @@ impl ModelsManager {
             auth_manager,
             cfg.clone(),
         );
-        mgr.record_substituted_preference(cfg, model_source);
         if has_prefetched {
-            mgr.inner.catalog.write().has_fetched_real_catalog = true;
+            let mut cat = mgr.inner.catalog.write();
+            cat.has_fetched_real_catalog = true;
+            // With the etag, the first check renews instead of refetching.
+            cat.etag = cached_etag;
+            mgr.inner
+                .catalog_progress
+                .send_replace(CatalogProgress::Ready);
         }
         Ok(mgr)
     }
@@ -523,10 +411,6 @@ impl ModelsManager {
             }
             cat.models = new_catalog;
         }
-        // Catalog contents changed (config-driven re-resolve); invalidate
-        // generation-keyed auth memos even when the config-watcher also
-        // broadcasts InvalidateModelAuthMemo.
-        self.bump_catalog_generation();
 
         let preferred_changed = new_preferred != old_preferred && new_preferred.is_some();
         let mut campaign_defaults = std::collections::HashSet::new();
@@ -544,16 +428,15 @@ impl ModelsManager {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
             let cur = self.inner.current_model_id.read();
-            models.get(cur.0.as_ref()).is_some_and(|e| {
-                e.info.user_selectable && e.info.visible_for_auth(self.is_session_auth())
-            })
+            models
+                .get(cur.0.as_ref())
+                .is_some_and(|e| e.info.user_selectable)
         };
         if preferred_changed && !(campaign_only_flip && current_still_ok) {
             self.reselect_default_model(&new_config);
         } else {
             self.reselect_current_model_if_missing(&new_config);
         }
-        self.revalidate_current_reasoning_effort();
 
         self.notify_models_updated();
     }
@@ -562,7 +445,6 @@ impl ModelsManager {
     pub(crate) fn apply_config_reselecting_default(&self, new_config: config::Config) {
         self.apply_config(new_config.clone());
         self.reselect_default_model(&new_config);
-        self.revalidate_current_reasoning_effort();
         self.notify_models_updated();
     }
 
@@ -570,26 +452,6 @@ impl ModelsManager {
 
     pub fn models(&self) -> IndexMap<String, ModelEntry> {
         self.inner.catalog.read().models.clone()
-    }
-
-    /// Return the complete catalog and its ACP-selectable projection from one
-    /// catalog generation. Callers that authorize a persisted model must not
-    /// combine independently captured `models()` and `available()` snapshots.
-    pub(crate) fn models_and_available(
-        &self,
-    ) -> (
-        IndexMap<String, ModelEntry>,
-        IndexMap<acp::ModelId, acp::ModelInfo>,
-    ) {
-        let is_session_auth = self.is_session_auth();
-        let models = self.inner.catalog.read().models.clone();
-        let selectable = models
-            .iter()
-            .filter(|(_, entry)| entry.info.user_selectable)
-            .map(|(key, entry)| (key.clone(), entry.clone()))
-            .collect();
-        let available = available_models(&selectable, is_session_auth);
-        (models, available)
     }
 
     pub fn endpoints(&self) -> config::EndpointsConfig {
@@ -604,41 +466,20 @@ impl ModelsManager {
             .is_some_and(|a| a.is_session_auth())
     }
 
-    /// Sample-ready ambient xAI for #303 default selection (not catalog visibility).
-    ///
-    /// Uses [`AuthManager::first_party_session_eligibility`] (wire-usable **or**
-    /// complete-refreshable session) plus static keys / preferred_method pin —
-    /// never bare `current_or_expired` / mixed `has_usable_token() && current()`.
-    fn usable_ambient_xai(&self, cfg: &config::Config) -> bool {
-        resolution::classify_ambient_xai_auth(
-            cfg,
-            self.inner.auth_manager.first_party_session_eligibility(),
-        )
-        .is_usable()
-    }
-
-    /// Whether a Codex-backed model is actually reachable: holding a live
-    /// provider credential *and* surviving the same `user_selectable` /
-    /// `visible_for_auth` filters the picker applies.
-    ///
-    /// Suppressing the interactive xAI login keys on this, so a Codex entry
-    /// that `allowed_models` or `hidden_models` filters out must not count —
-    /// otherwise the login screen is skipped for a model `/model` cannot
-    /// reach, stranding the session on a default xAI model with no credential.
-    ///
-    /// Only *known usable* Codex entries count here. Unready entries still
-    /// appear in [`Self::available`] labelled via `ready` /
-    /// `readinessReason` meta — visible and available are not one bool (#133).
-    pub(crate) fn has_selectable_openai_codex_model(&self) -> bool {
-        let is_session_auth = self.is_session_auth();
-        self.models()
-            .values()
-            .any(|entry| resolution::is_ready_selectable_openai_codex_entry(entry, is_session_auth))
-    }
-
     /// ACP-visible (non-hidden) projection of the catalog.
     pub fn available(&self) -> IndexMap<acp::ModelId, acp::ModelInfo> {
-        self.models_and_available().1
+        let snapshot = {
+            let cat = self.inner.catalog.read();
+            let models = &cat.models;
+            models.clone()
+        };
+
+        let selectable: IndexMap<_, _> = snapshot
+            .into_iter()
+            .filter(|(_, e)| e.info.user_selectable)
+            .collect();
+
+        available_models(&selectable, self.is_session_auth())
     }
 
     pub(crate) fn task_model_error(&self, requested: &str) -> Option<String> {
@@ -650,65 +491,6 @@ impl ModelsManager {
 
     pub fn current_model_id(&self) -> acp::ModelId {
         self.inner.current_model_id.read().clone()
-    }
-
-    /// The configured default that resolve fell through on (absent from the
-    /// catalog, or present but not user-selectable), so a substitute is what
-    /// `current_model_id` names (#131). Derived from
-    /// [`resolve_default_model`]'s source: an explicit preference that was
-    /// seated — ready, or kept-unready under #145 — comes back carrying its
-    /// own source, not `Default`. `None` covers every other outcome, including
-    /// kept-but-unready (already reported per-model as `readinessReason`).
-    ///
-    /// After a later catalog makes the preference honourable, the warm-cache
-    /// path reseats it (when the user has not `/model`-picked), so a cleared
-    /// verdict means the preference is seated — not merely "would be seated if
-    /// we reselected".
-    pub(crate) fn substituted_preference(&self) -> Option<resolution::SubstitutedPreference> {
-        self.inner.substituted_preference.read().clone()
-    }
-
-    /// Write the #131 verdict into a `_meta` map.
-    ///
-    /// - `clear_when_absent = false` (`initialize`): omit the key when there is
-    ///   no substitution — the omit-not-null contract.
-    /// - `clear_when_absent = true` (`x.ai/models/update`): write JSON `null`
-    ///   so a client holding a prior accusation can retract it.
-    pub(crate) fn write_substituted_default_model_meta(
-        &self,
-        map: &mut serde_json::Map<String, serde_json::Value>,
-        clear_when_absent: bool,
-    ) {
-        match self.substituted_preference() {
-            Some(pref) => {
-                map.insert(
-                    resolution::SUBSTITUTED_DEFAULT_MODEL_META_KEY.to_string(),
-                    pref.to_meta_value(),
-                );
-            }
-            None if clear_when_absent => {
-                map.insert(
-                    resolution::SUBSTITUTED_DEFAULT_MODEL_META_KEY.to_string(),
-                    serde_json::Value::Null,
-                );
-            }
-            None => {}
-        }
-    }
-
-    /// Refresh the substitution verdict from a resolution that just ran.
-    ///
-    /// Called at every `resolve_default_model` site rather than only at
-    /// construction: the catalog is populated asynchronously, so a verdict
-    /// taken against an empty catalog would otherwise accuse the user of
-    /// configuring a model that had simply not loaded yet.
-    fn record_substituted_preference(
-        &self,
-        cfg: &config::Config,
-        resolved_source: config::ConfigSource,
-    ) {
-        *self.inner.substituted_preference.write() =
-            resolution::substituted_preference(cfg, resolved_source);
     }
 
     pub(crate) fn set_current_model_id(&self, id: acp::ModelId) {
@@ -746,24 +528,10 @@ impl ModelsManager {
             .unwrap_or_default()
     }
 
-    /// Test-only catalog poke: inserts a `ModelEntry` keyed by `id`.
-    /// Bumps generation so auth memos keyed on the prior snapshot are not reused.
-    /// Prefer [`Self::apply_catalog_for_test`] when the test is about the publish
-    /// path itself (etag refresh / fetch_and_apply).
+    /// Test-only catalog poke: inserts a `ModelEntry` keyed by `id`,
     #[cfg(test)]
     pub(crate) fn insert_test_entry(&self, id: impl Into<String>, entry: ModelEntry) {
         self.inner.catalog.write().models.insert(id.into(), entry);
-        self.bump_catalog_generation();
-    }
-
-    /// Test-only: publish a prefetched catalog through the real
-    /// [`Self::apply_catalog`] path (same as etag refresh / `fetch_and_apply` /
-    /// `reload_from_cache_manager`). Uses the manager's current config so
-    /// `resolve_model_catalog` and the generation bump match production.
-    #[cfg(test)]
-    pub(crate) fn apply_catalog_for_test(&self, models: IndexMap<String, ModelEntry>) {
-        let cfg = self.inner.cfg.read().clone();
-        self.apply_catalog(&cfg, models, None);
     }
 
     pub(crate) fn current_reasoning_effort(&self) -> Option<ReasoningEffort> {
@@ -772,42 +540,6 @@ impl ModelsManager {
 
     pub(crate) fn set_current_reasoning_effort(&self, effort: Option<ReasoningEffort>) {
         *self.inner.current_reasoning_effort.write() = effort;
-    }
-
-    fn revalidate_current_reasoning_effort(&self) {
-        let Some(effort) = self.current_reasoning_effort() else {
-            return;
-        };
-        let current_model_id = self.inner.current_model_id.read().clone();
-        let is_valid = {
-            let catalog = self.inner.catalog.read();
-            resolve_catalog_key(&catalog.models, &current_model_id)
-                .and_then(|model_id| catalog.models.get(model_id.0.as_ref()))
-                .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
-        };
-        if !is_valid {
-            self.clear_reasoning_effort_if_selection_unchanged(&current_model_id, effort);
-        }
-    }
-
-    fn clear_reasoning_effort_if_selection_unchanged(
-        &self,
-        expected_model_id: &acp::ModelId,
-        expected_effort: ReasoningEffort,
-    ) {
-        // Keep the model read guard through the conditional effort write. A
-        // concurrent A/high -> B/high switch otherwise defeats an effort-only
-        // CAS because the value is unchanged even though the selection is new.
-        // Model switching never holds the model lock while taking the effort
-        // lock, so this ordering cannot invert that path.
-        let current_model_id = self.inner.current_model_id.read();
-        if *current_model_id != *expected_model_id {
-            return;
-        }
-        let mut current_effort = self.inner.current_reasoning_effort.write();
-        if *current_effort == Some(expected_effort) {
-            *current_effort = None;
-        }
     }
 
     /// Whether the given model supports reasoning effort according to the catalog.
@@ -819,17 +551,6 @@ impl ModelsManager {
             .get(model_id)
             .map(|e| e.info().supports_reasoning_effort)
             .unwrap_or(false)
-    }
-
-    pub(crate) fn model_offers_reasoning_effort(
-        &self,
-        model_id: &str,
-        effort: ReasoningEffort,
-    ) -> bool {
-        let catalog = self.inner.catalog.read();
-        resolve_catalog_key(&catalog.models, &acp::ModelId::new(model_id))
-            .and_then(|resolved_id| catalog.models.get(resolved_id.0.as_ref()))
-            .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
     }
 
     pub(crate) fn model_default_reasoning_effort(&self, model_id: &str) -> Option<ReasoningEffort> {
@@ -853,59 +574,24 @@ impl ModelsManager {
     }
 
     pub(crate) fn model_supports_backend_search(&self, model_id: &str) -> bool {
-        let catalog = self.inner.catalog.read();
-        let models = &catalog.models;
-        resolve_catalog_key(models, &acp::ModelId::new(model_id))
-            .and_then(|key| models.get(key.0.as_ref()))
+        self.inner
+            .catalog
+            .read()
+            .models
+            .get(model_id)
             .map(|e| e.info().supports_backend_search)
             .unwrap_or(false)
-    }
-
-    /// Catalog wire capabilities for one model.
-    ///
-    /// Read this instead of copying `codex_wire` off a `SamplingConfig`: the
-    /// config's copy belongs to whichever model was selected when it was
-    /// built, which is not necessarily the model about to be sampled (#245,
-    /// #277).
-    ///
-    /// Outer `None` is a catalog miss — callers may inherit a same-model
-    /// baseline (#159). `Some(None)` is an authoritative "this model has no
-    /// wire capabilities" and must not fall back to a stale parent `Some`
-    /// (#282).
-    pub(crate) fn model_codex_wire(
-        &self,
-        model_id: &str,
-    ) -> Option<Option<xai_grok_sampling_types::CodexWireCapabilities>> {
-        let catalog = self.inner.catalog.read();
-        let models = &catalog.models;
-        resolve_catalog_key(models, &acp::ModelId::new(model_id))
-            .and_then(|key| models.get(key.0.as_ref()))
-            .map(|e| e.info().codex_wire.clone())
-    }
-
-    /// Whether two model identities resolve to the same catalog entry.
-    ///
-    /// Exact equality intentionally succeeds even on a catalog miss: runtime
-    /// models can be absent from the config-derived catalog (#159).
-    pub(crate) fn model_ids_refer_to_same_entry(&self, left: &str, right: &str) -> bool {
-        if left == right {
-            return true;
-        }
-        let catalog = self.inner.catalog.read();
-        let models = &catalog.models;
-        let left = resolve_catalog_key(models, &acp::ModelId::new(left));
-        let right = resolve_catalog_key(models, &acp::ModelId::new(right));
-        left.is_some() && left == right
     }
 
     pub(crate) fn model_compactions_remaining(
         &self,
         model_id: &str,
     ) -> Option<xai_grok_sampling_types::CompactionsRemaining> {
-        let catalog = self.inner.catalog.read();
-        let models = &catalog.models;
-        resolve_catalog_key(models, &acp::ModelId::new(model_id))
-            .and_then(|key| models.get(key.0.as_ref()))
+        self.inner
+            .catalog
+            .read()
+            .models
+            .get(model_id)
             .and_then(|e| e.info().compactions_remaining)
     }
 
@@ -913,10 +599,11 @@ impl ModelsManager {
         &self,
         model_id: &str,
     ) -> Option<xai_grok_sampling_types::CompactionAtTokens> {
-        let catalog = self.inner.catalog.read();
-        let models = &catalog.models;
-        resolve_catalog_key(models, &acp::ModelId::new(model_id))
-            .and_then(|key| models.get(key.0.as_ref()))
+        self.inner
+            .catalog
+            .read()
+            .models
+            .get(model_id)
             .and_then(|e| e.info().compaction_at_tokens)
     }
 
@@ -952,18 +639,52 @@ impl ModelsManager {
         self.inner.catalog.read().has_fetched_real_catalog
     }
 
+    /// Wait, bounded by one auth refresh plus one fetch, for the first
+    /// fetch outcome; never triggers a fetch.
+    pub(crate) async fn wait_for_first_catalog(&self) {
+        self.wait_for_first_catalog_inner(crate::util::config::resolve_remote_fetch_enabled())
+            .await;
+    }
+
+    async fn wait_for_first_catalog_inner(&self, remote_fetch_enabled: bool) -> bool {
+        const BUDGET: std::time::Duration = crate::http::STARTUP_AUTH_REFRESH_TIMEOUT
+            .saturating_add(crate::http::STARTUP_FETCH_TIMEOUT);
+        let mut progress = self.inner.catalog_progress.subscribe();
+        match *progress.borrow() {
+            CatalogProgress::Ready => return true,
+            CatalogProgress::Failed => return false,
+            CatalogProgress::Pending => {}
+        }
+        if !remote_fetch_enabled {
+            return false;
+        }
+        // Signed out with a session-only endpoint: no fetch is coming.
+        if *self.inner.fetch_auth.read() == ModelFetchAuth::Session
+            && self.inner.auth_manager.current_or_expired().is_none()
+        {
+            return false;
+        }
+        // Attempts latch `Failed` on exit, so pending plus idle means none started.
+        if self.inner.fetches_in_flight.load(Ordering::Acquire) == 0 {
+            return *progress.borrow() == CatalogProgress::Ready;
+        }
+        matches!(
+            tokio::time::timeout(BUDGET, progress.wait_for(|p| *p != CatalogProgress::Pending))
+                .await,
+            Ok(Ok(p)) if *p == CatalogProgress::Ready
+        )
+    }
+
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        // Mutate, then bump — same order as apply_catalog / apply_config.
-        // `on_auth_changed` reaches this via the bundled-fallback branch when a
-        // remote fetch fails (or remote_fetch is off) and no real catalog was
-        // ever published; without the bump, a session auth memo under the prior
-        // generation would outlive a wholesale models replacement that may have
-        // dropped its subject (#159 F1).
         self.inner.catalog.write().models = resolve_model_catalog(cfg, prefetched);
-        self.bump_catalog_generation();
-        self.revalidate_current_reasoning_effort();
+    }
+
+    /// Reset to this identity's bundled catalog and reselect a valid default.
+    fn rebuild_bundled(&self, cfg: &config::Config) {
+        self.rebuild(cfg, None);
+        self.reselect_current_model_if_missing(cfg);
     }
 
     /// Refresh models when the etag changes.
@@ -984,18 +705,38 @@ impl ModelsManager {
         self.spawn_fetch(Some(etag));
     }
 
-    /// Auth identity changed: invalidate disk cache and refresh the catalog.
-    pub async fn on_auth_changed(&self) {
+    /// Auth identity changed: invalidate the disk cache and refresh the catalog.
+    pub(crate) async fn on_auth_changed(&self) {
         let config = self.inner.cfg.read().clone();
         crate::agent::init::update_telemetry_config(&config, &self.inner.auth_manager);
         self.inner.cache.invalidate();
+        // Fetches and the etag from the previous identity are stale now.
+        {
+            let mut cat = self.inner.catalog.write();
+            cat.generation += 1;
+            cat.etag = None;
+        }
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&config.endpoints, has_session);
         *self.inner.fetch_auth.write() = fetch_auth;
-        if self.inner.auth_manager.current_or_expired().is_none()
-            && fetch_auth == ModelFetchAuth::Session
-        {
+        // No session but the endpoint needs one: a fetch would 401, so skip it
+        // and reset to this identity's bundled catalog.
+        if !has_session && fetch_auth == ModelFetchAuth::Session {
             self.clear();
+            self.rebuild_bundled(&config);
+            // No fetch is coming; wake parked waiters. Lock and gate like
+            // every other outcome publish.
+            {
+                let _cat = self.inner.catalog.read();
+                self.inner.catalog_progress.send_if_modified(|p| {
+                    let pending = *p == CatalogProgress::Pending;
+                    if pending {
+                        *p = CatalogProgress::Failed;
+                    }
+                    pending
+                });
+            }
+            self.notify_models_updated();
             return;
         }
 
@@ -1019,11 +760,10 @@ impl ModelsManager {
             } else {
                 tracing::debug!("model catalog: bundled defaults in use (remote_fetch disabled)");
             }
-            self.rebuild(&config, None);
-            self.reselect_current_model_if_missing(&config);
+            self.rebuild_bundled(&config);
 
             if remote_fetch_enabled {
-                self.spawn_catalog_retry();
+                self.spawn_catalog_retry(remote_fetch_enabled);
             }
         }
 
@@ -1043,22 +783,8 @@ impl ModelsManager {
             })),
         );
         if let Some(ref gw) = *self.inner.gateway.read() {
-            // #131: republish (or clear) the substitution verdict on every
-            // catalog push. `initialize` is one-shot; without this, a verdict
-            // taken against a bundled/empty catalog survives on the only
-            // surface a client can see after the remote catalog corrects it.
-            //
-            // Path asymmetry (intentional until a consumer unifies them):
-            // `initialize` writes the key on the *response* top-level `_meta`
-            // (sibling of `modelState`); this notification writes it on
-            // `SessionModelState._meta` (inside the update params). Same key
-            // name, different JSON path — first consumers must branch.
-            // JSON `null` means "no longer substituted".
-            let mut model_state =
+            let model_state =
                 acp::SessionModelState::new(current, available.values().cloned().collect());
-            let mut meta = serde_json::Map::new();
-            self.write_substituted_default_model_meta(&mut meta, true);
-            model_state = model_state.meta(meta);
             if let Ok(params) = serde_json::value::to_raw_value(&model_state) {
                 gw.forward_fire_and_forget(acp::ExtNotification::new(
                     "x.ai/models/update",
@@ -1109,15 +835,20 @@ impl ModelsManager {
     }
 
     /// Retry model catalog fetch in the background with exponential backoff.
-    fn spawn_catalog_retry(&self) {
-        self.spawn_catalog_retry_with_backoff(crate::tools::retry::BackoffConfig::new(
-            5, 5_000, 60_000,
-        ));
+    fn spawn_catalog_retry(&self, remote_fetch_enabled: bool) {
+        self.spawn_catalog_retry_with_backoff(
+            remote_fetch_enabled,
+            crate::tools::retry::BackoffConfig::new(5, 5_000, 60_000),
+        );
     }
 
     /// [`Self::spawn_catalog_retry`] with an injectable backoff (fast in tests).
-    fn spawn_catalog_retry_with_backoff(&self, backoff: crate::tools::retry::BackoffConfig) {
-        if !crate::util::config::resolve_remote_fetch_enabled() {
+    fn spawn_catalog_retry_with_backoff(
+        &self,
+        remote_fetch_enabled: bool,
+        backoff: crate::tools::retry::BackoffConfig,
+    ) {
+        if !remote_fetch_enabled {
             return;
         }
         if self
@@ -1130,8 +861,11 @@ impl ModelsManager {
             return;
         }
 
+        // The whole retry sequence is one attempt to waiters.
+        let attempt = FetchAttemptGuard::begin(&self.inner);
         let mgr = self.clone();
         tokio::task::spawn(async move {
+            let _attempt = attempt;
             let _retry_guard = RetryInFlightGuard(mgr.inner.clone());
             let result = crate::tools::retry::execute_with_backoff(
                 &backoff,
@@ -1188,13 +922,17 @@ impl ModelsManager {
 
     /// One-shot background catalog refresh after readiness; no-op when a fresh disk cache already loaded a real catalog.
     pub fn spawn_background_refresh(&self) {
+        self.spawn_background_refresh_inner(crate::util::config::resolve_remote_fetch_enabled());
+    }
+
+    fn spawn_background_refresh_inner(&self, remote_fetch_enabled: bool) {
         if self.inner.catalog.read().has_fetched_real_catalog {
             tracing::debug!(
                 "skipping startup background model refresh: fresh cache already loaded"
             );
             return;
         }
-        self.spawn_catalog_retry();
+        self.spawn_catalog_retry(remote_fetch_enabled);
     }
 
     /// Refresh the model catalog on every auth token refresh.
@@ -1259,53 +997,34 @@ impl ModelsManager {
 
     /// Wipe in-memory state so a previous identity's catalog doesn't leak.
     fn clear(&self) {
-        *self.inner.catalog.write() = CatalogState::default();
-        // The previous identity's model capability must not remain a future
-        // session default while the replacement catalog is still loading.
-        *self.inner.current_reasoning_effort.write() = None;
+        {
+            let mut cat = self.inner.catalog.write();
+            let generation = cat.generation + 1;
+            *cat = CatalogState::default();
+            cat.generation = generation;
+            self.inner
+                .catalog_progress
+                .send_replace(CatalogProgress::Pending);
+        }
         // A new identity starts fresh: drop the prior user's pick so its
         // first catalog reselects that identity's default.
         self.inner
             .user_selected_model
             .store(false, Ordering::Relaxed);
-        // Same invariant for #131: a previous identity's substitution verdict
-        // must not accuse the new one of rejecting a preference it never held.
-        *self.inner.substituted_preference.write() = None;
-        // The catalog just became empty, which is a content change like any
-        // other -- without this a memo taken under the previous identity stays
-        // valid at the same generation and is served after the wipe (#159).
-        self.bump_catalog_generation();
     }
 
     /// Build a `SamplingConfig` from the current model + auth state.
     pub fn sampling_config(&self) -> SamplingConfig {
         let config = self.inner.cfg.read().clone();
         let auth_manager = self.inner.auth_manager.as_ref();
-        let is_session_auth = self.is_session_auth();
         let current_model_id = self.current_model_id();
         let all_models = self.models();
-        let mut fallback;
+        let fallback;
         let current_model = match all_models
             .get(current_model_id.0.as_ref())
-            .filter(|entry| {
-                entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
-            })
-            .or_else(|| {
-                all_models.values().find(|entry| {
-                    entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
-                })
-            }) {
+            .or_else(|| all_models.values().next())
+        {
             Some(m) => m,
-            None if !all_models.is_empty() => {
-                tracing::error!(
-                    "catalog has no model selectable for the current auth mode; withholding the sampling endpoint"
-                );
-                fallback = ModelEntry::fallback("", &config.endpoints);
-                fallback
-                    .config_validation_errors
-                    .push("no model is selectable for the current authentication mode".to_owned());
-                &fallback
-            }
             None => {
                 tracing::warn!("no models available in catalog; defaulting to bundled model");
                 let default_id = crate::models::default_model().to_string();
@@ -1318,7 +1037,7 @@ impl ModelsManager {
         let credentials =
             resolve_credentials(current_model, session_auth.as_ref().map(|a| a.key.as_str()));
 
-        let mut sampling = sampling_config_for_model(
+        sampling_config_for_model(
             current_model,
             credentials,
             config.endpoints.alpha_test_key.clone(),
@@ -1327,28 +1046,7 @@ impl ModelsManager {
                 config.endpoints.deployment_key.as_deref(),
             ),
             None,
-            &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
-        );
-        // #110 / #131: this is not only a startup snapshot. When the session
-        // path cannot resolve a model id it clones this config verbatim
-        // (`resolve_sampling_config_for_model`), and the readiness latch skips
-        // entries it cannot find — so an unready model here would carry the
-        // user's first prompt to its endpoint with the credential stripped
-        // but the destination intact. Withhold the destination too: a config
-        // with no endpoint fails locally instead of reaching a stranger.
-        // Catalog-unavailable / unknown ids are handled upstream by keeping
-        // the configured id and deferring validation; this path always has a
-        // concrete catalog entry, so `!ready` here means Unusable.
-        if let (false, reason) = crate::agent::config::model_readiness(current_model) {
-            let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
-            tracing::error!(
-                model = current_model.info().model.as_str(),
-                %reason,
-                "construction-time sampling config is not ready; withholding its endpoint"
-            );
-            sampling.base_url = String::new();
-        }
-        sampling
+        )
     }
 
     /// Disk-cache origin key for this manager's current endpoints/auth shape
@@ -1358,26 +1056,14 @@ impl ModelsManager {
         crate::remote::models_list_url(&endpoints, fetch_auth)
     }
 
-    fn try_load_cache(&self) -> bool {
-        let fetch_auth = *self.inner.fetch_auth.read();
-        let Some(cached) = self
-            .inner
-            .cache
-            .load_fresh(&fetch_auth.cache_auth_method(), &self.cache_origin())
-        else {
-            return false;
-        };
-        let cfg = self.inner.cfg.read().clone();
-        self.apply_catalog(&cfg, cached.models, cached.etag);
-        true
-    }
-
     /// A catalog-fetch session refresh bounded by `STARTUP_AUTH_REFRESH_TIMEOUT`.
     /// A hung IdP on a cold cache degrades to a session-less fetch (the
     /// bundled/cache catalog stays and the next refresh retries) instead of
     /// stalling boot, mirroring the readiness path's no-mint auth bound.
     async fn bounded_startup_auth(auth_manager: &Arc<AuthManager>) -> Option<GrokAuth> {
-        Self::bounded_auth_refresh(async { auth_manager.auth().await.ok() }).await
+        // A dark-wake deferral degrades to a session-less fetch here and the
+        // next full wake retries.
+        Self::bounded_auth_refresh(async { auth_manager.auth_background().await.ok() }).await
     }
 
     /// Bounds an auth-refresh future to `STARTUP_AUTH_REFRESH_TIMEOUT`, yielding
@@ -1406,7 +1092,6 @@ impl ModelsManager {
         );
     }
 
-    /// `remote_fetch_enabled` is a parameter so tests can drive the gate without touching on-disk config.
     fn spawn_fetch_inner(&self, new_etag: Option<String>, remote_fetch_enabled: bool) {
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
@@ -1421,6 +1106,10 @@ impl ModelsManager {
             tracing::debug!("model catalog refresh already in flight, skipping");
             return;
         }
+        // Generation first: an identity change after this point fails the
+        // apply fence instead of publishing an old-credential fetch.
+        let attempt = FetchAttemptGuard::begin(&self.inner);
+        let generation = attempt.generation;
         let cfg = self.inner.cfg.read().clone();
         let endpoints = cfg.endpoints.clone();
         let fetch_auth = *self.inner.fetch_auth.read();
@@ -1429,6 +1118,7 @@ impl ModelsManager {
         let mgr = self.clone();
 
         tokio::task::spawn(async move {
+            let _attempt = attempt;
             let _refresh_guard = RefreshInFlightGuard(mgr.inner.clone());
             let auth = Self::bounded_startup_auth(&auth_manager).await;
             let new_prefetched = match tokio::time::timeout(
@@ -1443,7 +1133,7 @@ impl ModelsManager {
                     None
                 }
             };
-            if !mgr.apply_refresh_result(&cfg, new_prefetched, new_etag) {
+            if !mgr.apply_refresh_result_fenced(&cfg, new_prefetched, new_etag, generation) {
                 return;
             }
             tracing::info!("models manager refreshed");
@@ -1451,35 +1141,18 @@ impl ModelsManager {
         });
     }
 
-    /// Resolve the model list: tries cache first, then fetches from the network.
-    pub async fn list_models(&self, strategy: RefreshStrategy) {
-        match strategy {
-            RefreshStrategy::Offline => {
-                self.try_load_cache();
-            }
-            RefreshStrategy::OnlineIfUncached => {
-                if self.try_load_cache() {
-                    return;
-                }
-                self.fetch_and_apply().await;
-            }
-            RefreshStrategy::Online => {
-                self.fetch_and_apply().await;
-            }
-        }
-    }
-
     async fn fetch_and_apply(&self) {
         self.fetch_and_apply_inner(crate::util::config::resolve_remote_fetch_enabled())
             .await
     }
 
-    /// `remote_fetch_enabled` is a parameter so tests can drive the gate
     async fn fetch_and_apply_inner(&self, remote_fetch_enabled: bool) {
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;
         }
+        let attempt = FetchAttemptGuard::begin(&self.inner);
+        let generation = attempt.generation;
         let auth = Self::bounded_startup_auth(&self.inner.auth_manager).await;
         let has_auth = auth.is_some();
         let fetch_auth = *self.inner.fetch_auth.read();
@@ -1508,7 +1181,7 @@ impl ModelsManager {
                 None
             }
         };
-        let success = self.apply_refresh_result(&cfg, new_prefetched, None);
+        let success = self.apply_refresh_result_fenced(&cfg, new_prefetched, None, generation);
         if success {
             xai_grok_telemetry::unified_log::info(
                 "model catalog: fetch succeeded",
@@ -1527,23 +1200,38 @@ impl ModelsManager {
         models: IndexMap<String, ModelEntry>,
         new_etag: Option<String>,
     ) {
+        let _ = self.apply_catalog_fenced(cfg, models, new_etag, None);
+    }
+
+    /// Discards a result captured before an identity change; returns
+    /// whether the catalog applied.
+    fn apply_catalog_fenced(
+        &self,
+        cfg: &config::Config,
+        models: IndexMap<String, ModelEntry>,
+        new_etag: Option<String>,
+        generation: Option<u64>,
+    ) -> bool {
         let (first_real_catalog, excludes_all) = {
             let mut cat = self.inner.catalog.write();
+            if let Some(generation) = generation
+                && cat.generation != generation
+            {
+                tracing::info!("model catalog result discarded: identity changed during fetch");
+                return false;
+            }
             let first_real_catalog = !cat.has_fetched_real_catalog;
             cat.has_fetched_real_catalog = true;
             cat.prefetched = Some(models);
             cat.models = resolve_model_catalog(cfg, cat.prefetched.clone());
             cat.etag = new_etag;
             cat.allowlist_excludes_all = allowlist_matches_nothing(cfg, &cat.models);
+            // In the lock: the flag and its mirror can't desync vs `clear()`.
+            self.inner
+                .catalog_progress
+                .send_replace(CatalogProgress::Ready);
             (first_real_catalog, cat.allowlist_excludes_all)
         };
-        // Every publish advances the generation so session `model_auth_memo`
-        // entries that depended on the prior snapshot are not reused after a
-        // transient miss (etag refresh that drops then restores a model).
-        // Background fetch/retry paths never pass through the agent, so a
-        // generation key is required — `invalidate_model_auth_memo_all_sessions`
-        // only runs on config-watcher ext methods (#159 F1).
-        self.bump_catalog_generation();
         if excludes_all {
             tracing::error!("allowed_models excludes all fetched models; prompts will be blocked");
         }
@@ -1556,17 +1244,43 @@ impl ModelsManager {
         } else {
             self.reselect_current_model_if_missing(cfg);
         }
-        self.revalidate_current_reasoning_effort();
+        true
     }
 
+    /// A same-identity refresh, as the fetch paths see it.
+    #[cfg(test)]
     fn apply_refresh_result(
         &self,
         config: &config::Config,
         new_prefetched: Option<IndexMap<String, ModelEntry>>,
         new_etag: Option<String>,
     ) -> bool {
+        let generation = self.inner.catalog.read().generation;
+        self.apply_refresh_result_fenced(config, new_prefetched, new_etag, generation)
+    }
+
+    fn apply_refresh_result_fenced(
+        &self,
+        config: &config::Config,
+        new_prefetched: Option<IndexMap<String, ModelEntry>>,
+        new_etag: Option<String>,
+        generation: u64,
+    ) -> bool {
         let Some(new_prefetched) = new_prefetched else {
             tracing::warn!("model refresh failed, leaving existing models unchanged");
+            // Lock held across the send: atomic against a racing `clear()`.
+            {
+                let cat = self.inner.catalog.read();
+                if cat.generation == generation {
+                    self.inner.catalog_progress.send_if_modified(|p| {
+                        let first_failure = *p == CatalogProgress::Pending;
+                        if first_failure {
+                            *p = CatalogProgress::Failed;
+                        }
+                        first_failure
+                    });
+                }
+            }
             xai_grok_telemetry::unified_log::warn(
                 "model catalog refresh failed",
                 None,
@@ -1576,157 +1290,62 @@ impl ModelsManager {
             );
             return false;
         };
-        self.apply_catalog(config, new_prefetched, new_etag);
-        true
+        self.apply_catalog_fenced(config, new_prefetched, new_etag, Some(generation))
     }
 
     pub fn allowlist_excludes_all(&self) -> bool {
         self.inner.catalog.read().allowlist_excludes_all
     }
 
-    /// Re-pick the default if `current_model_id` is gone from the catalog,
-    /// no longer user-selectable, or hidden for the current auth mode. Always
-    /// refreshes the #131 verdict: the
-    /// early-return path is exactly when a stale `Some` taken against an
-    /// emptier catalog would otherwise survive.
-    ///
-    /// Warm-cache path: a prefetched disk catalog already set
-    /// `has_fetched_real_catalog`, so later remote catalogs take this method
-    /// rather than [`Self::reselect_default_model`]. When a prior substitution
-    /// verdict exists and resolve now honours an explicit preference that is
-    /// not the seated id (and the user has not `/model`-picked), reseat —
-    /// otherwise clearing the verdict would retract the accusation while the
-    /// substitute stayed seated. Gating on a prior verdict also keeps
-    /// campaign-only preferred flips from yanking a live session.
+    /// Re-pick the default when the current model is gone or unselectable;
+    /// auth visibility never evicts an explicit user pick.
     fn reselect_current_model_if_missing(&self, config: &config::Config) {
         let current = self.inner.current_model_id.read().clone();
-        let is_session_auth = self.is_session_auth();
-        let usable_xai = self.usable_ambient_xai(config);
+        let user_selected = self.inner.user_selected_model.load(Ordering::Relaxed);
         let needs_reselection = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
             match models.get(current.0.as_ref()) {
                 None => true,
                 Some(entry) => {
-                    let not_selectable = !entry.info.user_selectable
-                        || !entry.info.visible_for_auth(is_session_auth);
-                    // #303: only yank first-party ambient Grok/sentinel when a
-                    // ready OpenAI Codex *account* route exists — never BYOK /
-                    // auth_scheme=none / third-party CodexResponses shims.
-                    let stranded_on_ambient_grok = !usable_xai
-                        && resolution::is_first_party_ambient_xai_entry(entry)
-                        && models.values().any(|e| {
-                            resolution::is_ready_selectable_openai_codex_entry(e, is_session_auth)
-                        });
-                    not_selectable || stranded_on_ambient_grok
+                    !entry.info.user_selectable
+                        || (!user_selected && !entry.info.visible_for_auth(self.is_session_auth()))
                 }
             }
         };
-        let (key, _, source, _) = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
-            resolve_default_model_for_catalog_with_usable_xai(
-                config,
-                models,
-                is_session_auth,
-                cat.has_fetched_real_catalog,
-                usable_xai,
-            )
-        };
-        let user_picked = self.inner.user_selected_model.load(Ordering::Relaxed);
-        // Only reseat when we previously recorded a substitution: that is the
-        // warm-cache "preference was missing, now honourable" path. Without
-        // this gate, a campaign-only preferred flip (which deliberately takes
-        // this method rather than reselect_default_model) would yank a live
-        // session onto the pushed default.
-        //
-        // #303 strand reseat is an exception: it must not require a prior
-        // substitution verdict (login skip leaves Grok seated with none).
-        let had_substitution = self.substituted_preference().is_some();
-        let honour_explicit_preference = had_substitution
-            && !user_picked
-            && key.as_str() != current.0.as_ref()
-            && resolution::is_explicit_preference(source);
-        self.record_substituted_preference(config, source);
-        if !needs_reselection && !honour_explicit_preference {
+        if !needs_reselection {
             return;
         }
-        // User-picked models stay put even under Codex-only (#131 family).
-        if user_picked && !honour_explicit_preference {
-            let still_missing = {
-                let cat = self.inner.catalog.read();
-                cat.models.get(current.0.as_ref()).is_none_or(|entry| {
-                    !entry.info.user_selectable || !entry.info.visible_for_auth(is_session_auth)
-                })
-            };
-            if !still_missing {
-                return;
-            }
-        }
+        let (key, _, source) = {
+            let cat = self.inner.catalog.read();
+            let models = &cat.models;
+            resolve_default_model(config, models, self.is_session_auth())
+        };
         let new_id = acp::ModelId::new(Arc::from(key));
-        if honour_explicit_preference && !needs_reselection {
-            tracing::info!(
-                old = %current.0, new = %new_id.0, source = %source,
-                "configured preference now honourable, reseating"
-            );
-        } else {
-            tracing::info!(
-                old = %current.0, new = %new_id.0, source = %source,
-                "current model not in new catalog, reselecting default"
-            );
-        }
+        tracing::info!(
+            old = %current.0, new = %new_id.0, source = %source,
+            "current model not in new catalog, reselecting default"
+        );
         self.set_current_model_id_internal(new_id);
     }
 
     /// Re-resolve the default model against the current catalog.
     fn reselect_default_model(&self, config: &config::Config) {
-        let usable_xai = self.usable_ambient_xai(config);
-        let (key, _, source, unready_reason) = {
+        let (key, _, source) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
-            resolve_default_model_for_catalog_with_usable_xai(
-                config,
-                models,
-                self.is_session_auth(),
-                cat.has_fetched_real_catalog,
-                usable_xai,
-            )
+            resolve_default_model(config, models, self.is_session_auth())
         };
         let new_id = acp::ModelId::new(Arc::from(key));
-        // Recorded whether or not the selection changes: the catalog landing is
-        // exactly when an "absent" verdict taken against an emptier catalog
-        // becomes wrong, and that correction is independent of whether the
-        // resolved key moved.
-        self.record_substituted_preference(config, source);
         let current = self.inner.current_model_id.read().clone();
         if current.0.as_ref() != new_id.0.as_ref() {
-            if let Some(reason) = &unready_reason {
-                tracing::error!(
-                    old = %current.0, new = %new_id.0, source = %source, %reason,
-                    "re-resolved default model to an unusable catalog entry"
-                );
-            } else {
-                tracing::info!(
-                    old = %current.0, new = %new_id.0, source = %source,
-                    "re-resolved default model after catalog populated"
-                );
-            }
+            tracing::info!(
+                old = %current.0, new = %new_id.0, source = %source,
+                "re-resolved default model after catalog populated"
+            );
             self.set_current_model_id_internal(new_id);
         }
     }
-}
-
-// ── Refresh strategy ────────────────────────────────────────────────────────
-
-/// How to resolve the model list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefreshStrategy {
-    /// Always fetch from network, ignore cache.
-    Online,
-    /// Only use cached data, never fetch.
-    Offline,
-    /// Use cache if fresh, otherwise fetch.
-    OnlineIfUncached,
 }
 
 mod cache;

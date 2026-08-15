@@ -6,11 +6,10 @@
 //! - **Gates** (awaited reverse *requests* `x.ai/hooks/run`):
 //!   - `PreToolUse`: a `deny` blocks the tool.
 //!   - `Stop` / `SubagentStop` (turn-end gate): a `deny` blocks the agent from
-//!     stopping (the presence of `systemMessage` is retained, but its text is
-//!     omitted), `continue: false` (+ optional `stopReason`) force-stops
-//!     overriding blocks, and `additionalContext` keeps the agent working with
-//!     a closed non-error marker: the same safe vocabulary file hooks produce,
-//!     aggregated in [`Self::run_stop_client_hooks`].
+//!     stopping (its `systemMessage` becomes the feedback), `continue: false`
+//!     (+ `stopReason`) force-stops overriding blocks, and `additionalContext`
+//!     keeps the agent working with non-error feedback: the same vocabulary
+//!     file hooks produce, aggregated in [`Self::run_stop_client_hooks`].
 //! - **All other events**: fire-and-forget *notifications* `x.ai/hooks/event`,
 //!   observe-only (the callback's return is ignored). Sent per matching callback.
 
@@ -73,11 +72,8 @@ fn classify(outcome: ReverseOutcome) -> (ClientHookResponse, ClientHookGateOutco
                     };
                     (resp, label)
                 }
-                Err(_) => {
-                    tracing::warn!(
-                        error_class = "malformed_response",
-                        "malformed x.ai/hooks/run response; failing open"
-                    );
+                Err(err) => {
+                    tracing::warn!(%err, "malformed x.ai/hooks/run response; failing open");
                     (
                         ClientHookResponse::default(),
                         ClientHookGateOutcome::Malformed,
@@ -85,11 +81,8 @@ fn classify(outcome: ReverseOutcome) -> (ClientHookResponse, ClientHookGateOutco
                 }
             }
         }
-        ReverseOutcome::Transport(_) => {
-            tracing::warn!(
-                error_class = "transport",
-                "x.ai/hooks/run transport error (no client wired?); failing open"
-            );
+        ReverseOutcome::Transport(err) => {
+            tracing::warn!(%err, "x.ai/hooks/run transport error (no client wired?); failing open");
             (
                 ClientHookResponse::default(),
                 ClientHookGateOutcome::TransportError,
@@ -124,18 +117,9 @@ fn matching_callback_ids<'a>(
 /// rather than panic the session actor.
 fn dispatch_params(dispatch: &ClientHookDispatch<'_>) -> Option<Arc<RawValue>> {
     serde_json::value::to_raw_value(dispatch)
-        .inspect_err(|_| {
-            tracing::warn!(
-                error_class = "serialization",
-                "failed to serialize client hook dispatch"
-            )
-        })
+        .inspect_err(|err| tracing::warn!(%err, "failed to serialize client hook dispatch"))
         .ok()
         .map(Into::into)
-}
-
-fn reason_diagnostics(reason: &str) -> bool {
-    !reason.trim().is_empty()
 }
 
 impl SessionActor {
@@ -165,11 +149,20 @@ impl SessionActor {
 
     /// Whether any hook source could consume `event`, letting the hot path skip
     /// building a payload when nothing is listening. Deliberately coarse: any
-    /// on-disk registry activates every event (see
-    /// `has_enabled_hooks_for_canonical` for the precise check the stop gate
-    /// uses), while client hooks are checked per event.
-    pub(super) fn hook_event_active(&self, event: HookEventName) -> bool {
+    /// on-disk registry activates every event (see [`Self::has_enabled_hooks_for`] for
+    /// the precise check), while client hooks are checked per event.
+    pub(super) fn may_have_hooks_for(&self, event: HookEventName) -> bool {
         self.hook_registry.borrow().is_some()
+            || self.client_hooks.borrow().contains_key(&event.canonical())
+    }
+
+    /// Whether a hook is registered and enabled for `event` specifically, checking the on-disk
+    /// registry per event rather than treating any registry as active.
+    pub(super) fn has_enabled_hooks_for(&self, event: HookEventName) -> bool {
+        self.hook_registry
+            .borrow()
+            .as_ref()
+            .is_some_and(|registry| registry.has_enabled_hooks_for_canonical(event))
             || self.client_hooks.borrow().contains_key(&event.canonical())
     }
 
@@ -198,25 +191,18 @@ impl SessionActor {
         hook_name: String,
         reason: String,
     ) -> Result<ToolLoop, acp::Error> {
-        let reason_present = reason_diagnostics(&reason);
-        let safe_reason = xai_grok_hooks::dispatcher::safe_deny_reason(&reason);
-        tracing::info!(
-            %tool_name,
-            %hook_name,
-            reason_present,
-            "tool call denied by pre_tool_use hook"
-        );
+        tracing::info!(%tool_name, %hook_name, %reason, "tool call denied by pre_tool_use hook");
         xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::HookBlocked {
             hook_name: hook_name.clone(),
         });
         self.handle_tool_not_executed(
             model_call_id,
             tool_call_id,
-            format!("Hook denied: {safe_reason}"),
+            format!("Hook denied: {reason}"),
         )
         .await?;
         self.send_hook_annotation(&format!(
-            "\u{26a0} `{tool_name}` blocked by hook `{hook_name}`: {safe_reason}"
+            "\u{26a0} `{tool_name}` blocked by hook `{hook_name}`: {reason}"
         ))
         .await;
         Ok(ToolLoop::HookDenied { hook_name })
@@ -231,7 +217,9 @@ impl SessionActor {
         groups: &'a [ClientHookGroup],
         tool_name: Option<&'a str>,
         envelope: &'a HookEventEnvelope,
-    ) -> FuturesUnordered<impl Future<Output = (&'a str, ClientHookResponse, Duration)> + 'a> {
+    ) -> FuturesUnordered<
+        impl Future<Output = (&'a str, ClientHookResponse, Duration, ClientHookGateOutcome)> + 'a,
+    > {
         let default_timeout =
             if envelope.hook_event_name.traits().gate == xai_grok_hooks::event::GateKind::Stop {
                 CLIENT_STOP_GATE_TIMEOUT
@@ -271,7 +259,7 @@ impl SessionActor {
                             duration_ms: elapsed.as_millis() as u64,
                         },
                     );
-                    (callback_id, response, elapsed)
+                    (callback_id, response, elapsed, gate_outcome)
                 }
             })
             .collect()
@@ -307,7 +295,7 @@ impl SessionActor {
             .unwrap_or(call.function.name.as_str());
 
         let mut pending = self.client_gate_responses(&groups, Some(tool_name), envelope);
-        while let Some((callback_id, response, _elapsed)) = pending.next().await {
+        while let Some((callback_id, response, _elapsed, _outcome)) = pending.next().await {
             if response.decision == ClientHookDecision::Deny {
                 let reason = response
                     .system_message
@@ -355,14 +343,14 @@ impl SessionActor {
         // deterministic (completion order is not).
         let mut pending = self.client_gate_responses(&groups, match_value, envelope);
         let mut responses = std::collections::HashMap::new();
-        while let Some((callback_id, response, elapsed)) = pending.next().await {
-            responses.insert(callback_id, (response, elapsed));
+        while let Some((callback_id, response, elapsed, gate_outcome)) = pending.next().await {
+            responses.insert(callback_id, (response, elapsed, gate_outcome));
         }
         let ordered = groups
             .iter()
             .flat_map(|group| group.callback_ids.iter())
             .filter_map(|id| responses.remove(id.as_str()).map(|r| (id.as_str(), r)));
-        for (callback_id, (response, elapsed)) in ordered {
+        for (callback_id, (response, elapsed, gate_outcome)) in ordered {
             let hook_name = format!("client:{callback_id}");
             let block_reason = (response.decision == ClientHookDecision::Deny).then(|| {
                 response
@@ -382,14 +370,30 @@ impl SessionActor {
                 stop_reason.as_deref(),
                 block_reason.as_deref(),
             );
-            out.results.push(match detail {
-                Some(detail) => HookRunResult::Blocked {
+            // A hook that never answered did not observe the turn end, so the gate must not
+            // count it as one that ran.
+            let unanswered = match gate_outcome {
+                ClientHookGateOutcome::TimedOut => Some("timed out"),
+                ClientHookGateOutcome::TransportError => Some("transport error"),
+                ClientHookGateOutcome::Denied
+                | ClientHookGateOutcome::Proceeded
+                | ClientHookGateOutcome::Malformed
+                | ClientHookGateOutcome::UnknownDecision => None,
+            };
+            out.results.push(match (detail, unanswered) {
+                (Some(detail), _) => HookRunResult::Blocked {
                     hook_name: hook_name.clone(),
                     detail,
                     elapsed,
                     http_info: None,
                 },
-                None => HookRunResult::Success {
+                (None, Some(why)) => HookRunResult::Failed {
+                    hook_name: hook_name.clone(),
+                    error: format!("client hook {why}"),
+                    elapsed,
+                    http_info: None,
+                },
+                (None, None) => HookRunResult::Success {
                     hook_name: hook_name.clone(),
                     elapsed,
                     http_info: None,
@@ -461,22 +465,6 @@ mod tests {
         serde_json::value::to_raw_value(&value).unwrap().into()
     }
 
-    #[test]
-    fn deny_reason_diagnostics_omit_full_and_partial_credentials() {
-        const SECRET: &str = "GB002SECabcdefgh87654321";
-        const PREFIX: &str = "GB002SEC";
-        const SUFFIX: &str = "87654321";
-
-        let rendered = format!("{:?}", reason_diagnostics(SECRET));
-        assert!(reason_diagnostics(SECRET));
-        for fragment in [SECRET, PREFIX, SUFFIX] {
-            assert!(
-                !rendered.contains(fragment),
-                "deny reason diagnostics leaked credential fragment: {fragment}"
-            );
-        }
-    }
-
     /// Only an explicit `deny` blocks; malformed/transport/timeout all proceed. The second
     /// tuple element is the telemetry outcome, distinct per fail-open mode.
     #[test]
@@ -517,11 +505,11 @@ mod tests {
         assert!(matches!(outcome, ClientHookGateOutcome::TimedOut));
     }
 
-    /// `hook_event_active` is the inert-when-unused guard: `false` with no file registry and
+    /// `may_have_hooks_for` is the inert-when-unused guard: `false` with no file registry and
     /// no client hook for the event; `true` once a client hook for that event is registered;
     /// and `true` for any event whenever a file registry is present.
     #[tokio::test(flavor = "current_thread")]
-    async fn hook_event_active_inert_vs_active() {
+    async fn may_have_hooks_for_inert_vs_active() {
         use xai_grok_hooks::event::HookEventName;
 
         let local = tokio::task::LocalSet::new();
@@ -541,7 +529,7 @@ mod tests {
                 // Inert: no file registry, no client hooks.
                 assert!(actor.hook_registry.borrow().is_none());
                 assert!(actor.client_hooks.borrow().is_empty());
-                assert!(!actor.hook_event_active(HookEventName::PreToolUse));
+                assert!(!actor.may_have_hooks_for(HookEventName::PreToolUse));
 
                 // A registered client hook activates exactly its event.
                 actor.client_hooks.borrow_mut().insert(
@@ -552,15 +540,15 @@ mod tests {
                         timeout: None,
                     }],
                 );
-                assert!(actor.hook_event_active(HookEventName::PreToolUse));
-                assert!(!actor.hook_event_active(HookEventName::Stop));
+                assert!(actor.may_have_hooks_for(HookEventName::PreToolUse));
+                assert!(!actor.may_have_hooks_for(HookEventName::Stop));
 
                 // A present file registry activates every event, even ones with no client hook.
                 *actor.hook_registry.borrow_mut() = Some(std::sync::Arc::new(
                     xai_grok_hooks::discovery::HookRegistry::default(),
                 ));
-                assert!(actor.hook_event_active(HookEventName::Stop));
-                assert!(actor.hook_event_active(HookEventName::PostCompact));
+                assert!(actor.may_have_hooks_for(HookEventName::Stop));
+                assert!(actor.may_have_hooks_for(HookEventName::PostCompact));
             })
             .await;
     }

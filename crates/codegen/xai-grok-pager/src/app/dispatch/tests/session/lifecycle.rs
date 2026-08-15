@@ -133,7 +133,6 @@ fn session_created_sets_session_id() {
             session_id: "new-session-123".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -178,7 +177,6 @@ fn session_created_omits_cta_catalog_when_disabled() {
             session_id: "new-session-123".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -224,7 +222,6 @@ fn session_created_banner_advertises_resume_in_minimal_mode() {
             session_id: "new-session-123".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -307,7 +304,6 @@ fn worktree_session_created_sets_session_and_cwd() {
             session_cwd: session_cwd.clone(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -344,6 +340,47 @@ fn worktree_session_created_sets_session_and_cwd() {
     assert!(app.agents[&id].session.state.is_idle());
 }
 #[test]
+fn worktree_session_created_clears_sticky_branch_from_main_repo() {
+    let mut app = test_app_git();
+    dispatch(
+        Action::NewWorktreeSession {
+            load_session_id: None,
+            label: None,
+            git_ref: None,
+        },
+        &mut app,
+    );
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.current_branch = Some("main-random".into());
+        agent.main_repo = Some("~/old-main".into());
+        agent.is_worktree = false;
+    }
+    let worktree_path = PathBuf::from("/tmp/grok-worktrees/pager-sticky");
+    let session_cwd = worktree_path.clone();
+    dispatch(
+        Action::TaskComplete(TaskResult::WorktreeSessionCreated {
+            agent_id: id,
+            session_id: acp::SessionId::new("wt-sticky-1"),
+            worktree_path,
+            session_cwd: session_cwd.clone(),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    assert!(
+        agent.current_branch.is_none(),
+        "sticky main-repo branch must not survive the worktree cwd switch"
+    );
+    assert!(agent.main_repo.is_none());
+    assert!(agent.is_worktree);
+    assert!(agent.session.is_worktree);
+    assert_eq!(agent.session.cwd, session_cwd);
+}
+#[test]
 fn worktree_session_preserves_subdirectory_offset() {
     let mut app = test_app();
     app.cwd = PathBuf::from("/repo/crates/codegen/xai-grok-pager");
@@ -367,7 +404,6 @@ fn worktree_session_preserves_subdirectory_offset() {
             session_cwd: session_cwd.clone(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -497,7 +533,6 @@ fn worktree_session_created_drains_queued_prompts() {
             session_cwd: PathBuf::from("/tmp/grok-worktrees/pager-abc"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -532,7 +567,6 @@ fn session_created_drains_queued_prompts() {
             session_id: acp::SessionId::new("sess-drain-1"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -570,7 +604,6 @@ fn session_created_with_flag_emits_five_fetches_and_clears_flag() {
             session_id: acp::SessionId::new("s"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -594,7 +627,6 @@ fn session_created_without_flag_emits_no_extension_fetches() {
             session_id: acp::SessionId::new("s"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -996,7 +1028,6 @@ fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
             session_id: "deferred-fail-session".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1078,7 +1109,6 @@ fn pre_session_pick_with_no_prior_model_still_persists() {
             session_id: "no-prior-model-session".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1143,7 +1173,6 @@ fn pre_session_effort_only_change_still_persists() {
             session_id: "effort-only-session".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1209,7 +1238,6 @@ fn deferred_pre_session_pick_persists_after_switch_succeeds() {
             session_id: "deferred-ok-session".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1269,7 +1297,6 @@ fn deferred_switch_threads_stash_prev_into_effect() {
             session_id: "prev-session".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1308,7 +1335,6 @@ fn deferred_switch_prefers_authoritative_current_as_prev() {
             session_id: "auth-session".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1341,7 +1367,6 @@ fn deferred_model_switch_applied_on_session_created() {
             session_id: session_id.clone(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1410,7 +1435,6 @@ fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1494,7 +1518,6 @@ fn deferred_switch_dropped_at_apply_releases_stash_time_slot() {
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1592,7 +1615,6 @@ fn a_refused_deferred_switch_restores_the_truth_not_a_stale_snapshot() {
                 session_id: acp::SessionId::new("b-session"),
                 models,
                 scheduler_background_loops: None,
-                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -1693,7 +1715,6 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
             session_id: acp::SessionId::new("new-session"),
             models: Some(acp::SessionModelState::new(model_a.clone(), infos)),
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1825,7 +1846,6 @@ fn rapid_no_session_model_choice_failure_restores_original_model() {
             session_id: acp::SessionId::new("failed-session"),
             models: Some(acp::SessionModelState::new(model_a.clone(), infos)),
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1879,7 +1899,6 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
             session_cwd: PathBuf::from("/tmp/worktree"),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -2120,6 +2139,11 @@ fn chat_mode_new_session_creates_with_chat_kind() {
             }
         )),
         "expected chat CreateSession under --chat, got {effects:?}"
+    );
+    let agent = app.agents.values().next().expect("agent");
+    assert!(
+        agent.conversation_entry,
+        "sticky --chat NewSession must stamp conversation_entry for rename kind"
     );
 }
 /// Atomicity: when several startup intents coexist (e.g. CLI
@@ -2855,6 +2879,178 @@ fn delete_current_session_confirm_emits_effect() {
                 after: AfterSessionDelete::Welcome,
                 ..
             }) if session_id == "sess-current"
+        ),
+        "got {effects:?}"
+    );
+}
+/// Reverting session-delete kills to the wire default (`ClientUi`) would auto-wake.
+#[test]
+fn delete_current_session_kills_bg_tasks_as_teardown() {
+    use xai_grok_shell::extensions::task::TaskKillSource;
+    let mut app = test_app_with_agent();
+    {
+        let a = app.agents.get_mut(&AgentId(0)).unwrap();
+        a.session.session_id = Some(acp::SessionId::new("sess-del"));
+        a.session.cwd = std::path::PathBuf::from("/repo");
+        a.session
+            .bg_tasks
+            .insert("bg-del".into(), super::super::make_bg_task("bg-del"));
+    }
+    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
+    let effects = dispatch(
+        Action::DeleteCurrentSessionAnswered { confirmed: true },
+        &mut app,
+    );
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::KillBgTask {
+                task_id,
+                source: TaskKillSource::Teardown,
+                ..
+            } if task_id == "bg-del"
+        )),
+        "session delete must emit Teardown, got {effects:?}"
+    );
+    assert!(
+        !effects.iter().any(|e| matches!(
+            e,
+            Effect::KillBgTask {
+                source: TaskKillSource::ClientUi,
+                ..
+            }
+        )),
+        "session delete must not emit ClientUi, got {effects:?}"
+    );
+}
+#[test]
+fn delete_current_session_confirm_from_dashboard_emits_dashboard_after() {
+    use crate::app::actions::AfterSessionDelete;
+    let mut app = test_app_with_agent();
+    {
+        let a = app.agents.get_mut(&AgentId(0)).unwrap();
+        a.session.session_id = Some(acp::SessionId::new("sess-dashboard"));
+        a.session.cwd = std::path::PathBuf::from("/repo");
+    }
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(0));
+    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
+    assert_eq!(
+        app.agents[&AgentId(0)]
+            .question_view
+            .as_ref()
+            .unwrap()
+            .questions[0]
+            .options[0]
+            .description,
+        "Remove history and return to the dashboard"
+    );
+    let effects = dispatch(
+        Action::DeleteCurrentSessionAnswered { confirmed: true },
+        &mut app,
+    );
+    assert!(
+        matches!(
+            effects.first(),
+            Some(Effect::CancelTurn {
+                cancel_subagents: true,
+                ..
+            })
+        ),
+        "must cancel the turn/subagents before delete, got {effects:?}"
+    );
+    assert!(
+        matches!(
+            effects.last(),
+            Some(Effect::DeleteSession {
+                session_id,
+                after: AfterSessionDelete::Dashboard,
+                ..
+            }) if session_id == "sess-dashboard"
+        ),
+        "got {effects:?}"
+    );
+}
+/// Dashboard state can exist without overlay attach; must still Welcome.
+#[test]
+fn delete_current_session_dashboard_state_without_attach_stays_welcome() {
+    use crate::app::actions::AfterSessionDelete;
+    let mut app = test_app_with_agent();
+    {
+        let a = app.agents.get_mut(&AgentId(0)).unwrap();
+        a.session.session_id = Some(acp::SessionId::new("sess-no-attach"));
+        a.session.cwd = std::path::PathBuf::from("/repo");
+    }
+    ensure_dashboard_state(&mut app);
+    assert!(app.dashboard.as_ref().unwrap().attached_agent.is_none());
+    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
+    assert_eq!(
+        app.agents[&AgentId(0)]
+            .question_view
+            .as_ref()
+            .unwrap()
+            .questions[0]
+            .options[0]
+            .description,
+        "Remove history and return home"
+    );
+    let effects = dispatch(
+        Action::DeleteCurrentSessionAnswered { confirmed: true },
+        &mut app,
+    );
+    assert!(
+        matches!(
+            effects.last(),
+            Some(Effect::DeleteSession {
+                after: AfterSessionDelete::Welcome,
+                ..
+            })
+        ),
+        "got {effects:?}"
+    );
+}
+/// Stale attach on a different agent must not steer /delete to Dashboard.
+#[test]
+fn delete_current_session_stale_attach_other_agent_stays_welcome() {
+    use crate::app::actions::AfterSessionDelete;
+    let mut app = test_app_with_agent();
+    {
+        let a = app.agents.get_mut(&AgentId(0)).unwrap();
+        a.session.session_id = Some(acp::SessionId::new("sess-active"));
+        a.session.cwd = std::path::PathBuf::from("/repo");
+    }
+    let other = AgentId(1);
+    let session = make_test_agent_session(&app, other, "other");
+    app.agents
+        .insert(other, AgentView::new(session, ScrollbackState::new()));
+    app.agents.get_mut(&other).unwrap().session.session_id =
+        Some(acp::SessionId::new("sess-other"));
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(other);
+    app.active_view = ActiveView::Agent(AgentId(0));
+    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
+    assert_eq!(
+        app.agents[&AgentId(0)]
+            .question_view
+            .as_ref()
+            .unwrap()
+            .questions[0]
+            .options[0]
+            .description,
+        "Remove history and return home"
+    );
+    let effects = dispatch(
+        Action::DeleteCurrentSessionAnswered { confirmed: true },
+        &mut app,
+    );
+    assert!(
+        matches!(
+            effects.last(),
+            Some(Effect::DeleteSession {
+                session_id,
+                after: AfterSessionDelete::Welcome,
+                ..
+            }) if session_id == "sess-active"
         ),
         "got {effects:?}"
     );
@@ -3825,6 +4021,7 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3888,6 +4085,7 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3951,6 +4149,7 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }]);
         let _ = dispatch(Action::PickSessionInWorktree(0), &mut app);
@@ -3988,6 +4187,7 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSessionInWorktree(0), &mut app);
@@ -4032,6 +4232,7 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSessionInWorktree(0), &mut app);
@@ -4075,6 +4276,7 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -4121,6 +4323,7 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -4194,6 +4397,7 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -4268,6 +4472,7 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -4431,7 +4636,6 @@ mod welcome_workspace_mode {
 /// fire) and not twice (what a second delivery path alongside this one would
 /// produce, which is how #44's duplicate-render bugs started).
 #[test]
-fn web_search_disabled_meta_renders_exactly_one_system_block() {
     use crate::scrollback::block::RenderBlock;
     const MSG: &str = "web_search is unavailable: model \"grok-4-fast\" could not be used (no API key or session credential available)";
     let mut app = test_app_with_agent();
@@ -4443,7 +4647,6 @@ fn web_search_disabled_meta_renders_exactly_one_system_block() {
             session_id: "sess-ws-161".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: Some(xai_grok_shell::session::WebSearchDisabledNotice {
                 model_id: "grok-4-fast".into(),
                 reason: "no API key or session credential available".into(),
                 message: MSG.to_string(),
@@ -4473,7 +4676,6 @@ fn no_web_search_notice_pushes_no_block() {
             session_id: "sess-ws-none".into(),
             models: None,
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -4548,7 +4750,6 @@ fn synthesized_switch_does_not_clear_transaction_with_live_request_id() {
             session_id: acp::SessionId::new("new-session-123"),
             models: Some(models_payload),
             scheduler_background_loops: None,
-            web_search_disabled: None,
         }),
         &mut app,
     );

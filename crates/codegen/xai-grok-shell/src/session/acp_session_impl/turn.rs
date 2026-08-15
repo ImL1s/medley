@@ -37,28 +37,6 @@ fn validate_structured_output(
         Err(e) => Err(format!("output does not match the required schema: {e}")),
     }
 }
-/// Resolve the exact tool schema exposed for this turn.
-///
-/// For verbatim forks, preserve parent ordering and docs but intersect with the
-/// current session's admitted tool set so restricted children cannot dispatch a
-/// parent-only exact ID.
-fn resolve_turn_tool_specs(
-    turn_base_tool_specs: &[xai_grok_sampling_types::ToolSpec],
-    forked_tool_override: Option<&[xai_grok_sampling_types::ToolSpec]>,
-) -> Vec<xai_grok_sampling_types::ToolSpec> {
-    let Some(override_tools) = forked_tool_override else {
-        return turn_base_tool_specs.to_vec();
-    };
-    let admitted_names: std::collections::HashSet<&str> = turn_base_tool_specs
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect();
-    override_tools
-        .iter()
-        .filter(|tool| admitted_names.contains(tool.name.as_str()))
-        .cloned()
-        .collect()
-}
 /// Result of the turn-end usage drain (and cancel's no-drain snapshot).
 ///
 /// **Ledger marks** only when [`Self::fail_closed`]. Sticky and background
@@ -161,6 +139,20 @@ fn user_echo_mode(prompt_id: &str) -> UserEchoMode {
     }
 }
 impl SessionActor {
+    /// Exactly once per turn: the cancel path and the turn's own post-loop both announce.
+    pub(super) async fn notify_turn_abort(
+        &self,
+        epoch: TurnEpoch,
+        reason: xai_agent_lifecycle::TurnAbortReason,
+    ) {
+        if !self.turn_abort.try_mark_announced(epoch) {
+            return;
+        }
+        let input = xai_agent_lifecycle::TurnAbortInput::new(reason);
+        for contributor in self.extension_registry.turn_lifecycle_contributors() {
+            contributor.on_turn_abort(&input).await;
+        }
+    }
     /// Run the image-normalization pipeline (re-encode caps, min-side and
     /// integrity checks) and surface its outcomes: compression / re-encode
     /// fallback / dropped notices are appended to `text_out` (TEXT only —
@@ -270,6 +262,7 @@ impl SessionActor {
         prompt_client_identifier: Option<String>,
         prompt_screen_mode: Option<String>,
         verbatim: bool,
+        send_now: bool,
         json_schema: Option<serde_json::Value>,
         persist_ack: Option<oneshot::Sender<()>>,
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
@@ -621,6 +614,11 @@ impl SessionActor {
             );
         }
         let query = crate::session::placeholder_images::strip_paths_from_image_placeholders(query);
+        let query = if send_now && !verbatim {
+            xai_interjection_core::frame_user_turn(xai_interjection_core::INTERJECTION_NOTE, &query)
+        } else {
+            query
+        };
         let user_images = self
             .normalize_images_with_notices(&mut context, raw_images, is_cursor)
             .await;
@@ -733,11 +731,15 @@ impl SessionActor {
             self.transcribe_user_images(user_message, &user_images)
                 .await?
         } else {
-            let session_dir =
-                crate::session::persistence::session_dir(&crate::session::info::Info {
+            let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
+                &crate::session::info::Info {
                     id: self.session_info.id.clone(),
                     cwd: self.session_info.cwd.clone(),
-                });
+                },
+            )
+            .map_err(|e| {
+                acp::Error::internal_error().data(format!("failed to create session dir: {e}"))
+            })?;
             crate::session::image_describe::persist_and_prepend_image_files(
                 &session_dir,
                 &user_images,
@@ -764,9 +766,6 @@ impl SessionActor {
                 self.chat_state_handle.begin_turn_capture();
             }
             let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
-            if matches!(origin, super::super::PromptOrigin::User) {
-                self.maybe_inject_interrupt_reminder().await;
-            }
             let mut user_chat = match &origin {
                 super::super::PromptOrigin::TaskCompleted { .. } => {
                     ConversationItem::task_completed(user_message)
@@ -791,7 +790,9 @@ impl SessionActor {
                 }
                 super::super::PromptOrigin::PlanResume => ConversationItem::user(user_message),
                 super::super::PromptOrigin::User => {
-                    let mut item = ConversationItem::user(user_message);
+                    let mut item = ConversationItem::user(
+                        self.maybe_apply_interrupt_envelope(user_message, verbatim),
+                    );
                     if let Some(interrupt) = self
                         .events
                         .take_prior_interrupt_category()
@@ -853,6 +854,7 @@ impl SessionActor {
             xai_grok_hooks::event::HookEventName::UserPromptSubmit,
             xai_grok_hooks::event::HookPayload::UserPromptSubmit {
                 prompt: Some(prompt_text_for_hook),
+                subagent_type: self.subagent_type_label(),
             },
             Some(prompt_id),
             None,
@@ -991,18 +993,15 @@ impl SessionActor {
                     None,
                 );
                 if let Some(explanation) = refusal {
-                    let details = (!explanation.is_empty()).then(|| explanation.clone());
-                    self.dispatch_hook(
-                        xai_grok_hooks::event::HookEventName::StopFailure,
-                        xai_grok_hooks::event::HookPayload::StopFailure {
+                    self.report_turn_end(
+                        prompt_id,
+                        TurnEnd::Failed {
                             error: xai_grok_hooks::event::StopFailureKind::InvalidRequest,
-                            error_details: details.clone(),
-                            last_assistant_message: details,
+                            error_details: None,
+                            last_assistant_message: (!explanation.is_empty())
+                                .then(|| explanation.clone()),
                         },
-                        Some(prompt_id),
-                        None,
-                    )
-                    .await;
+                    );
                 }
                 self.send_after_turn_event(xai_tool_protocol::turn_hook::AfterTurnPayload {
                     turn_number: current_prompt_index as u64,
@@ -1152,17 +1151,14 @@ impl SessionActor {
                         error_category: Some(error_category),
                     },
                 );
-                self.dispatch_hook(
-                    xai_grok_hooks::event::HookEventName::StopFailure,
-                    xai_grok_hooks::event::HookPayload::StopFailure {
+                self.report_turn_end(
+                    prompt_id,
+                    TurnEnd::Failed {
                         error: Self::stop_failure_error_type(err),
                         error_details: Self::turn_error_detail(err),
                         last_assistant_message: Some(Self::format_turn_error_message(err)),
                     },
-                    Some(prompt_id),
-                    None,
-                )
-                .await;
+                );
             }
         }
         xai_grok_telemetry::session_ctx::log_session_event(
@@ -1193,12 +1189,11 @@ impl SessionActor {
                 }
             }
             Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. }) => {
-                let input = xai_agent_lifecycle::TurnAbortInput::new(
+                self.notify_turn_abort(
+                    self.turn_report.epoch(),
                     xai_agent_lifecycle::TurnAbortReason::Interrupted,
-                );
-                for contributor in self.extension_registry.turn_lifecycle_contributors() {
-                    contributor.on_turn_abort(&input).await;
-                }
+                )
+                .await;
             }
             Err(err) => {
                 let message = err.to_string();
@@ -1680,6 +1675,9 @@ impl SessionActor {
             }
         }
     }
+    pub(super) fn is_first_turn_memory_score_visible(score: f64) -> bool {
+        format!("{score:.2}") != "0.00"
+    }
     /// Compute the first-turn memory reminder, if one should be injected.
     ///
     /// A block persisted by an earlier session segment (a prior `--resume`
@@ -1737,15 +1735,14 @@ impl SessionActor {
             raw_query
         };
         let inject_start = std::time::Instant::now();
-        let inject_results = backend.search(&query, 6, configured_min_score).await.ok();
-        let result_count = inject_results.as_ref().map_or(0, |r| r.len());
-        let top_score = inject_results
-            .as_ref()
-            .and_then(|r| r.first())
-            .map_or(0.0, |r| r.score);
-        let total_snippet_chars: usize = inject_results
-            .as_ref()
-            .map_or(0, |r| r.iter().map(|s| s.snippet.len()).sum());
+        let mut inject_results = backend
+            .search(&query, 6, configured_min_score)
+            .await
+            .unwrap_or_default();
+        inject_results.retain(|result| Self::is_first_turn_memory_score_visible(result.score));
+        let result_count = inject_results.len();
+        let top_score = inject_results.first().map_or(0.0, |r| r.score);
+        let total_snippet_chars: usize = inject_results.iter().map(|s| s.snippet.len()).sum();
         tracing::info!(
             target: xai_grok_telemetry::memory_log::TARGET,
             configured_min_score,
@@ -1762,9 +1759,7 @@ impl SessionActor {
                 injection_duration_ms: inject_start.elapsed().as_millis() as u64,
             },
         );
-        inject_results.and_then(|results| {
-            crate::session::helpers::memory_context::format_memory_reminder(&results)
-        })
+        crate::session::helpers::memory_context::format_memory_reminder(&inject_results)
     }
     /// Inspect `tool_calls` for a `StructuredOutput` call and decide the turn's
     /// next step, pushing the call's `tool_result` (correction / retry error /
@@ -1787,13 +1782,11 @@ impl SessionActor {
                 .iter()
                 .filter(|tc| tc.name == STRUCTURED_OUTPUT_TOOL)
             {
-                self.chat_state_handle.push_tool_result(
-                    ConversationItem::tool_result(
+                self.chat_state_handle
+                    .push_tool_result(ConversationItem::tool_result(
                         tc.id.as_ref().to_owned(),
                         "Call StructuredOutput alone, exactly once, after all other tools finish.",
-                    ),
-                    self.tool_result_truncation_policy(),
-                );
+                    ), None);
             }
             tool_calls.retain(|tc| tc.name != STRUCTURED_OUTPUT_TOOL);
             return StructuredOutputStep::Proceed;
@@ -1804,25 +1797,21 @@ impl SessionActor {
             && *retries < STRUCTURED_OUTPUT_MAX_RETRIES
         {
             *retries += 1;
-            self.chat_state_handle.push_tool_result(
-                ConversationItem::tool_result(
+            self.chat_state_handle
+                .push_tool_result(ConversationItem::tool_result(
                     call_id,
                     format!("{err}\nFix the arguments and call StructuredOutput again."),
-                ),
-                self.tool_result_truncation_policy(),
-            );
+                ), None);
             return StructuredOutputStep::Retry;
         }
-        self.chat_state_handle.push_tool_result(
-            ConversationItem::tool_result(
+        self.chat_state_handle
+            .push_tool_result(ConversationItem::tool_result(
                 call_id,
                 match &validated {
                     Ok(_) => "Structured output accepted.".to_string(),
                     Err(err) => err.clone(),
                 },
-            ),
-            self.tool_result_truncation_policy(),
-        );
+            ), None);
         StructuredOutputStep::Complete(validated)
     }
     /// Single shell tool call whose parsed command is `true` (via ToolBridge).
@@ -2000,14 +1989,6 @@ impl SessionActor {
         let mut identical_tool_calls = IdenticalToolCallRun::default();
         let mut todo_gate_fires: u32 = 0;
         let mut auth_retry_schedule = AuthRetrySchedule::new();
-        let codex_backend = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .is_some_and(|config| {
-                config.api_backend == xai_grok_sampling_types::ApiBackend::CodexResponses
-            });
-        let mut codex_retry_budget = Codex401RetryBudget::new();
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
@@ -2111,7 +2092,7 @@ impl SessionActor {
                     .unwrap_or_else(|| ACTION_STATIONARITY_NUDGE_TEMPLATE.to_string());
                 self.push_system_reminder(&reminder);
             }
-            self.drain_pending_interjections().await;
+            self.drain_interjections_at_safe_point().await;
             self.flush_pending_skill_reminders().await;
             self.inject_pending_monitor_events().await;
             let memory_reminder = self.first_turn_memory_reminder().await;
@@ -2154,11 +2135,12 @@ impl SessionActor {
                 backend_search_active,
                 "backend_search: turn tool resolution"
             );
-            let turn_base_tool_specs = self.turn_base_tool_specs(&tool_definitions);
-            let mut effective_tools: Vec<ToolSpec> = resolve_turn_tool_specs(
-                &turn_base_tool_specs,
-                self.forked_tool_override.as_deref(),
-            );
+            let mut effective_tools: Vec<ToolSpec> =
+                if let Some(ref override_tools) = self.forked_tool_override {
+                    override_tools.clone()
+                } else {
+                    self.turn_base_tool_specs(&tool_definitions)
+                };
             if structured_output_tool && let Some(schema) = json_schema.clone() {
                 effective_tools.push(ToolSpec {
                     name: STRUCTURED_OUTPUT_TOOL.to_string(),
@@ -2235,10 +2217,7 @@ impl SessionActor {
                 })),
             );
             let model_timer = std::time::Instant::now();
-            let (response, latency) = match self
-                .run_turn_via_sampler(request.clone(), codex_retry_budget.available())
-                .await
-            {
+            let (response, latency) = match self.run_turn_via_sampler(request.clone()).await {
                 Ok(SamplerTurnOutcome::Response(r, latency)) => (r, latency),
                 Err(error) => {
                     self.tool_context.fail_task_output_usage_closed();
@@ -2249,32 +2228,6 @@ impl SessionActor {
                     continue;
                 }
                 Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store }) => {
-                    if codex_backend && store == RecoveredStore::AuthProvider {
-                        let consumed = codex_retry_budget.consume();
-                        debug_assert!(consumed);
-                        tracing::warn!(
-                            "auth 401 retry: resubmitting Codex request once with refreshed auth"
-                        );
-                        xai_grok_telemetry::unified_log::warn(
-                            "shell.turn.codex_auth_retry",
-                            Some(self.session_info.id.0.as_ref()),
-                            Some(serde_json::json!({
-                                "loop_index": loop_index,
-                                "attempt": 1,
-                                "max_retries": 1,
-                            })),
-                        );
-                        self.send_xai_notification(XaiSessionUpdate::RetryState(
-                            crate::extensions::notification::RetryState::Retrying {
-                                attempt: 1,
-                                max_retries: 1,
-                                reason: "Re-authenticated OpenAI Codex after 401; retrying request"
-                                    .to_string(),
-                            },
-                        ))
-                        .await;
-                        continue;
-                    }
                     if auth_retry_schedule.reset_if_incident_spans_suspend() {
                         tracing::info!("auth 401 retry: incident spanned a suspend; budget reset");
                         xai_grok_telemetry::unified_log::info(
@@ -2497,7 +2450,7 @@ impl SessionActor {
                     turn_index,
                     mcp_count,
                     mcp_tools,
-                    self.mcp_strategy,
+                    self.mcp_strategy.get(),
                     self.current_model_id().await,
                 );
             }
@@ -2522,8 +2475,7 @@ impl SessionActor {
                         self.record_assistant_response(item).await;
                     }
                     _ => {
-                        self.chat_state_handle
-                            .push_tool_result(item, self.tool_result_truncation_policy());
+                        self.chat_state_handle.push_tool_result(item, None);
                     }
                 }
             }
@@ -2616,8 +2568,8 @@ impl SessionActor {
                         ));
                     }
                 }
-                if self.drain_pending_interjections().await {
-                    tracing::info!("Drained interjection(s) before turn completion — continuing");
+                if self.drain_interjections_at_safe_point().await {
+                    tracing::info!("Drained interjection(s) before turn completion; continuing");
                     continue;
                 }
                 let snapshot = self
@@ -2630,7 +2582,7 @@ impl SessionActor {
                     .await;
                 if self.drain_pending_interjections().await {
                     tracing::info!(
-                        "Drained late interjection(s) during turn-end bookkeeping — continuing"
+                        "Drained late interjection(s) during turn-end bookkeeping; continuing"
                     );
                     continue;
                 }
@@ -2988,32 +2940,5 @@ mod structured_output_validation_tests {
         let bad: Result<jsonschema::Validator, String> = Err("invalid output schema: boom".into());
         let err = validate_structured_output(&bad, r#"{"name":"alice","age":1}"#).unwrap_err();
         assert_eq!(err, "invalid output schema: boom");
-    }
-}
-#[cfg(test)]
-mod issue39_turn_tool_resolution_tests {
-    use super::resolve_turn_tool_specs;
-
-    fn tool(name: &str) -> xai_grok_sampling_types::ToolSpec {
-        xai_grok_sampling_types::ToolSpec {
-            name: name.to_string(),
-            description: Some(format!("{name} description")),
-            parameters: serde_json::json!({"type":"object"}),
-        }
-    }
-
-    #[test]
-    fn issue39_verbatim_fork_tools_intersect_session_admission() {
-        let admitted = vec![tool("read_file"), tool("search")];
-        let parent_override = vec![tool("read_file"), tool("deploy_app")];
-
-        let resolved = resolve_turn_tool_specs(&admitted, Some(&parent_override));
-        let names: Vec<_> = resolved.iter().map(|tool| tool.name.as_str()).collect();
-
-        assert_eq!(
-            names,
-            vec!["read_file"],
-            "verbatim forks must not expose parent-only exact IDs to restricted children"
-        );
     }
 }

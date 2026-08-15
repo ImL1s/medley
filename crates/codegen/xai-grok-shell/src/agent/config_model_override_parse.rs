@@ -38,9 +38,6 @@ pub enum ConfigWarningKind {
     /// Entry failed to parse even after skipping invalid fields; the model
     /// keeps an empty override.
     UnparseableEntry,
-    /// Section is spelled correctly and would be valid, but the config tier it
-    /// was written in never loads it, so the entry is inert where it sits.
-    WrongConfigTier,
 }
 
 /// What a [`ConfigWarning`] is about. Serialize-only: `grok inspect --json`
@@ -296,18 +293,9 @@ fn parse_model_override_table(
             (entry, warnings)
         }
         Err(_) => {
-            let invalid_auth_scheme = table.get("auth_scheme").and_then(|value| {
-                field_parse_error("auth_scheme", value).is_some().then(|| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| value.to_string())
-                })
-            });
             prune_invalid_fields(model_key, &mut table, &mut warnings);
             match deserialize_with_unknown_fields(table) {
-                Ok((mut entry, unknown)) => {
-                    entry.invalid_auth_scheme = invalid_auth_scheme;
+                Ok((entry, unknown)) => {
                     warnings.extend(unknown_field_warnings(model_key, unknown));
                     (entry, warnings)
                 }
@@ -328,36 +316,6 @@ fn parse_model_override_table(
             }
         }
     };
-
-    let mut entry = entry;
-    // #13: normalize env_key names and surface invalid entries as path-specific
-    // warnings instead of silently selecting whitespace / illegal names.
-    if let Some(raw_keys) = entry.env_key.take() {
-        let candidates: Vec<String> = raw_keys.names().into_iter().map(str::to_owned).collect();
-        let (normalized, rejected) = crate::agent::config::EnvKeys::normalize(candidates);
-        for rejected in rejected {
-            let reason = if rejected.name.is_empty() {
-                format!(
-                    "invalid env_key entry ({}); ignored — not used as a credential source",
-                    rejected.reason
-                )
-            } else {
-                format!(
-                    "invalid env_key name {:?}: {}; ignored — not used as a credential source",
-                    rejected.name, rejected.reason
-                )
-            };
-            warnings.push(ConfigWarning::model(
-                model_key,
-                Some("env_key"),
-                ConfigWarningKind::InvalidValue,
-                reason,
-            ));
-        }
-        if !normalized.is_empty() {
-            entry.env_key = Some(normalized);
-        }
-    }
 
     if entry.auth_provider.is_some() {
         // A non-empty `api_key` always shadows; an `env_key` only shadows when
@@ -498,7 +456,6 @@ fn field_parse_error(field: &str, value: &toml::Value) -> Option<toml::de::Error
 mod tests {
     use super::*;
     use crate::sampling::ApiBackend;
-    use xai_grok_sampler::AuthScheme;
     use xai_grok_sampling_types::{
         CompactionAtTokens, CompactionsRemaining, ReasoningEffort, ReasoningEffortOption,
     };
@@ -737,7 +694,6 @@ mod tests {
             temperature: Some(0.5),
             top_p: Some(0.9),
             api_backend: Some(ApiBackend::Messages),
-            auth_scheme: Some(AuthScheme::XApiKey),
             extra_headers: [("x-team".to_owned(), "codegen".to_owned())]
                 .into_iter()
                 .collect(),
@@ -770,9 +726,6 @@ mod tests {
             compaction_at_tokens: Some(CompactionAtTokens::Fixed(100_000)),
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
-            codex_wire: None,
-            catalog_degraded_reason: None,
-            invalid_auth_scheme: None,
         }
     }
 
@@ -786,74 +739,6 @@ mod tests {
         let ParsedModelOverrides { models, warnings } =
             parse_model_overrides(&toml::Value::Table(root));
         (models, warnings)
-    }
-
-    #[test]
-    fn auth_scheme_x_api_key_parses_and_applies() {
-        let mut entry = toml::map::Map::new();
-        entry.insert(
-            "auth_scheme".into(),
-            toml::Value::String("x_api_key".into()),
-        );
-        entry.insert("context_window".into(), toml::Value::Integer(200_000));
-        let (models, warnings) = parse_single_entry(entry);
-        assert!(warnings.is_empty());
-        let over = models.get("m").expect("model m");
-        assert_eq!(over.auth_scheme, Some(AuthScheme::XApiKey));
-    }
-
-    #[test]
-    fn auth_scheme_none_parses() {
-        let mut entry = toml::map::Map::new();
-        entry.insert("auth_scheme".into(), toml::Value::String("none".into()));
-        let (models, warnings) = parse_single_entry(entry);
-        assert!(warnings.is_empty());
-        assert_eq!(models.get("m").unwrap().auth_scheme, Some(AuthScheme::None));
-    }
-
-    #[test]
-    fn invalid_auth_scheme_warns_and_keeps_entry() {
-        let mut entry = toml::map::Map::new();
-        entry.insert("model".into(), toml::Value::String("kept".into()));
-        entry.insert(
-            "auth_scheme".into(),
-            toml::Value::String("not-a-scheme".into()),
-        );
-        let (models, warnings) = parse_single_entry(entry);
-        let over = models.get("m").expect("model retained");
-        assert_eq!(over.model.as_deref(), Some("kept"));
-        assert_eq!(
-            over.invalid_auth_scheme.as_deref(),
-            Some("not-a-scheme"),
-            "invalid auth_scheme must be stashed before prune"
-        );
-        assert!(over.auth_scheme.is_none());
-        assert!(warnings.iter().any(|w| {
-            w.kind == ConfigWarningKind::InvalidValue && w.field() == Some("auth_scheme")
-        }));
-
-        let raw = toml::toml! {
-            [model.m]
-            model = "kept"
-            auth_scheme = "not-a-scheme"
-            base_url = "http://127.0.0.1:11434/v1"
-            context_window = 200000
-        };
-        let cfg = parse_cfg(&raw.to_string());
-        let resolved = crate::agent::config::resolve_model_list(&cfg, None);
-        let model = resolved.get("m").expect("model retained after resolve");
-        assert!(
-            !model.config_validation_errors.is_empty(),
-            "invalid auth_scheme must fail-closed at resolve"
-        );
-        let (ready, reason) = crate::agent::config::model_readiness(model);
-        assert!(!ready, "invalid auth_scheme must be unready");
-        assert!(
-            reason
-                .as_deref()
-                .is_some_and(|r| r.contains("not-a-scheme") && r.contains("bearer")),
-            "unexpected readiness reason: {reason:?}"
-        );
     }
 
     #[test]
@@ -922,58 +807,6 @@ mod tests {
         );
         let (_, warnings) = parse_single_entry(entry);
         assert_eq!(warnings, Vec::new());
-    }
-
-    /// #13: invalid `env_key` entries warn with a model-path-specific message
-    /// instead of silently becoming the primary credential source.
-    #[test]
-    fn env_keys_invalid_entry_emits_path_specific_config_warning() {
-        let cfg = parse_cfg(
-            r#"
-            [model."custom-llm"]
-            model = "custom-llm"
-            base_url = "https://inference.example/v1"
-            env_key = ["  API_KEY  ", "   ", "FOO=BAR", "API_KEY", "FALLBACK"]
-            "#,
-        );
-        let model = cfg
-            .config_models
-            .get("custom-llm")
-            .expect("model must remain in catalog");
-        assert_eq!(
-            model.env_key.as_ref().map(|k| k.names()),
-            Some(vec!["API_KEY", "FALLBACK"]),
-            "valid names trim+dedupe; invalid ones must not remain"
-        );
-        let env_warnings: Vec<_> = cfg
-            .config_warnings
-            .iter()
-            .filter(|w| w.field() == Some("env_key"))
-            .collect();
-        assert!(
-            env_warnings.len() >= 2,
-            "whitespace-only and FOO=BAR must each warn: {env_warnings:?}"
-        );
-        assert!(
-            env_warnings.iter().all(|w| {
-                w.kind == ConfigWarningKind::InvalidValue
-                    && w.target.label() == "model.\"custom-llm\""
-            }),
-            "warnings must point at model.\"custom-llm\" env_key: {env_warnings:?}"
-        );
-        let joined = env_warnings
-            .iter()
-            .map(|w| w.reason.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        assert!(
-            joined.contains("FOO=BAR"),
-            "reason should name the invalid variable (Value withheld.): {joined}"
-        );
-        assert!(
-            !joined.contains("sk-") && !joined.contains("token="),
-            "warning must not include credential values (Value withheld.): {joined}"
-        );
     }
 
     /// Drift guard: every `#[serde(alias)]` on [`ConfigModelOverride`] must

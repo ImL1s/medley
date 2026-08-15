@@ -344,7 +344,7 @@ fn format_tokens(tokens: u64) -> String {
 pub struct SessionEventBlock {
     /// The typed event data.
     pub event: SessionEvent,
-    /// Stop/stop_failure hook runs folded into a turn-terminal marker
+    /// Stop-family hook runs folded into a turn-terminal marker
     /// (`(event_name, runs)` per hook batch). Rendered as a right-justified
     /// `stop  [hooks: N]` summary on the marker line, with per-hook detail
     /// on expand. Always empty for non-terminal events.

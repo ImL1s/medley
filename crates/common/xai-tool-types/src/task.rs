@@ -866,7 +866,8 @@ fn substitute_tool_placeholders(
 /// code exploration, and multi-step research tasks.
 pub const GENERAL_PURPOSE_PROMPT: &str = "\
 Complete the assigned task directly. Do what was asked; nothing more, nothing less. \
-Respond with a detailed writeup when done.
+Report results in the format and length the task specifies; otherwise give a clear, \
+complete writeup.
 
 Strengths:
 - Searching across large codebases for code, configurations, and patterns
@@ -1048,7 +1049,8 @@ pub fn build_task_description(subagents: &[SubagentDescriptor], naming: &TaskToo
          - When the agent is done, it returns a single message with its agent ID. Use that ID to resume the agent later for follow-up work.\n\
          - {run_in_background_param}: Returns immediately with a subagent_id. Use {background_retrieval_tool} to retrieve results. This is set to true by default.\n\
          - Subagents receive a compacted version of project instructions (AGENTS.md). If the task requires detailed conventions (e.g., build rules, testing patterns), include the relevant rules directly in the prompt.\n\
-         - When using the {task_tool} tool, you must specify a {subagent_type_param} parameter to select which agent type to use.\n\n\
+         - When using the {task_tool} tool, you must specify a {subagent_type_param} parameter to select which agent type to use.\n\
+         - When launching independent subagents, you MUST incorporate the results into the task based on requirements BEFORE concluding.\n\n\
          Resuming a previous agent (resume_from):\n\
          - Use {resume_from_param} to continue a previously completed subagent's conversation. Pass the subagent_id returned by a prior {task_tool} call. A resumed agent keeps its full transcript and tool state, so you only need to describe what changed since the last run — don't re-explain the original task.\n\
          - The resumed agent must use the same subagent_type as the source.\n\n\
@@ -1432,6 +1434,14 @@ mod tests {
             "run_in_background: Returns immediately with a subagent_id. Use get_task_output to retrieve results. This is set to true by default."
         ));
         assert!(desc.contains("you must specify a subagent_type parameter"));
+        assert!(desc.contains(
+            "When launching independent subagents, you MUST incorporate the results into the task based on requirements BEFORE concluding."
+        ));
+        assert!(
+            !desc.contains("only actual task calls do")
+                && !desc.contains("If the user explicitly asked for subagents"),
+            "delegation timing belongs in the shared system prompt, not the task contract: {desc}"
+        );
         assert!(desc.contains("Use resume_from to continue"));
     }
 

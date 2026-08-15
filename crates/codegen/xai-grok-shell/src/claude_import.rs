@@ -92,10 +92,7 @@ impl ImportPlan {
         let mut out = String::from("Found Claude settings to import:\n");
 
         if !self.global_items.is_empty() {
-            out.push_str(&format!(
-                "\nGlobal ({}):\n",
-                xai_grok_config::display_user_grok_path("config.toml")
-            ));
+            out.push_str("\nGlobal (~/.grok/config.toml):\n");
             out.push_str(&format_item_summary(&self.global_items));
         }
 
@@ -1626,10 +1623,6 @@ mod tests {
     fn gate_load_claude_env_returns_empty_when_marker_set() {
         let _g = MarkerGuard;
         refresh_marker_cache(true);
-        // Workspace-resident `load_claude_env_with_project` cannot see the
-        // shell-side MARKER_CACHE; the env override is the cross-crate hatch
-        // (same pattern as `gate_resolve_permissions_with_provenance_*`).
-        unsafe { std::env::set_var("_GROK_CLAUDE_MARKER_OVERRIDE", "1") };
         let dir = tempfile::tempdir().unwrap();
         let env = xai_grok_workspace::permission::claude_settings::load_claude_env_with_project(
             dir.path(),

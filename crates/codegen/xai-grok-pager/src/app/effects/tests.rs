@@ -742,11 +742,8 @@ fn parse_session_load_restore_meta_rejects_unknown_degree() {
     assert!(degree.is_none());
 }
 /// #161 write→parse bridge: the shell publishes `WebSearchDisabledNotice` under
-/// `WEB_SEARCH_DISABLED_META_KEY`; the pager must recover the same shape. This
 /// is the production parser dispatch tests skip when they inject
-/// `TaskResult::SessionLoaded { web_search_disabled: Some(...) }` directly.
 #[test]
-fn parse_session_web_search_disabled_round_trips_shared_notice() {
     let notice = xai_grok_shell::session::WebSearchDisabledNotice {
         model_id: "grok-4-fast".into(),
         reason: "model is not ready".into(),
@@ -754,30 +751,22 @@ fn parse_session_web_search_disabled_round_trips_shared_notice() {
     };
     let mut meta = acp::Meta::new();
     meta.insert(
-        xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY.into(),
         serde_json::to_value(&notice).expect("notice serializes"),
     );
-    let parsed = parse_session_web_search_disabled(Some(&meta))
         .expect("well-formed meta must parse");
     assert_eq!(parsed, notice);
 }
 /// Absent key means available — must not invent a notice.
 #[test]
-fn parse_session_web_search_disabled_absent_key_is_none() {
     let meta = acp::Meta::new();
-    assert!(parse_session_web_search_disabled(Some(&meta)).is_none());
-    assert!(parse_session_web_search_disabled(None).is_none());
 }
 /// Present-but-malformed collapses to None (with a warn), not a panic — and
 /// must not be mistaken for a successful disable notice.
 #[test]
-fn parse_session_web_search_disabled_malformed_is_none() {
     let mut meta = acp::Meta::new();
     meta.insert(
-        xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY.into(),
         serde_json::json!("not-an-object"),
     );
-    assert!(parse_session_web_search_disabled(Some(&meta)).is_none());
 }
 /// Unknown keys return a descriptive error.
 #[tokio::test]
@@ -905,7 +894,7 @@ fn setup_grok_home_in_tempdir() -> tempfile::TempDir {
     tmp
 }
 fn register_session_in(root: &std::path::Path, id: &str) -> acp::SessionId {
-    use xai_grok_shell::active_sessions::{ActiveSession, register_in};
+    use xai_grok_active_sessions::{ActiveSession, register_in};
     let session_id = acp::SessionId::new(id);
     register_in(
             root,
@@ -926,7 +915,7 @@ fn unregister_best_effort_removes_entry_when_lock_free() {
     let sid = register_session_in(dir.path(), "s1");
     unregister_active_session_best_effort_in(dir.path(), &sid);
     assert!(
-            xai_grok_shell::active_sessions::list_in(dir.path())
+            xai_grok_active_sessions::list_in(dir.path())
                 .expect("list")
                 .is_empty(),
             "lock-free unregister must remove the entry",
@@ -965,7 +954,7 @@ fn unregister_best_effort_is_nonblocking_under_lock_contention() {
             "contended unregister blocked on the shared flock instead of skipping",
         );
     assert_eq!(
-            xai_grok_shell::active_sessions::list_in(dir.path())
+            xai_grok_active_sessions::list_in(dir.path())
                 .expect("list")
                 .len(),
             1,
@@ -1453,7 +1442,7 @@ async fn foreign_scan_task_echoes_sequence_without_enabled_sources() {
     execute(
         Effect::ScanForeignSessions {
             cwd: PathBuf::from("/path/that/must/not/be-read"),
-            compat: xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources::default(),
+            compat: xai_grok_foreign_sessions::EnabledForeignSessionSources::default(),
             grok_home: PathBuf::from("/path/that/must/not/be-read"),
             coordinator: app_coordinator.clone(),
             seq: 41,
@@ -1506,7 +1495,7 @@ async fn foreign_resume_detection_runs_as_task_result() {
     let (quit, _) = execute(
         Effect::DetectForeignResumeHint {
             canonical_cwd: canonical_cwd.clone(),
-            compat: xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources::default(),
+            compat: xai_grok_foreign_sessions::EnabledForeignSessionSources::default(),
             grok_home: PathBuf::from("/path/that/must/not-be-read"),
             launch_token: 8,
         },

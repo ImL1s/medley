@@ -1,7 +1,6 @@
 use std::{borrow::Borrow, fmt, ops::Deref};
 
 use agent_client_protocol as acp;
-use derive_more::From;
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use tokio::sync::oneshot;
 
@@ -176,7 +175,7 @@ mod client {
     );
 
     /// ACP messages meant *for* the client.
-    #[derive(Debug, From)]
+    #[derive(Debug, derive_more::From)]
     pub enum AcpClientMessageGeneric<S: StorageMarker> {
         RequestPermission(AcpArgsGeneric<acp::RequestPermissionRequest, S>),
         ReadTextFile(AcpArgsGeneric<acp::ReadTextFileRequest, S>),
@@ -396,7 +395,7 @@ mod agent {
     );
 
     /// ACP messages meant *for* the agent.
-    #[derive(Debug, From)]
+    #[derive(Debug, derive_more::From)]
     pub enum AcpAgentMessageGeneric<S: StorageMarker> {
         Initialize(AcpArgsGeneric<acp::InitializeRequest, S>),
         Authenticate(AcpArgsGeneric<acp::AuthenticateRequest, S>),

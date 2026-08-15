@@ -1,7 +1,7 @@
 use agent_client_protocol as acp;
 
 use crate::agent::config::ModelEntry;
-use crate::auth::{PreferredAuthMethod, with_login_instruction};
+use crate::auth::PreferredAuthMethod;
 
 /// Shared, live handle to the agent's current ACP auth method id.
 ///
@@ -29,39 +29,15 @@ pub const XAI_API_KEY_ENV_VAR: &str = "XAI_API_KEY";
 /// so existing deployments that use the old name keep working.
 pub const LEGACY_XAI_API_KEY_ENV_VAR: &str = "GROK_CODE_XAI_API_KEY";
 
-/// Non-blank (after trim) value from an env var, if present.
-///
-/// Empty or whitespace-only values are treated as unset so they do not block
-/// fallback to the legacy name and never count as usable ambient credentials
-/// (#303 / Pro P0: blank `XAI_API_KEY` must not pin Grok precedence).
-fn nonblank_env(var: &str) -> Result<String, std::env::VarError> {
-    match std::env::var(var) {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                Err(std::env::VarError::NotPresent)
-            } else {
-                Ok(trimmed.to_string())
-            }
-        }
-        Err(e) => Err(e),
-    }
-}
-
 /// Read the API key from the environment.
 ///
 /// Checks `XAI_API_KEY` first, then falls back to the legacy
 /// `GROK_CODE_XAI_API_KEY` for backward compatibility.
-///
-/// Only **non-blank after trim** values count. A blank or whitespace-only
-/// primary variable falls through to the legacy name (so a placeholder
-/// `XAI_API_KEY=` in shell profiles / CI secret projection does not mask a
-/// valid legacy key). Both blank → `Err(NotPresent)`.
 pub(crate) fn read_xai_api_key_env() -> Result<String, std::env::VarError> {
-    nonblank_env(XAI_API_KEY_ENV_VAR).or_else(|_| nonblank_env(LEGACY_XAI_API_KEY_ENV_VAR))
+    std::env::var(XAI_API_KEY_ENV_VAR).or_else(|_| std::env::var(LEGACY_XAI_API_KEY_ENV_VAR))
 }
 
-/// Returns `true` if a non-blank `XAI_API_KEY` or `GROK_CODE_XAI_API_KEY` is set.
+/// Returns `true` if either `XAI_API_KEY` or `GROK_CODE_XAI_API_KEY` is set.
 pub fn has_xai_api_key_env() -> bool {
     read_xai_api_key_env().is_ok()
 }
@@ -78,9 +54,7 @@ pub fn has_xai_api_key_env() -> bool {
 ///
 /// Probes `std::env` at call time and consults each `ModelEntry` for a
 /// resolvable api_key/env_key -- both inputs can change between calls, so the
-/// result is not cached. Entries on the reserved OpenAI Codex profile are
-/// skipped: their bearer comes from that provider's own OAuth login, so the
-/// built-in preset is not evidence of an xAI or BYOK key.
+/// result is not cached.
 ///
 /// `disable_api_key_auth` (`[grok_com_config] disable_api_key_auth` /
 /// `GROK_DISABLE_API_KEY_AUTH`) is the admin kill switch: when true the
@@ -111,9 +85,7 @@ where
     if disable_api_key_auth {
         return false;
     }
-    let has_byok = models
-        .into_iter()
-        .any(|m| m.has_own_credentials() && !m.is_openai_codex_profile());
+    let has_byok = models.into_iter().any(ModelEntry::has_own_credentials);
     has_byok || (has_xai_api_key_env() && first_party_env_ok)
 }
 
@@ -146,17 +118,6 @@ pub struct AuthMethodsBuildInputs<'a> {
     /// Config pin (`[auth] preferred_method`). `None` keeps multi-method
     /// fallthrough; `Some` is fail-closed (only that method family).
     pub preferred_method: Option<PreferredAuthMethod>,
-    /// True when the startup-selected / default model has
-    /// `auth_scheme = none`. When unpinned, advertises `local.none` first
-    /// and selects it as the default. Catalog presence of other no-auth
-    /// models alone must not set this — only the selected model matters.
-    pub selected_model_is_no_auth: bool,
-    /// True when a live OpenAI Codex credential exists. It is not an xAI
-    /// credential, so it never advertises `xai.api_key` — but a user who has
-    /// only run `grok login --provider openai-codex` does have a way to
-    /// sample, and must not be sent to the xAI login screen. Only consulted
-    /// when no xAI credential is present at all; see [`build_unpinned`].
-    pub has_openai_codex_credential: bool,
 }
 
 /// Output of [`build_auth_methods`].
@@ -175,34 +136,25 @@ pub struct BuiltAuthMethods {
 /// Build the `auth_methods` list and default `auth_method_id` from
 /// pre-computed inputs.
 ///
-/// REGRESSION GUARD: when unpinned, `has_external_api_key` is true, and
-/// `selected_model_is_no_auth` is **false**, the **first** entry MUST be
-/// `xai.api_key`. A prior change deferred it to the END for per-model
-/// credentials, which made the pager send per-model-key users to the login
-/// screen. Unit tests lock this. When `selected_model_is_no_auth` is true,
-/// `local.none` is first instead (and is the default).
-///
-/// `local.none` also goes first when a Codex credential is the only credential
-/// present (`has_openai_codex_credential` with neither xAI credential): the
-/// user can sample, so the interactive xAI login screen would be a dead end.
+/// REGRESSION GUARD: when unpinned and
+/// `has_external_api_key` is true, the **first** entry MUST be `xai.api_key`.
+/// A prior change deferred it to the END for per-model credentials, which made
+/// the pager send per-model-key users to the login screen. Unit tests lock this.
 ///
 /// Unpinned ordering (when each method is enabled):
-/// 1. `local.none`      (if `selected_model_is_no_auth` or Codex-only)
-/// 2. `xai.api_key`     (if `has_external_api_key`)
-/// 3. `cached_token`    (if `has_cached_token`)
-/// 4. exactly one of:
+/// 1. `xai.api_key`     (if `has_external_api_key`)
+/// 2. `cached_token`    (if `has_cached_token`)
+/// 3. exactly one of:
 ///    - `oidc`          (if `has_enterprise_oidc`)
 ///    - `grok.com`      (otherwise)
 ///
 /// Unpinned `default_auth_method_id`:
-/// - `local.none`   if `selected_model_is_no_auth` or Codex-only
-/// - `cached_token` else if `has_cached_token`
+/// - `cached_token` if `has_cached_token`
 /// - `xai.api_key`  else if `has_external_api_key`
 /// - `None`         otherwise
 ///
 /// Pinned (`preferred_method`):
 /// - `ApiKey`: only `xai.api_key` if available; else empty list + `None` (fail).
-///   Does **not** fall through to `local.none`.
 /// - `Oidc`: `cached_token` (if any) + interactive login; never `xai.api_key`.
 ///   Default is `cached_token` when present, else `None` (interactive).
 pub fn build_auth_methods(inputs: AuthMethodsBuildInputs<'_>) -> BuiltAuthMethods {
@@ -214,8 +166,6 @@ pub fn build_auth_methods(inputs: AuthMethodsBuildInputs<'_>) -> BuiltAuthMethod
         login_label,
         has_auth_provider_command,
         preferred_method,
-        selected_model_is_no_auth,
-        has_openai_codex_credential,
     } = inputs;
 
     match preferred_method {
@@ -234,8 +184,6 @@ pub fn build_auth_methods(inputs: AuthMethodsBuildInputs<'_>) -> BuiltAuthMethod
             enterprise_oidc_issuer,
             login_label,
             has_auth_provider_command,
-            selected_model_is_no_auth,
-            has_openai_codex_credential,
         ),
     }
 }
@@ -294,53 +242,30 @@ fn build_unpinned(
     enterprise_oidc_issuer: Option<&str>,
     login_label: Option<&str>,
     has_auth_provider_command: bool,
-    selected_model_is_no_auth: bool,
-    has_openai_codex_credential: bool,
 ) -> BuiltAuthMethods {
     let mut methods: Vec<acp::AuthMethod> = Vec::new();
     let mut default_auth_method_id: Option<acp::AuthMethodId> = None;
 
-    // A Codex credential with no xAI credential behind it: the user can sample
-    // (their Codex models are ready) but has nothing to authenticate to xAI
-    // with, so the interactive xAI login screen is a dead end. Gated on having
-    // neither xAI credential so every existing path stays byte-identical.
-    let codex_is_the_only_credential =
-        has_openai_codex_credential && !has_cached_token && !has_external_api_key;
-    let skip_interactive_login = selected_model_is_no_auth || codex_is_the_only_credential;
-
-    // Selected no-auth model: advertise local.none first and default to it so
-    // the pager skips interactive login. Catalog-only no-auth entries must
-    // not set selected_model_is_no_auth (caller responsibility).
-    if skip_interactive_login {
-        methods.push(local_none_auth_method());
-        default_auth_method_id = Some(acp::AuthMethodId::new(LOCAL_NONE_METHOD_ID));
-    }
-
     if has_external_api_key {
         methods.push(xai_api_key_auth_method());
-        if default_auth_method_id.is_none() {
-            default_auth_method_id = Some(acp::AuthMethodId::new(XAI_API_KEY_METHOD_ID));
-        }
+        default_auth_method_id = Some(acp::AuthMethodId::new(XAI_API_KEY_METHOD_ID));
     }
 
     if has_cached_token {
         methods.push(cached_token_auth_method());
         // cached_token wins over xai.api_key for default_auth_method_id so
         // is_session_based_auth() returns true and OIDC refresh stays alive.
-        // It does NOT override local.none — keyless local models stay default.
-        if !skip_interactive_login {
-            let overrode_api_key = default_auth_method_id.is_some();
-            default_auth_method_id = Some(acp::AuthMethodId::new(CACHED_TOKEN_AUTH_METHOD_ID));
-            if overrode_api_key {
-                xai_grok_telemetry::unified_log::info(
-                    "auth method priority: cached_token overrides xai.api_key for default_auth_method_id",
-                    None,
-                    Some(serde_json::json!({
-                        "has_external_api_key": has_external_api_key,
-                        "has_cached_token": has_cached_token,
-                    })),
-                );
-            }
+        let overrode_api_key = default_auth_method_id.is_some();
+        default_auth_method_id = Some(acp::AuthMethodId::new(CACHED_TOKEN_AUTH_METHOD_ID));
+        if overrode_api_key {
+            xai_grok_telemetry::unified_log::info(
+                "auth method priority: cached_token overrides xai.api_key for default_auth_method_id",
+                None,
+                Some(serde_json::json!({
+                    "has_external_api_key": has_external_api_key,
+                    "has_cached_token": has_cached_token,
+                })),
+            );
         }
     }
 
@@ -387,8 +312,6 @@ pub enum AuthMethodKind {
     CachedToken,
     GrokCom,
     Oidc,
-    /// Keyless local / `auth_scheme = none` — not session-based, not interactive.
-    LocalNone,
     Unknown,
 }
 
@@ -399,7 +322,6 @@ impl AuthMethodKind {
             CACHED_TOKEN_AUTH_METHOD_ID => Self::CachedToken,
             GROK_COM_METHOD_ID => Self::GrokCom,
             OIDC_METHOD_ID => Self::Oidc,
-            LOCAL_NONE_METHOD_ID => Self::LocalNone,
             _ => Self::Unknown,
         }
     }
@@ -447,96 +369,6 @@ impl ModelByok {
     }
 }
 
-/// Why [`ModelReadiness::Unusable`]: the catalog entry failed
-/// [`crate::agent::config::model_readiness`]. Kept as a string so the
-/// refusal / default-resolution surfaces can name the same reason the
-/// picker already shows.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct UnusableReason(pub String);
-
-impl UnusableReason {
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Why [`ModelReadiness::Unknown`]. These are not interchangeable: an
-/// absent catalog entry, an unloadable catalog, and an empty model id
-/// want different attach / refusal behaviour (#133).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UnknownReason {
-    /// Effective config loaded; `model_id` is not in the catalog.
-    NotInCatalog,
-    /// Config load/parse failed — readiness knowledge is unobtainable.
-    CatalogUnavailable,
-    /// No identified model yet (empty sampling-config model id).
-    UnidentifiedModel,
-}
-
-impl UnknownReason {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::NotInCatalog => "not_in_catalog",
-            Self::CatalogUnavailable => "catalog_unavailable",
-            Self::UnidentifiedModel => "unidentified_model",
-        }
-    }
-}
-
-/// Catalog readiness for a model id, distinct from BYOK.
-///
-/// `ModelAuthFacts` used to collapse this into a bool, so "catalogued but
-/// failed readiness" and "not in the catalog" both read as `!ready`. A
-/// refusal keyed on that bool then also refused every uncatalogued model
-/// (#133). Same shape as [`ModelByok`], with the unknown *reason*
-/// preserved so readers can tell absence from unobtainable knowledge.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ModelReadiness {
-    /// Catalog entry present and `model_readiness` passed.
-    Ready,
-    /// Catalog entry present and `model_readiness` failed.
-    Unusable(UnusableReason),
-    /// No definite catalog answer — see [`UnknownReason`].
-    Unknown(UnknownReason),
-}
-
-impl ModelReadiness {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Unusable(_) => "unusable",
-            Self::Unknown(_) => "unknown",
-        }
-    }
-
-    pub(crate) fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready)
-    }
-
-    /// Refusal keys on this alone — never on [`Self::Unknown`] (#133).
-    pub(crate) fn is_unusable(&self) -> bool {
-        matches!(self, Self::Unusable(_))
-    }
-
-    pub(crate) fn is_unknown(&self) -> bool {
-        matches!(self, Self::Unknown(_))
-    }
-
-    pub(crate) fn unusable_reason(&self) -> Option<&str> {
-        match self {
-            Self::Unusable(reason) => Some(reason.as_str()),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn unknown_reason(&self) -> Option<UnknownReason> {
-        match self {
-            Self::Unknown(reason) => Some(*reason),
-            _ => None,
-        }
-    }
-}
-
 /// Whether this session+model uses a refreshable session token.
 ///
 /// Gates on stable inputs, not `Credentials.auth_type`: that field collapses
@@ -553,14 +385,8 @@ impl ModelReadiness {
 /// demote on `Unknown`). It refreshes when `endpoint_is_first_party` — the
 /// request targets a first-party host (cli-chat-proxy / first-party API),
 /// where sending the session token cannot leak to a third-party BYOK
-/// endpoint. A definite `Byok` never refreshes.
-///
-/// `NotByok` used to refresh unconditionally, on the reasoning that it "only
-/// ever routes to the session endpoint". That does not hold in this fork:
-/// `NotByok` says the model declares no credential of its own, and says
-/// nothing about where its `base_url` points — a catalog model with an
-/// overridden endpoint is both `NotByok` and third-party. So it consults the
-/// endpoint too (#110).
+/// endpoint. A definite `NotByok` always refreshes (it only ever routes to
+/// the session endpoint); a definite `Byok` never does.
 pub(crate) fn session_token_auth_gate(
     is_session_based_method: bool,
     model_byok: ModelByok,
@@ -568,56 +394,16 @@ pub(crate) fn session_token_auth_gate(
 ) -> bool {
     is_session_based_method
         && match model_byok {
-            ModelByok::NotByok => endpoint_is_first_party,
+            ModelByok::NotByok => true,
             ModelByok::Byok => false,
             ModelByok::Unknown => endpoint_is_first_party,
         }
 }
 
-/// Was a `const`, which cannot call [`with_login_instruction`] to pick the
-/// right verb for the invoked name (#117).
-pub fn auth_error_session_expired() -> String {
-    with_login_instruction(
-        |prog| format!("Session expired. Run `{prog} login` to re-authenticate."),
-        "Session expired. Sign in again to re-authenticate.",
-    )
-}
+pub const AUTH_ERROR_SESSION_EXPIRED: &str =
+    "Session expired. Run `grok login` to re-authenticate.";
 
-/// Names the config file *this* install reads.
-///
-/// Was a `const`, which cannot interpolate — so it said `~/.grok/config.toml`
-/// on an install whose config lives in `~/.medley`. In the one message whose
-/// entire job is to tell you which file to edit, and which appears exactly
-/// when someone is going to follow it.
-pub fn auth_error_api_key() -> String {
-    with_login_instruction(
-        |prog| {
-            format!(
-                "Authentication failed. Run `{prog} login`, set XAI_API_KEY, or add api_key to {}.",
-                xai_grok_config::display_user_grok_path("config.toml")
-            )
-        },
-        &format!(
-            "Authentication failed. Sign in again, set XAI_API_KEY, or add api_key to {}.",
-            xai_grok_config::display_user_grok_path("config.toml")
-        ),
-    )
-}
-
-/// Readiness / auth-required reason when an ambient xAI credential is withheld
-/// because the model's resolved origin is not an xAI endpoint (#123 option 3).
-///
-/// `origin` must already be secret-free (use [`crate::agent::config::sanitized_origin`]).
-/// This is the same shape as [`auth_error_session_expired`] / [`auth_error_api_key`]:
-/// a single constructor for the user-facing string, never the credential bytes.
-pub fn auth_error_ambient_origin_refused(origin: &str) -> String {
-    format!(
-        "xAI credential withheld for non-xAI origin {origin}: set api_key, env_key, or auth_provider \
-         — or auth_scheme = \"none\" for a keyless local server — or, for a self-hosted xAI \
-         gateway you trust with that credential, declare the origin in trusted_xai_origins \
-         in your local config (#123)"
-    )
-}
+pub const AUTH_ERROR_API_KEY: &str = "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to ~/.grok/config.toml.";
 
 /// Next ACP method id when `cached_token` cannot proceed (missing / expired /
 /// legacy WebLogin), or `None` when fallthrough is forbidden.
@@ -646,16 +432,8 @@ pub(crate) fn method_id_after_cached_token_unavailable(
 pub const PREFERRED_API_KEY_UNAVAILABLE: &str = "preferred_method=api_key but no API key is configured (set XAI_API_KEY or model api_key/env_key in config.toml).";
 
 /// Error when `preferred_method=oidc` but the session path cannot proceed.
-pub fn preferred_oidc_unavailable() -> String {
-    with_login_instruction(
-        |prog| {
-            format!(
-                "preferred_method=oidc but no session is available. Run `{prog} login` to authenticate."
-            )
-        },
-        "preferred_method=oidc but no session is available. Sign in again to authenticate.",
-    )
-}
+pub const PREFERRED_OIDC_UNAVAILABLE: &str =
+    "preferred_method=oidc but no session is available. Run `grok login` to authenticate.";
 
 pub const XAI_API_KEY_METHOD_ID: &str = "xai.api_key";
 pub(crate) fn xai_api_key_auth_method() -> acp::AuthMethod {
@@ -670,21 +448,6 @@ pub(crate) fn xai_api_key_auth_method() -> acp::AuthMethod {
     )
 }
 
-/// Non-interactive no-credentials method for a selected model with
-/// `auth_scheme = none` (local OpenAI-compatible servers, etc.).
-pub const LOCAL_NONE_METHOD_ID: &str = "local.none";
-pub fn local_none_auth_method() -> acp::AuthMethod {
-    acp::AuthMethod::Agent(
-        acp::AuthMethodAgent::new(
-            acp::AuthMethodId::new(LOCAL_NONE_METHOD_ID),
-            "local.none".to_string(),
-        )
-        .description(Some(
-            "No credentials (auth_scheme = none on the selected model)".into(),
-        )),
-    )
-}
-
 pub const CACHED_TOKEN_AUTH_METHOD_ID: &str = "cached_token";
 pub(crate) fn cached_token_auth_method() -> acp::AuthMethod {
     acp::AuthMethod::Agent(
@@ -692,10 +455,7 @@ pub(crate) fn cached_token_auth_method() -> acp::AuthMethod {
             acp::AuthMethodId::new(CACHED_TOKEN_AUTH_METHOD_ID),
             "cached_token".to_string(),
         )
-        .description(Some(format!(
-            "Cached token from {}",
-            xai_grok_config::display_user_grok_path("auth.json")
-        ))),
+        .description(Some("Cached token from ~/.grok/auth.json".to_string())),
     )
 }
 
@@ -738,25 +498,6 @@ mod tests {
     use crate::agent::config::{Config, resolve_model_list};
     use agent_client_protocol as acp;
     use serial_test::serial;
-
-    /// #110: `NotByok` says the model declares no credential of its own. It
-    /// does NOT say where the model's `base_url` points -- a catalog model
-    /// with an overridden endpoint is `NotByok` and third-party at the same
-    /// time. So the endpoint has to be consulted on this arm too, exactly as
-    /// it already is for `Unknown`; otherwise the turn-time resolver attaches
-    /// a live session bearer to whatever host the config named.
-    /// Only the arm #110 changed, kept next to the function so someone editing
-    /// the gate meets it. The full matrix -- non-session methods, `Byok`,
-    /// `Unknown` -- lives in
-    /// `session::acp_session::auth_error_no_retry_tests::session_token_auth_gate_truth_table`.
-    #[test]
-    fn session_token_auth_gate_requires_first_party_for_not_byok() {
-        assert!(
-            !session_token_auth_gate(true, ModelByok::NotByok, false),
-            "a session resolver must not attach on a non-first-party endpoint"
-        );
-        assert!(session_token_auth_gate(true, ModelByok::NotByok, true));
-    }
 
     /// When API-key credentials are advertiseable, fall through from a dead
     /// `cached_token` to non-interactive `xai.api_key` (not browser OAuth).
@@ -822,13 +563,6 @@ mod tests {
         assert!(!is_session_based_method(&acp::AuthMethodId::new(
             "unknown-method"
         )));
-        let local_none_id = acp::AuthMethodId::new(LOCAL_NONE_METHOD_ID);
-        let local_none_kind = AuthMethodKind::from_id(&local_none_id);
-        assert_eq!(local_none_kind, AuthMethodKind::LocalNone);
-        assert!(!local_none_kind.is_session_based());
-        assert!(!local_none_kind.is_api_key());
-        assert!(!local_none_kind.needs_interactive_login());
-        assert!(!is_session_based_method(&local_none_id));
     }
 
     use xai_grok_test_support::EnvGuard;
@@ -847,8 +581,6 @@ mod tests {
             login_label: None,
             has_auth_provider_command: false,
             preferred_method: None,
-            selected_model_is_no_auth: false,
-            has_openai_codex_credential: false,
         }
     }
 
@@ -1118,95 +850,6 @@ mod tests {
         }
     }
 
-    /// The built-in Codex preset ships with every install and satisfies
-    /// `has_own_credentials()` (its traffic must not carry an xAI session
-    /// token), but its bearer comes from `grok login --provider openai-codex`.
-    /// Counting it as an external key would advertise `xai.api_key` first for
-    /// every user and skip the login screen with no key anywhere.
-    #[test]
-    #[serial]
-    fn builtin_openai_codex_preset_does_not_advertise_xai_api_key() {
-        let _global = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-        let cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
-            .expect("an empty config should parse");
-        let models = resolve_model_list(&cfg, None);
-        assert!(
-            models.values().any(ModelEntry::is_openai_codex_profile),
-            "this test is vacuous unless the Codex preset is in the catalog"
-        );
-
-        assert!(!should_advertise_xai_api_key(false, models.values()));
-        let built = build_auth_methods(AuthMethodsBuildInputs {
-            has_external_api_key: false,
-            has_cached_token: false,
-            ..default_inputs()
-        });
-        assert_ne!(
-            first_kind(&built.methods),
-            Some(AuthMethodKind::XaiApiKey),
-            "the Codex preset alone must not skip the login screen",
-        );
-    }
-
-    /// A user who has run only `grok login --provider openai-codex` has no xAI
-    /// credential, so `xai.api_key` must stay unadvertised — but they can
-    /// sample, and the interactive xAI login screen is a dead end for them.
-    /// `local.none` goes first so the pager starts the session instead.
-    #[test]
-    fn codex_only_credential_skips_the_interactive_xai_login() {
-        let built = build_auth_methods(AuthMethodsBuildInputs {
-            has_openai_codex_credential: true,
-            ..default_inputs()
-        });
-        assert_eq!(first_kind(&built.methods), Some(AuthMethodKind::LocalNone));
-        assert!(
-            !AuthMethodKind::from_id(built.methods[0].id()).needs_interactive_login(),
-            "a Codex-only user must not be sent to the xAI login screen"
-        );
-        assert!(
-            !built
-                .methods
-                .iter()
-                .any(|m| AuthMethodKind::from_id(m.id()) == AuthMethodKind::XaiApiKey),
-            "a Codex credential is not an xAI API key"
-        );
-    }
-
-    /// The Codex credential only breaks the login-screen tie when nothing else
-    /// authenticates. With an xAI session present, ordering and the default
-    /// method must be exactly what they were before Codex entered the picture.
-    #[test]
-    fn codex_credential_alongside_an_xai_session_changes_nothing() {
-        let with_codex = build_auth_methods(AuthMethodsBuildInputs {
-            has_cached_token: true,
-            has_openai_codex_credential: true,
-            ..default_inputs()
-        });
-        let without_codex = build_auth_methods(AuthMethodsBuildInputs {
-            has_cached_token: true,
-            ..default_inputs()
-        });
-        let ids = |b: &BuiltAuthMethods| {
-            b.methods
-                .iter()
-                .map(|m| m.id().0.to_string())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids(&with_codex), ids(&without_codex));
-        assert_eq!(
-            with_codex.default_auth_method_id.map(|id| id.0.to_string()),
-            without_codex
-                .default_auth_method_id
-                .map(|id| id.0.to_string()),
-        );
-        assert_eq!(
-            first_kind(&with_codex.methods),
-            Some(AuthMethodKind::CachedToken)
-        );
-    }
-
     /// `XAI_API_KEY` alone (no per-model creds) also triggers
     /// advertising `xai.api_key` as the first method. Historical "external
     /// key" path; covered here so the predicate keeps treating env-var-only
@@ -1351,48 +994,6 @@ mod tests {
         assert_eq!(read_xai_api_key_env().unwrap(), "new-key");
     }
 
-    /// Pro P0: empty `XAI_API_KEY` is not usable (presence-only was wrong).
-    #[test]
-    #[serial]
-    fn blank_xai_api_key_env_is_not_usable() {
-        let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "");
-        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-        assert!(
-            !has_xai_api_key_env(),
-            "empty XAI_API_KEY must not count as ambient usable"
-        );
-        assert!(read_xai_api_key_env().is_err());
-    }
-
-    /// Pro P0: whitespace-only primary is not usable.
-    #[test]
-    #[serial]
-    fn whitespace_xai_api_key_env_is_not_usable() {
-        let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "   \t  ");
-        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-        assert!(!has_xai_api_key_env());
-        assert!(read_xai_api_key_env().is_err());
-    }
-
-    /// Pro P0: blank primary falls through to a valid legacy key.
-    #[test]
-    #[serial]
-    fn blank_primary_falls_through_to_legacy() {
-        let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "");
-        let _legacy = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "legacy-live-key");
-        assert!(has_xai_api_key_env());
-        assert_eq!(read_xai_api_key_env().unwrap(), "legacy-live-key");
-    }
-
-    /// Pro P0: non-blank values are trimmed.
-    #[test]
-    #[serial]
-    fn nonblank_env_is_trimmed() {
-        let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "  padded-key  ");
-        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-        assert_eq!(read_xai_api_key_env().unwrap(), "padded-key");
-    }
-
     // -- grok login --legacy regression coverage ------------------------
     //
     // `grok login --legacy` produces a GrokAuth with `auth_mode: WebLogin`,
@@ -1524,106 +1125,6 @@ mod tests {
         );
     }
 
-    // ── local.none for selected AuthScheme::None models ─────────────────
-
-    /// Startup-selected model with `auth_scheme = none` must advertise
-    /// non-interactive `local.none` first so the pager skips login.
-    #[test]
-    fn selected_no_auth_model_advertises_local_none_first_when_unpinned() {
-        let inputs = AuthMethodsBuildInputs {
-            has_external_api_key: false,
-            has_cached_token: false,
-            has_enterprise_oidc: false,
-            enterprise_oidc_issuer: None,
-            login_label: None,
-            has_auth_provider_command: false,
-            preferred_method: None,
-            selected_model_is_no_auth: true,
-            has_openai_codex_credential: false,
-        };
-        let built = build_auth_methods(inputs);
-        assert_eq!(
-            method_ids(&built).first().copied(),
-            Some(LOCAL_NONE_METHOD_ID)
-        );
-        assert_eq!(default_id(&built), Some(LOCAL_NONE_METHOD_ID));
-    }
-
-    /// Cached session token must not override `local.none` as the default
-    /// when the startup-selected model is explicitly no-auth.
-    #[test]
-    fn selected_no_auth_keeps_local_none_default_even_with_cached_token() {
-        let inputs = AuthMethodsBuildInputs {
-            has_external_api_key: true,
-            has_cached_token: true,
-            preferred_method: None,
-            selected_model_is_no_auth: true,
-            ..default_inputs()
-        };
-        let built = build_auth_methods(inputs);
-        assert_eq!(
-            method_ids(&built).first().copied(),
-            Some(LOCAL_NONE_METHOD_ID)
-        );
-        assert_eq!(default_id(&built), Some(LOCAL_NONE_METHOD_ID));
-        assert!(
-            method_ids(&built).contains(&XAI_API_KEY_METHOD_ID),
-            "BYOK may still be listed after local.none"
-        );
-    }
-
-    /// A catalog no-auth model that is *not* selected must not reorder
-    /// auth methods for a selected xAI/BYOK model.
-    #[test]
-    fn non_selected_no_auth_does_not_change_xai_ordering() {
-        let inputs = AuthMethodsBuildInputs {
-            has_external_api_key: true,
-            has_cached_token: true,
-            preferred_method: None,
-            selected_model_is_no_auth: false,
-            ..default_inputs()
-        };
-        let built = build_auth_methods(inputs);
-        assert_eq!(
-            method_ids(&built).first().copied(),
-            Some(XAI_API_KEY_METHOD_ID)
-        );
-    }
-
-    /// `[auth] preferred_method = api_key` stays fail-closed: never fall
-    /// through to `local.none` even when the selected model is no-auth.
-    #[test]
-    fn preferred_api_key_pin_does_not_fall_through_to_local_none() {
-        let inputs = AuthMethodsBuildInputs {
-            has_external_api_key: false,
-            preferred_method: Some(PreferredAuthMethod::ApiKey),
-            selected_model_is_no_auth: true,
-            ..default_inputs()
-        };
-        let built = build_auth_methods(inputs);
-        assert!(built.methods.is_empty());
-        assert!(built.default_auth_method_id.is_none());
-    }
-
-    /// `[auth] preferred_method = oidc` stays fail-closed: never advertise
-    /// or default to `local.none` for a selected no-auth model.
-    #[test]
-    fn preferred_oidc_pin_does_not_fall_through_to_local_none() {
-        let inputs = AuthMethodsBuildInputs {
-            has_external_api_key: true,
-            has_cached_token: true,
-            preferred_method: Some(PreferredAuthMethod::Oidc),
-            selected_model_is_no_auth: true,
-            ..default_inputs()
-        };
-        let built = build_auth_methods(inputs);
-        assert!(
-            !method_ids(&built).contains(&LOCAL_NONE_METHOD_ID),
-            "oidc pin must not advertise local.none"
-        );
-        assert_ne!(default_id(&built), Some(LOCAL_NONE_METHOD_ID));
-    }
-
     // ── preferred_method pin (fail-closed) ──────────────────────────────
 
     #[test]
@@ -1675,67 +1176,5 @@ mod tests {
         });
         assert_eq!(method_ids(&built), vec![GROK_COM_METHOD_ID]);
         assert!(built.default_auth_method_id.is_none());
-    }
-}
-
-#[cfg(test)]
-mod state_dir_message_tests {
-    /// The needle, assembled at run time.
-    ///
-    /// This module is inside a file it scans. Written as one literal it would
-    /// match itself, and the test would fail on a clean tree — the same
-    /// self-matching trap as a `pkill -f` pattern that appears in its own
-    /// command line.
-    fn legacy_prefix() -> String {
-        ["~/.", "grok"].concat()
-    }
-
-    /// No message this crate shows a user may name the state directory
-    /// literally.
-    ///
-    /// #84 swept these once and #112 found six it missed, four of them here.
-    /// A literal is right until someone sets `MEDLEY_HOME` or keeps an
-    /// existing `~/.grok`, and then it is a confident lie in exactly the
-    /// message whose job is to say where to look.
-    ///
-    /// Scans source, not rendered output: rendering resolves the *developer's*
-    /// state directory, so on a machine that still has the legacy directory a
-    /// correct message contains the legacy name and the assertion would fail
-    /// for being right.
-    ///
-    /// Comments are exempt — several explain this very problem. Scanning stops
-    /// at each file's `#[cfg(test)]`, since fixtures and assertions there name
-    /// the legacy path deliberately.
-    #[test]
-    fn no_user_facing_message_hardcodes_the_state_directory() {
-        let needle = legacy_prefix();
-        for (file, src) in [
-            ("agent/auth_method.rs", include_str!("auth_method.rs")),
-            ("config/mod.rs", include_str!("../config/mod.rs")),
-            (
-                "session/acp_session_impl/slash_exec.rs",
-                include_str!("../session/acp_session_impl/slash_exec.rs"),
-            ),
-            (
-                "session/acp_session_impl/session_setup.rs",
-                include_str!("../session/acp_session_impl/session_setup.rs"),
-            ),
-        ] {
-            for (idx, line) in src.lines().enumerate() {
-                let trimmed = line.trim_start();
-                if trimmed == "#[cfg(test)]" {
-                    break;
-                }
-                if trimmed.starts_with("//") || !line.contains(&needle) {
-                    continue;
-                }
-                panic!(
-                    "{file}:{} names the state directory literally in code. \
-                     Resolve it with xai_grok_config::display_user_grok_path \
-                     or display_grok_home_prefix — see #112.\n  {trimmed}",
-                    idx + 1
-                );
-            }
-        }
     }
 }

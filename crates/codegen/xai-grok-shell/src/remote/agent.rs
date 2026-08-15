@@ -92,19 +92,21 @@ impl SandboxClient {
     ) -> Result<T> {
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            bail!("{operation} failed with status {status}");
+            let body = response.text().await.unwrap_or_default();
+            bail!("{operation} failed: {status} - {body}");
         }
         response
             .json()
             .await
-            .map_err(|_| anyhow::anyhow!("failed to parse {operation} response"))
+            .with_context(|| format!("failed to parse {operation} response"))
     }
 
     /// Check an HTTP response for errors, discarding the body.
     async fn check_response(response: reqwest::Response, operation: &str) -> Result<()> {
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            bail!("{operation} failed with status {status}");
+            let body = response.text().await.unwrap_or_default();
+            bail!("{operation} failed: {status} - {body}");
         }
         Ok(())
     }
@@ -118,7 +120,7 @@ impl SandboxClient {
             .json(request)
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("failed to send fork session request"))?;
+            .context("failed to send fork session request")?;
         Self::parse_response(response, "fork session").await
     }
 
@@ -138,7 +140,7 @@ impl SandboxClient {
             .await?
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("failed to send terminate session request"))?;
+            .context("failed to send terminate session request")?;
 
         if response.status().as_u16() == 404 {
             bail!("session not found: {session_id}");
@@ -170,7 +172,7 @@ impl SandboxClient {
         let response = builder
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("failed to send list environments request"))?;
+            .context("failed to send list environments request")?;
         Self::parse_response(response, "list environments").await
     }
 
@@ -186,7 +188,7 @@ impl SandboxClient {
             .json(request)
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("failed to send create environment request"))?;
+            .context("failed to send create environment request")?;
         Self::parse_response(response, "create environment").await
     }
 
@@ -203,7 +205,7 @@ impl SandboxClient {
             .json(request)
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("failed to send update environment request"))?;
+            .context("failed to send update environment request")?;
         Self::parse_response(response, "update environment").await
     }
 
@@ -215,7 +217,7 @@ impl SandboxClient {
             .await?
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("failed to send delete environment request"))?;
+            .context("failed to send delete environment request")?;
         Self::check_response(response, "delete environment").await
     }
 }

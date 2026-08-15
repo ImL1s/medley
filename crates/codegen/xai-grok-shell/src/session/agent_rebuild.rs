@@ -47,7 +47,6 @@ use xai_grok_agent::error::AgentBuildError;
 use xai_grok_agent::prompt::context::PromptAudience;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_agent::{Agent, AgentBuilder, CompactionPolicy, ReminderPolicy};
-use xai_grok_tools::capability::CapabilityPolicy;
 use xai_grok_tools::computer::types::{AsyncFileSystem, TerminalBackend};
 use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest;
 use xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig;
@@ -93,6 +92,10 @@ pub(crate) struct AgentRebuildSpec {
     pub memory_workspace_path: Option<String>,
     pub memory_backend: Option<Arc<dyn MemoryBackend>>,
     pub web_search_config: WebSearchConfig,
+    /// `[toolset.web_search]` domain policy, resolved once at spawn and applied
+    /// to both search paths (the hosted `tool_overrides` merge and the
+    /// client-side `WebSearchConfig`) so they never diverge.
+    pub web_search_domains: Option<xai_grok_sampling_types::WebSearchOptions>,
     pub backend_search: bool,
     pub web_fetch_config: WebFetchConfig,
     pub image_gen_config: ImageGenConfig,
@@ -124,9 +127,6 @@ pub(crate) struct AgentRebuildSpec {
     pub subagent_depth: u32,
     pub subagents_max_depth: u32,
     pub session_id_str: String,
-    /// Session ceiling applied to every rebuild so zero-turn harness switches
-    /// cannot widen a restricted session.
-    pub capability_mode_ceiling: Option<xai_tool_types::SubagentCapabilityMode>,
     pub blocking_wait_depth: Arc<crate::tools::tool_context::BlockingWaitState>,
     pub respect_gitignore: bool,
     pub path_not_found_hints: bool,
@@ -199,6 +199,7 @@ impl AgentRebuildSpec {
             memory_workspace_path,
             memory_backend,
             web_search_config,
+            web_search_domains,
             backend_search,
             web_fetch_config,
             image_gen_config,
@@ -228,7 +229,6 @@ impl AgentRebuildSpec {
             subagent_depth,
             subagents_max_depth,
             session_id_str,
-            capability_mode_ceiling,
             blocking_wait_depth,
             respect_gitignore,
             path_not_found_hints,
@@ -241,33 +241,27 @@ impl AgentRebuildSpec {
             parent_scheduler_handle,
         } = self.as_ref();
         let _ = mcp_state;
-        let mut definition = definition;
-        definition.capability_mode =
-            xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
-                definition.capability_mode,
-                None,
-                *capability_mode_ceiling,
-            );
         #[allow(unused_variables)]
         let is_cursor_template =
             crate::session::is_cursor_system_template(&definition.system_prompt);
-        let capability_policy = CapabilityPolicy::new(
+        let mut definition = definition;
+        if let Some(cfg_opts) = web_search_domains.clone() {
             definition
-                .capability_mode
-                .unwrap_or(xai_tool_types::SubagentCapabilityMode::All),
-            crate::config::tool_capabilities::load_trusted_tool_capabilities(
-                working_directory,
-                crate::agent::folder_trust::project_scope_allowed(working_directory),
-            )
-            .into_trusted(),
-        );
+                .tool_overrides
+                .get_or_insert_with(Default::default)
+                .web_search = Some(cfg_opts);
+        }
+        let session_env = {
+            let mut env = session_env.as_ref().clone();
+            env.insert("GROK_SESSION_ID".to_string(), session_id_str.clone());
+            Arc::new(env)
+        };
         let mut builder = AgentBuilder::new(
             working_directory.clone(),
             terminal_backend.clone(),
             tools_notification_handle.clone(),
         )
         .from_definition(definition)
-        .with_capability_policy(capability_policy)
         .with_compaction_policy(compaction_policy.clone())
         .with_reminder_policy(reminder_policy.clone())
         .with_memory_enabled(*memory_enabled)
@@ -342,13 +336,6 @@ impl AgentRebuildSpec {
             builder = builder.with_preloaded_skills(skills);
         }
         let agent = builder.build().await?;
-        if managed_gateway_tool_client.is_some() {
-            // Until the first per-session MCP snapshot proves that gateway
-            // mode is disabled or atomically admits a catalog, restricted
-            // local/MCP exact IDs must not dispatch under a potentially shared
-            // gateway capability subject.
-            agent.tool_bridge().begin_managed_gateway_admission();
-        }
         let model_validator = models_manager.clone();
         agent
             .tool_bridge()
@@ -451,6 +438,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         memory_workspace_path: None,
         memory_backend: None,
         web_search_config: WebSearchConfig::default(),
+        web_search_domains: None,
         backend_search: false,
         web_fetch_config: WebFetchConfig::Disabled,
         image_gen_config: ImageGenConfig::default(),
@@ -480,7 +468,6 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         subagent_depth: 0,
         subagents_max_depth: xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH,
         session_id_str: "test-session".to_string(),
-        capability_mode_ceiling: None,
         blocking_wait_depth: Arc::new(crate::tools::tool_context::BlockingWaitState::new()),
         respect_gitignore: false,
         scheduler_background_loops: true,
@@ -499,8 +486,6 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
 mod tests {
     use super::*;
     use crate::agent::config::{EndpointsConfig, ModelEntry};
-    use xai_grok_tools::types::tool::ToolKind;
-    use xai_tool_types::SubagentCapabilityMode;
     fn model_entry(internal_id: &str) -> ModelEntry {
         ModelEntry::fallback(internal_id, &EndpointsConfig::default())
     }
@@ -515,6 +500,84 @@ mod tests {
             .find(|definition| definition.function.name == task_name)
             .and_then(|definition| definition.function.description)
             .expect("GrokBuild Task description should be present")
+    }
+    /// The `[toolset.web_search]` policy is authoritative on the backend-hosted
+    /// path: agent frontmatter is model-writable (`.grok/agents/*.md`), so a
+    /// configured blocklist must survive a frontmatter allowlist, matching the
+    /// client-side `resolve_filters`. With no configured policy, frontmatter
+    /// still applies.
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_web_search_domains_beat_agent_frontmatter() {
+        use xai_grok_sampling_types::{HostedTool, ToolOverrides, WebSearchOptions};
+        let frontmatter = WebSearchOptions {
+            allowed_domains: Some(vec!["attacker.example".into()]),
+            excluded_domains: None,
+        };
+        let configured = WebSearchOptions {
+            allowed_domains: None,
+            excluded_domains: Some(vec!["reddit.com".into()]),
+        };
+        let definition = || {
+            let mut d = AgentDefinition::default_grok_build();
+            d.tool_overrides = Some(ToolOverrides {
+                x_search: None,
+                web_search: Some(frontmatter.clone()),
+            });
+            d
+        };
+        let spec_with = |domains: Option<WebSearchOptions>| {
+            let mut spec = test_rebuild_spec_default();
+            let spec_mut =
+                Arc::get_mut(&mut spec).expect("test rebuild spec should be uniquely owned");
+            spec_mut.web_search_domains = domains;
+            spec_mut.backend_search = true;
+            spec_mut.web_search_config = WebSearchConfig::Enabled {
+                api_key: "test-key".to_string(),
+                base_url: "https://api.x.ai/v1".to_string(),
+                model: "grok-4".to_string(),
+                extra_headers: Default::default(),
+                alpha_test_key: None,
+                allowed_domains: None,
+                excluded_domains: None,
+            };
+            spec
+        };
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let agent = spec_with(Some(configured.clone()))
+                    .build_agent(definition())
+                    .await
+                    .expect("agent build should succeed");
+                assert_eq!(
+                    agent
+                        .definition()
+                        .tool_overrides
+                        .as_ref()
+                        .and_then(|o| o.web_search.clone()),
+                    Some(configured.clone()),
+                    "config must replace the frontmatter allowlist"
+                );
+                assert!(
+                    agent.hosted_tools().contains(&HostedTool::WebSearch {
+                        options: Some(configured.clone()),
+                    }),
+                    "the hosted tool carries the configured policy: {:?}",
+                    agent.hosted_tools()
+                );
+                let agent = spec_with(None)
+                    .build_agent(definition())
+                    .await
+                    .expect("agent build should succeed");
+                assert_eq!(
+                    agent
+                        .definition()
+                        .tool_overrides
+                        .as_ref()
+                        .and_then(|o| o.web_search.clone()),
+                    Some(frontmatter.clone())
+                );
+            })
+            .await;
     }
     #[tokio::test(flavor = "current_thread")]
     async fn rebuild_projects_fresh_public_model_keys_into_task_description() {
@@ -574,41 +637,6 @@ mod tests {
                          - beta-public\n\
                          - zeta-public"
                     )
-                );
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn issue39_rebuild_respects_capability_mode_ceiling() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let mut spec = test_rebuild_spec_default();
-                let spec_mut =
-                    Arc::get_mut(&mut spec).expect("test rebuild spec should be uniquely owned");
-                spec_mut.capability_mode_ceiling = Some(SubagentCapabilityMode::ReadOnly);
-
-                let mut definition = AgentDefinition::default_grok_build();
-                definition.capability_mode = Some(SubagentCapabilityMode::All);
-
-                let agent = spec
-                    .build_agent(definition)
-                    .await
-                    .expect("agent rebuild with ceiling should succeed");
-
-                assert_eq!(
-                    agent.definition().capability_mode,
-                    Some(SubagentCapabilityMode::ReadOnly),
-                    "rebuild must clamp capability mode to the session ceiling"
-                );
-                let toolset = agent.tool_bridge().toolset();
-                assert!(
-                    toolset.tool_name_for_kind(ToolKind::Read).is_some(),
-                    "read tools remain available under ReadOnly"
-                );
-                assert!(
-                    toolset.tool_name_for_kind(ToolKind::Write).is_none(),
-                    "write tools must be removed by the rebuild capability ceiling"
                 );
             })
             .await;

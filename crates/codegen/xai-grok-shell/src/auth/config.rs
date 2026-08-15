@@ -54,7 +54,7 @@ pub enum PreferredAuthMethod {
     /// including devbox-minted OIDC).
     Oidc,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GrokComConfig {
     pub grok_ws_origin: String,
@@ -66,10 +66,7 @@ pub struct GrokComConfig {
     /// OAuth2 provider config. When set, preferred over the legacy relay flow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth2: Option<OAuth2ProviderConfig>,
-    /// External auth provider command (stdout = token, stderr may advertise a
-    /// browser URL, exit 0 = success). Provider stderr is never displayed or
-    /// logged; the first valid HTTPS/loopback URL is opened directly and all
-    /// other output is drained.
+    /// External auth provider command (stdout = token, stderr = user UX, exit 0 = success).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_provider_command: Option<String>,
     /// Login button label (env: `GROK_AUTH_PROVIDER_LABEL`).
@@ -95,36 +92,6 @@ pub struct GrokComConfig {
     /// multi-method fallthrough. Config.toml only (`[auth] preferred_method`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_method: Option<PreferredAuthMethod>,
-}
-
-impl std::fmt::Debug for GrokComConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GrokComConfig")
-            .field(
-                "grok_ws_origin_configured",
-                &!self.grok_ws_origin.is_empty(),
-            )
-            .field("grok_ws_url_configured", &!self.grok_ws_url.is_empty())
-            .field("token_header_configured", &!self.token_header.is_empty())
-            .field("oidc_configured", &self.oidc.is_some())
-            .field("oauth2_configured", &self.oauth2.is_some())
-            .field(
-                "auth_provider_command_configured",
-                &self.auth_provider_command.is_some(),
-            )
-            .field(
-                "auth_provider_label_configured",
-                &self.auth_provider_label.is_some(),
-            )
-            .field("auth_token_ttl", &self.auth_token_ttl)
-            .field("disable_api_key_auth", &self.disable_api_key_auth)
-            .field(
-                "force_login_team_configured",
-                &self.force_login_team_uuid.is_some(),
-            )
-            .field("preferred_method", &self.preferred_method)
-            .finish()
-    }
 }
 /// Team login restriction. TOML string or array; an empty array fails closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,28 +341,6 @@ impl OidcAuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn grok_com_config_debug_never_exposes_provider_command_or_urls() {
-        let secret = "GB002-auth-config-Q7w5E3r1T9y7";
-        let config = GrokComConfig {
-            grok_ws_origin: format!("https://user:{secret}@example.test/?token={secret}"),
-            grok_ws_url: format!("wss://user:{secret}@example.test/?token={secret}"),
-            token_header: secret.to_owned(),
-            auth_provider_command: Some(format!("printf {secret}")),
-            auth_provider_label: Some(secret.to_owned()),
-            ..GrokComConfig::default()
-        };
-
-        let rendered = format!("{config:?}");
-        assert!(rendered.contains("auth_provider_command_configured: true"));
-        assert!(!rendered.contains(secret));
-        for window in secret.as_bytes().windows(8) {
-            let window = std::str::from_utf8(window).unwrap();
-            assert!(!rendered.contains(window), "leaked secret window: {window}");
-        }
-    }
-
     #[test]
     fn team_auth_scope_is_base_scope() {
         let cfg = OAuth2ProviderConfig {

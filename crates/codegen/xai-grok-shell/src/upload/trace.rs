@@ -141,43 +141,13 @@ fn upload_method_label(method: &UploadMethod) -> &'static str {
     }
     .as_str()
 }
-
-fn upload_failure_method(
-    method: &UploadMethod,
-) -> xai_grok_telemetry::unified_log::UploadFailureMethod {
-    use xai_grok_telemetry::unified_log::UploadFailureMethod;
-    match method {
-        UploadMethod::Direct { .. } => UploadFailureMethod::DirectGcs,
-        UploadMethod::Proxy { .. } => UploadFailureMethod::Proxy,
-        UploadMethod::S3 { .. } => UploadFailureMethod::DirectS3,
-    }
-}
-
-fn upload_failure_reason(reason: &str) -> xai_grok_telemetry::unified_log::UploadFailureReason {
-    use xai_grok_telemetry::unified_log::UploadFailureReason;
-    match reason {
-        "upload_failed" => UploadFailureReason::UploadFailed,
-        "gcs_upload_failed" => UploadFailureReason::GcsUploadFailed,
-        "direct_upload_failed" => UploadFailureReason::DirectUploadFailed,
-        "direct_upload_timed_out" => UploadFailureReason::DirectUploadTimedOut,
-        _ => UploadFailureReason::Other,
-    }
-}
 /// A confirmed upload ends the session's failure episode; the next failure
 /// logs at full detail again.
 fn record_upload_success(ctx: &PromptTraceContext) {
     use std::sync::atomic::Ordering::Relaxed;
-    let prior_failure_count = ctx
-        .session_handle
+    ctx.session_handle
         .upload_failures_since_success
-        .swap(0, Relaxed);
-    if prior_failure_count > 0 {
-        xai_grok_telemetry::unified_log::emit_upload_recovered(
-            upload_failure_method(&ctx.gcs_config.upload_method),
-            prior_failure_count,
-            Some(ctx.session_info.id.0.as_ref()),
-        );
-    }
+        .store(0, Relaxed);
 }
 /// Full detail (and the unified-log mirror) for the first failure of a
 /// session's episode, split on `artifact` + `reason`; repeats log at debug
@@ -190,21 +160,20 @@ fn record_upload_failure(ctx: &PromptTraceContext, f: UploadFailure<'_>) {
         .fetch_add(1, Relaxed);
     let level = upload_failure_log_level(&ctx.gcs_config.upload_method, prior_failures);
     let method = upload_method_label(&ctx.gcs_config.upload_method);
-    let reason = upload_failure_reason(f.reason);
     macro_rules! log_failure {
         ($level:ident) => {
             tracing::$level!(
-                artifact_present = !f.artifact.is_empty(),
-                reason_class = ?reason,
+                artifact = f.artifact,
+                reason = f.reason,
                 method,
-                phase_present = f.phase.is_some(),
-                gcs_path_present = f.gcs_path.is_some(),
+                phase = f.phase.unwrap_or(""),
+                gcs_path = f.gcs_path.unwrap_or(""),
                 status_code = ?f.status_code,
                 bytes = ?f.bytes,
                 session_id = %ctx.session_info.id.0,
                 turn_number = ctx.turn_number,
                 suppressed_count = prior_failures,
-                error_present = !f.error.is_empty(),
+                error = f.error,
                 "file upload failed"
             )
         };
@@ -217,21 +186,28 @@ fn record_upload_failure(ctx: &PromptTraceContext, f: UploadFailure<'_>) {
     if prior_failures > 0 {
         return;
     }
-    xai_grok_telemetry::unified_log::emit_upload_failure(
-        xai_grok_telemetry::unified_log::UploadFailureArtifact::TraceArtifact,
-        reason,
-        upload_failure_method(&ctx.gcs_config.upload_method),
-        f.phase.is_some(),
-        f.status_code,
-        f.bytes.and_then(|bytes| u64::try_from(bytes).ok()),
-        prior_failures,
-        Some(ctx.session_info.id.0.as_ref()),
-    );
+    let msg = format!("upload failed: {} ({})", f.artifact, f.reason);
+    let sid = Some(ctx.session_info.id.0.as_ref());
+    let log_ctx = Some(serde_json::json!({
+        "artifact": f.artifact,
+        "reason": f.reason,
+        "method": method,
+        "error": f.error,
+        "gcs_path": f.gcs_path,
+        "status_code": f.status_code,
+        "bytes": f.bytes,
+        "phase": f.phase,
+    }));
+    if level == UploadFailureLogLevel::Warn {
+        xai_grok_telemetry::unified_log::warn(&msg, sid, log_ctx);
+    } else {
+        xai_grok_telemetry::unified_log::error(&msg, sid, log_ctx);
+    }
 }
 /// Increment when making breaking changes to PromptMetadata structure.
 /// Re-exported from the shared types crate.
 pub(crate) use prod_mc_cli_chat_proxy_types::{
-    GCS_SCHEMA_VERSION, LocalSandboxTelemetry, PromptMetadata,
+    GCS_SCHEMA_VERSION, LocalSandboxTelemetry, PromptMetadata, PromptMetadataParams,
 };
 pub(crate) fn local_sandbox_telemetry() -> Option<LocalSandboxTelemetry> {
     let profile = xai_grok_sandbox::configured_profile_name()?;
@@ -240,37 +216,21 @@ pub(crate) fn local_sandbox_telemetry() -> Option<LocalSandboxTelemetry> {
         applied: xai_grok_sandbox::is_active(),
     })
 }
-/// Strip all credential-capable URL components from a git remote URL.
+/// Strip username/password credentials from a git remote URL.
 ///
 /// In CI environments, git config may inject access tokens via URL rewriting
 /// (e.g., `url."https://x-access-token:TOKEN@github.com/".insteadOf`).
 /// We strip these to avoid leaking credentials in metadata.
 pub(crate) fn strip_url_credentials(url_str: &str) -> String {
-    if !url_str.contains("://") {
-        if let Some((_, host_and_path)) = url_str.split_once('@')
-            && host_and_path.contains(':')
-        {
-            return host_and_path.to_string();
-        }
-        if let Some((host, path)) = url_str.split_once(':')
-            && !host.is_empty()
-            && !path.is_empty()
-            && !host.contains('/')
-        {
-            return url_str.to_string();
-        }
-    }
     if let Ok(mut parsed) = Url::parse(url_str) {
-        if parsed.cannot_be_a_base() {
-            return "<configured>".to_string();
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            return parsed.to_string();
         }
-        let _ = parsed.set_username("");
-        let _ = parsed.set_password(None);
-        parsed.set_query(None);
-        parsed.set_fragment(None);
-        return parsed.to_string();
+        return url_str.to_string();
     }
-    "<configured>".to_string()
+    url_str.to_string()
 }
 /// Best-effort git repo root and remote URL for the session's cwd.
 /// Runs git2 discovery off-thread since it walks parent directories.
@@ -304,10 +264,6 @@ fn classify_workspace(cwd: &str) -> String {
 async fn fill_git_fields(metadata: &mut PromptMetadata, cwd: &str) {
     if metadata.repo_root.is_some() && metadata.remote_url.is_some() {
         metadata.workspace_type = Some("git".to_owned());
-        metadata.remote_url = metadata
-            .remote_url
-            .take()
-            .map(|url| strip_url_credentials(&url));
         return;
     }
     let (repo_root, remote_url) = resolve_git_repo_info(cwd).await;
@@ -326,10 +282,6 @@ async fn fill_git_fields(metadata: &mut PromptMetadata, cwd: &str) {
     if metadata.remote_url.is_none() {
         metadata.remote_url = remote_url;
     }
-    metadata.remote_url = metadata
-        .remote_url
-        .take()
-        .map(|url| strip_url_credentials(&url));
 }
 /// Fill in `repo_root`, `remote_url`, and `workspace_type` on a
 /// [`PromptMetadata`].
@@ -901,40 +853,24 @@ pub(crate) async fn upload_memory_state(ctx: &PromptTraceContext) {
 /// Called only from 401/404 auth-failure diagnostics, never per turn.
 ///
 /// Only entries belonging to the current session (matching `sid`) are included.
-/// The snapshot runs on a blocking thread since `snapshot_session_log_for_upload` reads
+/// The snapshot runs on a blocking thread since `snapshot_session_log` reads
 /// and parses the on-disk log file.
-struct UnifiedLogSnapshots {
-    session: Option<Vec<u8>>,
-    auth_diagnostics: Option<Vec<u8>>,
-}
-
-fn snapshot_unified_logs_with<S, A>(
-    session_id: &str,
-    session_snapshot: S,
-    auth_snapshot: A,
-) -> UnifiedLogSnapshots
-where
-    S: FnOnce(&str) -> Option<Vec<u8>>,
-    A: FnOnce() -> Option<Vec<u8>>,
-{
-    UnifiedLogSnapshots {
-        session: session_snapshot(session_id),
-        auth_diagnostics: auth_snapshot(),
-    }
-}
-
 pub(crate) async fn upload_unified_log(ctx: &PromptTraceContext, wait: UploadWait) {
     let session_id = ctx.session_info.id.0.to_string();
-    let snapshots = match tokio::task::spawn_blocking(move || {
-        snapshot_unified_logs_with(
-            &session_id,
-            xai_grok_telemetry::unified_log::snapshot_session_log_for_upload,
-            xai_grok_telemetry::unified_log::snapshot_log_for_upload,
-        )
+    let log_bytes = match tokio::task::spawn_blocking(move || {
+        xai_grok_telemetry::unified_log::snapshot_session_log(&session_id)
     })
     .await
     {
-        Ok(snapshots) => snapshots,
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            tracing::debug!(
+                session_id = %ctx.session_info.id.0,
+                turn_number = ctx.turn_number,
+                "No unified log entries for this session, skipping upload"
+            );
+            return;
+        }
         Err(e) => {
             tracing::warn!(
                 session_id = %ctx.session_info.id.0,
@@ -945,34 +881,28 @@ pub(crate) async fn upload_unified_log(ctx: &PromptTraceContext, wait: UploadWai
             return;
         }
     };
-    if let Some(log_bytes) = snapshots.session {
-        let gcs_path = format!(
-            "{}/unified_log.jsonl",
-            ctx.gcs_config.gcs_prefix.as_deref().unwrap_or("")
-        );
-        upload_small_artifact(
-            ctx,
-            &log_bytes,
-            &gcs_path,
-            "application/x-ndjson",
-            "unified_log",
-            wait,
-        )
-        .await;
-    } else {
-        tracing::debug!(
-            session_id = %ctx.session_info.id.0,
-            turn_number = ctx.turn_number,
-            "No unified log entries for this session, skipping session upload"
-        );
-    }
+    let gcs_path = format!(
+        "{}/unified_log.jsonl",
+        ctx.gcs_config.gcs_prefix.as_deref().unwrap_or("")
+    );
+    upload_small_artifact(
+        ctx,
+        &log_bytes,
+        &gcs_path,
+        "application/x-ndjson",
+        "unified_log",
+        wait,
+    )
+    .await;
+    let full_log_bytes =
+        tokio::task::spawn_blocking(xai_grok_telemetry::unified_log::snapshot_log).await;
     let user_id = ctx
         .auth_manager
         .current_or_expired()
         .map(|a| a.user_id)
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| "unknown".to_owned());
-    if let Some(full_bytes) = snapshots.auth_diagnostics {
+    if let Ok(Some(full_bytes)) = full_log_bytes {
         crate::upload::gcs::upload_to_auth_diagnostics(
             &full_bytes,
             &user_id,
@@ -1036,19 +966,21 @@ pub(crate) struct SessionStateBuildError {
     pub reason: &'static str,
     pub error: anyhow::Error,
 }
-/// Build a gzipped tar holding a single `chat_history.jsonl` entry from the
-/// in-memory conversation `messages`.
-///
-/// The trace viewer renders a turn's conversation only from the
-/// `chat_history.jsonl` entry inside a session-state archive, parsed as JSONL.
-/// Harness sub-turns upload no other session state, so we emit that shape from
-/// the same items that feed `turn_messages.json`: each `ConversationItem`
-/// serialized compactly, one per `\n`-terminated line. Empty `messages` yield a
-/// zero-byte payload the viewer treats as "no history" (harness pairs always
-/// carry ≥1 message, so this is only a safety floor).
-pub(crate) fn build_chat_history_session_state(
+fn session_state_archive_join_error(err: tokio::task::JoinError) -> SessionStateBuildError {
+    SessionStateBuildError {
+        reason: "archive_failed",
+        error: anyhow::anyhow!("spawn_blocking join failed: {err}"),
+    }
+}
+fn serialize_chat_history_jsonl(
     messages: &[xai_grok_sampling_types::conversation::ConversationItem],
 ) -> Result<Vec<u8>, SessionStateBuildError> {
+    {
+        let _ = messages;
+        Ok(Vec::new())
+    }
+}
+fn compress_chat_history_archive(jsonl: Vec<u8>) -> Result<Vec<u8>, SessionStateBuildError> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     fn archive_failed(error: std::io::Error) -> SessionStateBuildError {
@@ -1057,10 +989,8 @@ pub(crate) fn build_chat_history_session_state(
             error: error.into(),
         }
     }
-    let jsonl = {
-        let _ = messages;
-        Vec::new()
-    };
+    #[cfg(test)]
+    apply_test_archive_fault().map_err(archive_failed)?;
     let mut archive_data = Vec::new();
     {
         let encoder = GzEncoder::new(&mut archive_data, Compression::default());
@@ -1083,6 +1013,34 @@ pub(crate) fn build_chat_history_session_state(
             .map_err(archive_failed)?;
     }
     Ok(archive_data)
+}
+/// Build a gzipped tar holding a single `chat_history.jsonl` entry from the
+/// in-memory conversation `messages`.
+///
+/// The trace viewer renders a turn's conversation only from the
+/// `chat_history.jsonl` entry inside a session-state archive, parsed as JSONL.
+/// Harness sub-turns upload no other session state, so we emit that shape from
+/// the same items that feed `turn_messages.json`: each `ConversationItem`
+/// serialized compactly, one per `\n`-terminated line. Empty `messages` yield a
+/// zero-byte payload the viewer treats as "no history" (harness pairs always
+/// carry ≥1 message, so this is only a safety floor).
+pub(crate) async fn build_chat_history_session_state(
+    messages: &[xai_grok_sampling_types::conversation::ConversationItem],
+) -> Result<Vec<u8>, SessionStateBuildError> {
+    let jsonl = serialize_chat_history_jsonl(messages)?;
+    match tokio::task::spawn_blocking(move || compress_chat_history_archive(jsonl)).await {
+        Ok(result) => result,
+        Err(e) => Err(session_state_archive_join_error(e)),
+    }
+}
+pub(crate) async fn build_chat_history_then_move_capture(
+    capture: xai_chat_state::TurnCapture,
+) -> (
+    Result<Vec<u8>, SessionStateBuildError>,
+    xai_chat_state::TurnCapture,
+) {
+    let session_state = build_chat_history_session_state(&capture.messages).await;
+    (session_state, capture)
 }
 pub(crate) async fn upload_harness_session_archive(
     _ctx: &PromptTraceContext,
@@ -1155,26 +1113,6 @@ impl TraceExportSource for DynamicResolver {
         }
         self.auth_manager.has_usable_token()
     }
-    /// Defers to the `AuthManager` token-rotation notifier (same mechanism
-    /// the signals sync loop waits on, so parking adds no refresh paths).
-    /// `None` after an IdP-confirmed permanent failure: the queue drops
-    /// instead of parking for an unrecoverable credential.
-    fn wait_for_auth_recovery(
-        &self,
-        comparison: xai_grok_auth::CredentialComparison,
-        timeout: std::time::Duration,
-    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>> {
-        if self.auth_manager.has_permanent_failure() {
-            return None;
-        }
-        if comparison.relation == xai_grok_auth::SentCredentialRelation::DifferentFromCurrent {
-            return Some(Box::pin(std::future::ready(true)));
-        }
-        let am = self.auth_manager.clone();
-        Some(Box::pin(
-            async move { am.wait_for_token_refresh(timeout).await },
-        ))
-    }
     fn resolve_async(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TraceExportConfig> + Send + '_>> {
@@ -1184,8 +1122,8 @@ impl TraceExportSource for DynamicResolver {
                 ref mut user_token, ..
             } = config.upload_method
             {
-                match self.auth_manager.get_valid_token().await {
-                    Ok(key) => *user_token = key,
+                match self.auth_manager.auth_background().await {
+                    Ok(auth) => *user_token = auth.key,
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -1398,7 +1336,9 @@ pub(crate) fn spawn_upload_queue(
 fn enqueue_outcome_is_durable(outcome: &EnqueueOutcome) -> bool {
     match outcome {
         EnqueueOutcome::Enqueued | EnqueueOutcome::Deduplicated => true,
-        EnqueueOutcome::FellBackToInline | EnqueueOutcome::Failed { .. } => false,
+        EnqueueOutcome::FellBackToInline
+        | EnqueueOutcome::Failed { .. }
+        | EnqueueOutcome::Skipped { .. } => false,
     }
 }
 /// Durable-accept a trace artifact for the flush-bounded blocking path: the
@@ -1557,38 +1497,90 @@ fn sort_session_files_by_priority(files: &mut [crate::session::persistence::Copi
     });
 }
 #[cfg(test)]
+#[derive(Clone, Copy)]
+enum ArchiveBuildFault {
+    Panic = 1,
+    Io = 2,
+}
+#[cfg(test)]
+static ARCHIVE_BUILD_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+struct ArchiveFaultGuard;
+#[cfg(test)]
+impl Drop for ArchiveFaultGuard {
+    fn drop(&mut self) {
+        ARCHIVE_BUILD_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+#[cfg(test)]
+fn set_archive_build_fault(fault: ArchiveBuildFault) -> ArchiveFaultGuard {
+    ARCHIVE_BUILD_FAULT.store(fault as u8, std::sync::atomic::Ordering::SeqCst);
+    ArchiveFaultGuard
+}
+#[cfg(test)]
+fn apply_test_archive_fault() -> std::io::Result<()> {
+    match ARCHIVE_BUILD_FAULT.swap(0, std::sync::atomic::Ordering::SeqCst) {
+        1 => panic!("test-forced archive panic"),
+        2 => Err(std::io::Error::other("test-forced archive io failure")),
+        _ => Ok(()),
+    }
+}
+#[cfg(test)]
+fn build_session_state_archive(
+    mut session_copy: crate::session::persistence::SessionStateCopy,
+    session_id: &str,
+) -> std::io::Result<Vec<u8>> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    #[cfg(test)]
+    apply_test_archive_fault()?;
+    sort_session_files_by_priority(&mut session_copy.files);
+    let mut archive_data = Vec::new();
+    {
+        let encoder = GzEncoder::new(&mut archive_data, Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for file in &session_copy.files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(file.data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+            if let Err(e) = archive.append_data(&mut header, &file.name, file.data.as_slice()) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    file = %file.name,
+                    error = %e,
+                    "Failed to add file to session state archive"
+                );
+            }
+        }
+        archive.into_inner().and_then(|encoder| encoder.finish())?;
+    }
+    Ok(archive_data)
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::persistence::CopiedSessionFile;
     use prod_mc_cli_chat_proxy_types::PromptMetadata;
     fn bare_prompt_metadata() -> PromptMetadata {
-        PromptMetadata {
+        PromptMetadata::new(PromptMetadataParams {
             schema_version: GCS_SCHEMA_VERSION.to_string(),
             session_id: "test-session".into(),
             turn_number: 1,
             request_id: "req-001".into(),
             turn_started_at: "2026-01-01T00:00:00Z".into(),
-            repo_root: None,
-            remote_url: None,
-            user_id: None,
-            user_email: None,
-            team_id: None,
-            client_source: None,
-            client_version: None,
             model: "grok-3".into(),
-            reasoning_effort: None,
-            experiment_id: None,
             host_os: "linux".into(),
             host_arch: "x86_64".into(),
             prompt_has_image: Some(false),
             prompt_was_truncated: Some(false),
-            prompt_verbatim: None,
-            cwd: None,
-            agent_type: None,
-            shell_version: None,
-            workspace_type: None,
-            sandbox: None,
-        }
+            ..Default::default()
+        })
     }
     #[tokio::test]
     async fn fill_git_fields_skips_when_both_present() {
@@ -1598,7 +1590,10 @@ mod tests {
         fill_git_fields(&mut meta, "/nonexistent/path").await;
         assert_eq!(meta.workspace_type.as_deref(), Some("git"));
         assert_eq!(meta.repo_root.as_deref(), Some("/repo"));
-        assert_eq!(meta.remote_url.as_deref(), Some("github.com:org/repo.git"));
+        assert_eq!(
+            meta.remote_url.as_deref(),
+            Some("git@github.com:org/repo.git")
+        );
     }
     #[tokio::test]
     async fn fill_git_fields_preserves_existing_fields() {
@@ -1667,78 +1662,14 @@ mod tests {
         );
     }
     #[test]
-    fn missing_session_snapshot_does_not_skip_auth_diagnostics_snapshot() {
-        let snapshots = snapshot_unified_logs_with(
-            "session-without-typed-entries",
-            |_| None,
-            || Some(b"independent-auth-diagnostics".to_vec()),
-        );
-
-        assert!(snapshots.session.is_none());
-        assert_eq!(
-            snapshots.auth_diagnostics.as_deref(),
-            Some(b"independent-auth-diagnostics".as_slice())
-        );
-    }
-    #[tokio::test]
-    async fn prompt_metadata_serialization_omits_all_remote_url_credentials() {
-        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
-        let mut meta = bare_prompt_metadata();
-        meta.repo_root = Some("/repo".into());
-        meta.remote_url = Some(format!(
-            "https://user:{sentinel}@github.example/org/repo.git?access_token={sentinel}#{sentinel}"
-        ));
-
-        fill_git_fields(&mut meta, "/nonexistent/path").await;
-        let serialized = serde_json::to_string(&meta).unwrap();
-
-        assert_eq!(
-            meta.remote_url.as_deref(),
-            Some("https://github.example/org/repo.git")
-        );
-        assert!(!serialized.contains(sentinel));
-        for window in sentinel.as_bytes().windows(8) {
-            let fragment = std::str::from_utf8(window).unwrap();
-            assert!(!serialized.contains(fragment));
-        }
-    }
-    #[test]
     fn strip_url_credentials_preserves_clean_https_url() {
         let clean_url = "https://github.com/test/repo.git";
         assert_eq!(strip_url_credentials(clean_url), clean_url);
     }
     #[test]
-    fn strip_url_credentials_drops_scp_username() {
+    fn strip_url_credentials_preserves_ssh_url() {
         let ssh_url = "git@github.com:org/repo.git";
-        assert_eq!(strip_url_credentials(ssh_url), "github.com:org/repo.git");
-    }
-    #[test]
-    fn strip_url_credentials_drops_credential_like_scp_username() {
-        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
-        let sanitized = strip_url_credentials(&format!("{sentinel}@github.com:org/repo.git"));
-
-        assert_eq!(sanitized, "github.com:org/repo.git");
-        for window in sentinel.as_bytes().windows(8) {
-            let fragment = std::str::from_utf8(window).unwrap();
-            assert!(!sanitized.contains(fragment));
-        }
-    }
-    #[test]
-    fn strip_url_credentials_handles_scheme_like_scp_credentials_fail_closed() {
-        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
-        let remote = format!("x-access-token:{sentinel}@github.com:org/repo.git");
-        let sanitized = strip_url_credentials(&remote);
-
-        assert_eq!(sanitized, "github.com:org/repo.git");
-        for window in sentinel.as_bytes().windows(8) {
-            let fragment = std::str::from_utf8(window).unwrap();
-            assert!(!sanitized.contains(fragment));
-        }
-    }
-    #[test]
-    fn strip_url_credentials_preserves_already_sanitized_scp_remote() {
-        let clean = "github.com:org/repo.git";
-        assert_eq!(strip_url_credentials(clean), clean);
+        assert_eq!(strip_url_credentials(ssh_url), ssh_url);
     }
     #[test]
     fn strip_url_credentials_removes_username_password() {
@@ -2274,24 +2205,17 @@ mod tests {
             },
         };
         let wake = resolver
-            .wait_for_auth_recovery(
-                xai_grok_auth::CredentialComparison::different_from_current(),
-                std::time::Duration::from_secs(30),
-            )
+            .wait_for_auth_recovery(Some("stale-token"), std::time::Duration::from_secs(30))
             .expect("recovery hook available");
         assert!(wake.await, "already-rotated token wakes without waiting");
         let wait = resolver
-            .wait_for_auth_recovery(
-                xai_grok_auth::CredentialComparison::same_as_current(),
-                std::time::Duration::from_millis(10),
-            )
+            .wait_for_auth_recovery(Some("fresh-token"), std::time::Duration::from_millis(10))
             .expect("recovery hook available");
         assert!(!wait.await, "unchanged token falls through to the notifier");
     }
     /// With a deployment key on the wire, the session token in `AuthManager`
-    /// could differ from the static deployment key. The queue must use the
-    /// final-attempt comparison rather than recomparing against the session
-    /// token, or parking becomes a hot retry loop.
+    /// always differs from `failed_bearer` — the wake comparison must use the
+    /// deployment key (wire precedence) or parking becomes a hot retry loop.
     #[tokio::test]
     async fn dynamic_resolver_auth_recovery_ignores_session_token_for_deployment_key() {
         use crate::session::repo_changes::UploadMethod;
@@ -2324,10 +2248,7 @@ mod tests {
             },
         };
         let wait = resolver
-            .wait_for_auth_recovery(
-                xai_grok_auth::CredentialComparison::same_as_current(),
-                std::time::Duration::from_millis(10),
-            )
+            .wait_for_auth_recovery(Some("deployment-key"), std::time::Duration::from_millis(10))
             .expect("recovery hook available");
         assert!(
             !wait.await,
@@ -2431,13 +2352,113 @@ mod tests {
         }
         out
     }
-    #[test]
-    fn chat_history_session_state_empty_messages_yields_valid_empty_archive() {
-        let archive = build_chat_history_session_state(&[]).unwrap();
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(archive_build_fault)]
+    async fn chat_history_session_state_empty_messages_yields_valid_empty_archive() {
+        let archive = build_chat_history_session_state(&[]).await.unwrap();
         let entries = read_tar_gz_entries(&archive);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "chat_history.jsonl");
         assert!(entries[0].1.is_empty());
+    }
+    #[test]
+    fn chat_history_jsonl_is_empty_when_feature_disabled() {
+        use xai_grok_sampling_types::conversation::ConversationItem;
+        let messages = vec![ConversationItem::user("ignored without the feature")];
+        let jsonl = serialize_chat_history_jsonl(&messages).unwrap();
+        assert!(jsonl.is_empty());
+        assert_eq!(messages.len(), 1);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(archive_build_fault)]
+    async fn chat_history_wrapper_ignores_messages_when_feature_disabled() {
+        use xai_grok_sampling_types::conversation::ConversationItem;
+        let messages = vec![ConversationItem::user("must not appear in the archive")];
+        let archive = build_chat_history_session_state(&messages).await.unwrap();
+        let entries = read_tar_gz_entries(&archive);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "chat_history.jsonl");
+        assert!(entries[0].1.is_empty());
+    }
+    #[test]
+    #[serial_test::serial(archive_build_fault)]
+    fn chat_history_compress_round_trips_owned_jsonl() {
+        let jsonl = b"{\"role\":\"user\",\"content\":\"hi\"}\n";
+        let archive = compress_chat_history_archive(jsonl.to_vec()).unwrap();
+        let entries = read_tar_gz_entries(&archive);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "chat_history.jsonl");
+        assert_eq!(entries[0].1, jsonl);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(archive_build_fault)]
+    async fn chat_history_spawn_blocking_panic_is_archive_failed() {
+        let _fault = set_archive_build_fault(ArchiveBuildFault::Panic);
+        let err = build_chat_history_session_state(&[])
+            .await
+            .expect_err("compress panic must surface as archive_failed");
+        assert_eq!(err.reason, "archive_failed");
+        let msg = format!("{:#}", err.error);
+        assert!(
+            msg.contains("spawn_blocking join failed"),
+            "join error must keep cancel vs panic distinguishable: {msg}"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(archive_build_fault)]
+    async fn chat_history_spawn_blocking_io_error_is_archive_failed() {
+        let _fault = set_archive_build_fault(ArchiveBuildFault::Io);
+        let err = build_chat_history_session_state(&[])
+            .await
+            .expect_err("compress io error must surface as archive_failed");
+        assert_eq!(err.reason, "archive_failed");
+        assert!(format!("{:#}", err.error).contains("test-forced archive io failure"));
+    }
+    fn session_copy_with(
+        files: Vec<(&str, &[u8])>,
+    ) -> crate::session::persistence::SessionStateCopy {
+        crate::session::persistence::SessionStateCopy {
+            files: files
+                .into_iter()
+                .map(|(name, data)| CopiedSessionFile {
+                    name: name.to_string(),
+                    data: data.to_vec(),
+                })
+                .collect(),
+        }
+    }
+    #[test]
+    #[serial_test::serial(archive_build_fault)]
+    fn session_state_archive_contains_sorted_files() {
+        let session_copy = session_copy_with(vec![
+            ("call_001.jsonl", b"call"),
+            ("summary.json", b"sum"),
+            ("chat_history.jsonl", b"hist"),
+            ("events.jsonl", b"ev"),
+        ]);
+        let archive = build_session_state_archive(session_copy, "test-sid").unwrap();
+        let entries = read_tar_gz_entries(&archive);
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "summary.json",
+                "chat_history.jsonl",
+                "events.jsonl",
+                "call_001.jsonl"
+            ]
+        );
+        assert_eq!(entries[0].1, b"sum");
+        assert_eq!(entries[1].1, b"hist");
+        assert_eq!(entries[2].1, b"ev");
+        assert_eq!(entries[3].1, b"call");
+    }
+    #[test]
+    #[serial_test::serial(archive_build_fault)]
+    fn session_state_archive_empty_files_is_valid_tar_gz() {
+        let archive = build_session_state_archive(session_copy_with(vec![]), "test-sid").unwrap();
+        let entries = read_tar_gz_entries(&archive);
+        assert!(entries.is_empty());
     }
     #[test]
     fn turn_result_metadata_serializes_token_breakdown() {
@@ -2580,26 +2601,6 @@ mod tests {
         assert_eq!(upload_method_label(&s3), "direct_s3");
         assert_eq!(upload_method_label(&proxy), "proxy");
         assert_eq!(upload_method_label(&gcs), "direct_gcs");
-        assert_eq!(
-            upload_failure_method(&s3),
-            xai_grok_telemetry::unified_log::UploadFailureMethod::DirectS3
-        );
-        assert_eq!(
-            upload_failure_method(&proxy),
-            xai_grok_telemetry::unified_log::UploadFailureMethod::Proxy
-        );
-        assert_eq!(
-            upload_failure_method(&gcs),
-            xai_grok_telemetry::unified_log::UploadFailureMethod::DirectGcs
-        );
-        assert_eq!(
-            upload_failure_reason("gcs_upload_failed"),
-            xai_grok_telemetry::unified_log::UploadFailureReason::GcsUploadFailed
-        );
-        assert_eq!(
-            upload_failure_reason("provider supplied arbitrary detail"),
-            xai_grok_telemetry::unified_log::UploadFailureReason::Other
-        );
     }
     /// The manifest may claim `enqueued` (queue-owned: flushable and
     /// sidecar-recoverable) only for these accept shapes; an inline fallback
@@ -2614,6 +2615,9 @@ mod tests {
         ));
         assert!(!enqueue_outcome_is_durable(&EnqueueOutcome::Failed {
             reason: "upload queue worker is shut down".to_owned(),
+        }));
+        assert!(!enqueue_outcome_is_durable(&EnqueueOutcome::Skipped {
+            reason: "collect_deadline".to_owned(),
         }));
     }
     /// A disabled verdict escalates exactly once over a prior recovery (pairs

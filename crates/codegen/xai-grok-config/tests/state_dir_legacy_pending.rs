@@ -11,6 +11,8 @@ fn existing_legacy_dir_stays_live_and_is_flagged_for_migration() {
     std::fs::write(legacy.join("config.toml"), b"x = 1").expect("seed config");
     // Safety: single-threaded test binary, set before any other thread exists.
     unsafe { std::env::set_var("HOME", home.path()) };
+    #[cfg(windows)]
+    unsafe { std::env::set_var("USERPROFILE", home.path()) };
     unsafe { std::env::remove_var("MEDLEY_HOME") };
     unsafe { std::env::remove_var("GROK_HOME") };
 

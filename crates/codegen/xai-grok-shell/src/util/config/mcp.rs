@@ -27,7 +27,7 @@ pub use xai_grok_config_types::{McpConfig, RelaySyncConfig};
 pub use xai_grok_config_types::PoolConfig;
 
 /// TUI/CLI settings. Composed from typed section configs defined in `agent::config`.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub cli: crate::agent::config::CliConfig,
     pub models: crate::agent::config::ModelsConfig,
@@ -51,34 +51,6 @@ pub struct Config {
     pub ask_user_question: crate::tools::config::AskUserQuestionToolConfig,
     /// `[privacy]` — local banner ack (not auth-metadata).
     pub privacy: PrivacyConfig,
-}
-
-impl std::fmt::Debug for Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // This aggregate sits above several independently evolving config
-        // types. Do not recursively trust their Debug implementations: nested
-        // sections may gain URL, header, command, or credential-shaped fields.
-        f.debug_struct("Config")
-            .field("cli_section", &"configured")
-            .field("models_section", &"configured")
-            .field("ui_section", &"configured")
-            .field("harness_section", &"configured")
-            .field("skills_section", &"configured")
-            .field("compat_section", &"configured")
-            .field(
-                "management_api_key_present",
-                &self.management_api_key.is_some(),
-            )
-            .field("permission_present", &self.permission.is_some())
-            .field("diagnostics_section", &"configured")
-            .field("session_section", &"configured")
-            .field("ask_user_question_section", &"configured")
-            .field(
-                "privacy_banner_ack_present",
-                &self.privacy.privacy_banner_acked.is_some(),
-            )
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1163,7 +1135,6 @@ fn deserialize_mcp_server_config(
 /// transport-less case is steered to `disabled_mcp_servers`, Grok's real
 /// disable mechanism.
 fn diagnose_invalid_entry(name: &str, value: &TomlValue, error: &str) -> McpServerConfigProblem {
-    let guide = mcp_guide_path();
     let has_command = value.get("command").is_some();
     let has_url = value.get("url").is_some();
     let message = if !has_command && !has_url {
@@ -1171,12 +1142,12 @@ fn diagnose_invalid_entry(name: &str, value: &TomlValue, error: &str) -> McpServ
             "`mcp_servers.{name}` has no transport. To run it, set `command = \"...\"` or \
              `url = \"...\"`. To turn it off, add \"{name}\" to `disabled_mcp_servers` instead of \
              leaving an entry with no transport. \
-             See {guide}"
+             See ~/.grok/docs/user-guide/07-mcp-servers.md"
         )
     } else {
         format!(
             "`mcp_servers.{name}` has an invalid transport: {error}. \
-             See {guide}"
+             See ~/.grok/docs/user-guide/07-mcp-servers.md"
         )
     };
     McpServerConfigProblem {
@@ -1185,16 +1156,6 @@ fn diagnose_invalid_entry(name: &str, value: &TomlValue, error: &str) -> McpServ
         severity: McpServerProblemSeverity::Error,
         message,
     }
-}
-
-/// Where the MCP guide actually lives for this install.
-///
-/// Resolved, not written literally: state moved to `~/.medley`, `MEDLEY_HOME`
-/// can point anywhere, and an install that kept an existing `~/.grok` stays
-/// there. A hardcoded path in a "see this file" pointer sends the reader to a
-/// directory the program is not writing to.
-fn mcp_guide_path() -> String {
-    xai_grok_config::display_user_grok_path("docs/user-guide/07-mcp-servers.md")
 }
 
 pub(crate) struct ParsedMcpServers {
@@ -1207,7 +1168,6 @@ pub(crate) struct ParsedMcpServers {
 pub(crate) fn parse_mcp_servers_with_problems(root: &TomlValue) -> ParsedMcpServers {
     let mut servers = IndexMap::new();
     let mut problems = Vec::new();
-    let guide = mcp_guide_path();
 
     let entries = match root {
         TomlValue::Table(table) => match table.get("mcp_servers") {
@@ -1227,7 +1187,7 @@ pub(crate) fn parse_mcp_servers_with_problems(root: &TomlValue) -> ParsedMcpServ
                         severity: McpServerProblemSeverity::Warning,
                         message: format!(
                             "`mcp_servers.{name}` has an unrecognized field `{field}`; it is \
-                             ignored. See {guide}"
+                             ignored. See ~/.grok/docs/user-guide/07-mcp-servers.md"
                         ),
                     });
                 }
@@ -1241,7 +1201,7 @@ pub(crate) fn parse_mcp_servers_with_problems(root: &TomlValue) -> ParsedMcpServ
                         message: format!(
                             "`mcp_servers.{name}` is enabled but its `{field}` is blank. \
                              Set a value, or add \"{name}\" to `disabled_mcp_servers` to turn it \
-                             off. See {guide}"
+                             off. See ~/.grok/docs/user-guide/07-mcp-servers.md"
                         ),
                     });
                     continue;
@@ -1767,12 +1727,13 @@ pub fn disabled_mcp_server_names(cwd: &std::path::Path) -> std::collections::Has
 
 /// Names `grok mcp enable`/`disable` may target: user/project TOML (including
 /// setup-required/invalid entries that session merge drops), the user
-/// `disabled_mcp_servers` list, compat JSON (`.mcp.json`, Claude, Cursor),
-/// **plugin** MCP servers (same discovery as doctor/`/mcps`), and legacy
-/// managed `grok_com_*` (special-cased in the CLI).
+/// `disabled_mcp_servers` list, compat JSON (`.mcp.json`, Claude, Cursor), and
+/// **plugin** MCP servers (same discovery as doctor/`/mcps`).
 ///
 /// Does **not** include gateway connectors (`managed_gateway:…`); those use
 /// `disabled_mcp_tools.__managed_gateway_connectors` via the `/mcps` Space.
+/// `grok_com_*` is known only when a TOML / disabled / compat / plugin
+/// definition exists — not by prefix.
 pub fn cli_known_mcp_server_names(cwd: &std::path::Path) -> std::collections::HashSet<String> {
     let mut names = disabled_mcp_server_names(cwd);
     // Full TOML key set (list parity) — merge drops setup-required/invalid.
@@ -1955,47 +1916,6 @@ pub(crate) fn session_registry_local_override(root: Option<&TomlValue>) -> Optio
 mod tests {
     use super::*;
     use toml::Value as TomlValue;
-
-    #[test]
-    fn config_debug_reports_management_key_presence_without_exposing_fragments() {
-        const URL_SECRET: &str = "GB002URL-A7s5D3f1G9h7J6k4L2m8";
-        const MANAGEMENT_SECRET: &str = "GB002MGT-Q7w5E3r1T9y7Z6x4C2v8";
-        let secret_url =
-            format!("https://user:{URL_SECRET}@registry.example.test/npm?token={URL_SECRET}");
-        let config = Config {
-            cli: crate::agent::config::CliConfig {
-                npm_registry: Some(secret_url),
-                channel: Some(URL_SECRET.to_owned()),
-                ..crate::agent::config::CliConfig::default()
-            },
-            management_api_key: Some(MANAGEMENT_SECRET.to_owned()),
-            privacy: PrivacyConfig {
-                privacy_banner_acked: Some(URL_SECRET.to_owned()),
-            },
-            ..Config::default()
-        };
-
-        let debug = format!("{config:?}");
-        assert!(
-            debug.contains("management_api_key_present: true"),
-            "{debug}"
-        );
-        assert!(debug.contains("cli_section: \"configured\""), "{debug}");
-        assert!(
-            debug.contains("privacy_banner_ack_present: true"),
-            "{debug}"
-        );
-        for secret in [URL_SECRET, MANAGEMENT_SECRET] {
-            assert!(!debug.contains(secret), "{debug}");
-            for window in secret.as_bytes().windows(8) {
-                let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
-                assert!(
-                    !debug.contains(fragment),
-                    "leaked fragment {fragment:?}: {debug}"
-                );
-            }
-        }
-    }
 
     /// Env beats config.toml; unrecognized env defers; both absent defers to remote.
     #[test]

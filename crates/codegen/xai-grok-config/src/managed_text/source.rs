@@ -128,6 +128,7 @@ impl ParentPlan {
 pub(super) struct ParentAnchor {
     path: PathBuf,
     identity: FileIdentity,
+    #[cfg(unix)]
     directory: fs::File,
 }
 
@@ -140,6 +141,7 @@ impl ParentAnchor {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ManagedConfigError::ParentChanged(path.to_path_buf()));
         }
+        #[cfg(unix)]
         let directory = fs::File::open(path).map_err(|source| ManagedConfigError::Read {
             path: path.to_path_buf(),
             source,
@@ -147,6 +149,7 @@ impl ParentAnchor {
         Ok(Self {
             path: path.to_path_buf(),
             identity: FileIdentity::from_metadata(&metadata),
+            #[cfg(unix)]
             directory,
         })
     }
@@ -188,10 +191,12 @@ pub(super) struct FileIdentity {
     dev: u64,
     #[cfg(unix)]
     ino: u64,
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    file_attributes: u32,
+    #[cfg(not(any(unix, windows)))]
     len: u64,
-    #[cfg(not(unix))]
-    modified: Option<std::time::SystemTime>,
 }
 
 impl FileIdentity {
@@ -204,11 +209,18 @@ impl FileIdentity {
                 ino: metadata.ino(),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            Self {
+                creation_time: metadata.creation_time(),
+                file_attributes: metadata.file_attributes(),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             Self {
                 len: metadata.len(),
-                modified: metadata.modified().ok(),
             }
         }
     }

@@ -1,53 +1,11 @@
+use super::attempt_runner::{
+    OneTurnAttemptInput, OneTurnAttemptOutcome, OneTurnTraceCapture, OneTurnUsageInput,
+    capture_and_fold_one_turn_usage, run_one_turn_attempt,
+};
 use super::*;
-use crate::session::storage::{StorageAdapter, jsonl::JsonlStorageAdapter};
+use crate::upload::trace::PromptMetadataParams;
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_tools::implementations::{grok_build, opencode};
-pub(super) fn inherited_web_search_model_id(
-    follows_default: bool,
-    effective_model_id: &str,
-) -> Option<&str> {
-    follows_default.then_some(effective_model_id)
-}
-pub(super) fn canonical_total_tokens(totals: &xai_chat_state::UsageTotals) -> u64 {
-    totals.total_tokens()
-}
-pub(super) fn usage_is_incomplete(
-    ledger_incomplete: bool,
-    cancellation_may_hide_usage: bool,
-    _known_total_tokens: u64,
-    _has_usage_entries: bool,
-) -> bool {
-    ledger_incomplete || cancellation_may_hide_usage
-}
-pub(super) async fn record_subagent_usage(
-    parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
-    by_model: Option<Vec<(String, xai_chat_state::UsageTotals)>>,
-    parent_prompt_id: Option<String>,
-    incomplete: bool,
-) -> bool {
-    match by_model {
-        None => false,
-        Some(by_model) if by_model.is_empty() && !incomplete => true,
-        Some(by_model) => {
-            let Some(cmd_tx) = parent_cmd_tx else {
-                return false;
-            };
-            let (respond_to, ack) = oneshot::channel();
-            if cmd_tx
-                .send(SessionCommand::RecordSubagentUsage {
-                    by_model,
-                    parent_prompt_id,
-                    incomplete,
-                    respond_to,
-                })
-                .is_err()
-            {
-                return false;
-            }
-            ack.await.is_ok()
-        }
-    }
-}
 pub(super) fn task_model_override_error(
     requested: Option<&str>,
     provenance: ModelOverrideProvenance,
@@ -60,217 +18,6 @@ pub(super) fn task_model_override_error(
     }
     let requested = requested?;
     crate::agent::models::task_model_error_for_catalog(requested, available, is_session_auth)
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ResumeModelLineage {
-    route: Option<String>,
-    agent_type: Option<String>,
-    catalog_identity: Option<xai_chat_state::CatalogIdentity>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResumeModelLineageError {
-    MissingRoute,
-    MissingDurableIdentity,
-    RouteChanged,
-    HarnessChanged,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResumeModelLineageRecoveryError {
-    ModelConflict,
-    RouteConflict,
-}
-
-fn validate_resume_model_lineage(
-    source: &ResumeModelLineage,
-    current_route: &str,
-    current_agent_type: &str,
-) -> Result<(), ResumeModelLineageError> {
-    let Some(source_route) = source.route.as_deref() else {
-        return Err(ResumeModelLineageError::MissingRoute);
-    };
-    if source_route != current_route {
-        return Err(ResumeModelLineageError::RouteChanged);
-    }
-    if source.agent_type.is_none() && source.catalog_identity.is_none() {
-        return Err(ResumeModelLineageError::MissingDurableIdentity);
-    }
-    if source
-        .agent_type
-        .as_deref()
-        .is_some_and(|agent_type| agent_type != current_agent_type)
-    {
-        return Err(ResumeModelLineageError::HarnessChanged);
-    }
-    Ok(())
-}
-
-async fn recover_resume_model_lineage(
-    source: &ResumeSourceData,
-) -> Result<ResumeModelLineage, ResumeModelLineageRecoveryError> {
-    let child_info = SessionInfo {
-        id: acp::SessionId::new(source.child_session_id.clone()),
-        cwd: source.child_cwd.clone(),
-    };
-    let child_dir = session::persistence::session_dir(&child_info);
-    recover_resume_model_lineage_at(source, child_dir).await
-}
-
-async fn recover_resume_model_lineage_at(
-    source: &ResumeSourceData,
-    child_dir: PathBuf,
-) -> Result<ResumeModelLineage, ResumeModelLineageRecoveryError> {
-    let mut lineage = ResumeModelLineage {
-        route: source.model_route.clone(),
-        agent_type: source.model_agent_type.clone(),
-        catalog_identity: None,
-    };
-    if source.model_id.is_none() {
-        return Ok(lineage);
-    }
-    let metadata_is_incomplete = lineage.route.is_none() || lineage.agent_type.is_none();
-
-    let child_info = SessionInfo {
-        id: acp::SessionId::new(source.child_session_id.clone()),
-        cwd: source.child_cwd.clone(),
-    };
-    let storage = JsonlStorageAdapter::with_explicit_session_dir(child_dir);
-    let Ok(summary) = storage.load_summary(&child_info).await else {
-        if metadata_is_incomplete {
-            tracing::warn!(
-                source_subagent_id = %source.subagent_id,
-                "Legacy resume metadata lacks complete model lineage and the child session summary could not be loaded"
-            );
-        }
-        return Ok(lineage);
-    };
-    let Some(identity) = summary.catalog_identity else {
-        if metadata_is_incomplete {
-            tracing::warn!(
-                source_subagent_id = %source.subagent_id,
-                "Legacy resume metadata lacks complete model lineage and the child session summary has no catalog identity"
-            );
-        }
-        return Ok(lineage);
-    };
-    if source.model_id.as_deref() != Some(identity.model_id.as_str())
-        || summary.current_model_id.0.as_ref() != identity.model_id
-    {
-        tracing::error!(
-            source_subagent_id = %source.subagent_id,
-            metadata_model_id = ?source.model_id,
-            summary_model_id = %summary.current_model_id.0,
-            catalog_model_id = %identity.model_id,
-            "Refusing inconsistent legacy resume model lineage"
-        );
-        return Err(ResumeModelLineageRecoveryError::ModelConflict);
-    }
-    if lineage
-        .route
-        .as_deref()
-        .is_some_and(|route| route != identity.route)
-    {
-        tracing::error!(
-            source_subagent_id = %source.subagent_id,
-            metadata_route = ?lineage.route,
-            summary_route = %identity.route,
-            "Refusing conflicting durable resume route lineage"
-        );
-        return Err(ResumeModelLineageRecoveryError::RouteConflict);
-    }
-
-    if lineage.route.is_none() {
-        lineage.route = Some(identity.route.clone());
-    }
-    lineage.catalog_identity = Some(identity);
-    Ok(lineage)
-}
-
-fn should_preflight_model_harness(
-    is_resume: bool,
-    has_committed_resume_model: bool,
-    has_fresh_model_selection: bool,
-) -> bool {
-    !(is_resume && has_committed_resume_model) && has_fresh_model_selection
-}
-/// Lifecycle guard that keeps managed-gateway refresh barriers aware of live
-/// child sessions until this spawn path exits.
-struct ManagedGatewayChildSessionRegistration {
-    registry: Option<ManagedGatewayChildSessionRegistry>,
-    session_id: acp::SessionId,
-}
-
-impl ManagedGatewayChildSessionRegistration {
-    fn register(
-        registry: Option<ManagedGatewayChildSessionRegistry>,
-        session_id: &acp::SessionId,
-        cmd_tx: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
-    ) -> Self {
-        if let Some(registry_ref) = registry.as_ref() {
-            registry_ref.borrow_mut().insert(session_id.clone(), cmd_tx);
-        }
-        Self {
-            registry,
-            session_id: session_id.clone(),
-        }
-    }
-}
-
-impl Drop for ManagedGatewayChildSessionRegistration {
-    fn drop(&mut self) {
-        if let Some(registry) = self.registry.as_ref() {
-            registry.borrow_mut().remove(&self.session_id);
-        }
-    }
-}
-/// Removes a freshly-created worktree if subagent spawn exits before the child
-/// session is handed off to the coordinator.
-pub(super) struct PreHandoffWorktreeCleanupGuard {
-    subagent_id: String,
-    worktree_path: Option<PathBuf>,
-    armed: bool,
-}
-
-impl PreHandoffWorktreeCleanupGuard {
-    pub(super) fn new(
-        subagent_id: &str,
-        worktree_path: Option<&Path>,
-        worktree_freshly_created: bool,
-    ) -> Self {
-        Self {
-            subagent_id: subagent_id.to_owned(),
-            worktree_path: worktree_path.map(Path::to_path_buf),
-            armed: worktree_freshly_created && worktree_path.is_some(),
-        }
-    }
-
-    pub(super) fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PreHandoffWorktreeCleanupGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let Some(worktree_path) = self.worktree_path.take() else {
-            return;
-        };
-        if let Err(e) = xai_fast_worktree::remove_worktree_with_delegate(
-            &worktree_path,
-            crate::session::worktree::btrfs_delegate_from_env(),
-        ) {
-            tracing::warn!(
-                subagent_id = %self.subagent_id,
-                worktree_path = %worktree_path.display(),
-                error = %e,
-                "failed to remove freshly created subagent worktree after pre-handoff exit"
-            );
-        }
-    }
 }
 /// Runtime adapter for one shell child. Shared lifecycle state is owned by the
 /// `xai-grok-tools` coordinator actor and reached only through `reporter`.
@@ -290,11 +37,11 @@ pub(crate) async fn run_shell_child(
 ) -> ChildRunOutput<ShellCompletionData> {
     let grok_build::task::coordinator::ChildRunRequest {
         mut request,
-        spawn_parent_session_id: _,
         cancellation: cancel_token,
         reporter,
         queued_for,
         session_running,
+        spawn_parent_session_id: _,
     } = run;
     let start = std::time::Instant::now();
     let mut completion_data = ShellCompletionData::from_context(&ctx);
@@ -305,17 +52,10 @@ pub(crate) async fn run_shell_child(
             None,
         );
     }
-    let Some(selected_harness_definition) =
-        resolve_agent_definition_without_session_cli_overrides(&request.subagent_type, &ctx)
-    else {
+    let Some(mut definition) = resolve_agent_definition(&request.subagent_type, &ctx) else {
         let msg = format!("Unknown subagent type: {}", request.subagent_type);
         return child_run_output(failure_result(&request, &msg), completion_data, None);
     };
-    // Model compatibility compares the raw resolved harness identities. The
-    // session CLI clamp is enforced independently on the definition that
-    // actually runs and must not create a false harness mismatch.
-    let mut definition = selected_harness_definition.clone();
-    ctx.apply_session_cli_overrides(&mut definition);
     match gate_subagent_type(&request.subagent_type, &ctx) {
         SubagentValidateTypeOutcome::Disabled => {
             let msg = format!(
@@ -402,8 +142,8 @@ pub(crate) async fn run_shell_child(
                 subagent_type: info.subagent_type,
                 persona: info.persona,
                 model_id: info.model_id,
-                model_route: info.model_route,
-                model_agent_type: info.model_agent_type,
+                model_agent_type: None,
+                model_route: None,
             }),
             SubagentResumeLookup::Missing => {
                 match durable_resume_source_for(resume_id, &ctx.parent_session_id, &ctx.parent_cwd)
@@ -425,27 +165,6 @@ pub(crate) async fn run_shell_child(
         }
     } else {
         None
-    };
-    let mut resume_model_lineage = match resume_source.as_ref() {
-        Some(source) => match recover_resume_model_lineage(source).await {
-            Ok(lineage) => Some(lineage),
-            Err(conflict) => {
-                let detail = match conflict {
-                    ResumeModelLineageRecoveryError::ModelConflict => {
-                        "subagent metadata conflicts with the durable child session model identity"
-                    }
-                    ResumeModelLineageRecoveryError::RouteConflict => {
-                        "subagent metadata conflicts with the durable child session route identity"
-                    }
-                };
-                let msg = format!(
-                    "Cannot resume from subagent '{}': {detail}.",
-                    source.subagent_id,
-                );
-                return child_run_output(failure_result(&request, &msg), completion_data, None);
-            }
-        },
-        None => None,
     };
     if let Some(ref source) = resume_source {
         if request.runtime_overrides.model.is_some() {
@@ -477,32 +196,6 @@ pub(crate) async fn run_shell_child(
             .is_some_and(|a| a.is_session_auth()),
     ) {
         return child_run_output(failure_result(&request, &error), completion_data, None);
-    }
-    if effective_runtime.reasoning_effort.is_some() || effective_runtime.capability_mode.is_some() {
-        tracing::info!(
-            subagent_id = %request.id,
-            reasoning_effort = ?effective_runtime.reasoning_effort,
-            capability_mode = ?effective_runtime.capability_mode,
-            "Resolved runtime overrides for subagent"
-        );
-    }
-    effective_runtime.capability_mode =
-        xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
-            effective_runtime.capability_mode,
-            definition.capability_mode,
-            ctx.parent_capability_mode,
-        );
-    definition.capability_mode = effective_runtime.capability_mode;
-    if let Some(error) =
-        agent_owned_mcp_server_admission_error(&definition, effective_runtime.capability_mode)
-    {
-        tracing::warn!(
-            subagent_id = %request.id,
-            agent = %definition.name,
-            capability_mode = ?effective_runtime.capability_mode,
-            "Rejected agent-owned MCP server startup for restricted subagent"
-        );
-        return child_run_output(failure_result(&request, error), completion_data, None);
     }
     let worktree_path = if let Some(ref source) = resume_source {
         if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None
@@ -621,11 +314,6 @@ pub(crate) async fn run_shell_child(
         None
     };
     let worktree_freshly_created = resume_source.is_none() && worktree_path.is_some();
-    let mut pre_handoff_worktree_cleanup = PreHandoffWorktreeCleanupGuard::new(
-        &request.id,
-        worktree_path.as_deref(),
-        worktree_freshly_created,
-    );
     if let Some(raw_cwd) = request.cwd.as_deref() {
         match sanitize_cwd_value(raw_cwd) {
             Some(cwd_path) => {
@@ -649,6 +337,18 @@ pub(crate) async fn run_shell_child(
             None => request.cwd = None,
         }
     }
+    if effective_runtime.reasoning_effort.is_some() || effective_runtime.capability_mode.is_some() {
+        tracing::info!(
+            subagent_id = %request.id,
+            reasoning_effort = ?effective_runtime.reasoning_effort,
+            capability_mode = ?effective_runtime.capability_mode,
+            "Resolved runtime overrides for subagent"
+        );
+    }
+    effective_runtime.capability_mode = xai_grok_subagent_resolution::intersect_capability_modes(
+        effective_runtime.capability_mode,
+        definition.capability_mode,
+    );
     let child_depth = request
         .runtime_overrides
         .spawn_depth
@@ -664,7 +364,8 @@ pub(crate) async fn run_shell_child(
         tracing::info!(
             subagent_id = %request.id,
             capability_mode = ?mode,
-            "Deferred capability enforcement to the final agent tool policy"
+            tools_remaining = definition.tool_config.tools.len(),
+            "Applied capability mode filter to agent tool config"
         );
     }
     if !allow_nested_subagents && definition.tool_config.tools.len() < tools_before_policy {
@@ -682,195 +383,75 @@ pub(crate) async fn run_shell_child(
             )
         });
     }
-    let mut prepared_model = resolve_request_prepared_model(
-        request.fork_context,
+    if request.fork_context {
+        effective_runtime.model = Some(ctx.model_id.0.to_string());
+    }
+    let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
         effective_runtime.model.as_deref(),
         &request.subagent_type,
         &definition.model,
         &ctx,
     )
     .await;
-    let mut effective_sampling_config = prepared_model.sampling_config.clone();
-    let mut effective_model_id = prepared_model.model_id.clone();
     let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
+    {
+        let model_str = &effective_sampling_config.model;
+        let model_unknown = !model_str.is_empty()
+            && !ctx.available_models.is_empty()
+            && !ctx.available_models.contains_key(model_str)
+            && !ctx
+                .available_models
+                .values()
+                .any(|e| e.info().model == *model_str);
+        if model_unknown {
+            let (parent_config, parent_mid) = read_parent_sampling_config(&ctx).await;
+            tracing::warn!(
+                subagent_id = %request.id,
+                resolved_model = %model_str,
+                parent_model = %parent_config.model,
+                "Resolved subagent model not found in available models — \
+                 falling back to parent model"
+            );
+            effective_sampling_config = parent_config;
+            effective_model_id = parent_mid;
+        }
+    }
     if let Some(ref source) = resume_source
         && let Some(ref source_model) = source.model_id
+        && effective_model_id.0.as_ref() != source_model.as_str()
     {
-        let persisted_identity = resume_model_lineage
-            .as_ref()
-            .and_then(|lineage| lineage.catalog_identity.clone());
-        let reconciled_identity = persisted_identity.as_ref().and_then(|identity| {
-            crate::agent::models::reconcile_persisted_catalog_identity(
-                &ctx.available_models,
-                identity,
-            )
-        });
-        if persisted_identity.is_some() && reconciled_identity.is_none() {
+        if let Some(resolved) = resolve_model_override_to_config(source_model, &ctx) {
+            tracing::info!(
+                subagent_id = %request.id,
+                resolved_model = %effective_model_id.0,
+                source_model = source_model,
+                "Pinning resumed child to source model"
+            );
+            effective_sampling_config = resolved.0;
+            effective_model_id = resolved.1;
+        } else {
             let msg = format!(
-                "Cannot resume from subagent '{}': persisted source model lineage no longer matches the current catalog.",
+                "Cannot resume from subagent '{}': source model '{source_model}' \
+                 is no longer available in the model catalogue.",
                 source.subagent_id,
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
-        if let Some(identity) = reconciled_identity.as_ref()
-            && let Some(lineage) = resume_model_lineage.as_mut()
-        {
-            lineage.catalog_identity = Some(identity.clone());
-        }
-        let resume_model_id = reconciled_identity
-            .as_ref()
-            .map_or(source_model.as_str(), |identity| identity.model_id.as_str());
-        if effective_model_id.0.as_ref() != resume_model_id {
-            if let Some(resolved) = resolve_model_override_to_prepared(resume_model_id, &ctx) {
-                tracing::info!(
-                    subagent_id = %request.id,
-                    resolved_model = %effective_model_id.0,
-                    source_model = resume_model_id,
-                    "Pinning resumed child to source model"
-                );
-                effective_sampling_config = resolved.sampling_config.clone();
-                effective_model_id = resolved.model_id.clone();
-                prepared_model = resolved;
-            } else {
-                let msg = format!(
-                    "Cannot resume from subagent '{}': source model '{resume_model_id}' \
-                     is no longer available in the model catalogue.",
-                    source.subagent_id,
-                );
-                return child_run_output(failure_result(&request, &msg), completion_data, None);
-            }
-        }
     }
-    // A resident parent keeps its immutable sampling config across catalog
-    // refreshes. A new child must instead honor the fresh prepared menu, or a
-    // narrowed model can inherit a now-invalid effort and send it on the wire.
-    reconcile_inherited_subagent_reasoning_effort(
-        &mut effective_sampling_config,
-        prepared_model.supports_reasoning_effort,
-        &prepared_model.reasoning_efforts,
-    );
-    let requested_model_matches_effective = |requested: &str| {
-        crate::agent::models::resolve_catalog_identity(
-            &ctx.available_models,
-            &acp::ModelId::new(requested),
-        )
-        .is_some_and(|identity| identity.model_id == effective_model_id.0.as_ref())
-    };
-    let explicit_model_selection = request.fork_context
-        || effective_runtime
-            .model
-            .as_deref()
-            .is_some_and(&requested_model_matches_effective)
-        || ctx
-            .subagent_model_overrides
-            .get(&request.subagent_type)
-            .is_some_and(|model| requested_model_matches_effective(model))
-        || match &definition.model {
-            xai_grok_agent::config::ModelOverride::Override(model) => {
-                requested_model_matches_effective(model)
+    if let Some(raw) = effective_runtime.reasoning_effort.as_deref()
+        && ctx
+            .models_manager
+            .model_supports_reasoning_effort(effective_model_id.0.as_ref())
+    {
+        match raw.parse::<ReasoningEffort>() {
+            Ok(eff) => effective_sampling_config.reasoning_effort = Some(eff),
+            Err(err) => {
+                tracing::warn!(
+                    value = raw,
+                    error = %err,
+                    "subagent reasoning_effort: parse failed, ignoring override"
+                )
             }
-            xai_grok_agent::config::ModelOverride::Inherit => false,
-        };
-    let is_resume = resume_source.is_some();
-    let has_committed_resume_model = resume_source
-        .as_ref()
-        .and_then(|source| source.model_id.as_deref())
-        .is_some();
-    if is_resume && has_committed_resume_model {
-        if let Some(source_lineage) = resume_model_lineage.as_ref()
-            && let Err(lineage_error) = validate_resume_model_lineage(
-                source_lineage,
-                &prepared_model.catalog_identity.route,
-                &prepared_model.agent_type,
-            )
-        {
-            let detail = match lineage_error {
-                ResumeModelLineageError::MissingRoute => {
-                    "source model route evidence is missing; resume requires persisted route lineage"
-                }
-                ResumeModelLineageError::MissingDurableIdentity => {
-                    "legacy metadata has no harness lineage and no reconciled durable catalog identity"
-                }
-                ResumeModelLineageError::RouteChanged => {
-                    "source model route no longer matches the current catalog"
-                }
-                ResumeModelLineageError::HarnessChanged => {
-                    "source model harness no longer matches the current catalog"
-                }
-            };
-            let msg = format!(
-                "Cannot resume from subagent '{}': {detail}.",
-                resume_source
-                    .as_ref()
-                    .map_or("unknown", |source| source.subagent_id.as_str()),
-            );
-            return child_run_output(failure_result(&request, &msg), completion_data, None);
-        }
-        if resume_model_lineage
-            .as_ref()
-            .is_some_and(|lineage| lineage.agent_type.is_none())
-        {
-            tracing::warn!(
-                source_subagent_id = %resume_source
-                    .as_ref()
-                    .map_or("unknown", |source| source.subagent_id.as_str()),
-                model_route = %prepared_model.catalog_identity.route,
-                "Migrating legacy resume without historical harness lineage after durable catalog identity reconciliation"
-            );
-        }
-    } else if should_preflight_model_harness(
-        is_resume,
-        has_committed_resume_model,
-        explicit_model_selection,
-    ) {
-        if prepared_model.agent_type.is_empty() {
-            let msg = format!(
-                "Cannot spawn subagent '{}': resolved model '{}' is no longer in the model catalog.",
-                request.subagent_type, effective_model_id.0,
-            );
-            return child_run_output(failure_result(&request, &msg), completion_data, None);
-        }
-        let required_agent_type = prepared_model.agent_type.as_str();
-        if let Err(harness_error) = resolve_and_validate_subagent_model_harness(
-            &selected_harness_definition,
-            required_agent_type,
-            &ctx.parent_cwd,
-            ctx.plugin_registry.as_deref(),
-        ) {
-            let detail = match harness_error {
-                SubagentModelHarnessError::Unavailable => "is unavailable",
-                SubagentModelHarnessError::Incompatible => {
-                    "is incompatible with the selected subagent harness"
-                }
-            };
-            let msg = format!(
-                "Cannot spawn subagent '{}' with model '{}': required harness '{}' {}.",
-                request.subagent_type, effective_model_id.0, required_agent_type, detail,
-            );
-            tracing::warn!(
-                subagent_id = %request.id,
-                subagent_type = %request.subagent_type,
-                model_id = %effective_model_id.0,
-                required_agent_type,
-                active_agent_type = %selected_harness_definition.name,
-                "subagent model override rejected by harness preflight"
-            );
-            return child_run_output(failure_result(&request, &msg), completion_data, None);
-        }
-    }
-    if let Some(raw) = effective_runtime.reasoning_effort.as_deref() {
-        if let Some(effort) = resolve_subagent_reasoning_effort_override(
-            prepared_model.supports_reasoning_effort,
-            &prepared_model.reasoning_efforts,
-            raw,
-        ) {
-            effective_sampling_config.reasoning_effort = Some(effort);
-        } else {
-            tracing::warn!(
-                value = raw,
-                model_id = %prepared_model.model_id.0,
-                "subagent reasoning_effort is invalid or unavailable for model; ignoring override"
-            );
         }
     }
     let subagent_id = request.id.clone();
@@ -884,6 +465,9 @@ pub(crate) async fn run_shell_child(
         cwd: effective_cwd,
     };
     let child_session_dir = session::persistence::session_dir(&child_session_info);
+    if let Err(e) = crate::util::grok_home::ensure_sessions_cwd_dir(&child_session_info.cwd) {
+        tracing::warn!(?e, "failed to ensure sessions cwd dir for subagent session");
+    }
     let parent_session_dir = session::persistence::session_dir(&SessionInfo {
         id: acp::SessionId::new(ctx.parent_session_id.clone()),
         cwd: ctx.parent_cwd.to_string_lossy().to_string(),
@@ -962,9 +546,6 @@ pub(crate) async fn run_shell_child(
             .map(|p| p.to_string_lossy().to_string()),
         snapshot_ref: None,
         effective_model_id: Some(effective_model_id.0.to_string()),
-        effective_model_route: Some(prepared_model.catalog_identity.route.clone()),
-        effective_model_agent_type: (!prepared_model.agent_type.is_empty())
-            .then(|| prepared_model.agent_type.clone()),
     };
     write_subagent_meta(&subagent_meta_dir, &subagent_meta);
     if let (Some(bucket_url), Some(upload_method)) = (&ctx.gcs_bucket_url, &ctx.gcs_upload_method) {
@@ -1113,47 +694,17 @@ pub(crate) async fn run_shell_child(
     let parent_traceparent = xai_file_utils::trace_context::current_traceparent();
     let tracker_child_cwd = child_session_info.cwd.clone();
     let tracker_model_id = effective_model_id.0.to_string();
-    let tracker_model_route = prepared_model.catalog_identity.route.clone();
-    let tracker_model_agent_type =
-        (!prepared_model.agent_type.is_empty()).then(|| prepared_model.agent_type.clone());
     let initial_child_tokens = xai_chat_state::estimate_conversation_tokens(&forked_conversation);
-    let model_has_own_creds = prepared_model.model_has_own_credentials;
-    let inherited_auth_type = prepared_model.auth_type;
-    // `read_parent_sampling_config` sets `credential_source` only when the
-    // parent declared a credential header, so it is `None` for the ordinary
-    // case -- while `api_key` here is the parent's live session token. Falling
-    // back to `Missing` would label a real ambient credential with the one
-    // variant whose own doc says it never blocks a route, which is the
-    // under-restricting direction.
-    //
-    // Derive it from the posture the subagent actually inherits, preferring the
-    // more-restricted answer when unsure: a session token is ambient xAI, a
-    // model with its own credential is BYOK, and no key at all is the only
-    // honest `Missing`.
-    let source = effective_sampling_config
-        .credential_source
-        .clone()
-        .unwrap_or(
-            match (
-                effective_sampling_config.api_key.is_some(),
-                inherited_auth_type,
-                model_has_own_creds,
-            ) {
-                (false, _, _) => xai_grok_sampler::CredentialSource::Missing,
-                (true, xai_chat_state::AuthType::SessionToken, _) => {
-                    xai_grok_sampler::CredentialSource::XaiSession
-                }
-                (true, _, true) => xai_grok_sampler::CredentialSource::ModelApiKey,
-                // A key the parent carries that is neither a session token nor the
-                // model's own: ambient env is the restricted reading, and being
-                // wrong here refuses rather than permits.
-                (true, _, false) => xai_grok_sampler::CredentialSource::XaiApiKeyEnv,
-            },
-        );
+    let model_entry = crate::agent::config::find_model_by_id(
+        &ctx.available_models,
+        effective_model_id.0.as_ref(),
+    );
+    let model_has_own_creds = model_entry.is_some_and(|entry| entry.has_own_credentials());
+    let inherited_auth_type = subagent_auth_type(model_entry, &ctx.auth_method_id);
     let credentials = xai_chat_state::Credentials::bound(
         effective_sampling_config.api_key.clone(),
         inherited_auth_type,
-        source,
+        xai_grok_sampling_types::CredentialSource::XaiSession,
     )
     .with_alpha_test_key(ctx.alpha_test_key.clone())
     .with_client_version(effective_sampling_config.client_version.clone());
@@ -1165,13 +716,13 @@ pub(crate) async fn run_shell_child(
             "subagent_type": &request.subagent_type,
             "effective_model": effective_model_id.0.as_ref(),
             "effective_model_raw": &effective_sampling_config.model,
-            "endpoint_is_first_party": crate::util::is_xai_api_url(&effective_sampling_config.base_url),
-            "credential_present": effective_sampling_config.api_key.is_some(),
+            "base_url": &effective_sampling_config.base_url,
+            "key_prefix": key_prefix(&effective_sampling_config.api_key),
             "auth_type": format!("{:?}", inherited_auth_type),
             "model_has_own_creds": model_has_own_creds,
             "auth_method_id": ctx.auth_method_id.0.as_ref(),
             "parent_model": ctx.model_id.0.as_ref(),
-            "parent_credential_present": ctx.sampling_config.api_key.is_some(),
+            "parent_key_prefix": key_prefix(&ctx.sampling_config.api_key),
             "context_window": effective_sampling_config.context_window,
         })),
     );
@@ -1406,51 +957,10 @@ pub(crate) async fn run_shell_child(
     });
     let subagent_session_default_agent_profile = Some(definition.name.clone());
     let subagent_model_id = effective_sampling_config.model.clone();
-    let effective_catalog_identity = prepared_model.catalog_identity;
-    effective_model_id = acp::ModelId::new(effective_catalog_identity.model_id.clone());
-    let image_description_model = crate::config::auxiliary_model_or_operative(
-        &ctx.image_description_model,
-        effective_model_id.0.as_ref(),
-        ctx.image_description_follows_default,
-    );
-    let web_search_sampling_config = if let Some(web_search_model_id) =
-        inherited_web_search_model_id(
-            ctx.web_search_follows_default,
-            effective_model_id.0.as_ref(),
-        ) {
-        if let Some(cfg) = ctx.agent_config.as_ref() {
-            let mut resolved =
-                crate::agent::config::resolve_web_search_sampling_config_preflight_result(
-                    web_search_model_id,
-                    &ctx.available_models,
-                    ctx.auth.as_ref().map(|auth| auth.key.as_str()),
-                    cfg.grok_com_config.api_key_auth_disabled(),
-                    cfg.endpoints.alpha_test_key.clone(),
-                    cfg.client_version.clone(),
-                    &cfg.endpoints,
-                )
-                .await
-                .ok();
-            if let Some(config) = resolved.as_mut() {
-                crate::agent::mvp_agent::inject_proxy_headers(
-                    &mut config.extra_headers,
-                    config.client_version.as_deref(),
-                    cfg.endpoints.alpha_test_key.as_deref(),
-                    &config.base_url,
-                );
-            }
-            resolved
-        } else {
-            ctx.web_search_sampling_config.clone()
-        }
-    } else {
-        ctx.web_search_sampling_config.clone()
-    };
     let _ = persistence
         .tx
         .send(crate::session::persistence::PersistenceMsg::CurrentModel {
             model_id: effective_model_id.clone(),
-            catalog_identity: Some(effective_catalog_identity.clone()),
             agent_name: Some(definition.name.clone()),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
         });
@@ -1458,7 +968,6 @@ pub(crate) async fn run_shell_child(
         child_session_info,
         gateway.clone(),
         effective_sampling_config,
-        effective_catalog_identity,
         credentials,
         crate::agent::auth_method::new_shared_auth_method_id(Some(ctx.auth_method_id.clone())),
         Some(ctx.auth_manager.clone()),
@@ -1480,16 +989,14 @@ pub(crate) async fn run_shell_child(
         crate::session::StartupHints {
             inherited_prefix_len: Some(inherited_prefix_len),
             is_subagent: true,
+            non_interactive: ctx.parent_non_interactive,
             parent_session_id: Some(ctx.parent_session_id.clone()),
             subagent_type: Some(request.subagent_type.clone()),
             preserve_inherited_system: verbatim_mirror_fork,
             ..Default::default()
         },
         xai_grok_workspace::permission::ClientType::Generic,
-        ctx.resolve_auto_compact_threshold_percent(
-            &subagent_model_id,
-            prepared_model.auto_compact_threshold_percent,
-        ),
+        ctx.resolve_auto_compact_threshold_percent(&subagent_model_id),
         xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
         xai_chat_state::CompactionMode::Summary,
         ctx.resolve_compaction_verbatim_input(),
@@ -1545,7 +1052,6 @@ pub(crate) async fn run_shell_child(
         false,
         Default::default(),
         ctx.managed_mcp_state.clone(),
-        None,
         ctx.managed_mcp_proxy_base_url.clone(),
         effective_model_id,
         ctx.yolo_mode
@@ -1557,7 +1063,7 @@ pub(crate) async fn run_shell_child(
         None,
         ctx.inference_idle_timeout_secs,
         None,
-        web_search_sampling_config,
+        ctx.web_search_sampling_config.clone(),
         ctx.web_fetch_config.clone(),
         ctx.image_gen_config.clone(),
         ctx.video_gen_config.clone(),
@@ -1587,7 +1093,7 @@ pub(crate) async fn run_shell_child(
         parent_traceparent,
         ctx.permission_handle.clone(),
         ctx.api_key_provider.clone(),
-        image_description_model,
+        ctx.image_description_model.clone(),
         ctx.hook_registry.clone(),
         ctx.workspace_ops.clone(),
         vec![],
@@ -1610,10 +1116,7 @@ pub(crate) async fn run_shell_child(
     )
     .await;
     let (child_handle, mut permission_rx, _system_prompt, child_thread) = match spawn_result {
-        Ok(r) => {
-            pre_handoff_worktree_cleanup.disarm();
-            r
-        }
+        Ok(r) => r,
         Err(e) => {
             let msg = format!("Failed to spawn child session: {e}");
             let result = fail_subagent(
@@ -1627,15 +1130,11 @@ pub(crate) async fn run_shell_child(
             return child_run_output(result, completion_data, None);
         }
     };
-    let _managed_gateway_child_session_registration =
-        ManagedGatewayChildSessionRegistration::register(
-            ctx.managed_gateway_child_sessions.clone(),
-            &child_session_id,
-            child_handle.cmd_tx.clone(),
-        );
     let promoted = reporter
         .started(StartedChild {
             child_session_id: child_session_id.0.to_string(),
+            effective_model_agent_type: None,
+            effective_model_route: None,
             persona: effective_runtime.persona.clone(),
             resumed_from: request.resume_from.clone(),
             child_cwd: tracker_child_cwd,
@@ -1643,8 +1142,6 @@ pub(crate) async fn run_shell_child(
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
             effective_model_id: tracker_model_id.clone(),
-            effective_model_route: Some(tracker_model_route),
-            effective_model_agent_type: tracker_model_agent_type,
             definition_background,
             control: ShellChildRuntime {
                 child_handle: child_handle.clone(),
@@ -1678,257 +1175,29 @@ pub(crate) async fn run_shell_child(
         cancel_token.clone(),
         goal_tick_cmd_tx(ctx.goal_enabled, ctx.parent_cmd_tx.as_ref()),
     );
-    let (before_copy_tx, before_copy_rx) = tokio::sync::oneshot::channel();
-    let _ = child_handle.cmd_tx.send(SessionCommand::CopyFile {
-        respond_to: before_copy_tx,
-    });
-    if let Some(overrides) = ctx.inherited_tool_overrides.clone() {
-        let _ = child_handle
-            .cmd_tx
-            .send(SessionCommand::SetToolOverrides { overrides });
-    }
-    let (prompt_tx, prompt_rx) = oneshot::channel();
-    let prompt_text = task_prompt_text;
-    let child_prompt_id = uuid::Uuid::now_v7().to_string();
-    let turn_started_at = chrono::Utc::now().to_rfc3339();
-    let _ = child_handle.cmd_tx.send(SessionCommand::Prompt {
-        prompt_id: child_prompt_id.clone(),
-        prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(prompt_text))],
-        prompt_mode: crate::session::plan_mode::PromptMode::Agent,
-        artifact_upload_ctx: ctx.gcs_bucket_url.as_ref().and_then(|_| {
-            ctx.gcs_upload_method.as_ref().map(|method| {
-                crate::upload::manifest::ArtifactUploadContext {
-                    gcs_config: crate::session::repo_changes::TraceExportConfig {
-                        bucket_url: ctx.gcs_bucket_url.clone(),
-                        service_account_key: None,
-                        prefix_dir: None,
-                        gcs_prefix: Some(format!("{}/turn_0", child_session_id.0)),
-                        absolute_paths: false,
-                        archive_name_override: None,
-                        upload_method: method.clone(),
-                    },
-                    artifact_tracker: crate::upload::manifest::new_artifact_tracker(),
-                }
-            })
-        }),
-        client_identifier: None,
-        screen_mode: None,
-        verbatim: true,
-        traceparent: xai_file_utils::trace_context::current_traceparent(),
-        json_schema: request.runtime_overrides.output_schema.clone(),
-        send_now: false,
-        admission: None,
-        tool_overrides_update: None,
-        respond_to: prompt_tx,
-        persist_ack: None,
-        parsed_prompt_tx: None,
-    });
-    let wait_outcome = await_subagent_turn_or_cancellation(prompt_rx, cancel_token.clone()).await;
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let mut turn_token_totals: Option<(u64, u64, u64)> = None;
-    let mut cancellation_may_hide_usage = false;
-    let mut result = match wait_outcome {
-        SubagentWaitOutcome::Cancelled => {
-            let (tool_calls, turns) = signals_snapshot_counts(&child_handle).await;
-            cancellation_may_hide_usage = turns > 0 || tool_calls > 0;
-            SubagentResult {
-                success: false,
-                cancelled: true,
-                error: Some("Subagent was cancelled".to_string()),
-                subagent_id: request.id.clone(),
-                child_session_id: child_session_id.0.to_string(),
-                tool_calls,
-                turns,
-                duration_ms,
-                worktree_path: worktree_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string()),
-                ..Default::default()
-            }
-        }
-        SubagentWaitOutcome::TurnResult(turn_result) => {
-            let was_cancelled = cancel_token.is_cancelled();
-            let (tool_calls, turns) = match &*turn_result {
-                Ok(Ok(crate::session::commands::PromptTurnOk {
-                    turn_snapshot: Some(snapshot),
-                    ..
-                })) => {
-                    turn_token_totals = Some((
-                        snapshot.turn_input_tokens,
-                        snapshot.turn_cached_input_tokens,
-                        snapshot.turn_output_tokens,
-                    ));
-                    (
-                        snapshot.current.tool_call_count,
-                        snapshot.current.turn_count,
-                    )
-                }
-                _ => signals_snapshot_counts(&child_handle).await,
-            };
-            let final_text = child_handle
-                .chat_state_handle
-                .get_last_assistant_text()
-                .await
-                .unwrap_or_default();
-            let result_tokens = child_handle.chat_state_handle.get_total_tokens().await;
-            match *turn_result {
-                Ok(Ok(crate::session::commands::PromptTurnOk {
-                    completion_kind: PromptCompletionKind::Cancelled { category, context },
-                    ..
-                })) => {
-                    cancellation_may_hide_usage = true;
-                    let reason = cancellation_error_message(category, context.as_ref());
-                    SubagentResult {
-                        success: false,
-                        cancelled: true,
-                        error: Some(reason),
-                        output: if final_text.is_empty() {
-                            std::sync::Arc::from(format!(
-                                "Subagent '{}' ({}) was cancelled. {} tool calls, {} turns.",
-                                request.description, request.subagent_type, tool_calls, turns
-                            ))
-                        } else {
-                            std::sync::Arc::from(final_text)
-                        },
-                        subagent_id: request.id.clone(),
-                        child_session_id: child_session_id.0.to_string(),
-                        tool_calls,
-                        turns,
-                        duration_ms,
-                        tokens_used: result_tokens,
-                        output_tokens_used: 0,
-                        output_usage_incomplete: true,
-                        total_tokens_used: 0,
-                        worktree_path: worktree_path
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().to_string()),
-                        backgrounded: false,
-                    }
-                }
-                Ok(Ok(crate::session::commands::PromptTurnOk {
-                    completion_kind: PromptCompletionKind::MaxTurnsReached { limit },
-                    ..
-                })) => SubagentResult {
-                    success: false,
-                    cancelled: true,
-                    error: Some(format!("max turns reached (limit: {limit})")),
-                    output: if final_text.is_empty() {
-                        std::sync::Arc::from(format!(
-                            "Subagent '{}' ({}) hit max-turns limit ({limit}). {} tool calls, {} turns.",
-                            request.description, request.subagent_type, tool_calls, turns
-                        ))
-                    } else {
-                        std::sync::Arc::from(final_text)
-                    },
-                    subagent_id: request.id.clone(),
-                    child_session_id: child_session_id.0.to_string(),
-                    tool_calls,
-                    turns,
-                    duration_ms,
-                    tokens_used: result_tokens,
-                    output_tokens_used: 0,
-                    output_usage_incomplete: true,
-                    total_tokens_used: 0,
-                    worktree_path: worktree_path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().to_string()),
-                    backgrounded: false,
-                },
-                Ok(Ok(crate::session::commands::PromptTurnOk {
-                    structured_output, ..
-                })) => {
-                    let wanted_schema = request.runtime_overrides.output_schema.is_some();
-                    let (success, error, output) = match (wanted_schema, structured_output) {
-                        (true, Some(Ok(value))) => {
-                            (true, None, std::sync::Arc::from(value.to_string()))
-                        }
-                        (true, Some(Err(e))) => (
-                            false,
-                            Some(format!("structured output validation failed: {e}")),
-                            std::sync::Arc::from(final_text),
-                        ),
-                        (true, None) => (
-                            false,
-                            Some("structured output requested but none produced".to_string()),
-                            std::sync::Arc::from(final_text),
-                        ),
-                        (false, _) => (
-                            true,
-                            None,
-                            if final_text.is_empty() {
-                                std::sync::Arc::from(format!(
-                                    "Subagent '{}' ({}) completed successfully. {} tool calls, {} turns.",
-                                    request.description, request.subagent_type, tool_calls, turns
-                                ))
-                            } else {
-                                std::sync::Arc::from(final_text)
-                            },
-                        ),
-                    };
-                    SubagentResult {
-                        success,
-                        error,
-                        output,
-                        subagent_id: request.id.clone(),
-                        child_session_id: child_session_id.0.to_string(),
-                        tool_calls,
-                        turns,
-                        duration_ms,
-                        tokens_used: result_tokens,
-                        output_tokens_used: 0,
-                        output_usage_incomplete: true,
-                        total_tokens_used: 0,
-                        worktree_path: worktree_path
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().to_string()),
-                        ..Default::default()
-                    }
-                }
-                Ok(Err(e)) => {
-                    cancellation_may_hide_usage = was_cancelled;
-                    SubagentResult {
-                        success: false,
-                        cancelled: was_cancelled,
-                        error: Some(if was_cancelled {
-                            "Subagent was cancelled".to_string()
-                        } else {
-                            format!("Session error: {e}")
-                        }),
-                        subagent_id: request.id.clone(),
-                        child_session_id: child_session_id.0.to_string(),
-                        tool_calls,
-                        turns,
-                        duration_ms,
-                        worktree_path: worktree_path
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().to_string()),
-                        ..Default::default()
-                    }
-                }
-                Err(_) => {
-                    cancellation_may_hide_usage = was_cancelled;
-                    SubagentResult {
-                        success: false,
-                        cancelled: was_cancelled,
-                        error: Some(if was_cancelled {
-                            "Subagent was cancelled".to_string()
-                        } else {
-                            "Child session dropped unexpectedly".to_string()
-                        }),
-                        subagent_id: request.id.clone(),
-                        child_session_id: child_session_id.0.to_string(),
-                        tool_calls,
-                        turns,
-                        duration_ms,
-                        worktree_path: worktree_path
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().to_string()),
-                        ..Default::default()
-                    }
-                }
-            }
-        }
-    };
+    let attempt = run_one_turn_attempt(OneTurnAttemptInput {
+        child_handle: &child_handle,
+        request: &request,
+        worktree_path: worktree_path.as_deref(),
+        task_prompt_text: &task_prompt_text,
+        inherited_tool_overrides: ctx.inherited_tool_overrides.clone(),
+        gcs_bucket_url: ctx.gcs_bucket_url.as_deref(),
+        gcs_upload_method: ctx.gcs_upload_method.as_ref(),
+        cancel_token: cancel_token.clone(),
+        child_run_started_at: start,
+    })
+    .await;
+    let OneTurnAttemptOutcome {
+        mut result,
+        trace,
+        cancellation_may_hide_usage,
+    } = attempt;
+    let OneTurnTraceCapture {
+        before_copy_rx,
+        child_prompt_id,
+        turn_started_at,
+        turn_token_totals,
+    } = trace;
     if let Some(trace_gcs_config) = gcs_upload_ctx.upload_method.as_ref().map(|method| {
         crate::session::repo_changes::TraceExportConfig {
             bucket_url: gcs_upload_ctx.bucket_url.clone(),
@@ -2016,14 +1285,12 @@ pub(crate) async fn run_shell_child(
         )
         .await;
         let subagent_auth = ctx.auth_manager.current();
-        let metadata = PromptMetadata {
+        let metadata = PromptMetadata::new(PromptMetadataParams {
             schema_version: GCS_SCHEMA_VERSION.to_string(),
             session_id: child_session_id.0.to_string(),
             turn_number: 0,
             request_id: child_prompt_id.clone(),
             turn_started_at: turn_started_at.clone(),
-            repo_root: None,
-            remote_url: None,
             user_id: subagent_auth.as_ref().map(|a| a.user_id.clone()),
             user_email: subagent_auth.as_ref().and_then(|a| a.email.clone()),
             team_id: subagent_auth.as_ref().and_then(|a| a.team_id.clone()),
@@ -2033,7 +1300,6 @@ pub(crate) async fn run_shell_child(
             reasoning_effort: child_handle
                 .reasoning_effort
                 .map(|e| e.as_str().to_string()),
-            experiment_id: None,
             host_os: std::env::consts::OS.to_string(),
             host_arch: std::env::consts::ARCH.to_string(),
             prompt_has_image: Some(false),
@@ -2042,9 +1308,9 @@ pub(crate) async fn run_shell_child(
             cwd: Some(child_handle.info.cwd.clone()),
             agent_type: Some(request.subagent_type.clone()),
             shell_version: Some(xai_grok_version::VERSION.to_string()),
-            workspace_type: None,
             sandbox: local_sandbox_telemetry(),
-        };
+            ..Default::default()
+        });
         upload_metadata(&trace_ctx, metadata).await;
         let resolved_model = child_handle
             .get_model_metadata()
@@ -2111,42 +1377,15 @@ pub(crate) async fn run_shell_child(
         0
     };
     completion_data.telemetry_tokens = telemetry_tokens;
-    let task_budget_usage = task_output_budget.as_ref().map(|budget| budget.usage());
-    let (subagent_usage_by_model, subagent_usage_incomplete, output_tokens_used, total_tokens_used) =
-        match child_handle.chat_state_handle.try_get_session_usage().await {
-            Ok(u) => {
-                let output_tokens = u.totals.output_tokens;
-                let total_tokens = canonical_total_tokens(&u.totals);
-                let has_usage_entries = !u.by_model.is_empty();
-                let usage_incomplete = usage_is_incomplete(
-                    u.incomplete,
-                    cancellation_may_hide_usage,
-                    total_tokens,
-                    has_usage_entries,
-                );
-                (
-                    Some(u.by_model.into_iter().collect::<Vec<_>>()),
-                    usage_incomplete,
-                    (!usage_incomplete).then_some(output_tokens),
-                    Some(total_tokens),
-                )
-            }
-            Err(()) => (None, true, None, None),
-        };
-    result.total_tokens_used = total_tokens_used.unwrap_or(0);
-    if let Some((task_spent, task_incomplete)) = task_budget_usage {
-        result.output_tokens_used = output_tokens_used.unwrap_or(task_spent);
-        result.output_usage_incomplete =
-            task_incomplete || subagent_usage_incomplete || output_tokens_used.is_none();
-    } else {
-        result.output_tokens_used = output_tokens_used.unwrap_or(0);
-        result.output_usage_incomplete = subagent_usage_incomplete || output_tokens_used.is_none();
-    }
-    let fold_acked = record_subagent_usage(
-        ctx.parent_cmd_tx.as_ref(),
-        subagent_usage_by_model,
-        request.parent_prompt_id.clone(),
-        subagent_usage_incomplete,
+    let fold_acked = capture_and_fold_one_turn_usage(
+        &mut result,
+        OneTurnUsageInput {
+            child_handle: &child_handle,
+            task_budget_usage: task_output_budget.as_ref().map(|budget| budget.usage()),
+            cancellation_may_hide_usage,
+            parent_cmd_tx: ctx.parent_cmd_tx.as_ref(),
+            parent_prompt_id: request.parent_prompt_id.as_deref(),
+        },
     )
     .await;
     if !fold_acked {
@@ -2330,13 +1569,7 @@ pub(crate) async fn run_shell_child(
         result.worktree_path = None;
     }
     let success = result.success && !result.cancelled;
-    let error_class = if result.cancelled {
-        "cancelled"
-    } else if result.error.is_some() {
-        "subagent_error"
-    } else {
-        "none"
-    };
+    let preview = crate::util::truncate(&result.output, 200);
     let level_fn = if success {
         xai_grok_telemetry::unified_log::info
     } else {
@@ -2358,144 +1591,9 @@ pub(crate) async fn run_shell_child(
             "duration_ms": result.duration_ms,
             "turns": result.turns,
             "tool_calls": result.tool_calls,
-            "output_present": !result.output.is_empty(),
-            "output_len": result.output.len(),
-            "error_present": result.error.is_some(),
-            "error_class": error_class,
+            "output_preview": preview,
+            "error": &result.error,
         })),
     );
     child_run_output(result, completion_data, disposed_snapshot_ref)
-}
-
-#[cfg(test)]
-mod resume_model_lineage_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn legacy_resume_recovers_committed_route_from_child_summary() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let child_dir = temp.path().join("persisted-child");
-        let child_info = SessionInfo {
-            id: acp::SessionId::new("child-session"),
-            cwd: "/workspace".to_owned(),
-        };
-        let storage = JsonlStorageAdapter::with_explicit_session_dir(child_dir.clone());
-        storage
-            .init_session(&child_info, acp::ModelId::new("codex-key"))
-            .await
-            .expect("initialize persisted child session");
-        let identity = xai_chat_state::CatalogIdentity {
-            model_id: "codex-key".to_owned(),
-            route: "gpt-5.3-codex-spark".to_owned(),
-            lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
-            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
-        };
-        storage
-            .update_current_model_identity_and_agent(
-                &child_info,
-                &acp::ModelId::new("codex-key"),
-                Some(&identity),
-                Some("codex"),
-                None,
-            )
-            .await
-            .expect("persist child model lineage");
-        let source = ResumeSourceData {
-            subagent_id: "legacy-source".to_owned(),
-            subagent_type: "general-purpose".to_owned(),
-            persona: None,
-            model_id: Some("codex-key".to_owned()),
-            model_route: None,
-            model_agent_type: None,
-            child_cwd: child_info.cwd.clone(),
-            worktree_path: None,
-            snapshot_ref: None,
-            child_session_id: child_info.id.0.to_string(),
-        };
-
-        let recovered = recover_resume_model_lineage_at(&source, child_dir)
-            .await
-            .expect("durable lineage should be consistent");
-
-        assert_eq!(recovered.route.as_deref(), Some("gpt-5.3-codex-spark"));
-        assert!(
-            recovered.agent_type.is_none(),
-            "summary.agent_name is the selected child role, not catalog harness lineage"
-        );
-        assert_eq!(recovered.catalog_identity.as_ref(), Some(&identity));
-    }
-
-    #[test]
-    fn inherited_codex_subagent_resume_preserves_accepted_model_harness_tuple() {
-        let selected_role = xai_grok_agent::AgentDefinition::general_purpose();
-        let catalog_harness = xai_grok_agent::AgentDefinition::grok_build_plan();
-        assert_eq!(
-            super::super::validate_subagent_model_harness(
-                &selected_role,
-                "grok-build-plan",
-                Some(&catalog_harness),
-            ),
-            Err(super::super::SubagentModelHarnessError::Incompatible),
-            "the regression requires role and catalog harness to differ",
-        );
-        assert!(
-            !should_preflight_model_harness(false, false, false),
-            "a fresh inherited model is not a model override",
-        );
-        assert!(
-            !should_preflight_model_harness(true, true, true),
-            "resume continues an accepted tuple instead of selecting a new model",
-        );
-        assert_eq!(
-            validate_resume_model_lineage(
-                &ResumeModelLineage {
-                    route: Some("gpt-5.3-codex-spark".to_owned()),
-                    agent_type: Some("grok-build-plan".to_owned()),
-                    catalog_identity: None,
-                },
-                "gpt-5.3-codex-spark",
-                "grok-build-plan",
-            ),
-            Ok(()),
-        );
-    }
-
-    #[test]
-    fn fresh_explicit_incompatible_model_still_requires_harness_preflight() {
-        assert!(should_preflight_model_harness(false, false, true));
-    }
-
-    #[test]
-    fn legacy_resume_without_committed_model_still_preflights_fresh_selection() {
-        assert!(should_preflight_model_harness(true, false, true));
-    }
-
-    #[test]
-    fn resume_model_lineage_fails_closed_when_route_or_harness_changes() {
-        let source = ResumeModelLineage {
-            route: Some("gpt-5.3-codex-spark".to_owned()),
-            agent_type: Some("grok-build-plan".to_owned()),
-            catalog_identity: None,
-        };
-        assert_eq!(
-            validate_resume_model_lineage(&source, "reused-route", "grok-build-plan"),
-            Err(ResumeModelLineageError::RouteChanged),
-        );
-        assert_eq!(
-            validate_resume_model_lineage(&source, "gpt-5.3-codex-spark", "codex"),
-            Err(ResumeModelLineageError::HarnessChanged),
-        );
-    }
-
-    #[test]
-    fn legacy_resume_without_route_lineage_fails_closed() {
-        assert_eq!(
-            validate_resume_model_lineage(
-                &ResumeModelLineage::default(),
-                "gpt-5.3-codex-spark",
-                "grok-build-plan",
-            ),
-            Err(ResumeModelLineageError::MissingRoute),
-        );
-    }
 }

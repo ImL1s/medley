@@ -60,65 +60,6 @@ pub(crate) enum AuthRetryDecision {
     RunawayGuard { rejections: u32 },
 }
 
-/// Per-top-level-turn retry lid for ChatGPT Codex. Unlike the xAI session
-/// recovery schedule below, Codex's provider contract permits exactly one
-/// forced refresh/resubmit after a 401. The turn driver owns this value so a
-/// successful refresh cannot silently reset the budget before the resubmit.
-pub(crate) struct Codex401RetryBudget {
-    available: bool,
-}
-
-impl Codex401RetryBudget {
-    pub(crate) fn new() -> Self {
-        Self { available: true }
-    }
-
-    pub(crate) fn available(&self) -> bool {
-        self.available
-    }
-
-    pub(crate) fn consume(&mut self) -> bool {
-        std::mem::replace(&mut self.available, false)
-    }
-}
-
-/// Provider action for one sampler 401. The input is secret-free request
-/// metadata captured at the HTTP response boundary plus whether the provider
-/// still has a current credential when recovery starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Provider401RecoveryAction {
-    /// The rejected request used an older credential (or none); use the
-    /// provider's newer cached credential without another refresh.
-    AdoptCached,
-    /// The server rejected the provider's current credential; refresh it with
-    /// the provider's `ServerRejected` path before retrying.
-    RefreshServerRejected,
-    /// No current provider credential is available; mint/resolve one.
-    EnsureFresh,
-}
-
-/// Choose recovery from the credential actually placed on the rejected
-/// request. Legacy/unknown metadata fails closed toward a forced refresh, so
-/// the one allowed retry never knowingly replays the rejected current token.
-pub(crate) fn provider_401_recovery_action(
-    credential: SentCredential,
-    current_provider_credential_present: bool,
-) -> Provider401RecoveryAction {
-    use Provider401RecoveryAction::{AdoptCached, EnsureFresh, RefreshServerRejected};
-
-    if !current_provider_credential_present {
-        return EnsureFresh;
-    }
-    match credential {
-        SentCredential::DifferentFromCurrent | SentCredential::Missing => AdoptCached,
-        SentCredential::SameAsCurrent
-        | SentCredential::Sent
-        | SentCredential::Unknown
-        | SentCredential::CurrentUnavailable => RefreshServerRejected,
-        _ => RefreshServerRejected,
-    }
-}
-
 /// Escalating retry budget for post-recovery 401s. The budget is
 /// per-incident (successes and suspend boundaries reset it, the latter
 /// capped) and only credentialed rejections charge it; the doc on each
@@ -210,7 +151,7 @@ impl AuthRetrySchedule {
         }
         self.incident_started.get_or_insert(now);
         self.incident_rejections += 1;
-        if credential.is_sent() {
+        if credential == SentCredential::Sent {
             self.incident_authenticated += 1;
         }
         match self.delays.next() {

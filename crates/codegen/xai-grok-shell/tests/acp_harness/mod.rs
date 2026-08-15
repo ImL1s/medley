@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent as _};
-use futures::FutureExt as _;
 use serde_json::json;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use xai_acp_lib::{
@@ -57,29 +56,11 @@ pub fn allow_once(args: &acp::RequestPermissionRequest) -> acp::RequestPermissio
 pub async fn connect_and_auth<C>(
     client: C,
     client_type: &str,
-    inference_base_url: &str,
 ) -> (acp::ClientSideConnection, acp::InitializeResponse)
 where
     C: acp::Client + 'static,
 {
-    // The harness constructs `MvpAgent` directly, bypassing production's
-    // config-file loader. Declare the fixture model here so both catalog
-    // discovery and inference remain pinned to the same mock origin.
-    let raw_config: toml::Value = toml::from_str(&format!(
-        r#"[model.test-model]
-model = "test-model"
-base_url = {inference_base_url:?}
-api_backend = "responses"
-env_key = "XAI_API_KEY"
-
-[models]
-default = "test-model"
-session_summary = "test-model"
-"#
-    ))
-    .expect("parse hermetic ACP model config");
-    let agent_config =
-        AgentConfig::new_from_toml_cfg(&raw_config).expect("valid hermetic ACP model config");
+    let agent_config = AgentConfig::default();
     let auth_manager = Arc::new(agent_config.create_auth_manager());
     let (gw_tx, gw_rx) = tokio::sync::mpsc::unbounded_channel();
     let agent = MvpAgent::new(GatewaySender::new(gw_tx), &agent_config, auth_manager, None)
@@ -155,6 +136,9 @@ session_summary = "test-model"
     (client_conn, init)
 }
 
+// Dead-code allows below: same per-binary compilation as `AutoApproveClient`
+// above — each helper is used by some including test binaries, not all.
+#[allow(dead_code)]
 pub async fn ext_method(
     conn: &acp::ClientSideConnection,
     method: &str,
@@ -172,6 +156,7 @@ pub async fn ext_method(
     serde_json::from_str(resp.0.get()).unwrap_or_else(|e| panic!("{method}: bad response: {e}"))
 }
 
+#[allow(dead_code)]
 pub async fn new_session(
     conn: &acp::ClientSideConnection,
     cwd: &std::path::Path,
@@ -224,6 +209,9 @@ fn set_test_env(grok_home: &std::path::Path, server_url: &str) {
         std::env::set_var("GROK_TELEMETRY_ENABLED", "false");
         std::env::set_var("GROK_FEEDBACK_ENABLED", "false");
         std::env::set_var("GROK_TRACE_UPLOAD", "false");
+        // Turn summaries fire a post-turn side-call to the same mock endpoint
+        // on a spawned task; the race makes request-count assertions flaky.
+        std::env::set_var("GROK_TURN_SUMMARY", "false");
     }
 }
 
@@ -258,20 +246,8 @@ where
         .build()
         .expect("agent runtime");
     let local = tokio::task::LocalSet::new();
-    let outcome = agent_rt.block_on(
-        local.run_until(
-            std::panic::AssertUnwindSafe(body(
-                workdir.path().to_path_buf(),
-                std::rc::Rc::clone(&server),
-            ))
-            .catch_unwind(),
-        ),
-    );
-    if let Err(payload) = outcome {
-        eprintln!(
-            "mock inference request log:\n{}",
-            server.request_log_summary()
-        );
-        std::panic::resume_unwind(payload);
-    }
+    agent_rt.block_on(local.run_until(body(
+        workdir.path().to_path_buf(),
+        std::rc::Rc::clone(&server),
+    )));
 }

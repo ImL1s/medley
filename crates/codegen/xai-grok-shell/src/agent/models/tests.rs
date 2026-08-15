@@ -18,64 +18,67 @@ fn test_manager() -> ModelsManager {
     .build()
 }
 
-/// #110: with an empty catalog, `sampling_config` synthesises a fallback
-/// entry against `models_base_url`. Pointed anywhere non-first-party that
-/// entry is credential-less and unready, and the choke point strips it — but
-/// stripping is not enough here. When the session path cannot resolve a model
-/// id it clones this construction-time config verbatim
-/// (`resolve_sampling_config_for_model`), and the readiness latch skips
-/// entries it cannot find, so the user's first prompt would be sent to that
-/// origin with no authentication. Unready has to mean unusable at this seam.
-#[test]
-fn construction_fallback_is_unusable_when_the_catalog_endpoint_is_external() {
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = std::env::temp_dir().join("grok-test-fallback-origin");
-    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
-    let mut cfg = config::Config::default();
-    cfg.endpoints.models_base_url = Some("https://third-party.example/v1".to_string());
-    let mgr = ModelsManagerBuilder::new(
+/// Cold manager (no prefetch, isolated cache and auth) over `endpoint`.
+fn cold_manager(cfg: config::Config, endpoint: Arc<dyn ModelsEndpoint>) -> ModelsManager {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    ModelsManagerBuilder::new(
         None,
         IndexMap::new(),
         acp::ModelId::new("default"),
         auth_manager,
         cfg,
     )
-    .cache(test_cache_manager(&tmp))
-    .build();
-
-    let sampling = mgr.sampling_config();
-    assert!(
-        sampling.base_url.is_empty(),
-        "an unready construction fallback must not carry a usable endpoint, got {}",
-        sampling.base_url
-    );
-    assert_eq!(sampling.api_key, None, "and no credential with it");
+    .endpoint(endpoint)
+    .cache(test_cache_manager(tmp.path()))
+    .build()
 }
 
-/// The same seam on a first-party endpoint is the normal startup path and
-/// must keep working.
-#[test]
-fn construction_fallback_is_usable_on_a_first_party_endpoint() {
-    let tmp = std::env::temp_dir().join("grok-test-fallback-first-party");
-    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
-    let mgr = ModelsManagerBuilder::new(
-        None,
-        IndexMap::new(),
-        acp::ModelId::new("default"),
-        auth_manager,
-        config::Config::default(),
-    )
-    .cache(test_cache_manager(&tmp))
-    .build();
+/// Never resolves.
+struct HangingEndpoint;
+impl ModelsEndpoint for HangingEndpoint {
+    fn fetch_models(
+        &self,
+        _endpoints: config::EndpointsConfig,
+        _auth: Option<GrokAuth>,
+        _fetch_auth: ModelFetchAuth,
+    ) -> ModelsFetchFuture {
+        Box::pin(std::future::pending())
+    }
+}
 
-    assert!(
-        !mgr.sampling_config().base_url.is_empty(),
-        "the first-party default is the normal startup path"
-    );
+/// Fails every fetch immediately.
+struct FailingEndpoint;
+impl ModelsEndpoint for FailingEndpoint {
+    fn fetch_models(
+        &self,
+        _endpoints: config::EndpointsConfig,
+        _auth: Option<GrokAuth>,
+        _fetch_auth: ModelFetchAuth,
+    ) -> ModelsFetchFuture {
+        Box::pin(async { None })
+    }
+}
+
+/// Serves `catalog` after `delay`.
+struct SlowEndpoint {
+    catalog: IndexMap<String, ModelEntry>,
+    delay: std::time::Duration,
+}
+impl ModelsEndpoint for SlowEndpoint {
+    fn fetch_models(
+        &self,
+        _endpoints: config::EndpointsConfig,
+        _auth: Option<GrokAuth>,
+        _fetch_auth: ModelFetchAuth,
+    ) -> ModelsFetchFuture {
+        let catalog = self.catalog.clone();
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Some(catalog)
+        })
+    }
 }
 
 #[tokio::test]
@@ -120,7 +123,10 @@ async fn catalog_retry_recovers_after_endpoint_returns() {
     .build();
     assert!(!mgr.has_fetched_real_catalog());
 
-    mgr.spawn_catalog_retry_with_backoff(crate::tools::retry::BackoffConfig::new(5, 1, 10));
+    mgr.spawn_catalog_retry_with_backoff(
+        /*remote_fetch_enabled*/ true,
+        crate::tools::retry::BackoffConfig::new(5, 1, 10),
+    );
 
     let mut recovered = false;
     for _ in 0..200 {
@@ -142,7 +148,7 @@ async fn catalog_retry_recovers_after_endpoint_returns() {
 }
 
 #[tokio::test]
-async fn offline_strategy_serves_cache_without_fetching() {
+async fn disk_cache_reload_applies_without_fetching() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingEndpoint {
@@ -185,12 +191,12 @@ async fn offline_strategy_serves_cache_without_fetching() {
         &mgr.cache_origin(),
     );
 
-    mgr.list_models(RefreshStrategy::Offline).await;
+    mgr.reload_from_disk_cache();
 
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
-        "Offline must serve the disk cache, never hit the transport",
+        "the disk cache load must never hit the transport",
     );
     assert!(mgr.models().contains_key("grok-4.5"));
     assert!(mgr.has_fetched_real_catalog());
@@ -258,33 +264,11 @@ async fn auth_refresh_watcher_refetches_on_notify() {
 
 #[tokio::test(start_paused = true)]
 async fn hanging_fetch_does_not_block_refresh() {
-    struct HangingEndpoint;
-    impl ModelsEndpoint for HangingEndpoint {
-        fn fetch_models(
-            &self,
-            _endpoints: config::EndpointsConfig,
-            _auth: Option<GrokAuth>,
-            _fetch_auth: ModelFetchAuth,
-        ) -> ModelsFetchFuture {
-            Box::pin(std::future::pending())
-        }
-    }
-
-    let tmp = std::env::temp_dir().join("grok-test-hanging-fetch");
-    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
-    let mgr = ModelsManagerBuilder::new(
-        None,
-        IndexMap::new(),
-        acp::ModelId::new("default"),
-        auth_manager,
-        config::Config::default(),
-    )
-    .endpoint(Arc::new(HangingEndpoint))
-    .build();
+    let mgr = cold_manager(config::Config::default(), Arc::new(HangingEndpoint));
 
     tokio::time::timeout(
         crate::http::STARTUP_FETCH_TIMEOUT * 10,
-        mgr.fetch_and_apply_inner(true),
+        mgr.fetch_and_apply_inner(/*remote_fetch_enabled*/ true),
     )
     .await
     .expect("fetch_and_apply_inner must return despite a hanging endpoint");
@@ -299,42 +283,16 @@ async fn hanging_fetch_does_not_block_refresh() {
 async fn slow_fetch_within_timeout_still_applies() {
     // "Slow but succeeds": a fetch that returns just under STARTUP_FETCH_TIMEOUT
     // must still be applied, not degraded to offline.
-    struct SlowEndpoint {
-        catalog: IndexMap<String, ModelEntry>,
-        delay: std::time::Duration,
-    }
-    impl ModelsEndpoint for SlowEndpoint {
-        fn fetch_models(
-            &self,
-            _endpoints: config::EndpointsConfig,
-            _auth: Option<GrokAuth>,
-            _fetch_auth: ModelFetchAuth,
-        ) -> ModelsFetchFuture {
-            let catalog = self.catalog.clone();
-            let delay = self.delay;
-            Box::pin(async move {
-                tokio::time::sleep(delay).await;
-                Some(catalog)
-            })
-        }
-    }
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
-    let mgr = ModelsManagerBuilder::new(
-        None,
-        IndexMap::new(),
-        acp::ModelId::new("default"),
-        auth_manager,
+    let mgr = cold_manager(
         config::Config::default(),
-    )
-    .endpoint(Arc::new(SlowEndpoint {
-        catalog: make_prefetched(&["grok-4"]),
-        delay: crate::http::STARTUP_FETCH_TIMEOUT / 2,
-    }))
-    .build();
+        Arc::new(SlowEndpoint {
+            catalog: make_prefetched(&["grok-4"]),
+            delay: crate::http::STARTUP_FETCH_TIMEOUT / 2,
+        }),
+    );
 
-    mgr.fetch_and_apply_inner(true).await;
+    mgr.fetch_and_apply_inner(/*remote_fetch_enabled*/ true)
+        .await;
     assert!(
         mgr.has_fetched_real_catalog(),
         "a fetch within the timeout must apply, not degrade",
@@ -377,10 +335,10 @@ async fn etag_refresh_is_bounded_and_single_flighted() {
     .build();
 
     // First etag change spawns a bounded fetch; let the task register in-flight.
-    mgr.spawn_fetch_inner(Some("etag-1".into()), true);
+    mgr.spawn_fetch_inner(Some("etag-1".into()), /*remote_fetch_enabled*/ true);
     tokio::task::yield_now().await;
     // Single-flight: a second spawn while one is in flight must not fetch again.
-    mgr.spawn_fetch_inner(Some("etag-2".into()), true);
+    mgr.spawn_fetch_inner(Some("etag-2".into()), /*remote_fetch_enabled*/ true);
     tokio::task::yield_now().await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -393,7 +351,7 @@ async fn etag_refresh_is_bounded_and_single_flighted() {
     tokio::task::yield_now().await;
 
     // Guard released → a later etag change fetches again.
-    mgr.spawn_fetch_inner(Some("etag-3".into()), true);
+    mgr.spawn_fetch_inner(Some("etag-3".into()), /*remote_fetch_enabled*/ true);
     tokio::task::yield_now().await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -402,13 +360,184 @@ async fn etag_refresh_is_bounded_and_single_flighted() {
     );
 
     // remote_fetch disabled is a no-op: no additional fetch.
-    mgr.spawn_fetch_inner(Some("etag-4".into()), false);
+    mgr.spawn_fetch_inner(Some("etag-4".into()), /*remote_fetch_enabled*/ false);
     tokio::task::yield_now().await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,
         "disabled gate must not fetch"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_catalog_wait_unblocks_on_fetch_and_skips_dead_dwell() {
+    // Deployment auth: a fetch can succeed without a session, so the wait
+    // dwells regardless of ambient API-key env.
+    let mgr = cold_manager(
+        config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\""),
+        Arc::new(SlowEndpoint {
+            catalog: make_prefetched(&["grok-4"]),
+            delay: crate::http::STARTUP_FETCH_TIMEOUT / 2,
+        }),
+    );
+
+    // Cold cache, remote fetch disabled: no fetch is coming, so no dwell.
+    let start = tokio::time::Instant::now();
+    assert!(
+        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ false)
+            .await
+    );
+    assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+
+    // Cold cache, no attempt spawned: nothing to wait for, so no dwell.
+    let start = tokio::time::Instant::now();
+    assert!(
+        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+            .await
+    );
+    assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+
+    // Cold cache, fetch in flight: the wait unblocks when the fetch lands.
+    mgr.spawn_fetch_inner(None, /*remote_fetch_enabled*/ true);
+    assert!(
+        mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+            .await,
+        "the wait must observe the completed fetch",
+    );
+    assert!(mgr.models().contains_key("grok-4"));
+
+    // Warm: an already-loaded catalog returns immediately.
+    let start = tokio::time::Instant::now();
+    assert!(
+        mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+            .await
+    );
+    assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_catalog_wait_unblocks_on_failed_fetch() {
+    let mgr = cold_manager(
+        config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\""),
+        Arc::new(FailingEndpoint),
+    );
+    let budget = crate::http::STARTUP_AUTH_REFRESH_TIMEOUT + crate::http::STARTUP_FETCH_TIMEOUT;
+    let start = tokio::time::Instant::now();
+    mgr.spawn_fetch_inner(None, /*remote_fetch_enabled*/ true);
+    assert!(
+        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+            .await
+    );
+    assert!(start.elapsed() < budget, "failure must beat the budget");
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_catalog_wait_is_bounded() {
+    let mgr = cold_manager(
+        config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\""),
+        Arc::new(HangingEndpoint),
+    );
+    let budget = crate::http::STARTUP_AUTH_REFRESH_TIMEOUT + crate::http::STARTUP_FETCH_TIMEOUT;
+    let _attempt = FetchAttemptGuard::begin(&mgr.inner);
+    let start = tokio::time::Instant::now();
+    assert!(
+        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+            .await
+    );
+    assert_eq!(start.elapsed(), budget, "only the budget ends this wait");
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn first_catalog_wait_skips_doomed_signed_out_fetch() {
+    let _no_key = EnvGuard::unset("XAI_API_KEY");
+    let _no_legacy_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let mgr = cold_manager(config::Config::default(), Arc::new(HangingEndpoint));
+    let start = tokio::time::Instant::now();
+    mgr.spawn_fetch_inner(None, /*remote_fetch_enabled*/ true);
+    assert!(
+        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+            .await
+    );
+    assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_catalog_wait_observes_inline_fetch() {
+    let mgr = cold_manager(
+        config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\""),
+        Arc::new(SlowEndpoint {
+            catalog: make_prefetched(&["grok-4"]),
+            delay: crate::http::STARTUP_FETCH_TIMEOUT / 2,
+        }),
+    );
+    // Fetch first in the join, so its attempt registers on first poll.
+    let ((), ready) = tokio::join!(
+        mgr.fetch_and_apply_inner(/*remote_fetch_enabled*/ true),
+        mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true),
+    );
+    assert!(ready, "the wait must observe the inline fetch's outcome");
+}
+
+#[tokio::test(start_paused = true)]
+async fn new_fetch_attempt_supersedes_failed_latch() {
+    let mgr = cold_manager(
+        config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\""),
+        Arc::new(FailingEndpoint),
+    );
+    mgr.fetch_and_apply_inner(/*remote_fetch_enabled*/ true)
+        .await;
+    assert_eq!(
+        *mgr.inner.catalog_progress.borrow(),
+        CatalogProgress::Failed
+    );
+
+    let attempt = FetchAttemptGuard::begin(&mgr.inner);
+    assert_eq!(
+        *mgr.inner.catalog_progress.borrow(),
+        CatalogProgress::Pending,
+        "a new attempt must supersede the stale failure",
+    );
+    drop(attempt);
+    assert_eq!(
+        *mgr.inner.catalog_progress.borrow(),
+        CatalogProgress::Failed,
+        "the last attempt out without an outcome must latch",
+    );
+
+    let start = tokio::time::Instant::now();
+    assert!(
+        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+            .await
+    );
+    assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+}
+
+#[test]
+fn stale_fetch_result_is_discarded_after_identity_change() {
+    let mgr = test_manager();
+    let cfg = config::Config::default();
+    let stale_generation = mgr.inner.catalog.read().generation;
+    mgr.clear();
+
+    assert!(!mgr.apply_refresh_result_fenced(
+        &cfg,
+        Some(make_prefetched(&["stale-model"])),
+        None,
+        stale_generation,
+    ));
+    assert!(!mgr.models().contains_key("stale-model"));
+    assert!(!mgr.has_fetched_real_catalog());
+
+    assert!(!mgr.apply_refresh_result_fenced(&cfg, None, None, stale_generation));
+    assert_eq!(
+        *mgr.inner.catalog_progress.borrow(),
+        CatalogProgress::Pending,
+        "a stale failure must not latch",
+    );
+
+    assert!(mgr.apply_refresh_result(&cfg, Some(make_prefetched(&["new-model"])), None));
+    assert!(mgr.models().contains_key("new-model"));
 }
 
 fn config_from_toml(toml: &str) -> config::Config {
@@ -425,7 +554,6 @@ fn model_show_model_fingerprint_reads_catalog_flag() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
-        config_validation_errors: Vec::new(),
     };
     flagged.info.show_model_fingerprint = true;
     mgr.insert_test_entry("fp-model", flagged);
@@ -438,7 +566,6 @@ fn model_show_model_fingerprint_reads_catalog_flag() {
             env_key: None,
             auth_provider: None,
             api_base_url: None,
-            config_validation_errors: Vec::new(),
         },
     );
 
@@ -448,7 +575,6 @@ fn model_show_model_fingerprint_reads_catalog_flag() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
-        config_validation_errors: Vec::new(),
     };
     custom.info.show_model_fingerprint = true;
     mgr.insert_test_entry("enterprise-key", custom);
@@ -480,7 +606,7 @@ fn default_model_honors_allowlist_when_no_default_set() {
             "#,
     );
     let catalog = resolve_model_catalog(&cfg, None);
-    let (_key, entry, _src, _) = resolve_default_model(&cfg, &catalog, true);
+    let (_key, entry, _src) = resolve_default_model(&cfg, &catalog, true);
     assert!(
         entry.info.user_selectable,
         "picked non-selectable {}",
@@ -612,97 +738,6 @@ fn reselect_missing_current_model_bumps_watch() {
     );
 }
 
-/// #296: once a non-empty runtime catalog is authoritative, the manager must
-/// never retain or synthesize a current id that is absent from that catalog.
-/// Even an all-unready catalog has more truthful identities than the bundled
-/// pre-catalog sentinel: seating a real entry lets the UI surface its concrete
-/// readiness reason and keeps the session catalog id aligned with its route.
-#[test]
-fn authoritative_all_unready_catalog_seats_a_present_model_id() {
-    let mgr = test_manager();
-    let cfg = config::Config::default();
-    let mut entry = make_model_entry("unready-runtime-model");
-    entry
-        .config_validation_errors
-        .push("fixture intentionally unready".to_string());
-    let catalog = IndexMap::from([("unready-runtime-model".to_string(), entry)]);
-
-    mgr.apply_refresh_result(&cfg, Some(catalog), None);
-
-    let current = mgr.current_model_id();
-    assert_eq!(current.0.as_ref(), "unready-runtime-model");
-    assert!(
-        mgr.models().contains_key(current.0.as_ref()),
-        "an authoritative catalog must never publish an absent current id"
-    );
-    let listed = mgr
-        .available()
-        .get(&current)
-        .cloned()
-        .expect("the seated runtime model must remain visible to the client");
-    let meta = listed
-        .meta
-        .expect("an unready model must expose readiness meta");
-    assert_eq!(meta.get("ready"), Some(&serde_json::json!(false)));
-    assert_eq!(
-        meta.get("readinessReason"),
-        Some(&serde_json::json!("fixture intentionally unready")),
-        "the TUI must receive the concrete reason instead of rendering an unknown model"
-    );
-}
-
-/// A non-empty catalog can still have no entry the current credential is
-/// allowed to select (for example, an API-key session receiving only
-/// OAuth-only entries). That state must not seat or sample an auth-hidden
-/// model merely to keep the internal id inside the raw catalog.
-#[test]
-fn authoritative_catalog_without_auth_visible_model_fails_closed() {
-    let mgr = test_manager();
-    let cfg = config::Config::default();
-    let mut oauth_only = make_model_entry("oauth-only");
-    oauth_only.info.supported_in_api = false;
-
-    mgr.apply_refresh_result(
-        &cfg,
-        Some(IndexMap::from([("oauth-only".to_string(), oauth_only)])),
-        None,
-    );
-
-    assert!(mgr.available().is_empty());
-    assert!(
-        mgr.current_model_id().0.is_empty(),
-        "an auth-hidden catalog entry must not become the current model"
-    );
-    let sampling = mgr.sampling_config();
-    assert!(
-        sampling.base_url.is_empty(),
-        "an auth-hidden catalog must fail before any provider request"
-    );
-    assert_eq!(sampling.api_key, None);
-}
-
-#[test]
-fn authoritative_catalog_without_user_selectable_model_fails_closed() {
-    let mgr = test_manager();
-    let cfg = config_from_toml("[models]\nallowed_models = [\"allowed-*\"]");
-    let hidden_from_picker = make_model_entry("not-selectable");
-
-    mgr.apply_refresh_result(
-        &cfg,
-        Some(IndexMap::from([(
-            "not-selectable".to_string(),
-            hidden_from_picker,
-        )])),
-        None,
-    );
-
-    assert!(mgr.available().is_empty());
-    assert!(mgr.current_model_id().0.is_empty());
-    let sampling = mgr.sampling_config();
-    assert!(sampling.base_url.is_empty());
-    assert_eq!(sampling.api_key, None);
-}
-
 #[test]
 fn rebuild_updates_models_and_available() {
     let mgr = test_manager();
@@ -719,21 +754,14 @@ fn rebuild_updates_models_and_available() {
             env_key: None,
             auth_provider: None,
             api_base_url: None,
-            config_validation_errors: Vec::new(),
         },
     );
 
-    let gen_before = mgr.catalog_generation();
     mgr.rebuild(&cfg, Some(prefetched));
 
     assert!(
         !mgr.models().is_empty(),
         "models should be populated after rebuild"
-    );
-    assert_ne!(
-        mgr.catalog_generation(),
-        gen_before,
-        "rebuild must bump catalog_generation so auth memos cannot outlive the swap (#159 F1)"
     );
 }
 
@@ -755,274 +783,14 @@ fn current_reasoning_effort_seeded_from_config() {
     let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
     let mut cfg = config::Config::default();
     cfg.models.default_reasoning_effort = Some(ReasoningEffort::Xhigh);
-    let mut entry = ModelEntry {
-        info: config::ModelInfo::fallback("default"),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    };
-    entry.info.supports_reasoning_effort = true;
-    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
-        id: "xhigh".into(),
-        value: ReasoningEffort::Xhigh,
-        label: "Extra high".into(),
-        description: None,
-        default: true,
-    }];
     let mgr = ModelsManager::new(
         None,
-        IndexMap::from([("default".to_string(), entry)]),
+        IndexMap::new(),
         acp::ModelId::new("default"),
         auth_manager,
         cfg,
     );
     assert_eq!(mgr.current_reasoning_effort(), Some(ReasoningEffort::Xhigh),);
-}
-
-#[test]
-fn current_reasoning_effort_rejects_persisted_value_outside_model_menu() {
-    let tmp = std::env::temp_dir().join("grok-test-models-manager-invalid-seed");
-    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
-    let mut cfg = config::Config::default();
-    cfg.models.default_reasoning_effort = Some(ReasoningEffort::Xhigh);
-    let mut entry = ModelEntry {
-        info: config::ModelInfo::fallback("default"),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    };
-    entry.info.supports_reasoning_effort = true;
-    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
-        id: "low".into(),
-        value: ReasoningEffort::Low,
-        label: "Low".into(),
-        description: None,
-        default: true,
-    }];
-    let mgr = ModelsManager::new(
-        None,
-        IndexMap::from([("default".to_string(), entry)]),
-        acp::ModelId::new("default"),
-        auth_manager,
-        cfg,
-    );
-    assert_eq!(
-        mgr.current_reasoning_effort(),
-        None,
-        "a persisted tier removed from the current model's menu must not seed the session",
-    );
-}
-
-fn reasoning_entry_with_menu(model: &str, effort: ReasoningEffort) -> (String, ModelEntry) {
-    let mut entry = ModelEntry {
-        info: config::ModelInfo::fallback(model),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    };
-    entry.info.supports_reasoning_effort = true;
-    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
-        id: effort.to_string(),
-        value: effort,
-        label: effort.to_string(),
-        description: None,
-        default: true,
-    }];
-    entry.info.reasoning_effort = Some(effort);
-    (model.to_owned(), entry)
-}
-
-#[test]
-fn catalog_refresh_clears_current_effort_removed_from_model_menu() {
-    let mgr = test_manager();
-    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
-    mgr.apply_catalog_for_test(IndexMap::from([reasoning_entry_with_menu(
-        "default",
-        ReasoningEffort::Low,
-    )]));
-    assert_eq!(mgr.current_reasoning_effort(), None);
-}
-
-#[test]
-fn stale_effort_revalidation_does_not_clear_newer_selection() {
-    let mgr = test_manager();
-    let validated_model = mgr.current_model_id();
-    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
-
-    // Deterministic interleaving: validation captured A/high, then a switch
-    // committed B/high before the invalid result attempted its conditional
-    // clear. Comparing only the effort would incorrectly clear B's selection.
-    mgr.set_current_model_id(acp::ModelId::new("grok-4"));
-    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
-    mgr.clear_reasoning_effort_if_selection_unchanged(&validated_model, ReasoningEffort::High);
-
-    assert_eq!(
-        mgr.current_reasoning_effort(),
-        Some(ReasoningEffort::High),
-        "a refresh validating A/high must not clobber a newer B/high selection"
-    );
-}
-
-#[test]
-fn config_refresh_clears_current_effort_removed_from_model_menu() {
-    let tmp = std::env::temp_dir().join("grok-test-models-manager-config-effort-refresh");
-    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
-    let mgr = ModelsManager::new(
-        None,
-        IndexMap::from([reasoning_entry_with_menu("default", ReasoningEffort::High)]),
-        acp::ModelId::new("default"),
-        auth_manager,
-        config::Config::default(),
-    );
-    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
-
-    let mut new_config = config::Config::default();
-    new_config.config_models.insert(
-        "default".to_owned(),
-        config::ConfigModelOverride {
-            supports_reasoning_effort: Some(true),
-            reasoning_effort: Some(ReasoningEffort::Low),
-            reasoning_efforts: vec![ReasoningEffortOption {
-                id: "low".into(),
-                value: ReasoningEffort::Low,
-                label: "Low".into(),
-                description: None,
-                default: true,
-            }],
-            ..Default::default()
-        },
-    );
-    mgr.apply_config(new_config);
-    assert_eq!(mgr.current_reasoning_effort(), None);
-}
-
-#[test]
-fn unconditional_default_reselection_revalidates_current_effort() {
-    let tmp = std::env::temp_dir().join("grok-test-models-manager-default-effort-reselect");
-    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("model-b".to_owned());
-    for (model, effort) in [
-        ("model-a", ReasoningEffort::High),
-        ("model-b", ReasoningEffort::Low),
-    ] {
-        cfg.config_models.insert(
-            model.to_owned(),
-            config::ConfigModelOverride {
-                model: Some(model.to_owned()),
-                supports_reasoning_effort: Some(true),
-                reasoning_effort: Some(effort),
-                reasoning_efforts: vec![ReasoningEffortOption {
-                    id: effort.to_string(),
-                    value: effort,
-                    label: effort.to_string(),
-                    description: None,
-                    default: true,
-                }],
-                ..Default::default()
-            },
-        );
-    }
-    let initial_models = resolve_model_catalog(&cfg, None);
-    let mgr = ModelsManager::new(
-        None,
-        initial_models,
-        acp::ModelId::new("model-a"),
-        auth_manager,
-        cfg.clone(),
-    );
-    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
-
-    mgr.apply_config_reselecting_default(cfg);
-
-    assert_eq!(mgr.current_model_id(), acp::ModelId::new("model-b"));
-    assert_eq!(mgr.current_reasoning_effort(), None);
-}
-
-#[test]
-fn session_model_effort_validation_uses_requested_model_menu() {
-    let tmp = std::env::temp_dir().join("grok-test-models-manager-session-effort");
-    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
-    let models = IndexMap::from([
-        reasoning_entry_with_menu("model-a", ReasoningEffort::Xhigh),
-        reasoning_entry_with_menu("model-b", ReasoningEffort::Low),
-    ]);
-    let mgr = ModelsManager::new(
-        None,
-        models,
-        acp::ModelId::new("model-a"),
-        auth_manager,
-        config::Config::default(),
-    );
-
-    assert!(mgr.model_offers_reasoning_effort("model-a", ReasoningEffort::Xhigh));
-    assert!(
-        !mgr.model_offers_reasoning_effort("model-b", ReasoningEffort::Xhigh),
-        "a custom session model must not inherit an effort offered only by the manager's current model"
-    );
-}
-
-#[test]
-fn menu_less_reasoning_model_accepts_legacy_minimal_effort() {
-    let tmp = std::env::temp_dir().join("grok-test-models-manager-minimal-effort");
-    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
-    let mut entry = ModelEntry {
-        info: config::ModelInfo::fallback("legacy-reasoning"),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    };
-    entry.info.supports_reasoning_effort = true;
-    entry.info.reasoning_efforts.clear();
-    let mut cfg = config::Config::default();
-    cfg.models.default_reasoning_effort = Some(ReasoningEffort::Minimal);
-    let mgr = ModelsManager::new(
-        None,
-        IndexMap::from([("legacy-reasoning".to_string(), entry)]),
-        acp::ModelId::new("legacy-reasoning"),
-        auth_manager,
-        cfg,
-    );
-
-    assert!(mgr.model_offers_reasoning_effort("legacy-reasoning", ReasoningEffort::Minimal));
-    assert_eq!(
-        mgr.current_reasoning_effort(),
-        Some(ReasoningEffort::Minimal)
-    );
-}
-
-#[test]
-fn rebuild_revalidates_current_reasoning_effort() {
-    let mut cfg = config::Config::default();
-    cfg.config_models.insert(
-        "default".to_string(),
-        config::ConfigModelOverride {
-            model: Some("default".to_string()),
-            supports_reasoning_effort: Some(true),
-            reasoning_efforts: vec![ReasoningEffortOption {
-                id: "low".to_string(),
-                value: ReasoningEffort::Low,
-                label: "Low".to_string(),
-                description: None,
-                default: true,
-            }],
-            ..Default::default()
-        },
-    );
-    let mgr = test_manager();
-    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
-
-    mgr.rebuild(&cfg, None);
-
-    assert_eq!(mgr.current_reasoning_effort(), None);
 }
 
 #[test]
@@ -1040,7 +808,6 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
-        config_validation_errors: Vec::new(),
     };
     reasoning_entry.info.supports_reasoning_effort = true;
     prefetched.insert("reasoning-model".to_string(), reasoning_entry);
@@ -1063,7 +830,6 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
-        config_validation_errors: Vec::new(),
     };
     prefetched.insert("plain-model".to_string(), plain_entry);
 
@@ -1071,39 +837,6 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
     assert_eq!(
         catalog["plain-model"].info.reasoning_effort, None,
         "non-reasoning default model must NOT be stamped with persisted effort",
-    );
-
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("limited-model".to_string());
-    cfg.models.default_reasoning_effort = Some(ReasoningEffort::High);
-    let mut limited_entry = ModelEntry {
-        info: config::ModelInfo::fallback("limited-model"),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    };
-    limited_entry.info.supports_reasoning_effort = true;
-    limited_entry.info.reasoning_efforts = vec![ReasoningEffortOption {
-        id: "low".into(),
-        value: ReasoningEffort::Low,
-        label: "Low".into(),
-        description: None,
-        default: true,
-    }];
-    limited_entry.info.reasoning_effort = Some(ReasoningEffort::Low);
-    let catalog = resolve_model_catalog(
-        &cfg,
-        Some(IndexMap::from([(
-            "limited-model".to_string(),
-            limited_entry,
-        )])),
-    );
-    assert_eq!(
-        catalog["limited-model"].info.reasoning_effort,
-        Some(ReasoningEffort::Low),
-        "a persisted tier outside the advertised menu must not replace the catalog default",
     );
 }
 
@@ -1124,7 +857,6 @@ fn reasoning_effort_override_skips_models_that_do_not_offer_level() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
-        config_validation_errors: Vec::new(),
     };
     no_none.info.supports_reasoning_effort = true;
     no_none.info.reasoning_efforts = vec![ReasoningEffortOption {
@@ -1143,7 +875,6 @@ fn reasoning_effort_override_skips_models_that_do_not_offer_level() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
-        config_validation_errors: Vec::new(),
     };
     with_none.info.supports_reasoning_effort = true;
     with_none.info.reasoning_efforts = vec![ReasoningEffortOption {
@@ -1245,7 +976,6 @@ fn cli_reasoning_effort_override_only_stamps_supporting_models() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
-        config_validation_errors: Vec::new(),
     };
     reasoning_entry.info.supports_reasoning_effort = true;
     prefetched.insert("reasoning-model".to_string(), reasoning_entry);
@@ -1256,7 +986,6 @@ fn cli_reasoning_effort_override_only_stamps_supporting_models() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
-        config_validation_errors: Vec::new(),
     };
     prefetched.insert("plain-model".to_string(), plain_entry);
 
@@ -1293,15 +1022,14 @@ fn apply_refresh_result_only_updates_etag_on_success() {
     );
 }
 
-/// The production constructor rather than a hand-rolled copy of it.
-///
-/// The copy left `base_url` empty, which no catalog entry ever is in
-/// production -- `ModelEntry::fallback` fills it from the endpoints. That was
-/// invisible until readiness began consulting the endpoint (#110), at which
-/// point every fixture here became a credential-less non-first-party model
-/// and stopped being selectable.
 fn make_model_entry(model_id: &str) -> ModelEntry {
-    ModelEntry::fallback(model_id, &config::EndpointsConfig::default())
+    ModelEntry {
+        info: config::ModelInfo::fallback(model_id),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+    }
 }
 
 fn make_prefetched(ids: &[&str]) -> IndexMap<String, ModelEntry> {
@@ -1316,8 +1044,136 @@ fn make_prefetched(ids: &[&str]) -> IndexMap<String, ModelEntry> {
 fn spawn_background_refresh_is_noop_when_real_catalog_present() {
     let mgr = test_manager();
     mgr.inner.catalog.write().has_fetched_real_catalog = true;
-    mgr.spawn_background_refresh(); // must not panic (no tokio::spawn taken)
+    mgr.spawn_background_refresh_inner(/*remote_fetch_enabled*/ true); // must not panic (no tokio::spawn taken)
     assert!(mgr.has_fetched_real_catalog());
+}
+
+// Guards the readiness-never-blocks invariant in CI; the e2e proofs are `#[ignore]`.
+// current_thread: the post-spawn `!polled` check relies on the task not being
+// polled until this test awaits.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_background_refresh_never_blocks_on_a_hanging_endpoint() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    // Never resolves; signals the instant the detached task first polls it.
+    struct NeverResolvingEndpoint {
+        polled: Arc<AtomicBool>,
+        dispatched: Arc<Notify>,
+    }
+    impl ModelsEndpoint for NeverResolvingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            let polled = self.polled.clone();
+            let dispatched = self.dispatched.clone();
+            Box::pin(async move {
+                polled.store(true, Ordering::SeqCst);
+                dispatched.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    let polled = Arc::new(AtomicBool::new(false));
+    let dispatched = Arc::new(Notify::new());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        make_prefetched(&["grok-4", "grok-4.5"]),
+        acp::ModelId::new("grok-4.5"),
+        auth_manager,
+        config_from_toml("[models]\ndefault = \"grok-4.5\""),
+    )
+    .endpoint(Arc::new(NeverResolvingEndpoint {
+        polled: polled.clone(),
+        dispatched: dispatched.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    mgr.spawn_background_refresh_inner(/*remote_fetch_enabled*/ true);
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "fetch ran inline on the readiness path; it must be spawned",
+    );
+
+    // Generous failure bound: the dispatch may sit behind a full 5s auth dwell.
+    tokio::time::timeout(std::time::Duration::from_secs(30), dispatched.notified())
+        .await
+        .expect("background refresh was never dispatched");
+}
+
+#[tokio::test]
+#[serial]
+async fn sign_out_clears_catalog_rebuilds_bundled_without_fetching() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BoomEndpoint {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for BoomEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        }
+    }
+
+    // Unset keys so fetch_auth resolves to Session (the sign-out branch).
+    let _no_key = EnvGuard::unset("XAI_API_KEY");
+    let _no_legacy_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        make_prefetched(&["grok-4", "grok-4.5"]),
+        acp::ModelId::new("grok-4.5"),
+        auth_manager,
+        config_from_toml("[models]\ndefault = \"grok-4.5\""),
+    )
+    .endpoint(Arc::new(BoomEndpoint {
+        calls: calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    mgr.inner.catalog.write().has_fetched_real_catalog = true;
+    mgr.inner.user_selected_model.store(true, Ordering::Relaxed);
+
+    mgr.on_auth_changed().await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "sign-out must skip the doomed Session-auth fetch",
+    );
+    assert!(
+        !mgr.has_fetched_real_catalog(),
+        "sign-out must drop the prior identity's real catalog",
+    );
+    assert!(
+        !mgr.inner.user_selected_model.load(Ordering::Relaxed),
+        "sign-out must reset the user-pick latch",
+    );
+    assert!(
+        !mgr.models().is_empty(),
+        "sign-out must rebuild the bundled default catalog",
+    );
+    assert_eq!(
+        *mgr.inner.catalog_progress.borrow(),
+        CatalogProgress::Failed,
+        "sign-out publishes an outcome so parked waiters wake",
+    );
 }
 
 #[test]
@@ -1774,11 +1630,9 @@ fn clear_resets_has_fetched_real_catalog() {
     let prefetched = make_prefetched(&["grok-3", "grok-4"]);
     mgr.apply_refresh_result(&cfg, Some(prefetched), None);
     assert!(mgr.has_fetched_real_catalog());
-    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
 
     mgr.clear();
     assert!(!mgr.has_fetched_real_catalog());
-    assert_eq!(mgr.current_reasoning_effort(), None);
 
     let prefetched = make_prefetched(&["grok-4.5", "grok-4.3"]);
     mgr.apply_refresh_result(&cfg, Some(prefetched), None);
@@ -1862,7 +1716,7 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg.models.default = Some("missing-model".to_string());
     cfg.models.default_is_campaign_driven = true;
     cfg.models.pre_campaign_default = Some("real-model".to_string());
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
     assert_eq!(
         key, "real-model",
         "must fall back to the pre-campaign default"
@@ -1872,13 +1726,13 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg2.models.default = Some("missing-model".to_string());
     cfg2.models.default_is_campaign_driven = true;
     cfg2.models.pre_campaign_default = Some("also-missing".to_string());
-    let (key2, _, _, _) = resolve_default_model(&cfg2, &catalog, true);
+    let (key2, _, _) = resolve_default_model(&cfg2, &catalog, true);
     assert_eq!(&key2, catalog.keys().next().unwrap());
 
     let mut cfg3 = config::Config::default();
     cfg3.models.default = Some("missing-model".to_string());
     cfg3.models.pre_campaign_default = Some("real-model".to_string());
-    let (key3, _, _, _) = resolve_default_model(&cfg3, &catalog, true);
+    let (key3, _, _) = resolve_default_model(&cfg3, &catalog, true);
     assert_eq!(
         &key3,
         catalog.keys().next().unwrap(),
@@ -1892,63 +1746,12 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg4.models.default = Some("campaign-model".to_string());
     cfg4.models.default_is_campaign_driven = true;
     cfg4.models.pre_campaign_default = Some("real-model".to_string());
-    let (key4, _, _, _) = resolve_default_model(&cfg4, &catalog, true);
+    let (key4, _, _) = resolve_default_model(&cfg4, &catalog, true);
     assert_eq!(
         &key4,
         catalog.keys().next().unwrap(),
         "a CLI pref miss must not detour through pre_campaign_default"
     );
-}
-
-/// A campaign-driven default that is *present* in the catalog but unready must
-/// still recover the pre-campaign default.
-///
-/// #131 keeps an explicit unready preference selected instead of silently
-/// swapping it, which is right for a choice the user made. A campaign default
-/// lands in the same `ConfigSource::Config` slot without the user choosing
-/// anything, so counting it as explicit turns one bad remote push into a
-/// cohort that cannot complete a turn until somebody hand-edits config --
-/// which is the exact failure `pre_campaign_default` exists to undo.
-///
-/// Every case in `unavailable_campaign_default_falls_back_to_config_default`
-/// uses a preference *absent* from the catalog. That reaches the recovery
-/// through the catalog-miss branch and so never exercised this one.
-#[test]
-fn an_unready_campaign_default_recovers_the_pre_campaign_default() {
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    let mut pushed = make_model_entry("pushed-model");
-    pushed
-        .config_validation_errors
-        .push("invalid auth_scheme `not-a-scheme`".into());
-    catalog.insert("pushed-model".to_string(), pushed);
-    catalog.insert("real-model".to_string(), make_model_entry("real-model"));
-
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("pushed-model".to_string());
-    cfg.models.default_is_campaign_driven = true;
-    cfg.models.pre_campaign_default = Some("real-model".to_string());
-
-    let (key, _, _, reason) = resolve_default_model(&cfg, &catalog, true);
-    assert_eq!(
-        key, "real-model",
-        "a pushed default that cannot authenticate must not strand the cohort"
-    );
-    assert!(
-        reason.is_none(),
-        "recovering is not a failure to report to the user: {reason:?}"
-    );
-
-    // The same broken entry, chosen by the user instead of pushed, is still
-    // kept selected and reported. That is #131, and this fix must not undo it.
-    let mut chosen = config::Config::default();
-    chosen.models.default = Some("pushed-model".to_string());
-    chosen.models.pre_campaign_default = Some("real-model".to_string());
-    let (key, _, _, reason) = resolve_default_model(&chosen, &catalog, true);
-    assert_eq!(
-        key, "pushed-model",
-        "an explicit user choice that is broken stays selected"
-    );
-    assert!(reason.is_some(), "and the user is told why");
 }
 
 // ── ModelFetchAuth::resolve priority tests ──────────────────────
@@ -1971,72 +1774,6 @@ fn resolve_custom_endpoint_always_wins() {
     assert_eq!(
         ModelFetchAuth::resolve(&endpoints, false),
         ModelFetchAuth::CustomEndpoint,
-    );
-}
-
-#[test]
-#[serial]
-fn from_config_surfaces_missing_custom_catalog_key() {
-    let _unset = EnvGuard::unset("XAI_API_KEY");
-    let _unset_legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
-    let tmp = tempfile::TempDir::new().unwrap();
-    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
-    let mut cfg = config::Config::default();
-    cfg.endpoints.models_list_url = Some("https://custom.example.com/v1/models".to_owned());
-
-    let result = ModelsManager::from_config_with_remote_fetch(&cfg, None, auth_manager, true);
-    let Err(message) = result else {
-        panic!("missing custom catalog key must be a configuration error");
-    };
-    assert_eq!(
-        message,
-        "Custom model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY)."
-    );
-}
-
-#[test]
-#[serial]
-fn from_config_accepts_explicit_custom_catalog_key() {
-    let _key = EnvGuard::set("XAI_API_KEY", "catalog-key");
-    let _unset_legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
-    let tmp = tempfile::TempDir::new().unwrap();
-    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
-    let mut cfg = config::Config::default();
-    cfg.endpoints.models_base_url = Some("https://custom.example.com/v1".to_owned());
-
-    assert!(ModelsManager::from_config_with_remote_fetch(&cfg, None, auth_manager, true).is_ok());
-}
-
-#[test]
-#[serial]
-fn from_config_allows_offline_custom_catalog_without_key() {
-    let _unset = EnvGuard::unset("XAI_API_KEY");
-    let _unset_legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
-    let tmp = tempfile::TempDir::new().unwrap();
-    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
-    let mut cfg = config::Config::default();
-    cfg.endpoints.models_base_url = Some("https://custom.example.com/v1".to_owned());
-
-    assert!(ModelsManager::from_config_with_remote_fetch(&cfg, None, auth_manager, false).is_ok());
-}
-
-#[test]
-#[serial]
-fn from_config_surfaces_missing_key_for_untrusted_proxy_catalog() {
-    let _unset = EnvGuard::unset("XAI_API_KEY");
-    let _unset_legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
-    let tmp = tempfile::TempDir::new().unwrap();
-    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
-    let mut cfg = config::Config::default();
-    cfg.endpoints.cli_chat_proxy_base_url = Some("https://proxy.example.com/v1".to_owned());
-
-    let result = ModelsManager::from_config_with_remote_fetch(&cfg, None, auth_manager, true);
-    let Err(message) = result else {
-        panic!("untrusted proxy catalog without an explicit key must fail closed");
-    };
-    assert_eq!(
-        message,
-        "Custom model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY)."
     );
 }
 
@@ -2161,7 +1898,6 @@ async fn fetch_and_apply_degrades_offline_when_remote_fetch_disabled() {
             env_key: None,
             auth_provider: None,
             api_base_url: None,
-            config_validation_errors: Vec::new(),
         },
     );
 
@@ -2184,20 +1920,33 @@ fn default_model_skips_oauth_only_for_api_key_users() {
     let cfg = config::Config::default();
     let mut catalog = IndexMap::new();
 
-    let mut oauth_only = make_model_entry("oauth-only");
+    let mut oauth_only = ModelEntry {
+        info: config::ModelInfo::fallback("oauth-only"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+    };
     oauth_only.info.supported_in_api = false;
     catalog.insert("oauth-only".to_string(), oauth_only);
 
-    catalog.insert("public-model".to_string(), make_model_entry("public-model"));
+    let public = ModelEntry {
+        info: config::ModelInfo::fallback("public-model"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+    };
+    catalog.insert("public-model".to_string(), public);
 
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
+    let (key, _, _) = resolve_default_model(&cfg, &catalog, false);
     assert_ne!(
         key, "oauth-only",
         "API-key default must not be an OAuth-only model"
     );
     assert_eq!(key, "public-model");
 
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
     assert!(
         key == "oauth-only" || key == "public-model",
         "OAuth user should be able to use either model as default"
@@ -2329,96 +2078,8 @@ fn resolve_default_model_prefers_id_over_model_slug() {
     let mut cfg = config::Config::default();
     cfg.models.default = Some("grok-build".to_string());
 
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
     assert_eq!(key, "grok-build", "must match id, not first slug hit");
-}
-
-/// #131: an explicit configured default that is catalogued-but-unusable must
-/// be kept (no silent substitute), with the readiness reason returned.
-#[test]
-fn resolve_default_model_keeps_explicit_unusable_preference() {
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    let mut custom = make_model_entry("custom");
-    custom
-        .config_validation_errors
-        .push("invalid auth_scheme `not-a-scheme`".into());
-    catalog.insert("custom".to_string(), custom);
-
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("custom".to_string());
-
-    let (key, entry, _, reason) = resolve_default_model(&cfg, &catalog, true);
-    assert_eq!(key, "custom", "must keep the explicit unusable preference");
-    assert!(
-        !crate::agent::config::model_readiness(&entry).0,
-        "kept entry must still be unusable"
-    );
-    let reason = reason.expect("must surface the readiness reason");
-    assert!(
-        reason.contains("invalid auth_scheme"),
-        "unexpected reason: {reason}"
-    );
-}
-
-/// Keeping an unusable explicit preference must not bypass the gates that say
-/// whether the user may select it at all.
-///
-/// `allowed_models` / `hidden_models` / `supported_in_api` answer a different
-/// question from "does it work", and an earlier version returned the unready
-/// preference *before* consulting them. `validate_selectable` guards
-/// `models.default` but not `GROK_DEFAULT_MODEL`, and `reselect_default_model`
-/// never calls it, so this is the only gate on that path — without it the
-/// session's current model can be one `available()` does not list, and
-/// `allowed_models` stops being a gate.
-#[test]
-fn an_unusable_preference_the_user_may_not_select_is_not_seated() {
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-
-    let mut hidden = make_model_entry("hidden-custom");
-    hidden
-        .config_validation_errors
-        .push("invalid auth_scheme `not-a-scheme`".into());
-    hidden.info.user_selectable = false;
-    catalog.insert("hidden-custom".to_string(), hidden);
-
-    let usable = make_model_entry("usable");
-    catalog.insert("usable".to_string(), usable);
-
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("hidden-custom".to_string());
-
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
-    assert_ne!(
-        key, "hidden-custom",
-        "a model the user may not select must not be seated just because it was named"
-    );
-}
-
-/// When no preference is set and every selectable entry is unready, fall back
-/// to the bundled default sentinel rather than returning an unusable entry.
-#[test]
-fn resolve_default_model_falls_back_when_all_selectable_unready() {
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    let mut custom = make_model_entry("custom");
-    custom
-        .config_validation_errors
-        .push("invalid auth_scheme `not-a-scheme`".into());
-    catalog.insert("custom".to_string(), custom);
-
-    let cfg = config::Config::default(); // no explicit preference
-
-    let (key, entry, _, reason) = resolve_default_model(&cfg, &catalog, true);
-    assert!(reason.is_none());
-    assert_ne!(
-        key, "custom",
-        "must not pick an unready selectable model as the implicit default"
-    );
-    assert_eq!(key, crate::models::default_model());
-    assert!(
-        entry.config_validation_errors.is_empty(),
-        "bundled sentinel must be validation-clean"
-    );
-    assert!(crate::agent::config::model_readiness(&entry).0);
 }
 
 #[test]
@@ -2461,7 +2122,7 @@ fn resolve_catalog_key_prefers_exact_key_match() {
 }
 
 #[test]
-fn resolve_catalog_key_none_when_slug_is_ambiguous() {
+fn resolve_catalog_key_last_slug_match_wins() {
     let mut models = IndexMap::new();
     models.insert(
         "default-grok-build".to_string(),
@@ -2470,10 +2131,8 @@ fn resolve_catalog_key_none_when_slug_is_ambiguous() {
     models.insert("user-grok-build".to_string(), make_model_entry("grok-4.5"));
 
     let persisted = acp::ModelId::new("grok-4.5");
-    assert!(
-        resolve_catalog_key(&models, &persisted).is_none(),
-        "ambiguous routing slugs must not silently pick one catalog key"
-    );
+    let key = resolve_catalog_key(&models, &persisted).expect("slug must resolve");
+    assert_eq!(key.0.as_ref(), "user-grok-build");
 }
 
 #[test]
@@ -2545,31 +2204,6 @@ fn selectable_prefers_exact_key_over_later_slug_match() {
     assert_eq!(key.0.as_ref(), "grok-build");
 }
 
-#[test]
-fn selectable_catalog_resolution_reports_ambiguous_slug() {
-    let mut models = IndexMap::new();
-    models.insert("local-fast".to_string(), make_model_entry("qwen"));
-    models.insert("remote-accurate".to_string(), make_model_entry("qwen"));
-    let available = test_available_keys(&["local-fast", "remote-accurate"]);
-    let persisted = acp::ModelId::new("qwen");
-
-    let resolution = selectable_catalog_resolution_for_persisted(&models, &available, &persisted);
-    assert_eq!(
-        resolution,
-        PersistedCatalogKeyResolution::AmbiguousSlug {
-            slug: acp::ModelId::new("qwen"),
-            matches: vec![
-                acp::ModelId::new("local-fast"),
-                acp::ModelId::new("remote-accurate")
-            ],
-        }
-    );
-    assert!(
-        selectable_catalog_key_for_persisted(&models, &available, &persisted).is_none(),
-        "legacy slug-only restores must require an explicit catalog key when ambiguous"
-    );
-}
-
 fn test_available_keys(keys: &[&str]) -> IndexMap<acp::ModelId, acp::ModelInfo> {
     keys.iter()
         .map(|k| {
@@ -2631,1530 +2265,5 @@ async fn identity_switch_clears_user_pick_latch() {
         mgr.current_model_id().0.as_ref(),
         "grok-4.5",
         "a new identity's first catalog must reselect the default after clear()",
-    );
-}
-
-/// A Codex entry the picker cannot offer must not suppress the xAI login
-/// screen: `allowed_models` / `hidden_models` filter the catalog by clearing
-/// `user_selectable` / setting `hidden`, and a session started on that basis
-/// would strand the user on a default xAI model with no credential.
-#[test]
-fn filtered_out_codex_model_does_not_count_as_selectable() {
-    let tmp = tempfile::tempdir().expect("temp home");
-    let auth_home = tmp.path();
-    let auth = crate::auth::GrokAuth {
-        key: "live-codex-token".to_owned(),
-        auth_mode: crate::auth::AuthMode::OpenAiCodex,
-        refresh_token: Some("refresh".to_owned()),
-        expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-        oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
-        oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
-        account_id: Some("account".to_owned()),
-        ..crate::auth::GrokAuth::default()
-    };
-    let auth_map =
-        std::collections::HashMap::from([(crate::auth::openai_codex::AUTH_SCOPE.to_owned(), auth)]);
-    std::fs::write(
-        auth_home.join("auth.json"),
-        serde_json::to_vec(&auth_map).unwrap(),
-    )
-    .unwrap();
-
-    let toml_cfg: toml::Value = toml::from_str("").unwrap();
-    let cfg = config::Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
-    let mut catalog = config::resolve_model_list(&cfg, None);
-    let preset_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID;
-    let preset = catalog.get_mut(preset_key).expect("preset in catalog");
-    preset.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
-        crate::auth::openai_codex::manager(auth_home),
-    ));
-
-    let manager_with = |models: IndexMap<String, ModelEntry>| {
-        let xai_home = tmp.path().join("xai");
-        ModelsManagerBuilder::new(
-            None,
-            models,
-            acp::ModelId::new("default"),
-            Arc::new(AuthManager::new(&xai_home, GrokComConfig::default())),
-            config::Config::default(),
-        )
-        .cache(test_cache_manager(tmp.path()))
-        .build()
-    };
-
-    assert!(
-        manager_with(catalog.clone()).has_selectable_openai_codex_model(),
-        "a ready, unfiltered preset must count — otherwise this test is vacuous"
-    );
-
-    let mut filtered = catalog.clone();
-    filtered.get_mut(preset_key).unwrap().info.user_selectable = false;
-    assert!(
-        !manager_with(filtered).has_selectable_openai_codex_model(),
-        "an allowed_models-filtered Codex model must not suppress the login screen"
-    );
-
-    let mut hidden = catalog;
-    hidden.get_mut(preset_key).unwrap().info.hidden = true;
-    assert!(
-        !manager_with(hidden).has_selectable_openai_codex_model(),
-        "a hidden_models-hidden Codex model must not suppress the login screen"
-    );
-}
-
-/// #131 helpers: a ready entry (first-party origin needs no declared
-/// credential) and a manager built over a fixed catalog.
-fn ready_entry(slug: &str) -> ModelEntry {
-    let mut info = config::ModelInfo::fallback(slug);
-    info.base_url = "https://api.x.ai/v1".to_string();
-    ModelEntry {
-        info,
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    }
-}
-
-fn manager_over(cfg: &config::Config, catalog: IndexMap<String, ModelEntry>) -> ModelsManager {
-    let tmp = tempfile::tempdir().expect("temp home for #131 models tests");
-    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
-    // Persist the directory for AuthManager's lifetime; unique per call so
-    // parallel tests do not race on a shared `grok-test-models-131` path.
-    let _path = tmp.keep();
-    ModelsManager::from_config(cfg, Some(catalog), auth_manager)
-        .expect("manager construction should succeed")
-}
-
-/// #131: a configured default **not seated** (absent from the catalog, or
-/// present but not user-selectable) is still substituted, and that substitution
-/// is now reported — the configured id and the configuration that supplied it.
-///
-/// This is the case no client can reconstruct: the substitute occupies
-/// `currentModelId`, and the configured model is not in the selectable
-/// `availableModels` listing to be looked up.
-///
-/// The selection itself is asserted unchanged. This reports the decision; it
-/// does not remake it.
-#[test]
-fn absent_configured_default_is_substituted_and_reported() {
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("typo-provider".to_string());
-
-    let mut catalog = IndexMap::new();
-    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
-
-    let mgr = manager_over(&cfg, catalog);
-
-    // Unchanged: a substitute is still seated, exactly as before.
-    assert_ne!(
-        mgr.current_model_id().0.as_ref(),
-        "typo-provider",
-        "an absent preference is still substituted — this change reports, it does not select"
-    );
-
-    let reported = mgr
-        .substituted_preference()
-        .expect("an absent configured default must be reported");
-    assert_eq!(reported.configured, "typo-provider");
-    assert_eq!(
-        reported.source_wire(),
-        "config",
-        "a `[models] default` preference is reported as coming from config"
-    );
-}
-
-/// #131: present in the catalog but `user_selectable = false` is the other
-/// half of "not seated". Resolve falls through to `Default` the same way as
-/// absence; the preference must still be reported.
-///
-/// Asserted at the resolve layer: `from_config` rebuilds selectable flags from
-/// `allowed_models` (and rejects a config default the allowlist excludes), so
-/// a hand-flipped `user_selectable` does not survive construction. The docs
-/// claim is about [`resolve_default_model`]'s fall-through.
-#[test]
-fn present_but_not_selectable_configured_default_is_substituted_and_reported() {
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("hidden-byo".to_string());
-
-    let mut catalog = IndexMap::new();
-    let mut blocked = ready_entry("hidden-byo");
-    blocked.info.user_selectable = false;
-    catalog.insert("hidden-byo".to_string(), blocked);
-    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
-
-    let (key, _, source, _) = resolve_default_model(&cfg, &catalog, false);
-    assert_ne!(
-        key.as_str(),
-        "hidden-byo",
-        "a not-user-selectable preference must not be seated"
-    );
-    let reported = substituted_preference(&cfg, source)
-        .expect("present-but-not-selectable must be reported as substituted");
-    assert_eq!(reported.configured, "hidden-byo");
-    assert_eq!(reported.source_wire(), "config");
-}
-
-/// #131 counterweight: a configured default that is **honoured** must produce
-/// no substitution field — including the kept-but-unready case, which #145
-/// already covers through `readinessReason`. A field that appeared for a
-/// preference the user did get would describe a rejection that never happened.
-#[test]
-fn honoured_configured_default_reports_no_substitution() {
-    // Ready and present.
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("grok-4".to_string());
-    let mut catalog = IndexMap::new();
-    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
-    let mgr = manager_over(&cfg, catalog);
-    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4");
-    assert!(
-        mgr.substituted_preference().is_none(),
-        "a honoured preference is not a substitution"
-    );
-
-    // Present but unready: #145 keeps it selected, so it was not substituted
-    // either — and its reason already travels per-model.
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("byo-provider".to_string());
-    let mut unready = config::ModelInfo::fallback("byo-provider");
-    unready.base_url = "https://api.third-party.example/v1".to_string();
-    let mut catalog = IndexMap::new();
-    catalog.insert(
-        "byo-provider".to_string(),
-        ModelEntry {
-            info: unready,
-            api_key: None,
-            env_key: None,
-            auth_provider: None,
-            api_base_url: None,
-            config_validation_errors: Vec::new(),
-        },
-    );
-    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
-    let mgr = manager_over(&cfg, catalog);
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        "byo-provider",
-        "#145 keeps an unready explicit preference selected"
-    );
-    assert!(
-        mgr.substituted_preference().is_none(),
-        "kept-but-unready is not a substitution; its reason travels as readinessReason"
-    );
-}
-
-/// #131: a campaign-driven default that goes missing must not be reported as
-/// the user's configuration being rejected. They never wrote it, and naming it
-/// would send them to edit a line that is not theirs.
-#[test]
-fn campaign_driven_default_is_not_reported_as_the_users_choice() {
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("pushed-model".to_string());
-    cfg.models.default_is_campaign_driven = true;
-
-    let mut catalog = IndexMap::new();
-    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
-
-    let mgr = manager_over(&cfg, catalog);
-    assert!(
-        mgr.substituted_preference().is_none(),
-        "a pushed default is not the user's configuration"
-    );
-}
-
-/// #131: for a configured default that is present in the catalog but
-/// **unready**, the readiness reason already reaches the client — through
-/// per-model `readinessReason` in `modelState.availableModels`, not through
-/// `unready_default_reason`, which is log-only.
-///
-/// This is why the kept case needs no new wire field. The issue predates #145,
-/// and #145 keeping the model instead of swapping it is exactly what makes
-/// `currentModelId` *be* the configured model, which is what makes the
-/// per-model path sufficient. What #131 still owes the user is the case this
-/// chain cannot reach: a configured default **absent** from the catalog, which
-/// no client can look up because it is not there to look up.
-///
-/// Asserted link by link on purpose: if this breaks, the failure names which
-/// link moved rather than only "the reason stopped arriving".
-#[test]
-fn configured_unready_default_already_publishes_its_reason_per_model() {
-    use crate::agent::config::model_readiness;
-    use crate::agent::models::resolution::available_models;
-
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("byo-provider".to_string());
-
-    // Credential-less against a non-first-party origin: unready with no
-    // dependence on ambient environment, so the assertions below are about the
-    // chain rather than about the machine running them.
-    let mut info = config::ModelInfo::fallback("byo-provider");
-    info.base_url = "https://api.third-party.example/v1".to_string();
-    let mut catalog = IndexMap::new();
-    catalog.insert(
-        "byo-provider".to_string(),
-        ModelEntry {
-            info,
-            api_key: None,
-            env_key: None,
-            auth_provider: None,
-            api_base_url: None,
-            config_validation_errors: Vec::new(),
-        },
-    );
-
-    // Link 0 — the model really is unready, and readiness produced a reason.
-    let (ready, reason) = model_readiness(&catalog["byo-provider"]);
-    assert!(
-        !ready,
-        "precondition: credential-less external model is unready"
-    );
-    let reason = reason.expect("an unready model must carry an actionable reason");
-
-    // Link 1 (#145) — an explicit configured preference is KEPT, not swapped,
-    // so the selected model *is* the one the user configured.
-    let (key, _entry, source, unready) = resolve_default_model(&cfg, &catalog, true);
-    assert_eq!(
-        key, "byo-provider",
-        "#145: an unready explicit preference is kept, not substituted"
-    );
-    assert!(
-        matches!(source, config::ConfigSource::Config),
-        "a `[models] default` preference reports source Config, got {source:?}"
-    );
-    assert_eq!(
-        unready.as_deref(),
-        Some(reason.as_str()),
-        "the same reason is handed back to the caller"
-    );
-
-    // Link 2 — readiness is NOT a filter on the ACP listing, so the model the
-    // user configured is still there for a client to look up.
-    let available = available_models(&catalog, true);
-    let listed = available
-        .get(&acp::ModelId::new(key.as_str()))
-        .expect("unready entries stay in availableModels (#133)");
-
-    // Link 3 — and it carries the reason, in the field the pager and headless
-    // already read via `unready_reason_from_model_meta`.
-    let meta = listed.meta.as_ref().expect("listed model carries meta");
-    assert_eq!(
-        meta.get("ready").and_then(serde_json::Value::as_bool),
-        Some(false),
-        "the listing marks it unready"
-    );
-    assert_eq!(
-        meta.get("readinessReason")
-            .and_then(serde_json::Value::as_str),
-        Some(reason.as_str()),
-        "the reason the client renders is the reason readiness computed"
-    );
-}
-
-/// #131 B2: when the current model is still present and selectable,
-/// `reselect_current_model_if_missing` must still recompute the substitution
-/// verdict. A stale `Some` taken against an emptier catalog would otherwise
-/// survive the early return forever.
-#[test]
-fn reselect_if_missing_clears_stale_substitution_on_early_return() {
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("grok-4".to_string());
-    let mut catalog = IndexMap::new();
-    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
-    let mgr = manager_over(&cfg, catalog);
-    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4");
-    assert!(
-        mgr.substituted_preference().is_none(),
-        "precondition: preference is honoured"
-    );
-
-    *mgr.inner.substituted_preference.write() = Some(SubstitutedPreference {
-        configured: "grok-4".to_string(),
-        source: config::ConfigSource::Config,
-    });
-    assert!(
-        mgr.substituted_preference().is_some(),
-        "precondition: inject a stale accusation"
-    );
-
-    mgr.reselect_current_model_if_missing(&cfg);
-    assert!(
-        mgr.substituted_preference().is_none(),
-        "early-return must still clear a stale substitution verdict"
-    );
-}
-
-/// #131 B2: `clear()` must wipe the substitution verdict so a new identity
-/// does not inherit the previous identity's accusation.
-#[test]
-fn clear_wipes_substituted_preference() {
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("typo-provider".to_string());
-    let mut catalog = IndexMap::new();
-    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
-    let mgr = manager_over(&cfg, catalog);
-    assert!(
-        mgr.substituted_preference().is_some(),
-        "precondition: absent preference is reported"
-    );
-
-    mgr.clear();
-    assert!(
-        mgr.substituted_preference().is_none(),
-        "clear() must wipe the substitution verdict with the rest of identity state"
-    );
-}
-
-/// #131 B1+B4+B5: after a false accusation against a thinner (warm-cache)
-/// catalog, landing the real catalog must (1) *reseat* the configured
-/// preference, (2) clear the in-memory verdict, and (3) publish JSON `null` on
-/// a real `x.ai/models/update` ExtNotification — not via a hand-rolled
-/// `write_substituted_default_model_meta` call that bypasses the wire.
-///
-/// Deleting the `model_state.meta(...)` block in `notify_models_updated` must
-/// fail this test; asserting only on `substituted_preference()` would not
-/// (same bar as initialize B3). Asserting seating stops the warm-cache path
-/// from retracting while the substitute stays current.
-#[test]
-fn models_update_meta_clears_substitution_after_catalog_lands() {
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("my-byo".to_string());
-
-    let mut thin = IndexMap::new();
-    thin.insert("grok-4".to_string(), ready_entry("grok-4"));
-    let mgr = manager_over(&cfg, thin);
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        "grok-4",
-        "precondition: thin catalog seats the substitute"
-    );
-    assert!(
-        mgr.substituted_preference().is_some(),
-        "precondition: thin catalog substitutes the preference"
-    );
-
-    let (gateway, mut rx) = crate::test_support::lsp_runtime::test_gateway_with_receiver();
-    mgr.set_gateway(gateway);
-
-    // Accusation while it stands — through the notify wire, not a hand write.
-    mgr.notify_models_updated();
-    let accused = recv_models_update_meta(&mut rx);
-    assert!(
-        accused
-            .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
-            .is_some_and(|v| v.is_object()),
-        "x.ai/models/update SessionModelState._meta must carry the accusation while it stands"
-    );
-
-    let mut full = IndexMap::new();
-    full.insert("my-byo".to_string(), ready_entry("my-byo"));
-    full.insert("grok-4".to_string(), ready_entry("grok-4"));
-    // Prefetch already set has_fetched_real_catalog — this is the warm-cache
-    // path that takes reselect_current_model_if_missing, not reselect_default.
-    assert!(
-        mgr.inner.catalog.read().has_fetched_real_catalog,
-        "precondition: warm-cache path (prefetch marked the catalog real)"
-    );
-    mgr.apply_refresh_result(&cfg, Some(full), None);
-    mgr.notify_models_updated();
-
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        "my-byo",
-        "warm-cache refresh must reseat the now-honourable preference — \
-         retracting while the substitute stays seated is the B4 lie"
-    );
-    assert!(
-        mgr.substituted_preference().is_none(),
-        "in-memory verdict must clear once the preference is seated"
-    );
-
-    let cleared = recv_models_update_meta(&mut rx);
-    assert!(
-        cleared
-            .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
-            .is_some_and(|v| v.is_null()),
-        "x.ai/models/update SessionModelState._meta must publish JSON null so clients can retract"
-    );
-    assert_eq!(
-        cleared.get("currentModelId").and_then(|v| v.as_str()),
-        Some("my-byo"),
-        "wire currentModelId must name the reseated preference"
-    );
-}
-
-/// Drain one `x.ai/models/update` ExtNotification and return its params as JSON
-/// (the `SessionModelState` body, including `_meta`).
-fn recv_models_update_meta(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
-) -> serde_json::Map<String, serde_json::Value> {
-    let msg = rx
-        .try_recv()
-        .expect("expected an x.ai/models/update ExtNotification");
-    let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg else {
-        panic!("expected ExtNotification, got another message kind");
-    };
-    assert_eq!(
-        args.request.method.as_ref(),
-        "x.ai/models/update",
-        "notify_models_updated must publish x.ai/models/update"
-    );
-    let params: serde_json::Value =
-        serde_json::from_str(args.request.params.get()).expect("models/update params are JSON");
-    let obj = params
-        .as_object()
-        .cloned()
-        .expect("SessionModelState serializes as a JSON object");
-    // Flatten: assertions look at both top-level currentModelId and _meta keys.
-    let mut flat = obj.clone();
-    if let Some(serde_json::Value::Object(meta)) = obj.get("_meta") {
-        for (k, v) in meta {
-            flat.insert(k.clone(), v.clone());
-        }
-    }
-    flat
-}
-
-/// #131 B4 counterweight: an explicit `/model` pick must not be clobbered when
-/// a previously missing configured preference later appears in the catalog.
-#[test]
-fn warm_cache_refresh_does_not_reseat_over_user_model_pick() {
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("my-byo".to_string());
-
-    let mut thin = IndexMap::new();
-    thin.insert("grok-4".to_string(), ready_entry("grok-4"));
-    let mgr = manager_over(&cfg, thin);
-    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4");
-    // User explicitly keeps the substitute.
-    mgr.set_current_model_id(acp::ModelId::new(std::sync::Arc::from("grok-4")));
-
-    let mut full = IndexMap::new();
-    full.insert("my-byo".to_string(), ready_entry("my-byo"));
-    full.insert("grok-4".to_string(), ready_entry("grok-4"));
-    mgr.apply_refresh_result(&cfg, Some(full), None);
-
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        "grok-4",
-        "a /model pick must survive the preference becoming available"
-    );
-}
-
-#[test]
-fn test_catalog_auth_schemes_and_override() {
-    use crate::remote::client::fetch_models_blocking;
-    use xai_grok_test_support::EnvGuard;
-
-    let target_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let last_auth_header = Arc::new(std::sync::Mutex::new(None));
-    let last_custom_header = Arc::new(std::sync::Mutex::new(None));
-    let last_extra_header = Arc::new(std::sync::Mutex::new(None));
-
-    let target_reqs_clone = target_requests.clone();
-    let auth_header_clone = last_auth_header.clone();
-    let custom_header_clone = last_custom_header.clone();
-    let extra_header_clone = last_extra_header.clone();
-
-    let app = axum::Router::new().route(
-        "/v1/models",
-        axum::routing::get(move |headers: axum::http::HeaderMap| async move {
-            target_reqs_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(auth) = headers.get("authorization")
-                && let Ok(s) = auth.to_str()
-            {
-                *auth_header_clone.lock().unwrap() = Some(s.to_string());
-            }
-            if let Some(custom) = headers.get("x-api-key")
-                && let Ok(s) = custom.to_str()
-            {
-                *custom_header_clone.lock().unwrap() = Some(s.to_string());
-            }
-            if let Some(extra) = headers.get("X-Organization")
-                && let Ok(s) = extra.to_str()
-            {
-                *extra_header_clone.lock().unwrap() = Some(s.to_string());
-            }
-            axum::Json(serde_json::json!({
-                "data": [
-                    {
-                        "id": "my-mock-model",
-                        "model": "my-mock-model",
-                        "contextWindow": 4096,
-                        "baseUrl": "https://api.example.com/v1"
-                    }
-                ]
-            }))
-        }),
-    );
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    let listener =
-        rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
-    let addr = listener.local_addr().unwrap();
-    let mock_endpoint = format!("http://{}/v1/models", addr);
-
-    let server_task = rt.spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    // Test cases:
-    // 1. None auth scheme (anonymous)
-    {
-        let mut cfg = config::Config::default();
-        cfg.models.endpoint = Some(mock_endpoint.clone());
-        cfg.models.catalog_auth_scheme = Some("none".to_string());
-
-        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
-        cfg.endpoints.catalog_auth = catalog_auth;
-
-        *last_auth_header.lock().unwrap() = None;
-        *last_custom_header.lock().unwrap() = None;
-
-        let result = fetch_models_blocking(
-            &cfg.endpoints,
-            None,
-            crate::agent::models::ModelFetchAuth::CustomEndpoint,
-        );
-        assert!(result.is_ok());
-        assert_eq!(*last_auth_header.lock().unwrap(), None);
-        assert_eq!(*last_custom_header.lock().unwrap(), None);
-    }
-
-    // 2. Bearer auth scheme
-    {
-        let _g = EnvGuard::set("CATALOG_KEY", "dummy-bearer-token");
-        let mut cfg = config::Config::default();
-        cfg.models.endpoint = Some(mock_endpoint.clone());
-        cfg.models.catalog_auth_scheme = Some("bearer".to_string());
-        cfg.models.catalog_env_key = Some(config::EnvKeys::One("CATALOG_KEY".to_string()));
-
-        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
-        cfg.endpoints.catalog_auth = catalog_auth;
-
-        *last_auth_header.lock().unwrap() = None;
-
-        let result = fetch_models_blocking(
-            &cfg.endpoints,
-            None,
-            crate::agent::models::ModelFetchAuth::CustomEndpoint,
-        );
-        assert!(result.is_ok());
-        assert_eq!(
-            *last_auth_header.lock().unwrap(),
-            Some("Bearer dummy-bearer-token".to_string())
-        );
-    }
-
-    // 3. X-API-KEY auth scheme
-    {
-        let _g = EnvGuard::set("CATALOG_KEY", "dummy-x-api-key");
-        let mut cfg = config::Config::default();
-        cfg.models.endpoint = Some(mock_endpoint.clone());
-        cfg.models.catalog_auth_scheme = Some("x_api_key".to_string());
-        cfg.models.catalog_env_key = Some(config::EnvKeys::One("CATALOG_KEY".to_string()));
-
-        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
-        cfg.endpoints.catalog_auth = catalog_auth;
-
-        *last_custom_header.lock().unwrap() = None;
-
-        let result = fetch_models_blocking(
-            &cfg.endpoints,
-            None,
-            crate::agent::models::ModelFetchAuth::CustomEndpoint,
-        );
-        assert!(result.is_ok());
-        assert_eq!(
-            *last_custom_header.lock().unwrap(),
-            Some("dummy-x-api-key".to_string())
-        );
-    }
-
-    // 4. Extra headers
-    {
-        let mut cfg = config::Config::default();
-        cfg.models.endpoint = Some(mock_endpoint.clone());
-        cfg.models.catalog_auth_scheme = Some("none".to_string());
-        let mut headers = IndexMap::new();
-        headers.insert("X-Organization".to_string(), "Anthropic".to_string());
-        headers.insert("Host".to_string(), "bad-host.com".to_string());
-        cfg.models.catalog_headers = headers;
-
-        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
-        cfg.endpoints.catalog_auth = catalog_auth;
-
-        *last_extra_header.lock().unwrap() = None;
-
-        // Validation fails because Host is a protected header
-        let validate_result = crate::remote::validate_models_catalog_auth(
-            &cfg.endpoints,
-            crate::agent::models::ModelFetchAuth::CustomEndpoint,
-            true,
-        );
-        assert!(validate_result.is_err());
-        assert!(
-            validate_result
-                .unwrap_err()
-                .contains("protected and cannot be overridden")
-        );
-    }
-
-    // 5. Invalid validation (empty env var or missing env var name)
-    {
-        let mut cfg = config::Config::default();
-        cfg.models.endpoint = Some(mock_endpoint.clone());
-        cfg.models.catalog_auth_scheme = Some("bearer".to_string());
-        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
-        cfg.endpoints.catalog_auth = catalog_auth;
-        let validate_result = crate::remote::validate_models_catalog_auth(
-            &cfg.endpoints,
-            crate::agent::models::ModelFetchAuth::CustomEndpoint,
-            true,
-        );
-        assert!(validate_result.is_err());
-        assert!(
-            validate_result
-                .unwrap_err()
-                .contains("catalog_env_key is missing")
-        );
-
-        let _g = EnvGuard::set("EMPTY_KEY", "");
-        let mut cfg2 = config::Config::default();
-        cfg2.models.endpoint = Some(mock_endpoint.clone());
-        cfg2.models.catalog_auth_scheme = Some("bearer".to_string());
-        cfg2.models.catalog_env_key = Some(config::EnvKeys::One("EMPTY_KEY".to_string()));
-        cfg2.endpoints.catalog_auth = cfg2.models.catalog_auth_config().unwrap();
-        let validate_result = crate::remote::validate_models_catalog_auth(
-            &cfg2.endpoints,
-            crate::agent::models::ModelFetchAuth::CustomEndpoint,
-            true,
-        );
-        assert!(validate_result.is_err());
-    }
-
-    server_task.abort();
-}
-
-// ── #303 Codex-only implicit default ────────────────────────────────
-
-/// Serialize #303 fixtures: they mutate process env (GROK_AUTH_PATH / XAI keys)
-/// and must not interleave.
-static CODEX_ONLY_DEFAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Build a ready Codex preset entry backed by a live-looking scoped credential.
-///
-/// Returns an [`EnvGuard`] that pins `GROK_AUTH_PATH` to this fixture's auth
-/// file for the lifetime of the test — required because
-/// `AuthManager::new_openai_codex` prefers that env over `grok_home`.
-fn ready_codex_entry(auth_home: &std::path::Path) -> (ModelEntry, xai_grok_test_support::EnvGuard) {
-    use xai_grok_test_support::EnvGuard;
-    let auth_path = auth_home.join("auth.json");
-    let auth = crate::auth::GrokAuth {
-        key: "live-codex-token".to_owned(),
-        auth_mode: crate::auth::AuthMode::OpenAiCodex,
-        refresh_token: Some("refresh".to_owned()),
-        expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-        oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
-        oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
-        account_id: Some("account".to_owned()),
-        ..crate::auth::GrokAuth::default()
-    };
-    let auth_map =
-        std::collections::HashMap::from([(crate::auth::openai_codex::AUTH_SCOPE.to_owned(), auth)]);
-    std::fs::write(&auth_path, serde_json::to_vec(&auth_map).unwrap()).unwrap();
-
-    // Pin after write so status reads this file even if peer tests thrash env.
-    let auth_path_guard = EnvGuard::set(
-        "GROK_AUTH_PATH",
-        auth_path.to_str().expect("utf-8 temp path"),
-    );
-
-    let slug = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID;
-    let mut entry = ModelEntry::fallback(slug, &config::EndpointsConfig::default());
-    entry.info.model = slug.to_string();
-    entry.info.api_backend = crate::sampling::ApiBackend::CodexResponses;
-    entry.info.base_url = crate::auth::openai_codex::CODEX_API_BASE_URL.to_string();
-    entry.info.user_selectable = true;
-    entry.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
-        crate::auth::openai_codex::manager(auth_home),
-    ));
-    let (ready, reason) = crate::agent::config::model_readiness(&entry);
-    assert!(
-        ready,
-        "fixture Codex entry must be ready, got reason={reason:?}"
-    );
-    (entry, auth_path_guard)
-}
-
-#[test]
-fn codex_only_cold_start_defaults_to_ready_codex() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
-
-    // Grok first (bundled order), then ready Codex — the historical failure mode.
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(codex_key.clone(), codex);
-
-    let cfg = config::Config::default(); // no explicit preference
-    let (key, entry, source, reason) = resolve_default_model(&cfg, &catalog, false);
-    assert!(
-        reason.is_none(),
-        "ready Codex default must not be unready: {reason:?}"
-    );
-    assert!(
-        matches!(source, config::ConfigSource::Default),
-        "implicit path reports Default, got {source:?}"
-    );
-    assert_eq!(
-        key, codex_key,
-        "#303: Codex-only cold start must seat ready Codex, not ambient-ready Grok"
-    );
-    assert_eq!(
-        entry.info.api_backend,
-        crate::sampling::ApiBackend::CodexResponses
-    );
-}
-
-#[test]
-fn codex_only_default_not_bundled_grok_when_codex_ready() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
-    assert_ne!(
-        key,
-        crate::models::default_model(),
-        "must not keep the bundled default when a ready Codex route exists"
-    );
-}
-
-#[test]
-fn xai_ambient_still_prefers_first_party_grok() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::XAI_API_KEY_ENV_VAR;
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "test-xai-key-not-real");
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
-    assert_eq!(
-        key, "grok-4.5",
-        "with ambient XAI_API_KEY, first ready first-party Grok remains eligible"
-    );
-}
-
-#[test]
-fn codex_ready_reseats_ambient_grok_without_xai_auth() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
-
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(codex_key.clone(), codex);
-
-    let xai_home = tmp.path().join("xai");
-    std::fs::create_dir_all(&xai_home).unwrap();
-    let mgr = ModelsManagerBuilder::new(
-        None,
-        catalog,
-        acp::ModelId::new("grok-4.5"), // stranded default
-        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default())),
-        config::Config::default(),
-    )
-    .cache(test_cache_manager(tmp.path()))
-    .build();
-
-    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4.5");
-    mgr.reselect_current_model_if_missing(&config::Config::default());
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        codex_key.as_str(),
-        "#303: manager reseat must leave ambient Grok for ready Codex when no usable xAI auth"
-    );
-}
-
-#[test]
-fn byok_unchanged_when_codex_ready() {
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-
-    // BYOK-style entry: own api_key, non-first-party origin.
-    let mut byok = make_model_entry("my-byok");
-    byok.info.base_url = "https://third-party.example/v1".to_string();
-    byok.api_key = Some("sk-test".to_string());
-    assert!(byok.has_own_credentials());
-    assert!(!resolution::is_first_party_ambient_xai_entry(&byok));
-
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("my-byok".to_string(), byok);
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("my-byok".to_string());
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
-    assert_eq!(
-        key, "my-byok",
-        "explicit BYOK preference must not be swapped for Codex under #303"
-    );
-
-    // Manager reseat must not yank BYOK current when ready Codex exists.
-    let xai_home = tmp.path().join("xai");
-    std::fs::create_dir_all(&xai_home).unwrap();
-    let mgr = ModelsManagerBuilder::new(
-        None,
-        catalog,
-        acp::ModelId::new("my-byok"),
-        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default())),
-        config::Config::default(),
-    )
-    .cache(test_cache_manager(tmp.path()))
-    .build();
-    mgr.reselect_current_model_if_missing(&config::Config::default());
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        "my-byok",
-        "BYOK current must not be stranded-reseat to Codex"
-    );
-}
-
-/// Keyless `auth_scheme = none` is not ambient first-party xAI and must not be
-/// reseated to Codex when the user already seated it (Pro P1 coverage split).
-#[test]
-fn auth_scheme_none_unchanged_when_codex_ready() {
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-
-    let mut keyless = make_model_entry("local-none");
-    keyless.info.base_url = "http://127.0.0.1:8080/v1".to_string();
-    keyless.info.auth_scheme = xai_grok_sampler::AuthScheme::None;
-    keyless.api_key = None;
-    keyless.env_key = None;
-    assert!(!keyless.has_own_credentials());
-    assert!(!resolution::is_first_party_ambient_xai_entry(&keyless));
-
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("local-none".to_string(), keyless);
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("local-none".to_string());
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
-    assert_eq!(
-        key, "local-none",
-        "explicit auth_scheme=none preference must not be swapped for Codex"
-    );
-
-    let xai_home = tmp.path().join("xai-none");
-    std::fs::create_dir_all(&xai_home).unwrap();
-    let mgr = ModelsManagerBuilder::new(
-        None,
-        catalog,
-        acp::ModelId::new("local-none"),
-        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default())),
-        config::Config::default(),
-    )
-    .cache(test_cache_manager(tmp.path()))
-    .build();
-    mgr.reselect_current_model_if_missing(&config::Config::default());
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        "local-none",
-        "auth_scheme=none current must not be stranded-reseat to Codex"
-    );
-}
-
-/// Deployment key is ambient usable xAI — keep Grok over ready Codex.
-#[test]
-fn deployment_key_keeps_first_party_when_codex_ready() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    let mut cfg = config::Config::default();
-    cfg.endpoints.deployment_key = Some("deploy-key-not-blank".to_string());
-    assert!(
-        resolution::usable_ambient_xai_auth(&cfg, false),
-        "non-empty deployment_key is ambient usable xAI"
-    );
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
-    assert_eq!(key, "grok-4.5");
-}
-
-/// Third-party CodexResponses shim must not steal #303 default over ambient Grok
-/// (Pro P1: only official OpenAI Codex account routes qualify).
-#[test]
-fn third_party_codex_responses_does_not_steal_default() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let mut shim = make_model_entry("third-party-codex");
-    shim.info.base_url = "https://proxy.example/codex".to_string();
-    shim.info.api_backend = crate::sampling::ApiBackend::CodexResponses;
-    shim.info.user_selectable = true;
-    // Ready-ish without openai-codex provider / official base URL.
-    assert!(
-        !resolution::is_openai_codex_account_route(&shim),
-        "third-party CodexResponses is not an OpenAI Codex account route"
-    );
-    assert!(!resolution::is_ready_selectable_openai_codex_entry(
-        &shim, false
-    ));
-
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert("third-party-codex".to_string(), shim);
-
-    // No usable xAI → without the taxonomy fix this would seat the shim first.
-    let (key, entry, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
-    assert_eq!(
-        key, "grok-4.5",
-        "third-party CodexResponses must not displace bundled Grok as #303 default"
-    );
-    assert_ne!(
-        entry.info.base_url,
-        crate::auth::openai_codex::CODEX_API_BASE_URL
-    );
-}
-
-/// Pro P0: blank primary + valid legacy still counts as ambient usable → Grok.
-#[test]
-fn blank_primary_valid_legacy_keeps_grok_when_codex_ready() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "");
-    let _l = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "legacy-live-key");
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    assert!(
-        resolution::usable_ambient_xai_auth(&config::Config::default(), false),
-        "blank primary + valid legacy must count as ambient xAI"
-    );
-    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
-    assert_eq!(
-        key, "grok-4.5",
-        "legacy fallthrough must keep first-party Grok over Codex"
-    );
-}
-
-/// Pro P0: blank / whitespace `XAI_API_KEY` must not keep Grok over ready Codex.
-#[test]
-fn blank_xai_env_does_not_pin_grok_when_codex_ready() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "");
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(codex_key.clone(), codex);
-
-    assert!(
-        !resolution::usable_ambient_xai_auth(&config::Config::default(), false),
-        "blank XAI_API_KEY must not count as usable ambient xAI"
-    );
-    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
-    assert_eq!(
-        key, codex_key,
-        "blank env must seat ready Codex, not ambient Grok"
-    );
-}
-
-/// Pro P0: whitespace-only primary is not ambient usable.
-#[test]
-fn whitespace_xai_env_does_not_pin_grok_when_codex_ready() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "  \t ");
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(codex_key.clone(), codex);
-
-    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
-    assert_eq!(key, codex_key);
-}
-
-/// Pro P0: `[auth] preferred_method = api_key` keeps Grok even with ready Codex
-/// and no live credential (avoids model/auth-surface contradiction).
-#[test]
-fn preferred_method_api_key_pin_keeps_first_party_when_codex_ready() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use crate::auth::PreferredAuthMethod;
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    let mut cfg = config::Config::default();
-    cfg.grok_com_config.preferred_method = Some(PreferredAuthMethod::ApiKey);
-    assert!(
-        resolution::usable_ambient_xai_auth(&cfg, false),
-        "api_key pin must preserve ambient xAI / Grok precedence"
-    );
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
-    assert_eq!(
-        key, "grok-4.5",
-        "preferred_method=api_key must not seat Codex over first-party Grok"
-    );
-}
-
-/// Pro P0: `[auth] preferred_method = oidc` same pin semantics as api_key.
-#[test]
-fn preferred_method_oidc_pin_keeps_first_party_when_codex_ready() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use crate::auth::PreferredAuthMethod;
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    let mut cfg = config::Config::default();
-    cfg.grok_com_config.preferred_method = Some(PreferredAuthMethod::Oidc);
-    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
-    assert_eq!(key, "grok-4.5");
-}
-
-/// Pro P1: hard-expired OIDC with complete refresh surface keeps Grok over Codex.
-#[test]
-fn refreshable_expired_oidc_session_keeps_first_party_when_codex_ready() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use crate::auth::{AuthMode, FirstPartySessionEligibility, GrokAuth, XAI_OAUTH2_ISSUER};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    let xai_home = tmp.path().join("xai-refreshable");
-    std::fs::create_dir_all(&xai_home).unwrap();
-    let am = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
-    let expired = GrokAuth {
-        key: "expired-access".into(),
-        auth_mode: AuthMode::Oidc,
-        create_time: chrono::Utc::now() - chrono::Duration::hours(2),
-        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
-        refresh_token: Some("rt-complete".into()),
-        oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_owned()),
-        oidc_client_id: Some("client".into()),
-        user_id: "u".into(),
-        ..GrokAuth::test_default()
-    };
-    // Use hot_swap for memory classification.
-    am.hot_swap(expired);
-    assert_eq!(
-        am.first_party_session_eligibility(),
-        FirstPartySessionEligibility::Refreshable
-    );
-    let cfg = config::Config::default();
-    assert_eq!(
-        resolution::classify_ambient_xai_auth(&cfg, am.first_party_session_eligibility()),
-        resolution::AmbientXaiEligibility::RefreshableSession
-    );
-
-    let mgr = ModelsManagerBuilder::new(
-        None,
-        catalog,
-        acp::ModelId::new("grok-4.5"),
-        am,
-        cfg.clone(),
-    )
-    .cache(test_cache_manager(tmp.path()))
-    .build();
-    // Warm path: stranded ambient Grok must stay when refreshable session exists.
-    mgr.reselect_current_model_if_missing(&cfg);
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        "grok-4.5",
-        "refreshable hard-expired OIDC must not reseat to Codex"
-    );
-}
-
-/// #316: an expired first-party External session with a configured provider
-/// command is refreshable without OIDC client_id. Ready Codex must not
-/// displace that self-healing first-party default.
-#[test]
-#[serial_test::serial]
-fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use crate::auth::{AuthMode, FirstPartySessionEligibility, GrokAuth, XAI_OAUTH2_ISSUER};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
-        codex,
-    );
-
-    let xai_home = tmp.path().join("xai-external-refreshable");
-    std::fs::create_dir_all(&xai_home).unwrap();
-    let cfg_auth = GrokComConfig {
-        auth_provider_command: Some(
-            "printf '%s' '{\"access_token\":\"fresh-external\",\"issuer\":\"https://auth.x.ai\"}'"
-                .to_owned(),
-        ),
-        ..GrokComConfig::default()
-    };
-    let am = Arc::new(AuthManager::new(&xai_home, cfg_auth));
-    am.hot_swap(GrokAuth {
-        key: "expired-external".into(),
-        auth_mode: AuthMode::External,
-        create_time: chrono::Utc::now() - chrono::Duration::hours(2),
-        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
-        refresh_token: None,
-        oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_owned()),
-        oidc_client_id: None,
-        user_id: "u".into(),
-        ..GrokAuth::test_default()
-    });
-    assert_eq!(
-        am.first_party_session_eligibility(),
-        FirstPartySessionEligibility::Refreshable,
-        "configured external provider command is the complete refresh authority"
-    );
-
-    let model_cfg = config::Config::default();
-    let mgr = ModelsManagerBuilder::new(
-        None,
-        catalog,
-        acp::ModelId::new("grok-4.5"),
-        am,
-        model_cfg.clone(),
-    )
-    .cache(test_cache_manager(tmp.path()))
-    .build();
-    mgr.reselect_current_model_if_missing(&model_cfg);
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        "grok-4.5",
-        "refreshable hard-expired External session must not reseat to Codex"
-    );
-}
-
-/// Pro P1 stack: `ModelsManager::from_config` (no CLI `--model`) seats ready
-/// OpenAI Codex and produces a CodexResponses sampling config against the
-/// official Codex base URL — not ambient Grok.
-///
-/// Uses production config presets (`merge_openai_codex_presets`) so the Codex
-/// entry is a **canonical** account route; hand-stitched
-/// `AuthProviderRef::openai_codex` on prefetched entries is fail-closed by
-/// `resolve_model_list` outside that profile.
-///
-/// Stops short of a full ACP turn / mock HTTP (still out of residual scope).
-#[test]
-fn codex_only_from_config_seats_codex_and_sampling_stack() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    // Live Codex credential file + GROK_AUTH_PATH pin (used by attached
-    // openai-codex manager during resolve_model_list).
-    let (_codex_fixture, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
-
-    // Prefetch only ambient Grok first — Codex arrives from config presets so
-    // it is marked canonical and keeps a working auth_provider attachment.
-    let mut prefetched: IndexMap<String, ModelEntry> = IndexMap::new();
-    prefetched.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-
-    // Empty first-party xAI home — no ambient session on the models AuthManager.
-    // Unset GROK_AUTH_PATH only for this AuthManager construction would steal
-    // the Codex pin; instead use a dedicated path that has no xAI entry while
-    // GROK_AUTH_PATH remains the Codex fixture for the provider attach step.
-    let xai_home = tmp.path().join("xai-empty");
-    std::fs::create_dir_all(&xai_home).unwrap();
-    // Build xAI manager against xai_home *without* reading GROK_AUTH_PATH:
-    // temporarily clear, construct, restore via drop order after pin lives.
-    let auth = {
-        let _clear_path = EnvGuard::unset("GROK_AUTH_PATH");
-        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()))
-    };
-    // Re-pin Codex auth path for resolve_model_list provider attach.
-    let _re_pin = EnvGuard::set(
-        "GROK_AUTH_PATH",
-        tmp.path()
-            .join("auth.json")
-            .to_str()
-            .expect("utf-8 temp path"),
-    );
-    assert!(
-        !auth.has_ambient_first_party_session(),
-        "precondition: no ambient first-party session"
-    );
-
-    // Production config path includes openai-codex presets (not Config::default).
-    let empty = toml::Value::Table(toml::map::Map::new());
-    let cfg = config::Config::new_from_toml_cfg(&empty).expect("empty toml config");
-    assert!(
-        cfg.config_models.contains_key(codex_key.as_str())
-            || cfg
-                .config_models
-                .values()
-                .any(|m| m.model_provider.as_deref()
-                    == Some(crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID)),
-        "precondition: config must carry openai-codex preset after merge"
-    );
-
-    let mgr = ModelsManager::from_config_with_remote_fetch(&cfg, Some(prefetched), auth, false)
-        .expect("from_config with prefetched catalog must succeed offline");
-
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        codex_key.as_str(),
-        "from_config cold start without --model must seat ready Codex, not Grok"
-    );
-
-    let models = mgr.models();
-    let current = models
-        .get(codex_key.as_str())
-        .expect("seated Codex remains in catalog");
-    assert!(
-        resolution::is_ready_selectable_openai_codex_entry(current, false),
-        "seated entry must be the shared OpenAI Codex account predicate"
-    );
-    assert!(
-        current.auth_provider.is_some(),
-        "Codex account route carries provider-scoped bearer, not XAI_API_KEY"
-    );
-
-    let sampling = mgr.sampling_config();
-    assert_eq!(
-        sampling.api_backend,
-        crate::sampling::ApiBackend::CodexResponses,
-        "sampling stack must use CodexResponses backend"
-    );
-    assert_eq!(
-        sampling.base_url.trim_end_matches('/'),
-        crate::auth::openai_codex::CODEX_API_BASE_URL.trim_end_matches('/'),
-        "sampling destination must be official Codex API base"
-    );
-    assert_eq!(
-        sampling.model.as_str(),
-        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
-        "sampling model id must match seated catalog wire model"
-    );
-    assert!(
-        !sampling.base_url.is_empty(),
-        "ready Codex sampling config must keep its endpoint"
-    );
-}
-
-/// Pro P1: hard-expired session without complete refresh surface seats Codex.
-#[test]
-fn hard_expired_nonrefreshable_session_seats_codex() {
-    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-    use crate::auth::{AuthMode, FirstPartySessionEligibility, GrokAuth};
-    use xai_grok_test_support::EnvGuard;
-    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-
-    let tmp = tempfile::tempdir().expect("temp home");
-    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
-    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
-    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
-    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
-    catalog.insert(codex_key.clone(), codex);
-
-    let xai_home = tmp.path().join("xai-dead");
-    std::fs::create_dir_all(&xai_home).unwrap();
-    let am = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
-    // RT present but no issuer/client — malformed for ambient self-heal.
-    let dead = GrokAuth {
-        key: "expired-access".into(),
-        auth_mode: AuthMode::Oidc,
-        create_time: chrono::Utc::now() - chrono::Duration::hours(2),
-        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
-        refresh_token: Some("rt-incomplete".into()),
-        oidc_issuer: None,
-        oidc_client_id: None,
-        user_id: "u".into(),
-        ..GrokAuth::test_default()
-    };
-    am.hot_swap(dead);
-    assert_eq!(
-        am.first_party_session_eligibility(),
-        FirstPartySessionEligibility::None
-    );
-
-    let cfg = config::Config::default();
-    assert_eq!(
-        resolution::classify_ambient_xai_auth(&cfg, am.first_party_session_eligibility()),
-        resolution::AmbientXaiEligibility::Unavailable
-    );
-
-    let mgr = ModelsManagerBuilder::new(
-        None,
-        catalog,
-        acp::ModelId::new("grok-4.5"),
-        am,
-        cfg.clone(),
-    )
-    .cache(test_cache_manager(tmp.path()))
-    .build();
-    mgr.reselect_current_model_if_missing(&cfg);
-    assert_eq!(
-        mgr.current_model_id().0.as_ref(),
-        codex_key.as_str(),
-        "hard-expired non-refreshable session must reseat ambient Grok to Codex"
     );
 }

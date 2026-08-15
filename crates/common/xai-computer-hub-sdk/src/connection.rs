@@ -410,6 +410,10 @@ pub type ReconnectCallback = Box<dyn Fn(ReconnectEvent) + Send + Sync + 'static>
 /// Boxed disconnect callback, fired when the live socket drops (before a
 /// reconnect attempt) and on a terminal close.
 pub type DisconnectCallback = Box<dyn Fn() + Send + Sync + 'static>;
+/// Boxed terminal-close callback, fired with the WebSocket close code when
+/// the server ends the connection in the 4100–4199 range (no reconnect).
+/// Always followed by [`DisconnectCallback`] so readiness still flips.
+pub type TerminalCloseCallback = Box<dyn Fn(u16) + Send + Sync + 'static>;
 /// Boxed connect callback, fired once on the initial successful connect
 /// after the writer keepalive loop has entered (so `/ready` cannot race
 /// the first ping) and before the reader actor task spawns. It therefore
@@ -456,6 +460,9 @@ pub struct ConnectionConfig {
     /// Optional disconnect callback, fired when the live socket drops or the
     /// server sends a terminal close.
     pub on_disconnect: Option<Arc<DisconnectCallback>>,
+    /// Optional terminal-close callback, fired with the close code on a
+    /// 4100–4199 close, before [`Self::on_disconnect`].
+    pub on_terminal_close: Option<Arc<TerminalCloseCallback>>,
     /// Optional connect callback, fired once on the initial successful connect
     /// after the writer task enters its loop (happens-before reader start).
     /// The first keepalive may still be in flight or one scheduler quanta away.
@@ -511,6 +518,7 @@ struct HubConnectionInner {
     credential: Arc<dyn AuthProvider>,
     on_reconnect: Option<Arc<ReconnectCallback>>,
     on_disconnect: Option<Arc<DisconnectCallback>>,
+    on_terminal_close: Option<Arc<TerminalCloseCallback>>,
     server_id: Option<xai_tool_protocol::ServerId>,
     server_description: Option<String>,
     server_metadata: Option<serde_json::Value>,
@@ -626,6 +634,7 @@ impl HubConnection {
             credential: config.credential,
             on_reconnect: config.on_reconnect.clone(),
             on_disconnect: config.on_disconnect.clone(),
+            on_terminal_close: config.on_terminal_close.clone(),
             server_id: config.server_id,
             server_description: config.server_description,
             server_metadata: config.server_metadata,
@@ -1502,6 +1511,12 @@ fn fire_on_disconnect(inner: &HubConnectionInner) {
         cb();
     }
 }
+/// Invoke the optional terminal-close callback (best-effort, sync).
+fn fire_on_terminal_close(inner: &HubConnectionInner, code: u16) {
+    if let Some(cb) = &inner.on_terminal_close {
+        cb(code);
+    }
+}
 /// Reader half of the split actor: owns the stream, routes inbound
 /// frames, and drives reconnect. Never touches the sink — it asks the
 /// writer task to `Pause`/`Resume` instead.
@@ -1982,6 +1997,7 @@ mod tests {
             kind: ConnectionKind::Harness,
             on_reconnect: None,
             on_disconnect: None,
+            on_terminal_close: None,
             on_connect: None,
             server_id: None,
             server_description: None,
@@ -3526,6 +3542,7 @@ mod tests {
             credential,
             on_reconnect: None,
             on_disconnect: None,
+            on_terminal_close: None,
             server_id: None,
             server_description: None,
             server_metadata: None,
@@ -3897,6 +3914,7 @@ mod tests {
             kind: ConnectionKind::ToolServer,
             on_reconnect: None,
             on_disconnect: None,
+            on_terminal_close: None,
             on_connect: None,
             server_id: None,
             server_description: None,
@@ -3989,6 +4007,7 @@ mod tests {
             kind: ConnectionKind::ToolServer,
             on_reconnect: Some(on_reconnect),
             on_disconnect: None,
+            on_terminal_close: None,
             on_connect: None,
             server_id: None,
             server_description: None,
@@ -4087,6 +4106,7 @@ mod tests {
             kind: ConnectionKind::ToolServer,
             on_reconnect: Some(on_reconnect),
             on_disconnect: None,
+            on_terminal_close: None,
             on_connect: None,
             server_id: None,
             server_description: None,
@@ -4189,6 +4209,7 @@ mod tests {
             kind: ConnectionKind::ToolServer,
             on_reconnect: Some(on_reconnect),
             on_disconnect,
+            on_terminal_close: None,
             on_connect: None,
             server_id: None,
             server_description: None,
@@ -4344,6 +4365,7 @@ mod tests {
             kind: ConnectionKind::ToolServer,
             on_reconnect: Some(on_reconnect),
             on_disconnect: None,
+            on_terminal_close: None,
             on_connect: None,
             server_id: None,
             server_description: None,
@@ -4424,6 +4446,7 @@ mod tests {
                 kind: ConnectionKind::ToolServer,
                 on_reconnect: None,
                 on_disconnect: None,
+                on_terminal_close: None,
                 on_connect: None,
                 server_id: None,
                 server_description: None,

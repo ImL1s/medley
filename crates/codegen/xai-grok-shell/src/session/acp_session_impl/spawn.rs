@@ -9,17 +9,6 @@
 #![allow(clippy::items_after_test_module)]
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
-
-/// Stack for a session thread. A turn composes a deep future that a debug
-/// build lays out far larger than a release one, so this is sized for the
-/// debug case.
-///
-/// `pub(crate)` so the tests that drive a whole turn borrow the same number
-/// instead of picking their own. They overflowed the 2 MiB default and took
-/// the entire test binary down with them; a private copy would have to be
-/// re-tuned by hand every time this one moved, which is how the margin gets
-/// lost again.
-pub(crate) const SESSION_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// Partition CLI `--allow` rules under the pin: blanket catch-all allows
 /// (`Allow(Any)` `*` / `**`, plus bare/match-all Bash/MCP/WebFetch grants — see
 /// `resolution::is_catchall_allow`) substitute for the blocked `--yolo`, so drop them when
@@ -49,108 +38,15 @@ fn drop_cli_catchall_allows(
 /// Build the per-session current-thread tokio runtime.
 ///
 /// Construction acquires fds (epoll/kqueue, waker) and fails with
-/// `EMFILE`/`EAGAIN` under resource pressure. Extracted so the containment
-/// contract — exhaustion returns `Err`, never aborts — is testable
-/// (`runtime_containment_tests`).
+/// `EMFILE`/`EAGAIN` under resource pressure. Cap only — pre-warm is
+/// process-lifetime (`xai_tty_utils::runtime`).
 pub(crate) fn build_session_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    xai_tty_utils::runtime::apply_blocking_pool(builder.enable_all()).build()
 }
-/// Building the session runtime under fd exhaustion must return `Err`, never
-/// panic (under `panic=abort` a panic kills every live session).
-///
-/// The rlimit is lowered only in a re-exec'd child (the `xai-gix-status`
-/// pattern), so parallel tests are unaffected; stdout markers distinguish
-/// skip (unenforceable environment) from pass/fail.
 #[cfg(all(test, unix))]
-mod runtime_containment_tests {
-    use super::build_session_runtime;
-    /// Env marker dispatching the re-exec'd test binary into child logic.
-    const CHILD_ENV: &str = "XAI_GROK_SHELL_RUNTIME_CONTAINMENT_CHILD";
-    const PASS_MARK: &str = "runtime-build-contained:";
-    const SKIP_MARK: &str = "skip-child:";
-    /// Child: lower RLIMIT_NOFILE, fill the fd table, assert `Err`.
-    fn run_child() -> ! {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-            println!("{SKIP_MARK} getrlimit failed");
-            std::process::exit(0);
-        }
-        lim.rlim_cur = 64.min(lim.rlim_max);
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
-            println!("{SKIP_MARK} setrlimit failed");
-            std::process::exit(0);
-        }
-        let mut held = Vec::new();
-        loop {
-            let fd = unsafe { libc::dup(0) };
-            if fd < 0 {
-                break;
-            }
-            held.push(fd);
-            if held.len() > 4096 {
-                println!("{SKIP_MARK} fd limit not enforced");
-                std::process::exit(0);
-            }
-        }
-        match build_session_runtime() {
-            Err(e) => {
-                println!("{PASS_MARK} {e}");
-                std::process::exit(0);
-            }
-            Ok(_) => {
-                println!("{SKIP_MARK} runtime built despite full fd table");
-                std::process::exit(0);
-            }
-        }
-    }
-    /// Doubles as the child entry point when `CHILD_ENV` is set.
-    #[test]
-    fn child_entry_runtime_build_under_fd_exhaustion() {
-        if std::env::var_os(CHILD_ENV).is_some() {
-            run_child();
-        }
-    }
-    #[test]
-    fn runtime_build_failure_is_contained() {
-        let filter = module_path!()
-            .split_once("::")
-            .map(|(_, rest)| rest)
-            .unwrap_or_default();
-        let exe = std::env::current_exe().expect("current_exe");
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("--exact")
-            .arg(format!(
-                "{filter}::child_entry_runtime_build_under_fd_exhaustion"
-            ))
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env(CHILD_ENV, "1")
-            .stdin(std::process::Stdio::null());
-        xai_tty_utils::detach_std_command(&mut cmd);
-        let out = cmd.output().expect("spawn child test process");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success() && !stderr.contains("panicked at"),
-            "child aborted/panicked instead of containing the failure \
-             (status: {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            out.status
-        );
-        if stdout.contains(SKIP_MARK) {
-            eprintln!("skipped: {stdout}");
-            return;
-        }
-        assert!(
-            stdout.contains(PASS_MARK),
-            "no pass/skip marker (filter matched nothing?)\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
-}
+#[path = "spawn_runtime_containment_tests.rs"]
+mod runtime_containment_tests;
 #[cfg(test)]
 mod cli_catchall_drop_tests {
     use super::drop_cli_catchall_allows;
@@ -217,7 +113,6 @@ pub(crate) async fn spawn_session_actor(
     session_info: SessionInfo,
     gateway: GatewaySender,
     sampling_config: SamplingConfig,
-    catalog_identity: xai_chat_state::CatalogIdentity,
     credentials: xai_chat_state::Credentials,
     auth_method_id: crate::agent::auth_method::SharedAuthMethodId,
     auth_manager: Option<Arc<AuthManager>>,
@@ -273,7 +168,6 @@ pub(crate) async fn spawn_session_actor(
     loc_tracking_enabled: bool,
     feedback_flags: crate::session::feedback_manager::FeedbackFlags,
     managed_mcp_handle: crate::session::managed_mcp::ManagedMcpStateHandle,
-    managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     managed_mcp_proxy_base_url: String,
     session_model_id: acp::ModelId,
     session_yolo_mode: bool,
@@ -361,7 +255,6 @@ pub(crate) async fn spawn_session_actor(
         };
         let project_trusted =
             crate::agent::folder_trust::project_scope_allowed(tool_context.cwd.as_path());
-        crate::config::warn_inert_project_model_sections(tool_context.cwd.as_path());
         let mut permission_config =
             xai_grok_workspace::permission::resolution::resolve_permission_config_with_fallback(
                 tool_context.cwd.as_path(),
@@ -451,10 +344,7 @@ pub(crate) async fn spawn_session_actor(
             session_yolo_mode,
         ) {
             permissions.set_auto_mode(true);
-            let turns = build_classifier_turns(&conversation, CLASSIFIER_SPAWN_SEED_TURNS);
-            if !turns.is_empty() {
-                permissions.set_classifier_transcript(turns);
-            }
+            refresh_classifier_transcript(&permissions, &conversation);
         }
         (permissions, permission_events_rx, deny_read_globs)
     };
@@ -496,40 +386,28 @@ pub(crate) async fn spawn_session_actor(
             (0, Vec::new(), Vec::new())
         };
     let primary_model_id = sampling_config.model.clone();
+    let web_search_domains = if disable_web_search {
+        None
+    } else {
+        crate::util::config::resolve_web_search_domains_from_disk()
+    };
     let web_search_config = if disable_web_search {
         xai_grok_tools::implementations::WebSearchConfig::Disabled
     } else if let Some(cfg) = web_search_sampling_config {
-        let transport_profile = match cfg.api_backend {
-            xai_grok_sampling_types::ApiBackend::CodexResponses => {
-                xai_grok_tools::types::ApiTransportProfile::CodexResponses
-            }
-            _ => xai_grok_tools::types::ApiTransportProfile::GenericResponses,
-        };
-        let api_key_provider = cfg.bearer_resolver.clone().map(|resolver| {
-            crate::auth::credential_provider::ProviderScopedToolKeyProvider::shared(
-                resolver,
-                transport_profile,
-            )
-        });
-        // A missing `api_key` is not the same as a missing credential: a model
-        // authenticated by an explicit `authorization` / `x-api-key` header
-        // resolves with no key and is fully authenticated. Gating on the key
-        // alone disabled web_search for those users, and #153 then told them
-        // they had no credential (#160). `env_http_headers` travels with the
-        // config so the client can resolve it at build time — dropping it here
-        // would enable the tool and then send the request unauthenticated.
-        if crate::agent::config::has_usable_credential(&cfg) {
+        if let Some(api_key) = cfg.api_key {
             xai_grok_tools::implementations::WebSearchConfig::Enabled {
-                api_key: cfg.api_key,
+                api_key: Some(api_key),
                 base_url: cfg.base_url,
                 model: cfg.model,
                 extra_headers: cfg.extra_headers,
-                env_http_headers: cfg.env_http_headers,
                 alpha_test_key: credentials.alpha_test_key_cloned(),
-                api_key_provider,
+                allowed_domains: web_search_domains.as_ref().and_then(|d| d.allowed_domains.clone()),
+                excluded_domains: web_search_domains.as_ref().and_then(|d| d.excluded_domains.clone()),
+                env_http_headers: Default::default(),
+                api_key_provider: None,
             }
         } else {
-            tracing::warn!("web_search disabled: resolved config has no usable credential");
+            tracing::warn!("web_search disabled: resolved config has no API key");
             xai_grok_tools::implementations::WebSearchConfig::Disabled
         }
     } else {
@@ -567,7 +445,6 @@ pub(crate) async fn spawn_session_actor(
         max_completion_tokens: sampling_config.max_completion_tokens,
         temperature: sampling_config.temperature,
         top_p: sampling_config.top_p,
-        endpoint_trust: sampling_config.endpoint_trust,
         api_backend: sampling_config.api_backend.clone(),
         extra_headers: sampling_config.extra_headers.clone(),
         query_params: sampling_config.query_params.clone(),
@@ -575,6 +452,7 @@ pub(crate) async fn spawn_session_actor(
         context_window: context_window_override.unwrap_or(baseline_context_window),
         reasoning_effort: sampling_config.reasoning_effort,
         stream_tool_calls: Some(sampling_config.stream_tool_calls),
+        endpoint_trust: Default::default(),
     };
     let actor_pruning_config = xai_chat_state::PruningConfig {
         enabled: session_pruning_config.enabled,
@@ -585,10 +463,9 @@ pub(crate) async fn spawn_session_actor(
         hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
     };
     let (chat_state_event_tx, chat_state_event_rx) = mpsc::unbounded_channel();
-    let chat_state_handle = xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
+    let chat_state_handle = xai_chat_state::ChatStateActor::spawn_with_pruning(
         conversation.clone(),
         chat_state_sampling_config,
-        Some(catalog_identity),
         actor_pruning_config,
         Box::new(super::chat_persistence::ChannelChatPersistence::new(
             persistence.tx.clone(),
@@ -613,18 +490,14 @@ pub(crate) async fn spawn_session_actor(
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
-        combine_edit_holds: std::collections::HashSet::new(),
+        edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
         nudges_used_this_session: 0,
     });
-    let mcp_strategy = match std::env::var("MCP_INIT_STRATEGY") {
-        Ok(v) if !v.trim().is_empty() => McpInitStrategy::from(v),
-        _ if startup_hints.non_interactive => McpInitStrategy::Blocking,
-        _ => McpInitStrategy::Progressive,
-    };
+    let mcp_strategy = startup_hints.resolve_mcp_strategy();
     let file_state_tracker = Arc::new(match rewind_points_path {
         Some(path) => FileStateTracker::with_lazy_source(path),
         None => FileStateTracker::new(),
@@ -781,7 +654,6 @@ pub(crate) async fn spawn_session_actor(
     let bridge_state_path =
         crate::session::persistence::session_dir(&session_info).join("tool_state.json");
     let initial_agent_name = agent_definition.name.clone();
-    let effective_capability_mode = agent_definition.capability_mode;
     let initial_agent_type = Some(initial_agent_name.clone());
     let compaction_policy = xai_grok_agent::CompactionPolicy {
         auto_compact_threshold_percent: auto_compact_threshold_percent as u32,
@@ -994,6 +866,7 @@ pub(crate) async fn spawn_session_actor(
             .map(|s| s.workspace_memory_file().to_string_lossy().into_owned()),
         memory_backend: memory_backend_for_spec,
         web_search_config: web_search_config.clone(),
+        web_search_domains,
         backend_search: backend_tools_enabled,
         web_fetch_config: web_fetch_config.clone(),
         image_gen_config: image_gen_config.clone(),
@@ -1023,7 +896,6 @@ pub(crate) async fn spawn_session_actor(
         subagent_depth: tool_context.subagent_depth,
         subagents_max_depth,
         session_id_str: session_info.id.0.to_string(),
-        capability_mode_ceiling: effective_capability_mode,
         blocking_wait_depth: tool_context.blocking_wait_depth.clone(),
         respect_gitignore,
         path_not_found_hints,
@@ -1138,6 +1010,7 @@ pub(crate) async fn spawn_session_actor(
     prompt_context.normalize_for_persistence();
     save_prompt_context(&session_info, &prompt_context);
     let is_subagent_spawn = startup_hints.is_subagent;
+    let session_non_interactive = startup_hints.non_interactive;
     install_system_prompt(
         &mut conversation,
         &mut startup_hints.inherited_prefix_len,
@@ -1603,14 +1476,13 @@ pub(crate) async fn spawn_session_actor(
             gateway: gateway.clone(),
             gateway_enabled: gateway_enabled.clone(),
             persistence_tx: persistence.tx.clone(),
-            persistence_is_noop: persistence.is_noop(),
             disk_full: persistence.subscribe_disk_full(),
         },
         permissions,
         tool_context,
         deny_read_globs,
         mcp_state: mcp_state.clone(),
-        mcp_strategy,
+        mcp_strategy: std::cell::Cell::new(mcp_strategy),
         initial_client_mcp_servers: initial_client_mcp_servers.clone(),
         chat_state_handle,
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
@@ -1618,13 +1490,6 @@ pub(crate) async fn spawn_session_actor(
         pending_interactions: pending_interactions.clone(),
         telemetry_enabled,
         supports_backend_search: std::cell::Cell::new(sampling_config.supports_backend_search),
-        catalog_model_id: std::cell::Cell::new(session_model_id.0.to_string()),
-        committed_tool_result_truncation_policy: std::cell::Cell::new(
-            sampling_config
-                .codex_wire
-                .as_ref()
-                .and_then(|capabilities| capabilities.truncation_policy),
-        ),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: resolved_tool_overrides.clone(),
         compactions_remaining: std::cell::Cell::new(sampling_config.compactions_remaining),
@@ -1633,6 +1498,8 @@ pub(crate) async fn spawn_session_actor(
         doom_loop_turn_tally: Default::default(),
         file_state_tracker,
         rewind_pending_prompt: std::sync::Mutex::new(None),
+        delivery_tools: std::cell::RefCell::new(startup_hints.delivery_tools.clone()),
+        attach_non_interactive: std::cell::Cell::new(startup_hints.non_interactive),
         startup_hints,
         forked_tool_override,
         compaction: super::compaction_config::CompactionConfig {
@@ -1760,7 +1627,6 @@ pub(crate) async fn spawn_session_actor(
         pending_classifier_completions: parking_lot::Mutex::new(VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle,
-        managed_mcp_expires_at: std::sync::Mutex::new(managed_mcp_expires_at),
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
         mcp_announced_servers: Mutex::new(
             persisted_announcement_state
@@ -1778,6 +1644,7 @@ pub(crate) async fn spawn_session_actor(
         mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
         user_input_generation: std::sync::atomic::AtomicU64::new(0),
         laziness_debug_log: laziness_debug_log.map(|p| std::sync::Arc::from(p.as_path())),
+        last_live_orphan_reconcile: std::cell::Cell::new(None),
         deferred_prefix: TaskSlot::new(),
         extension_registry: session_extension_registry(weak.clone()),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
@@ -1785,6 +1652,9 @@ pub(crate) async fn spawn_session_actor(
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(built_hook_registry),
+        turn_report: Default::default(),
+        turn_abort: Default::default(),
+        turn_end_tx: Default::default(),
         client_hooks: std::cell::RefCell::new(client_hooks),
         hook_resolved_workspace_root: resolved_workspace_root,
         vcs_kind: {
@@ -1813,14 +1683,18 @@ pub(crate) async fn spawn_session_actor(
         session_turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
+        pending_image_strip: parking_lot::Mutex::new(None),
         sampler_handle,
         rebuild_spec: rebuild_spec.clone(),
-        image_description_model: std::cell::RefCell::new(image_description_model),
+        image_description_model,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: workspace_ops.clone(),
         trace_config_template: std::cell::RefCell::new(None),
     });
+    if owns_permission_manager {
+        session.wire_permission_prompt_notification();
+    }
     if goal_was_restored {
         let current_tokens = session.chat_state_handle.get_total_tokens().await as i64;
         let (tokens_used, finished_marginal) = session.goal_tokens(current_tokens);
@@ -2143,7 +2017,6 @@ pub(crate) async fn spawn_session_actor(
             pending_interactions,
             info: session_info,
             max_turns,
-            capability_mode: effective_capability_mode,
             resolved_tool_overrides,
             hunk_tracker_handle,
             chat_state_handle: chat_state_handle_for_handle,
@@ -2157,13 +2030,13 @@ pub(crate) async fn spawn_session_actor(
             upload_failures_since_success: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tool_context: tool_context_for_handle,
             model_id: session_model_id,
-            auxiliary_model_provenance: crate::session::AuxiliaryModelProvenance::default(),
             scheduler_background_loops,
             reasoning_effort: sampling_config.reasoning_effort,
             yolo_mode: session_yolo_mode,
             origin_client: origin_client.clone(),
             code_nav_enabled,
             ask_user_question_enabled,
+            non_interactive: session_non_interactive,
             plan_mode: plan_mode.clone(),
             force_compact,
             permission_handle: permissions_for_handle,
@@ -2219,7 +2092,6 @@ pub(crate) async fn spawn_session_on_thread(
     session_info: SessionInfo,
     gateway: GatewaySender,
     sampling_config: SamplingConfig,
-    catalog_identity: xai_chat_state::CatalogIdentity,
     credentials: xai_chat_state::Credentials,
     auth_method_id: crate::agent::auth_method::SharedAuthMethodId,
     auth_manager: Option<Arc<AuthManager>>,
@@ -2273,7 +2145,6 @@ pub(crate) async fn spawn_session_on_thread(
     loc_tracking_enabled: bool,
     feedback_flags: crate::session::feedback_manager::FeedbackFlags,
     managed_mcp_handle: crate::session::managed_mcp::ManagedMcpStateHandle,
-    managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     managed_mcp_proxy_base_url: String,
     session_model_id: acp::ModelId,
     session_yolo_mode: bool,
@@ -2341,6 +2212,7 @@ pub(crate) async fn spawn_session_on_thread(
     >();
     let sid = session_info.id.0.to_string();
     let thread_name = format!("ses-{}", &sid[..sid.len().min(8)]);
+    const SESSION_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
     let join_handle = std::thread::Builder::new()
         .name(thread_name)
         .stack_size(SESSION_THREAD_STACK_SIZE)
@@ -2392,7 +2264,6 @@ pub(crate) async fn spawn_session_on_thread(
                         session_info,
                         gateway,
                         sampling_config,
-                        catalog_identity,
                         credentials,
                         auth_method_id,
                         auth_manager,
@@ -2448,7 +2319,6 @@ pub(crate) async fn spawn_session_on_thread(
                         loc_tracking_enabled,
                         feedback_flags,
                         managed_mcp_handle,
-                        managed_mcp_expires_at,
                         managed_mcp_proxy_base_url,
                         session_model_id,
                         session_yolo_mode,
@@ -2580,16 +2450,7 @@ impl crate::session::mcp_restart::RestartActions for SessionRestartActions {
             .is_shutting_down(server)
     }
     async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
-        let shutdown = std::sync::Arc::clone(&self.shutdown);
-        let server_name = server.to_string();
-        self.session
-            .respawn_stdio_then(server, move || {
-                shutdown
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .note_ready(&server_name);
-            })
-            .await
+        self.session.respawn_stdio(server).await
     }
     async fn is_http_server_configured(&self, server: &str) -> bool {
         self.session.is_http_server_configured(server).await
@@ -2614,22 +2475,6 @@ impl crate::session::mcp_restart::RestartActions for SessionRestartActions {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .end_restart(server);
-    }
-    fn note_ready(&self, server: &str) {
-        self.shutdown
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .note_ready(server);
-    }
-    fn classify_death(
-        &self,
-        server: &str,
-        kind: xai_grok_mcp::servers::McpClientEventKind,
-    ) -> crate::session::mcp_restart::DeathDisposition {
-        self.shutdown
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .classify_death(server, kind)
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
