@@ -150,7 +150,7 @@ pub struct CapabilityRequirements {
 
 /// Plugin-facing native route request. Contains no credentials or endpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeSubagentRouteRequest {
     pub schema_version: u32,
     pub selection: NativeModelSelection,

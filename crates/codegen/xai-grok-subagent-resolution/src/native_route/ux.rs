@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use xai_grok_agent::config::ModelOverride;
 
+use super::resolve::validate_published_receipt;
 use super::types::{NativeSubagentRouteResult, RejectionCode};
 
 /// Selection intent shown in compact rows.
@@ -243,6 +244,29 @@ pub fn snapshot_from_resolution(
         "ordered_candidates" => AgentSelectionMode::OrderedCandidates,
         _ => AgentSelectionMode::Inherit,
     };
+    if validate_published_receipt(&result.receipt).is_err() {
+        return AgentRouteUxSnapshot {
+            generation,
+            agent_id: agent_id.into(),
+            display_name: display_name.into(),
+            scope: scope.into(),
+            enabled,
+            active,
+            default_for_new_sessions,
+            selection_mode: mode,
+            requested_model_refs: result.receipt.requested_catalog_ids.clone(),
+            policy_id: result.receipt.consumer_policy_id.clone(),
+            policy_digest: result.receipt.consumer_policy_digest.clone(),
+            route_status: RouteStatus::Incompatible,
+            selected_catalog_id: None,
+            selected_wire_model: None,
+            capability_floor: capability_floor.map(str::to_string),
+            route_receipt_digest: None,
+            attempt: None,
+            resume_source_receipt: None,
+            rejected_candidates: Vec::new(),
+        };
+    }
     AgentRouteUxSnapshot {
         generation,
         agent_id: agent_id.into(),
