@@ -924,13 +924,18 @@ async fn headless_web_search_notice_surfaces_on_new_session() {
                 let resp = acp::NewSessionResponse::new(acp::SessionId::new("headless-ws-new"))
                     .meta(Some(headless_ws_notice_meta()));
                 let _ = args.response_tx.send(Ok(resp));
+                break;
             }
         }
     });
     let cwd = tempfile::tempdir().expect("temp cwd");
-    let opened = super::open_session(&tx, cwd.path(), None, None)
-        .await
-        .expect("session opens");
+    let opened = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        super::open_session(&tx, cwd.path(), None, None),
+    )
+    .await
+    .expect("open_session must complete within 5s")
+    .expect("session opens");
     assert_eq!(opened.session_id.0.as_ref(), "headless-ws-new");
     assert_eq!(
         opened.web_search_disabled.as_deref(),
@@ -951,13 +956,18 @@ async fn headless_web_search_notice_surfaces_on_session_load() {
             if let xai_acp_lib::AcpAgentMessage::LoadSession(args) = msg {
                 let resp = acp::LoadSessionResponse::new().meta(Some(headless_ws_notice_meta()));
                 let _ = args.response_tx.send(Ok(resp));
+                break;
             }
         }
     });
     let cwd = tempfile::tempdir().expect("temp cwd");
-    let opened = super::open_session(&tx, cwd.path(), Some("headless-ws-resume"), None)
-        .await
-        .expect("resume loads");
+    let opened = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        super::open_session(&tx, cwd.path(), Some("headless-ws-resume"), None),
+    )
+    .await
+    .expect("open_session must complete within 5s")
+    .expect("resume loads");
     assert_eq!(opened.session_id.0.as_ref(), "headless-ws-resume");
     assert_eq!(
         opened.web_search_disabled.as_deref(),
@@ -977,13 +987,18 @@ async fn headless_web_search_notice_absent_meta_means_available() {
             if let xai_acp_lib::AcpAgentMessage::NewSession(args) = msg {
                 let resp = acp::NewSessionResponse::new(acp::SessionId::new("headless-ws-fine"));
                 let _ = args.response_tx.send(Ok(resp));
+                break;
             }
         }
     });
     let cwd = tempfile::tempdir().expect("temp cwd");
-    let opened = super::open_session(&tx, cwd.path(), None, None)
-        .await
-        .expect("session opens");
+    let opened = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        super::open_session(&tx, cwd.path(), None, None),
+    )
+    .await
+    .expect("open_session must complete within 5s")
+    .expect("session opens");
     assert_eq!(
         opened.web_search_disabled, None,
         "absent meta key must read as web_search available"
