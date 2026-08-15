@@ -855,7 +855,7 @@ fn usage_facts_from_receipt_are_secret_free() {
 fn inspect_document_includes_live_receipts() {
     let result =
         resolve_native_route(&request(NativeModelSelection::Inherit), &catalog(), 1, 1).unwrap();
-    let doc = inspect_document(vec![result.receipt.clone()]);
+    let doc = inspect_document(vec![result.receipt.clone()]).expect("valid receipt");
     assert_eq!(doc.receipts.len(), 1);
     assert_eq!(doc.receipts[0].selected_catalog_id, "review-primary");
 }
