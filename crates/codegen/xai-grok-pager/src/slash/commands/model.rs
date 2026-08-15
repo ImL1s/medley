@@ -428,6 +428,7 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
             display,
             match_text: model_item_match_text(id, info, &readiness.provider_hint),
             insert_text,
+            identity: id.0.to_string(),
             description,
             badge,
             dimmed: !readiness.ready,
@@ -931,6 +932,62 @@ mod tests {
         let by_cap_b = selectable_by_match(&items, "issue17-search");
         assert_eq!(by_cap_b.len(), 1);
         assert!(by_cap_b[0].match_text.contains("issue17-catalog-b"));
+    }
+
+    /// Catalog refresh remaps an open `/model` picker by ModelId, not display
+    /// `insert_text` (Codex P2 3788439758).
+    #[test]
+    fn remap_model_picker_selection_keeps_focused_id_when_display_names_collide() {
+        let mut state = ModelState::default();
+        let (id_a, info_a) = model_with_meta(
+            "issue-remap-a",
+            "Shared Name",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("a")),
+            ]),
+        );
+        let (id_b, info_b) = model_with_meta(
+            "issue-remap-b",
+            "Shared Name",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("b")),
+            ]),
+        );
+        state.available.insert(id_a, info_a);
+        state.available.insert(id_b, info_b);
+        let before = build_model_items(&state);
+        let focused = before
+            .iter()
+            .find(|item| item.identity == "issue-remap-b")
+            .expect("sibling B");
+        assert_eq!(focused.insert_text, "Shared Name");
+
+        // Display names both change; identities stay.
+        let mut renamed = ModelState::default();
+        let (id_a, info_a) = model_with_meta(
+            "issue-remap-a",
+            "Renamed Shared",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("a")),
+            ]),
+        );
+        let (id_b, info_b) = model_with_meta(
+            "issue-remap-b",
+            "Renamed Shared",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("b")),
+            ]),
+        );
+        renamed.available.insert(id_a, info_a);
+        renamed.available.insert(id_b, info_b);
+        let after = build_model_items(&renamed);
+        let idx = ArgItem::remap_selection(&after, Some(focused.identity.as_str()));
+        assert_eq!(after[idx].identity, "issue-remap-b");
+        assert_eq!(after[idx].insert_text, "Renamed Shared");
     }
 
     #[test]

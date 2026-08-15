@@ -3277,6 +3277,7 @@ mod tests {
                 display: display.into(),
                 match_text: match_text.into(),
                 insert_text: insert.into(),
+                identity: String::new(),
                 description: String::new(),
                 ..Default::default()
             };

@@ -84,6 +84,7 @@ impl SlashCommand for UsageCommand {
                 display: "show".into(),
                 match_text: "show".into(),
                 insert_text: "show".into(),
+                identity: String::new(),
                 description: "View usage".into(),
                 ..Default::default()
             },
@@ -91,6 +92,7 @@ impl SlashCommand for UsageCommand {
                 display: "manage".into(),
                 match_text: "manage".into(),
                 insert_text: "manage".into(),
+                identity: String::new(),
                 description: "Manage billing".into(),
                 ..Default::default()
             },

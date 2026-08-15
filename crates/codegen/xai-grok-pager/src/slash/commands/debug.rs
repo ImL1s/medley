@@ -72,6 +72,7 @@ impl SlashCommand for DebugCommand {
                     display: name.to_string(),
                     match_text: name.to_string(),
                     insert_text: name.to_string(),
+                    identity: String::new(),
                     description: desc.to_string(),
                     ..Default::default()
                 })

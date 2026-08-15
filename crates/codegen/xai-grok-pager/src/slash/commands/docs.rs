@@ -49,6 +49,7 @@ impl SlashCommand for DocsCommand {
                 display: "how-to".into(),
                 match_text: "how-to".into(),
                 insert_text: "how-to".into(),
+                identity: String::new(),
                 description: "Browse in-TUI How-to Guides".into(),
                 ..Default::default()
             },
@@ -56,6 +57,7 @@ impl SlashCommand for DocsCommand {
                 display: "web".into(),
                 match_text: "web".into(),
                 insert_text: "web".into(),
+                identity: String::new(),
                 description: "Open docs.x.ai/build in the browser".into(),
                 ..Default::default()
             },
@@ -64,6 +66,7 @@ impl SlashCommand for DocsCommand {
             display: title.into(),
             match_text: title.into(),
             insert_text: title.into(),
+            identity: String::new(),
             description: format!("Open \"{title}\""),
             ..Default::default()
         }));

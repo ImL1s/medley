@@ -1742,6 +1742,8 @@ jobs:
           run_nonzero -p xai-grok-pager --lib \
             build_model_items_match_issue17_duplicate_display_name -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
+            remap_model_picker_selection_keeps_focused_id_when_display_names_collide -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
             issue15_doctor_providers -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             issue49 -- --nocapture

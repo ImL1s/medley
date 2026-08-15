@@ -135,6 +135,7 @@ fn list_path_completions(cwd: &Path, query: &str) -> Vec<ArgItem> {
             display: format!("{name_str}{suffix}"),
             match_text: format!("{typed_prefix}{name_str}"),
             insert_text: format!("{typed_prefix}{name_str}{suffix}"),
+            identity: String::new(),
             description: if is_dir {
                 "directory".to_string()
             } else {

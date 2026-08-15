@@ -73,9 +73,13 @@ fn refresh_open_model_arg_picker(agent: &mut AgentView) {
             state,
             ..
         }) if command == "model" || command == "m" => {
-            let prev = items
-                .get(state.selected)
-                .map(|item| item.insert_text.clone());
+            let prev = items.get(state.selected).map(|item| {
+                if item.identity.is_empty() {
+                    item.insert_text.clone()
+                } else {
+                    item.identity.clone()
+                }
+            });
             (command.clone(), args_query.clone(), prev)
         }
         _ => return,
@@ -115,13 +119,7 @@ fn refresh_open_model_arg_picker(agent: &mut AgentView) {
                 || item.description.to_lowercase().contains(&q)
         })
         .collect();
-    if let Some(prev) = prev_insert
-        && let Some(idx) = items.iter().position(|item| item.insert_text == prev)
-    {
-        state.selected = idx;
-    } else {
-        state.selected = crate::slash::command::ArgItem::preferred_index(items);
-    }
+    state.selected = crate::slash::command::ArgItem::remap_selection(items, prev_insert.as_deref());
 }
 
 /// Handle `x.ai/settings/update` — remote settings refreshed on `/new`.

@@ -932,16 +932,21 @@ thread_local! {
 
 /// Thread-local pin of the Codex auth.json path for production constructors
 /// that cannot take a path argument. Does not mutate process environment.
+/// `!Send`: Drop restores this thread's `AUTH_PATH_OVERRIDE` (#343).
 #[cfg(test)]
 pub struct CodexAuthPathGuard {
     previous: Option<PathBuf>,
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 #[cfg(test)]
 impl CodexAuthPathGuard {
     pub fn pin(path: impl Into<PathBuf>) -> Self {
         let previous = AUTH_PATH_OVERRIDE.with(|slot| slot.replace(Some(path.into())));
-        Self { previous }
+        Self {
+            previous,
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 
