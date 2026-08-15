@@ -19,7 +19,7 @@ use unicode_width::UnicodeWidthStr;
 use xai_grok_agent::config::{AgentDefinition, AgentScope, BuiltinAgentName};
 use xai_grok_shell::agent::config::AgentSelectionConfig;
 use xai_grok_subagent_resolution::native_route::{
-    AgentRouteUxSnapshot, format_route_detail, snapshot_from_model_override,
+    AgentRouteUxSnapshot, format_route_detail, snapshot_from_agent_definition,
 };
 use xai_grok_tools::implementations::skills::discovery::extract_first_paragraph;
 use xai_grok_tools::registry::types::ToolServerConfig;
@@ -778,14 +778,14 @@ pub fn toggle_agent(name: &str, enabled: bool) -> Result<(), String> {
 }
 fn route_snapshot_for_entry(entry: &AgentListEntry) -> AgentRouteUxSnapshot {
     let floor = entry.definition.capability_mode.map(|mode| mode.as_str());
-    snapshot_from_model_override(
+    snapshot_from_agent_definition(
         &entry.name,
         &entry.name,
         entry.scope.label(),
         entry.enabled,
         false,
         false,
-        &entry.definition.model,
+        &entry.definition,
         floor,
         0,
     )
@@ -796,6 +796,9 @@ pub fn format_agent_detail(entry: &AgentListEntry) -> Vec<String> {
     let def = &entry.definition;
     let mut lines = Vec::new();
     lines.push(format!("  Model: {}", def.model));
+    if !def.models.is_empty() {
+        lines.push(format!("  Models: {}", def.models.join(", ")));
+    }
     lines.extend(format_route_detail(&route_snapshot_for_entry(entry)));
     let mode_label = match def.prompt_mode {
         xai_grok_agent::config::PromptMode::Extend => "extend",
@@ -2567,6 +2570,34 @@ mod tests {
         );
         assert!(
             lines.iter().any(|line| line.contains("Selection:")),
+            "{lines:?}"
+        );
+    }
+    #[test]
+    fn format_agent_detail_includes_models_list() {
+        let mut def = AgentDefinition::explore();
+        def.models = vec!["review-primary".into(), "review-fallback".into()];
+        let entry = AgentListEntry {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            scope: def.scope,
+            source_path: None,
+            enabled: true,
+            is_builtin: true,
+            expanded: true,
+            definition: def,
+        };
+        let lines = format_agent_detail(&entry);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Models: review-primary, review-fallback")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Selection: ordered_candidates")),
             "{lines:?}"
         );
     }

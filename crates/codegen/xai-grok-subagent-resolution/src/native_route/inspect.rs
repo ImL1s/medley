@@ -1,12 +1,13 @@
 //! Inspect JSON and declarative plugin/agent syntax.
 
 use serde::{Deserialize, Serialize};
+use xai_grok_agent::config::{AgentDefinition, ModelOverride};
 
 use super::resolve::validate_published_receipt;
 use super::types::{
     CapabilityRequirements, DiscoveredCapability, INSPECT_SCHEMA, NativeModelSelection,
-    NativeRouteError, NativeSubagentRouteRequest, RejectionCode, RouteReceipt, SCHEMA_VERSION,
-    discover_capabilities, reject_secret_text,
+    NativeRouteError, NativeSubagentRouteRequest, RejectionCode, ResumePin, RouteReceipt,
+    SCHEMA_VERSION, discover_capabilities, reject_secret_text,
 };
 
 /// Versioned inspect document for consumers. Discovery performs no inference.
@@ -135,5 +136,53 @@ pub fn parse_declarative_spec(
         parent_session_id: None,
         child_session_id: None,
         resume: None,
+    })
+}
+
+/// Build a native route request from a parsed `AgentDefinition`.
+pub fn request_from_agent_definition(
+    def: &AgentDefinition,
+    parent_catalog_id: Option<String>,
+    parent_session_id: Option<String>,
+    child_session_id: Option<String>,
+    resume: Option<ResumePin>,
+) -> Result<NativeSubagentRouteRequest, NativeRouteError> {
+    let model = match &def.model {
+        ModelOverride::Inherit => None,
+        ModelOverride::Override(id) => Some(id.clone()),
+    };
+    let mut request = parse_declarative_spec(DeclarativeNativeRouteSpec {
+        model,
+        models: if def.models.is_empty() {
+            None
+        } else {
+            Some(def.models.clone())
+        },
+        routing_requirements: CapabilityRequirements {
+            structured_output: def.routing_requirements.structured_output,
+            minimum_context_tokens: def.routing_requirements.minimum_context_tokens,
+            required_harness: def.routing_requirements.required_harness.clone(),
+            local_only: def.routing_requirements.local_only,
+            required_named_capabilities: Vec::new(),
+        },
+        consumer_policy_id: None,
+        consumer_policy_digest: None,
+    })?;
+    request.parent_catalog_id = parent_catalog_id;
+    request.parent_session_id = parent_session_id;
+    request.child_session_id = child_session_id;
+    request.resume = resume;
+    Ok(request)
+}
+
+/// Secret-free usage projection keyed by the committed catalog route.
+pub fn usage_facts_from_receipt(receipt: &RouteReceipt) -> serde_json::Value {
+    serde_json::json!({
+        "catalogId": receipt.selected_catalog_id,
+        "wireModel": receipt.selected_wire_model,
+        "accessProfile": receipt.access_profile,
+        "routeDigest": receipt.route_digest,
+        "attempt": receipt.attempt,
+        "selectionMode": receipt.selection_mode,
     })
 }

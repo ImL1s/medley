@@ -608,6 +608,34 @@ impl serde::Serialize for ModelOverride {
         }
     }
 }
+/// Hard requirements for Medley native route selection. Unknown/unready
+/// catalog routes must not satisfy these.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRoutingRequirements {
+    #[serde(default, alias = "structured_output")]
+    pub structured_output: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "minimum_context_tokens"
+    )]
+    pub minimum_context_tokens: Option<u32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "required_harness"
+    )]
+    pub required_harness: Option<String>,
+    #[serde(default, alias = "local_only")]
+    pub local_only: bool,
+}
+
+impl AgentRoutingRequirements {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
 const AGENT_TASK_KEYWORDS: &str = "Agent|Task";
 /// Splits `"Agent(a, b), read_file"` → `["Agent(a, b)", "read_file"]`.
 pub static AGENT_TASK_TOKENIZER_RE: std::sync::LazyLock<regex::Regex> =
@@ -807,6 +835,22 @@ pub struct AgentDefinition {
     pub memory: Option<MemoryScope>,
     #[serde(default)]
     pub model: ModelOverride,
+    /// Ordered catalog-ID candidates (Medley native route extension).
+    /// Empty means "use `model` only". Conflicting non-inherit `model` plus
+    /// a non-empty list is rejected at parse time.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub models: Vec<String>,
+    /// Hard routing requirements applied to exact/ordered native selection.
+    #[serde(
+        default,
+        skip_serializing_if = "AgentRoutingRequirements::is_default",
+        alias = "routing_requirements"
+    )]
+    pub routing_requirements: AgentRoutingRequirements,
     /// Completion requirement — declares that this agent must call a
     /// specific tool before the turn ends.
     #[serde(default)]
@@ -1336,6 +1380,7 @@ impl AgentDefinition {
         def.source_path = Some(path.to_path_buf());
         def.plugin_name = None;
         def.scope = Self::scope_from_path(path);
+        def.validate_native_route_syntax()?;
         Ok(def)
     }
     /// Parse from string content (for testing and inline definitions).
@@ -1363,7 +1408,21 @@ impl AgentDefinition {
             .map_err(|e| AgentBuildError::ParseError(e.to_string()))?;
         def.prompt_body = prompt_body;
         def.plugin_name = None;
+        def.validate_native_route_syntax()?;
         Ok(def)
+    }
+    fn validate_native_route_syntax(&self) -> Result<(), AgentBuildError> {
+        if self.models.iter().any(|id| id.is_empty()) {
+            return Err(AgentBuildError::ParseError(
+                "empty models catalog ids are invalid".into(),
+            ));
+        }
+        if !self.models.is_empty() && matches!(self.model, ModelOverride::Override(_)) {
+            return Err(AgentBuildError::ParseError(
+                "model and models cannot both declare a non-inherit exact route".into(),
+            ));
+        }
+        Ok(())
     }
     /// Determine the scope of a definition file based on its path.
     fn scope_from_path(path: &Path) -> AgentScope {
@@ -1509,6 +1568,8 @@ impl AgentDefinition {
             session_tools_allowlist: None,
             session_tools_denylist: None,
             model: ModelOverride::Inherit,
+            models: vec![],
+            routing_requirements: AgentRoutingRequirements::default(),
             completion_requirement: None,
             tool_overrides: None,
             prompt_body: None,

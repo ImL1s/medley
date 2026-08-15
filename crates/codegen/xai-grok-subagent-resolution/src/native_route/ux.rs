@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use xai_grok_agent::config::ModelOverride;
+use xai_grok_agent::config::{AgentDefinition, ModelOverride};
 
 use super::resolve::validate_published_receipt;
 use super::types::{NativeSubagentRouteResult, RejectionCode};
@@ -218,6 +218,54 @@ pub fn snapshot_from_model_override(
         policy_id: None,
         policy_digest: None,
         route_status: status,
+        selected_catalog_id: None,
+        selected_wire_model: None,
+        capability_floor: capability_floor.map(str::to_string),
+        route_receipt_digest: None,
+        attempt: None,
+        resume_source_receipt: None,
+        rejected_candidates: Vec::new(),
+    }
+}
+
+/// Snapshot from a real `AgentDefinition`, including `models:` ordered lists.
+pub fn snapshot_from_agent_definition(
+    agent_id: &str,
+    display_name: &str,
+    scope: &str,
+    enabled: bool,
+    active: bool,
+    default_for_new_sessions: bool,
+    definition: &AgentDefinition,
+    capability_floor: Option<&str>,
+    generation: u64,
+) -> AgentRouteUxSnapshot {
+    if definition.models.is_empty() {
+        return snapshot_from_model_override(
+            agent_id,
+            display_name,
+            scope,
+            enabled,
+            active,
+            default_for_new_sessions,
+            &definition.model,
+            capability_floor,
+            generation,
+        );
+    }
+    AgentRouteUxSnapshot {
+        generation,
+        agent_id: agent_id.into(),
+        display_name: display_name.into(),
+        scope: scope.into(),
+        enabled,
+        active,
+        default_for_new_sessions,
+        selection_mode: AgentSelectionMode::OrderedCandidates,
+        requested_model_refs: definition.models.clone(),
+        policy_id: None,
+        policy_digest: None,
+        route_status: RouteStatus::Unknown,
         selected_catalog_id: None,
         selected_wire_model: None,
         capability_floor: capability_floor.map(str::to_string),

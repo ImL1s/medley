@@ -36,6 +36,9 @@ use xai_file_utils::events::types::CancellationCategory;
 use xai_grok_agent::config::{McpInheritance, ModelOverride, PermissionMode};
 use xai_grok_sampling_types::conversation::ConversationItem;
 use xai_grok_subagent_resolution::ResumeSourceData;
+use xai_grok_subagent_resolution::native_route::{
+    ResumePin, RouteReceipt, request_from_agent_definition, resolve_native_route,
+};
 use xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer;
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
     ChildCompletion, ChildControl, ChildRunOutput, LocalBoxFuture, StartedChild, SubagentProgress,
@@ -45,6 +48,7 @@ use xai_grok_tools::types::tool::ToolKind;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod handle_request;
+mod native_route_live;
 pub(crate) use handle_request::run_shell_child;
 /// Command channels for live child sessions that participate in managed-gateway
 /// admission and refresh barriers.
@@ -736,6 +740,100 @@ async fn resolve_request_prepared_model(
         )
         .await
     }
+}
+
+struct NativeRoutePrepared {
+    prepared: PreparedSubagentModel,
+    receipt: Option<RouteReceipt>,
+}
+
+fn native_route_now_ms() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+fn runtime_or_config_pin_resolves(
+    runtime_override_model: Option<&str>,
+    subagent_type: &str,
+    ctx: &SubagentSpawnContext,
+) -> bool {
+    if runtime_override_model
+        .is_some_and(|model_id| resolve_model_override_to_prepared(model_id, ctx).is_some())
+    {
+        return true;
+    }
+    ctx.subagent_model_overrides
+        .get(subagent_type)
+        .is_some_and(|model_id| resolve_model_override_to_prepared(model_id, ctx).is_some())
+}
+
+/// Live native-route resolution for spawn. Ordered `models:` is fail-closed.
+/// Runtime / `[subagents.models]` pins still win when they resolve. Legacy
+/// exact `model:` keeps falling through on unknown ids.
+async fn resolve_request_prepared_model_with_native_route(
+    fork_context: bool,
+    runtime_override_model: Option<&str>,
+    subagent_type: &str,
+    definition: &xai_grok_agent::AgentDefinition,
+    ctx: &SubagentSpawnContext,
+    child_session_id: Option<&str>,
+    resume: Option<ResumePin>,
+    allow_native_ordered: bool,
+) -> Result<NativeRoutePrepared, String> {
+    let catalog = native_route_live::synthetic_catalog_from_available_models(&ctx.available_models);
+    let now = native_route_now_ms();
+    if !fork_context
+        && allow_native_ordered
+        && !definition.models.is_empty()
+        && !runtime_or_config_pin_resolves(runtime_override_model, subagent_type, ctx)
+    {
+        let request = request_from_agent_definition(
+            definition,
+            Some(ctx.model_id.0.to_string()),
+            Some(ctx.parent_session_id.clone()),
+            child_session_id.map(str::to_string),
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+        let result = resolve_native_route(&request, &catalog, now, 1).map_err(|err| {
+            format!("Cannot spawn subagent '{subagent_type}': native route failed ({err})")
+        })?;
+        let prepared = resolve_model_override_to_prepared(&result.selected_catalog_id, ctx)
+            .ok_or_else(|| {
+                format!(
+                    "Cannot spawn subagent '{subagent_type}': selected catalog '{}' is not a ready model",
+                    result.selected_catalog_id
+                )
+            })?;
+        log_subagent_model_resolution(
+            subagent_type,
+            "native_ordered",
+            &prepared.sampling_config,
+            &prepared.model_id,
+            &ctx.sampling_config,
+        );
+        return Ok(NativeRoutePrepared {
+            prepared,
+            receipt: Some(result.receipt),
+        });
+    }
+    let prepared = resolve_request_prepared_model(
+        fork_context,
+        runtime_override_model,
+        subagent_type,
+        &definition.model,
+        ctx,
+    )
+    .await;
+    let receipt = native_route_live::stamp_receipt_for_selection(
+        definition,
+        ctx,
+        &catalog,
+        prepared.model_id.0.as_ref(),
+        child_session_id,
+        resume,
+        now,
+    );
+    Ok(NativeRoutePrepared { prepared, receipt })
 }
 
 async fn resolve_effective_model_config(
@@ -2802,6 +2900,9 @@ pub(crate) struct SubagentMeta {
     /// as a model harness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_model_agent_type: Option<String>,
+    /// Secret-free native route receipt for this spawn, when resolution ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_route_receipt: Option<RouteReceipt>,
 }
 /// Canonical subagent metadata for GCS persistence (`subagent.json`).
 ///
@@ -2871,6 +2972,9 @@ pub(crate) struct SubagentSessionMetadata {
     /// ID of the source subagent this session was resumed from (`resume_from`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<String>,
+    /// Digest of the native route receipt when spawn resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_receipt_digest: Option<String>,
 }
 impl SubagentSessionMetadata {
     /// Current schema version.
@@ -2924,6 +3028,10 @@ impl SubagentSessionMetadata {
             error: meta.error.clone(),
             fork_copy_error: meta.fork_copy_error.clone(),
             resumed_from: meta.resumed_from.clone(),
+            route_receipt_digest: meta
+                .native_route_receipt
+                .as_ref()
+                .map(|receipt| receipt.route_digest.clone()),
         }
     }
 }

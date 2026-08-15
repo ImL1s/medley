@@ -798,3 +798,86 @@ fn receipt_digest_binds_serialized_schema() {
     );
     assert_ne!(with_message, forged_message);
 }
+
+#[test]
+fn agent_definition_parses_models_as_ordered_candidates() {
+    let def = crate::AgentDefinition::parse(
+        "---\nname: verifier\ndescription: dual review\nmodels:\n  - review-primary\n  - review-fallback\n---\n",
+    )
+    .unwrap();
+    assert_eq!(
+        def.models,
+        vec!["review-primary".to_string(), "review-fallback".to_string()]
+    );
+    let req = request_from_agent_definition(&def, None, None, None, None).unwrap();
+    assert_eq!(
+        req.selection,
+        NativeModelSelection::OrderedCandidates {
+            catalog_ids: vec!["review-primary".into(), "review-fallback".into()],
+        }
+    );
+}
+
+#[test]
+fn agent_definition_rejects_model_and_models_conflict() {
+    let err = crate::AgentDefinition::parse(
+        "---\nname: verifier\ndescription: dual review\nmodel: review-primary\nmodels:\n  - review-fallback\n---\n",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("model and models"));
+}
+
+#[test]
+fn usage_facts_from_receipt_are_secret_free() {
+    let result = resolve_native_route(
+        &request(NativeModelSelection::Exact {
+            catalog_id: "review-primary".into(),
+        }),
+        &catalog(),
+        1,
+        2,
+    )
+    .unwrap();
+    let facts = usage_facts_from_receipt(&result.receipt);
+    assert_eq!(facts["catalogId"], "review-primary");
+    assert_eq!(facts["wireModel"], "gpt-family-wire");
+    assert_eq!(facts["accessProfile"], "subscription");
+    assert_eq!(facts["attempt"], 2);
+    assert_eq!(facts["selectionMode"], "exact");
+    assert_eq!(facts["routeDigest"], result.receipt.route_digest);
+    let blob = facts.to_string().to_ascii_lowercase();
+    assert!(!blob.contains("sk-"));
+    assert!(!blob.contains("bearer"));
+    assert!(!blob.contains("api_key"));
+}
+
+#[test]
+fn inspect_document_includes_live_receipts() {
+    let result =
+        resolve_native_route(&request(NativeModelSelection::Inherit), &catalog(), 1, 1).unwrap();
+    let doc = inspect_document(vec![result.receipt.clone()]);
+    assert_eq!(doc.receipts.len(), 1);
+    assert_eq!(doc.receipts[0].selected_catalog_id, "review-primary");
+}
+
+#[test]
+fn snapshot_from_agent_definition_uses_models_list() {
+    let mut def = crate::AgentDefinition::explore();
+    def.models = vec!["review-primary".into(), "review-fallback".into()];
+    let snap = snapshot_from_agent_definition(
+        "verifier",
+        "verifier",
+        "project",
+        true,
+        false,
+        false,
+        &def,
+        Some("read-only"),
+        1,
+    );
+    assert_eq!(snap.selection_mode, AgentSelectionMode::OrderedCandidates);
+    assert_eq!(
+        snap.requested_model_refs,
+        vec!["review-primary".to_string(), "review-fallback".to_string()]
+    );
+}
