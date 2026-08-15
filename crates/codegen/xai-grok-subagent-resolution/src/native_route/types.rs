@@ -133,7 +133,7 @@ impl NativeModelSelection {
 
 /// Hard requirements that unknown/unready state must not satisfy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityRequirements {
     #[serde(default)]
     pub structured_output: bool,

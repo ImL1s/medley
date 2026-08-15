@@ -418,12 +418,44 @@ fn receipt_digest_binds_harness_ceiling_and_resume() {
 
 #[test]
 fn inspect_document_matches_capability_registry() {
-    let doc = inspect_document(Vec::new());
+    let doc = inspect_document(Vec::new()).expect("empty inspect");
     assert_eq!(doc.schema, "medley.native-subagent-route.inspect/v1");
     assert_eq!(doc.host, "medley");
     assert_eq!(doc.capabilities.len(), 5);
     let json = serde_json::to_value(&doc).unwrap();
     assert_eq!(json["schema"], "medley.native-subagent-route.inspect/v1");
+}
+
+#[test]
+fn snake_case_requirement_field_is_rejected() {
+    let err = serde_json::from_str::<CapabilityRequirements>(r#"{"local_only":true}"#);
+    assert!(err.is_err());
+    let spec = serde_json::from_str::<DeclarativeNativeRouteSpec>(
+        r#"{"routingRequirements":{"local_only":true}}"#,
+    );
+    assert!(spec.is_err());
+    let ok = serde_json::from_str::<CapabilityRequirements>(r#"{"localOnly":true}"#).unwrap();
+    assert!(ok.local_only);
+}
+
+#[test]
+fn inspect_document_rejects_forged_receipt_digest() {
+    let result = resolve_native_route(
+        &request(NativeModelSelection::Exact {
+            catalog_id: "review-primary".into(),
+        }),
+        &catalog(),
+        20,
+        1,
+    )
+    .unwrap();
+    let ok = inspect_document(vec![result.receipt.clone()]).expect("valid receipt");
+    assert_eq!(ok.receipts.len(), 1);
+
+    let mut forged = result.receipt;
+    forged.route_digest = "0".repeat(64);
+    let err = inspect_document(vec![forged]).unwrap_err();
+    assert_eq!(err.code(), RejectionCode::UnsupportedContract);
 }
 
 #[test]

@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::resolve::validate_published_receipt;
 use super::types::{
     CapabilityRequirements, DiscoveredCapability, INSPECT_SCHEMA, NativeModelSelection,
     NativeRouteError, NativeSubagentRouteRequest, RejectionCode, RouteReceipt, SCHEMA_VERSION,
@@ -20,14 +21,17 @@ pub struct InspectDocument {
     pub receipts: Vec<RouteReceipt>,
 }
 
-pub fn inspect_document(receipts: Vec<RouteReceipt>) -> InspectDocument {
-    InspectDocument {
+pub fn inspect_document(receipts: Vec<RouteReceipt>) -> Result<InspectDocument, NativeRouteError> {
+    for receipt in &receipts {
+        validate_published_receipt(receipt)?;
+    }
+    Ok(InspectDocument {
         schema: INSPECT_SCHEMA.into(),
         schema_version: SCHEMA_VERSION,
         host: "medley".into(),
         capabilities: discover_capabilities(),
         receipts,
-    }
+    })
 }
 
 /// Smallest generic declarative extension (`model` / `models` / routingRequirements).

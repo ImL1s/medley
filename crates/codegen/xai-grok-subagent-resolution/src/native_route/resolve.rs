@@ -452,6 +452,18 @@ fn digest_receipt(receipt: &RouteReceipt) -> Result<String, NativeRouteError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Fail closed before publishing a receipt on inspect JSON.
+pub(crate) fn validate_published_receipt(receipt: &RouteReceipt) -> Result<(), NativeRouteError> {
+    let expected = digest_receipt(receipt)?;
+    if expected != receipt.route_digest {
+        return Err(NativeRouteError::Rejected(
+            RejectionCode::UnsupportedContract,
+            "inspect receipt digest does not match canonical payload".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Replay-safety admission. This slice always refuses cross-route fallback
 /// after visible output, a tool call, or a side effect. #18 owns a proven
 /// replay API later.
