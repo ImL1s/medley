@@ -858,7 +858,7 @@ pub(crate) async fn upload_memory_state(ctx: &PromptTraceContext) {
 pub(crate) async fn upload_unified_log(ctx: &PromptTraceContext, wait: UploadWait) {
     let session_id = ctx.session_info.id.0.to_string();
     let log_bytes = match tokio::task::spawn_blocking(move || {
-        xai_grok_telemetry::unified_log::snapshot_session_log(&session_id)
+        xai_grok_telemetry::unified_log::snapshot_session_log_for_upload(&session_id)
     })
     .await
     {
@@ -895,7 +895,7 @@ pub(crate) async fn upload_unified_log(ctx: &PromptTraceContext, wait: UploadWai
     )
     .await;
     let full_log_bytes =
-        tokio::task::spawn_blocking(xai_grok_telemetry::unified_log::snapshot_log).await;
+        tokio::task::spawn_blocking(xai_grok_telemetry::unified_log::snapshot_log_for_upload).await;
     let user_id = ctx
         .auth_manager
         .current_or_expired()
