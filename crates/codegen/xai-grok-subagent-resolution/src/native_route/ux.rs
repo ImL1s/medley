@@ -256,13 +256,14 @@ pub fn snapshot_from_resolution(
         policy_id: result.receipt.consumer_policy_id.clone(),
         policy_digest: result.receipt.consumer_policy_digest.clone(),
         route_status: RouteStatus::Ready,
-        selected_catalog_id: Some(result.selected_catalog_id.clone()),
-        selected_wire_model: Some(result.selected_wire_model.clone()),
+        selected_catalog_id: Some(result.receipt.selected_catalog_id.clone()),
+        selected_wire_model: Some(result.receipt.selected_wire_model.clone()),
         capability_floor: capability_floor.map(str::to_string),
         route_receipt_digest: Some(result.receipt.route_digest.clone()),
         attempt: Some(result.receipt.attempt),
         resume_source_receipt: result.receipt.resume_source_receipt.clone(),
         rejected_candidates: result
+            .receipt
             .rejected_candidates
             .iter()
             .map(|row| (row.catalog_id.clone(), row.reason_code))

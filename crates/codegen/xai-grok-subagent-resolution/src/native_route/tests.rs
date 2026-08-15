@@ -504,6 +504,14 @@ fn ux_snapshot_from_resolution_carries_receipt_digest() {
     assert_eq!(snap.route_status, RouteStatus::Ready);
     assert_eq!(snap.attempt, Some(3));
     assert_eq!(
+        snap.selected_catalog_id.as_deref(),
+        Some(result.receipt.selected_catalog_id.as_str())
+    );
+    assert_eq!(
+        snap.selected_wire_model.as_deref(),
+        Some(result.receipt.selected_wire_model.as_str())
+    );
+    assert_eq!(
         snap.route_receipt_digest.as_deref(),
         Some(result.receipt.route_digest.as_str())
     );
