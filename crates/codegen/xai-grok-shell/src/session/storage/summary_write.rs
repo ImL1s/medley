@@ -239,6 +239,14 @@ pub(crate) fn apply_patch_locked(
     result
 }
 
+pub(crate) fn apply_patch_locked_durable(
+    summary_path: &Path,
+    lock_path: &Path,
+    patch: &SummaryPatch,
+) -> io::Result<bool> {
+    apply_patch_locked(summary_path, lock_path, patch)
+}
+
 fn read_modify_write(summary_path: &Path, patch: &SummaryPatch) -> io::Result<bool> {
     let mut summary = read_summary(summary_path)?;
     let absent_title_applied = summary.apply_patch(patch, Utc::now());

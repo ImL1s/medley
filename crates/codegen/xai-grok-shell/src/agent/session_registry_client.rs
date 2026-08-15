@@ -240,12 +240,15 @@ impl SessionRegistryClient {
     /// [`xai_grok_auth::StampedBearerSuffix`] for why never a re-resolution).
     fn record_401_attribution(&self, op: &str, stamp: Option<&xai_grok_auth::CredentialComparison>) {
         if let Some(manager) = self.credentials.auth_manager() {
+            let comparison = stamp
+                .copied()
+                .unwrap_or_else(xai_grok_auth::CredentialComparison::current_unavailable);
             crate::auth::attribution::record_consumer_401(
                 manager.as_ref(),
                 self.session_id.as_deref(),
                 crate::auth::attribution::ConsumerKind::SessionRegistryClient,
                 op,
-                None /* comparison token unavailable */,
+                Some(comparison.relation.as_str()),
             );
         }
     }

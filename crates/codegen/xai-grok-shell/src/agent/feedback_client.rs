@@ -446,15 +446,15 @@ impl FeedbackClient {
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && let Some(am) = self.credentials.auth_manager()
         {
-            // Attribute what the middleware stamped, never a re-resolved or
-            // constructor-time credential (see `StampedBearerSuffix`).
-            // `None` = the request went out with no bearer.
+            let comparison = stamp
+                .copied()
+                .unwrap_or_else(xai_grok_auth::CredentialComparison::current_unavailable);
             crate::auth::attribution::record_consumer_401(
                 am.as_ref(),
                 self.session_id.as_deref(),
                 crate::auth::attribution::ConsumerKind::FeedbackClient,
                 op,
-                None /* comparison token unavailable */,
+                Some(comparison.relation.as_str()),
             );
         }
     }

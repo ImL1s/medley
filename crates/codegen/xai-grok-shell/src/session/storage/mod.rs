@@ -83,6 +83,52 @@ pub(crate) fn sync_file_durable(_file: &std::fs::File) -> io::Result<()> {
     ))
 }
 
+pub(crate) fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            let dir = std::fs::File::open(parent)?;
+            sync_file_durable(&dir)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_bytes_atomic_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let tmp = temp_sibling(path);
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    sync_file_durable(&file)?;
+    drop(file);
+    let result = std::fs::rename(&tmp, path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    sync_parent_directory(path)
+}
+
+pub(crate) fn replace_file_atomic_durable(src: &Path, dst: &Path) -> io::Result<()> {
+    let file = std::fs::File::open(src)?;
+    sync_file_durable(&file)?;
+    drop(file);
+    std::fs::rename(src, dst)?;
+    sync_parent_directory(dst)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ModelSwitchCommitError {
+    #[error("committed model switch failure: {0}")]
+    Committed(io::Error),
+    #[error("uncommitted model switch failure: {0}")]
+    NotCommitted(io::Error),
+}
+
 /// Async sibling of [`write_bytes_atomic`].
 pub(crate) async fn write_bytes_atomic_async(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
     let tmp = temp_sibling(path);

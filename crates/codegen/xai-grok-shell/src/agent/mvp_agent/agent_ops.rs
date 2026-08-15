@@ -3194,11 +3194,7 @@ impl MvpAgent {
         let auth_manager = self.auth_manager.clone();
         let trace_upload_live = self.trace_upload_live.clone();
         Some(
-            std::sync::Arc::new(move |
-                log_bytes: Vec<u8>,
-                auth_token: String,
-                user_id: String|
-            {
+            std::sync::Arc::new(move |log_bytes: Vec<u8>, auth_token: String, user_id: String| {
                 let proxy_base_url = proxy_base_url.clone();
                 let deployment_key = deployment_key.clone();
                 let alpha_test_key = alpha_test_key.clone();

@@ -70,8 +70,9 @@ pub(crate) enum RefreshReason {
 /// `manager::consumed_sentinel`). Nobody waits on background work, so it
 /// gains nothing from taking that risk; the next full wake refreshes the
 /// never-presented disk RT cleanly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RefreshUrgency {
+    #[default]
     /// A user is waiting. May force an exchange through the dark-wake
     /// deferral budget.
     UserFacing,

@@ -208,7 +208,8 @@ pub(crate) async fn run_shell_child(
         }
         match source.worktree_path.as_deref() {
             None => None,
-            Some(dest) => {
+            Some(dest_str) => {
+                let dest = std::path::Path::new(dest_str);
                 match resume_worktree_action(dest.is_dir(), source.snapshot_ref.as_deref()) {
                     ResumeWorktreeAction::Reuse => Some(dest.to_path_buf()),
                     ResumeWorktreeAction::Rehydrate => {
