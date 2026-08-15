@@ -36,7 +36,7 @@ pub fn inspect_document(receipts: Vec<RouteReceipt>) -> Result<InspectDocument, 
 
 /// Smallest generic declarative extension (`model` / `models` / routingRequirements).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeclarativeNativeRouteSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

@@ -242,7 +242,30 @@ pub fn snapshot_from_resolution(
     let mode = match result.receipt.selection_mode.as_str() {
         "exact" => AgentSelectionMode::Exact,
         "ordered_candidates" => AgentSelectionMode::OrderedCandidates,
-        _ => AgentSelectionMode::Inherit,
+        "inherit" => AgentSelectionMode::Inherit,
+        _ => {
+            return AgentRouteUxSnapshot {
+                generation,
+                agent_id: agent_id.into(),
+                display_name: display_name.into(),
+                scope: scope.into(),
+                enabled,
+                active,
+                default_for_new_sessions,
+                selection_mode: AgentSelectionMode::Inherit,
+                requested_model_refs: result.receipt.requested_catalog_ids.clone(),
+                policy_id: result.receipt.consumer_policy_id.clone(),
+                policy_digest: result.receipt.consumer_policy_digest.clone(),
+                route_status: RouteStatus::Incompatible,
+                selected_catalog_id: None,
+                selected_wire_model: None,
+                capability_floor: capability_floor.map(str::to_string),
+                route_receipt_digest: None,
+                attempt: None,
+                resume_source_receipt: None,
+                rejected_candidates: Vec::new(),
+            };
+        }
     };
     if validate_published_receipt(&result.receipt).is_err() {
         return AgentRouteUxSnapshot {

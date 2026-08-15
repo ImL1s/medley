@@ -439,6 +439,19 @@ fn snake_case_requirement_field_is_rejected() {
 }
 
 #[test]
+fn unknown_declarative_route_field_is_rejected() {
+    let err = serde_json::from_str::<DeclarativeNativeRouteSpec>(
+        r#"{"model":"cloud","routingRequirement":{"localOnly":true}}"#,
+    );
+    assert!(err.is_err());
+    let ok = serde_json::from_str::<DeclarativeNativeRouteSpec>(
+        r#"{"model":"review-primary","routingRequirements":{"localOnly":true}}"#,
+    )
+    .unwrap();
+    assert!(ok.routing_requirements.local_only);
+}
+
+#[test]
 fn inspect_document_rejects_forged_receipt_digest() {
     let result = resolve_native_route(
         &request(NativeModelSelection::Exact {
@@ -471,6 +484,25 @@ fn inspect_document_rejects_incompatible_receipt_schema_version() {
     .unwrap();
     let mut forged = result.receipt;
     forged.schema_version = 2;
+    let blob = serde_json::to_vec(&forged.canonical_payload()).unwrap();
+    forged.route_digest = format!("{:x}", Sha256::digest(blob));
+    let err = inspect_document(vec![forged]).unwrap_err();
+    assert_eq!(err.code(), RejectionCode::UnsupportedContract);
+}
+
+#[test]
+fn inspect_document_rejects_unknown_selection_mode() {
+    let result = resolve_native_route(
+        &request(NativeModelSelection::Exact {
+            catalog_id: "review-primary".into(),
+        }),
+        &catalog(),
+        20,
+        1,
+    )
+    .unwrap();
+    let mut forged = result.receipt;
+    forged.selection_mode = "bogus".into();
     let blob = serde_json::to_vec(&forged.canonical_payload()).unwrap();
     forged.route_digest = format!("{:x}", Sha256::digest(blob));
     let err = inspect_document(vec![forged]).unwrap_err();
@@ -593,6 +625,36 @@ fn ux_snapshot_rejects_forged_receipt_digest() {
     )
     .unwrap();
     result.receipt.selected_catalog_id = "forged-catalog".into();
+    let snap = snapshot_from_resolution(
+        "verifier",
+        "verifier",
+        "plugin",
+        true,
+        true,
+        false,
+        &result,
+        Some("read-only"),
+        7,
+    );
+    assert_eq!(snap.route_status, RouteStatus::Incompatible);
+    assert!(snap.selected_catalog_id.is_none());
+    assert!(snap.route_receipt_digest.is_none());
+}
+
+#[test]
+fn ux_snapshot_rejects_unknown_selection_mode() {
+    let mut result = resolve_native_route(
+        &request(NativeModelSelection::Exact {
+            catalog_id: "review-primary".into(),
+        }),
+        &catalog(),
+        1,
+        3,
+    )
+    .unwrap();
+    result.receipt.selection_mode = "bogus".into();
+    let blob = serde_json::to_vec(&result.receipt.canonical_payload()).unwrap();
+    result.receipt.route_digest = format!("{:x}", Sha256::digest(blob));
     let snap = snapshot_from_resolution(
         "verifier",
         "verifier",

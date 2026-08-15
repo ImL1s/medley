@@ -449,6 +449,15 @@ fn digest_receipt(receipt: &RouteReceipt) -> Result<String, NativeRouteError> {
             "receipt schema_version must be 1".into(),
         ));
     }
+    match receipt.selection_mode.as_str() {
+        "inherit" | "exact" | "ordered_candidates" => {}
+        _ => {
+            return Err(NativeRouteError::Rejected(
+                RejectionCode::UnsupportedContract,
+                "receipt selection_mode must be inherit, exact, or ordered_candidates".into(),
+            ));
+        }
+    }
     let payload = receipt.canonical_payload();
     let blob = serde_json::to_vec(&payload).map_err(|_| NativeRouteError::SecretMaterial)?;
     let text = String::from_utf8_lossy(&blob);
