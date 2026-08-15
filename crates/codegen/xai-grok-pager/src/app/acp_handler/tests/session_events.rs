@@ -629,6 +629,90 @@
             }
             other => panic!("expected typed 400 RequestFailed, got {other:?}"),
         }
+        let msg = last_session_event(&scrollback)
+            .expect("banner")
+            .message();
+        assert!(
+            !msg.contains("Retry failed"),
+            "RetryState::Failed 400 must not say Retry failed: {msg}"
+        );
+        assert!(!msg.contains('{'), "must not dump an envelope: {msg}");
+    }
+
+    fn collect_session_events(
+        scrollback: &crate::scrollback::state::ScrollbackState,
+    ) -> Vec<SessionEvent> {
+        use crate::scrollback::block::RenderBlock;
+        (0..scrollback.len())
+            .filter_map(|i| match scrollback.get(i).map(|e| &e.block) {
+                Some(RenderBlock::SessionEvent(b)) => Some(b.event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn issue244_typed_provider_failure_retry_then_prompt_is_one_banner() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: "api".into(),
+                message: "Provider request failed (HTTP 400). Invalid value for reasoning.effort"
+                    .into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        let events = collect_session_events(&scrollback);
+        assert_eq!(events.len(), 1, "RetryState composes one banner: {events:?}");
+        match &events[0] {
+            SessionEvent::RequestFailed { status, headline, detail } => {
+                assert_eq!(*status, Some(400));
+                assert_eq!(headline, "Bad request (400)");
+                assert!(
+                    detail.contains("Invalid value for reasoning.effort"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+        assert!(!events[0].message().contains("Retry failed"));
+    }
+
+    #[test]
+    fn issue244_typed_provider_failure_prompt_then_retry_is_one_banner() {
+        use crate::scrollback::block::RenderBlock;
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        scrollback.push_block(RenderBlock::session_event(SessionEvent::RequestFailed {
+            status: Some(400),
+            headline: "Bad request (400)".into(),
+            detail: "The server rejected this request.".into(),
+        }));
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: "api".into(),
+                message: "Internal error: {\n  \"message\": \"Provider request failed (HTTP 400).\",\n  \"http_status\": 400\n}".into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        let events = collect_session_events(&scrollback);
+        assert_eq!(
+            events.len(),
+            1,
+            "late RetryState must not add a second banner: {events:?}"
+        );
+        match &events[0] {
+            SessionEvent::RequestFailed { status, .. } => assert_eq!(*status, Some(400)),
+            other => panic!("expected the prompt's RequestFailed, got {other:?}"),
+        }
+        let msg = events[0].message();
+        assert!(!msg.contains("Retry failed"), "{msg}");
+        assert!(!msg.contains('{'), "{msg}");
     }
 
     #[test]

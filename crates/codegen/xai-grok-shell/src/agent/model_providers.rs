@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use reqwest::header::HeaderValue;
 
-use super::config::{ConfigModelOverride, EnvKeys};
+use super::config::{CodexCatalogUpgrade, ConfigModelOverride, EnvKeys};
 use super::config_model_override_parse::{ConfigWarning, ConfigWarningKind};
 use crate::sampling::ApiBackend;
 
@@ -305,10 +305,64 @@ fn codex_catalog_access(
 ///
 /// `0.0.0` is what this fork's Codex user-agent already claims
 /// (`codex_cli_rs/0.0.0`), and the endpoint accepts it. Verified against the
-/// live endpoint on 2026-08-08: HTTP 200, nine models. Entries carry a
-/// `minimal_client_version`, so a future server-side floor could start
-/// rejecting this; the failure is loud in the log and falls back to the preset.
+/// live endpoint on 2026-08-08: HTTP 200, nine models. Entries (and a
+/// catalog-wide field) may carry `minimal_client_version`. When that floor is
+/// above this advertised version, parse stamps `catalog_degraded_reason` so
+/// the picker/ACP can show it. A rejected fetch still falls back to the
+/// last-good or built-in catalog via the existing degraded path.
 const OPENAI_CODEX_CATALOG_CLIENT_VERSION: &str = "0.0.0";
+
+fn parse_codex_catalog_semver(raw: &str) -> Option<semver::Version> {
+    semver::Version::parse(raw.trim()).ok()
+}
+
+fn advertised_codex_catalog_client_version() -> Option<semver::Version> {
+    let parsed = parse_codex_catalog_semver(OPENAI_CODEX_CATALOG_CLIENT_VERSION);
+    if parsed.is_none() {
+        tracing::warn!(
+            advertised = OPENAI_CODEX_CATALOG_CLIENT_VERSION,
+            "Codex catalog advertised client_version is not valid semver"
+        );
+    }
+    parsed
+}
+
+/// True when `floor` is a higher semver than this client's advertised catalog
+/// version. Unparseable floors are ignored so a bad payload cannot mark the
+/// whole catalog degraded.
+fn codex_catalog_client_is_below_floor(floor: &str) -> bool {
+    match (
+        advertised_codex_catalog_client_version(),
+        parse_codex_catalog_semver(floor),
+    ) {
+        (Some(advertised), Some(required)) => required > advertised,
+        (Some(_), None) => {
+            tracing::warn!(
+                floor = %floor,
+                "ignoring unparseable Codex catalog minimal_client_version"
+            );
+            false
+        }
+        (None, _) => false,
+    }
+}
+
+pub(crate) fn openai_codex_catalog_client_version_floor_reason(floor: &str) -> String {
+    format!(
+        "this client advertises catalog version {}; the server requires {floor}",
+        OPENAI_CODEX_CATALOG_CLIENT_VERSION
+    )
+}
+
+/// Stamp a version-floor degraded reason. Returns whether this call newly
+/// attached one. Does not overwrite an existing operational reason.
+fn stamp_codex_catalog_client_version_floor(model: &mut ConfigModelOverride, floor: &str) -> bool {
+    if model.catalog_degraded_reason.is_some() || !codex_catalog_client_is_below_floor(floor) {
+        return false;
+    }
+    model.catalog_degraded_reason = Some(openai_codex_catalog_client_version_floor_reason(floor));
+    true
+}
 
 fn apply_codex_catalog_auth_headers(
     request: reqwest::blocking::RequestBuilder,
@@ -349,6 +403,50 @@ fn codex_catalog_string(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn codex_catalog_minimal_client_version(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    codex_catalog_string(obj, "minimal_client_version")
+        .or_else(|| codex_catalog_string(obj, "minimalClientVersion"))
+}
+
+/// Top-level catalog publisher version. Parsed so it is not ignored, but it
+/// is **not** a client floor: the live payload reports `client_version`
+/// `0.147.0` while still accepting advertised `0.0.0`. The floor is
+/// `minimal_client_version` only.
+fn codex_catalog_payload_client_version(payload: &serde_json::Value) -> Option<String> {
+    payload.as_object().and_then(|obj| {
+        codex_catalog_string(obj, "client_version")
+            .or_else(|| codex_catalog_string(obj, "clientVersion"))
+    })
+}
+
+/// Live-shape `upgrade` object: `{ "model": "...", "migration_markdown": "..." }`.
+/// Missing `model` drops the advisory. Missing markdown still attaches the
+/// target so the picker can name the replacement.
+fn codex_catalog_upgrade(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<CodexCatalogUpgrade> {
+    let raw = obj.get("upgrade")?;
+    if raw.is_null() {
+        return None;
+    }
+    let Some(upgrade) = raw.as_object() else {
+        tracing::warn!(value = %raw, "Codex catalog upgrade was not an object");
+        return None;
+    };
+    let Some(model) = codex_catalog_string(upgrade, "model") else {
+        tracing::warn!("Codex catalog upgrade omitted model");
+        return None;
+    };
+    Some(CodexCatalogUpgrade {
+        model,
+        migration_markdown: codex_catalog_string(upgrade, "migration_markdown")
+            .or_else(|| codex_catalog_string(upgrade, "migrationMarkdown"))
+            .unwrap_or_default(),
+    })
 }
 
 /// Keys tried in order when reading a Codex catalog entry's session budget.
@@ -624,25 +722,34 @@ fn parse_openai_codex_catalog_entry(
     } else {
         reasoning_effort.map(|_| true)
     };
-    Some((
-        key,
-        ConfigModelOverride {
-            model: Some(model.clone()),
-            model_provider: Some(OPENAI_CODEX_PROVIDER_ID.to_owned()),
-            name: codex_catalog_string(obj, "display_name")
-                .or_else(|| codex_catalog_string(obj, "name"))
-                .or(Some(model)),
-            description: codex_catalog_string(obj, "description")
-                .or(Some(OPENAI_CODEX_MODELS_CATALOG_DESCRIPTION.to_owned())),
-            context_window: Some(context_window),
-            reasoning_effort,
-            supports_reasoning_effort,
-            reasoning_efforts,
-            codex_wire: Some(codex_wire),
-            effective_context_window_percent: codex_catalog_effective_context_window_percent(obj),
-            ..ConfigModelOverride::default()
-        },
-    ))
+    let mut parsed = ConfigModelOverride {
+        model: Some(model.clone()),
+        model_provider: Some(OPENAI_CODEX_PROVIDER_ID.to_owned()),
+        name: codex_catalog_string(obj, "display_name")
+            .or_else(|| codex_catalog_string(obj, "name"))
+            .or(Some(model.clone())),
+        description: codex_catalog_string(obj, "description")
+            .or(Some(OPENAI_CODEX_MODELS_CATALOG_DESCRIPTION.to_owned())),
+        context_window: Some(context_window),
+        reasoning_effort,
+        supports_reasoning_effort,
+        reasoning_efforts,
+        codex_wire: Some(codex_wire),
+        catalog_upgrade: codex_catalog_upgrade(obj),
+        effective_context_window_percent: codex_catalog_effective_context_window_percent(obj),
+        ..ConfigModelOverride::default()
+    };
+    if let Some(floor) = codex_catalog_minimal_client_version(obj)
+        && stamp_codex_catalog_client_version_floor(&mut parsed, &floor)
+    {
+        tracing::warn!(
+            model = %model,
+            advertised = OPENAI_CODEX_CATALOG_CLIENT_VERSION,
+            required = %floor,
+            "Codex catalog model requires a newer client"
+        );
+    }
+    Some((key, parsed))
 }
 
 fn parse_openai_codex_catalog_models(
@@ -658,10 +765,34 @@ fn parse_openai_codex_catalog_models(
     else {
         return IndexMap::new();
     };
-    entries
+    let mut models: IndexMap<_, _> = entries
         .iter()
         .filter_map(parse_openai_codex_catalog_entry)
-        .collect()
+        .collect();
+    // Parsed so a future payload that starts using this as a floor is visible
+    // in diagnostics. It is not itself a minimum-client requirement.
+    let catalog_client_version = codex_catalog_payload_client_version(payload);
+    if let Some(client_version) = catalog_client_version.as_deref() {
+        tracing::debug!(client_version, "Codex catalog payload client_version");
+    }
+    if let Some(floor) = payload
+        .as_object()
+        .and_then(codex_catalog_minimal_client_version)
+    {
+        let mut stamped = false;
+        for model in models.values_mut() {
+            stamped |= stamp_codex_catalog_client_version_floor(model, &floor);
+        }
+        if stamped {
+            tracing::warn!(
+                advertised = OPENAI_CODEX_CATALOG_CLIENT_VERSION,
+                required = %floor,
+                catalog_client_version = catalog_client_version.as_deref().unwrap_or(""),
+                "Codex catalog requires a newer client"
+            );
+        }
+    }
+    models
 }
 
 fn fetch_openai_codex_catalog_models_blocking(
@@ -919,6 +1050,7 @@ fn merge_openai_codex_preset_entries(
             reasoning_efforts,
             codex_wire,
             catalog_degraded_reason,
+            catalog_upgrade,
             effective_context_window_percent,
             ..
         } = preset;
@@ -981,6 +1113,9 @@ fn merge_openai_codex_preset_entries(
             user_entry.codex_wire = codex_wire;
         }
         user_entry.catalog_degraded_reason = catalog_degraded_reason;
+        if user_entry.catalog_upgrade.is_none() {
+            user_entry.catalog_upgrade = catalog_upgrade;
+        }
         if let Some(percent) = effective_context_window_percent {
             user_entry
                 .effective_context_window_percent
@@ -2774,6 +2909,227 @@ mod tests {
             .get("gpt-5.3-codex-spark")
             .expect("a second model must not be lost — one entry is the bug");
         assert_eq!(spark.context_window, Some(128_000));
+    }
+
+    /// #265: parse per-entry `minimal_client_version` and top-level
+    /// `client_version`. Only `minimal_client_version` is a floor — the live
+    /// publisher field `0.147.0` must not degrade a catalog the server still
+    /// serves to advertised `0.0.0`. Drive apply + ACP reason, no network.
+    #[test]
+    fn codex_catalog_parser_reads_minimal_client_version() {
+        let payload = serde_json::json!({
+            "client_version": "0.147.0",
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6 Sol",
+                    "minimal_client_version": "0.100.0",
+                    "context_window": 272000
+                },
+                {
+                    "slug": "gpt-5.6-terra",
+                    "display_name": "GPT-5.6 Terra",
+                    "minimal_client_version": "0.0.0",
+                    "context_window": 272000
+                },
+                {
+                    "slug": "gpt-5.5",
+                    "display_name": "GPT-5.5",
+                    "context_window": 272000
+                }
+            ]
+        });
+        assert_eq!(
+            codex_catalog_payload_client_version(&payload).as_deref(),
+            Some("0.147.0"),
+            "top-level catalog client_version must be parsed when present"
+        );
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let below_floor_reason = openai_codex_catalog_client_version_floor_reason("0.100.0");
+        assert_eq!(
+            presets["gpt-5.6-sol"].catalog_degraded_reason.as_deref(),
+            Some(below_floor_reason.as_str()),
+            "a floor above advertised 0.0.0 must stamp catalog-degraded"
+        );
+        assert!(
+            presets["gpt-5.6-terra"].catalog_degraded_reason.is_none(),
+            "an equal floor must not degrade"
+        );
+        assert!(
+            presets["gpt-5.5"].catalog_degraded_reason.is_none(),
+            "a missing floor must not degrade"
+        );
+
+        let publisher_only = parse_openai_codex_catalog_models(&serde_json::json!({
+            "client_version": "0.147.0",
+            "models": [{
+                "slug": "gpt-5.6-sol",
+                "display_name": "GPT-5.6 Sol",
+                "context_window": 272000
+            }]
+        }));
+        assert!(
+            publisher_only["gpt-5.6-sol"]
+                .catalog_degraded_reason
+                .is_none(),
+            "top-level client_version is the publisher version, not a floor"
+        );
+
+        let catalog_wide = parse_openai_codex_catalog_models(&serde_json::json!({
+            "client_version": "0.147.0",
+            "minimal_client_version": "1.0.0",
+            "models": [{
+                "slug": "gpt-5.6-sol",
+                "display_name": "GPT-5.6 Sol",
+                "context_window": 272000
+            }]
+        }));
+        assert_eq!(
+            catalog_wide["gpt-5.6-sol"]
+                .catalog_degraded_reason
+                .as_deref(),
+            Some(openai_codex_catalog_client_version_floor_reason("1.0.0").as_str())
+        );
+
+        let mut cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("empty config");
+        cfg.config_models = presets;
+        let resolved = resolve_model_list(&cfg, None);
+        let sol = resolved.get("gpt-5.6-sol").expect("parsed Sol");
+        assert_eq!(
+            sol.info.catalog_degraded_reason.as_deref(),
+            Some(below_floor_reason.as_str())
+        );
+        let (_ready, readiness_reason) = crate::agent::config::model_readiness(sol);
+        assert_ne!(
+            readiness_reason.as_deref(),
+            Some(below_floor_reason.as_str()),
+            "version floor is catalog-degraded state, not a readiness block"
+        );
+        let meta = crate::agent::config::to_acp_model_info(&resolved)
+            .get(&acp::ModelId::new("gpt-5.6-sol"))
+            .and_then(|model| model.meta.as_ref())
+            .cloned()
+            .expect("Sol ACP metadata");
+        assert_eq!(
+            meta.get("catalogDegradedReason")
+                .and_then(serde_json::Value::as_str),
+            Some(below_floor_reason.as_str())
+        );
+        let acp_models = crate::agent::config::to_acp_model_info(&resolved);
+        let terra_meta = acp_models
+            .get(&acp::ModelId::new("gpt-5.6-terra"))
+            .and_then(|model| model.meta.as_ref())
+            .expect("Terra ACP metadata");
+        assert!(
+            !terra_meta.contains_key("catalogDegradedReason"),
+            "an in-range floor must not synthesize degraded ACP state"
+        );
+    }
+
+    /// #267: live-shape `upgrade` on gpt-5.4 carries the target and markdown
+    /// through parse → apply → ACP. The selected wire model must stay gpt-5.4.
+    #[test]
+    fn codex_catalog_parser_reads_upgrade_migration() {
+        let migration = "GPT-5.4 will be deprecated soon\n\n\
+                         Codex now uses GPT-5.6 Terra in place of GPT-5.4. Switch to GPT-5.6 Terra to continue.\n";
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.4",
+                    "display_name": "GPT-5.4",
+                    "model": "gpt-5.4",
+                    "context_window": 272000,
+                    "max_context_window": 1000000,
+                    "upgrade": {
+                        "model": "gpt-5.6-terra",
+                        "migration_markdown": migration
+                    }
+                },
+                {
+                    "slug": "gpt-5.6-terra",
+                    "display_name": "GPT-5.6 Terra",
+                    "context_window": 272000
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let selected = presets.get("gpt-5.4").expect("gpt-5.4 catalog entry");
+        assert_eq!(
+            selected.model.as_deref(),
+            Some("gpt-5.4"),
+            "upgrade must not rewrite the selected wire model"
+        );
+        let upgrade = selected
+            .catalog_upgrade
+            .as_ref()
+            .expect("gpt-5.4 must carry the live-shape upgrade");
+        assert_eq!(upgrade.model, "gpt-5.6-terra");
+        assert_eq!(
+            upgrade.migration_markdown,
+            migration.trim_end(),
+            "catalog markdown is stored trimmed; trailing newline is not semantic"
+        );
+        assert!(
+            presets["gpt-5.6-terra"].catalog_upgrade.is_none(),
+            "a current model must not inherit another entry's upgrade"
+        );
+
+        let mut user_models = IndexMap::from([(
+            "gpt-5.4".to_owned(),
+            ConfigModelOverride {
+                name: Some("My 5.4".to_owned()),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        merge_openai_codex_preset_entries(&mut user_models, presets.clone());
+        assert_eq!(
+            user_models["gpt-5.4"].model.as_deref(),
+            Some("gpt-5.4"),
+            "metadata-only overlay must not auto-switch the selected model"
+        );
+        assert_eq!(
+            user_models["gpt-5.4"]
+                .catalog_upgrade
+                .as_ref()
+                .map(|upgrade| upgrade.model.as_str()),
+            Some("gpt-5.6-terra"),
+            "catalog upgrade must survive a metadata-only overlay"
+        );
+
+        let mut cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("empty config");
+        cfg.config_models = presets;
+        let resolved = resolve_model_list(&cfg, None);
+        let applied = resolved.get("gpt-5.4").expect("applied gpt-5.4");
+        assert_eq!(applied.info.model, "gpt-5.4");
+        let applied_upgrade = applied
+            .info
+            .catalog_upgrade
+            .as_ref()
+            .expect("upgrade survives apply");
+        assert_eq!(applied_upgrade.model, "gpt-5.6-terra");
+        assert_eq!(applied_upgrade.migration_markdown, migration.trim_end());
+        let meta = crate::agent::config::to_acp_model_info(&resolved)
+            .get(&acp::ModelId::new("gpt-5.4"))
+            .and_then(|model| model.meta.as_ref())
+            .cloned()
+            .expect("gpt-5.4 ACP metadata");
+        assert_eq!(
+            meta.get("modelSlug").and_then(serde_json::Value::as_str),
+            Some("gpt-5.4"),
+            "ACP must keep the selected slug"
+        );
+        assert_eq!(
+            meta.get("catalogUpgradeModel")
+                .and_then(serde_json::Value::as_str),
+            Some("gpt-5.6-terra")
+        );
+        assert_eq!(
+            meta.get("catalogUpgradeMigrationMarkdown")
+                .and_then(serde_json::Value::as_str),
+            Some(migration.trim_end())
+        );
     }
 
     /// #245: catalog entries that differ from the Sol preset on wire flags

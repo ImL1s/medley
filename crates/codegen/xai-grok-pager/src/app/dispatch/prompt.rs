@@ -1229,10 +1229,28 @@ pub(super) fn handle_prompt_response(
             || (http_status == Some(401)
                 && result.as_ref().err().is_some_and(|e| e.contains("(401)")));
         let request_failed_shown = scrollback_has_recent_request_failed(&agent.scrollback);
+        // Prompt-only (RetryState lost the race / never arrived): still one
+        // typed RequestFailed banner, never TurnFailed wrapping an envelope.
+        let pending_typed_failure = result.as_ref().err().and_then(|err| {
+            if rate_limited
+                || free_usage_blocked
+                || model_incompatible
+                || credit_limit_blocked
+                || reauth_prompted
+                || context_overflow
+                || disk_full
+                || request_failed_shown
+            {
+                return None;
+            }
+            crate::app::error_display::compose_typed_provider_failure(http_status, None, err)
+                .map(crate::app::error_display::FormattedRequestFailure::into_session_event)
+        });
         // A dedicated prompt/modal/banner replaces the generic TurnFailed
         // marker and error toast (rate limit, free-usage paywall, model
         // incompatibility, credit 402/403, 401 re-auth, context overflow,
-        // disk-full, or a formatted RequestFailed banner from RetryState).
+        // disk-full, a formatted RequestFailed banner from RetryState, or a
+        // typed provider failure composed from this PromptResponse).
         let dedicated_ux_shown = rate_limited
             || free_usage_blocked
             || model_incompatible
@@ -1240,7 +1258,8 @@ pub(super) fn handle_prompt_response(
             || reauth_prompted
             || context_overflow
             || disk_full
-            || request_failed_shown;
+            || request_failed_shown
+            || pending_typed_failure.is_some();
         let elapsed = agent.turn_elapsed();
 
         {
@@ -1303,6 +1322,10 @@ pub(super) fn handle_prompt_response(
             .or_else(|| response_pid.clone());
 
         agent.session.finish_turn(&mut agent.scrollback);
+
+        if let Some(ev) = pending_typed_failure {
+            agent.scrollback.push_block(RenderBlock::session_event(ev));
+        }
 
         // Insert session event message (skip TurnCompleted for bash-mode — no agent turn).
         let event = match (&result, was_cancelling) {

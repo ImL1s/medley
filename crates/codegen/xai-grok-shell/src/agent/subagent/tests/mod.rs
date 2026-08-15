@@ -2403,6 +2403,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
             catalog_degraded_reason: None,
+            catalog_upgrade: None,
         },
         api_key: None,
         env_key: None,

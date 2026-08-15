@@ -3,6 +3,9 @@ name: CI
 # Product-line CI for the ImL1s fork.
 # `main` stays a pristine upstream mirror (no fork workflows there).
 # Feature / sync PRs target `providers`; pushes to `providers` also run CI.
+#
+# Every GitHub Action is pinned to a full commit SHA (issue #30); the
+# version tag in the trailing comment is documentation only.
 
 on:
   push:
@@ -32,7 +35,7 @@ jobs:
     name: Audit publisher tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Validate checked-in audit manifest
         run: python3 -B scripts/publish-audit-issues.py --validate-only
@@ -60,6 +63,9 @@ jobs:
       - name: Guard distChannel docs against the release stamp
         run: python3 -B -m unittest tests.test_dist_channel_docs_guard -v
 
+      - name: Enforce SHA-pinned GitHub Actions
+        run: python3 -B -m unittest tests.test_workflow_action_pins -v
+
       # Direct-mention scan: EnvGuard / std::env::{set_var,remove_var} in
       # xai-grok-shell unit tests must carry unkeyed #[serial] (#319).
       # Known stragglers are allowlisted; new hits and stale entries fail.
@@ -73,7 +79,7 @@ jobs:
     name: Installer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # The installer is the one thing here that runs on machines unlike this
       # one, and until now nothing exercised it at all — every claim about it
@@ -119,7 +125,7 @@ jobs:
     name: Sync upstream script
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Lint sync-upstream shell scripts
         run: |
@@ -135,10 +141,10 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
           components: rustfmt
@@ -151,7 +157,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Full history: the check needs a merge base to find what this branch added.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -179,10 +185,10 @@ jobs:
     name: Compile every test target
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
 
@@ -193,7 +199,7 @@ jobs:
           "$PROTOC" --version
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: providers-compile-tests
           cache-targets: true
@@ -208,10 +214,10 @@ jobs:
     name: Clippy (hot path)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
           components: clippy
@@ -223,7 +229,7 @@ jobs:
           "$PROTOC" --version
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: providers-lint
           cache-targets: true
@@ -249,10 +255,10 @@ jobs:
     name: Tests (providers hot path)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
 
@@ -271,7 +277,7 @@ jobs:
           "$PROTOC" --version
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: providers-test
           cache-targets: true
@@ -349,6 +355,10 @@ jobs:
           # is unready before request I/O; a real slug override stays ready.
           run_nonzero -p xai-grok-shell --lib \
             codex_wire_model_catalog_slug_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_reads_minimal_client_version -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_reads_upgrade_migration -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             tool_result_truncation_policy_catalog_refresh_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -1723,6 +1733,12 @@ jobs:
             action_for_string_commits_catalog_model_id_not_display_name -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             every_dynamic_enum_setting_has_action_for_string_arm -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue244_typed_provider_failure -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue244_retry_failed_non_retryable_4xx_is_not_labelled_retry_failed -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_catalog_upgrade_migration_is_visible_in_model_picker -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             accept_fresh_publication_continues_only_for_committed_durability -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

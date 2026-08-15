@@ -4576,6 +4576,26 @@ impl std::fmt::Debug for ModelEntryConfig {
 fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
     cfg == &LazinessDetectorPerModelConfig::default()
 }
+/// Codex catalog `upgrade` advisory (#267). Display-only so picker/ACP can
+/// show a migration. Never used to rewrite the selected wire model.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CodexCatalogUpgrade {
+    pub model: String,
+    pub migration_markdown: String,
+}
+
+impl std::fmt::Debug for CodexCatalogUpgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexCatalogUpgrade")
+            .field("model_present", &!self.model.is_empty())
+            .field(
+                "migration_markdown_present",
+                &!self.migration_markdown.is_empty(),
+            )
+            .finish()
+    }
+}
+
 /// A `[model.foo]` entry from config.toml, parsed directly from raw TOML
 /// (bypassing deep merge). Scalar fields are `Option` so absent means "inherit
 /// from defaults/prefetched"; the collection fields (`extra_headers`,
@@ -4650,6 +4670,9 @@ pub struct ConfigModelOverride {
     /// `description` so a metadata-only user override cannot erase it.
     #[serde(skip)]
     pub(crate) catalog_degraded_reason: Option<String>,
+    /// Runtime-only catalog `upgrade` advisory (#267). Not a user TOML field.
+    #[serde(skip)]
+    pub(crate) catalog_upgrade: Option<CodexCatalogUpgrade>,
     /// Catalog `effective_context_window_percent` (0-100). Not a user TOML
     /// field — user `[model.<id>].auto_compact_threshold_percent` stays
     /// distinct so the resolver can keep catalog below user-global (#264).
@@ -4719,6 +4742,7 @@ impl std::fmt::Debug for ConfigModelOverride {
                 "catalog_degraded_reason_present",
                 &self.catalog_degraded_reason.is_some(),
             )
+            .field("catalog_upgrade", &self.catalog_upgrade)
             .field(
                 "effective_context_window_percent",
                 &self.effective_context_window_percent,
@@ -4837,6 +4861,7 @@ impl ConfigModelOverride {
             .info
             .catalog_degraded_reason
             .clone_from(&self.catalog_degraded_reason);
+        entry.info.catalog_upgrade.clone_from(&self.catalog_upgrade);
         if let Some(reason) = self.catalog_degraded_reason.as_deref() {
             let description = entry
                 .info
@@ -4964,6 +4989,9 @@ pub struct ModelInfo {
     /// Never infer this from user-controlled display text.
     #[serde(skip)]
     pub(crate) catalog_degraded_reason: Option<String>,
+    /// Runtime-only catalog `upgrade` advisory (#267). Display-only.
+    #[serde(skip)]
+    pub(crate) catalog_upgrade: Option<CodexCatalogUpgrade>,
 }
 
 impl std::fmt::Debug for ModelInfo {
@@ -5015,6 +5043,7 @@ impl std::fmt::Debug for ModelInfo {
                 "catalog_degraded_reason_present",
                 &self.catalog_degraded_reason.is_some(),
             )
+            .field("catalog_upgrade", &self.catalog_upgrade)
             .finish()
     }
 }
@@ -5057,6 +5086,7 @@ impl ModelInfo {
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
             catalog_degraded_reason: None,
+            catalog_upgrade: None,
         }
     }
     /// Extract shared model metadata from a flat config entry.
@@ -5096,6 +5126,7 @@ impl ModelInfo {
             laziness_detector: entry.laziness_detector.clone(),
             codex_wire: None,
             catalog_degraded_reason: None,
+            catalog_upgrade: None,
         }
     }
     /// Derive the legacy effort gate/default from `reasoning_efforts` so the
@@ -6075,6 +6106,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 codex_wire: None,
                 catalog_degraded_reason: None,
+                catalog_upgrade: None,
             },
             api_key: Some(bearer),
             env_key: None,
@@ -6742,6 +6774,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
             catalog_degraded_reason: None,
+            catalog_upgrade: None,
         },
         api_key: None,
         env_key: None,
@@ -7337,6 +7370,18 @@ pub(crate) fn to_acp_model_info(
                         "catalogDegradedReason".to_string(),
                         serde_json::Value::String(reason.to_owned()),
                     );
+                }
+                if let Some(upgrade) = info.catalog_upgrade.as_ref() {
+                    map.insert(
+                        "catalogUpgradeModel".to_string(),
+                        serde_json::Value::String(upgrade.model.clone()),
+                    );
+                    if !upgrade.migration_markdown.is_empty() {
+                        map.insert(
+                            "catalogUpgradeMigrationMarkdown".to_string(),
+                            serde_json::Value::String(upgrade.migration_markdown.clone()),
+                        );
+                    }
                 }
                 map.insert(
                     "providerHint".to_string(),
@@ -9392,6 +9437,7 @@ reasoning_effort = "low"
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 codex_wire: None,
                 catalog_degraded_reason: None,
+                catalog_upgrade: None,
             },
             api_key: api_key.map(|s| s.to_string()),
             env_key: env_key.map(EnvKeys::single),
@@ -17019,6 +17065,7 @@ default = "grok-4.5"
                 system_prompt_label: None,
                 codex_wire: None,
                 catalog_degraded_reason: None,
+                catalog_upgrade: None,
             },
             api_key: None,
             env_key: None,

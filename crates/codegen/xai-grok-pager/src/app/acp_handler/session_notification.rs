@@ -1415,6 +1415,8 @@ pub(super) fn apply_retry_state(
                     error,
                     error_type: None,
                 }));
+            } else if crate::app::dispatch::scrollback_has_recent_error_banner(scrollback) {
+                // PromptResponse already composed the typed banner.
             } else {
                 scrollback.push_block(RenderBlock::session_event(
                     crate::app::error_display::format_request_failure(None, None, reason)
@@ -1453,6 +1455,8 @@ pub(super) fn apply_retry_state(
                     error: message.clone(),
                     error_type: Some(error_type.clone()),
                 }));
+            } else if crate::app::dispatch::scrollback_has_recent_error_banner(scrollback) {
+                // PromptResponse (or another rail) already composed the typed banner.
             } else {
                 let status = crate::app::error_display::parse_http_status(message);
                 scrollback.push_block(RenderBlock::session_event(

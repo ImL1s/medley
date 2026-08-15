@@ -81,6 +81,58 @@ impl FormattedRequestFailure {
     }
 }
 
+/// Compose the shipped TUI banner for a provider / HTTP request failure.
+///
+/// `raw` may already be [`format_request_failure`] output (`Headline — detail`)
+/// or a raw carrier (`Provider request failed (HTTP 400).`, ACP
+/// `Internal error: {…}`). Returns `None` for non-request failures so the
+/// caller can keep a generic `TurnFailed` marker.
+pub(crate) fn compose_typed_provider_failure(
+    status: Option<u16>,
+    error_type: Option<&str>,
+    raw: &str,
+) -> Option<FormattedRequestFailure> {
+    if let Some((headline, detail)) = split_existing_banner(raw) {
+        return Some(FormattedRequestFailure {
+            status: status.or_else(|| parse_http_status(headline)),
+            headline: headline.to_string(),
+            detail: detail.to_string(),
+        });
+    }
+    if !looks_like_typed_provider_failure(status, error_type, raw) {
+        return None;
+    }
+    Some(format_request_failure(status, error_type, raw))
+}
+
+/// Our own banner shape: `Headline (NNN) — detail`. Used so PromptResponse
+/// (already formatted by `format_acp_error`) is not re-run through classify
+/// and does not lose a safe provider reason.
+fn split_existing_banner(raw: &str) -> Option<(&str, &str)> {
+    let (headline, detail) = raw.split_once(" \u{2014} ")?;
+    parse_http_status(headline)?;
+    Some((headline.trim(), detail.trim()))
+}
+
+fn looks_like_typed_provider_failure(
+    status: Option<u16>,
+    error_type: Option<&str>,
+    raw: &str,
+) -> bool {
+    if status.is_some() {
+        return true;
+    }
+    match WireErrorType::parse(error_type) {
+        WireErrorType::Api | WireErrorType::Http => return true,
+        _ => {}
+    }
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("provider request failed")
+        || (lower.contains("internal error:") && raw.contains('{'))
+        || lower.contains("\"http_status\"")
+        || lower.contains("api error (status ")
+}
+
 /// Format a terminal request / API error for the TUI.
 ///
 /// `status` is preferred when the caller already parsed it (ACP `http_status`
@@ -305,6 +357,14 @@ pub(crate) fn parse_http_status(raw: &str) -> Option<u16> {
             return Some(code);
         }
     }
+    // ACP `Internal error` envelope: `{"message":"…","http_status":400}`.
+    const HTTP_STATUS_JSON: &str = "\"http_status\":";
+    if let Some(i) = find_ignore_ascii_case(raw, HTTP_STATUS_JSON) {
+        let after = raw[i + HTTP_STATUS_JSON.len()..].trim_start();
+        if let Some(code) = parse_status_digits(after, false) {
+            return Some(code);
+        }
+    }
     // Every "status " occurrence, so "status unknown; … status 503" still
     // finds the code.
     let mut from = 0;
@@ -383,6 +443,19 @@ fn extract_error_detail(raw: &str) -> Option<String> {
         s = stripped;
     }
 
+    if let Some(stripped) = strip_internal_error_prefix(&s) {
+        s = stripped;
+    }
+
+    // JSON before carrier-prefix strips: an Internal-error envelope
+    // (`{"message":"Provider request failed (HTTP 400).","http_status":400}`)
+    // must not be sliced mid-object by the provider-prefix matcher.
+    if let Some(json_start) = s.find('{')
+        && let Some(extracted) = extract_from_json(&s[json_start..])
+    {
+        s = extracted;
+    }
+
     if let Some(rest) = strip_provider_request_failed_prefix(&s) {
         s = rest;
     }
@@ -391,8 +464,7 @@ fn extract_error_detail(raw: &str) -> Option<String> {
         s = rest;
     }
 
-    // JSON before the URL-clause strip: a URL inside a JSON string would
-    // otherwise split the body at its own ": " and leave garbage.
+    // A remaining JSON object after prefix strips (API error + body).
     if let Some(json_start) = s.find('{')
         && let Some(extracted) = extract_from_json(&s[json_start..])
     {
@@ -437,6 +509,19 @@ fn strip_retry_prefix(s: &str) -> Option<String> {
     let rest = s.strip_prefix("failed after ")?;
     let idx = rest.find(" retries: ")?;
     Some(rest[idx + " retries: ".len()..].to_string())
+}
+
+/// ACP `Error` Display when `data` was serialized instead of unwrapped:
+/// `Internal error: {"message":"…","http_status":400}`.
+fn strip_internal_error_prefix(s: &str) -> Option<String> {
+    const HEAD: &str = "Internal error:";
+    let trimmed = s.trim();
+    if trimmed.len() < HEAD.len()
+        || !trimmed.as_bytes()[..HEAD.len()].eq_ignore_ascii_case(HEAD.as_bytes())
+    {
+        return None;
+    }
+    Some(trimmed[HEAD.len()..].trim().to_string())
 }
 
 fn strip_api_error_prefix(s: &str) -> Option<String> {
@@ -561,6 +646,7 @@ fn is_noise_detail(s: &str) -> bool {
             | "overloaded"
     ) || lower.starts_with("json-rpc")
         || lower.starts_with("request error -")
+        || lower.starts_with("provider request failed")
         || s.starts_with('{')
 }
 
@@ -896,6 +982,93 @@ mod tests {
             !formatted.message().contains("Server error"),
             "must not misclassify 4xx as a server fault: {}",
             formatted.message()
+        );
+    }
+
+    #[test]
+    fn issue244_typed_provider_failure_internal_error_envelope_is_not_user_facing() {
+        let envelope = "Internal error: {\n  \"message\": \"Provider request failed (HTTP 400).\",\n  \"http_status\": 400\n}";
+        let formatted = compose_typed_provider_failure(None, Some("api"), envelope)
+            .expect("ACP Internal-error envelope must compose as a typed 400");
+        let msg = formatted.message();
+        assert_eq!(formatted.status, Some(400));
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert!(
+            !msg.contains("Retry failed"),
+            "non-retryable 4xx must not be labelled Retry failed: {msg}"
+        );
+        assert!(
+            !msg.contains('{'),
+            "internal envelope must not be the user-facing line: {msg}"
+        );
+        assert!(
+            !msg.contains("http_status"),
+            "envelope field names must not leak: {msg}"
+        );
+        assert!(
+            !msg.contains("Internal error"),
+            "ACP Display prefix must not leak: {msg}"
+        );
+        assert!(
+            msg.contains("rejected") || msg.contains("Bad request"),
+            "must stay actionable, got {msg}"
+        );
+    }
+
+    #[test]
+    fn issue244_typed_provider_failure_http_400_keeps_safe_reason() {
+        let formatted = compose_typed_provider_failure(
+            Some(400),
+            Some("api"),
+            "Provider request failed (HTTP 400). Invalid value for reasoning.effort",
+        )
+        .expect("provider 400 must compose");
+        let msg = formatted.message();
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert!(
+            formatted
+                .detail
+                .contains("Invalid value for reasoning.effort"),
+            "safe reason must survive: {}",
+            formatted.detail
+        );
+        assert!(!msg.contains("Retry failed"), "{msg}");
+        assert!(!msg.contains('{'), "{msg}");
+    }
+
+    #[test]
+    fn issue244_typed_provider_failure_does_not_reformat_existing_banner() {
+        let already = "Bad request (400) \u{2014} Invalid value for reasoning.effort";
+        let formatted = compose_typed_provider_failure(Some(400), None, already)
+            .expect("already-formatted banner is typed");
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert_eq!(formatted.detail, "Invalid value for reasoning.effort");
+    }
+
+    #[test]
+    fn issue244_typed_provider_failure_skips_generic_connection_copy() {
+        assert!(
+            compose_typed_provider_failure(None, None, "connection reset").is_none(),
+            "generic transport copy stays a TurnFailed marker"
+        );
+        assert!(
+            compose_typed_provider_failure(None, None, "Internal error: session failed to respond")
+                .is_none(),
+            "ACP Display without an envelope is not a typed provider failure"
+        );
+    }
+
+    #[test]
+    fn parse_http_status_from_internal_error_envelope() {
+        assert_eq!(
+            parse_http_status(
+                r#"Internal error: {"message":"Provider request failed (HTTP 400).","http_status":400}"#
+            ),
+            Some(400)
+        );
+        assert_eq!(
+            parse_http_status(r#"{"http_status": 503, "message": "overloaded"}"#),
+            Some(503)
         );
     }
 }

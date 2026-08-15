@@ -128,6 +128,7 @@ struct ModelReadinessMeta {
     readiness_reason: String,
     provider_hint: String,
     catalog_degraded_reason: String,
+    upgrade_model: String,
 }
 
 fn parse_model_readiness(
@@ -150,6 +151,7 @@ fn parse_model_readiness(
         readiness_reason: get_str("readinessReason"),
         provider_hint: get_str("providerHint"),
         catalog_degraded_reason: get_str("catalogDegradedReason"),
+        upgrade_model: get_str("catalogUpgradeModel"),
     }
 }
 
@@ -313,16 +315,21 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
         } else {
             readiness.auth_scheme.clone()
         };
-        let description = if readiness.catalog_degraded_reason.is_empty() {
+        let mut description = if readiness.catalog_degraded_reason.is_empty() {
             format!("{hint} · {scheme}")
         } else {
             format!("{hint} · {scheme} · {}", readiness.catalog_degraded_reason)
         };
+        if !readiness.upgrade_model.is_empty() {
+            description = format!("{description} · upgrade to {}", readiness.upgrade_model);
+        }
 
         let badge = if !readiness.ready {
             "missing".to_string()
         } else if !readiness.catalog_degraded_reason.is_empty() {
             "degraded".to_string()
+        } else if !readiness.upgrade_model.is_empty() {
+            "upgrade".to_string()
         } else if readiness.auth_scheme == "none" || readiness.auth_class == "none" {
             "none".to_string()
         } else {
@@ -775,6 +782,45 @@ mod tests {
         assert!(!item.dimmed);
         assert!(!item.non_selectable);
         assert!(item.description.contains(reason));
+    }
+
+    #[test]
+    fn codex_catalog_upgrade_migration_is_visible_in_model_picker() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_meta(
+            "gpt-5.4",
+            "GPT-5.4",
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("session")),
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("chatgpt.com")),
+                ("modelSlug".into(), serde_json::json!("gpt-5.4")),
+                (
+                    "catalogUpgradeModel".into(),
+                    serde_json::json!("gpt-5.6-terra"),
+                ),
+                (
+                    "catalogUpgradeMigrationMarkdown".into(),
+                    serde_json::json!(
+                        "GPT-5.4 will be deprecated soon\n\n\
+                         Codex now uses GPT-5.6 Terra in place of GPT-5.4."
+                    ),
+                ),
+            ]),
+        );
+        state.available.insert(id, info);
+
+        let item = build_model_items(&state).pop().expect("gpt-5.4 row");
+        assert_eq!(item.badge, "upgrade");
+        assert!(!item.dimmed);
+        assert!(!item.non_selectable);
+        assert!(
+            item.description.contains("upgrade to gpt-5.6-terra"),
+            "picker must name the migration target: {}",
+            item.description
+        );
+        assert_eq!(item.match_text, "GPT-5.4");
     }
 
     /// #306 C-min gate 1 (**component presentation** — not cold-boot/ACP
