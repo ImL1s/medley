@@ -418,6 +418,7 @@ fn finish(
         access_profile: entry.access_profile.clone(),
         harness: entry.harness.clone(),
         capability_ceiling: request.capability_ceiling.clone(),
+        required_capabilities: request.required_capabilities.clone(),
         selection_provenance: provenance.into(),
         rejected_candidates: rejected.clone(),
         route_digest: String::new(),

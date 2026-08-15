@@ -283,6 +283,8 @@ pub struct RouteReceipt {
     pub harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_ceiling: Option<String>,
+    #[serde(default)]
+    pub required_capabilities: CapabilityRequirements,
     pub selection_provenance: String,
     pub rejected_candidates: Vec<RejectedCandidate>,
     pub route_digest: String,
@@ -407,6 +409,10 @@ impl RouteReceipt {
                 serde_json::Value::String(ceiling.clone()),
             );
         }
+        map.insert(
+            "required_capabilities".into(),
+            canonical_requirements(&self.required_capabilities),
+        );
         if let Some(resume) = &self.resume_source_receipt {
             map.insert(
                 "resume_source_receipt".into(),
@@ -415,6 +421,39 @@ impl RouteReceipt {
         }
         map
     }
+}
+
+fn canonical_requirements(req: &CapabilityRequirements) -> serde_json::Value {
+    let mut item = serde_json::Map::new();
+    item.insert(
+        "structured_output".into(),
+        serde_json::Value::Bool(req.structured_output),
+    );
+    item.insert("local_only".into(), serde_json::Value::Bool(req.local_only));
+    if let Some(tokens) = req.minimum_context_tokens {
+        item.insert(
+            "minimum_context_tokens".into(),
+            serde_json::Value::Number(tokens.into()),
+        );
+    }
+    if let Some(harness) = &req.required_harness {
+        item.insert(
+            "required_harness".into(),
+            serde_json::Value::String(harness.clone()),
+        );
+    }
+    if !req.required_named_capabilities.is_empty() {
+        item.insert(
+            "required_named_capabilities".into(),
+            serde_json::Value::Array(
+                req.required_named_capabilities
+                    .iter()
+                    .map(|name| serde_json::Value::String(name.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(item)
 }
 
 /// Successful resolution: selected catalog route plus receipt.

@@ -404,6 +404,16 @@ fn receipt_digest_binds_harness_ceiling_and_resume() {
         baseline.receipt.route_digest,
         with_resume.receipt.route_digest
     );
+
+    let mut with_caps = request(NativeModelSelection::Exact {
+        catalog_id: "review-primary".into(),
+    });
+    with_caps.required_capabilities.structured_output = true;
+    let bound_caps = resolve_native_route(&with_caps, &catalog(), 20, 1).unwrap();
+    assert_ne!(
+        baseline.receipt.route_digest,
+        bound_caps.receipt.route_digest
+    );
 }
 
 #[test]
