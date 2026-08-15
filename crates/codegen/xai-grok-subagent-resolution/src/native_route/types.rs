@@ -89,7 +89,7 @@ fn implemented_reason(id: &str) -> &'static str {
         CAP_ROUTE_RECEIPT => "secret-free immutable receipt + digest",
         CAP_MODEL_FAMILY_METADATA => "not implemented in this slice",
         CAP_REPLAY_SAFE_FALLBACK => {
-            "runtime fallback remains Medley #18; this slice refuses replay"
+            "admission API is fail-closed and tested; live sampler auto-failover is not wired"
         }
         _ => "unknown capability",
     }
@@ -467,7 +467,7 @@ pub struct NativeSubagentRouteResult {
     pub rejected_candidates: Vec<RejectedCandidate>,
 }
 
-/// Lifecycle facts for later #18 fallback. This slice records them only.
+/// Lifecycle facts for #18 fallback admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptLifecycleFact {
@@ -477,6 +477,57 @@ pub enum AttemptLifecycleFact {
     ToolCallEmitted,
     ToolSideEffectStarted,
     AttemptTerminal,
+}
+
+impl AttemptLifecycleFact {
+    pub fn blocks_cross_route_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::VisibleOutputCommitted | Self::ToolCallEmitted | Self::ToolSideEffectStarted
+        )
+    }
+}
+
+/// Failure class for replay-safe fallback. A retryable 429/5xx is not
+/// sufficient authorization by itself — lifecycle facts still gate replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackFailureClass {
+    ConnectTimeout,
+    RateLimited,
+    RetryableServer,
+    ProviderUnavailable,
+    AuthOrConfig,
+    SafetyPolicy,
+    PartialOutput,
+    ToolSideEffect,
+    IncompatibleCapability,
+}
+
+impl FallbackFailureClass {
+    pub fn is_retryable_pre_output(self) -> bool {
+        matches!(
+            self,
+            Self::ConnectTimeout
+                | Self::RateLimited
+                | Self::RetryableServer
+                | Self::ProviderUnavailable
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectTimeout => "connect_timeout",
+            Self::RateLimited => "rate_limited",
+            Self::RetryableServer => "retryable_server",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::AuthOrConfig => "auth_or_config",
+            Self::SafetyPolicy => "safety_policy",
+            Self::PartialOutput => "partial_output",
+            Self::ToolSideEffect => "tool_side_effect",
+            Self::IncompatibleCapability => "incompatible_capability",
+        }
+    }
 }
 
 /// Fail-closed native-route errors.

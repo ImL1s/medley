@@ -3,9 +3,10 @@
 use sha2::{Digest, Sha256};
 
 use super::types::{
-    AttemptLifecycleFact, NativeModelSelection, NativeRouteError, NativeSubagentRouteRequest,
-    NativeSubagentRouteResult, RECEIPT_SCHEMA, RejectedCandidate, RejectionCode, RouteReceipt,
-    SCHEMA_VERSION, WorkerRoute, reject_secret_opt, reject_secret_text,
+    AttemptLifecycleFact, CapabilityRequirements, FallbackFailureClass, NativeModelSelection,
+    NativeRouteError, NativeSubagentRouteRequest, NativeSubagentRouteResult, RECEIPT_SCHEMA,
+    RejectedCandidate, RejectionCode, RouteReceipt, SCHEMA_VERSION, WorkerRoute, reject_secret_opt,
+    reject_secret_text,
 };
 
 /// One catalog route. Duplicate wire slugs stay distinct via `route_key`.
@@ -479,42 +480,227 @@ pub(crate) fn validate_published_receipt(receipt: &RouteReceipt) -> Result<(), N
     Ok(())
 }
 
-/// Replay-safety admission. This slice always refuses cross-route fallback
-/// after visible output, a tool call, or a side effect. #18 owns a proven
-/// replay API later.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Replay-safety admission. Cross-route fallback is fail-closed: only a
+/// retryable pre-output failure on an ordered same-lane candidate may admit.
+/// Exact/inherit never fall over. Live sampler auto-failover is not wired.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FallbackAdmission {
     pub admitted: bool,
     pub reason_code: RejectionCode,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_catalog_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_candidates: Vec<RejectedCandidate>,
 }
 
-pub fn admit_cross_route_fallback(facts: &[AttemptLifecycleFact]) -> FallbackAdmission {
-    for fact in facts {
-        match fact {
-            AttemptLifecycleFact::VisibleOutputCommitted
-            | AttemptLifecycleFact::ToolCallEmitted
-            | AttemptLifecycleFact::ToolSideEffectStarted => {
-                return FallbackAdmission {
-                    admitted: false,
-                    reason_code: RejectionCode::FallbackReplayUnsafe,
-                    message: format!(
-                        "cross-route fallback refused after {}",
-                        match fact {
-                            AttemptLifecycleFact::VisibleOutputCommitted => "visible output",
-                            AttemptLifecycleFact::ToolCallEmitted => "a tool call",
-                            AttemptLifecycleFact::ToolSideEffectStarted => "a side effect",
-                            _ => "an unsafe observation",
-                        }
-                    ),
-                };
-            }
-            _ => {}
+impl FallbackAdmission {
+    fn refuse(
+        reason_code: RejectionCode,
+        message: impl AsRef<str>,
+        skipped: Vec<RejectedCandidate>,
+    ) -> Self {
+        Self {
+            admitted: false,
+            reason_code,
+            message: message.as_ref().to_string(),
+            next_catalog_id: None,
+            skipped_candidates: skipped,
         }
     }
-    FallbackAdmission {
-        admitted: false,
-        reason_code: RejectionCode::FallbackReplayUnsafe,
-        message: "replay-safe fallback is unsupported in this slice (Medley #18)".into(),
+
+    fn admit(next_catalog_id: String, skipped: Vec<RejectedCandidate>) -> Self {
+        Self {
+            admitted: true,
+            reason_code: RejectionCode::RouteUnready,
+            message: format!("admitted same-lane fallback to {next_catalog_id}"),
+            next_catalog_id: Some(next_catalog_id),
+            skipped_candidates: skipped,
+        }
     }
+}
+
+/// Inputs for the #18 planner. Candidates independently resolve identity;
+/// this function never copies credentials.
+pub struct FallbackPlanRequest<'a> {
+    pub selection: &'a NativeModelSelection,
+    pub current_catalog_id: &'a str,
+    pub current_access_profile: &'a str,
+    pub remaining_catalog_ids: &'a [String],
+    pub catalog: &'a SyntheticCatalog,
+    pub requirements: &'a CapabilityRequirements,
+    pub facts: &'a [AttemptLifecycleFact],
+    pub failure: FallbackFailureClass,
+}
+
+/// Fact-only gate used by older call sites. Without remaining candidates this
+/// never admits (fail-closed).
+pub fn admit_cross_route_fallback(facts: &[AttemptLifecycleFact]) -> FallbackAdmission {
+    if let Some(fact) = facts
+        .iter()
+        .copied()
+        .find(|f| f.blocks_cross_route_fallback())
+    {
+        return FallbackAdmission::refuse(
+            RejectionCode::FallbackReplayUnsafe,
+            format!(
+                "cross-route fallback refused after {}",
+                match fact {
+                    AttemptLifecycleFact::VisibleOutputCommitted => "visible output",
+                    AttemptLifecycleFact::ToolCallEmitted => "a tool call",
+                    AttemptLifecycleFact::ToolSideEffectStarted => "a side effect",
+                    _ => "an unsafe observation",
+                }
+            ),
+            Vec::new(),
+        );
+    }
+    FallbackAdmission::refuse(
+        RejectionCode::RouteUnready,
+        "replay-safe fallback requires an ordered remaining same-lane candidate",
+        Vec::new(),
+    )
+}
+
+/// Plan the next same-lane catalog id, or refuse. No network, no credential copy.
+pub fn plan_replay_safe_fallback(request: &FallbackPlanRequest<'_>) -> FallbackAdmission {
+    if let Some(fact) = request
+        .facts
+        .iter()
+        .copied()
+        .find(|f| f.blocks_cross_route_fallback())
+    {
+        return FallbackAdmission::refuse(
+            RejectionCode::FallbackReplayUnsafe,
+            format!(
+                "cross-route fallback refused after {}",
+                match fact {
+                    AttemptLifecycleFact::VisibleOutputCommitted => "visible output",
+                    AttemptLifecycleFact::ToolCallEmitted => "a tool call",
+                    AttemptLifecycleFact::ToolSideEffectStarted => "a side effect",
+                    _ => "an unsafe observation",
+                }
+            ),
+            Vec::new(),
+        );
+    }
+    match request.failure {
+        FallbackFailureClass::PartialOutput | FallbackFailureClass::ToolSideEffect => {
+            return FallbackAdmission::refuse(
+                RejectionCode::FallbackReplayUnsafe,
+                format!(
+                    "cross-route fallback refused after {}",
+                    request.failure.as_str()
+                ),
+                Vec::new(),
+            );
+        }
+        FallbackFailureClass::AuthOrConfig => {
+            return FallbackAdmission::refuse(
+                RejectionCode::CredentialMissing,
+                "auth/config errors require operator correction; no fallback",
+                Vec::new(),
+            );
+        }
+        FallbackFailureClass::SafetyPolicy => {
+            return FallbackAdmission::refuse(
+                RejectionCode::UnsupportedContract,
+                "safety/policy rejection is not fallback-eligible",
+                Vec::new(),
+            );
+        }
+        FallbackFailureClass::IncompatibleCapability => {
+            return FallbackAdmission::refuse(
+                RejectionCode::CapabilityMismatch,
+                "capability/harness mismatch is not fallback-eligible",
+                Vec::new(),
+            );
+        }
+        FallbackFailureClass::ConnectTimeout
+        | FallbackFailureClass::RateLimited
+        | FallbackFailureClass::RetryableServer
+        | FallbackFailureClass::ProviderUnavailable => {}
+    }
+    match request.selection {
+        NativeModelSelection::Exact { .. } => {
+            return FallbackAdmission::refuse(
+                RejectionCode::FallbackReplayUnsafe,
+                "exact mode never cross-route fallbacks",
+                Vec::new(),
+            );
+        }
+        NativeModelSelection::Inherit => {
+            return FallbackAdmission::refuse(
+                RejectionCode::FallbackReplayUnsafe,
+                "inherit has no ordered fallback chain",
+                Vec::new(),
+            );
+        }
+        NativeModelSelection::OrderedCandidates { .. } => {}
+    }
+    let mut skipped = Vec::new();
+    for catalog_id in request.remaining_catalog_ids {
+        if catalog_id == request.current_catalog_id {
+            skipped.push(RejectedCandidate {
+                catalog_id: catalog_id.clone(),
+                wire_model: None,
+                route_key: None,
+                reason_code: RejectionCode::DuplicateRequest,
+                message: "current route is not a fallback target".into(),
+            });
+            continue;
+        }
+        let Some(entry) = request.catalog.get(catalog_id) else {
+            skipped.push(RejectedCandidate {
+                catalog_id: catalog_id.clone(),
+                wire_model: None,
+                route_key: None,
+                reason_code: RejectionCode::ExactModelMissing,
+                message: format!("catalog id {catalog_id} is missing"),
+            });
+            continue;
+        };
+        if entry.access_profile != request.current_access_profile {
+            skipped.push(RejectedCandidate {
+                catalog_id: entry.catalog_id.clone(),
+                wire_model: Some(entry.wire_model.clone()),
+                route_key: Some(entry.route_key.clone()),
+                reason_code: RejectionCode::CrossBillingBlocked,
+                message: format!(
+                    "access profile {} is not the same lane as {}",
+                    entry.access_profile, request.current_access_profile
+                ),
+            });
+            continue;
+        }
+        match eligibility(entry, request.requirements) {
+            Ok(()) => return FallbackAdmission::admit(entry.catalog_id.clone(), skipped),
+            Err(reason) => skipped.push(reason),
+        }
+    }
+    FallbackAdmission::refuse(
+        RejectionCode::RouteUnready,
+        format!(
+            "no eligible same-lane remaining candidate; skipped={}",
+            skipped.len()
+        ),
+        skipped,
+    )
+}
+
+/// Generation-bound mutation admission for `/agents` and other TUI actions.
+pub fn admit_generation_bound_mutation(
+    expected_generation: u64,
+    current_generation: u64,
+) -> Result<(), NativeRouteError> {
+    if expected_generation != current_generation {
+        return Err(NativeRouteError::Rejected(
+            RejectionCode::StaleGeneration,
+            format!(
+                "stale generation: expected={expected_generation}, actual={current_generation}"
+            ),
+        ));
+    }
+    Ok(())
 }

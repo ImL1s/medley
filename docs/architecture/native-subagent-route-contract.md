@@ -35,21 +35,32 @@ plus live spawn in `xai-grok-shell`):
   (`routeReceiptDigest`), and optional ACP `SubagentSpawned` fields;
 - inspect/adapter usage facts helper from the canonical receipt (`catalogId` /
   `wireModel` / `accessProfile` / `routeDigest`); live `by_model` usage still
-  keys by catalog id on the existing #23 path.
-
-Live exact `model:` still uses the legacy pin path: an unknown catalog id warns
-and falls through to inherit. Fail-closed exact selection is the offline
-resolver and the `models:` ordered path.
+  keys by catalog id on the existing #23 path;
+- live exact `model:` fail-closed against the session catalog (unknown ids do
+  **not** inherit);
+- generation-bound `/agents` enable/disable and default mutations (persisted
+  to `config.toml`; this session is not silently rebound);
+- lifecycle card labels on `/agents` details (selecting / running / same-route
+  retry / fallback / refusal / resume / terminal);
+- compact-row a11y tests (narrow/normal/wide, CJK, 1,000 synthetic format
+  rows, no color-only status);
+- fail-closed replay-safe fallback *planner* (`plan_replay_safe_fallback`):
+  pre-output same-lane ordered candidates only.
 
 **Not implemented here (do not claim):**
 
-- generation-bound `/agents` mutation, lifecycle cards, picker/#207, or the
-  full a11y matrix ([#290](https://github.com/ImL1s/medley/issues/290));
-- replay-safe runtime fallback ([#18](https://github.com/ImL1s/medley/issues/18));
-- qualified model-family metadata.
+- picker / `/providers` / `/route` control plane ([#207](https://github.com/ImL1s/medley/issues/207));
+- live sampler auto-failover on a running child HTTP stream;
+- session-only vs persist *model policy* editing in `/agents`;
+- the full #290 interaction matrix (mouse/resize/suspend, 1,000-entry TUI
+  latency, NO_COLOR terminal snapshots);
+- qualified model-family metadata;
+- bounded live evidence at exact SHAs.
 
 `medley.native-model-family-metadata.v1` and
-`medley.native-replay-safe-fallback.v1` advertise `unsupported`.
+`medley.native-replay-safe-fallback.v1` advertise `unsupported` because live
+sampler auto-failover is not wired. The admission planner is tested and
+fail-closed.
 
 ## Ownership
 
@@ -58,8 +69,7 @@ resolver and the `models:` ordered path.
 Catalog-ID lookup and duplicate wire-slug disambiguation; readiness, harness,
 local-only, and capability eligibility; native child-session construction
 (existing spawn path); deterministic candidate resolution; immutable receipts;
-replay-safety *admission types* (cross-route fallback still refused in this
-slice).
+replay-safety admission planner (live sampler auto-failover is not wired).
 
 ### Orchestration consumers own
 
@@ -120,8 +130,11 @@ as a provider/access route. Worktree isolation is not an execution sandbox.
 ## Fallback
 
 Cross-route fallback after visible output, a tool call, or a side effect is
-refused (`fallback_replay_unsafe`). A `429` is not replay authorization.
-Runtime failover remains [#18](https://github.com/ImL1s/medley/issues/18).
+refused (`fallback_replay_unsafe`). Exact and inherit never fall over. A
+`429` is not replay authorization by itself. Same-lane ordered candidates may
+be *admitted* by `plan_replay_safe_fallback` before output; live sampler
+auto-failover is not wired. Runtime failover remains
+[#18](https://github.com/ImL1s/medley/issues/18).
 
 ## Inspect JSON
 
@@ -148,7 +161,10 @@ from an explicit inspect document (never inferred from PATH). Example
 
 ## TUI
 
-`/agents` compact rows append a non-color route status. Expanded details add
-selection, route status, and receipt fields from `AgentRouteUxSnapshot`.
-Generation-bound mutation, lifecycle cards, and stale-action gates remain
-[#290](https://github.com/ImL1s/medley/issues/290).
+`/agents` compact rows append non-color route status, selection intent, and
+capability floor. Expanded details add selection, route status, rejected
+candidates, receipt fields, and a lifecycle card from `AgentRouteUxSnapshot`.
+Enable/disable (`t`) and default (`s`) persist to `config.toml` and are
+generation-bound; stale actions refuse with `stale_generation`. This session
+is not silently rebound. Picker/#207 and the remaining a11y interaction
+matrix stay [#290](https://github.com/ImL1s/medley/issues/290).
