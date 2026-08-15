@@ -1,7 +1,8 @@
 //! In-TUI `/doctor` report formatting.
 
 use super::{
-    DataControlFact, DiagnosticReport, FindingDisposition, NewlineFact, RuntimeFact, VoiceFacts,
+    DataControlFact, DiagnosticReport, FindingDisposition, NewlineFact, ProviderRouteFact,
+    RuntimeFact, VoiceFacts,
 };
 use crate::clipboard::{ClipboardDelivery, NativeClipboardPreflight};
 use crate::host::{DisplayServer, HostOs};
@@ -135,8 +136,39 @@ pub fn format_doctor(report: &DiagnosticReport) -> String {
         }
     }
 
+    if !facts.providers.is_empty() {
+        format_providers(&facts.providers, &mut out);
+    }
+
     format_findings(report, &mut out);
     out
+}
+
+fn format_providers(routes: &[ProviderRouteFact], out: &mut String) {
+    out.push_str("\nProviders\n");
+    for (index, route) in routes.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("  model        {}\n", route.catalog_id));
+        if route.wire_model != route.catalog_id {
+            out.push_str(&format!("  wire         {}\n", route.wire_model));
+        }
+        out.push_str(&format!("  origin       {}\n", route.sanitized_origin));
+        out.push_str(&format!("  auth         {}\n", route.auth_scheme.as_str()));
+        out.push_str(&format!("  source       {}\n", route.credential_source));
+        out.push_str(&format!(
+            "  trust        {}\n",
+            route.endpoint_trust.as_str()
+        ));
+        match (route.ready, route.unready_reason.as_deref()) {
+            (true, _) => out.push_str("  status       ready\n"),
+            (false, Some(reason)) => {
+                out.push_str(&format!("  status       unready ({reason})\n"));
+            }
+            (false, None) => out.push_str("  status       unready\n"),
+        }
+    }
 }
 
 fn format_findings(report: &DiagnosticReport, out: &mut String) {

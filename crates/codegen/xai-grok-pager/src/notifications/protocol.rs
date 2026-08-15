@@ -8,9 +8,9 @@ use crate::terminal::{MultiplexerKind, TerminalContext, TerminalName};
 pub enum NotificationProtocol {
     /// iTerm2/WezTerm/Warp: `\x1b]9;{message}\x07`
     Osc9,
-    /// Kitty: `\x1b]99;i=grok;{message}\x1b\\`
+    /// Kitty: `\x1b]99;i={program};{message}\x1b\\`
     Osc99,
-    /// Ghostty/VTE: `\x1b]777;notify;{title};{body}\x1b\\`
+    /// Ghostty/VTE: `\x1b]777;notify;{program};{body}\x1b\\`
     Osc777,
     /// Universal fallback: `\x07`
     Bel,
@@ -76,12 +76,15 @@ fn notification_sequence(
 ) -> Option<Cow<'static, str>> {
     let title = sanitize_osc_text(title);
     let body = sanitize_osc_text(body);
+    // OSC 99 `i=` and OSC 777's title slot are this process's public name,
+    // not the upstream product title. Tab-title protocols still fold `title`.
+    let app = sanitize_osc_text(&super::app_notification_title());
     Some(match protocol {
-        // Body-only protocols fold the title (session name) into the body.
-        // OSC 777 already uses the tab title as subtitle, so keep "Grok".
         NotificationProtocol::Osc9 => format!("\x1b]9;{body} \u{b7} {title}\x07").into(),
-        NotificationProtocol::Osc99 => format!("\x1b]99;i=grok;{body} \u{b7} {title}\x1b\\").into(),
-        NotificationProtocol::Osc777 => format!("\x1b]777;notify;Grok;{body}\x1b\\").into(),
+        NotificationProtocol::Osc99 => {
+            format!("\x1b]99;i={app};{body} \u{b7} {title}\x1b\\").into()
+        }
+        NotificationProtocol::Osc777 => format!("\x1b]777;notify;{app};{body}\x1b\\").into(),
         NotificationProtocol::Bel => Cow::Borrowed("\x07"),
         NotificationProtocol::None => return None,
     })
@@ -361,13 +364,50 @@ mod tests {
 
     #[test]
     fn notification_sequence_osc99_and_osc777_strip_controls() {
+        let app = xai_grok_config::program_name::program_name();
         let osc99 = notification_sequence(NotificationProtocol::Osc99, "t\x1b", "b\x07")
             .expect("osc99 yields a sequence");
-        assert_eq!(osc99.as_ref(), "\x1b]99;i=grok;b \u{b7} t\x1b\\");
+        assert_eq!(osc99.as_ref(), format!("\x1b]99;i={app};b \u{b7} t\x1b\\"));
 
         let osc777 = notification_sequence(NotificationProtocol::Osc777, "ignored\x1b", "b\x1body")
             .expect("osc777 yields a sequence");
-        assert_eq!(osc777.as_ref(), "\x1b]777;notify;Grok;body\x1b\\");
+        assert_eq!(osc777.as_ref(), format!("\x1b]777;notify;{app};body\x1b\\"));
+    }
+
+    #[test]
+    fn issue49_osc99_identifier_follows_program_name() {
+        let name = xai_grok_config::program_name::program_name();
+        let seq = notification_sequence(NotificationProtocol::Osc99, "title", "body")
+            .expect("osc99 yields a sequence");
+        assert!(
+            seq.contains(&format!("i={name};")),
+            "OSC 99 identifier must follow program_name() ({name}), got {seq}"
+        );
+        if !name.eq_ignore_ascii_case("grok") {
+            assert!(
+                !seq.contains("i=grok;"),
+                "OSC 99 must not hardcode i=grok when argv0 is {name:?}: {seq}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue49_osc777_does_not_hardcode_grok_when_argv0_is_medley() {
+        let name = xai_grok_config::program_name::program_name();
+        let seq = notification_sequence(NotificationProtocol::Osc777, "medley", "Session ready")
+            .expect("osc777 yields a sequence");
+        assert_eq!(
+            seq.as_ref(),
+            format!("\x1b]777;notify;{name};Session ready\x1b\\")
+        );
+        // program_name() is argv[0]. A `medley` (or any non-Grok) invocation
+        // must not still stamp the upstream product title into OSC 777.
+        if !name.eq_ignore_ascii_case("Grok") {
+            assert!(
+                !seq.contains("notify;Grok;"),
+                "OSC 777 must not hardcode Grok when argv0-derived name is {name:?}: {seq}"
+            );
+        }
     }
 
     #[test]

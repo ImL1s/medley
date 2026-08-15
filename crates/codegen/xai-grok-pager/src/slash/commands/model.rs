@@ -279,6 +279,94 @@ fn detect_effort_phase(models: &ModelState, args_query: &str) -> Option<acp::Mod
     None
 }
 
+/// Append `raw` to the `/model` search index unless it is empty or already present.
+fn push_unique_search_token(tokens: &mut Vec<String>, raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if tokens
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+    {
+        return;
+    }
+    tokens.push(trimmed.to_string());
+}
+
+/// Collect capability tokens from a meta string or string array.
+fn collect_capability_tokens(value: Option<&serde_json::Value>, tokens: &mut Vec<String>) {
+    match value {
+        Some(serde_json::Value::String(s)) => {
+            for part in s.split_whitespace() {
+                if !part.is_empty() {
+                    tokens.push(part.to_string());
+                }
+            }
+        }
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        tokens.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Capability tokens from ACP model meta (explicit lists plus known flags).
+fn capability_tokens_from_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Vec<String> {
+    let Some(meta) = meta else {
+        return Vec::new();
+    };
+    let mut tokens = Vec::new();
+    collect_capability_tokens(meta.get("capabilityTokens"), &mut tokens);
+    collect_capability_tokens(meta.get("capabilities"), &mut tokens);
+    if meta
+        .get("supportsReasoningEffort")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        tokens.push("reasoning".to_string());
+    }
+    if meta
+        .get("supportsBackendSearch")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        tokens.push("search".to_string());
+    }
+    tokens
+}
+
+/// Search index for a `/model` row: display name plus identity and capability tokens.
+///
+/// `insert_text` stays the display name so committing a row is unchanged.
+fn model_item_match_text(id: &acp::ModelId, info: &acp::ModelInfo, provider_hint: &str) -> String {
+    let mut tokens = Vec::new();
+    push_unique_search_token(&mut tokens, &info.name);
+    push_unique_search_token(&mut tokens, id.0.as_ref());
+    if let Some(slug) = info
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("modelSlug"))
+        .and_then(|v| v.as_str())
+    {
+        push_unique_search_token(&mut tokens, slug);
+    }
+    push_unique_search_token(&mut tokens, provider_hint);
+    for token in capability_tokens_from_meta(info.meta.as_ref()) {
+        push_unique_search_token(&mut tokens, &token);
+    }
+    tokens.join(" ")
+}
+
 /// One row per logical model. Reasoning models get a trailing space in
 /// `insert_text` so the prompt widget chains into the effort sub-menu.
 fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
@@ -338,7 +426,7 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
 
         items.push(ArgItem {
             display,
-            match_text: info.name.clone(),
+            match_text: model_item_match_text(id, info, &readiness.provider_hint),
             insert_text,
             description,
             badge,
@@ -464,14 +552,11 @@ mod tests {
         // Reasoning model has trailing space in insert_text -- this is the
         // signal the prompt widget reads to keep the dropdown open after
         // Enter so the effort sub-menu can render.
-        let reasoning = items
-            .iter()
-            .find(|i| i.match_text == "Reasoning X")
-            .unwrap();
+        let reasoning = row_named(&items, "Reasoning X");
         assert_eq!(reasoning.insert_text, "Reasoning X ");
 
         // Plain model has no trailing space -- Enter commits immediately.
-        let plain = items.iter().find(|i| i.match_text == "Grok 4.5").unwrap();
+        let plain = row_named(&items, "Grok 4.5");
         assert_eq!(plain.insert_text, "Grok 4.5");
     }
 
@@ -693,6 +778,21 @@ mod tests {
         (id, info)
     }
 
+    fn row_named<'a>(items: &'a [ArgItem], name: &str) -> &'a ArgItem {
+        items
+            .iter()
+            .find(|item| item.insert_text.trim_end() == name)
+            .unwrap_or_else(|| panic!("expected model row {name}"))
+    }
+
+    fn selectable_by_match<'a>(items: &'a [ArgItem], query: &str) -> Vec<&'a ArgItem> {
+        let q = query.to_lowercase();
+        items
+            .iter()
+            .filter(|item| !item.non_selectable && item.match_text.to_lowercase().contains(&q))
+            .collect()
+    }
+
     #[test]
     fn build_model_items_badges_ready_missing_none() {
         let mut state = ModelState::default();
@@ -735,29 +835,102 @@ mod tests {
         state.available.insert(none_id, none_info);
 
         let items = build_model_items(&state);
-        let ready = items
-            .iter()
-            .find(|i| i.match_text == "Ready Model")
-            .unwrap();
+        let ready = row_named(&items, "Ready Model");
         assert_eq!(ready.badge, "ready");
         assert!(!ready.dimmed);
         assert!(!ready.non_selectable);
         assert_eq!(ready.description, "xAI · bearer");
 
-        let missing = items
-            .iter()
-            .find(|i| i.match_text == "Missing Model")
-            .unwrap();
+        let missing = row_named(&items, "Missing Model");
         assert_eq!(missing.badge, "missing");
         assert!(missing.dimmed);
         assert!(missing.non_selectable);
         assert_eq!(missing.blocked_reason, "missing OPENAI_API_KEY");
         assert_eq!(missing.description, "api.openai.com · bearer");
 
-        let none = items.iter().find(|i| i.match_text == "None Model").unwrap();
+        let none = row_named(&items, "None Model");
         assert_eq!(none.badge, "none");
         assert!(!none.non_selectable);
         assert_eq!(none.description, "local · none");
+    }
+
+    /// #17 first slice: picker search matches catalog id / wire slug /
+    /// provider hint / capability tokens, not display name only. Two rows
+    /// share a name so a name query cannot disambiguate; identity queries
+    /// leave only the matching id selectable. `insert_text` stays the name.
+    #[test]
+    fn build_model_items_match_issue17_duplicate_display_name() {
+        let mut state = ModelState::default();
+        let display = "Shared Twin";
+        let (id_a, info_a) = model_with_meta(
+            "issue17-catalog-a",
+            display,
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("session")),
+                ("ready".into(), serde_json::json!(true)),
+                (
+                    "providerHint".into(),
+                    serde_json::json!("issue17-provider-a"),
+                ),
+                ("modelSlug".into(), serde_json::json!("issue17-wire-a")),
+                (
+                    "capabilityTokens".into(),
+                    serde_json::json!(["issue17-vision"]),
+                ),
+            ]),
+        );
+        let (id_b, info_b) = model_with_meta(
+            "issue17-catalog-b",
+            display,
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("session")),
+                ("ready".into(), serde_json::json!(true)),
+                (
+                    "providerHint".into(),
+                    serde_json::json!("issue17-provider-b"),
+                ),
+                ("modelSlug".into(), serde_json::json!("issue17-wire-b")),
+                ("capabilities".into(), serde_json::json!(["issue17-search"])),
+            ]),
+        );
+        state.available.insert(id_a, info_a);
+        state.available.insert(id_b, info_b);
+
+        let items = build_model_items(&state);
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .all(|item| item.insert_text == display && !item.non_selectable)
+        );
+
+        let by_name = selectable_by_match(&items, display);
+        assert_eq!(by_name.len(), 2, "shared display name still matches both");
+
+        let by_id = selectable_by_match(&items, "issue17-catalog-a");
+        assert_eq!(by_id.len(), 1, "catalog id must isolate one row");
+        assert!(by_id[0].match_text.contains("issue17-catalog-a"));
+        assert!(!by_id[0].match_text.contains("issue17-catalog-b"));
+        assert_eq!(by_id[0].insert_text, display);
+
+        let by_provider = selectable_by_match(&items, "issue17-provider-b");
+        assert_eq!(by_provider.len(), 1, "provider hint must isolate one row");
+        assert!(by_provider[0].match_text.contains("issue17-catalog-b"));
+        assert_eq!(by_provider[0].insert_text, display);
+
+        let by_slug = selectable_by_match(&items, "issue17-wire-a");
+        assert_eq!(by_slug.len(), 1);
+        assert!(by_slug[0].match_text.contains("issue17-catalog-a"));
+
+        let by_cap_a = selectable_by_match(&items, "issue17-vision");
+        assert_eq!(by_cap_a.len(), 1);
+        assert!(by_cap_a[0].match_text.contains("issue17-catalog-a"));
+
+        let by_cap_b = selectable_by_match(&items, "issue17-search");
+        assert_eq!(by_cap_b.len(), 1);
+        assert!(by_cap_b[0].match_text.contains("issue17-catalog-b"));
     }
 
     #[test]
@@ -820,7 +993,12 @@ mod tests {
             "picker must name the migration target: {}",
             item.description
         );
-        assert_eq!(item.match_text, "GPT-5.4");
+        assert!(
+            item.match_text.to_ascii_lowercase().contains("gpt-5.4"),
+            "match_text must still include the display name/id: {}",
+            item.match_text
+        );
+        assert_eq!(item.insert_text, "GPT-5.4");
     }
 
     /// #306 C-min gate 1 (**component presentation** — not cold-boot/ACP
@@ -962,10 +1140,7 @@ mod tests {
         let items = build_model_items(&state);
         assert_eq!(items.len(), 2, "picker must list both catalog entries");
 
-        let codex = items
-            .iter()
-            .find(|i| i.match_text == "GPT-5.6 Sol")
-            .expect("live Codex row in picker");
+        let codex = row_named(&items, "GPT-5.6 Sol");
         assert_eq!(codex.badge, "ready");
         assert!(!codex.dimmed);
         assert!(!codex.non_selectable);
@@ -977,10 +1152,7 @@ mod tests {
             codex.display
         );
 
-        let grok = items
-            .iter()
-            .find(|i| i.match_text == "Grok 4.5")
-            .expect("Grok row in picker");
+        let grok = row_named(&items, "Grok 4.5");
         assert_eq!(grok.badge, "missing");
         assert!(grok.dimmed);
         assert!(grok.non_selectable);
@@ -1041,10 +1213,7 @@ mod tests {
 
         let items = build_model_items(&state);
         for (_, name) in &ready_ids {
-            let row = items
-                .iter()
-                .find(|i| i.match_text == *name)
-                .expect("ready Codex row in picker");
+            let row = row_named(&items, name);
             assert_eq!(row.badge, "ready");
             assert!(!row.non_selectable);
         }

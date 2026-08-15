@@ -183,6 +183,7 @@ fn merge_section<T: serde::Serialize>(
                 .or_insert_with(|| TomlValue::Table(TomlMap::new()));
             if let TomlValue::Table(existing) = section {
                 merge_toml_tables(existing, new_fields);
+                strip_retired_ui_aliases(key, existing);
             } else {
                 *section = TomlValue::Table(new_fields);
             }
@@ -191,6 +192,19 @@ fn merge_section<T: serde::Serialize>(
         Ok(_) | Err(_) => {
             table.remove(key);
         }
+    }
+}
+
+/// Drop `[ui].simple_mode` once the public `readline_mode` key is written so
+/// serde cannot see both names (the field uses `alias = "simple_mode"`).
+fn strip_retired_ui_aliases(section_key: &str, existing: &mut TomlMap<String, TomlValue>) {
+    if section_key != "ui" {
+        return;
+    }
+    let ui = crate::agent::config::UiConfig::READLINE_MODE_KEY;
+    let alias = crate::agent::config::UiConfig::SIMPLE_MODE_ALIAS_KEY;
+    if existing.contains_key(ui) {
+        existing.remove(alias);
     }
 }
 /// Update settings with a read-modify-write, preserving unrelated fields.
@@ -1410,12 +1424,15 @@ custom_user_key = "preserve-me"
              this is the merge_section invariant the new helpers depend on"
         );
     }
-    /// Same merge round-trip for `show_timestamps` and `simple_mode`.
+    /// Same merge round-trip for `show_timestamps` and `readline_mode`.
+    /// A pre-existing `simple_mode` alias is dropped so both keys cannot
+    /// coexist after a write (issue #66).
     #[test]
     fn set_show_timestamps_and_simple_mode_round_trip_through_merge() {
         let original = r#"
 [ui]
 compact_mode = true
+simple_mode = true
 custom_unknown_key = 42
 "#;
         let root: TomlValue = toml::from_str(original).unwrap();
@@ -1429,7 +1446,16 @@ custom_unknown_key = 42
             ui.get("show_timestamps").and_then(|v| v.as_bool()),
             Some(false),
         );
-        assert_eq!(ui.get("simple_mode").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            ui.get(crate::agent::config::UiConfig::READLINE_MODE_KEY)
+                .and_then(|v| v.as_bool()),
+            Some(false),
+        );
+        assert!(
+            ui.get(crate::agent::config::UiConfig::SIMPLE_MODE_ALIAS_KEY)
+                .is_none(),
+            "retired simple_mode must be dropped when readline_mode is written"
+        );
         assert_eq!(
             ui.get("compact_mode").and_then(|v| v.as_bool()),
             Some(true),

@@ -40,8 +40,8 @@ pub(crate) use model::{
 pub use model::{
     ClipboardFacts, ColorFacts, DataControlFact, DiagnosticFacts, DiagnosticFinding, DiagnosticId,
     DiagnosticReport, FindingDisposition, KeyboardFact, ManualRemediation, NewlineFact, ProbeNote,
-    ProbeStatus, RuntimeFact, TmuxColorPassthrough, TmuxFacts, TmuxOptionFact, TmuxSupportFact,
-    VoiceFacts,
+    ProbeStatus, ProviderAuthScheme, ProviderEndpointTrust, ProviderRouteFact, RuntimeFact,
+    TmuxColorPassthrough, TmuxFacts, TmuxOptionFact, TmuxSupportFact, VoiceFacts,
 };
 pub use view::{DiagnosticSnapshot, view};
 

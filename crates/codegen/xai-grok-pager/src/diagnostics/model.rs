@@ -97,6 +97,73 @@ pub struct DiagnosticFacts {
     /// Passive mic enumeration when voice capture is available. `None` omits the
     /// Voice section (no-audio builds, or TUI when voice mode is off).
     pub voice: Option<VoiceFacts>,
+    /// Offline model-route facts, shaped like inspect's secret-free
+    /// `EffectiveModelRoute`. Empty omits the Providers section. Fields are
+    /// names, classes, and sanitized origins only — never credential bytes.
+    pub providers: Vec<ProviderRouteFact>,
+}
+
+/// Wire auth header a model route will send. Display/JSON labels only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthScheme {
+    /// `auth_scheme = "none"`: deliberately keyless.
+    None,
+    Bearer,
+    #[serde(rename = "x-api-key")]
+    XApiKey,
+}
+
+impl ProviderAuthScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bearer => "bearer",
+            Self::XApiKey => "x-api-key",
+        }
+    }
+}
+
+/// Endpoint trust class copied from the inspect route (sampler-enforced).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderEndpointTrust {
+    FirstPartyXai,
+    External,
+    Local,
+    UserDeclared,
+}
+
+impl ProviderEndpointTrust {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstPartyXai => "first_party_xai",
+            Self::External => "external",
+            Self::Local => "local",
+            Self::UserDeclared => "user_declared",
+        }
+    }
+}
+
+/// One secret-free provider/model row for `/doctor` and `grok doctor --json`.
+///
+/// Mirrors `EffectiveModelRoute` plus the inspect auth scheme. `credential_source`
+/// is the already-formatted label (`env:NAME`, `none`, `missing`, …) — env-var
+/// **names** are allowed; secret bytes are not.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRouteFact {
+    pub catalog_id: String,
+    pub wire_model: String,
+    /// Scheme + host [+ port] [+ path]. Userinfo, query, and fragment must
+    /// already have been stripped by the inspect/route builder.
+    pub sanitized_origin: String,
+    pub auth_scheme: ProviderAuthScheme,
+    pub credential_source: String,
+    pub endpoint_trust: ProviderEndpointTrust,
+    pub ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unready_reason: Option<String>,
 }
 
 /// Result of a passive input-device lookup (does not open a capture stream).

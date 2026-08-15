@@ -248,6 +248,7 @@ fn facts(
             newline,
             clipboard,
             voice: None,
+            providers: Vec::new(),
         },
         clipboard_recovery,
     )

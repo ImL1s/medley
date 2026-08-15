@@ -26,6 +26,25 @@ pub struct NotificationEvent {
     pub session_id: Option<String>,
 }
 
+/// Popup title for chrome notifications. Follows argv[0] so a `medley`
+/// invocation is not labeled Grok (#49).
+pub(crate) fn app_notification_title() -> String {
+    xai_grok_config::program_name::program_name().to_owned()
+}
+
+/// Session-ready / approval popup: program name as title, event kind as body.
+pub(crate) fn chrome_notification(
+    kind: NotificationEventKind,
+    session_id: Option<String>,
+) -> NotificationEvent {
+    NotificationEvent {
+        kind,
+        title: app_notification_title(),
+        body: kind.as_str().into(),
+        session_id,
+    }
+}
+
 pub struct NotificationService {
     config: NotificationConfig,
     pub focus_tracker: focus::FocusTracker,
@@ -467,6 +486,92 @@ mod tests {
         assert!(svc.should_emit_terminal());
         svc.focus_tracker.on_focus_gained();
         assert!(!svc.should_emit_terminal());
+    }
+
+    #[test]
+    fn issue49_notify_title_follows_program_name() {
+        let name = xai_grok_config::program_name::program_name();
+        let session_ready = chrome_notification(NotificationEventKind::SessionReady, None);
+        let approval = chrome_notification(
+            NotificationEventKind::ApprovalRequired,
+            Some("issue49-session".into()),
+        );
+        assert_eq!(session_ready.title, name);
+        assert_eq!(approval.title, name);
+        assert_eq!(
+            session_ready.body,
+            NotificationEventKind::SessionReady.as_str()
+        );
+        assert_eq!(
+            approval.body,
+            NotificationEventKind::ApprovalRequired.as_str()
+        );
+        // argv0 is `medley` in shipped installs; cargo-test uses the
+        // test-binary name. Neither may still advertise the product title.
+        if name == "medley" || !name.eq_ignore_ascii_case("Grok") {
+            assert_ne!(session_ready.title, "Grok");
+            assert_ne!(approval.title, "Grok");
+        }
+    }
+
+    #[test]
+    fn issue49_production_chrome_notify_does_not_hardcode_grok_title() {
+        let status = include_str!("../app/dispatch/status.rs");
+        let perms = include_str!("../app/acp_handler/permissions.rs");
+        let protocol = include_str!("protocol.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("protocol.rs has a test module");
+        assert!(
+            status.contains("chrome_notification"),
+            "notify_session_ready must use chrome_notification"
+        );
+        assert!(
+            perms.contains("chrome_notification"),
+            "approval notify must use chrome_notification"
+        );
+        assert!(
+            !status.contains("title: \"Grok\""),
+            "notify_session_ready must not hardcode title Grok"
+        );
+        assert!(
+            !perms.contains("title: \"Grok\""),
+            "approval notify must not hardcode title Grok"
+        );
+        assert!(
+            protocol.contains("app_notification_title()"),
+            "OSC sequences must take the app name from app_notification_title"
+        );
+        assert!(
+            !protocol.contains("i=grok;"),
+            "OSC 99 must not hardcode i=grok"
+        );
+        assert!(
+            !protocol.contains("notify;Grok;"),
+            "OSC 777 must not hardcode notify;Grok;"
+        );
+    }
+
+    #[test]
+    fn issue49_notify_session_ready_and_approval_use_program_name_title() {
+        let svc = NotificationService::new_for_test(NotificationConfig {
+            events: vec![
+                NotificationEventKind::SessionReady,
+                NotificationEventKind::ApprovalRequired,
+            ],
+            condition: NotificationCondition::Always,
+            ..Default::default()
+        });
+        let title = app_notification_title();
+        assert_eq!(title, xai_grok_config::program_name::program_name());
+        svc.notify(chrome_notification(
+            NotificationEventKind::SessionReady,
+            Some("issue49-ready".into()),
+        ));
+        svc.notify(chrome_notification(
+            NotificationEventKind::ApprovalRequired,
+            Some("issue49-approval".into()),
+        ));
     }
 
     #[test]

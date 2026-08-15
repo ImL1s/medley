@@ -8,7 +8,7 @@ use crate::diagnostics::probes::{
 use crate::diagnostics::{
     ClipboardFacts, ColorFacts, DataControlFact, DiagnosticFacts, DiagnosticFinding, DiagnosticId,
     DiagnosticReport, FindingDisposition, KeyboardFact, ManualRemediation, NewlineFact, ProbeNote,
-    ProbeStatus, RuntimeFact,
+    ProbeStatus, ProviderAuthScheme, ProviderEndpointTrust, ProviderRouteFact, RuntimeFact,
 };
 use crate::host::{DisplayServer, HostOs};
 use crate::terminal::{
@@ -129,6 +129,7 @@ fn healthy_report() -> DiagnosticReport {
                 fix: None,
             },
             voice: None,
+            providers: Vec::new(),
         },
         findings: Vec::new(),
         probe_notes: Vec::new(),
@@ -1047,4 +1048,62 @@ fn output_writer_errors_propagate() {
 
     assert!(write_report(&healthy_report(), false, &mut BrokenWriter).is_err());
     assert!(write_report(&healthy_report(), true, &mut BrokenWriter).is_err());
+}
+
+#[test]
+fn issue15_doctor_json_providers_rows_are_secret_free() {
+    const SECRET: &str = "sk-live-issue15-secret-0123456789";
+    let mut report = healthy_report();
+    report.facts.providers = vec![
+        ProviderRouteFact {
+            catalog_id: "local-llama".to_owned(),
+            wire_model: "llama3".to_owned(),
+            sanitized_origin: "http://127.0.0.1:11434/v1".to_owned(),
+            auth_scheme: ProviderAuthScheme::None,
+            credential_source: "none".to_owned(),
+            endpoint_trust: ProviderEndpointTrust::Local,
+            ready: true,
+            unready_reason: None,
+        },
+        ProviderRouteFact {
+            catalog_id: "openai".to_owned(),
+            wire_model: "gpt-4o".to_owned(),
+            sanitized_origin: "https://api.openai.com/v1".to_owned(),
+            auth_scheme: ProviderAuthScheme::Bearer,
+            credential_source: "env:OPENAI_API_KEY".to_owned(),
+            endpoint_trust: ProviderEndpointTrust::External,
+            ready: true,
+            unready_reason: None,
+        },
+        ProviderRouteFact {
+            catalog_id: "anthropic".to_owned(),
+            wire_model: "claude-sonnet".to_owned(),
+            sanitized_origin: "https://api.anthropic.com".to_owned(),
+            auth_scheme: ProviderAuthScheme::XApiKey,
+            credential_source: "env:ANTHROPIC_API_KEY".to_owned(),
+            endpoint_trust: ProviderEndpointTrust::External,
+            ready: true,
+            unready_reason: None,
+        },
+    ];
+
+    let mut output = Vec::new();
+    write_report(&report, true, &mut output).expect("serialize doctor json");
+    let text = String::from_utf8(output).expect("JSON is UTF-8");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    let providers = json["facts"]["providers"].as_array().expect("providers");
+    assert_eq!(providers.len(), 3);
+    assert_eq!(providers[0]["authScheme"], "none");
+    assert_eq!(providers[1]["authScheme"], "bearer");
+    assert_eq!(providers[1]["credentialSource"], "env:OPENAI_API_KEY");
+    assert_eq!(providers[2]["authScheme"], "x-api-key");
+    assert_eq!(providers[2]["credentialSource"], "env:ANTHROPIC_API_KEY");
+    assert!(text.contains("OPENAI_API_KEY"));
+    for window in SECRET.as_bytes().windows(8) {
+        let window = std::str::from_utf8(window).expect("ascii");
+        assert!(
+            !text.contains(window),
+            "doctor --json leaked secret fragment {window}: {text}"
+        );
+    }
 }
