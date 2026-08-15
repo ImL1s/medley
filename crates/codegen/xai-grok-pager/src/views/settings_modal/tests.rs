@@ -415,7 +415,8 @@ fn every_dynamic_enum_setting_has_action_for_string_arm() {
         // a generic `Action::DynamicSettingChanged(...)` would
         // pass `is_some()` while breaking the typed dispatch.
         let empty_action = action_for_string(meta.key, String::new(), &snapshot);
-        let nonempty_action = action_for_string(meta.key, "Test Model".to_string(), &snapshot);
+        // Picker canonical is the catalog ModelId, not the display name.
+        let nonempty_action = action_for_string(meta.key, "test-model".to_string(), &snapshot);
         match meta.key {
             "default_model" => {
                 assert!(
@@ -447,6 +448,60 @@ fn every_dynamic_enum_setting_has_action_for_string_arm() {
                  additions can't silently rely on the generic is_some() check.",
             ),
         }
+    }
+}
+
+/// DynamicEnum rows commit ModelId. A display-only resolver would make
+/// Enter no-op when id != display, and would pick the wrong sibling
+/// when two rows share a display name.
+#[test]
+fn action_for_string_commits_catalog_model_id_not_display_name() {
+    use agent_client_protocol as acp;
+    use std::sync::Arc;
+
+    let snapshot = PagerLocalSnapshot {
+        available_models: vec![
+            (
+                "GPT-5.6 Sol".to_string(),
+                acp::ModelId::new(Arc::from("gpt-5.6-sol")),
+            ),
+            (
+                "GPT-5.6 Sol".to_string(),
+                acp::ModelId::new(Arc::from("gpt-5.6-sol-preview")),
+            ),
+        ],
+        ..PagerLocalSnapshot::default()
+    };
+
+    match action_for_string(
+        "default_model",
+        "gpt-5.6-sol-preview".to_string(),
+        &snapshot,
+    ) {
+        Some(Action::SetDefaultModel(id)) => {
+            assert_eq!(id.0.as_ref(), "gpt-5.6-sol-preview");
+        }
+        other => panic!("Enter on the sibling ModelId must persist that id, got {other:?}"),
+    }
+    match action_for_string(
+        "fork_secondary_model",
+        "gpt-5.6-sol-preview".to_string(),
+        &snapshot,
+    ) {
+        Some(Action::SetForkSecondaryModel(id)) => {
+            assert_eq!(id.0.as_ref(), "gpt-5.6-sol-preview");
+        }
+        other => panic!("fork picker must persist the focused ModelId, got {other:?}"),
+    }
+    match action_for_string("default_model", "GPT-5.6 Sol".to_string(), &snapshot) {
+        Some(Action::SetDefaultModel(id)) => {
+            assert_eq!(
+                id.0.as_ref(),
+                "gpt-5.6-sol",
+                "typed display text still resolves to the first catalog row"
+            );
+        }
+        other => panic!("typed display name must still resolve, got {other:?}"),
     }
 }
 

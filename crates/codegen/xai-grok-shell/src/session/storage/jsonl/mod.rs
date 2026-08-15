@@ -111,31 +111,47 @@ impl JsonlStorageAdapter {
     }
     /// Move a public session directory that has no `summary.json` aside.
     /// Caller must hold the exclusive session-ID lease.
+    ///
+    /// Walks the publication parent without following links. A
+    /// `sessions/<encoded-cwd>` symlink must fail closed before any rename
+    /// so an outside occupant cannot be moved (#340 / Codex P1).
     fn quarantine_incomplete_public_session(&self, info: &Info) -> io::Result<()> {
-        let public = self.session_dir(info);
-        match std::fs::metadata(&public) {
-            Ok(meta) if meta.is_dir() => {}
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "session path is occupied by a non-directory",
-                ));
-            }
+        let Some(root) = self.lock_root() else {
+            return Ok(());
+        };
+        use std::ffi::OsStr;
+        use xai_grok_workspace::session::publication_parent::ensure_publication_parent;
+
+        let encoded = crate::util::grok_home::encode_cwd_dirname(&info.cwd);
+        let parent = ensure_publication_parent(root, OsStr::new(&encoded))?;
+        parent.revalidate()?;
+
+        let session_id = info.id.to_string();
+        let occupant = match parent
+            .parent_anchor()
+            .open_child_dir(OsStr::new(&session_id))
+        {
+            Ok(occupant) => occupant,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
+        };
+        match occupant.open_child_file(OsStr::new(super::SUMMARY_FILE)) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        if public.join(super::SUMMARY_FILE).exists() {
-            return Ok(());
-        }
+        parent.revalidate()?;
+
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let quarantine = public.with_file_name(format!(
-            "{}.incomplete-{stamp}",
-            public.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        std::fs::rename(&public, &quarantine)?;
+        let quarantine_name = format!("{session_id}.incomplete-{stamp}");
+        parent.parent_anchor().rename_child_dir_no_replace(
+            OsStr::new(&session_id),
+            parent.parent_anchor(),
+            OsStr::new(&quarantine_name),
+        )?;
         Ok(())
     }
 

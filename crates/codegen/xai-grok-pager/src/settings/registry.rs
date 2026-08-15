@@ -402,18 +402,23 @@ impl PagerLocalSnapshot {
         self.available_models.iter().map(|(name, _)| name.as_str())
     }
 
-    /// Resolve a user-supplied name to a `ModelId` via the snapshot.
-    /// Case-insensitive ASCII match against display names only (ids
-    /// aren't carried in the snapshot's primary key — callers needing
-    /// id-based resolution should reach for `ModelState::resolve_by_name_or_id`).
+    /// Resolve a user-supplied name or catalog id to a `ModelId`.
+    ///
+    /// Dynamic pickers commit [`OwnedEnumChoice::canonical`] which is the
+    /// catalog `ModelId`, not the display name. Typed editors still pass
+    /// display text. Match id first so a colliding display name cannot
+    /// steal an Enter on a sibling row.
     pub fn resolve_model_name(&self, query: &str) -> Option<acp::ModelId> {
-        self.available_models.iter().find_map(|(name, id)| {
-            if name.eq_ignore_ascii_case(query) {
-                Some(id.clone())
-            } else {
-                None
-            }
-        })
+        if let Some((_, id)) = self
+            .available_models
+            .iter()
+            .find(|(_, id)| id.0.as_ref().eq_ignore_ascii_case(query))
+        {
+            return Some(id.clone());
+        }
+        self.available_models
+            .iter()
+            .find_map(|(name, id)| name.eq_ignore_ascii_case(query).then(|| id.clone()))
     }
 }
 

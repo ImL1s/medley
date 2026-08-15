@@ -1258,6 +1258,8 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             fork_and_import_reject_symlinked_encoded_cwd_parent -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            init_session_rejects_symlinked_encoded_cwd_occupant_without_summary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             model_switch_interruption_before_intent_rename_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_switch_interruption_after_intent_rename_ -- --nocapture
@@ -1717,6 +1719,10 @@ jobs:
             remap_picking_enum_resets_when_focused_model_disappears -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             remap_picking_enum_keeps_the_focused_model_id_when_display_names_collide -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            action_for_string_commits_catalog_model_id_not_display_name -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            every_dynamic_enum_setting_has_action_for_string_arm -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             accept_fresh_publication_continues_only_for_committed_durability -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

@@ -2280,6 +2280,99 @@ async fn init_session_recovers_occupied_directory_without_summary() {
     );
 }
 
+/// #340 / Codex P1: a crash occupant under a *symlinked* encoded-CWD
+/// parent must not be renamed. `FreshPublication::prepare` would reject
+/// that parent, but quarantine used to run first via lexical rename.
+#[cfg(unix)]
+#[tokio::test]
+async fn init_session_rejects_symlinked_encoded_cwd_occupant_without_summary() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::symlink;
+
+    fn snapshot(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.file_type().is_symlink() {
+                    out.insert(
+                        rel,
+                        format!(
+                            "symlink->{}",
+                            std::fs::read_link(&path).unwrap().display()
+                        )
+                        .into_bytes(),
+                    );
+                } else if meta.is_dir() {
+                    out.insert(rel, b"dir".to_vec());
+                    walk(root, &path, out);
+                } else {
+                    out.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        walk(root, root, &mut out);
+        out
+    }
+
+    let grok = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    std::fs::write(outside.path().join("canary"), b"outside-untouched-quarantine").unwrap();
+    let info = Info {
+        id: acp::SessionId::new("019c0000-0000-7000-8000-000000000401"),
+        cwd: "/repo/publication/symlink-occupant".to_string(),
+    };
+    let adapter = JsonlStorageAdapter::with_root(grok.path().to_path_buf());
+    let encoded = crate::util::grok_home::encode_cwd_dirname(&info.cwd);
+    let sessions = grok.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    symlink(outside.path(), sessions.join(&encoded)).unwrap();
+
+    let occupant = outside.path().join(info.id.to_string());
+    std::fs::create_dir_all(&occupant).unwrap();
+    std::fs::write(occupant.join("partial"), b"outside-crash-occupant").unwrap();
+    assert!(!occupant.join("summary.json").exists());
+    let before = snapshot(outside.path());
+
+    let published = adapter.init_session(&info, default_model_id()).await;
+    assert!(
+        published.is_err(),
+        "init must fail closed on a symlinked encoded-CWD parent: {published:?}"
+    );
+    assert_eq!(snapshot(outside.path()), before);
+    assert_eq!(
+        std::fs::read(outside.path().join("canary")).unwrap(),
+        b"outside-untouched-quarantine"
+    );
+    assert_eq!(
+        std::fs::read(occupant.join("partial")).unwrap(),
+        b"outside-crash-occupant"
+    );
+    assert!(
+        !outside
+            .path()
+            .read_dir()
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".incomplete-")),
+        "quarantine must not rename the outside occupant"
+    );
+}
+
 #[test]
 fn accept_fresh_publication_continues_only_for_committed_durability() {
     use std::io;
