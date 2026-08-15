@@ -50,9 +50,7 @@ pub(super) fn stamp_receipt_for_selection(
     resume: Option<ResumePin>,
     now_unix_ms: u64,
 ) -> Option<RouteReceipt> {
-    if catalog.get(selected_catalog_id).is_none() {
-        return None;
-    }
+    catalog.get(selected_catalog_id)?;
     let mut request = request_from_agent_definition(
         definition,
         Some(ctx.model_id.0.to_string()),

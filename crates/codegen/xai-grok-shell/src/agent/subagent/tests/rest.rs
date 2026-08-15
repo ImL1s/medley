@@ -5159,6 +5159,7 @@ fn resume_digest_comes_from_source_meta_not_current_spawn() {
         access_profile: "none".into(),
         harness: None,
         capability_ceiling: None,
+        required_capabilities: Default::default(),
         selection_provenance: "inherit".into(),
         rejected_candidates: Vec::new(),
         route_digest: "source-digest".into(),

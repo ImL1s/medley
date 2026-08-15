@@ -1740,6 +1740,7 @@ impl AgentDefinition {
             def.tool_config = default_grok_build_toolset();
         }
         def.scope = AgentScope::BuiltIn;
+        def.validate_native_route_syntax()?;
         Ok(def)
     }
     /// Serialize to a JSON value suitable for `from_json` roundtrip.
@@ -2486,6 +2487,30 @@ description: Test default tool config
         });
         let def = AgentDefinition::from_json(&json).unwrap();
         assert_eq!(def.name, "test");
+    }
+    #[test]
+    fn from_json_rejects_model_and_models_conflict() {
+        let json = serde_json::json!({
+            "name": "test",
+            "description": "Test",
+            "model": "cloud",
+            "models": ["review-primary"]
+        });
+        let err = AgentDefinition::from_json(&json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("model and models cannot both declare")
+        );
+    }
+    #[test]
+    fn from_json_rejects_empty_models_entry() {
+        let json = serde_json::json!({
+            "name": "test",
+            "description": "Test",
+            "models": [""]
+        });
+        let err = AgentDefinition::from_json(&json).unwrap_err();
+        assert!(err.to_string().contains("empty models catalog ids"));
     }
     #[test]
     fn to_json_value_roundtrips_through_from_json() {
