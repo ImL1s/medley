@@ -7321,6 +7321,18 @@ pub(crate) fn unready_reason_for_model_id(
     })
 }
 
+/// Wire string for ACP `endpointTrust`. Keep in lockstep with
+/// pager `ProviderEndpointTrust::as_str`.
+fn endpoint_trust_meta_value(trust: xai_grok_sampler::EndpointTrustClass) -> &'static str {
+    use xai_grok_sampler::EndpointTrustClass::*;
+    match trust {
+        FirstPartyXai => "first_party_xai",
+        External => "external",
+        Local => "local",
+        UserDeclared => "user_declared",
+    }
+}
+
 pub(crate) fn to_acp_model_info(
     models: &IndexMap<String, ModelEntry>,
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {
@@ -7386,6 +7398,26 @@ pub(crate) fn to_acp_model_info(
                 map.insert(
                     "providerHint".to_string(),
                     serde_json::Value::String(provider_hint_for_url(&info.base_url)),
+                );
+                // Secret-free route facts for TUI `/doctor`. Ask the same
+                // sampler classifier inspect uses — never invent External.
+                let creds = resolve_credentials(model, None);
+                let route = effective_model_route(key, model, &creds);
+                map.insert(
+                    "sanitizedOrigin".to_string(),
+                    serde_json::Value::String(route.sanitized_origin),
+                );
+                map.insert(
+                    "credentialSource".to_string(),
+                    serde_json::Value::String(format_credential_source_label(
+                        &route.credential_source,
+                    )),
+                );
+                map.insert(
+                    "endpointTrust".to_string(),
+                    serde_json::Value::String(
+                        endpoint_trust_meta_value(route.endpoint_trust).to_string(),
+                    ),
                 );
                 if info.supports_reasoning_effort {
                     map.insert(
@@ -12373,6 +12405,65 @@ reasoning_effort = "low"
         assert_eq!(meta["ready"], true);
         assert!(meta.get("readinessReason").is_none());
         assert_eq!(meta["providerHint"], "local");
+    }
+
+    /// Codex P2 3788538943: ACP meta must carry the sampler-enforced
+    /// secret-free route so `/doctor` does not invent External.
+    #[test]
+    #[serial]
+    fn acp_model_meta_emits_secret_free_origin_source_and_trust() {
+        let mut models = IndexMap::new();
+        models.insert(
+            "local".to_string(),
+            test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None),
+        );
+        models.insert(
+            "openai".to_string(),
+            test_model_entry(
+                "openai",
+                "https://api.openai.com/v1",
+                Some("sk-test-not-a-real-key"),
+                None,
+                None,
+            ),
+        );
+        models.insert(
+            "proxy".to_string(),
+            test_model_entry(
+                "proxy",
+                crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+                Some("proxy-key"),
+                None,
+                None,
+            ),
+        );
+        let acp_models = to_acp_model_info(&models);
+        let local = acp_models
+            .get(&acp::ModelId::new(Arc::from("local")))
+            .and_then(|m| m.meta.clone())
+            .expect("local meta");
+        assert_eq!(local["sanitizedOrigin"], "http://127.0.0.1:11434/v1");
+        assert_eq!(local["endpointTrust"], "local");
+        assert_eq!(local["credentialSource"], "missing");
+
+        let openai = acp_models
+            .get(&acp::ModelId::new(Arc::from("openai")))
+            .and_then(|m| m.meta.clone())
+            .expect("openai meta");
+        assert_eq!(openai["sanitizedOrigin"], "https://api.openai.com/v1");
+        assert_eq!(openai["endpointTrust"], "external");
+        assert_eq!(openai["credentialSource"], "model_api_key");
+        let rendered = format!("{openai:?}");
+        assert!(
+            !rendered.contains("sk-test-not-a-real-key"),
+            "ACP meta Debug must stay secret-free: {rendered}"
+        );
+
+        let proxy = acp_models
+            .get(&acp::ModelId::new(Arc::from("proxy")))
+            .and_then(|m| m.meta.clone())
+            .expect("proxy meta");
+        assert_eq!(proxy["endpointTrust"], "first_party_xai");
     }
     #[test]
     fn acp_model_meta_invalid_auth_scheme_is_not_ready() {

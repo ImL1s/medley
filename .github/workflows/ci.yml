@@ -1752,6 +1752,12 @@ jobs:
           run_nonzero -p xai-grok-pager --lib \
             issue15_provider_facts_from_model_state_mark_unready_without_secrets -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
+            issue15_provider_facts_from_model_state_does_not_fabricate_external_trust -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue17_run_commits_focused_catalog_id_when_display_names_collide -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            resolve_by_name_or_id_prefers_catalog_id_when_display_names_collide -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
             model_auto_switched_uncatalogued_target_is_unavailable_resident -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             issue49 -- --nocapture

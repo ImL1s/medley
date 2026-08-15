@@ -901,3 +901,68 @@ fn issue15_provider_facts_from_model_state_mark_unready_without_secrets() {
     );
     assert!(!format!("{rows:?}").contains(ISSUE15_SECRET));
 }
+
+#[test]
+fn issue15_provider_facts_from_model_state_does_not_fabricate_external_trust() {
+    use crate::acp::model_state::ModelState;
+    use crate::diagnostics::ProviderEndpointTrust;
+    use agent_client_protocol as acp;
+    use std::sync::Arc;
+
+    let mut models = ModelState::default();
+    let missing = acp::ModelId::new(Arc::from("missing-trust"));
+    models.available.insert(
+        missing.clone(),
+        acp::ModelInfo::new(missing, "Missing Trust".to_string()).meta(Some(
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("authScheme".into(), serde_json::json!("bearer")),
+            ]),
+        )),
+    );
+    let first = acp::ModelId::new(Arc::from("first-party"));
+    models.available.insert(
+        first.clone(),
+        acp::ModelInfo::new(first, "First Party".to_string()).meta(Some(
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("endpointTrust".into(), serde_json::json!("first_party_xai")),
+                (
+                    "sanitizedOrigin".into(),
+                    serde_json::json!("https://cli-chat-proxy.grok.com/v1"),
+                ),
+            ]),
+        )),
+    );
+    let local = acp::ModelId::new(Arc::from("local-ollama"));
+    models.available.insert(
+        local.clone(),
+        acp::ModelInfo::new(local, "Local".to_string()).meta(Some(serde_json::Map::from_iter([
+            ("ready".into(), serde_json::json!(true)),
+            ("endpointTrust".into(), serde_json::json!("local")),
+            (
+                "sanitizedOrigin".into(),
+                serde_json::json!("http://127.0.0.1:11434/v1"),
+            ),
+        ]))),
+    );
+
+    let rows = crate::diagnostics::provider_facts_from_model_state(&models);
+    let by_id = |id: &str| {
+        rows.iter()
+            .find(|row| row.catalog_id == id)
+            .unwrap_or_else(|| panic!("missing row {id}"))
+    };
+    assert_eq!(
+        by_id("missing-trust").endpoint_trust,
+        ProviderEndpointTrust::Unknown
+    );
+    assert_eq!(
+        by_id("first-party").endpoint_trust,
+        ProviderEndpointTrust::FirstPartyXai
+    );
+    assert_eq!(
+        by_id("local-ollama").endpoint_trust,
+        ProviderEndpointTrust::Local
+    );
+}

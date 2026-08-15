@@ -308,16 +308,22 @@ impl ModelState {
             })
     }
 
-    /// Resolve a user-supplied name to a `ModelId` via case-insensitive
-    /// ASCII match against the catalog.
+    /// Resolve a user-supplied name or catalog id to a `ModelId`.
+    ///
+    /// Match id first so a colliding display name cannot steal a picker
+    /// commit that already inserted the focused `ModelId`. Typed `/model`
+    /// still falls through to a case-insensitive display-name match.
     pub fn resolve_by_name_or_id(&self, query: &str) -> Option<acp::ModelId> {
-        self.available.iter().find_map(|(id, info)| {
-            if info.name.eq_ignore_ascii_case(query) || id.0.as_ref().eq_ignore_ascii_case(query) {
-                Some(id.clone())
-            } else {
-                None
-            }
-        })
+        if let Some((id, _)) = self
+            .available
+            .iter()
+            .find(|(id, _)| id.0.as_ref().eq_ignore_ascii_case(query))
+        {
+            return Some(id.clone());
+        }
+        self.available
+            .iter()
+            .find_map(|(id, info)| info.name.eq_ignore_ascii_case(query).then(|| id.clone()))
     }
 
     /// Look up the display name for a `ModelId` in the catalog.
@@ -416,6 +422,23 @@ mod tests {
         assert!(state.is_empty());
         assert!(state.current_model_name().is_none());
         assert!(state.next_model().is_none());
+    }
+
+    #[test]
+    fn resolve_by_name_or_id_prefers_catalog_id_when_display_names_collide() {
+        let mut state = ModelState::default();
+        let id_a = acp::ModelId::new(Arc::from("catalog-a"));
+        let id_b = acp::ModelId::new(Arc::from("catalog-b"));
+        state.available.insert(
+            id_a.clone(),
+            acp::ModelInfo::new(id_a.clone(), "Shared".to_string()),
+        );
+        state.available.insert(
+            id_b.clone(),
+            acp::ModelInfo::new(id_b.clone(), "Shared".to_string()),
+        );
+        assert_eq!(state.resolve_by_name_or_id("catalog-b"), Some(id_b));
+        assert_eq!(state.resolve_by_name_or_id("Shared"), Some(id_a));
     }
 
     fn model_with_effort(id: &str, name: &str, effort: &str) -> acp::ModelInfo {

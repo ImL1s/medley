@@ -555,12 +555,12 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|i| i.display.starts_with("Grok 4.5") && i.insert_text == "Grok 4.5")
+                .any(|i| i.display.starts_with("Grok 4.5") && i.insert_text == "grok-4.5")
         );
         assert!(
             items
                 .iter()
-                .any(|i| i.display == "Grok 4.3" && i.insert_text == "Grok 4.3")
+                .any(|i| i.display == "Grok 4.3" && i.insert_text == "grok-4.3")
         );
     }
     #[test]

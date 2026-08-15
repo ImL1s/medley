@@ -132,6 +132,8 @@ pub enum ProviderEndpointTrust {
     External,
     Local,
     UserDeclared,
+    /// ACP meta omitted or used an unrecognized class. Do not invent External.
+    Unknown,
 }
 
 impl ProviderEndpointTrust {
@@ -141,6 +143,7 @@ impl ProviderEndpointTrust {
             Self::External => "external",
             Self::Local => "local",
             Self::UserDeclared => "user_declared",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -215,7 +218,8 @@ pub fn provider_facts_from_model_state(
                     Some("first_party_xai") => ProviderEndpointTrust::FirstPartyXai,
                     Some("local") => ProviderEndpointTrust::Local,
                     Some("user_declared") => ProviderEndpointTrust::UserDeclared,
-                    _ => ProviderEndpointTrust::External,
+                    Some("external") => ProviderEndpointTrust::External,
+                    _ => ProviderEndpointTrust::Unknown,
                 },
                 ready,
                 unready_reason: if ready {

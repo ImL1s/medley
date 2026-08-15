@@ -257,23 +257,28 @@ fn split_trailing_token(args: &str) -> Option<(&str, &str)> {
 }
 
 /// Returns the matched model id when `args_query` is `"<reasoning-model> ..."`.
-/// Longest-name-first to disambiguate names that share a prefix.
+/// Prefer catalog-id prefixes (picker `insert_text`), then display names.
+/// Longest prefix first so `"Grok 4.5 "` is not stolen by `"Grok "`.
 fn detect_effort_phase(models: &ModelState, args_query: &str) -> Option<acp::ModelId> {
-    let mut candidates: Vec<(&acp::ModelId, &str)> = models
-        .available
-        .iter()
-        .filter(|(_, info)| supports_reasoning_effort(info))
-        .map(|(id, info)| (id, info.name.as_str()))
-        .collect();
-    candidates.sort_by_key(|(_, name)| std::cmp::Reverse(name.len()));
+    let mut candidates: Vec<(acp::ModelId, String)> = Vec::new();
+    for (id, info) in &models.available {
+        if !supports_reasoning_effort(info) {
+            continue;
+        }
+        candidates.push((id.clone(), id.0.to_string()));
+        if !info.name.eq_ignore_ascii_case(id.0.as_ref()) {
+            candidates.push((id.clone(), info.name.clone()));
+        }
+    }
+    candidates.sort_by_key(|(_, prefix)| std::cmp::Reverse(prefix.len()));
 
-    for (id, name) in candidates {
-        if args_query.len() > name.len()
-            && args_query.is_char_boundary(name.len())
-            && args_query[..name.len()].eq_ignore_ascii_case(name)
-            && args_query[name.len()..].starts_with(char::is_whitespace)
+    for (id, prefix) in candidates {
+        if args_query.len() > prefix.len()
+            && args_query.is_char_boundary(prefix.len())
+            && args_query[..prefix.len()].eq_ignore_ascii_case(&prefix)
+            && args_query[prefix.len()..].starts_with(char::is_whitespace)
         {
-            return Some(id.clone());
+            return Some(id);
         }
     }
     None
@@ -347,7 +352,8 @@ fn capability_tokens_from_meta(
 
 /// Search index for a `/model` row: display name plus identity and capability tokens.
 ///
-/// `insert_text` stays the display name so committing a row is unchanged.
+/// `insert_text` is the catalog `ModelId` so Enter commits the focused row
+/// even when two entries share a display name.
 fn model_item_match_text(id: &acp::ModelId, info: &acp::ModelInfo, provider_hint: &str) -> String {
     let mut tokens = Vec::new();
     push_unique_search_token(&mut tokens, &info.name);
@@ -387,10 +393,12 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
         // expected" to the prompt widget so Enter advances to effort
         // phase instead of submitting. Unready models stay non-chaining
         // so selection is hard-blocked instead of advancing to effort.
+        // Insert the catalog id, not the display name: colliding labels
+        // would otherwise commit the first name match (Codex P2 3788538942).
         let insert_text = if supports && readiness.ready {
-            format!("{} ", info.name)
+            format!("{} ", id.0)
         } else {
-            info.name.clone()
+            id.0.to_string()
         };
 
         let hint = if readiness.provider_hint.is_empty() {
@@ -447,20 +455,19 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
 }
 
 /// One row per effort level for the `/model` chained effort phase.
-/// `insert_text` is `"ModelName high"` so selecting a row completes both tokens.
+/// `insert_text` is `"<catalog-id> high"` so selecting a row completes both tokens.
 fn build_effort_items(models: &ModelState, model_id: &acp::ModelId) -> Vec<ArgItem> {
-    let info = match models.available.get(model_id) {
-        Some(info) => info,
-        None => return Vec::new(),
-    };
-    let model_name = info.name.clone();
+    if !models.available.contains_key(model_id) {
+        return Vec::new();
+    }
+    let catalog_id = model_id.0.to_string();
     let is_current_model = models.current.as_ref() == Some(model_id);
     let options = models.reasoning_effort_options_for(model_id);
     build_effort_arg_items(
         &options,
         models.reasoning_effort,
         is_current_model,
-        |option| format!("{model_name} {}", option.id),
+        |option| format!("{catalog_id} {}", option.id),
     )
 }
 
@@ -554,11 +561,13 @@ mod tests {
         // signal the prompt widget reads to keep the dropdown open after
         // Enter so the effort sub-menu can render.
         let reasoning = row_named(&items, "Reasoning X");
-        assert_eq!(reasoning.insert_text, "Reasoning X ");
+        assert_eq!(reasoning.insert_text, "reasoning-x ");
+        assert_eq!(reasoning.identity, "reasoning-x");
 
         // Plain model has no trailing space -- Enter commits immediately.
         let plain = row_named(&items, "Grok 4.5");
-        assert_eq!(plain.insert_text, "Grok 4.5");
+        assert_eq!(plain.insert_text, "grok-4.5");
+        assert_eq!(plain.identity, "grok-4.5");
     }
 
     #[test]
@@ -581,11 +590,11 @@ mod tests {
         // ordered xhigh -> minimal (strongest first) per EFFORT_LEVELS.
         let items = cmd.suggest_args(&ctx, "Reasoning X ").unwrap();
         assert_eq!(items.len(), 5);
-        assert_eq!(items[0].insert_text, "Reasoning X xhigh");
-        assert_eq!(items[1].insert_text, "Reasoning X high");
-        assert_eq!(items[2].insert_text, "Reasoning X medium");
-        assert_eq!(items[3].insert_text, "Reasoning X low");
-        assert_eq!(items[4].insert_text, "Reasoning X minimal");
+        assert_eq!(items[0].insert_text, "reasoning-x xhigh");
+        assert_eq!(items[1].insert_text, "reasoning-x high");
+        assert_eq!(items[2].insert_text, "reasoning-x medium");
+        assert_eq!(items[3].insert_text, "reasoning-x low");
+        assert_eq!(items[4].insert_text, "reasoning-x minimal");
         // Display is just the level so the user sees a clean column.
         assert_eq!(items[0].display, "xhigh");
         // match_text carries the sort-key prefix that forces the matcher's
@@ -635,7 +644,7 @@ mod tests {
         // No trailing space, user is still typing the model name.
         let items = cmd.suggest_args(&ctx, "Reason").unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].insert_text, "Reasoning X ");
+        assert_eq!(items[0].insert_text, "reasoning-x ");
     }
 
     #[test]
@@ -782,7 +791,11 @@ mod tests {
     fn row_named<'a>(items: &'a [ArgItem], name: &str) -> &'a ArgItem {
         items
             .iter()
-            .find(|item| item.insert_text.trim_end() == name)
+            .find(|item| {
+                item.display == name
+                    || item.display == format!("{name} (current)")
+                    || item.identity == name
+            })
             .unwrap_or_else(|| panic!("expected model row {name}"))
     }
 
@@ -858,7 +871,7 @@ mod tests {
     /// #17 first slice: picker search matches catalog id / wire slug /
     /// provider hint / capability tokens, not display name only. Two rows
     /// share a name so a name query cannot disambiguate; identity queries
-    /// leave only the matching id selectable. `insert_text` stays the name.
+    /// leave only the matching id selectable. `insert_text` is the catalog id.
     #[test]
     fn build_model_items_match_issue17_duplicate_display_name() {
         let mut state = ModelState::default();
@@ -901,11 +914,11 @@ mod tests {
 
         let items = build_model_items(&state);
         assert_eq!(items.len(), 2);
-        assert!(
-            items
-                .iter()
-                .all(|item| item.insert_text == display && !item.non_selectable)
-        );
+        assert!(items.iter().all(|item| {
+            !item.non_selectable
+                && (item.insert_text == "issue17-catalog-a"
+                    || item.insert_text == "issue17-catalog-b")
+        }));
 
         let by_name = selectable_by_match(&items, display);
         assert_eq!(by_name.len(), 2, "shared display name still matches both");
@@ -914,12 +927,12 @@ mod tests {
         assert_eq!(by_id.len(), 1, "catalog id must isolate one row");
         assert!(by_id[0].match_text.contains("issue17-catalog-a"));
         assert!(!by_id[0].match_text.contains("issue17-catalog-b"));
-        assert_eq!(by_id[0].insert_text, display);
+        assert_eq!(by_id[0].insert_text, "issue17-catalog-a");
 
         let by_provider = selectable_by_match(&items, "issue17-provider-b");
         assert_eq!(by_provider.len(), 1, "provider hint must isolate one row");
         assert!(by_provider[0].match_text.contains("issue17-catalog-b"));
-        assert_eq!(by_provider[0].insert_text, display);
+        assert_eq!(by_provider[0].insert_text, "issue17-catalog-b");
 
         let by_slug = selectable_by_match(&items, "issue17-wire-a");
         assert_eq!(by_slug.len(), 1);
@@ -932,6 +945,50 @@ mod tests {
         let by_cap_b = selectable_by_match(&items, "issue17-search");
         assert_eq!(by_cap_b.len(), 1);
         assert!(by_cap_b[0].match_text.contains("issue17-catalog-b"));
+    }
+
+    /// Codex P2 3788538942: picker Enter inserts the focused catalog id, so
+    /// two rows that share a display name cannot collapse to the first match.
+    #[test]
+    fn issue17_run_commits_focused_catalog_id_when_display_names_collide() {
+        let mut state = ModelState::default();
+        let display = "Shared Twin";
+        let (id_a, info_a) = model_with_meta(
+            "issue17-catalog-a",
+            display,
+            serde_json::Map::from_iter([("ready".into(), serde_json::json!(true))]),
+        );
+        let (id_b, info_b) = model_with_meta(
+            "issue17-catalog-b",
+            display,
+            serde_json::Map::from_iter([("ready".into(), serde_json::json!(true))]),
+        );
+        state.available.insert(id_a.clone(), info_a);
+        state.available.insert(id_b.clone(), info_b);
+
+        let focused = build_model_items(&state)
+            .into_iter()
+            .find(|item| item.identity == "issue17-catalog-b")
+            .expect("sibling B");
+        assert_eq!(focused.insert_text, "issue17-catalog-b");
+
+        let mut ctx = dummy_exec_ctx(&state);
+        match ModelCommand.run(&mut ctx, focused.insert_text.trim()) {
+            CommandResult::Action(Action::SetDefaultModel(resolved)) => {
+                assert_eq!(resolved, id_b);
+                assert_ne!(resolved, id_a);
+            }
+            other => panic!("expected SetDefaultModel(issue17-catalog-b), got {other:?}"),
+        }
+
+        // Typed display name still resolves, but must not be the picker path.
+        let mut ctx = dummy_exec_ctx(&state);
+        match ModelCommand.run(&mut ctx, display) {
+            CommandResult::Action(Action::SetDefaultModel(resolved)) => {
+                assert_eq!(resolved, id_a);
+            }
+            other => panic!("expected first-name match for typed display, got {other:?}"),
+        }
     }
 
     /// Catalog refresh remaps an open `/model` picker by ModelId, not display
@@ -962,7 +1019,7 @@ mod tests {
             .iter()
             .find(|item| item.identity == "issue-remap-b")
             .expect("sibling B");
-        assert_eq!(focused.insert_text, "Shared Name");
+        assert_eq!(focused.insert_text, "issue-remap-b");
 
         // Display names both change; identities stay.
         let mut renamed = ModelState::default();
@@ -987,7 +1044,7 @@ mod tests {
         let after = build_model_items(&renamed);
         let idx = ArgItem::remap_selection(&after, Some(focused.identity.as_str()));
         assert_eq!(after[idx].identity, "issue-remap-b");
-        assert_eq!(after[idx].insert_text, "Renamed Shared");
+        assert_eq!(after[idx].insert_text, "issue-remap-b");
     }
 
     #[test]
@@ -1055,7 +1112,7 @@ mod tests {
             "match_text must still include the display name/id: {}",
             item.match_text
         );
-        assert_eq!(item.insert_text, "GPT-5.4");
+        assert_eq!(item.insert_text, "gpt-5.4");
     }
 
     /// #306 C-min gate 1 (**component presentation** — not cold-boot/ACP
