@@ -815,6 +815,10 @@ jobs:
           # drift still fails closed, and fresh overrides still preflight.
           run_nonzero -p xai-grok-subagent-resolution --lib \
             resume::tests -- --nocapture
+          run_nonzero -p xai-grok-subagent-resolution --lib \
+            native_route -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            format_agent_detail -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             resume_model_lineage_tests -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
