@@ -169,6 +169,38 @@ pub struct ProviderRouteFact {
     pub unready_reason: Option<String>,
 }
 
+/// Offline provider rows from inspect's secret-free routes (`grok doctor`).
+///
+/// Trust is copied from the sampler class. Do not invent `External` when
+/// the inspect route already classified the origin.
+pub fn provider_facts_from_inspect_routes(
+    routes: &[xai_grok_shell::agent::InspectedModelRoute],
+) -> Vec<ProviderRouteFact> {
+    use xai_grok_shell::agent::{InspectedAuthScheme, InspectedEndpointTrust};
+    routes
+        .iter()
+        .map(|route| ProviderRouteFact {
+            catalog_id: route.catalog_id.clone(),
+            wire_model: route.wire_model.clone(),
+            sanitized_origin: route.sanitized_origin.clone(),
+            auth_scheme: match route.auth_scheme {
+                InspectedAuthScheme::None => ProviderAuthScheme::None,
+                InspectedAuthScheme::Bearer => ProviderAuthScheme::Bearer,
+                InspectedAuthScheme::XApiKey => ProviderAuthScheme::XApiKey,
+            },
+            credential_source: route.credential_source.clone(),
+            endpoint_trust: match route.endpoint_trust {
+                InspectedEndpointTrust::FirstPartyXai => ProviderEndpointTrust::FirstPartyXai,
+                InspectedEndpointTrust::External => ProviderEndpointTrust::External,
+                InspectedEndpointTrust::Local => ProviderEndpointTrust::Local,
+                InspectedEndpointTrust::UserDeclared => ProviderEndpointTrust::UserDeclared,
+            },
+            ready: route.ready,
+            unready_reason: route.unready_reason.clone(),
+        })
+        .collect()
+}
+
 /// Offline provider rows from the pager's live `ModelState` (TUI `/doctor`).
 ///
 /// Origins and credential bytes are not on ACP `ModelInfo`; those stay

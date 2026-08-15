@@ -1266,6 +1266,8 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             copy_session_data_with_model_override -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            issue345_fork_rewrites_parent_compaction_transcript_hint -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             fork_and_import_reject_symlinked_encoded_cwd_parent -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             init_session_rejects_symlinked_encoded_cwd_occupant_without_summary -- --nocapture
@@ -1736,6 +1738,8 @@ jobs:
           run_nonzero -p xai-grok-pager --lib \
             issue244_typed_provider_failure -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
+            issue244_headless_typed_provider_failure_omits_acp_internal_error_envelope -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
             issue244_retry_failed_non_retryable_4xx_is_not_labelled_retry_failed -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             codex_catalog_upgrade_migration_is_visible_in_model_picker -- --nocapture
@@ -1753,6 +1757,12 @@ jobs:
             issue15_provider_facts_from_model_state_mark_unready_without_secrets -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             issue15_provider_facts_from_model_state_does_not_fabricate_external_trust -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue15_standalone_doctor_collects_provider_rows_from_inspect_routes -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue15_inspect_model_routes_from_toml_covers_keyless_bearer_and_x_api_key -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue15_inspect_model_routes_from_toml_is_empty_when_config_parse_fails -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             issue17_run_commits_focused_catalog_id_when_display_names_collide -- --nocapture
           run_nonzero -p xai-grok-pager --lib \

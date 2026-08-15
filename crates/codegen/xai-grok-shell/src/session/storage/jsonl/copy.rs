@@ -5,17 +5,24 @@
 //! record when a prompt cut is requested. Chat history stays materialized: its
 //! transforms need random access and the compacted history is bounded by the
 //! context window.
+//!
+//! Inherited compaction summaries embed an absolute `session_dir/compaction`
+//! pointer (`SessionActor::transcript_hint`). After the archive is copied,
+//! that prefix is rewritten to the child's dir so deleting the parent cannot
+//! break the child's history.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::Arc;
 
 use agent_client_protocol as acp;
 
 use crate::sampling::{
-    ConversationItem, conversation_truncate_for_prompt, fork_filter_chat,
+    ContentPart, ConversationItem, conversation_truncate_for_prompt, fork_filter_chat,
     transform_conversation_cwd,
 };
 use crate::session::info::Info;
@@ -127,6 +134,121 @@ fn for_each_jsonl_line_capped<R: BufRead>(
     result
 }
 
+/// Parent `session_dir/compaction` as `SessionActor::transcript_hint` writes
+/// it (`Path::to_string_lossy` of `session_dir.join(COMPACTION_DIR)`). Only
+/// this prefix is rewritten so workspace cwd text stays put.
+struct CompactionHintRewrite {
+    from: String,
+    to: String,
+}
+
+impl CompactionHintRewrite {
+    fn between(source_session_dir: &Path, target_session_dir: &Path) -> Option<Self> {
+        let from = source_session_dir
+            .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+            .to_string_lossy()
+            .into_owned();
+        let to = target_session_dir
+            .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+            .to_string_lossy()
+            .into_owned();
+        if from.is_empty() || from == to {
+            None
+        } else {
+            Some(Self { from, to })
+        }
+    }
+
+    fn apply<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if !text.contains(&self.from) {
+            return Cow::Borrowed(text);
+        }
+        Cow::Owned(replace_compaction_dir_prefix(text, &self.from, &self.to))
+    }
+}
+
+/// Replace `from` only at a path-component boundary so a sibling such as
+/// `.../compaction_checkpoints` is not rewritten as a prefix of `.../compaction`.
+fn replace_compaction_dir_prefix(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find(from) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + from.len()..];
+        let continues_component = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+        if continues_component {
+            out.push_str(from);
+        } else {
+            out.push_str(to);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn rewrite_arc_str(text: &mut Arc<str>, rewrite: &CompactionHintRewrite) {
+    if let Cow::Owned(replaced) = rewrite.apply(text) {
+        *text = Arc::<str>::from(replaced);
+    }
+}
+
+fn rewrite_string(text: &mut String, rewrite: &CompactionHintRewrite) {
+    if let Cow::Owned(replaced) = rewrite.apply(text) {
+        *text = replaced;
+    }
+}
+
+fn rewrite_conversation_compaction_hint(
+    items: &mut [ConversationItem],
+    rewrite: &CompactionHintRewrite,
+) {
+    for item in items.iter_mut() {
+        match item {
+            ConversationItem::System(s) => rewrite_arc_str(&mut s.content, rewrite),
+            ConversationItem::User(u) => {
+                for part in u.content.iter_mut() {
+                    if let ContentPart::Text { text } = part {
+                        rewrite_arc_str(text, rewrite);
+                    }
+                }
+            }
+            ConversationItem::Assistant(a) => {
+                rewrite_arc_str(&mut a.content, rewrite);
+                for tc in &mut a.tool_calls {
+                    rewrite_arc_str(&mut tc.arguments, rewrite);
+                }
+            }
+            ConversationItem::ToolResult(t) => rewrite_arc_str(&mut t.content, rewrite),
+            ConversationItem::BackendToolCall(_) => {}
+            ConversationItem::Reasoning(r) => {
+                for sp in r.summary.iter_mut() {
+                    match sp {
+                        crate::sampling::rs::SummaryPart::SummaryText(t) => {
+                            rewrite_string(&mut t.text, rewrite);
+                        }
+                    }
+                }
+                if let Some(ref mut content) = r.content {
+                    for c in content.iter_mut() {
+                        rewrite_string(&mut c.text, rewrite);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_summary_compaction_hint(summary: &mut Summary, rewrite: &CompactionHintRewrite) {
+    rewrite_string(&mut summary.session_summary, rewrite);
+    if let Some(ref mut last) = summary.last_turn_summary {
+        rewrite_string(last, rewrite);
+    }
+}
+
 /// Indexes (in non-empty-line order) of the source lines that survive rewind
 /// filtering and the `target_prompt_index` cut, holding one classification per
 /// line instead of the lines. As in replay, an unparseable line classifies as
@@ -158,6 +280,7 @@ struct UpdateLineWriter<'a> {
     writer: BufWriter<std::fs::File>,
     source: &'a Path,
     target_session_id: &'a acp::SessionId,
+    hint_rewrite: Option<&'a CompactionHintRewrite>,
     copied: CopiedUpdates,
     skipped_lines: usize,
 }
@@ -167,23 +290,35 @@ impl<'a> UpdateLineWriter<'a> {
         target: &Path,
         source: &'a Path,
         target_session_id: &'a acp::SessionId,
+        hint_rewrite: Option<&'a CompactionHintRewrite>,
     ) -> io::Result<Self> {
         Ok(Self {
             writer: BufWriter::new(std::fs::File::create(target)?),
             source,
             target_session_id,
+            hint_rewrite,
             copied: CopiedUpdates::default(),
             skipped_lines: 0,
         })
     }
 
     fn copy_line(&mut self, line: &[u8]) -> io::Result<()> {
-        let update = match std::str::from_utf8(line).map(SessionUpdateEnvelope::from_str) {
-            Ok(Ok(update)) => update,
-            Ok(Err(error)) => {
+        let utf8 = match std::str::from_utf8(line) {
+            Ok(s) => s,
+            Err(error) => {
                 self.skip_torn_line(&error);
                 return Ok(());
             }
+        };
+        let rewritten;
+        let utf8 = if let Some(rewrite) = self.hint_rewrite {
+            rewritten = rewrite.apply(utf8);
+            rewritten.as_ref()
+        } else {
+            utf8
+        };
+        let update = match SessionUpdateEnvelope::from_str(utf8) {
+            Ok(update) => update,
             Err(error) => {
                 self.skip_torn_line(&error);
                 return Ok(());
@@ -246,8 +381,9 @@ fn copy_updates_streaming(
     target: &Path,
     target_session_id: &acp::SessionId,
     target_prompt_index: Option<usize>,
+    hint_rewrite: Option<&CompactionHintRewrite>,
 ) -> io::Result<CopiedUpdates> {
-    let mut writer = UpdateLineWriter::try_new(target, source, target_session_id)?;
+    let mut writer = UpdateLineWriter::try_new(target, source, target_session_id, hint_rewrite)?;
     let mut file = match std::fs::File::open(source) {
         Ok(file) => file,
         // A missing source is an empty transcript; still write the target.
@@ -290,6 +426,8 @@ impl JsonlStorageAdapter {
         options: CopySessionOptions,
     ) -> io::Result<CopySessionResult> {
         let target_dir = self.session_dir(target_info);
+        let hint_rewrite =
+            CompactionHintRewrite::between(&self.session_dir(source_info), &target_dir);
         let publication_parent = if let Some(root) = self.lock_root() {
             let source_id = source_info.id.to_string();
             let target_id = target_info.id.to_string();
@@ -364,6 +502,12 @@ impl JsonlStorageAdapter {
             chat_to_copy = xai_chat_state::compaction_utils::strip_reasoning_blocks(chat_to_copy);
         }
 
+        // Independent of skip_cwd_transform: the hint is a session-store path,
+        // not workspace cwd. Worktree forks still skip the cwd rewrite.
+        if let Some(rewrite) = &hint_rewrite {
+            rewrite_conversation_compaction_hint(&mut chat_to_copy, rewrite);
+        }
+
         let num_chat_messages = chat_to_copy.len();
         let cwd_switch_bookkeeping_generation = chat_to_copy
             .iter()
@@ -393,12 +537,13 @@ impl JsonlStorageAdapter {
                 &self.updates_file(target_info),
                 &target_info.id,
                 options.target_prompt_index,
+                hint_rewrite.as_ref(),
             )?
         };
         let checkpoint_files = copied_updates.checkpoint_files;
         let num_messages = copied_updates.count;
 
-        let target_summary = fork_summary(
+        let mut target_summary = fork_summary(
             source_summary,
             target_info,
             &options,
@@ -409,6 +554,9 @@ impl JsonlStorageAdapter {
                 inherited_prefix_len,
             },
         );
+        if let Some(rewrite) = &hint_rewrite {
+            rewrite_summary_compaction_hint(&mut target_summary, rewrite);
+        }
         let summary_bytes = serde_json::to_vec_pretty(&target_summary).map_err(invalid_data)?;
         if let Some((_, parent)) = &publication_parent {
             parent.revalidate()?;

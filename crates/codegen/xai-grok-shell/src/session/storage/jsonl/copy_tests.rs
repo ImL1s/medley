@@ -408,6 +408,141 @@ async fn copy_session_data_copies_compaction_segments_when_enabled() {
     );
 }
 
+/// Inherited `transcript_hint` text names the parent `session_dir/compaction`.
+/// After a production-style fork copy the child must point at its own copied
+/// archive so deleting the parent cannot break history (issue #345).
+#[tokio::test]
+async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
+    use crate::extensions::notification::CompactionSegmentFile;
+    use xai_chat_state::{CompactionDetail, CompactionMode};
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let sid = "issue345-parent";
+    let source_info = Info {
+        id: acp::SessionId::new(sid),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+
+    adapter
+        .write_compaction_segment(
+            &source_info,
+            &CompactionSegmentFile {
+                items: vec![ConversationItem::user("pre-compact turn")],
+                summary: "segment for issue345".to_string(),
+                detail: CompactionDetail::Verbose,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let parent_compaction = adapter
+        .session_dir(&source_info)
+        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+    let parent_loc = parent_compaction.to_string_lossy().into_owned();
+    let hint = CompactionMode::Segments(CompactionDetail::Verbose)
+        .transcript_hint(Some(parent_loc.as_str()))
+        .expect("segments hint needs a location");
+    // Workspace path that cwd transform would rewrite; hint rewrite must not.
+    let decoy_cwd_path = "/source/workspace/src/main.rs";
+    let inherited = format!("Compacted history still needs {decoy_cwd_path}.{hint}");
+    adapter
+        .append_chat_message(&source_info, &ConversationItem::user_meta(inherited))
+        .await
+        .unwrap();
+    adapter
+        .append_update(&source_info, &fork_agent_chunk(sid, &hint))
+        .await
+        .unwrap();
+
+    let mut source_summary = adapter.read_summary_sync(&source_info).unwrap();
+    source_summary.last_turn_summary = Some(hint.clone());
+    adapter
+        .write_summary_sync(&source_info, &source_summary)
+        .unwrap();
+
+    let target_info = Info {
+        id: acp::SessionId::new("issue345-child"),
+        cwd: "/target/workspace".to_string(),
+    };
+    // Same options the production fork path uses, plus skip_cwd_transform so
+    // a worktree-style copy still rewrites only the compaction hint.
+    adapter
+        .copy_session_data_sync(
+            &source_info,
+            &target_info,
+            CopySessionOptions {
+                parent_session_id: Some(sid.to_string()),
+                copy_compaction_segments: true,
+                skip_cwd_transform: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let child_compaction = adapter
+        .session_dir(&target_info)
+        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+    let child_loc = child_compaction.to_string_lossy().into_owned();
+    assert_ne!(parent_loc, child_loc, "fork must land in a new session dir");
+
+    let loaded = adapter.load_session(&target_info).await.unwrap();
+    let chat_blob: String = loaded
+        .chat_history
+        .iter()
+        .map(ConversationItem::text_content)
+        .collect();
+    assert!(
+        chat_blob.contains(&child_loc),
+        "child chat must name the child compaction dir, got {chat_blob}"
+    );
+    assert!(
+        !chat_blob.contains(&parent_loc),
+        "child chat must not keep the parent compaction dir, got {chat_blob}"
+    );
+    assert!(
+        chat_blob.contains(decoy_cwd_path),
+        "hint rewrite must not touch workspace cwd text, got {chat_blob}"
+    );
+
+    let last = loaded
+        .summary
+        .last_turn_summary
+        .as_deref()
+        .expect("copied last_turn_summary");
+    assert!(
+        last.contains(&child_loc),
+        "copied summary must name the child compaction dir, got {last}"
+    );
+    assert!(
+        !last.contains(&parent_loc),
+        "copied summary must not keep the parent compaction dir, got {last}"
+    );
+
+    let updates_blob = std::fs::read_to_string(adapter.updates_file(&target_info)).unwrap();
+    assert!(
+        updates_blob.contains(&child_loc),
+        "copied updates must name the child compaction dir"
+    );
+    assert!(
+        !updates_blob.contains(&parent_loc),
+        "copied updates must not keep the parent compaction dir"
+    );
+
+    std::fs::remove_dir_all(adapter.session_dir(&source_info)).unwrap();
+    let copied_segment = std::fs::read_to_string(child_compaction.join("segment_000.md")).unwrap();
+    assert!(
+        copied_segment.contains("# HISTORICAL -- DO NOT EDIT"),
+        "child compaction files must stay readable after the parent is deleted"
+    );
+    assert!(child_compaction.join("INDEX.md").is_file());
+}
+
 /// A `compaction_checkpoint` record pointing at `compaction_checkpoints/{id}.json`.
 fn checkpoint_record(id: &str) -> SessionUpdate {
     checkpoint_record_with_path(id, &format!("compaction_checkpoints/{id}.json"))

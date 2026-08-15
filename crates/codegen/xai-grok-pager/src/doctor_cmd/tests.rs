@@ -1107,3 +1107,126 @@ fn issue15_doctor_json_providers_rows_are_secret_free() {
         );
     }
 }
+
+const ISSUE15_CLI_SECRET: &str = "sk-test-issue15-secret-0123456789";
+
+fn issue15_cli_fixture_toml() -> String {
+    format!(
+        r#"
+[model.ollama-codellama]
+model = "codellama"
+base_url = "http://localhost:11434/v1"
+name = "CodeLlama (Ollama)"
+auth_scheme = "none"
+context_window = 16384
+
+[model.gpt-4o]
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+name = "GPT-4o"
+env_key = "OPENAI_API_KEY"
+
+[model.claude-opus]
+model = "claude-opus-4-6"
+base_url = "https://api.anthropic.com/v1"
+name = "Claude Opus 4.6"
+api_backend = "messages"
+auth_scheme = "x_api_key"
+env_key = "ANTHROPIC_API_KEY"
+extra_headers = {{ "anthropic-version" = "2023-06-01" }}
+context_window = 200000
+
+[model.hostile-gateway]
+model = "wire-model"
+base_url = "https://user:{ISSUE15_CLI_SECRET}@api.example.com:8443/v1/x?api_key={ISSUE15_CLI_SECRET}#frag"
+api_key = "{ISSUE15_CLI_SECRET}"
+"#
+    )
+}
+
+#[test]
+#[serial_test::serial]
+fn issue15_standalone_doctor_collects_provider_rows_from_inspect_routes() {
+    let _openai = xai_grok_test_support::EnvGuard::set("OPENAI_API_KEY", ISSUE15_CLI_SECRET);
+    let _anthropic = xai_grok_test_support::EnvGuard::set("ANTHROPIC_API_KEY", ISSUE15_CLI_SECRET);
+    let root: toml::Value =
+        toml::from_str(&issue15_cli_fixture_toml()).expect("issue15 CLI fixture TOML");
+    let routes = xai_grok_shell::agent::inspect_model_routes_from_toml(&root);
+    let providers = crate::diagnostics::provider_facts_from_inspect_routes(&routes);
+    let terminal = local_terminal();
+    let snapshot = crate::diagnostics::probes::collect_standalone_from(
+        &terminal,
+        unavailable_tmux_facts(),
+        crate::diagnostics::probes::WaylandProbeFacts {
+            is_wayland: false,
+            data_control: TmuxProbeResult::Unavailable,
+            wl_copy_available: false,
+        },
+        "pbcopy",
+        LOCAL_ROUTE.clone(),
+        false,
+        HostOs::Macos,
+        DisplayServer::Unknown,
+        false,
+        RuntimeEvidence::Available(ColorLevel::TrueColor),
+    );
+    let report = collect_report_with_providers(snapshot, providers);
+
+    let by_id = |id: &str| {
+        report
+            .facts
+            .providers
+            .iter()
+            .find(|row| row.catalog_id == id)
+            .unwrap_or_else(|| panic!("missing provider row {id}"))
+    };
+
+    let local = by_id("ollama-codellama");
+    assert_eq!(local.auth_scheme, ProviderAuthScheme::None);
+    assert_eq!(local.credential_source, "none");
+    assert_eq!(local.endpoint_trust, ProviderEndpointTrust::Local);
+    assert!(local.ready);
+
+    let openai = by_id("gpt-4o");
+    assert_eq!(openai.auth_scheme, ProviderAuthScheme::Bearer);
+    assert_eq!(openai.credential_source, "env:OPENAI_API_KEY");
+    assert_eq!(openai.endpoint_trust, ProviderEndpointTrust::External);
+
+    let anthropic = by_id("claude-opus");
+    assert_eq!(anthropic.auth_scheme, ProviderAuthScheme::XApiKey);
+    assert_eq!(anthropic.credential_source, "env:ANTHROPIC_API_KEY");
+    assert_eq!(anthropic.endpoint_trust, ProviderEndpointTrust::External);
+
+    let hostile = by_id("hostile-gateway");
+    assert_eq!(
+        hostile.sanitized_origin,
+        "https://api.example.com:8443/v1/x"
+    );
+    assert_eq!(hostile.credential_source, "model_api_key");
+
+    let mut output = Vec::new();
+    write_report(&report, true, &mut output).expect("serialize doctor json");
+    let text = String::from_utf8(output).expect("JSON is UTF-8");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    let json_providers = json["facts"]["providers"].as_array().expect("providers");
+    let schemes: Vec<&str> = json_providers
+        .iter()
+        .filter_map(|row| row["authScheme"].as_str())
+        .collect();
+    assert!(schemes.contains(&"none"), "{schemes:?}");
+    assert!(schemes.contains(&"bearer"), "{schemes:?}");
+    assert!(schemes.contains(&"x-api-key"), "{schemes:?}");
+    assert!(text.contains("OPENAI_API_KEY"));
+    assert!(text.contains("ANTHROPIC_API_KEY"));
+
+    let debug = format!("{report:?}");
+    for rendered in [text.as_str(), debug.as_str()] {
+        for window in ISSUE15_CLI_SECRET.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ascii");
+            assert!(
+                !rendered.contains(window),
+                "standalone doctor leaked secret fragment {window}: {rendered}"
+            );
+        }
+    }
+}

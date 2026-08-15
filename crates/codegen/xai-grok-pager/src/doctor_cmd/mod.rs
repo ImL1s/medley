@@ -81,9 +81,24 @@ fn configured_report_for_terminal(
 fn collect_report_with(
     snapshot: crate::diagnostics::probes::StandaloneDiagnosticSnapshot<'_>,
 ) -> DiagnosticReport {
+    collect_report_with_providers(snapshot, standalone_provider_facts())
+}
+
+fn collect_report_with_providers(
+    snapshot: crate::diagnostics::probes::StandaloneDiagnosticSnapshot<'_>,
+    providers: Vec<crate::diagnostics::ProviderRouteFact>,
+) -> DiagnosticReport {
     let mut report = crate::diagnostics::view(snapshot.into());
     crate::diagnostics::apply_voice_probe(&mut report, true);
+    report.facts.providers = providers;
     report
+}
+
+/// Offline inspect routes → doctor rows. Empty when config cannot be loaded.
+fn standalone_provider_facts() -> Vec<crate::diagnostics::ProviderRouteFact> {
+    crate::diagnostics::provider_facts_from_inspect_routes(
+        &xai_grok_shell::agent::inspect_model_routes_offline(),
+    )
 }
 
 fn write_report(
