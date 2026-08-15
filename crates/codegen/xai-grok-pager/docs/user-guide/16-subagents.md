@@ -53,6 +53,23 @@ The parent receives the child's output -- usually a summary -- when the child fi
 
 ---
 
+## Optional native route contract
+
+Medley can advertise an optional, capability-negotiated native route extension
+for orchestration plugins: exact catalog routes, ordered candidates, and
+secret-free receipts. Original Grok Build does not implement this extension.
+Consumers negotiate versioned capabilities rather than guessing from the
+executable name.
+
+The canonical page is
+[`docs/architecture/native-subagent-route-contract.md`](../../../../../docs/architecture/native-subagent-route-contract.md).
+`/agents` compact rows include a non-color route status; expanded details show
+selection and receipt fields when present. Live spawn still uses existing
+`model: inherit` / exact `model:` strings until a later slice wires the
+resolver into child-session construction.
+
+---
+
 ## Built-in Agent Types
 
 The `spawn_subagent` tool accepts a `subagent_type` parameter that selects the child's role:

@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
 use xai_grok_agent::config::{AgentDefinition, AgentScope, BuiltinAgentName};
 use xai_grok_shell::agent::config::AgentSelectionConfig;
+use xai_grok_subagent_resolution::native_route::{
+    AgentRouteUxSnapshot, format_route_detail, snapshot_from_model_override,
+};
 use xai_grok_tools::implementations::skills::discovery::extract_first_paragraph;
 use xai_grok_tools::registry::types::ToolServerConfig;
 use xai_grok_tools::types::template_renderer::TemplateRenderer;
@@ -773,11 +776,27 @@ pub fn toggle_agent(name: &str, enabled: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to write config.toml: {e}"))?;
     Ok(())
 }
+fn route_snapshot_for_entry(entry: &AgentListEntry) -> AgentRouteUxSnapshot {
+    let floor = entry.definition.capability_mode.map(|mode| mode.as_str());
+    snapshot_from_model_override(
+        &entry.name,
+        &entry.name,
+        entry.scope.label(),
+        entry.enabled,
+        false,
+        false,
+        &entry.definition.model,
+        floor,
+        0,
+    )
+}
+
 /// Format detail lines for an expanded agent entry.
 pub fn format_agent_detail(entry: &AgentListEntry) -> Vec<String> {
     let def = &entry.definition;
     let mut lines = Vec::new();
     lines.push(format!("  Model: {}", def.model));
+    lines.extend(format_route_detail(&route_snapshot_for_entry(entry)));
     let mode_label = match def.prompt_mode {
         xai_grok_agent::config::PromptMode::Extend => "extend",
         xai_grok_agent::config::PromptMode::Full => "full",
@@ -1459,6 +1478,18 @@ fn render_agents_tab(
                     (content_area.x + content_area.width).saturating_sub(x + 1) as usize;
                 if badge_remaining >= badge_text.width() {
                     buf.set_string(x + 1, row_y, &badge_text, badge_style);
+                    x += 1 + badge_text.width() as u16;
+                }
+                let snap = route_snapshot_for_entry(entry);
+                let route_label = format!(" {}", snap.route_status.as_str());
+                let route_remaining =
+                    (content_area.x + content_area.width).saturating_sub(x) as usize;
+                if route_remaining >= route_label.width() {
+                    let mut route_style = Style::default().fg(theme.text_primary);
+                    if let Some(bg_color) = bg {
+                        route_style = route_style.bg(bg_color);
+                    }
+                    buf.set_string(x, row_y, &route_label, route_style);
                 }
             }
             FlatRow::Description(idx, line) => {
@@ -2516,6 +2547,29 @@ pub fn handle_agents_mouse(state: &mut AgentsModalState, mouse: &MouseEvent) -> 
 mod tests {
     use super::*;
     use xai_grok_shell::agent::config::DEFAULT_AGENT_TYPE;
+    #[test]
+    fn format_agent_detail_includes_route_status() {
+        let def = AgentDefinition::explore();
+        let entry = AgentListEntry {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            scope: def.scope,
+            source_path: None,
+            enabled: true,
+            is_builtin: true,
+            expanded: true,
+            definition: def,
+        };
+        let lines = format_agent_detail(&entry);
+        assert!(
+            lines.iter().any(|line| line.contains("Route status:")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Selection:")),
+            "{lines:?}"
+        );
+    }
     #[test]
     fn agents_tab_next_cycles() {
         assert_eq!(AgentsTab::Agents.next(), AgentsTab::Personas);
