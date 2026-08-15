@@ -166,6 +166,71 @@ pub struct ProviderRouteFact {
     pub unready_reason: Option<String>,
 }
 
+/// Offline provider rows from the pager's live `ModelState` (TUI `/doctor`).
+///
+/// Origins and credential bytes are not on ACP `ModelInfo`; those stay
+/// empty / source labels from meta only.
+pub fn provider_facts_from_model_state(
+    models: &crate::acp::model_state::ModelState,
+) -> Vec<ProviderRouteFact> {
+    models
+        .available
+        .iter()
+        .map(|(id, info)| {
+            let meta = info.meta.as_ref();
+            let ready = meta
+                .and_then(|m| m.get("ready"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let auth = meta
+                .and_then(|m| m.get("authScheme"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("bearer");
+            let source = meta
+                .and_then(|m| m.get("credentialSource"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            ProviderRouteFact {
+                catalog_id: id.0.to_string(),
+                wire_model: meta
+                    .and_then(|m| m.get("modelSlug"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(info.name.as_str())
+                    .to_string(),
+                sanitized_origin: meta
+                    .and_then(|m| m.get("sanitizedOrigin"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                auth_scheme: match auth {
+                    "none" => ProviderAuthScheme::None,
+                    "x-api-key" => ProviderAuthScheme::XApiKey,
+                    _ => ProviderAuthScheme::Bearer,
+                },
+                credential_source: source.to_string(),
+                endpoint_trust: match meta
+                    .and_then(|m| m.get("endpointTrust"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some("first_party_xai") => ProviderEndpointTrust::FirstPartyXai,
+                    Some("local") => ProviderEndpointTrust::Local,
+                    Some("user_declared") => ProviderEndpointTrust::UserDeclared,
+                    _ => ProviderEndpointTrust::External,
+                },
+                ready,
+                unready_reason: if ready {
+                    None
+                } else {
+                    meta.and_then(|m| m.get("readinessReason"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                },
+            }
+        })
+        .collect()
+}
+
 /// Result of a passive input-device lookup (does not open a capture stream).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VoiceFacts {

@@ -42,6 +42,7 @@ pub use model::{
     DiagnosticReport, FindingDisposition, KeyboardFact, ManualRemediation, NewlineFact, ProbeNote,
     ProbeStatus, ProviderAuthScheme, ProviderEndpointTrust, ProviderRouteFact, RuntimeFact,
     TmuxColorPassthrough, TmuxFacts, TmuxOptionFact, TmuxSupportFact, VoiceFacts,
+    provider_facts_from_model_state,
 };
 pub use view::{DiagnosticSnapshot, view};
 

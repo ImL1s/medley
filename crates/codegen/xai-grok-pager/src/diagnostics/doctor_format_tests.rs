@@ -862,3 +862,42 @@ fn doctor_providers_empty_omits_the_section() {
     assert!(!output.contains("Providers"));
     assert!(!output.contains("  auth         "));
 }
+
+#[test]
+fn issue15_provider_facts_from_model_state_mark_unready_without_secrets() {
+    use crate::acp::model_state::ModelState;
+    use agent_client_protocol as acp;
+    use std::sync::Arc;
+
+    let mut models = ModelState::default();
+    let id = acp::ModelId::new(Arc::from("codex-sol"));
+    let info = acp::ModelInfo::new(id.clone(), "GPT-5.6 Sol".to_string()).meta(Some(
+        serde_json::Map::from_iter([
+            ("ready".into(), serde_json::json!(false)),
+            (
+                "readinessReason".into(),
+                serde_json::json!("missing OPENAI_API_KEY"),
+            ),
+            ("authScheme".into(), serde_json::json!("bearer")),
+            (
+                "credentialSource".into(),
+                serde_json::json!("env:OPENAI_API_KEY"),
+            ),
+            ("modelSlug".into(), serde_json::json!("gpt-5.6-sol")),
+            (
+                "sanitizedOrigin".into(),
+                serde_json::json!("https://chatgpt.com"),
+            ),
+        ]),
+    ));
+    models.available.insert(id, info);
+    let rows = crate::diagnostics::provider_facts_from_model_state(&models);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].catalog_id, "codex-sol");
+    assert!(!rows[0].ready);
+    assert_eq!(
+        rows[0].unready_reason.as_deref(),
+        Some("missing OPENAI_API_KEY")
+    );
+    assert!(!format!("{rows:?}").contains(ISSUE15_SECRET));
+}

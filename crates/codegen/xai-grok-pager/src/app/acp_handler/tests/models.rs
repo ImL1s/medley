@@ -549,3 +549,37 @@
         );
     }
 
+    #[test]
+    fn model_auto_switched_uncatalogued_target_is_unavailable_resident() {
+        let mut app = make_app_with_agent("sess-1");
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        seed_models(agent, "grok-3", &["grok-3"]);
+
+        let payload = SessionNotification {
+            session_id: acp::SessionId::new("sess-1"),
+            update: XaiSessionUpdate::ModelAutoSwitched {
+                previous_model_id: "grok-3".into(),
+                new_model_id: "missing-from-catalog".into(),
+                reason: "previous model no longer available".into(),
+            },
+            meta: None,
+        };
+        let raw = serde_json::value::to_raw_value(&payload).unwrap();
+        let notif = acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw));
+        assert!(handle_ext_notification(&notif, &mut app));
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let new_id = acp::ModelId::new("missing-from-catalog");
+        assert_eq!(agent.session.models.current.as_ref(), Some(&new_id));
+        let inserted = agent
+            .session
+            .models
+            .available
+            .get(&new_id)
+            .expect("uncatalogued auto-switch must insert a placeholder");
+        assert!(
+            crate::slash::commands::model::is_unavailable_resident_meta(inserted.meta.as_ref()),
+            "placeholder must be unavailable, not ready-by-default"
+        );
+    }
+

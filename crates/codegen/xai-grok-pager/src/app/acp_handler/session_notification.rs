@@ -907,7 +907,10 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             if !agent.session.models.available.contains_key(&new_id) {
                 agent.session.models.available.insert(
                     new_id.clone(),
-                    acp::ModelInfo::new(new_id.clone(), new_model_id.clone()),
+                    crate::slash::commands::model::unavailable_resident_placeholder(
+                        &new_id,
+                        Some(new_model_id.as_str()),
+                    ),
                 );
             }
             agent.session.models.set_current(new_id, None);

@@ -75,6 +75,8 @@ pub(super) fn collect_live_doctor_report_for_terminal(
     if crate::app::voice_mode_enabled() {
         crate::diagnostics::apply_voice_probe(&mut report, true);
     }
+    report.facts.providers =
+        crate::diagnostics::provider_facts_from_model_state(&agent.session.models);
     Some(report)
 }
 
