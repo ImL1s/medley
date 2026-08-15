@@ -7,9 +7,9 @@ use xai_grok_subagent_resolution::native_route::{
     request_from_agent_definition, resolve_native_route,
 };
 
-use super::SubagentSpawnContext;
+use super::{SubagentMeta, SubagentSpawnContext};
 use crate::agent::config::{
-    ModelEntry, auth_class_for_entry, catalog_endpoint_is_local, model_readiness,
+    ModelEntry, auth_class_for_entry, catalog_entry_is_local, model_readiness,
 };
 
 /// Map the session catalog into the secret-free native-route catalog.
@@ -29,7 +29,7 @@ pub(super) fn synthetic_catalog_from_available_models(
                     access_profile: auth_class_for_entry(entry).to_string(),
                     ready,
                     unknown_readiness: false,
-                    local_only: catalog_endpoint_is_local(&entry.info.base_url),
+                    local_only: catalog_entry_is_local(entry),
                     harness: (!entry.info.agent_type.is_empty())
                         .then(|| entry.info.agent_type.clone()),
                     context_tokens: u32::try_from(entry.info.context_window.get()).ok(),
@@ -82,4 +82,14 @@ pub(super) fn stamp_receipt_for_selection(
         .ok()
         .filter(|result| result.selected_catalog_id == selected_catalog_id)
         .map(|result| result.receipt)
+}
+
+/// Resume lineage digest from the *source* child's persisted meta.
+/// Never use a receipt stamped for the current spawn.
+pub(super) fn resume_source_receipt_digest(source_meta: Option<&SubagentMeta>) -> Option<String> {
+    source_meta.and_then(|meta| {
+        meta.native_route_receipt
+            .as_ref()
+            .map(|receipt| receipt.route_digest.clone())
+    })
 }

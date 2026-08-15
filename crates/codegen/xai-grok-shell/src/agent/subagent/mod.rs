@@ -769,11 +769,16 @@ fn runtime_or_config_pin_resolves(
 /// Live native-route resolution for spawn. Ordered `models:` is fail-closed.
 /// Runtime / `[subagents.models]` pins still win when they resolve. Legacy
 /// exact `model:` keeps falling through on unknown ids.
+///
+/// `harness_definition` is the pre-CLI-overlay spawn definition used by
+/// model-harness preflight. Incompatible catalog harnesses are skipped so
+/// ordered fallback can select a later candidate that can actually spawn.
 async fn resolve_request_prepared_model_with_native_route(
     fork_context: bool,
     runtime_override_model: Option<&str>,
     subagent_type: &str,
     definition: &xai_grok_agent::AgentDefinition,
+    harness_definition: &xai_grok_agent::AgentDefinition,
     ctx: &SubagentSpawnContext,
     child_session_id: Option<&str>,
     resume: Option<ResumePin>,
@@ -786,8 +791,19 @@ async fn resolve_request_prepared_model_with_native_route(
         && !definition.models.is_empty()
         && !runtime_or_config_pin_resolves(runtime_override_model, subagent_type, ctx)
     {
+        let mut route_definition = definition.clone();
+        route_definition.models.retain(|catalog_id| {
+            ctx.available_models
+                .get(catalog_id)
+                .is_some_and(|entry| live_catalog_harness_can_spawn(harness_definition, entry, ctx))
+        });
+        if route_definition.models.is_empty() {
+            return Err(format!(
+                "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
+            ));
+        }
         let request = request_from_agent_definition(
-            definition,
+            &route_definition,
             Some(ctx.model_id.0.to_string()),
             Some(ctx.parent_session_id.clone()),
             child_session_id.map(str::to_string),
@@ -883,6 +899,41 @@ fn resolve_and_validate_subagent_model_harness(
         plugin_registry,
     );
     validate_subagent_model_harness(active, required_agent_type, required.as_ref())
+}
+
+fn live_catalog_harness_can_spawn(
+    active: &xai_grok_agent::AgentDefinition,
+    entry: &crate::agent::config::ModelEntry,
+    ctx: &SubagentSpawnContext,
+) -> bool {
+    if entry.info.agent_type.is_empty() {
+        return false;
+    }
+    resolve_and_validate_subagent_model_harness(
+        active,
+        &entry.info.agent_type,
+        &ctx.parent_cwd,
+        ctx.plugin_registry.as_deref(),
+    )
+    .is_ok()
+}
+
+fn load_subagent_meta(
+    id: &str,
+    parent_session_id: &str,
+    parent_cwd: &Path,
+) -> Option<SubagentMeta> {
+    let parent_info = SessionInfo {
+        id: acp::SessionId::new(parent_session_id),
+        cwd: parent_cwd.to_string_lossy().into_owned(),
+    };
+    let meta_path = session::persistence::session_dir(&parent_info)
+        .join("subagents")
+        .join(id)
+        .join("meta.json");
+    let data = std::fs::read_to_string(meta_path).ok()?;
+    let meta: SubagentMeta = serde_json::from_str(&data).ok()?;
+    (meta.parent_session_id == parent_session_id).then_some(meta)
 }
 /// Emit a unified log entry recording which model and credentials a subagent
 /// resolved to, and how they compare to the parent's.
@@ -1962,19 +2013,8 @@ fn durable_resume_source_for(
     parent_session_id: &str,
     parent_cwd: &Path,
 ) -> Option<ResumeSourceData> {
-    let parent_info = SessionInfo {
-        id: acp::SessionId::new(parent_session_id),
-        cwd: parent_cwd.to_string_lossy().into_owned(),
-    };
-    let meta_path = session::persistence::session_dir(&parent_info)
-        .join("subagents")
-        .join(id)
-        .join("meta.json");
-    let data = std::fs::read_to_string(meta_path).ok()?;
-    let meta: SubagentMeta = serde_json::from_str(&data).ok()?;
-    if meta.parent_session_id != parent_session_id
-        || !matches!(meta.status.as_str(), "completed" | "failed" | "cancelled")
-    {
+    let meta = load_subagent_meta(id, parent_session_id, parent_cwd)?;
+    if !matches!(meta.status.as_str(), "completed" | "failed" | "cancelled") {
         return None;
     }
     Some(ResumeSourceData {

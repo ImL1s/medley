@@ -688,6 +688,7 @@ pub(crate) async fn run_shell_child(
         effective_runtime.model.as_deref(),
         &request.subagent_type,
         &definition,
+        &selected_harness_definition,
         &ctx,
         Some(request.id.as_str()),
         None,
@@ -760,9 +761,14 @@ pub(crate) async fn run_shell_child(
             Some(request.id.as_str()),
             Some(ResumePin {
                 source_catalog_id: resume_model_id.to_string(),
-                source_receipt_digest: native_route_receipt
-                    .as_ref()
-                    .map(|receipt| receipt.route_digest.clone()),
+                source_receipt_digest: native_route_live::resume_source_receipt_digest(
+                    load_subagent_meta(
+                        &source.subagent_id,
+                        &ctx.parent_session_id,
+                        &ctx.parent_cwd,
+                    )
+                    .as_ref(),
+                ),
                 // Live catalog `route_key` is the catalog id, not the wire slug
                 // stored on `CatalogIdentity.route`.
                 source_route_key: Some(resume_model_id.to_string()),

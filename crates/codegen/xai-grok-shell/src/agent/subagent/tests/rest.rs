@@ -4889,12 +4889,13 @@ async fn native_ordered_models_select_first_eligible() {
     ctx.model_id = acp::ModelId::new("review-parent");
     ctx.sampling_config.model = "review-parent".into();
     ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
-    let mut definition = xai_grok_agent::AgentDefinition::explore();
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
     definition.models = vec!["review-unready".into(), "review-ready".into()];
     let resolved = resolve_request_prepared_model_with_native_route(
         false,
         None,
         "explore",
+        &definition,
         &definition,
         &ctx,
         Some("child-1"),
@@ -4924,12 +4925,13 @@ async fn native_ordered_models_all_unready_fail_closed() {
     ctx.available_models = models;
     ctx.model_id = acp::ModelId::new("review-parent");
     ctx.sampling_config.model = "review-parent".into();
-    let mut definition = xai_grok_agent::AgentDefinition::explore();
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
     definition.models = vec!["review-a".into(), "review-b".into()];
     let err = match resolve_request_prepared_model_with_native_route(
         false,
         None,
         "explore",
+        &definition,
         &definition,
         &ctx,
         Some("child-1"),
@@ -4963,6 +4965,7 @@ async fn config_pin_wins_over_native_ordered_models() {
         None,
         "explore",
         &definition,
+        &definition,
         &ctx,
         Some("child-1"),
         None,
@@ -4987,6 +4990,7 @@ async fn inherit_stamps_native_route_receipt() {
         false,
         None,
         "explore",
+        &definition,
         &definition,
         &ctx,
         Some("child-1"),
@@ -5070,5 +5074,105 @@ fn resume_stamp_pins_catalog_id_not_wire_slug() {
     assert!(
         missing_key.is_none(),
         "resume without route key must not fabricate a receipt"
+    );
+}
+
+#[test]
+fn live_catalog_local_only_uses_effective_credential_endpoint() {
+    let mut models = indexmap::IndexMap::new();
+    let mut split = test_model_entry("split-local-session");
+    split.info.base_url = "http://127.0.0.1:8080/v1".into();
+    split.api_base_url = Some("https://api.example.test/v1".into());
+    models.insert("split-local-session".into(), split);
+    let mut both_local = test_model_entry("both-local");
+    both_local.info.base_url = "http://127.0.0.1:8080/v1".into();
+    both_local.api_base_url = Some("http://localhost:9000/v1".into());
+    models.insert("both-local".into(), both_local);
+    let catalog = super::super::native_route_live::synthetic_catalog_from_available_models(&models);
+    let split_entry = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.catalog_id == "split-local-session")
+        .expect("split");
+    assert!(
+        !split_entry.local_only,
+        "loopback session URL plus remote api_base_url must not satisfy localOnly"
+    );
+    let local_entry = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.catalog_id == "both-local")
+        .expect("both-local");
+    assert!(local_entry.local_only);
+}
+
+#[tokio::test]
+async fn native_ordered_models_skip_incompatible_harness() {
+    let mut models = indexmap::IndexMap::new();
+    let mut codex = test_model_entry("review-codex");
+    codex.info.agent_type = "codex".into();
+    models.insert("review-codex".into(), codex);
+    models.insert("review-ready".into(), test_model_entry("review-ready"));
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
+    definition.models = vec!["review-codex".into(), "review-ready".into()];
+    let resolved = resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "grok-build-plan",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    .expect("compatible later candidate must spawn");
+    assert_eq!(resolved.prepared.model_id.0.as_ref(), "review-ready");
+    let receipt = resolved.receipt.expect("receipt");
+    assert_eq!(receipt.selected_catalog_id, "review-ready");
+}
+
+#[test]
+fn resume_digest_comes_from_source_meta_not_current_spawn() {
+    let mut source = snapshot_test_meta("source-child");
+    source.parent_session_id = "test-parent".into();
+    source.status = "completed".into();
+    source.native_route_receipt = Some(xai_grok_subagent_resolution::native_route::RouteReceipt {
+        schema: "medley.native-route-receipt.v1".into(),
+        schema_version: 1,
+        parent_session_id: Some("test-parent".into()),
+        child_session_id: Some("source-child".into()),
+        consumer_policy_id: None,
+        consumer_policy_digest: None,
+        selection_mode: "inherit".into(),
+        requested_catalog_ids: vec!["review-parent".into()],
+        selected_catalog_id: "review-parent".into(),
+        selected_wire_model: "review-parent".into(),
+        route_key: "review-parent".into(),
+        access_profile: "none".into(),
+        harness: None,
+        capability_ceiling: None,
+        selection_provenance: "inherit".into(),
+        rejected_candidates: Vec::new(),
+        route_digest: "source-digest".into(),
+        attempt: 1,
+        created_unix_ms: 1,
+        resume_source_receipt: None,
+    });
+    assert_eq!(
+        super::super::native_route_live::resume_source_receipt_digest(Some(&source)),
+        Some("source-digest".into())
+    );
+    assert_eq!(
+        super::super::native_route_live::resume_source_receipt_digest(None),
+        None,
+        "missing source meta must not invent a current-spawn digest"
     );
 }
