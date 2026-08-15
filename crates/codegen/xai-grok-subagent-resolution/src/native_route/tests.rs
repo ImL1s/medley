@@ -225,10 +225,27 @@ fn empty_candidates_are_invalid_not_inherit() {
 }
 
 #[test]
+fn declarative_empty_models_is_invalid_not_inherit() {
+    let spec = DeclarativeNativeRouteSpec {
+        models: Some(vec![]),
+        ..DeclarativeNativeRouteSpec::default()
+    };
+    let err = parse_declarative_spec(spec).unwrap_err();
+    assert_eq!(err.code(), RejectionCode::EmptyCandidates);
+
+    let from_json: DeclarativeNativeRouteSpec = serde_json::from_str(r#"{"models":[]}"#).unwrap();
+    let err = parse_declarative_spec(from_json).unwrap_err();
+    assert_eq!(err.code(), RejectionCode::EmptyCandidates);
+
+    let omitted = parse_declarative_spec(DeclarativeNativeRouteSpec::default()).unwrap();
+    assert!(matches!(omitted.selection, NativeModelSelection::Inherit));
+}
+
+#[test]
 fn declarative_conflict_model_and_models_is_rejected() {
     let spec = DeclarativeNativeRouteSpec {
         model: Some("review-primary".into()),
-        models: vec!["review-fallback".into()],
+        models: Some(vec!["review-fallback".into()]),
         ..DeclarativeNativeRouteSpec::default()
     };
     let err = parse_declarative_spec(spec).unwrap_err();
@@ -239,7 +256,7 @@ fn declarative_conflict_model_and_models_is_rejected() {
 fn declarative_models_become_ordered_candidates() {
     let spec = DeclarativeNativeRouteSpec {
         model: Some("inherit".into()),
-        models: vec!["review-primary".into(), "review-fallback".into()],
+        models: Some(vec!["review-primary".into(), "review-fallback".into()]),
         ..DeclarativeNativeRouteSpec::default()
     };
     let req = parse_declarative_spec(spec).unwrap();
@@ -298,6 +315,64 @@ fn request_secret_material_is_rejected() {
     req.consumer_policy_id = Some("sk-secret-example".into());
     let err = resolve_native_route(&req, &catalog(), 1, 1).unwrap_err();
     assert!(matches!(err, NativeRouteError::Rejected(_, _)));
+
+    let mut ceiling = request(NativeModelSelection::Inherit);
+    ceiling.capability_ceiling = Some("Bearer token-example".into());
+    let err = resolve_native_route(&ceiling, &catalog(), 1, 1).unwrap_err();
+    assert!(matches!(err, NativeRouteError::Rejected(_, _)));
+
+    let mut resume = request(NativeModelSelection::Inherit);
+    resume.resume = Some(ResumePin {
+        source_catalog_id: "review-primary".into(),
+        source_receipt_digest: Some("Bearer token-example".into()),
+        source_route_key: None,
+    });
+    let err = resolve_native_route(&resume, &catalog(), 1, 1).unwrap_err();
+    assert!(matches!(err, NativeRouteError::Rejected(_, _)));
+}
+
+#[test]
+fn receipt_digest_binds_harness_ceiling_and_resume() {
+    let mut req = request(NativeModelSelection::Exact {
+        catalog_id: "review-primary".into(),
+    });
+    let baseline = resolve_native_route(&req, &catalog(), 20, 1).unwrap();
+    req.capability_ceiling = Some("read-only".into());
+    let with_ceiling = resolve_native_route(&req, &catalog(), 20, 1).unwrap();
+    assert_ne!(
+        baseline.receipt.route_digest,
+        with_ceiling.receipt.route_digest
+    );
+
+    let mut cat = catalog();
+    cat.entries[0].harness = Some("other-harness".into());
+    let with_harness = resolve_native_route(
+        &request(NativeModelSelection::Exact {
+            catalog_id: "review-primary".into(),
+        }),
+        &cat,
+        20,
+        1,
+    )
+    .unwrap();
+    assert_ne!(
+        baseline.receipt.route_digest,
+        with_harness.receipt.route_digest
+    );
+
+    let mut resume = request(NativeModelSelection::Exact {
+        catalog_id: "review-primary".into(),
+    });
+    resume.resume = Some(ResumePin {
+        source_catalog_id: "review-primary".into(),
+        source_receipt_digest: Some("abc".into()),
+        source_route_key: Some("route-sub".into()),
+    });
+    let with_resume = resolve_native_route(&resume, &catalog(), 20, 2).unwrap();
+    assert_ne!(
+        baseline.receipt.route_digest,
+        with_resume.receipt.route_digest
+    );
 }
 
 #[test]
@@ -350,8 +425,10 @@ fn ux_snapshot_compact_row_keeps_status_without_color() {
     assert!(row.contains("verifier"));
     assert!(row.contains("enabled"));
     assert!(row.contains("inherit"));
-    assert!(row.contains("ready"));
+    assert!(row.contains("unknown"));
+    assert!(!row.contains("ready"));
     assert!(row.contains("read-only"));
+    assert_eq!(snap.route_status, RouteStatus::Unknown);
     assert!(!row.contains("\u{1b}"));
     let detail = format_route_detail(&snap);
     assert!(
@@ -407,7 +484,9 @@ fn thousand_entry_format_stays_bounded() {
     for width in [20, 40, 80, 160] {
         for _ in 0..1_000 {
             let row = format_compact_row(&snap, width);
-            assert!(row.chars().count() <= width);
+            assert!(unicode_width::UnicodeWidthStr::width(row.as_str()) <= width);
         }
     }
+    let cjk = format_compact_row(&snap, 8);
+    assert!(unicode_width::UnicodeWidthStr::width(cjk.as_str()) <= 8);
 }

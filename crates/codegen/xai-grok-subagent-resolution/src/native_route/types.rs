@@ -338,6 +338,35 @@ impl RouteReceipt {
             serde_json::Value::String(self.selection_provenance.clone()),
         );
         map.insert(
+            "rejected_candidates".into(),
+            serde_json::Value::Array(
+                self.rejected_candidates
+                    .iter()
+                    .map(|row| {
+                        let mut item = serde_json::Map::new();
+                        item.insert(
+                            "catalog_id".into(),
+                            serde_json::Value::String(row.catalog_id.clone()),
+                        );
+                        item.insert(
+                            "reason_code".into(),
+                            serde_json::Value::String(row.reason_code.as_str().into()),
+                        );
+                        if let Some(wire) = &row.wire_model {
+                            item.insert(
+                                "wire_model".into(),
+                                serde_json::Value::String(wire.clone()),
+                            );
+                        }
+                        if let Some(key) = &row.route_key {
+                            item.insert("route_key".into(), serde_json::Value::String(key.clone()));
+                        }
+                        serde_json::Value::Object(item)
+                    })
+                    .collect(),
+            ),
+        );
+        map.insert(
             "attempt".into(),
             serde_json::Value::Number(self.attempt.into()),
         );
@@ -363,6 +392,21 @@ impl RouteReceipt {
             map.insert(
                 "child_session_id".into(),
                 serde_json::Value::String(child.clone()),
+            );
+        }
+        if let Some(harness) = &self.harness {
+            map.insert("harness".into(), serde_json::Value::String(harness.clone()));
+        }
+        if let Some(ceiling) = &self.capability_ceiling {
+            map.insert(
+                "capability_ceiling".into(),
+                serde_json::Value::String(ceiling.clone()),
+            );
+        }
+        if let Some(resume) = &self.resume_source_receipt {
+            map.insert(
+                "resume_source_receipt".into(),
+                serde_json::Value::String(resume.clone()),
             );
         }
         map

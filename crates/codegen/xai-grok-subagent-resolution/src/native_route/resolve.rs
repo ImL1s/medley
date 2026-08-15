@@ -87,8 +87,20 @@ fn validate_request(request: &NativeSubagentRouteRequest) -> Result<(), NativeRo
     reject_secret_opt(request.parent_catalog_id.as_deref(), "parent_catalog_id")?;
     reject_secret_opt(request.parent_session_id.as_deref(), "parent_session_id")?;
     reject_secret_opt(request.child_session_id.as_deref(), "child_session_id")?;
+    reject_secret_opt(request.capability_ceiling.as_deref(), "capability_ceiling")?;
     if let Some(req) = &request.required_capabilities.required_harness {
         reject_secret_text(req, "required_harness")?;
+    }
+    for name in &request.required_capabilities.required_named_capabilities {
+        reject_secret_text(name, "required_named_capabilities")?;
+    }
+    if let Some(pin) = &request.resume {
+        reject_secret_text(&pin.source_catalog_id, "resume.source_catalog_id")?;
+        reject_secret_opt(
+            pin.source_receipt_digest.as_deref(),
+            "resume.source_receipt_digest",
+        )?;
+        reject_secret_opt(pin.source_route_key.as_deref(), "resume.source_route_key")?;
     }
     match &request.selection {
         NativeModelSelection::Exact { catalog_id } => {

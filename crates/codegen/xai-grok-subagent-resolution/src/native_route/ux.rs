@@ -1,6 +1,7 @@
 //! Typed UX snapshot shared by /agents, inspect JSON, and consumer adapters.
 
 use serde::{Deserialize, Serialize};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use xai_grok_agent::config::ModelOverride;
 
 use super::types::{NativeSubagentRouteResult, RejectionCode};
@@ -120,10 +121,27 @@ pub fn format_compact_row(snapshot: &AgentRouteUxSnapshot, max_width: usize) -> 
         snapshot.route_status.as_str(),
         floor
     );
-    if max_width > 0 && row.chars().count() > max_width {
-        row = row.chars().take(max_width).collect();
+    if max_width > 0 {
+        row = truncate_to_display_width(&row, max_width);
     }
     row
+}
+
+fn truncate_to_display_width(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used.saturating_add(width) > max_width {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    out
 }
 
 /// Expanded details. Never parse these strings to implement another surface.
@@ -175,7 +193,11 @@ pub fn snapshot_from_model_override(
     generation: u64,
 ) -> AgentRouteUxSnapshot {
     let (selection_mode, refs, status) = match model {
-        ModelOverride::Inherit => (AgentSelectionMode::Inherit, Vec::new(), RouteStatus::Ready),
+        ModelOverride::Inherit => (
+            AgentSelectionMode::Inherit,
+            Vec::new(),
+            RouteStatus::Unknown,
+        ),
         ModelOverride::Override(id) => (
             AgentSelectionMode::Exact,
             vec![id.clone()],
