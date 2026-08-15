@@ -38,7 +38,7 @@ impl SlashCommand for ModelCommand {
     }
 
     fn usage(&self) -> &str {
-        "/model <name> [effort]"
+        "/model <name> [effort] [--session]"
     }
 
     fn takes_args(&self) -> bool {
@@ -50,7 +50,7 @@ impl SlashCommand for ModelCommand {
     }
 
     fn arg_placeholder(&self) -> Option<&str> {
-        Some("<model> [effort]")
+        Some("<model> [effort] [--session]")
     }
 
     fn suggest_args(&self, ctx: &AppCtx, args_query: &str) -> Option<Vec<ArgItem>> {
@@ -74,22 +74,38 @@ impl SlashCommand for ModelCommand {
     fn run(&self, ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         let trimmed = args.trim();
         if trimmed.is_empty() {
-            return CommandResult::Error("Usage: /model <name> [effort]".into());
+            return CommandResult::Error("Usage: /model <name> [effort] [--session]".into());
         }
+
+        // Check for --session flag (session-only, no persist).
+        let (model_args, session_only) = if trimmed.ends_with("--session") {
+            (trimmed.trim_end_matches("--session").trim(), true)
+        } else {
+            (trimmed, false)
+        };
 
         // Prefer an exact full-string catalog match first. Model display names
         // often contain spaces ("Grok 4.5"); if we split on the last token
         // first, a shorter catalog entry ("Grok") would steal the prefix and
         // treat "4.5" as an effort level.
-        match ctx.models.resolve_unique_by_name_or_id(trimmed) {
+        match ctx.models.resolve_unique_by_name_or_id(model_args) {
             ModelNameResolution::Resolved(id) => {
                 if let Some(reason) = model_not_ready_reason(ctx.models, &id) {
                     return CommandResult::Error(reason);
                 }
-                return CommandResult::Action(Action::SetDefaultModel(id));
+                // Session-only: use SwitchModel with no effort (does not persist).
+                // Default: use SetDefaultModel (switches + persists on success).
+                return if session_only {
+                    CommandResult::Action(Action::SwitchModel {
+                        model_id: id,
+                        effort: None,
+                    })
+                } else {
+                    CommandResult::Action(Action::SetDefaultModel(id))
+                };
             }
             ModelNameResolution::Ambiguous => {
-                return ambiguous_model_error(trimmed);
+                return ambiguous_model_error(model_args);
             }
             ModelNameResolution::Unknown => {}
         }
@@ -98,7 +114,7 @@ impl SlashCommand for ModelCommand {
         // (not persisted as default). Resolve via the shared gate so a rejected
         // level (e.g. `none` on grok-4.5) surfaces the effort error with the
         // model's offered ids — not "Unknown model: … none".
-        if let Some((prefix, _token)) = split_trailing_token(trimmed)
+        if let Some((prefix, _token)) = split_trailing_token(model_args)
             && matches!(
                 ctx.models.resolve_unique_by_name_or_id(prefix),
                 ModelNameResolution::Ambiguous
@@ -106,7 +122,7 @@ impl SlashCommand for ModelCommand {
         {
             return ambiguous_model_error(prefix);
         }
-        if let Some((prefix, token)) = split_trailing_token(trimmed)
+        if let Some((prefix, token)) = split_trailing_token(model_args)
             && let Some(id) = resolve_model(ctx.models, prefix)
             && ctx
                 .models
@@ -127,7 +143,7 @@ impl SlashCommand for ModelCommand {
             };
         }
 
-        CommandResult::Error(format!("Unknown model: {trimmed}"))
+        CommandResult::Error(format!("Unknown model: {model_args}"))
     }
 }
 
@@ -813,6 +829,74 @@ mod tests {
                 assert_eq!(resolved_id, id);
             }
             other => panic!("expected Action::SetDefaultModel(<id>), got {other:?}"),
+        }
+    }
+
+    /// `/model <name> --session` dispatches `Action::SwitchModel` with
+    /// `effort: None`, which is session-only (does not persist to config).
+    /// This distinguishes explicit session-only selection from the default
+    /// persist-on-success behavior of `SetDefaultModel`.
+    #[test]
+    fn run_model_with_session_flag_dispatches_session_only_switch() {
+        let mut state = ModelState::default();
+        let (id, info) = plain_model("grok-4.5", "Grok 4.5");
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Grok 4.5 --session");
+        match result {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort: None,
+            }) => {
+                assert_eq!(model_id, id);
+            }
+            other => panic!(
+                "expected Action::SwitchModel with effort: None for --session, got {other:?}"
+            ),
+        }
+    }
+
+    /// `/model <name> --session` with an unready model must still hard-block.
+    #[test]
+    fn run_model_session_flag_rejects_unready() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_meta(
+            "unready",
+            "Unready",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(false)),
+                (
+                    "readinessReason".into(),
+                    serde_json::json!("missing credential"),
+                ),
+            ]),
+        );
+        state.available.insert(id, info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Unready --session");
+        match result {
+            CommandResult::Error(msg) => {
+                assert_eq!(msg, "missing credential");
+            }
+            other => panic!("expected Error for unready model with --session, got {other:?}"),
+        }
+    }
+
+    /// `/model <name> --session` with ambiguous name must surface the ambiguity error.
+    #[test]
+    fn run_model_session_flag_rejects_ambiguous() {
+        let mut state = ModelState::default();
+        let (id1, info1) = plain_model("provider-a/shared", "Shared Model");
+        let (id2, info2) = plain_model("provider-b/shared", "Shared Model");
+        state.available.insert(id1, info1);
+        state.available.insert(id2, info2);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Shared Model --session");
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(msg.contains("Ambiguous model name"));
+            }
+            other => panic!("expected Error for ambiguous model with --session, got {other:?}"),
         }
     }
 
