@@ -117,22 +117,24 @@ impl LifecyclePhase {
     }
 }
 
-pub fn lifecycle_phase_for_snapshot(snapshot: &AgentRouteUxSnapshot) -> LifecyclePhase {
+/// Idle configuration snapshots have no lifecycle. `SelectingRoute` is only
+/// for an attached in-flight selection, not for opening `/agents`.
+pub fn lifecycle_phase_for_snapshot(snapshot: &AgentRouteUxSnapshot) -> Option<LifecyclePhase> {
     if snapshot.resume_source_receipt.is_some() {
-        return LifecyclePhase::ResumedFromPriorReceipt;
+        return Some(LifecyclePhase::ResumedFromPriorReceipt);
     }
     match snapshot.last_fallback_admitted {
-        Some(false) => return LifecyclePhase::FallbackRefused,
-        Some(true) => return LifecyclePhase::FallingBack,
+        Some(false) => return Some(LifecyclePhase::FallbackRefused),
+        Some(true) => return Some(LifecyclePhase::FallingBack),
         None => {}
     }
     if snapshot.attempt.is_some_and(|n| n > 1) {
-        return LifecyclePhase::RetryingSameRoute;
+        return Some(LifecyclePhase::RetryingSameRoute);
     }
     if snapshot.attempt.is_some() {
-        return LifecyclePhase::RunningAttempt;
+        return Some(LifecyclePhase::RunningAttempt);
     }
-    LifecyclePhase::SelectingRoute
+    None
 }
 
 /// One lifecycle card line. Labels stay distinct; do not parse this string.
@@ -242,10 +244,9 @@ pub fn format_route_detail(snapshot: &AgentRouteUxSnapshot) -> Vec<String> {
             lines.push(format!("    - {id} ({})", code.as_str()));
         }
     }
-    lines.push(format_lifecycle_line(
-        lifecycle_phase_for_snapshot(snapshot),
-        snapshot.attempt,
-    ));
+    if let Some(phase) = lifecycle_phase_for_snapshot(snapshot) {
+        lines.push(format_lifecycle_line(phase, snapshot.attempt));
+    }
     if snapshot.last_fallback_admitted == Some(false) {
         lines.push("  Last fallback: refused".into());
     } else if snapshot.last_fallback_admitted == Some(true) {

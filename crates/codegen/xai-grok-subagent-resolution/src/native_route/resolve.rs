@@ -527,11 +527,22 @@ pub struct FallbackPlanRequest<'a> {
     pub selection: &'a NativeModelSelection,
     pub current_catalog_id: &'a str,
     pub current_access_profile: &'a str,
+    /// Caller hint only. Admission is derived from the declared ordered
+    /// selection after `current_catalog_id`; extra remaining ids cannot
+    /// authorize a route that was never in the agent's model policy.
     pub remaining_catalog_ids: &'a [String],
     pub catalog: &'a SyntheticCatalog,
     pub requirements: &'a CapabilityRequirements,
     pub facts: &'a [AttemptLifecycleFact],
     pub failure: FallbackFailureClass,
+}
+
+/// Ordered candidates after the current route. Missing current → empty tail.
+fn ordered_fallback_tail<'a>(catalog_ids: &'a [String], current_catalog_id: &str) -> &'a [String] {
+    match catalog_ids.iter().position(|id| id == current_catalog_id) {
+        Some(idx) => &catalog_ids[idx + 1..],
+        None => &[],
+    }
 }
 
 /// Fact-only gate used by older call sites. Without remaining candidates this
@@ -623,70 +634,82 @@ pub fn plan_replay_safe_fallback(request: &FallbackPlanRequest<'_>) -> FallbackA
         | FallbackFailureClass::ProviderUnavailable => {}
     }
     match request.selection {
-        NativeModelSelection::Exact { .. } => {
-            return FallbackAdmission::refuse(
-                RejectionCode::FallbackReplayUnsafe,
-                "exact mode never cross-route fallbacks",
-                Vec::new(),
-            );
-        }
-        NativeModelSelection::Inherit => {
-            return FallbackAdmission::refuse(
-                RejectionCode::FallbackReplayUnsafe,
-                "inherit has no ordered fallback chain",
-                Vec::new(),
-            );
-        }
-        NativeModelSelection::OrderedCandidates { .. } => {}
-    }
-    let mut skipped = Vec::new();
-    for catalog_id in request.remaining_catalog_ids {
-        if catalog_id == request.current_catalog_id {
-            skipped.push(RejectedCandidate {
-                catalog_id: catalog_id.clone(),
-                wire_model: None,
-                route_key: None,
-                reason_code: RejectionCode::DuplicateRequest,
-                message: "current route is not a fallback target".into(),
-            });
-            continue;
-        }
-        let Some(entry) = request.catalog.get(catalog_id) else {
-            skipped.push(RejectedCandidate {
-                catalog_id: catalog_id.clone(),
-                wire_model: None,
-                route_key: None,
-                reason_code: RejectionCode::ExactModelMissing,
-                message: format!("catalog id {catalog_id} is missing"),
-            });
-            continue;
-        };
-        if entry.access_profile != request.current_access_profile {
-            skipped.push(RejectedCandidate {
-                catalog_id: entry.catalog_id.clone(),
-                wire_model: Some(entry.wire_model.clone()),
-                route_key: Some(entry.route_key.clone()),
-                reason_code: RejectionCode::CrossBillingBlocked,
-                message: format!(
-                    "access profile {} is not the same lane as {}",
-                    entry.access_profile, request.current_access_profile
-                ),
-            });
-            continue;
-        }
-        match eligibility(entry, request.requirements) {
-            Ok(()) => return FallbackAdmission::admit(entry.catalog_id.clone(), skipped),
-            Err(reason) => skipped.push(reason),
-        }
-    }
-    FallbackAdmission::refuse(
-        RejectionCode::RouteUnready,
-        format!(
-            "no eligible same-lane remaining candidate; skipped={}",
-            skipped.len()
+        NativeModelSelection::Exact { .. } => FallbackAdmission::refuse(
+            RejectionCode::FallbackReplayUnsafe,
+            "exact mode never cross-route fallbacks",
+            Vec::new(),
         ),
-        skipped,
-    )
+        NativeModelSelection::Inherit => FallbackAdmission::refuse(
+            RejectionCode::FallbackReplayUnsafe,
+            "inherit has no ordered fallback chain",
+            Vec::new(),
+        ),
+        NativeModelSelection::OrderedCandidates { catalog_ids } => {
+            let authorized = ordered_fallback_tail(catalog_ids, request.current_catalog_id);
+            let mut skipped = Vec::new();
+            for catalog_id in request.remaining_catalog_ids {
+                if !authorized.iter().any(|id| id == catalog_id) {
+                    skipped.push(RejectedCandidate {
+                        catalog_id: catalog_id.clone(),
+                        wire_model: None,
+                        route_key: None,
+                        reason_code: RejectionCode::UnsupportedContract,
+                        message: format!(
+                            "remaining catalog id {catalog_id} is not the declared ordered tail after {}",
+                            request.current_catalog_id
+                        ),
+                    });
+                }
+            }
+            for catalog_id in authorized {
+                if catalog_id == request.current_catalog_id {
+                    skipped.push(RejectedCandidate {
+                        catalog_id: catalog_id.clone(),
+                        wire_model: None,
+                        route_key: None,
+                        reason_code: RejectionCode::DuplicateRequest,
+                        message: "current route is not a fallback target".into(),
+                    });
+                    continue;
+                }
+                let Some(entry) = request.catalog.get(catalog_id) else {
+                    skipped.push(RejectedCandidate {
+                        catalog_id: catalog_id.clone(),
+                        wire_model: None,
+                        route_key: None,
+                        reason_code: RejectionCode::ExactModelMissing,
+                        message: format!("catalog id {catalog_id} is missing"),
+                    });
+                    continue;
+                };
+                if entry.access_profile != request.current_access_profile {
+                    skipped.push(RejectedCandidate {
+                        catalog_id: entry.catalog_id.clone(),
+                        wire_model: Some(entry.wire_model.clone()),
+                        route_key: Some(entry.route_key.clone()),
+                        reason_code: RejectionCode::CrossBillingBlocked,
+                        message: format!(
+                            "access profile {} is not the same lane as {}",
+                            entry.access_profile, request.current_access_profile
+                        ),
+                    });
+                    continue;
+                }
+                match eligibility(entry, request.requirements) {
+                    Ok(()) => return FallbackAdmission::admit(entry.catalog_id.clone(), skipped),
+                    Err(reason) => skipped.push(reason),
+                }
+            }
+            FallbackAdmission::refuse(
+                RejectionCode::RouteUnready,
+                format!(
+                    "no eligible same-lane remaining candidate; skipped={}",
+                    skipped.len()
+                ),
+                skipped,
+            )
+        }
+    }
 }
 
 /// Generation-bound mutation admission for `/agents` and other TUI actions.

@@ -808,14 +808,30 @@ async fn resolve_request_prepared_model_with_native_route(
                     "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
                 ));
             }
-        } else if let xai_grok_agent::config::ModelOverride::Override(catalog_id) =
+        } else if let xai_grok_agent::config::ModelOverride::Override(requested_id) =
             &definition.model
-            && let Some(entry) = ctx.available_models.get(catalog_id.as_str())
-            && !live_catalog_harness_can_spawn(harness_definition, entry, ctx)
         {
-            return Err(format!(
-                "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
-            ));
+            let Some(identity) = crate::agent::models::resolve_catalog_identity(
+                &ctx.available_models,
+                &acp::ModelId::new(requested_id.clone()),
+            ) else {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (exact_model_missing)"
+                ));
+            };
+            let catalog_id = identity.model_id;
+            let Some(entry) = ctx.available_models.get(catalog_id.as_str()) else {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (exact_model_missing)"
+                ));
+            };
+            if !live_catalog_harness_can_spawn(harness_definition, entry, ctx) {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
+                ));
+            }
+            route_definition.model =
+                xai_grok_agent::config::ModelOverride::Override(catalog_id);
         }
         let request = request_from_agent_definition(
             &route_definition,

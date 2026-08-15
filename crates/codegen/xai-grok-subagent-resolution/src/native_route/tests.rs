@@ -1076,6 +1076,42 @@ fn fallback_refuses_401_and_policy() {
 }
 
 #[test]
+fn fallback_does_not_admit_unauthorized_remaining_ids() {
+    let mut cat = catalog();
+    cat.entries.push(entry(
+        "review-same-lane",
+        "other-wire",
+        "route-same",
+        "subscription",
+        true,
+    ));
+    let selection = NativeModelSelection::OrderedCandidates {
+        catalog_ids: vec!["review-primary".into()],
+    };
+    let remaining = vec!["review-same-lane".to_string()];
+    let facts = [AttemptLifecycleFact::AttemptStarted];
+    let reqs = CapabilityRequirements::default();
+    let decision = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &facts,
+        FallbackFailureClass::RateLimited,
+        &cat,
+        &reqs,
+    ));
+    assert!(!decision.admitted, "{decision:?}");
+    assert_eq!(decision.next_catalog_id, None);
+    assert!(
+        decision
+            .skipped_candidates
+            .iter()
+            .any(|row| row.catalog_id == "review-same-lane"
+                && row.reason_code == RejectionCode::UnsupportedContract),
+        "{decision:?}"
+    );
+}
+
+#[test]
 fn stale_generation_mutation_is_refused() {
     let err = admit_generation_bound_mutation(1, 2).unwrap_err();
     assert_eq!(err.code(), RejectionCode::StaleGeneration);
@@ -1154,7 +1190,7 @@ fn compact_row_a11y_matrix_preserves_identity_without_color() {
 }
 
 #[test]
-fn format_route_detail_includes_lifecycle_card() {
+fn format_route_detail_omits_lifecycle_card_when_idle() {
     let snap = snapshot_from_model_override(
         "verifier",
         "verifier",
@@ -1168,9 +1204,32 @@ fn format_route_detail_includes_lifecycle_card() {
     );
     let detail = format_route_detail(&snap);
     assert!(
+        detail.iter().all(|line| !line.contains("Lifecycle:")),
+        "idle /agents details must not claim selecting route: {detail:?}"
+    );
+    assert_eq!(lifecycle_phase_for_snapshot(&snap), None);
+}
+
+#[test]
+fn format_route_detail_includes_lifecycle_card_when_attempt_attached() {
+    let mut snap = snapshot_from_model_override(
+        "verifier",
+        "verifier",
+        "project",
+        true,
+        false,
+        false,
+        &ModelOverride::Inherit,
+        Some("read-only"),
+        1,
+    );
+    snap.attempt = Some(2);
+    snap.last_fallback_admitted = Some(false);
+    let detail = format_route_detail(&snap);
+    assert!(
         detail
             .iter()
-            .any(|line| line.contains("Lifecycle: selecting route")),
+            .any(|line| line.contains("Lifecycle: fallback refused")),
         "{detail:?}"
     );
 }

@@ -2674,8 +2674,8 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("Lifecycle: selecting route")),
-            "{lines:?}"
+                .all(|line| !line.contains("Lifecycle: selecting route")),
+            "idle expanded details must not claim selecting route: {lines:?}"
         );
     }
     #[test]
