@@ -535,11 +535,7 @@ fn configuration_only_exact_does_not_claim_selected_catalog() {
             .iter()
             .any(|line| line.contains("Requested: review-primary"))
     );
-    assert!(
-        !detail
-            .iter()
-            .any(|line| line.contains("Selected catalog:"))
-    );
+    assert!(!detail.iter().any(|line| line.contains("Selected catalog:")));
     let row = format_compact_row(&snap, 80);
     assert!(row.contains("review-primary"));
     assert!(row.contains("unknown"));
