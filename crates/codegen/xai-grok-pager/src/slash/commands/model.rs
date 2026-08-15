@@ -77,18 +77,30 @@ impl SlashCommand for ModelCommand {
             return CommandResult::Error("Usage: /model <name> [effort] [--session]".into());
         }
 
-        // Check for --session flag (session-only, no persist).
-        let (model_args, session_only) = if trimmed.ends_with("--session") {
-            (trimmed.trim_end_matches("--session").trim(), true)
-        } else {
-            (trimmed, false)
-        };
+        // Parse flags via whitespace tokenization (not string suffix matching).
+        // Flags can appear anywhere in the args string.
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let mut session_only = false;
+        let mut model_args_parts: Vec<&str> = Vec::new();
+
+        for token in tokens {
+            if token.eq_ignore_ascii_case("--session") {
+                session_only = true;
+            } else {
+                model_args_parts.push(token);
+            }
+        }
+
+        let model_args = model_args_parts.join(" ");
+        if model_args.is_empty() {
+            return CommandResult::Error("Usage: /model <name> [effort] [--session]".into());
+        }
 
         // Prefer an exact full-string catalog match first. Model display names
         // often contain spaces ("Grok 4.5"); if we split on the last token
         // first, a shorter catalog entry ("Grok") would steal the prefix and
         // treat "4.5" as an effort level.
-        match ctx.models.resolve_unique_by_name_or_id(model_args) {
+        match ctx.models.resolve_unique_by_name_or_id(&model_args) {
             ModelNameResolution::Resolved(id) => {
                 if let Some(reason) = model_not_ready_reason(ctx.models, &id) {
                     return CommandResult::Error(reason);
@@ -105,7 +117,7 @@ impl SlashCommand for ModelCommand {
                 };
             }
             ModelNameResolution::Ambiguous => {
-                return ambiguous_model_error(model_args);
+                return ambiguous_model_error(&model_args);
             }
             ModelNameResolution::Unknown => {}
         }
@@ -114,7 +126,12 @@ impl SlashCommand for ModelCommand {
         // (not persisted as default). Resolve via the shared gate so a rejected
         // level (e.g. `none` on grok-4.5) surfaces the effort error with the
         // model's offered ids — not "Unknown model: … none".
-        if let Some((prefix, _token)) = split_trailing_token(model_args)
+        //
+        // Reject effort + --session as conflicting. The user must choose one:
+        // - `/model <name> <effort>` → session-only with effort
+        // - `/model <name> --session` → session-only without effort
+        // - `/model <name>` → persist (default behavior)
+        if let Some((prefix, _token)) = split_trailing_token(&model_args)
             && matches!(
                 ctx.models.resolve_unique_by_name_or_id(prefix),
                 ModelNameResolution::Ambiguous
@@ -122,25 +139,32 @@ impl SlashCommand for ModelCommand {
         {
             return ambiguous_model_error(prefix);
         }
-        if let Some((prefix, token)) = split_trailing_token(model_args)
-            && let Some(id) = resolve_model(ctx.models, prefix)
-            && ctx
-                .models
-                .available
-                .get(&id)
-                .map(supports_reasoning_effort)
-                .unwrap_or(false)
-        {
-            if let Some(reason) = model_not_ready_reason(ctx.models, &id) {
-                return CommandResult::Error(reason);
+        if let Some((prefix, token)) = split_trailing_token(&model_args) {
+            // Check if the last token might be an effort level.
+            if let Some(id) = resolve_model(ctx.models, prefix)
+                && ctx
+                    .models
+                    .available
+                    .get(&id)
+                    .map(supports_reasoning_effort)
+                    .unwrap_or(false)
+            {
+                if session_only {
+                    return CommandResult::Error(
+                        "Cannot use --session with effort level. Use one of:\n  /model <name> <effort> (session-only with effort)\n  /model <name> --session (session-only)\n  /model <name> (persist as default)".into(),
+                    );
+                }
+                if let Some(reason) = model_not_ready_reason(ctx.models, &id) {
+                    return CommandResult::Error(reason);
+                }
+                return match ctx.models.resolve_effort_for_model(&id, token) {
+                    Ok(effort) => CommandResult::Action(Action::SwitchModel {
+                        model_id: id,
+                        effort: Some(effort),
+                    }),
+                    Err(err) => CommandResult::Error(err.message()),
+                };
             }
-            return match ctx.models.resolve_effort_for_model(&id, token) {
-                Ok(effort) => CommandResult::Action(Action::SwitchModel {
-                    model_id: id,
-                    effort: Some(effort),
-                }),
-                Err(err) => CommandResult::Error(err.message()),
-            };
         }
 
         CommandResult::Error(format!("Unknown model: {model_args}"))
@@ -897,6 +921,105 @@ mod tests {
                 assert!(msg.contains("Ambiguous model name"));
             }
             other => panic!("expected Error for ambiguous model with --session, got {other:?}"),
+        }
+    }
+
+    /// `/model --session <name>` (flag before model) must work (position-independent).
+    #[test]
+    fn run_model_session_flag_before_name_works() {
+        let mut state = ModelState::default();
+        let (id, info) = plain_model("grok-4.5", "Grok 4.5");
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "--session Grok 4.5");
+        match result {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort: None,
+            }) => {
+                assert_eq!(model_id, id);
+            }
+            other => panic!(
+                "expected Action::SwitchModel with --session before name, got {other:?}"
+            ),
+        }
+    }
+
+    /// `/model <name> --SESSION` (uppercase) must work (case-insensitive).
+    #[test]
+    fn run_model_session_flag_case_insensitive() {
+        let mut state = ModelState::default();
+        let (id, info) = plain_model("grok-4.5", "Grok 4.5");
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Grok 4.5 --SESSION");
+        match result {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort: None,
+            }) => {
+                assert_eq!(model_id, id);
+            }
+            other => panic!(
+                "expected Action::SwitchModel with uppercase --SESSION, got {other:?}"
+            ),
+        }
+    }
+
+    /// `/model <name> --session --session` (duplicate flag) must work (idempotent).
+    #[test]
+    fn run_model_duplicate_session_flag_idempotent() {
+        let mut state = ModelState::default();
+        let (id, info) = plain_model("grok-4.5", "Grok 4.5");
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Grok 4.5 --session --session");
+        match result {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort: None,
+            }) => {
+                assert_eq!(model_id, id);
+            }
+            other => panic!("expected idempotent --session --session, got {other:?}"),
+        }
+    }
+
+    /// `/model <name> <effort> --session` must reject with clear error.
+    /// Effort and --session are conflicting options:
+    /// - Effort alone is already session-only
+    /// - --session alone is session-only without effort
+    #[test]
+    fn run_model_effort_with_session_flag_rejects() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_reasoning("reasoning-x", "Reasoning X");
+        state.available.insert(id, info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Reasoning X high --session");
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(
+                    msg.contains("Cannot use --session with effort level"),
+                    "expected conflict error, got: {msg}"
+                );
+            }
+            other => panic!("expected Error for effort + --session conflict, got {other:?}"),
+        }
+    }
+
+    /// `/model --session <name> <effort>` (flag first) must also reject.
+    #[test]
+    fn run_model_session_flag_before_effort_rejects() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_reasoning("reasoning-x", "Reasoning X");
+        state.available.insert(id, info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "--session Reasoning X high");
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(msg.contains("Cannot use --session with effort level"));
+            }
+            other => panic!("expected Error for --session + effort conflict, got {other:?}"),
         }
     }
 
