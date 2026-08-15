@@ -361,6 +361,10 @@ impl RouteReceipt {
                         if let Some(key) = &row.route_key {
                             item.insert("route_key".into(), serde_json::Value::String(key.clone()));
                         }
+                        item.insert(
+                            "message".into(),
+                            serde_json::Value::String(row.message.clone()),
+                        );
                         serde_json::Value::Object(item)
                     })
                     .collect(),

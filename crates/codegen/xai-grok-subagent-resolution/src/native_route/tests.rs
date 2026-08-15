@@ -4,7 +4,7 @@ use crate::native_route::types::{
     AttemptLifecycleFact, CAP_MODEL_FAMILY_METADATA, CAP_ORDERED_CANDIDATES,
     CAP_REPLAY_SAFE_FALLBACK, CAP_ROUTE_RECEIPT, CapabilityRequirements, CapabilityState,
     NativeModelSelection, NativeRouteError, NativeSubagentRouteRequest, RECEIPT_SCHEMA,
-    RejectionCode, ResumePin, SCHEMA_VERSION, WorkerRoute,
+    RejectedCandidate, RejectionCode, ResumePin, SCHEMA_VERSION, WorkerRoute,
 };
 use sha2::{Digest, Sha256};
 use xai_grok_agent::config::ModelOverride;
@@ -562,4 +562,23 @@ fn receipt_digest_binds_serialized_schema() {
     let blob = serde_json::to_vec(&receipt.canonical_payload()).unwrap();
     let mutated = format!("{:x}", Sha256::digest(&blob));
     assert_ne!(original, mutated);
+
+    let mut with_reject = result.receipt.clone();
+    with_reject.rejected_candidates.push(RejectedCandidate {
+        catalog_id: "review-unready".into(),
+        wire_model: None,
+        route_key: None,
+        reason_code: RejectionCode::RouteUnready,
+        message: "catalog not ready".into(),
+    });
+    let with_message = format!(
+        "{:x}",
+        Sha256::digest(&serde_json::to_vec(&with_reject.canonical_payload()).unwrap())
+    );
+    with_reject.rejected_candidates[0].message = "forged explanation".into();
+    let forged_message = format!(
+        "{:x}",
+        Sha256::digest(&serde_json::to_vec(&with_reject.canonical_payload()).unwrap())
+    );
+    assert_ne!(with_message, forged_message);
 }
