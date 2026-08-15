@@ -297,12 +297,26 @@ fn resolve_ordered(
         }
     }
     Err(NativeRouteError::Rejected(
-        RejectionCode::RouteUnready,
+        ordered_exhausted_code(&rejected),
         format!(
             "no eligible candidate in declared order; rejected={}",
             rejected.len()
         ),
     ))
+}
+
+fn ordered_exhausted_code(rejected: &[RejectedCandidate]) -> RejectionCode {
+    let Some(first) = rejected.first() else {
+        return RejectionCode::EmptyCandidates;
+    };
+    if rejected
+        .iter()
+        .all(|row| row.reason_code == first.reason_code)
+    {
+        first.reason_code
+    } else {
+        RejectionCode::RouteUnready
+    }
 }
 
 fn eligibility(

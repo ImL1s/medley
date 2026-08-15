@@ -166,6 +166,15 @@ fn ordered_candidates_preserve_declaration_order() {
 }
 
 #[test]
+fn ordered_all_missing_preserves_exact_model_missing() {
+    let req = request(NativeModelSelection::OrderedCandidates {
+        catalog_ids: vec!["missing-a".into(), "missing-b".into()],
+    });
+    let err = resolve_native_route(&req, &catalog(), 1, 1).unwrap_err();
+    assert_eq!(err.code(), RejectionCode::ExactModelMissing);
+}
+
+#[test]
 fn duplicate_wire_slug_stays_distinct_by_route_key() {
     let cat = catalog();
     let a = cat.get("review-primary").unwrap();
