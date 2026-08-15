@@ -66,11 +66,20 @@ pub(super) fn stamp_receipt_for_selection(
     {
         return Some(result.receipt);
     }
+    let had_resume = request.resume.is_some();
     request.selection = NativeModelSelection::Exact {
         catalog_id: selected_catalog_id.to_string(),
     };
+    if had_resume {
+        // Keep the pin. Do not fabricate a non-resume receipt for a resumed child.
+        return resolve_native_route(&request, catalog, now_unix_ms, 1)
+            .ok()
+            .filter(|result| result.selected_catalog_id == selected_catalog_id)
+            .map(|result| result.receipt);
+    }
     request.resume = None;
     resolve_native_route(&request, catalog, now_unix_ms, 1)
         .ok()
+        .filter(|result| result.selected_catalog_id == selected_catalog_id)
         .map(|result| result.receipt)
 }

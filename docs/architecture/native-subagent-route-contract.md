@@ -33,8 +33,9 @@ plus live spawn in `xai-grok-shell`):
 - typed `AgentRouteUxSnapshot` plus compact/detail formatters used by `/agents`;
 - spawn-time persistence of receipts on `SubagentMeta`, GCS `subagent.json`
   (`routeReceiptDigest`), and optional ACP `SubagentSpawned` fields;
-- usage facts projected from the canonical receipt (`catalogId` / `wireModel` /
-  `accessProfile` / `routeDigest`).
+- inspect/adapter usage facts helper from the canonical receipt (`catalogId` /
+  `wireModel` / `accessProfile` / `routeDigest`); live `by_model` usage still
+  keys by catalog id on the existing #23 path.
 
 Live exact `model:` still uses the legacy pin path: an unknown catalog id warns
 and falls through to inherit. Fail-closed exact selection is the offline

@@ -760,8 +760,12 @@ pub(crate) async fn run_shell_child(
             Some(request.id.as_str()),
             Some(ResumePin {
                 source_catalog_id: resume_model_id.to_string(),
-                source_receipt_digest: None,
-                source_route_key: source.model_route.clone(),
+                source_receipt_digest: native_route_receipt
+                    .as_ref()
+                    .map(|receipt| receipt.route_digest.clone()),
+                // Live catalog `route_key` is the catalog id, not the wire slug
+                // stored on `CatalogIdentity.route`.
+                source_route_key: Some(resume_model_id.to_string()),
             }),
             native_route_now_ms(),
         );

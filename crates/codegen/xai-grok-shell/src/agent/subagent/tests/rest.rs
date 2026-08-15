@@ -5000,3 +5000,75 @@ async fn inherit_stamps_native_route_receipt() {
     assert_eq!(receipt.selection_mode, "inherit");
     assert_eq!(receipt.selected_catalog_id, "review-parent");
 }
+
+#[test]
+fn resume_stamp_pins_catalog_id_not_wire_slug() {
+    let mut models = indexmap::IndexMap::new();
+    let mut first = test_model_entry("shared-wire");
+    first.info.model = "shared-wire".into();
+    let mut second = test_model_entry("shared-wire");
+    second.info.model = "shared-wire".into();
+    models.insert("route-sub".into(), first);
+    models.insert("route-payg".into(), second);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models.clone();
+    ctx.model_id = acp::ModelId::new("route-sub");
+    ctx.sampling_config.model = "shared-wire".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("route-sub");
+    let catalog = super::super::native_route_live::synthetic_catalog_from_available_models(&models);
+    let definition = xai_grok_agent::AgentDefinition::explore();
+    let receipt = super::super::native_route_live::stamp_receipt_for_selection(
+        &definition,
+        &ctx,
+        &catalog,
+        "route-sub",
+        Some("child-1"),
+        Some(ResumePin {
+            source_catalog_id: "route-sub".into(),
+            source_receipt_digest: Some("deadbeef".into()),
+            source_route_key: Some("route-sub".into()),
+        }),
+        1,
+    )
+    .expect("resume receipt");
+    assert_eq!(receipt.selection_provenance, "resume");
+    assert_eq!(receipt.selected_catalog_id, "route-sub");
+    assert_eq!(receipt.selected_wire_model, "shared-wire");
+    assert_eq!(receipt.resume_source_receipt.as_deref(), Some("deadbeef"));
+
+    let fabricated = super::super::native_route_live::stamp_receipt_for_selection(
+        &definition,
+        &ctx,
+        &catalog,
+        "route-sub",
+        Some("child-1"),
+        Some(ResumePin {
+            source_catalog_id: "route-sub".into(),
+            source_receipt_digest: Some("deadbeef".into()),
+            source_route_key: Some("shared-wire".into()),
+        }),
+        1,
+    );
+    assert!(
+        fabricated.is_none(),
+        "wire slug must not restamp as a non-resume receipt"
+    );
+
+    let missing_key = super::super::native_route_live::stamp_receipt_for_selection(
+        &definition,
+        &ctx,
+        &catalog,
+        "route-sub",
+        Some("child-1"),
+        Some(ResumePin {
+            source_catalog_id: "route-sub".into(),
+            source_receipt_digest: Some("deadbeef".into()),
+            source_route_key: None,
+        }),
+        1,
+    );
+    assert!(
+        missing_key.is_none(),
+        "resume without route key must not fabricate a receipt"
+    );
+}
