@@ -8236,13 +8236,13 @@ fn unavailable_model_picker_state() -> SettingsModalState {
     assert!(
         choices
             .iter()
-            .any(|c| c.canonical == "Grok 4.5" && c.disabled),
+            .any(|c| c.canonical == "grok-4.5" && c.disabled),
         "unavailable Codex/Grok row must be marked disabled"
     );
     assert!(
         choices
             .iter()
-            .any(|c| c.canonical == "GPT-5.6 Sol" && !c.disabled),
+            .any(|c| c.canonical == "gpt-5.6-sol" && !c.disabled),
         "ready Codex row must stay selectable"
     );
     SettingsModalState::new(
@@ -8306,7 +8306,7 @@ fn remap_picking_enum_preserves_canonical_after_catalog_insert() {
     let selected = s
         .picking_enum_selected_canonical()
         .expect("picker has a focused row");
-    assert_eq!(selected, "Grok 4.5");
+    assert_eq!(selected, "grok-4.5");
     match &s.mode() {
         SettingsModalMode::PickingEnum { choices_idx, .. } => {
             assert_eq!(*choices_idx, 2, "precondition: unready row is index 2");
@@ -8338,7 +8338,7 @@ fn remap_picking_enum_preserves_canonical_after_catalog_insert() {
     }
     assert_eq!(
         s.picking_enum_selected_canonical().as_deref(),
-        Some("Grok 4.5")
+        Some("grok-4.5")
     );
 }
 
@@ -8351,7 +8351,7 @@ fn remap_picking_enum_resets_when_focused_model_disappears() {
     let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert_eq!(
         s.picking_enum_selected_canonical().as_deref(),
-        Some("Grok 4.5")
+        Some("grok-4.5")
     );
 
     let mut snapshot = s.pager_snapshot.clone();
@@ -8362,7 +8362,7 @@ fn remap_picking_enum_resets_when_focused_model_disappears() {
         .unavailable_model_reasons
         .retain(|(id, _)| id != "grok-4.5");
     s.pager_snapshot = snapshot;
-    s.remap_picking_enum_after_catalog_refresh(Some("Grok 4.5".to_string()));
+    s.remap_picking_enum_after_catalog_refresh(Some("grok-4.5".to_string()));
     match &s.mode() {
         SettingsModalMode::PickingEnum { choices_idx, .. } => {
             assert_eq!(
@@ -8373,6 +8373,52 @@ fn remap_picking_enum_resets_when_focused_model_disappears() {
         other => panic!("expected PickingEnum, got {other:?}"),
     }
     assert_eq!(s.picking_enum_selected_canonical().as_deref(), Some(""));
+}
+
+#[test]
+fn remap_picking_enum_keeps_the_focused_model_id_when_display_names_collide() {
+    use crate::settings::dynamic_enum_choices;
+    let snapshot = PagerLocalSnapshot {
+        available_models: vec![
+            (
+                "Shared Name".to_string(),
+                agent_client_protocol::ModelId::new(Arc::from("ready-id")),
+            ),
+            (
+                "Shared Name".to_string(),
+                agent_client_protocol::ModelId::new(Arc::from("unready-id")),
+            ),
+        ],
+        unavailable_model_reasons: vec![("unready-id".to_string(), "no credential".to_string())],
+        current_model_name: Some("Shared Name".to_string()),
+        ..PagerLocalSnapshot::default()
+    };
+    let choices = dynamic_enum_choices(
+        crate::settings::DynamicEnumSource::ActiveModelCatalog,
+        &snapshot,
+    );
+    assert_eq!(choices[1].canonical, "ready-id");
+    assert_eq!(choices[2].canonical, "unready-id");
+
+    let mut s = SettingsModalState::new(
+        Arc::new(SettingsRegistry::defaults()),
+        UiConfig::default(),
+        snapshot,
+    );
+    assert!(s.focus_key("default_model"));
+    assert!(s.try_enter_picking_enum());
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        s.picking_enum_selected_canonical().as_deref(),
+        Some("unready-id")
+    );
+    s.remap_picking_enum_after_catalog_refresh(Some("unready-id".to_string()));
+    assert_eq!(
+        s.picking_enum_selected_canonical().as_deref(),
+        Some("unready-id"),
+        "refresh must keep the focused ModelId, not the first shared display name"
+    );
 }
 
 #[test]

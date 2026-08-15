@@ -132,7 +132,7 @@ pub fn dynamic_enum_choices(
                     .find(|(key, _)| key == id_key)
                     .map(|(_, r)| r.as_str());
                 out.push(OwnedEnumChoice {
-                    canonical: name.clone(),
+                    canonical: id.0.to_string(),
                     display: name.clone(),
                     description: reason.unwrap_or("").to_string(),
                     disabled: reason.is_some(),
@@ -716,9 +716,8 @@ pub fn current_value_for(
         "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
         "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(true))),
         // fork_secondary_model: baseline value folds to empty string. The
-        // mirror persists the ModelId slug but the DynamicEnum canonicals
-        // are catalog display names, so resolve via the snapshot; a stale
-        // id passes through raw.
+        // mirror persists the ModelId slug. DynamicEnum row text is the
+        // catalog display name; picker identity/remap uses the ModelId.
         "fork_secondary_model" => Some(SettingValue::String({
             let baseline = xai_grok_shell::models::default_model();
             if ui.fork_secondary_model == baseline {

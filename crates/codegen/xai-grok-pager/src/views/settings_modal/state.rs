@@ -652,7 +652,7 @@ impl SettingsModalState {
                 .unwrap_or(0),
             Some(SettingValue::String(cur)) if !cur.is_empty() => resolved_choices
                 .iter()
-                .position(|c| c.canonical == *cur)
+                .position(|c| c.canonical == *cur || c.display == *cur)
                 .unwrap_or(unknown_dynamic_fallback_idx),
             Some(SettingValue::String(_)) => 0,
             _ => 0,

@@ -1685,6 +1685,8 @@ jobs:
             dynamic_enum_choices_disables_by_model_id_not_display_name -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             remap_picking_enum_resets_when_focused_model_disappears -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            remap_picking_enum_keeps_the_focused_model_id_when_display_names_collide -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             accept_fresh_publication_continues_only_for_committed_durability -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
