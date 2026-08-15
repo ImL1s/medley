@@ -523,6 +523,41 @@ fn unknown_request_field_is_rejected() {
 }
 
 #[test]
+fn unknown_selection_object_field_is_rejected() {
+    let err = serde_json::from_str::<NativeSubagentRouteRequest>(
+        r#"{"schemaVersion":1,"selection":{"mode":"exact","catalog_id":"cloud","requiredCapabilities":{"localOnly":true}}}"#,
+    );
+    assert!(err.is_err());
+    let ok = serde_json::from_str::<NativeSubagentRouteRequest>(
+        r#"{"schemaVersion":1,"selection":{"mode":"exact","catalog_id":"review-primary"},"requiredCapabilities":{"localOnly":true}}"#,
+    )
+    .unwrap();
+    assert!(ok.required_capabilities.local_only);
+    match ok.selection {
+        NativeModelSelection::Exact { catalog_id } => {
+            assert_eq!(catalog_id, "review-primary");
+        }
+        other => panic!("expected exact, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_resume_pin_field_is_rejected() {
+    let err = serde_json::from_str::<NativeSubagentRouteRequest>(
+        r#"{"schemaVersion":1,"selection":{"mode":"inherit"},"resume":{"sourceCatalogId":"review-primary","sourceRouteKe":"lane-a"}}"#,
+    );
+    assert!(err.is_err());
+    let ok = serde_json::from_str::<NativeSubagentRouteRequest>(
+        r#"{"schemaVersion":1,"selection":{"mode":"inherit"},"resume":{"sourceCatalogId":"review-primary","sourceRouteKey":"lane-a"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        ok.resume.as_ref().unwrap().source_route_key.as_deref(),
+        Some("lane-a")
+    );
+}
+
+#[test]
 fn external_executor_is_not_a_medley_provider_route() {
     let route = WorkerRoute::ExternalExecutor {
         descriptor: "codex --yolo".into(),

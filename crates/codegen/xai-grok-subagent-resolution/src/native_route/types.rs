@@ -106,7 +106,7 @@ pub struct DiscoveredCapability {
 
 /// Model selection modes. Inherit is the only mode that may choose parent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NativeModelSelection {
     Inherit,
     Exact { catalog_id: String },
@@ -174,7 +174,7 @@ pub struct NativeSubagentRouteRequest {
 
 /// Resume pin: source route/receipt stay bound. Same wire slug cannot rebind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResumePin {
     pub source_catalog_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
