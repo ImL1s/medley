@@ -1653,6 +1653,7 @@ impl AppView {
             effort: None,
             prev_model_id: None,
             prev_model_id_captured: false,
+            session_only: false,
         })
     }
     /// Voice capture is armed: the in-prompt dictation overlay can show and

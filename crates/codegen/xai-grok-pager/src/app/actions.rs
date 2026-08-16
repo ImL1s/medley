@@ -416,6 +416,9 @@ pub enum Action {
     SwitchModel {
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        /// When true, this is a session-only switch and must NOT persist to
+        /// the preferred model in config.toml (e.g., from `/model --session`).
+        session_only: bool,
     },
     /// Cancel the currently running turn.
     CancelTurn,
@@ -1604,6 +1607,9 @@ pub enum Effect {
         /// `SwitchModelComplete` as a compatibility fallback; the pager's
         /// transaction snapshot handles exact rollback for every error class.
         prev_model_id: Option<acp::ModelId>,
+        /// When true, this is a session-only switch and must NOT persist to
+        /// the preferred model in config.toml (e.g., from `/model --session`).
+        session_only: bool,
     },
     /// Fetch changelog from CDN (both markdown + structured JSON).
     /// Runs off the render path via `spawn_blocking`. Result is cached
@@ -2466,6 +2472,9 @@ pub enum TaskResult {
         /// Forwarded from `Effect::SwitchModel.prev_model_id` as a fallback
         /// when applying completions created by older/test-only call paths.
         prev_model_id: Option<acp::ModelId>,
+        /// When true, this is a session-only switch and must NOT persist to
+        /// the preferred model in config.toml.
+        session_only: bool,
     },
     /// Changelog fetched from CDN (both formats).
     ChangelogFetched {

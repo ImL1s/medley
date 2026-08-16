@@ -756,6 +756,7 @@ fn switch_model_without_session_sends_nothing_to_server() {
         Action::SwitchModel {
             model_id,
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -937,6 +938,7 @@ fn switch_model_deferred_when_no_session_id() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -955,6 +957,7 @@ fn switch_model_deferred_when_no_session_id() {
             effort: None,
             prev_model_id: None,
             prev_model_id_captured: true,
+            session_only: false,
         })
     );
     assert!(!app.agents[&id].session.model_switch_pending);
@@ -981,6 +984,7 @@ fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1021,6 +1025,7 @@ fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
             agent_id: id,
             model_id: model_b,
             effort: None,
+            session_only: false,
             request_id,
             result: Err(SwitchModelError::HarnessUnavailable {
                 error,
@@ -1063,6 +1068,7 @@ fn pre_session_pick_with_no_prior_model_still_persists() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1090,6 +1096,7 @@ fn pre_session_pick_with_no_prior_model_still_persists() {
             agent_id: id,
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
             request_id,
             result: Ok(()),
             prev_model_id,
@@ -1128,6 +1135,7 @@ fn pre_session_effort_only_change_still_persists() {
         Action::SwitchModel {
             model_id: model_a.clone(),
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            session_only: false,
         },
         &mut app,
     );
@@ -1155,6 +1163,7 @@ fn pre_session_effort_only_change_still_persists() {
             agent_id: id,
             model_id: model_a.clone(),
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            session_only: false,
             request_id,
             result: Ok(()),
             prev_model_id,
@@ -1194,6 +1203,7 @@ fn deferred_pre_session_pick_persists_after_switch_succeeds() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1229,6 +1239,7 @@ fn deferred_pre_session_pick_persists_after_switch_succeeds() {
             agent_id: id,
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
             request_id,
             result: Ok(()),
             prev_model_id,
@@ -1261,6 +1272,7 @@ fn deferred_switch_threads_stash_prev_into_effect() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1302,6 +1314,7 @@ fn deferred_switch_prefers_authoritative_current_as_prev() {
         effort: None,
         prev_model_id: None,
         prev_model_id_captured: false,
+        session_only: false,
     });
     agent.session.models.current = Some(server_model.clone());
     let effects = dispatch(
@@ -1337,6 +1350,7 @@ fn deferred_model_switch_applied_on_session_created() {
         effort: None,
         prev_model_id: None,
         prev_model_id_captured: false,
+        session_only: false,
     });
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionCreated {
@@ -1400,6 +1414,7 @@ fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
             effort: None,
             prev_model_id: Some(model_old.clone()),
             prev_model_id_captured: false,
+            session_only: false,
         });
         agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
             request_id: None,
@@ -1482,6 +1497,7 @@ fn deferred_switch_dropped_at_apply_releases_stash_time_slot() {
             effort: None,
             prev_model_id: None,
             prev_model_id_captured: false,
+            session_only: false,
         });
     }
     // The stash-time claim: this agent owns the slot, no request id yet.
@@ -1571,6 +1587,7 @@ fn a_refused_deferred_switch_restores_the_truth_not_a_stale_snapshot() {
                 effort: None,
                 prev_model_id: Some(model_old.clone()),
                 prev_model_id_captured: false,
+                session_only: false,
             });
             agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
                 request_id: None,
@@ -1691,6 +1708,7 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
             effort: None,
             prev_model_id: Some(model_a.clone()),
             prev_model_id_captured: true,
+            session_only: false,
         }),
     );
 
@@ -1716,6 +1734,7 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
             agent_id: id,
             model_id: model_c.clone(),
             effort: None,
+            session_only: false,
             request_id,
             result: Ok(()),
             prev_model_id: None,
@@ -1767,6 +1786,7 @@ fn both_pre_session_entry_points_stash_the_same_rollback_target() {
                     Action::SwitchModel {
                         model_id,
                         effort: None,
+                        session_only: false,
                     },
                     &mut app,
                 );
@@ -1842,6 +1862,7 @@ fn rapid_no_session_model_choice_failure_restores_original_model() {
             agent_id: id,
             model_id: model_c,
             effort: None,
+            session_only: false,
             request_id,
             result: Err(SwitchModelError::Other("rejected".into())),
             prev_model_id: None,
@@ -1913,6 +1934,7 @@ fn rapid_no_session_model_choice_failure_restores_original_none_end_to_end() {
             agent_id: id,
             model_id: model_c,
             effort: None,
+            session_only: false,
             request_id,
             result: Err(SwitchModelError::Other("rejected".into())),
             prev_model_id: None,
@@ -1945,6 +1967,7 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
         effort: None,
         prev_model_id: None,
         prev_model_id_captured: false,
+        session_only: false,
     });
     let session_id: acp::SessionId = "wt-session".into();
     let effects = dispatch(

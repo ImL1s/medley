@@ -303,6 +303,7 @@ fn model_switch_pending_resets_correctly_across_success_and_failure() {
         Action::SwitchModel {
             model_id: model_a.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -316,6 +317,7 @@ fn model_switch_pending_resets_correctly_across_success_and_failure() {
             request_id: first_request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -324,6 +326,7 @@ fn model_switch_pending_resets_correctly_across_success_and_failure() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -337,6 +340,7 @@ fn model_switch_pending_resets_correctly_across_success_and_failure() {
             request_id: second_request_id,
             result: Err(SwitchModelError::Other("network error".into())),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
