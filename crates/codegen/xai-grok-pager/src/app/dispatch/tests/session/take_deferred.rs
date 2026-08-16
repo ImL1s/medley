@@ -252,5 +252,6 @@ fn switch(model_id: acp::ModelId, effort: Option<ReasoningEffort>) -> DeferredMo
         effort,
         prev_model_id: None,
         prev_model_id_captured: false,
+        session_only: false,
     }
 }

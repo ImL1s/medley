@@ -1162,6 +1162,7 @@ fn apply_deferred_switch_outcome_hard_blocks_unready() {
                 effort: None,
                 prev_model_id: None,
                 prev_model_id_captured: false,
+                session_only: false,
             }),
             effort_error: None,
         },
@@ -1194,6 +1195,7 @@ fn apply_deferred_switch_outcome_hard_blocks_catalog_miss() {
                 effort: None,
                 prev_model_id: None,
                 prev_model_id_captured: false,
+                session_only: false,
             }),
             effort_error: None,
         },
@@ -1299,6 +1301,7 @@ fn agent_type_mismatch_with_effort_stashes_deferred_switch() {
                 effort,
                 prev_model_id: None,
                 prev_model_id_captured: false,
+                session_only: false,
             }),
             "effort override must be stashed for the shell via deferred_model_switch",
         );
@@ -1759,6 +1762,7 @@ fn rapid_deferred_switch_preserves_captured_none_rollback() {
             effort: None,
             prev_model_id: None,
             prev_model_id_captured: true,
+            session_only: false,
         })
     );
 }
@@ -1781,6 +1785,7 @@ fn pick_over_cli_seed_keeps_display_as_rollback_target() {
         effort: None,
         prev_model_id: None,
         prev_model_id_captured: false,
+        session_only: false,
     });
     dispatch(
         Action::SwitchModel {
@@ -1797,6 +1802,7 @@ fn pick_over_cli_seed_keeps_display_as_rollback_target() {
             effort: None,
             prev_model_id: Some(displayed),
             prev_model_id_captured: true,
+            session_only: false,
         })
     );
 }
@@ -1831,6 +1837,7 @@ fn deferred_switch_updates_display_and_persists() {
             effort: None,
             prev_model_id: None,
             prev_model_id_captured: true,
+            session_only: false,
         }),
         "switch must still round-trip once the session exists"
     );

@@ -957,6 +957,7 @@ fn switch_model_deferred_when_no_session_id() {
             effort: None,
             prev_model_id: None,
             prev_model_id_captured: true,
+            session_only: false,
         })
     );
     assert!(!app.agents[&id].session.model_switch_pending);
@@ -1313,6 +1314,7 @@ fn deferred_switch_prefers_authoritative_current_as_prev() {
         effort: None,
         prev_model_id: None,
         prev_model_id_captured: false,
+        session_only: false,
     });
     agent.session.models.current = Some(server_model.clone());
     let effects = dispatch(
@@ -1348,6 +1350,7 @@ fn deferred_model_switch_applied_on_session_created() {
         effort: None,
         prev_model_id: None,
         prev_model_id_captured: false,
+        session_only: false,
     });
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionCreated {
@@ -1582,6 +1585,7 @@ fn a_refused_deferred_switch_restores_the_truth_not_a_stale_snapshot() {
                 effort: None,
                 prev_model_id: Some(model_old.clone()),
                 prev_model_id_captured: false,
+                session_only: false,
             });
             agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
                 request_id: None,
@@ -1702,6 +1706,7 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
             effort: None,
             prev_model_id: Some(model_a.clone()),
             prev_model_id_captured: true,
+            session_only: false,
         }),
     );
 
@@ -1960,6 +1965,7 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
         effort: None,
         prev_model_id: None,
         prev_model_id_captured: false,
+        session_only: false,
     });
     let session_id: acp::SessionId = "wt-session".into();
     let effects = dispatch(

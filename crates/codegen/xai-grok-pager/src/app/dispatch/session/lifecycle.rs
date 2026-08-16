@@ -262,6 +262,7 @@ pub(crate) fn take_deferred_model_switch(
         mut effort,
         prev_model_id,
         prev_model_id_captured,
+        session_only,
     }) = stashed
     {
         let effort_error = match cli_effort_token {
@@ -282,6 +283,7 @@ pub(crate) fn take_deferred_model_switch(
                 effort,
                 prev_model_id,
                 prev_model_id_captured,
+                session_only,
             }),
             effort_error,
         };
@@ -309,6 +311,7 @@ pub(crate) fn take_deferred_model_switch(
                 effort: Some(effort),
                 prev_model_id: None,
                 prev_model_id_captured: false,
+                session_only: false,
             }),
             effort_error: None,
         },
@@ -2197,6 +2200,7 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
                     effort,
                     prev_model_id: None,
                     prev_model_id_captured: false,
+                    session_only: false,
                 });
             }
         }
@@ -2261,6 +2265,7 @@ pub(in crate::app::dispatch) fn dispatch_auth_class_switch_answered(
             // Rollback target is the model on display when the switch was stashed.
             prev_model_id: agent.session.models.current.clone(),
             prev_model_id_captured: true,
+            session_only: false,
         });
         return vec![];
     };

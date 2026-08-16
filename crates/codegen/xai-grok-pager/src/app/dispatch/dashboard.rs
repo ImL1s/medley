@@ -1739,6 +1739,7 @@ pub(super) fn apply_pending_dispatch_config(
                         // Effort-only push; no display change to roll back.
                         prev_model_id: None,
                         prev_model_id_captured: false,
+                        session_only: false,
                     });
                 } else if let Some(agent) = app.agents.get_mut(&agent_id) {
                     // Refused at stash time: the request completes here, once,

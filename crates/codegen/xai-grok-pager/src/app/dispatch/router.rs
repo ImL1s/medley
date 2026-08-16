@@ -995,7 +995,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 agent.session.models.set_current(model_id.clone(), effort);
                 agent
                     .session
-                    .stash_deferred_model_switch(model_id, effort, prev_model);
+                    .stash_deferred_model_switch(model_id, effort, prev_model, session_only);
                 return vec![];
             };
             let request_id = super::session::lifecycle::begin_model_switch_request(
