@@ -388,6 +388,7 @@ pub fn snapshot_from_resolution(
                 attempt: None,
                 resume_source_receipt: None,
                 rejected_candidates: Vec::new(),
+                last_fallback_admitted: None,
             };
         }
     };

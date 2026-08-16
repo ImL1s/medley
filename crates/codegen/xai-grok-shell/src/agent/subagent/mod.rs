@@ -830,8 +830,7 @@ async fn resolve_request_prepared_model_with_native_route(
                     "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
                 ));
             }
-            route_definition.model =
-                xai_grok_agent::config::ModelOverride::Override(catalog_id);
+            route_definition.model = xai_grok_agent::config::ModelOverride::Override(catalog_id);
         }
         let request = request_from_agent_definition(
             &route_definition,
