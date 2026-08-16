@@ -1537,6 +1537,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 session_id: session_id_clone.clone(),
                 model_id: switch.model_id,
                 effort: switch.effort,
+                session_only: switch.session_only,
                 request_id,
                 prev_model_id: switch.prev_model_id,
             });
@@ -1742,6 +1743,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
                 session_id: session_id_clone.clone(),
                 model_id: switch.model_id,
                 effort: switch.effort,
+                session_only: switch.session_only,
                 request_id,
                 prev_model_id: switch.prev_model_id,
             });
@@ -2276,6 +2278,7 @@ pub(in crate::app::dispatch) fn dispatch_auth_class_switch_answered(
         session_id,
         model_id,
         effort,
+        session_only: false,
         request_id,
         prev_model_id: None,
     }]

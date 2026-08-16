@@ -35,7 +35,14 @@ fn start_test_model_switch(
         insert_ready_model(app, agent_id, &model_id);
     }
     assert_eq!(app.active_view, ActiveView::Agent(agent_id));
-    let effects = dispatch(Action::SwitchModel { model_id, effort, session_only: false }, app);
+    let effects = dispatch(
+        Action::SwitchModel {
+            model_id,
+            effort,
+            session_only: false,
+        },
+        app,
+    );
     switch_model_request_id(&effects)
 }
 
@@ -4624,10 +4631,7 @@ fn session_only_model_switch_does_not_persist() {
     );
 
     // Verify the session model was updated
-    assert_eq!(
-        app.agents[&agent_id].session.models.current,
-        Some(model_b)
-    );
+    assert_eq!(app.agents[&agent_id].session.models.current, Some(model_b));
 
     // Verify app-global model was NOT persisted (it may be updated in memory for UI consistency)
     // The key is that no PersistPreferredModel effect was emitted

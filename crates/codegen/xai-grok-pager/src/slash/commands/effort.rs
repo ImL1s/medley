@@ -197,7 +197,11 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = EffortCommand.run(&mut ctx, "high");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort, session_only }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::High));
                 assert!(session_only, "effort switch must be session-only");

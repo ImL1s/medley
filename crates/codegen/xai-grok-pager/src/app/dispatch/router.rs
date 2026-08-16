@@ -903,7 +903,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             }]
         }
         Action::NextModel => vec![],
-        Action::SwitchModel { model_id, effort, session_only } => {
+        Action::SwitchModel {
+            model_id,
+            effort,
+            session_only,
+        } => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
             };
