@@ -1852,6 +1852,7 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
             session_id: sid,
             model_id: new_id,
             effort: None,
+            session_only: false,
             request_id: request_id.expect("live session opened a model-switch transaction"),
             prev_model_id: prev_id.clone(),
         });
