@@ -4616,17 +4616,15 @@ fn adoption_persists_model(pre_session: bool) {
 
 #[test]
 fn session_only_model_switch_does_not_persist() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut app = test_app_with_cwd(temp.path().to_path_buf());
-    let model_a = acp::ModelId("model-a".into());
-    let model_b = acp::ModelId("model-b".into());
-    insert_ready_model(&mut app, AgentId(1), &model_a);
-    insert_ready_model(&mut app, AgentId(1), &model_b);
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let model_a = acp::ModelId::new("model-a".into());
+    let model_b = acp::ModelId::new("model-b".into());
+    insert_ready_model(&mut app, agent_id, &model_a);
+    insert_ready_model(&mut app, agent_id, &model_b);
 
     // Start with model_a as the default
     app.models.current = Some(model_a.clone());
-
-    let (agent_id, _) = test_session(&mut app);
 
     // Switch to model_b with session_only=true
     let request_id = start_model_switch(
@@ -4670,7 +4668,7 @@ fn start_model_switch(
     app: &mut AppView,
     agent_id: AgentId,
     model_id: acp::ModelId,
-    effort: Option<ReasoningEffort>,
+    effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
     session_only: bool,
 ) -> u64 {
     let effects = dispatch(
