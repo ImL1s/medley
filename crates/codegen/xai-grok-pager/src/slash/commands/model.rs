@@ -954,9 +954,9 @@ mod tests {
             }) => {
                 assert_eq!(model_id, id);
             }
-            other => panic!(
-                "expected Action::SwitchModel with --session before name, got {other:?}"
-            ),
+            other => {
+                panic!("expected Action::SwitchModel with --session before name, got {other:?}")
+            }
         }
     }
 
@@ -976,9 +976,7 @@ mod tests {
             }) => {
                 assert_eq!(model_id, id);
             }
-            other => panic!(
-                "expected Action::SwitchModel with uppercase --SESSION, got {other:?}"
-            ),
+            other => panic!("expected Action::SwitchModel with uppercase --SESSION, got {other:?}"),
         }
     }
 

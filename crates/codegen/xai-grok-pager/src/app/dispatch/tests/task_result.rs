@@ -4626,7 +4626,9 @@ fn session_only_model_switch_does_not_persist() {
 
     // Verify that NO PersistPreferredModel effect was emitted
     assert!(
-        !effects.iter().any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
         "session_only switch must NOT emit PersistPreferredModel"
     );
 
