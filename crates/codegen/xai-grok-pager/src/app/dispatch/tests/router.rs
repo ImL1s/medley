@@ -1323,6 +1323,7 @@ fn deferred_model_switch_still_works_for_cli_override() {
             effort: None,
             prev_model_id: None,
             prev_model_id_captured: false,
+            session_only: false,
         }),
         "CLI -m override must still populate deferred_model_switch",
     );

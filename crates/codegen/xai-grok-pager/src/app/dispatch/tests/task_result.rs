@@ -1084,6 +1084,7 @@ fn switch_model_complete_without_exact_request_id_is_ignored() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1169,6 +1170,7 @@ fn switch_model_complete_persists_resolved_effort_from_catalog_meta() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1274,6 +1276,7 @@ fn switch_model_complete_failure_pushes_error_and_clears_pending() {
             request_id,
             result: Err(SwitchModelError::Other("model not found".into())),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1314,6 +1317,7 @@ fn switch_model_incompatible_agent_shows_question_modal() {
             }),
             session_only: false,
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1373,6 +1377,7 @@ fn incompatible_model_switch_opens_question_on_originating_session() {
             }),
             session_only: false,
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1455,6 +1460,7 @@ fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question
             }),
             session_only: false,
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1515,6 +1521,7 @@ fn incompatible_model_switch_holds_queue_until_declined() {
             }),
             session_only: false,
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1660,6 +1667,7 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
             }),
             session_only: false,
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1732,6 +1740,7 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2012,6 +2021,7 @@ fn failed_replacement_restores_and_drains_handed_queue_before_new_source_prompts
             }),
             session_only: false,
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2130,6 +2140,7 @@ fn incompatible_agent_rollback_restores_previous_model() {
                 prev_model_id: Some(prev_model.clone()),
             }),
             prev_model_id: Some(prev_model.clone()),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2216,6 +2227,7 @@ fn switch_model_unavailable_harness_rolls_back_default_without_new_session_modal
                 prev_model_id: Some(prev_model.clone()),
             }),
             prev_model_id: Some(prev_model.clone()),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2300,6 +2312,7 @@ fn confirmed_default_model_switch_persists_after_optimistic_mirror_update() {
             request_id,
             result: Ok(()),
             prev_model_id: Some(prev_model),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2366,6 +2379,7 @@ fn replacement_session_persists_confirmed_default_after_creation() {
                 prev_model_id: Some(previous.clone()),
             }),
             prev_model_id: Some(previous.clone()),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2470,6 +2484,7 @@ fn chat_mode_default_switch_does_not_persist_build_default() {
             request_id,
             result: Ok(()),
             prev_model_id: Some(previous),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2623,6 +2638,7 @@ fn generic_switch_failure_restores_exact_model_mirrors_and_effort() {
             request_id,
             result: Err(SwitchModelError::Other("transport closed".into())),
             prev_model_id: Some(prev_model.clone()),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2726,6 +2742,7 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
             request_id: second_request_id,
             result: Ok(()),
             prev_model_id: Some(global_original),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2739,6 +2756,7 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
             request_id: first_request_id,
             result: Err(SwitchModelError::Other("session switch failed".into())),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2825,6 +2843,7 @@ fn older_session_switch_success_cannot_overwrite_newer_committed_default() {
             request_id: second_request_id,
             result: Ok(()),
             prev_model_id: Some(global_original),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2842,6 +2861,7 @@ fn older_session_switch_success_cannot_overwrite_newer_committed_default() {
             request_id: first_request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2904,6 +2924,7 @@ fn rapid_model_selections_are_serialized_and_stale_completion_is_ignored() {
             request_id: first_request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2918,6 +2939,7 @@ fn rapid_model_selections_are_serialized_and_stale_completion_is_ignored() {
             request_id: first_request_id,
             result: Err(SwitchModelError::Other("late duplicate".into())),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2938,6 +2960,7 @@ fn rapid_model_selections_are_serialized_and_stale_completion_is_ignored() {
             request_id: second_request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2984,6 +3007,7 @@ fn incompatible_agent_closes_active_modal() {
             }),
             session_only: false,
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -3031,6 +3055,7 @@ fn same_agent_type_switch_no_modal() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -3078,6 +3103,7 @@ fn switch_model_pending_lifecycle() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -4546,6 +4572,7 @@ fn adoption_persists_model(pre_session: bool) {
             }),
             session_only: false,
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );

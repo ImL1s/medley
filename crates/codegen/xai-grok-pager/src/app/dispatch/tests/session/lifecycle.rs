@@ -1414,6 +1414,7 @@ fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
             effort: None,
             prev_model_id: Some(model_old.clone()),
             prev_model_id_captured: false,
+            session_only: false,
         });
         agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
             request_id: None,
@@ -1496,6 +1497,7 @@ fn deferred_switch_dropped_at_apply_releases_stash_time_slot() {
             effort: None,
             prev_model_id: None,
             prev_model_id_captured: false,
+            session_only: false,
         });
     }
     // The stash-time claim: this agent owns the slot, no request id yet.
