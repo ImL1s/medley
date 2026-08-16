@@ -950,7 +950,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: None,
-                session_only,
+                session_only: _,
             }) => {
                 assert_eq!(model_id, id);
             }
@@ -972,7 +972,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: None,
-                session_only,
+                session_only: _,
             }) => {
                 assert_eq!(model_id, id);
             }
@@ -992,7 +992,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: None,
-                session_only,
+                session_only: _,
             }) => {
                 assert_eq!(model_id, id);
             }

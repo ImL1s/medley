@@ -4618,8 +4618,8 @@ fn adoption_persists_model(pre_session: bool) {
 fn session_only_model_switch_does_not_persist() {
     let mut app = test_app_with_agent();
     let agent_id = AgentId(0);
-    let model_a = acp::ModelId::new("model-a".into());
-    let model_b = acp::ModelId::new("model-b".into());
+    let model_a = acp::ModelId::new("model-a");
+    let model_b = acp::ModelId::new("model-b");
     insert_ready_model(&mut app, agent_id, &model_a);
     insert_ready_model(&mut app, agent_id, &model_b);
 
@@ -4666,7 +4666,7 @@ fn session_only_model_switch_does_not_persist() {
 
 fn start_model_switch(
     app: &mut AppView,
-    agent_id: AgentId,
+    _agent_id: AgentId,
     model_id: acp::ModelId,
     effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
     session_only: bool,

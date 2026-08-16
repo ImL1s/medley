@@ -223,7 +223,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort,
-                session_only,
+                session_only: _,
             }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Minimal));
@@ -266,7 +266,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort,
-                session_only,
+                session_only: _,
             }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::None));
@@ -320,7 +320,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort,
-                session_only,
+                session_only: _,
             }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Ultra));
@@ -349,7 +349,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort,
-                session_only,
+                session_only: _,
             }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Xhigh));
@@ -498,7 +498,7 @@ mod tests {
                 CommandResult::Action(Action::SwitchModel {
                     model_id,
                     effort,
-                    session_only,
+                    session_only: _,
                 }) => {
                     assert_eq!(model_id, id_a);
                     assert_eq!(effort, Some(ReasoningEffort::None));
@@ -537,7 +537,7 @@ mod tests {
                 CommandResult::Action(Action::SwitchModel {
                     model_id,
                     effort,
-                    session_only,
+                    session_only: _,
                 }) => {
                     assert_eq!(model_id, id_b);
                     assert_eq!(effort, Some(ReasoningEffort::Minimal));
