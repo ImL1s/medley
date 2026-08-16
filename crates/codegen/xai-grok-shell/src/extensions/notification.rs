@@ -690,6 +690,12 @@ pub enum SessionUpdate {
         resumed_from: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_run_id: Option<String>,
+        /// Digest of the native route receipt when spawn resolved one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route_receipt_digest: Option<String>,
+        /// Catalog id selected by native route resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_catalog_id: Option<String>,
     },
     /// Periodic progress update for a running subagent.
     ///
@@ -1645,6 +1651,8 @@ mod tests {
             model: None,
             resumed_from: None,
             workflow_run_id: None,
+            route_receipt_digest: None,
+            selected_catalog_id: None,
         })
         .unwrap();
         let progress = serde_json::to_value(SessionUpdate::SubagentProgress {

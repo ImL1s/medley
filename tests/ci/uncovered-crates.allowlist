@@ -11,7 +11,6 @@ xai-computer-hub-core
 xai-computer-hub-mcp-adapter
 xai-crash-handler
 xai-gix-status
-xai-grok-agent
 xai-grok-announcements
 xai-grok-compaction
 xai-grok-config-types

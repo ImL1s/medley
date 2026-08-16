@@ -19,22 +19,32 @@ consumer [ImL1s/oh-my-grok#131](https://github.com/ImL1s/oh-my-grok/issues/131) 
 
 ## Implemented versus planned
 
-**Implemented in this slice** (`xai-grok-subagent-resolution::native_route`):
+**Implemented in this slice** (`xai-grok-subagent-resolution::native_route`
+plus live spawn in `xai-grok-shell`):
 
 - versioned capability discovery (`supported` / `unsupported` / `unavailable` /
   `incompatible` / `unknown`);
 - exact / inherit / ordered-candidate request types;
-- deterministic offline resolver over a synthetic catalog;
+- deterministic resolver over a synthetic catalog and the live session catalog;
 - immutable secret-free route receipts and digests;
 - inspect JSON (`medley.native-subagent-route.inspect/v1`);
-- declarative `model` / `models` / `routingRequirements` parse;
-- typed `AgentRouteUxSnapshot` plus compact/detail formatters used by `/agents`.
+- declarative `model` / `models` / `routingRequirements` parse on real
+  `AgentDefinition` files;
+- typed `AgentRouteUxSnapshot` plus compact/detail formatters used by `/agents`;
+- spawn-time persistence of receipts on `SubagentMeta`, GCS `subagent.json`
+  (`routeReceiptDigest`), and optional ACP `SubagentSpawned` fields;
+- inspect/adapter usage facts helper from the canonical receipt (`catalogId` /
+  `wireModel` / `accessProfile` / `routeDigest`); live `by_model` usage still
+  keys by catalog id on the existing #23 path.
+
+Live exact `model:` still uses the legacy pin path: an unknown catalog id warns
+and falls through to inherit. Fail-closed exact selection is the offline
+resolver and the `models:` ordered path.
 
 **Not implemented here (do not claim):**
 
-- wiring the resolver into live child-session spawn;
-- persisting receipts on real sessions / ACP / usage;
-- generation-bound `/agents` mutation;
+- generation-bound `/agents` mutation, lifecycle cards, picker/#207, or the
+  full a11y matrix ([#290](https://github.com/ImL1s/medley/issues/290));
 - replay-safe runtime fallback ([#18](https://github.com/ImL1s/medley/issues/18));
 - qualified model-family metadata.
 

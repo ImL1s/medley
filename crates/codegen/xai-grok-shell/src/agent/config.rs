@@ -6937,7 +6937,7 @@ fn invalid_auth_scheme_validation_error(raw: &str) -> String {
 }
 
 /// Credential class for picker UX: keyless, env/BYOK, or xAI session/login.
-fn auth_class_for_entry(model: &ModelEntry) -> &'static str {
+pub(crate) fn auth_class_for_entry(model: &ModelEntry) -> &'static str {
     if model.info.auth_scheme == AuthScheme::None {
         "none"
     } else if model.has_own_credentials()
@@ -6951,17 +6951,8 @@ fn auth_class_for_entry(model: &ModelEntry) -> &'static str {
 
 /// Short provider label for picker rows (`providerHint`).
 fn provider_hint_for_url(base_url: &str) -> String {
-    // Check loopback before `is_xai_api_url` — that helper treats localhost as
-    // cli-chat-proxy for credential refusal, which is not a useful picker label.
-    if let Ok(parsed) = reqwest::Url::parse(base_url) {
-        match parsed.host() {
-            Some(url::Host::Domain("localhost")) => {
-                return "local".to_string();
-            }
-            Some(url::Host::Ipv4(ip)) if ip.is_loopback() => return "local".to_string(),
-            Some(url::Host::Ipv6(ip)) if ip.is_loopback() => return "local".to_string(),
-            _ => {}
-        }
+    if catalog_endpoint_is_local(base_url) {
+        return "local".to_string();
     }
     if crate::util::is_xai_api_url(base_url) {
         return "xAI".to_string();
@@ -6975,6 +6966,33 @@ fn provider_hint_for_url(base_url: &str) -> String {
         Some(url::Host::Ipv6(ip)) => ip.to_string(),
         None => base_url.to_string(),
     }
+}
+
+/// Loopback catalog endpoints are `local_only` for native route eligibility.
+pub(crate) fn catalog_endpoint_is_local(base_url: &str) -> bool {
+    // Check loopback before `is_xai_api_url` — that helper treats localhost as
+    // cli-chat-proxy for credential refusal, which is not a useful picker label.
+    let Ok(parsed) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => true,
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => true,
+        _ => false,
+    }
+}
+
+/// `local_only` eligibility for one catalog entry.
+///
+/// Session auth uses `base_url`; the `XAI_API_KEY` arm uses `api_base_url`
+/// when set (`resolve_credentials`). This function cannot see which credential
+/// is live, so every arm that spawn might send must be loopback. A loopback
+/// `base_url` with a remote `api_base_url` is not local.
+pub(crate) fn catalog_entry_is_local(model: &ModelEntry) -> bool {
+    let session_url = model.info.base_url.as_str();
+    let api_url = model.api_base_url.as_deref().unwrap_or(session_url);
+    catalog_endpoint_is_local(session_url) && catalog_endpoint_is_local(api_url)
 }
 
 /// #135 origin binding for the built-in OpenAI Codex provider: its bearer is

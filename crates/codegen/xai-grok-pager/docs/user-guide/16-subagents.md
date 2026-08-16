@@ -64,9 +64,13 @@ executable name.
 The canonical page is
 [`docs/architecture/native-subagent-route-contract.md`](../../../../../docs/architecture/native-subagent-route-contract.md).
 `/agents` compact rows include a non-color route status; expanded details show
-selection and receipt fields when present. Live spawn still uses existing
-`model: inherit` / exact `model:` strings until a later slice wires the
-resolver into child-session construction.
+selection, `models:` candidates, and receipt fields when present. Live spawn
+resolves ordered `models:` fail-closed against the session catalog and persists
+a secret-free route receipt on the child session. Legacy exact `model:` still
+falls through to inherit when the id is unknown. Replay-safe runtime fallback
+remains [#18](https://github.com/ImL1s/medley/issues/18). Generation-bound
+`/agents` mutation and lifecycle cards remain
+[#290](https://github.com/ImL1s/medley/issues/290).
 
 ---
 
