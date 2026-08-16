@@ -1553,7 +1553,7 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
         CommandResult::Action(Action::SwitchModel {
             model_id,
             effort,
-            session_only,
+            session_only: _,
         }) => {
             stage_dashboard_model(app, model_id, effort);
             vec![]

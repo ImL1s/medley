@@ -1870,7 +1870,7 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
         // persisted a preference for a model that had not changed.
         agent
             .session
-            .stash_deferred_model_switch(new_id, None, prev_id);
+            .stash_deferred_model_switch(new_id, None, prev_id, false);
     }
     effects
 }
