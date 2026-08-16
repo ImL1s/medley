@@ -683,7 +683,11 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = ModelCommand.run(&mut ctx, "Reasoning X xhigh");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort, session_only }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only,
+            }) => {
                 assert_eq!(model_id.0.as_ref(), "reasoning-x");
                 assert_eq!(effort, Some(ReasoningEffort::Xhigh));
                 assert!(session_only);
@@ -753,7 +757,11 @@ mod tests {
 
         let mut exec_ctx = dummy_exec_ctx(&state);
         match ModelCommand.run(&mut exec_ctx, "GPT-5.6 Sol ultra") {
-            CommandResult::Action(Action::SwitchModel { model_id, effort, session_only }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Ultra));
                 assert!(session_only);
