@@ -5177,3 +5177,181 @@ fn resume_digest_comes_from_source_meta_not_current_spawn() {
         "missing source meta must not invent a current-spawn digest"
     );
 }
+
+#[tokio::test]
+async fn native_exact_unknown_model_fails_closed() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::explore();
+    definition.model = xai_grok_agent::config::ModelOverride::Override("does-not-exist".into());
+    let err = match resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(resolved) => panic!(
+            "unknown exact must not inherit parent ({})",
+            resolved.prepared.model_id.0
+        ),
+        Err(err) => err,
+    };
+    assert!(err.contains("native route failed"), "{err}");
+    assert!(
+        err.contains("exact_model_missing") || err.contains("does-not-exist"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn native_exact_known_model_selects_catalog() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("review-exact".into(), test_model_entry("review-exact"));
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
+    definition.model = xai_grok_agent::config::ModelOverride::Override("review-exact".into());
+    definition.models.clear();
+    let resolved = resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "grok-build-plan",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    .expect("known exact must resolve");
+    assert_eq!(resolved.prepared.model_id.0.as_ref(), "review-exact");
+    let receipt = resolved.receipt.expect("receipt");
+    assert_eq!(receipt.selection_mode, "exact");
+    assert_eq!(receipt.selected_catalog_id, "review-exact");
+}
+
+#[tokio::test]
+async fn native_exact_incompatible_harness_fails_closed() {
+    let mut models = indexmap::IndexMap::new();
+    let mut codex = test_model_entry("review-codex");
+    codex.info.agent_type = "codex".into();
+    models.insert("review-codex".into(), codex);
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::explore();
+    definition.model = xai_grok_agent::config::ModelOverride::Override("review-codex".into());
+    let err = match resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(resolved) => panic!(
+            "incompatible exact must not inherit parent ({})",
+            resolved.prepared.model_id.0
+        ),
+        Err(err) => err,
+    };
+    assert!(err.contains("native route failed"), "{err}");
+    assert!(err.contains("harness_incompatible"), "{err}");
+}
+
+#[tokio::test]
+async fn native_exact_unique_wire_slug_canonicalizes_to_catalog_id() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert(
+        "custom-local".into(),
+        test_model_entry("unique-wire-slug"),
+    );
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
+    definition.model =
+        xai_grok_agent::config::ModelOverride::Override("unique-wire-slug".into());
+    definition.models.clear();
+    let resolved = resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "grok-build-plan",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    .expect("unique wire slug must canonicalize");
+    assert_eq!(resolved.prepared.model_id.0.as_ref(), "custom-local");
+    let receipt = resolved.receipt.expect("receipt");
+    assert_eq!(receipt.selection_mode, "exact");
+    assert_eq!(receipt.selected_catalog_id, "custom-local");
+}
+
+#[tokio::test]
+async fn native_exact_ambiguous_wire_slug_fails_closed() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("first-key".into(), test_model_entry("shared-wire"));
+    models.insert("second-key".into(), test_model_entry("shared-wire"));
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::explore();
+    definition.model = xai_grok_agent::config::ModelOverride::Override("shared-wire".into());
+    let err = match resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(resolved) => panic!(
+            "ambiguous exact must not inherit parent ({})",
+            resolved.prepared.model_id.0
+        ),
+        Err(err) => err,
+    };
+    assert!(err.contains("native route failed"), "{err}");
+    assert!(err.contains("exact_model_missing"), "{err}");
+}

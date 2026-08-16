@@ -82,6 +82,72 @@ pub struct AgentRouteUxSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_source_receipt: Option<String>,
     pub rejected_candidates: Vec<(String, RejectionCode)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fallback_admitted: Option<bool>,
+}
+
+/// Distinct lifecycle labels. Same-route retry is never shown as fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecyclePhase {
+    SelectingRoute,
+    RunningAttempt,
+    RetryingSameRoute,
+    FallingBack,
+    FallbackRefused,
+    ResumedFromPriorReceipt,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl LifecyclePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SelectingRoute => "selecting route",
+            Self::RunningAttempt => "running attempt",
+            Self::RetryingSameRoute => "retrying same route",
+            Self::FallingBack => "falling back to another route",
+            Self::FallbackRefused => "fallback refused",
+            Self::ResumedFromPriorReceipt => "resumed from prior receipt",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Idle configuration snapshots have no lifecycle. `SelectingRoute` is only
+/// for an attached in-flight selection, not for opening `/agents`.
+pub fn lifecycle_phase_for_snapshot(snapshot: &AgentRouteUxSnapshot) -> Option<LifecyclePhase> {
+    if snapshot.resume_source_receipt.is_some() {
+        return Some(LifecyclePhase::ResumedFromPriorReceipt);
+    }
+    match snapshot.last_fallback_admitted {
+        Some(false) => return Some(LifecyclePhase::FallbackRefused),
+        Some(true) => return Some(LifecyclePhase::FallingBack),
+        None => {}
+    }
+    if snapshot.attempt.is_some_and(|n| n > 1) {
+        return Some(LifecyclePhase::RetryingSameRoute);
+    }
+    if snapshot.attempt.is_some() {
+        return Some(LifecyclePhase::RunningAttempt);
+    }
+    None
+}
+
+/// One lifecycle card line. Labels stay distinct; do not parse this string.
+pub fn format_lifecycle_line(phase: LifecyclePhase, attempt: Option<u32>) -> String {
+    match (phase, attempt) {
+        (LifecyclePhase::RunningAttempt, Some(n)) => {
+            format!("  Lifecycle: running attempt {n}")
+        }
+        (LifecyclePhase::RetryingSameRoute, Some(n)) => {
+            format!("  Lifecycle: retrying same route (attempt {n})")
+        }
+        _ => format!("  Lifecycle: {}", phase.as_str()),
+    }
 }
 
 /// Compact row: identity, status, selection/route, readiness, capability floor.
@@ -178,6 +244,14 @@ pub fn format_route_detail(snapshot: &AgentRouteUxSnapshot) -> Vec<String> {
             lines.push(format!("    - {id} ({})", code.as_str()));
         }
     }
+    if let Some(phase) = lifecycle_phase_for_snapshot(snapshot) {
+        lines.push(format_lifecycle_line(phase, snapshot.attempt));
+    }
+    if snapshot.last_fallback_admitted == Some(false) {
+        lines.push("  Last fallback: refused".into());
+    } else if snapshot.last_fallback_admitted == Some(true) {
+        lines.push("  Last fallback: admitted".into());
+    }
     lines
 }
 
@@ -225,6 +299,7 @@ pub fn snapshot_from_model_override(
         attempt: None,
         resume_source_receipt: None,
         rejected_candidates: Vec::new(),
+        last_fallback_admitted: None,
     }
 }
 
@@ -273,6 +348,7 @@ pub fn snapshot_from_agent_definition(
         attempt: None,
         resume_source_receipt: None,
         rejected_candidates: Vec::new(),
+        last_fallback_admitted: None,
     }
 }
 
@@ -312,6 +388,7 @@ pub fn snapshot_from_resolution(
                 attempt: None,
                 resume_source_receipt: None,
                 rejected_candidates: Vec::new(),
+                last_fallback_admitted: None,
             };
         }
     };
@@ -336,6 +413,7 @@ pub fn snapshot_from_resolution(
             attempt: None,
             resume_source_receipt: None,
             rejected_candidates: Vec::new(),
+            last_fallback_admitted: None,
         };
     }
     AgentRouteUxSnapshot {
@@ -363,5 +441,6 @@ pub fn snapshot_from_resolution(
             .iter()
             .map(|row| (row.catalog_id.clone(), row.reason_code))
             .collect(),
+        last_fallback_admitted: None,
     }
 }

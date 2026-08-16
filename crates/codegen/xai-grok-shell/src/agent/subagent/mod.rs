@@ -766,9 +766,9 @@ fn runtime_or_config_pin_resolves(
         .is_some_and(|model_id| resolve_model_override_to_prepared(model_id, ctx).is_some())
 }
 
-/// Live native-route resolution for spawn. Ordered `models:` is fail-closed.
-/// Runtime / `[subagents.models]` pins still win when they resolve. Legacy
-/// exact `model:` keeps falling through on unknown ids.
+/// Live native-route resolution for spawn. Ordered `models:` and exact
+/// `model:` are fail-closed. Runtime / `[subagents.models]` pins still win
+/// when they resolve. Unknown exact ids never inherit.
 ///
 /// `harness_definition` is the pre-CLI-overlay spawn definition used by
 /// model-harness preflight. Incompatible catalog harnesses are skipped so
@@ -786,21 +786,51 @@ async fn resolve_request_prepared_model_with_native_route(
 ) -> Result<NativeRoutePrepared, String> {
     let catalog = native_route_live::synthetic_catalog_from_available_models(&ctx.available_models);
     let now = native_route_now_ms();
+    let exact_or_ordered = !definition.models.is_empty()
+        || matches!(
+            definition.model,
+            xai_grok_agent::config::ModelOverride::Override(_)
+        );
     if !fork_context
         && allow_native_ordered
-        && !definition.models.is_empty()
+        && exact_or_ordered
         && !runtime_or_config_pin_resolves(runtime_override_model, subagent_type, ctx)
     {
         let mut route_definition = definition.clone();
-        route_definition.models.retain(|catalog_id| {
-            ctx.available_models
-                .get(catalog_id)
-                .is_some_and(|entry| live_catalog_harness_can_spawn(harness_definition, entry, ctx))
-        });
-        if route_definition.models.is_empty() {
-            return Err(format!(
-                "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
-            ));
+        if !route_definition.models.is_empty() {
+            route_definition.models.retain(|catalog_id| {
+                ctx.available_models.get(catalog_id).is_some_and(|entry| {
+                    live_catalog_harness_can_spawn(harness_definition, entry, ctx)
+                })
+            });
+            if route_definition.models.is_empty() {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
+                ));
+            }
+        } else if let xai_grok_agent::config::ModelOverride::Override(requested_id) =
+            &definition.model
+        {
+            let Some(identity) = crate::agent::models::resolve_catalog_identity(
+                &ctx.available_models,
+                &acp::ModelId::new(requested_id.clone()),
+            ) else {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (exact_model_missing)"
+                ));
+            };
+            let catalog_id = identity.model_id;
+            let Some(entry) = ctx.available_models.get(catalog_id.as_str()) else {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (exact_model_missing)"
+                ));
+            };
+            if !live_catalog_harness_can_spawn(harness_definition, entry, ctx) {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
+                ));
+            }
+            route_definition.model = xai_grok_agent::config::ModelOverride::Override(catalog_id);
         }
         let request = request_from_agent_definition(
             &route_definition,
@@ -822,7 +852,11 @@ async fn resolve_request_prepared_model_with_native_route(
             })?;
         log_subagent_model_resolution(
             subagent_type,
-            "native_ordered",
+            if definition.models.is_empty() {
+                "native_exact"
+            } else {
+                "native_ordered"
+            },
             &prepared.sampling_config,
             &prepared.model_id,
             &ctx.sampling_config,
