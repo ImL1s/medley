@@ -2407,6 +2407,18 @@ fn prefer_readline_mode_in_toml(root: &mut toml::Value) {
 
 impl Config {
     pub fn new_from_toml_cfg(raw_config: &toml::Value) -> Result<Self, String> {
+        Self::from_toml_cfg(raw_config, true)
+    }
+
+    /// Parse config without a live Codex `GET /models`.
+    ///
+    /// Used by standalone doctor / inspect so a usable Codex credential cannot
+    /// stall the report or mutate the catalog cache.
+    pub fn new_from_toml_cfg_offline(raw_config: &toml::Value) -> Result<Self, String> {
+        Self::from_toml_cfg(raw_config, false)
+    }
+
+    fn from_toml_cfg(raw_config: &toml::Value, allow_remote_catalog: bool) -> Result<Self, String> {
         let raw_config_with_project_models = if let Ok(cwd) = std::env::current_dir() {
             let project_trusted = crate::agent::folder_trust::project_scope_allowed(&cwd);
             crate::config::merge_project_model_sections(raw_config, &cwd, project_trusted)
@@ -2419,7 +2431,11 @@ impl Config {
             models: mut config_models,
             warnings: config_warnings,
         } = super::config_model_override_parse::parse_model_overrides(raw_config);
-        super::model_providers::merge_openai_codex_presets(&mut config_models);
+        if allow_remote_catalog {
+            super::model_providers::merge_openai_codex_presets(&mut config_models);
+        } else {
+            super::model_providers::merge_openai_codex_presets_offline(&mut config_models);
+        }
         let (mut auth_providers, auth_provider_warnings) = parse_auth_providers(raw_config);
         let (model_providers, mut model_provider_warnings) = parse_model_providers(raw_config);
         for (id, provider) in &model_providers {

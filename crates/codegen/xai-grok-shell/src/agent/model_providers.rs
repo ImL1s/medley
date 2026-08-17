@@ -858,7 +858,26 @@ fn fetch_openai_codex_catalog_models_on_native_thread(
     }
 }
 
+thread_local! {
+    static LIVE_CODEX_CATALOG_FETCH_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn record_live_codex_catalog_fetch_attempt() {
+    LIVE_CODEX_CATALOG_FETCH_ATTEMPTS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+pub(crate) fn live_codex_catalog_fetch_attempts() -> u32 {
+    LIVE_CODEX_CATALOG_FETCH_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_live_codex_catalog_fetch_attempts() {
+    LIVE_CODEX_CATALOG_FETCH_ATTEMPTS.with(|count| count.set(0));
+}
+
 fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOverride>> {
+    record_live_codex_catalog_fetch_attempt();
     if cfg!(test) {
         return None;
     }
@@ -1021,6 +1040,33 @@ pub(crate) fn merge_openai_codex_presets(
         config_models,
         effective_openai_codex_presets(fetch_openai_codex_catalog_models()),
     );
+}
+
+/// Same overlay as [`merge_openai_codex_presets`], but never `GET /models`.
+///
+/// Standalone `grok doctor` / inspect must stay side-effect-free: a usable
+/// Codex credential plus default remote fetch would otherwise block on the
+/// startup timeout and rewrite the account catalog cache.
+pub(crate) fn merge_openai_codex_presets_offline(
+    config_models: &mut IndexMap<String, ConfigModelOverride>,
+) {
+    merge_openai_codex_preset_entries(
+        config_models,
+        effective_openai_codex_presets(offline_openai_codex_catalog_models()),
+    );
+}
+
+fn offline_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOverride>> {
+    if cfg!(test) {
+        return None;
+    }
+    let home = crate::util::grok_home::grok_home();
+    let Some((cache_identity, _)) = codex_catalog_access(&home) else {
+        return Some(codex_catalog_fallback_models(None));
+    };
+    let cache_path = codex_catalog_cache_path(&home, &cache_identity);
+    load_codex_catalog_when_remote_fetch_disabled(cache_path.as_deref())
+        .or_else(|| Some(codex_catalog_fallback_models(cache_path.as_deref())))
 }
 
 fn merge_openai_codex_preset_entries(

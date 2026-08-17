@@ -69,8 +69,8 @@ pub struct InspectedModelRoute {
 
 /// Offline inspect routes for standalone `grok doctor`.
 ///
-/// Same load path as `grok inspect`: effective config, `compat` stripped so a
-/// malformed cell cannot block the rest, then `Config::new_from_toml_cfg`.
+/// Effective config, `compat` stripped so a malformed cell cannot block the
+/// rest, then an **offline** `Config` load (no Codex `GET /models`).
 /// Empty when the file cannot be loaded or parsed.
 pub fn inspect_model_routes_offline() -> Vec<InspectedModelRoute> {
     let Ok(effective) = crate::config::load_effective_config() else {
@@ -82,8 +82,9 @@ pub fn inspect_model_routes_offline() -> Vec<InspectedModelRoute> {
 /// Secret-free inspect routes from an already-loaded TOML table.
 ///
 /// Used by doctor tests with fixtures. Empty when `Config` parse fails.
+/// Never performs a live Codex catalog fetch.
 pub fn inspect_model_routes_from_toml(root: &toml::Value) -> Vec<InspectedModelRoute> {
-    let Ok(cfg) = Config::new_from_toml_cfg(root) else {
+    let Ok(cfg) = Config::new_from_toml_cfg_offline(root) else {
         return Vec::new();
     };
     inspected_routes_from_config(&cfg)
@@ -252,6 +253,23 @@ api_key = "{SECRET}"
         for rendered in [json.as_str(), debug.as_str()] {
             assert_secret_free(rendered);
         }
+    }
+
+    #[test]
+    fn issue15_inspect_model_routes_from_toml_does_not_attempt_live_codex_catalog_fetch() {
+        crate::agent::model_providers::reset_live_codex_catalog_fetch_attempts();
+        let root: toml::Value =
+            toml::from_str(&issue15_fixture_toml()).expect("issue15 fixture TOML");
+        let routes = inspect_model_routes_from_toml(&root);
+        assert!(
+            !routes.is_empty(),
+            "offline inspect must still resolve fixture routes"
+        );
+        assert_eq!(
+            crate::agent::model_providers::live_codex_catalog_fetch_attempts(),
+            0,
+            "standalone doctor inspect must not call GET /models"
+        );
     }
 
     #[test]
