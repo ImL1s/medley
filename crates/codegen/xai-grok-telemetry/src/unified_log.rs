@@ -445,6 +445,7 @@ fn test_log_dir() -> &'static PathBuf {
             "grok-unified-log-test-{}-{nanos}",
             std::process::id()
         ));
+        #[allow(unused_mut)]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {

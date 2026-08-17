@@ -8,7 +8,7 @@ use xai_grok_sampling_types::{
 use super::ChatStateActor;
 use super::request_builder::HARD_CLEAR_PLACEHOLDER;
 use crate::events::ChatStateEvent;
-use crate::types::{ChatStateSnapshot, TrustedPromptSuffix, TrustedReminderMessage};
+use crate::types::{ChatStateSnapshot, TrustedPromptSuffix};
 
 /// Static string label for tracing on `ConversationItem` (avoids pulling
 /// the `Role` enum into the format string).

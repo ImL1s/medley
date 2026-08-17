@@ -1798,7 +1798,7 @@ impl McpErasedTool {
                 });
                 service
             }
-            Err(e) => {
+            Err(_e) => {
                 ew.emit(xai_grok_session_events::Event::McpTransportReconnect {
                     server_name: self.tool.server_name.clone(),
                     success: false,
