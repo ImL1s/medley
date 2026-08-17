@@ -1206,6 +1206,7 @@ fn sync_session_tree_durable(session_dir: &Path) -> io::Result<()> {
                 let file = Some(std::fs::File::open(&path)?);
 
                 if let Some(file) = file {
+                    #[allow(clippy::question_mark)]
                     if let Err(e) = super::sync_file_durable(&file) {
                         #[cfg(windows)]
                         if e.kind() == io::ErrorKind::PermissionDenied {
