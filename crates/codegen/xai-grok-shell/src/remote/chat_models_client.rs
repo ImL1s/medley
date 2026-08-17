@@ -66,11 +66,17 @@ pub enum ChatModelsError {
     #[error("request timed out")]
     Timeout,
     #[error("network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(reqwest::Error),
     #[error("request failed: {status}")]
     Http { status: u16 },
     #[error("parse error: {0}")]
     Parse(#[from] serde_json::Error),
+}
+
+impl From<reqwest::Error> for ChatModelsError {
+    fn from(req_err: reqwest::Error) -> Self {
+        Self::Network(req_err.without_url())
+    }
 }
 
 /// Stateless transport for `POST /rest/modes`; caching lives in

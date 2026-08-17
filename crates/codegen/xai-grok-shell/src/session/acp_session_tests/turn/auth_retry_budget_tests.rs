@@ -164,7 +164,11 @@ async fn session_token_actor(
     cfg.model = "test".to_string();
     actor.chat_state_handle.update_sampling_config(cfg);
     let creds = actor.chat_state_handle.get_credentials().await;
-    let creds = creds.clone().rebind(None, xai_chat_state::AuthType::SessionToken, xai_grok_sampling_types::CredentialSource::None);
+    let creds = creds.clone().rebind(
+        None,
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampling_types::CredentialSource::None,
+    );
     actor.chat_state_handle.update_credentials(creds);
 
     // Definite NotByok: the session-token gate must stay active against the

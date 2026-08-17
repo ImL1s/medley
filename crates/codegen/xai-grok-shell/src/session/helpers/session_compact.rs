@@ -778,13 +778,13 @@ pub(crate) async fn generate_session_compact(
                 delta_count: timing.count,
                 itl_max_ms: timing.itl_max_ms(),
             }
-            }
-            _ => {
-                return Err(CompactFailure::Transient(
-                    agent_client_protocol::Error::internal_error().data("backend not supported here"),
-                ));
-            }
-        };
+        }
+        _ => {
+            return Err(CompactFailure::Transient(
+                agent_client_protocol::Error::internal_error().data("backend not supported here"),
+            ));
+        }
+    };
 
     if output.content.is_empty() {
         // Empty response is treated as transient: sampling variance and

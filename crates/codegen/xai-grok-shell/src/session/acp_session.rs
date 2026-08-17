@@ -302,7 +302,10 @@ struct GoalContinuationPlan {
 /// timer. A repeat `hold_edit` inserts a fresh stamp so re-entering edit after
 /// a dropped release does not inherit an aged bound.
 pub(crate) const EDIT_HOLD_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-pub(crate) fn expire_older_than(holds: &mut HashMap<String, std::time::Instant>, ttl: std::time::Duration) {
+pub(crate) fn expire_older_than(
+    holds: &mut HashMap<String, std::time::Instant>,
+    ttl: std::time::Duration,
+) {
     holds.retain(|_, since| since.elapsed() < ttl);
 }
 #[cfg(test)]

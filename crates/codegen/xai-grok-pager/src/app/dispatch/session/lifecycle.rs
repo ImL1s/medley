@@ -2104,7 +2104,8 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 ..
             }) => {
                 let fallback = error_prev.as_ref().or(prev_model_id.as_ref());
-                let message = "Couldn't switch to model: required harness is unavailable.".to_string();
+                let message =
+                    "Couldn't switch to model: required harness is unavailable.".to_string();
                 agent.scrollback.push_block(RenderBlock::system(message));
                 restore_model_switch_mirrors(
                     agent,

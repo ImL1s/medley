@@ -414,10 +414,7 @@ pub async fn run_headless(
     let on_first_connect: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
         if !did_browser_flow {
             eprintln!();
-            eprintln!(
-                "Open Grok Build: {} (press Enter to open in browser)",
-                grok_code_url
-            );
+            eprintln!("Open Grok Build in browser (press Enter to open)");
             eprintln!();
             let url_for_open = grok_code_url.clone();
             std::thread::spawn(move || {

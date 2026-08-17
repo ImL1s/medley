@@ -162,7 +162,7 @@ async fn create_test_actor_with_memory_and_events(
         is_chat_kind: false,
         state,
         notifications: NotificationSender {
-                    persistence_is_noop: true,
+            persistence_is_noop: true,
             gateway: GatewaySender::new(gateway_tx),
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
@@ -303,7 +303,7 @@ async fn create_test_actor_with_memory_and_events(
         pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
-                managed_mcp_expires_at: std::sync::Mutex::new(None),
+        managed_mcp_expires_at: std::sync::Mutex::new(None),
         initial_client_mcp_servers: vec![],
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
         mcp_announced_servers: Mutex::new(HashMap::new()),
@@ -345,7 +345,9 @@ async fn create_test_actor_with_memory_and_events(
         pending_image_strip: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-        image_description_model: std::cell::RefCell::new(crate::test_support::TEST_MODEL.to_owned()),
+        image_description_model: std::cell::RefCell::new(
+            crate::test_support::TEST_MODEL.to_owned(),
+        ),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),

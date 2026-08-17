@@ -367,7 +367,7 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
     }
     tracing::debug!(
         idp_rotated,
-        key_prefix = xai_grok_auth::bearer_suffix(&new_auth.key),
+        access_token_present = !new_auth.key.is_empty(),
         "oidc try_refresh_pure token obtained"
     );
     let (mono_ms, wall_ms, suspended_ms, suspected_suspend) = timing();

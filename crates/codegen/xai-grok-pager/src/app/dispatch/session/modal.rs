@@ -110,9 +110,11 @@ pub(in crate::app::dispatch) fn dispatch_rename_session(
     };
     let title = xai_grok_shell::session::persistence::sanitize_rename_title(&title).into_owned();
     if title.is_empty() {
-        agent.scrollback.push_block(crate::scrollback::RenderBlock::system(
-            "Couldn't rename session: title must not be blank".to_string(),
-        ));
+        agent
+            .scrollback
+            .push_block(crate::scrollback::RenderBlock::system(
+                "Couldn't rename session: title must not be blank".to_string(),
+            ));
         return vec![];
     }
     agent.display_name = Some(title.clone());
@@ -140,11 +142,9 @@ pub(in crate::app::dispatch) fn dispatch_reset_session_title(app: &mut AppView) 
     };
     let kind = agent.rename_kind();
     if kind == xai_grok_shell::session::unified_list::SessionKind::Chat {
-        agent
-            .scrollback
-            .push_block(RenderBlock::system(
-                "Chat conversations have no auto-title to restore",
-            ));
+        agent.scrollback.push_block(RenderBlock::system(
+            "Chat conversations have no auto-title to restore",
+        ));
         return vec![];
     }
     let previous_display_name = agent.display_name.clone();

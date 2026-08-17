@@ -1024,7 +1024,11 @@ async fn codex_rejected_refresh_mixed_scope_storage_full_retains_authoritative_s
     let _fault = StorageFullWriteFault::install(manager.auth_json_path());
 
     let error = manager
-        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::ServerRejected,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await
         .unwrap_err();
 
@@ -1157,7 +1161,11 @@ async fn codex_rejected_refresh_mixed_scope_reconciles_after_publication_failure
     let _fault = ParentSyncFault::install(manager.auth_json_path());
 
     let error = manager
-        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::ServerRejected,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await
         .unwrap_err();
 
@@ -1261,7 +1269,11 @@ async fn codex_rejected_refresh_mixed_scope_publication_is_atomic_for_readers() 
     reader_ready.wait();
 
     let error = manager
-        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::ServerRejected,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await
         .unwrap_err();
     writer_done.store(true, Ordering::Release);
@@ -1328,7 +1340,11 @@ async fn codex_rejected_refresh_mixed_scope_reconciles_after_permission_failure(
     let _fault = PostRenamePermissionFault::install(manager.auth_json_path());
 
     let error = manager
-        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::ServerRejected,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await
         .unwrap_err();
 
@@ -2421,7 +2437,11 @@ async fn storm_cap_engages_with_empty_inner_and_dead_disk_refresh_token() {
 
     for _ in 0..5 {
         let _ = mgr
-            .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
+            .refresh_chain(
+                TokenType::OidcSession,
+                RefreshReason::ServerRejected,
+                crate::auth::manager::RefreshUrgency::UserFacing,
+            )
             .await;
     }
     assert_eq!(
@@ -2489,7 +2509,11 @@ async fn verdict_not_keyed_on_in_mem_bearer() {
     }));
 
     let _ = mgr
-        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::ServerRejected,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -2512,7 +2536,11 @@ async fn verdict_not_keyed_on_in_mem_bearer() {
     });
 
     let _ = mgr
-        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::ServerRejected,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -2563,7 +2591,11 @@ async fn refresh_persist_failure_is_transient_but_swaps_in_memory() {
     }));
 
     let err = mgr
-        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::ServerRejected,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await
         .expect_err("persist failure must surface an error");
     assert!(
@@ -3117,7 +3149,11 @@ async fn refresh_chain_demotes_when_attributed_tried_rt_differs_from_disk() {
     mgr.set_refresher(Arc::new(AttributedRejection(tried)));
 
     let err = mgr
-        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::PreRequest,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await
         .unwrap_err();
 
@@ -3178,7 +3214,11 @@ async fn refresh_chain_still_discards_when_attributed_tried_rt_matches_disk() {
     mgr.set_refresher(Arc::new(AttributedRejection(tried)));
 
     let err = mgr
-        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::PreRequest,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await
         .unwrap_err();
 
@@ -3243,7 +3283,11 @@ async fn permanent_rtr_clears_only_the_tried_side_when_rts_diverge() {
     mgr.set_refresher(Arc::new(TriedDiskRtr(calls.clone())));
 
     let err = mgr
-        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::ServerRejected,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -5948,7 +5992,11 @@ async fn dark_wake_defers_refresh_while_a_live_token_can_be_served() {
     mgr.set_dark_wake_for_test(true);
 
     let err = mgr
-        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest, crate::auth::manager::RefreshUrgency::UserFacing)
+        .refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::PreRequest,
+            crate::auth::manager::RefreshUrgency::UserFacing,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -6012,10 +6060,14 @@ async fn dark_wake_does_not_defer_server_rejected_recovery() {
     mgr.set_dark_wake_for_test(true);
 
     assert_eq!(
-        mgr.refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected, crate::auth::manager::RefreshUrgency::UserFacing)
-            .await
-            .unwrap()
-            .key,
+        mgr.refresh_chain(
+            TokenType::OidcSession,
+            RefreshReason::ServerRejected,
+            crate::auth::manager::RefreshUrgency::UserFacing
+        )
+        .await
+        .unwrap()
+        .key,
         "fresh-token",
         "ServerRejected recovery must reach the IdP even in dark wake"
     );

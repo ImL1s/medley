@@ -59,11 +59,17 @@ pub enum ConvError {
     #[error("no OAuth credentials for conversations:read")]
     NoOauth,
     #[error("network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(reqwest::Error),
     #[error("request failed: {status}")]
     Http { status: u16 },
     #[error("parse error: {0}")]
     Parse(#[from] serde_json::Error),
+}
+
+impl From<reqwest::Error> for ConvError {
+    fn from(req_err: reqwest::Error) -> Self {
+        Self::Network(req_err.without_url())
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

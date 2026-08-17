@@ -6,8 +6,8 @@
 //! Config-file/plugin merge (which reads shell's config system) lives
 //! in shell's `session::managed_mcp`, which re-exports everything here.
 
-use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Agent-level cache for managed MCP gateway tool catalogs.
@@ -395,7 +395,7 @@ pub async fn get_authenticated_json<T: serde::de::DeserializeOwned>(
         Err(e) => {
             tracing::warn!(error = %e, "{}", fetch_failed_message);
             return Err(ManagedMcpFetchError::Transport {
-                kind: ManagedMcpTransportKind::from_reqwest_error(&e)
+                kind: ManagedMcpTransportKind::from_reqwest_error(&e),
             });
         }
     };
@@ -597,4 +597,3 @@ pub async fn get_or_fetch_gateway_tool_catalog(
         }
     }
 }
-

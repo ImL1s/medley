@@ -2254,7 +2254,10 @@ impl AuthManager {
         self.auth_background().await.map(|a| a.key)
     }
 
-    async fn auth_dispatch(self: &Arc<Self>, urgency: RefreshUrgency) -> Result<GrokAuth, AuthError> {
+    async fn auth_dispatch(
+        self: &Arc<Self>,
+        urgency: RefreshUrgency,
+    ) -> Result<GrokAuth, AuthError> {
         if !self.credential_store_is_safe() {
             return Err(AuthError::NotLoggedIn);
         }

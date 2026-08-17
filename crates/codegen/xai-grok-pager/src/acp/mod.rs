@@ -812,8 +812,7 @@ pub fn select_eager_auth_method(
     let cached_token_method = auth_methods
         .iter()
         .find(|m| AuthMethodKind::from_id(m.id()) == AuthMethodKind::CachedToken);
-    cached_token_method
-        .map(|m| m.id().clone())
+    cached_token_method.map(|m| m.id().clone())
 }
 
 pub fn is_session_update_ext_method(method: &str) -> bool {

@@ -118,7 +118,10 @@ pub(in crate::app::dispatch) fn focus_if_session_already_open(
     switch_to_agent(app, existing_id, SwitchCause::Load);
     Some(existing_id)
 }
-pub(in crate::app::dispatch) fn effective_loaded_session_chat_kind(app: &AppView, conversation_entry: bool) -> bool {
+pub(in crate::app::dispatch) fn effective_loaded_session_chat_kind(
+    app: &AppView,
+    conversation_entry: bool,
+) -> bool {
     #[cfg(feature = "local-workspace")]
     {
         conversation_entry || (app.chat_mode && !app.welcome_history_load_as_build)

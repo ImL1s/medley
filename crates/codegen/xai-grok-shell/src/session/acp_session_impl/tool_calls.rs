@@ -438,8 +438,10 @@ impl SessionActor {
                         format!("Tool execution cancelled for tool `{}`", call.function.name)
                     }
                 };
-                self.chat_state_handle
-                    .push_tool_result(ConversationItem::tool_result(call.id.clone(), message), None);
+                self.chat_state_handle.push_tool_result(
+                    ConversationItem::tool_result(call.id.clone(), message),
+                    None,
+                );
                 continue;
             }
             self.emit_event(crate::session::events::Event::ToolStarted {
@@ -879,7 +881,10 @@ impl SessionActor {
             let early_raw_input =
                 serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok();
             let subagent_background =
-                xai_grok_tools::implementations::grok_build::task::is_task_tool_id(&call.function.name).then(|| {
+                xai_grok_tools::implementations::grok_build::task::is_task_tool_id(
+                    &call.function.name,
+                )
+                .then(|| {
                     early_raw_input
                         .as_ref()
                         .and_then(|v| v.get("run_in_background").or_else(|| v.get("background")))

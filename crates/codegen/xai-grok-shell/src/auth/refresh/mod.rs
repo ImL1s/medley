@@ -159,10 +159,7 @@ impl SuspectConsumedRt {
 impl std::fmt::Debug for SuspectConsumedRt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SuspectConsumedRt")
-            .field(
-                "rt_suffix",
-                &xai_grok_auth::bearer_suffix(&self.refresh_token),
-            )
+            .field("refresh_token_present", &!self.refresh_token.is_empty())
             .field("suspended_ms", &self.suspended_ms)
             .finish()
     }

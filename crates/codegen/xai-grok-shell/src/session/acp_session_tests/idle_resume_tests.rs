@@ -178,8 +178,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
-        catalog_model_id: std::cell::Cell::new(String::new()),
-        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
+                catalog_model_id: std::cell::Cell::new(String::new()),
+                committed_tool_result_truncation_policy: std::cell::Cell::new(None),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 compactions_remaining: std::cell::Cell::new(None),
@@ -205,7 +205,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
-            configured_storage: None,
+                    configured_storage: None,
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
@@ -333,7 +333,9 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-                image_description_model: std::cell::RefCell::new(crate::test_support::TEST_MODEL.to_owned()),
+                image_description_model: std::cell::RefCell::new(
+                    crate::test_support::TEST_MODEL.to_owned(),
+                ),
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),

@@ -2421,9 +2421,7 @@ mod tests {
 
         let path = dir.path().join("auth.json");
         {
-            let mut guard = super::super::storage::WRITE_FAULT_PATH
-                .lock()
-                .unwrap();
+            let mut guard = super::super::storage::WRITE_FAULT_PATH.lock().unwrap();
             *guard = Some(path.clone());
         }
         let rotated = GrokAuth {
@@ -2437,9 +2435,7 @@ mod tests {
         };
         let result = manager.update(rotated).await;
         {
-            let mut guard = super::super::storage::WRITE_FAULT_PATH
-                .lock()
-                .unwrap();
+            let mut guard = super::super::storage::WRITE_FAULT_PATH.lock().unwrap();
             *guard = None;
         }
 

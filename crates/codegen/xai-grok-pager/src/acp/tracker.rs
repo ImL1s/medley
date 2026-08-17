@@ -2482,7 +2482,8 @@ fn is_todo_tool(tc: &acp::ToolCall) -> bool {
 /// SubagentSpawned notification) provides better visibility. Covers the
 /// `task` / `Task` / `spawn_subagent` ids and Task-family variant tags.
 fn is_task_tool(tc: &acp::ToolCall) -> bool {
-    xai_grok_tools::implementations::grok_build::is_task_tool_id(&tc.title) || is_task_variant(extract_variant(tc))
+    xai_grok_tools::implementations::grok_build::is_task_tool_id(&tc.title)
+        || is_task_variant(extract_variant(tc))
 }
 fn is_goal_tool(tc: &acp::ToolCall) -> bool {
     tc.title == "update_goal"
@@ -5677,7 +5678,9 @@ mod tests {
         tracker.handle_update(task_call_with_bg("t1", false), &meta(), &mut sb);
         assert_eq!(
             tracker.activity(),
-            Some(TurnActivity::Waiting(WaitingReason::Subagent { display: None })),
+            Some(TurnActivity::Waiting(WaitingReason::Subagent {
+                display: None
+            })),
             "a foreground-stamped subagent spawn surfaces the wait immediately"
         );
     }
@@ -5709,7 +5712,9 @@ mod tests {
         );
         assert_eq!(
             tracker.activity(),
-            Some(TurnActivity::Waiting(WaitingReason::Subagent { display: None }))
+            Some(TurnActivity::Waiting(WaitingReason::Subagent {
+                display: None
+            }))
         );
         tracker.finish_turn(&mut sb);
         assert_eq!(tracker.activity(), None);
@@ -5727,7 +5732,9 @@ mod tests {
         );
         assert_eq!(
             tracker.activity(),
-            Some(TurnActivity::Waiting(WaitingReason::Subagent { display: None }))
+            Some(TurnActivity::Waiting(WaitingReason::Subagent {
+                display: None
+            }))
         );
         let bg_update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
             acp::ToolCallId::new(Arc::from("t1")),
@@ -6122,7 +6129,9 @@ mod tests {
             );
             assert_eq!(
                 activity,
-                Some(TurnActivity::Waiting(WaitingReason::Subagent { display: None })),
+                Some(TurnActivity::Waiting(WaitingReason::Subagent {
+                    display: None
+                })),
                 "suppressed task tool with title={title:?} should surface as the subagent wait"
             );
         }

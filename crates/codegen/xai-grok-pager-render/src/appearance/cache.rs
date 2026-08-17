@@ -797,7 +797,9 @@ mod tests {
         );
         assert_eq!(
             FOLLOW_UP_BEHAVIOR_DEFAULT.as_canonical(),
-            ui.follow_up_behavior.as_deref().unwrap_or(FOLLOW_UP_BEHAVIOR_DEFAULT.as_canonical())
+            ui.follow_up_behavior
+                .as_deref()
+                .unwrap_or(FOLLOW_UP_BEHAVIOR_DEFAULT.as_canonical())
         );
         assert_eq!(SIMPLE_MODE_DEFAULT, ui.simple_mode.unwrap_or(true));
         assert_eq!(VIM_MODE_DEFAULT, ui.vim_mode.unwrap_or(false));

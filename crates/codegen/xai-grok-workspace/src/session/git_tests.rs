@@ -28,8 +28,7 @@ fn strip_url_credentials_removes_userinfo_query_and_fragment() {
 #[test]
 fn strip_url_credentials_drops_credential_like_scp_username() {
     let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
-    let sanitized =
-        strip_url_credentials(&format!("{sentinel}@github.com:xai-org/example.git"));
+    let sanitized = strip_url_credentials(&format!("{sentinel}@github.com:xai-org/example.git"));
     assert_eq!(sanitized, "github.com:xai-org/example.git");
     for window in sentinel.as_bytes().windows(8) {
         let fragment = std::str::from_utf8(window).unwrap();

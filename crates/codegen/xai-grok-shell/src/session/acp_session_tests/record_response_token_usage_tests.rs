@@ -124,15 +124,10 @@ async fn build_session_info_used_reflects_recorded_response() {
             actor
                 .chat_state_handle
                 .push_assistant_response(ConversationItem::assistant("hi there hi there hi there"));
-            actor
-                .chat_state_handle
-                .push_tool_result(
-                    ConversationItem::tool_result(
-                        "call-1",
-                        "tool result body tool result body",
-                    ),
-                    None,
-                );
+            actor.chat_state_handle.push_tool_result(
+                ConversationItem::tool_result("call-1", "tool result body tool result body"),
+                None,
+            );
             actor
                 .chat_state_handle
                 .push_user_message_and_ack(ConversationItem::user("hello hello hello hello"))

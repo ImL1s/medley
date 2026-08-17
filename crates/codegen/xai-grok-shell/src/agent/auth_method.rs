@@ -1134,7 +1134,9 @@ mod tests {
         let mut models = resolve_model_list(&cfg, None);
         let mut codex_entry = ModelEntry::fallback("gpt-4o", &cfg.endpoints);
         codex_entry.info.api_backend = xai_grok_sampling_types::ApiBackend::CodexResponses;
-        codex_entry.auth_provider = Some(crate::auth::AuthProviderRef::unresolved("openai-codex".to_string()));
+        codex_entry.auth_provider = Some(crate::auth::AuthProviderRef::unresolved(
+            "openai-codex".to_string(),
+        ));
         models.insert("gpt-4o".to_string(), codex_entry);
         assert!(
             models.values().any(ModelEntry::is_openai_codex_profile),

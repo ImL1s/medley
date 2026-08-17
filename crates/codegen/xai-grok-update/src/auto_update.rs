@@ -81,7 +81,11 @@ fn manual_install_cmd(channel: &str) -> String {
 /// telling a fork user to run `npm i -g @xai-official/grok` is the same
 /// silent-replacement failure this module exists to prevent.
 fn reinstall_hint(installer: &str, channel: &str) -> String {
-    reinstall_hint_for(installer, channel, dist_channel::self_update_refusal().is_some())
+    reinstall_hint_for(
+        installer,
+        channel,
+        dist_channel::self_update_refusal().is_some(),
+    )
 }
 
 /// Pure half of [`reinstall_hint`]. `self_update_disabled` is the distribution
@@ -4061,7 +4065,10 @@ mod tests {
     #[test]
     fn reinstall_hint_follows_the_distribution_decision() {
         let disabled = dist_channel::self_update_refusal().is_some();
-        assert_eq!(reinstall_hint("npm", "stable"), reinstall_hint_for("npm", "stable", disabled));
+        assert_eq!(
+            reinstall_hint("npm", "stable"),
+            reinstall_hint_for("npm", "stable", disabled)
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────

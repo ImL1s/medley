@@ -126,17 +126,19 @@ pub struct GrokAuth {
 impl std::fmt::Debug for GrokAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrokAuth")
-            .field("key", &bearer_suffix(&self.key))
+            .field("key_present", &!self.key.is_empty())
             .field("auth_mode", &self.auth_mode)
-            .field("user_id", &self.user_id)
+            .field("user_id_present", &!self.user_id.is_empty())
             .field("expires_at", &self.expires_at)
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_deref().map(bearer_suffix),
-            )
+            .field("refresh_token_present", &self.refresh_token.is_some())
+            .field("oidc_issuer_present", &self.oidc_issuer.is_some())
+            .field("oidc_client_id_present", &self.oidc_client_id.is_some())
             .field("id_token_present", &self.id_token.is_some())
             .field("account_id_present", &self.account_id.is_some())
-            .field("chatgpt_account_is_fedramp", &self.chatgpt_account_is_fedramp)
+            .field(
+                "chatgpt_account_is_fedramp",
+                &self.chatgpt_account_is_fedramp,
+            )
             .finish_non_exhaustive()
     }
 }

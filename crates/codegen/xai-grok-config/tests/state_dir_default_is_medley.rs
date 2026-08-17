@@ -9,7 +9,9 @@ fn fresh_home_resolves_and_creates_the_medley_dir() {
     // Safety: single-threaded test binary, set before any other thread exists.
     unsafe { std::env::set_var("HOME", home.path()) };
     #[cfg(windows)]
-    unsafe { std::env::set_var("USERPROFILE", home.path()) };
+    unsafe {
+        std::env::set_var("USERPROFILE", home.path())
+    };
     unsafe { std::env::remove_var("MEDLEY_HOME") };
     unsafe { std::env::remove_var("GROK_HOME") };
 

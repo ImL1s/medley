@@ -463,9 +463,8 @@ impl SessionActor {
             crate::auth::attribution::record_consumer_401(
                 am,
                 None,
-                crate::auth::attribution::ConsumerKind::IdleResumeModelRefresh,
-                "",
-                None,
+                xai_grok_telemetry::unified_log::CredentialDiagnosticConsumer::IdleResumeModelRefresh,
+                comparison,
             );
         }
         let result = if !response.status().is_success() {

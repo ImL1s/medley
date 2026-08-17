@@ -4806,29 +4806,32 @@ fn finalize_fresh_publication_sync_with(
                 Err(failure) => {
                     eprintln!("STAGE_CONTAINER rename failure: {:?}", failure.error);
                     let container = failure.source;
-                    let (parent, parent_is_new) = match sessions_anchor
-                        .open_child_dir(&publication.published_parent_name)
-                    {
-                        Ok(parent) => (parent, false),
-                        Err(_) => match sessions_anchor
-                            .create_child_dir(&publication.published_parent_name)
-                        {
-                            Ok(parent) => (parent, true),
-                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                                match sessions_anchor.open_child_dir(&publication.published_parent_name) {
-                                    Ok(parent) => (parent, false),
-                                    Err(error) => {
-                                        restore_fresh_stage_container(publication, container);
-                                        return Err(FreshPublicationFinalizeError::NotCommitted(error));
+                    let (parent, parent_is_new) =
+                        match sessions_anchor.open_child_dir(&publication.published_parent_name) {
+                            Ok(parent) => (parent, false),
+                            Err(_) => match sessions_anchor
+                                .create_child_dir(&publication.published_parent_name)
+                            {
+                                Ok(parent) => (parent, true),
+                                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                                    match sessions_anchor
+                                        .open_child_dir(&publication.published_parent_name)
+                                    {
+                                        Ok(parent) => (parent, false),
+                                        Err(error) => {
+                                            restore_fresh_stage_container(publication, container);
+                                            return Err(
+                                                FreshPublicationFinalizeError::NotCommitted(error),
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            Err(error) => {
-                                restore_fresh_stage_container(publication, container);
-                                return Err(FreshPublicationFinalizeError::NotCommitted(error));
-                            }
-                        },
-                    };
+                                Err(error) => {
+                                    restore_fresh_stage_container(publication, container);
+                                    return Err(FreshPublicationFinalizeError::NotCommitted(error));
+                                }
+                            },
+                        };
                     if parent_is_new {
                         if let Err(error) = write_staged_cwd_metadata_if_needed(
                             &parent,
@@ -5389,18 +5392,17 @@ pub(crate) async fn load_light(
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
-    let (persisted, loaded_info) =
-        match storage.load_session_without_updates(info).await {
-            Ok(p) => (p, info.clone()),
-            Err(e) => match backend {
-                Some(client) => {
-                    let pulled = pull_on_miss(info, client, e).await?;
-                    let p = storage.load_session_without_updates(&pulled).await?;
-                    (p, pulled)
-                }
-                None => return Err(e),
-            },
-        };
+    let (persisted, loaded_info) = match storage.load_session_without_updates(info).await {
+        Ok(p) => (p, info.clone()),
+        Err(e) => match backend {
+            Some(client) => {
+                let pulled = pull_on_miss(info, client, e).await?;
+                let p = storage.load_session_without_updates(&pulled).await?;
+                (p, pulled)
+            }
+            None => return Err(e),
+        },
+    };
     // Touch on load too: resuming must reset the worktree's gc expiry clock.
     touch_worktree_for_session(&loaded_info).await;
 

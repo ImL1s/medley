@@ -394,7 +394,7 @@ pub(super) fn build_authorize_url(
     url.push_str(&format!("&referrer={}", urlencoding::encode(referrer)));
     url
 }
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(super) struct TokenResponse {
     pub(super) access_token: String,
     #[serde(default)]
@@ -403,6 +403,17 @@ pub(super) struct TokenResponse {
     pub(super) id_token: Option<String>,
     #[serde(default)]
     pub(super) expires_in: Option<u64>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token_present", &!self.access_token.is_empty())
+            .field("refresh_token_present", &self.refresh_token.is_some())
+            .field("id_token_present", &self.id_token.is_some())
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 pub(super) async fn exchange_code(
     token_endpoint: &str,
@@ -556,8 +567,8 @@ async fn refresh_tokens_once(
         tracing::warn!(
             http_status = status,
             oauth2_error = ?error_code,
-            rt_prefix = xai_grok_auth::bearer_suffix(refresh_token),
-            client_id = %client_id,
+            refresh_token_present = !refresh_token.is_empty(),
+            client_id_present = !client_id.is_empty(),
             principal_type = ?principal_type,
             "OIDC: token refresh HTTP error"
         );

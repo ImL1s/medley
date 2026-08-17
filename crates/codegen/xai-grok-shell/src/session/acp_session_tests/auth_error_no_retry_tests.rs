@@ -497,11 +497,7 @@ async fn pre_flight_refresh_skips_api_key_auth_type() {
                 "pre-flight refresh must NOT fire for ApiKey auth_type"
             );
             assert_eq!(
-                actor
-                    .chat_state_handle
-                    .get_credentials()
-                    .await
-                    .api_key(),
+                actor.chat_state_handle.get_credentials().await.api_key(),
                 Some("byok-api-key"),
                 "BYOK api_key must not be overwritten by session token refresh"
             );
@@ -536,11 +532,7 @@ async fn pre_flight_refreshes_hard_expired_session_token() {
                 "pre-flight must invoke the refresher for a hard-expired session token"
             );
             assert_eq!(
-                actor
-                    .chat_state_handle
-                    .get_credentials()
-                    .await
-                    .api_key(),
+                actor.chat_state_handle.get_credentials().await.api_key(),
                 Some("refreshed-test-token"),
                 "credentials must be updated to the refreshed bearer"
             );
@@ -582,11 +574,7 @@ async fn pre_flight_hard_expired_refresh_failure_skips_jwt_fallthrough() {
                 "pre-flight must attempt refresh"
             );
             assert_eq!(
-                actor
-                    .chat_state_handle
-                    .get_credentials()
-                    .await
-                    .api_key(),
+                actor.chat_state_handle.get_credentials().await.api_key(),
                 None,
                 "hard-expired pre-flight failure must strip the chat-state seed"
             );
@@ -650,11 +638,7 @@ async fn pre_flight_soft_expired_transient_fail_retains_seed() {
                 "soft-expired pre-flight must still attempt refresh"
             );
             assert_eq!(
-                actor
-                    .chat_state_handle
-                    .get_credentials()
-                    .await
-                    .api_key(),
+                actor.chat_state_handle.get_credentials().await.api_key(),
                 Some("buffered-test-key"),
                 "buffer-window soft-expired + transient fail must retain seed"
             );
@@ -726,11 +710,7 @@ async fn proactive_refresh_makes_per_turn_refresh_a_cache_hit() {
                 "per-turn refresh must NOT call the refresher again (cache hit)"
             );
             assert_eq!(
-                actor
-                    .chat_state_handle
-                    .get_credentials()
-                    .await
-                    .api_key(),
+                actor.chat_state_handle.get_credentials().await.api_key(),
                 Some("proactive-fresh"),
                 "per-turn refresh must pick up the proactively-refreshed token"
             );
@@ -1146,11 +1126,7 @@ async fn pre_flight_refresh_heals_session_method_with_stale_api_key_auth_type() 
             actor.refresh_token_if_expired().await;
 
             assert_eq!(
-                actor
-                    .chat_state_handle
-                    .get_credentials()
-                    .await
-                    .api_key(),
+                actor.chat_state_handle.get_credentials().await.api_key(),
                 Some("fresh-session-token"),
                 "session-based pre-flight refresh must heal a stale api_key with the live token"
             );
@@ -1207,11 +1183,7 @@ async fn session_born_on_api_key_recovers_after_oidc_login_without_restart() {
             // The pre-flight refresh then heals the stale api_key with the live token.
             actor.refresh_token_if_expired().await;
             assert_eq!(
-                actor
-                    .chat_state_handle
-                    .get_credentials()
-                    .await
-                    .api_key(),
+                actor.chat_state_handle.get_credentials().await.api_key(),
                 Some("fresh-oidc-token"),
                 "the stale api_key must be healed with the fresh OIDC token"
             );
@@ -2823,7 +2795,15 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 endpoint_trust: Default::default(),
             };
             let _ = actor
-                .handle_set_session_model(acp::ModelId::new("test-model"), cfg, false, false, true, 85, "grok-build")
+                .handle_set_session_model(
+                    acp::ModelId::new("test-model"),
+                    cfg,
+                    false,
+                    false,
+                    true,
+                    85,
+                    "grok-build",
+                )
                 .await;
 
             assert!(
@@ -2922,7 +2902,15 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 endpoint_trust: Default::default(),
             };
             let _ = actor
-                .handle_set_session_model(acp::ModelId::new("test-model"), cfg, false, false, true, 85, "grok-build")
+                .handle_set_session_model(
+                    acp::ModelId::new("test-model"),
+                    cfg,
+                    false,
+                    false,
+                    true,
+                    85,
+                    "grok-build",
+                )
                 .await;
 
             let creds = actor.chat_state_handle.get_credentials().await;
@@ -3029,7 +3017,11 @@ async fn sampler_401_with_no_key_on_provider_model_mints_and_resubmits() {
             )
             .await;
             let creds = actor.chat_state_handle.get_credentials().await;
-            let creds = creds.clone().rebind(None, creds.auth_type(), xai_grok_sampling_types::CredentialSource::None);
+            let creds = creds.clone().rebind(
+                None,
+                creds.auth_type(),
+                xai_grok_sampling_types::CredentialSource::None,
+            );
             actor.chat_state_handle.update_credentials(creds);
             seed_provider_memo(&actor, provider).await;
 
@@ -3124,7 +3116,11 @@ async fn pre_turn_on_provider_model_never_installs_session_token() {
             .await;
             // Cold cache: no key on the wire yet.
             let creds = actor.chat_state_handle.get_credentials().await;
-            let creds = creds.clone().rebind(None, creds.auth_type(), xai_grok_sampling_types::CredentialSource::None);
+            let creds = creds.clone().rebind(
+                None,
+                creds.auth_type(),
+                xai_grok_sampling_types::CredentialSource::None,
+            );
             actor.chat_state_handle.update_credentials(creds);
             seed_provider_memo(&actor, provider).await;
 

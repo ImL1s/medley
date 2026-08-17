@@ -419,7 +419,10 @@ pub(in crate::app::dispatch) fn handle_worktree_forked(
     ) {
         return refuse_chat_mode_build_agent(app, agent_id);
     }
-    let rename_entry = crate::app::dispatch::session::load::effective_loaded_session_chat_kind(app, conversation_entry);
+    let rename_entry = crate::app::dispatch::session::load::effective_loaded_session_chat_kind(
+        app,
+        conversation_entry,
+    );
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "WorktreeForked");
         agent.session.finish_command();
@@ -496,7 +499,10 @@ pub(in crate::app::dispatch) fn handle_fork_session_ready(
     ) {
         return refuse_chat_mode_build_agent(app, agent_id);
     }
-    let rename_entry = crate::app::dispatch::session::load::effective_loaded_session_chat_kind(app, conversation_entry);
+    let rename_entry = crate::app::dispatch::session::load::effective_loaded_session_chat_kind(
+        app,
+        conversation_entry,
+    );
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "ForkSessionReady");
         agent.session.finish_command();

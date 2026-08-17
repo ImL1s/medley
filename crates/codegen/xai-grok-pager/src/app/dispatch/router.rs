@@ -8,7 +8,6 @@ use super::ctx::{
     active_agent_session_id, get_active_agent_mut, navigate_clearing_selection, open_url_or_show,
     sync_sleep_inhibitor, with_active_agent, with_scrollback,
 };
-use crate::app::dispatch::settings::setters::set_follow_up_behavior;
 use super::dashboard::{
     dispatch_dashboard_attach, dispatch_dashboard_begin_rename, dispatch_dashboard_change_location,
     dispatch_dashboard_commit_rename, dispatch_dashboard_confirm_worktree,
@@ -117,6 +116,7 @@ use super::voice::{dispatch_enable_voice_mode, dispatch_voice_stop, dispatch_voi
 use crate::app::actions::{Action, Effect};
 use crate::app::agent_view::ActivePane;
 use crate::app::app_view::{ActiveView, AppView, AuthState};
+use crate::app::dispatch::settings::setters::set_follow_up_behavior;
 use crate::scrollback::types::DisplayMode;
 use crate::views::session_picker::CONTENT_EXPAND_OFFSET;
 use xai_grok_telemetry::session_ctx::log_event;

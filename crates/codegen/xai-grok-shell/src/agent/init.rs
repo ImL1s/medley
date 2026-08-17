@@ -198,15 +198,11 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
         let telemetry_mode = cfg.resolve_telemetry_mode();
         let trace_upload = cfg.resolve_trace_upload();
         let feedback = cfg.resolve_feedback();
-        let feedback_url = cfg.endpoints.resolve_feedback_base_url();
-        let trace_upload_url = cfg.endpoints.resolve_trace_upload_url();
         tracing::info!(
             telemetry = %telemetry_mode,
             trace_upload = %trace_upload,
             feedback = %feedback,
-            feedback_url = %feedback_url,
             feedback_url_custom = cfg.endpoints.feedback_base_url.is_some(),
-            trace_upload_url = %trace_upload_url,
             trace_upload_url_custom = cfg.endpoints.trace_upload_url.is_some(),
             trace_upload_bucket = cfg.endpoints.trace_upload_bucket.as_deref().unwrap_or("none"),
             trace_upload_region = cfg.endpoints.trace_upload_region.as_deref().unwrap_or("none"),

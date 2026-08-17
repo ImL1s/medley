@@ -1345,8 +1345,7 @@ impl JsonlStorageAdapter {
                 .join(xai_compaction_transcript::COMPACTION_DIR);
             let mut copied = 0usize;
             if src_dir.is_dir() {
-                let dst_dir =
-                    target_dir.join(xai_compaction_transcript::COMPACTION_DIR);
+                let dst_dir = target_dir.join(xai_compaction_transcript::COMPACTION_DIR);
                 std::fs::create_dir_all(&dst_dir)?;
                 for entry in std::fs::read_dir(&src_dir)? {
                     let entry = entry?;

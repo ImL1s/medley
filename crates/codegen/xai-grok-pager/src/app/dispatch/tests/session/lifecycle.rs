@@ -3123,7 +3123,6 @@ fn delete_current_session_stale_attach_other_agent_stays_welcome() {
     );
 }
 
-
 #[test]
 fn delete_current_session_complete_welcome_and_guard() {
     use crate::app::actions::{AfterSessionDelete, TaskResult};

@@ -60,7 +60,7 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 15;
 pub const MIN_REMOTE_SECRET_BYTES: usize = 32;
 
 /// Configuration for the agent WebSocket server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Address to bind the server to
     pub bind_addr: SocketAddr,
@@ -68,6 +68,16 @@ pub struct ServerConfig {
     pub secret: String,
     /// Whether non-loopback bindings were explicitly acknowledged
     pub allow_remote: bool,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("secret_present", &!self.secret.is_empty())
+            .field("allow_remote", &self.allow_remote)
+            .finish()
+    }
 }
 
 /// Shared state for the WebSocket server.

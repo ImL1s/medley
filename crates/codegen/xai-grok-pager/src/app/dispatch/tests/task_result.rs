@@ -1801,11 +1801,9 @@ fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
         );
         let request_id = switch_model_request_id(&created);
         let result = match failure_kind {
-            "harness_unavailable" => {
-                Err(SwitchModelError::HarnessUnavailable {
-                    prev_model_id: None,
-                })
-            }
+            "harness_unavailable" => Err(SwitchModelError::HarnessUnavailable {
+                prev_model_id: None,
+            }),
             "other" => Err(SwitchModelError::Other("transport closed".into())),
             _ => unreachable!(),
         };

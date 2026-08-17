@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 
 mod bash_grants;
-use bash_grants::{bash_grant_segments, persist_bash_always_allow, whole_script_grant};
 pub use bash_grants::{always_allow_row_is_effective, always_allow_scope_persists};
+use bash_grants::{bash_grant_segments, persist_bash_always_allow, whole_script_grant};
 
 use crate::permission::auto_mode::{
     BashSecurityAssessment, ClassifierSecurityFinding, ClassifierVerdict, EnvRisk,

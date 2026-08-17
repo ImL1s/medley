@@ -106,7 +106,8 @@ fn enqueue_permission(
         .as_ref()
         .map(|h| xai_grok_workspace::permission::default_always_allow_scope(&h.highlighted_words))
         .unwrap_or(0);
-    let bash_deny_selection_count = bash_highlights.as_ref()
+    let bash_deny_selection_count = bash_highlights
+        .as_ref()
         .map(|h| xai_grok_workspace::permission::default_always_allow_scope(&h.highlighted_words))
         .unwrap_or(0);
 

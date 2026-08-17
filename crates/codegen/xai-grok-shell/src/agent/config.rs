@@ -3016,7 +3016,10 @@ impl Config {
                 .doom_loop_recovery
                 .window_tokens
                 .or(remote.and_then(|s| s.window_tokens))
-                .map_or(Policy::DEFAULT_RECOVERY_WINDOW_TOKENS, Policy::clamp_window_tokens),
+                .map_or(
+                    Policy::DEFAULT_RECOVERY_WINDOW_TOKENS,
+                    Policy::clamp_window_tokens,
+                ),
         })
     }
     /// Automatic worktree GC policy. Precedence: env kill/dry-run >
@@ -5721,10 +5724,6 @@ fn resolve_credentials_enforced(
     let mut credentials = resolve_credentials(entry, session_key);
     enforce_disable_api_key_auth(&mut credentials, disable_api_key_auth, session_key);
     credentials
-}
-/// Derive a stable deployment ID (UUIDv5) from the deployment key.
-pub fn deployment_id_from_key(key: &str) -> String {
-    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, key.as_bytes()).to_string()
 }
 /// Try to resolve credentials for a model by loading the effective config.
 /// Returns `None` (with a warning) if config loading, parsing, or model

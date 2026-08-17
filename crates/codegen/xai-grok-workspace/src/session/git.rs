@@ -12,8 +12,9 @@ use tokio::sync::Mutex;
 use url::Url;
 pub use xai_grok_workspace_types::rpc::git::{
     ChangeType, CheckoutCommitResponse, CommitData, CommitOutcome, CommitResult, DiscardScope,
-    GitBranchEntry, GitBranchListData, GitCommitReq, GitDiffsData, GitEnsureBindingResult, GitError, GitFileChange,
-    GitInfoData, GitMergeToMainOutcome, GitMergeToMainResult, GitPushResult, GitReadFile, GitReadFilesData, GitStatusData, GitSyncBaseOutcome,
+    GitBranchEntry, GitBranchListData, GitCommitReq, GitDiffsData, GitEnsureBindingResult,
+    GitError, GitFileChange, GitInfoData, GitMergeToMainOutcome, GitMergeToMainResult,
+    GitPushResult, GitReadFile, GitReadFilesData, GitStatusData, GitSyncBaseOutcome,
     GitSyncBaseResult, PushStatus, StageData, VcsKind,
 };
 pub const ERROR_CODE_DIFF_SIZE_EXCEEDED: &str = "DIFF_SIZE_EXCEEDED";

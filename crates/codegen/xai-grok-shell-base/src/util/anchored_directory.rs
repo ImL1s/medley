@@ -1802,7 +1802,9 @@ mod platform {
                 match std::fs::rename(&source_path, &target_path) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
-                        fs_rename_err = Some(format!("std::fs::rename({source_path:?}, {target_path:?}) err={e:?}"));
+                        fs_rename_err = Some(format!(
+                            "std::fs::rename({source_path:?}, {target_path:?}) err={e:?}"
+                        ));
                     }
                 }
             }
@@ -1924,10 +1926,18 @@ mod platform {
                     source_name,
                     FILE_OPEN,
                     FILE_DIRECTORY_FILE,
-                    (DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_TRAVERSE | SYNCHRONIZE).0,
+                    (DELETE
+                        | FILE_READ_ATTRIBUTES
+                        | FILE_WRITE_ATTRIBUTES
+                        | FILE_LIST_DIRECTORY
+                        | FILE_TRAVERSE
+                        | SYNCHRONIZE)
+                        .0,
                     None,
                 ) {
-                    if rename_retained_handle_no_replace(&source, target_parent, target_name).is_ok() {
+                    if rename_retained_handle_no_replace(&source, target_parent, target_name)
+                        .is_ok()
+                    {
                         return Ok(());
                     }
                 }
@@ -2494,36 +2504,68 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = AnchoredDirectory::open_root(temp.path()).unwrap();
         let private = root.create_child_dir(OsStr::new(".private")).unwrap();
-        let staging = private.create_child_dir(OsStr::new("session-staging")).unwrap();
-        let container = staging.create_child_dir(OsStr::new("session-container")).unwrap();
-        let session = container.create_child_dir(OsStr::new("session-id")).unwrap();
-        let marker = session.create_child_file_new(OsStr::new(".unpublished")).unwrap();
+        let staging = private
+            .create_child_dir(OsStr::new("session-staging"))
+            .unwrap();
+        let container = staging
+            .create_child_dir(OsStr::new("session-container"))
+            .unwrap();
+        let session = container
+            .create_child_dir(OsStr::new("session-id"))
+            .unwrap();
+        let marker = session
+            .create_child_file_new(OsStr::new(".unpublished"))
+            .unwrap();
         drop(marker);
-        let f1 = session.create_child_file_new(OsStr::new("summary.json")).unwrap();
+        let f1 = session
+            .create_child_file_new(OsStr::new("summary.json"))
+            .unwrap();
         drop(f1);
-        let f2 = session.create_child_file_new(OsStr::new("prompt_context.json")).unwrap();
+        let f2 = session
+            .create_child_file_new(OsStr::new("prompt_context.json"))
+            .unwrap();
         drop(f2);
-        let f3 = session.create_child_file_new(OsStr::new("system_prompt.txt")).unwrap();
+        let f3 = session
+            .create_child_file_new(OsStr::new("system_prompt.txt"))
+            .unwrap();
         drop(f3);
-        let f4 = session.create_child_file_new(OsStr::new("chat_history.jsonl")).unwrap();
+        let f4 = session
+            .create_child_file_new(OsStr::new("chat_history.jsonl"))
+            .unwrap();
         drop(f4);
-        
-        let session_path = temp.path().join(".private").join("session-staging").join("session-container").join("session-id");
+
+        let session_path = temp
+            .path()
+            .join(".private")
+            .join("session-staging")
+            .join("session-container")
+            .join("session-id");
         let mut opts = std::fs::OpenOptions::new();
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt as _;
             opts.share_mode(0x0000_0007);
         }
-        let events_f = opts.create(true).append(true).open(session_path.join("events.jsonl")).unwrap();
-        
+        let events_f = opts
+            .create(true)
+            .append(true)
+            .open(session_path.join("events.jsonl"))
+            .unwrap();
+
         drop(events_f);
         drop(session);
         let sessions = root.create_child_dir(OsStr::new("sessions")).unwrap();
         let published_parent = container
             .try_rename_self_no_replace(&sessions, OsStr::new("cwd"))
             .unwrap();
-        let session = published_parent.open_child_dir(OsStr::new("session-id")).unwrap();
-        assert!(session.child_names().unwrap().contains(&OsString::from(".unpublished")));
+        let session = published_parent
+            .open_child_dir(OsStr::new("session-id"))
+            .unwrap();
+        assert!(
+            session
+                .child_names()
+                .unwrap()
+                .contains(&OsString::from(".unpublished"))
+        );
     }
 }

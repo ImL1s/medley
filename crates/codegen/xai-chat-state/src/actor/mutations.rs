@@ -662,7 +662,6 @@ impl ChatStateActor {
     }
 }
 
-
 fn truncation_policy_byte_limit(policy: TruncationPolicyConfig) -> Option<usize> {
     let limit = u64::try_from(policy.limit)
         .ok()

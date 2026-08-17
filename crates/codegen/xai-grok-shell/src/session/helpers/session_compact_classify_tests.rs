@@ -145,7 +145,7 @@ fn sampling_http_is_transient() {
         .block_on(reqwest::get("http://127.0.0.1:0"))
         .expect_err("connecting to port 0 must fail");
     assert!(!is_det(&classify_sampling_error(SamplingError::Http(
-        http_err
+        http_err.without_url()
     ))));
 }
 

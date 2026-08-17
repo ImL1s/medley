@@ -21,8 +21,9 @@ use crate::session::{
 use crate::terminal::AsyncTerminalRunner;
 use crate::tools::ToolContext;
 use crate::upload::trace::{
-    GCS_SCHEMA_VERSION, PromptMetadata, PromptMetadataParams, TurnResultMetadata, local_sandbox_telemetry,
-    upload_metadata, upload_session_state, upload_subagent_metadata, upload_turn_result,
+    GCS_SCHEMA_VERSION, PromptMetadata, PromptMetadataParams, TurnResultMetadata,
+    local_sandbox_telemetry, upload_metadata, upload_session_state, upload_subagent_metadata,
+    upload_turn_result,
 };
 use crate::upload::turn::{PromptTraceContext, complete_prompt_trace};
 use agent_client_protocol as acp;
@@ -32,9 +33,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
-use xai_grok_session_events::types::CancellationCategory;
 use xai_grok_agent::config::{McpInheritance, ModelOverride, PermissionMode};
 use xai_grok_sampling_types::conversation::ConversationItem;
+use xai_grok_session_events::types::CancellationCategory;
 use xai_grok_subagent_resolution::ResumeSourceData;
 use xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer;
 use xai_grok_tools::implementations::grok_build::task::coordinator::{

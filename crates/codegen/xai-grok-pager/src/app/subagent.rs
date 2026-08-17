@@ -6,7 +6,9 @@
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
-use xai_grok_shell::session::storage::{ReplayLookupFallback, ReplayEmission, stream_replay_updates_at};
+use xai_grok_shell::session::storage::{
+    ReplayEmission, ReplayLookupFallback, stream_replay_updates_at,
+};
 /// Enriched subagent tracking info.
 ///
 /// Keyed by `child_session_id` in `AgentView::subagent_sessions`.

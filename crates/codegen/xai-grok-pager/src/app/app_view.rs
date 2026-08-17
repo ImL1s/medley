@@ -7722,11 +7722,10 @@ pub(crate) mod tests {
     #[test]
     fn welcome_ctrl_u_update_keeps_priority_over_foreign_resume() {
         let mut app = test_app();
-        app.foreign_session_compat =
-            xai_grok_foreign_sessions::EnabledForeignSessionSources {
-                cursor: true,
-                ..Default::default()
-            };
+        app.foreign_session_compat = xai_grok_foreign_sessions::EnabledForeignSessionSources {
+            cursor: true,
+            ..Default::default()
+        };
         let crate::app::actions::Effect::CanonicalizeForeignResumeCwd {
             requested_cwd,
             launch_token,

@@ -66,7 +66,9 @@ impl EventWriter {
         let Ok(mut guard) = self.inner.file.lock() else {
             return;
         };
-        if guard.is_none() && let Some(ref path) = self.inner.path {
+        if guard.is_none()
+            && let Some(ref path) = self.inner.path
+        {
             let mut options = std::fs::OpenOptions::new();
             #[cfg(windows)]
             {

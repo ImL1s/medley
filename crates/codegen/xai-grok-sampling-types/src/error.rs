@@ -511,7 +511,7 @@ impl SamplingError {
 
 impl From<reqwest::Error> for SamplingError {
     fn from(value: reqwest::Error) -> Self {
-        Self::http(value)
+        Self::Http(value.without_url())
     }
 }
 

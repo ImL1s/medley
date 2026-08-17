@@ -447,7 +447,6 @@ pub fn spawn_sync(cancel: tokio_util::sync::CancellationToken) {
 pub fn resolve_deployment_id(deployment_key: Option<&str>) -> Option<String> {
     let key = deployment_key.filter(|k| !k.is_empty())?;
     crate::config::managed_deployment_id(&deployment_key_fingerprint(key))
-        .or_else(|| Some(crate::agent::config::deployment_id_from_key(key)))
 }
 
 /// Resolve deployment key from `GROK_DEPLOYMENT_KEY` env var, then config files.

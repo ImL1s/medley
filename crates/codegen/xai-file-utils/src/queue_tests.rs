@@ -2085,13 +2085,13 @@ impl TraceExportSource for ParkingResolver {
 
     fn wait_for_auth_recovery(
         &self,
-        failed_bearer: Option<&str>,
+        stale_token: Option<&str>,
         _timeout: Duration,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>> {
         self.seen_bearers
             .lock()
             .unwrap()
-            .push(failed_bearer.map(str::to_owned));
+            .push(stale_token.map(str::to_owned));
         if !self.hook_enabled {
             return None;
         }

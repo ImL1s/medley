@@ -27,7 +27,7 @@ pub use xai_grok_config_types::{McpConfig, RelaySyncConfig};
 pub use xai_grok_config_types::PoolConfig;
 
 /// TUI/CLI settings. Composed from typed section configs defined in `agent::config`.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Config {
     pub cli: crate::agent::config::CliConfig,
     pub models: crate::agent::config::ModelsConfig,
@@ -51,6 +51,28 @@ pub struct Config {
     pub ask_user_question: crate::tools::config::AskUserQuestionToolConfig,
     /// `[privacy]` — local banner ack (not auth-metadata).
     pub privacy: PrivacyConfig,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("cli_section", &"configured")
+            .field("models_section", &"configured")
+            .field("ui_section", &"configured")
+            .field("harness_section", &"configured")
+            .field("skills_section", &"configured")
+            .field("compat_section", &"configured")
+            .field(
+                "management_api_key_present",
+                &self.management_api_key.is_some(),
+            )
+            .field("permission_present", &self.permission.is_some())
+            .field("diagnostics_section", &"configured")
+            .field("session_section", &"configured")
+            .field("ask_user_question_section", &"configured")
+            .field("privacy_section", &"configured")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

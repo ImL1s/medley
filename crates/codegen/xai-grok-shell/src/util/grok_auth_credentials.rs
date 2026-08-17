@@ -24,14 +24,9 @@ pub struct GrokAuthCredentials {
 impl std::fmt::Debug for GrokAuthCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrokAuthCredentials")
-            .field(
-                "user_token",
-                &self.user_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field(
-                "deployment_key",
-                &self.deployment_key.as_ref().map(|_| "<redacted>"),
-            )
+            .field("user_token_present", &self.user_token.is_some())
+            .field("deployment_key_present", &self.deployment_key.is_some())
+            .field("alpha_test_key_present", &self.alpha_test_key.is_some())
             .field(
                 "mode",
                 &if self.auth_manager.is_some() {
