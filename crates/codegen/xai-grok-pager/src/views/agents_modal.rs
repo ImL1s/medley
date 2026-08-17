@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
 use xai_grok_agent::config::{AgentDefinition, AgentScope, BuiltinAgentName};
 use xai_grok_shell::agent::config::AgentSelectionConfig;
+use xai_grok_subagent_resolution::native_route::{
+    AgentRouteUxSnapshot, AgentSelectionMode, admit_generation_bound_mutation, format_route_detail,
+    snapshot_from_agent_definition,
+};
 use xai_grok_tools::implementations::skills::discovery::extract_first_paragraph;
 use xai_grok_tools::registry::types::ToolServerConfig;
 use xai_grok_tools::types::template_renderer::TemplateRenderer;
@@ -63,6 +67,8 @@ pub struct AgentListEntry {
     pub is_builtin: bool,
     pub expanded: bool,
     pub definition: AgentDefinition,
+    /// Catalog/config generation this row was rendered from.
+    pub generation: u64,
 }
 /// Kind of inline message shown in the agents modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +268,8 @@ pub struct AgentsModalState {
     /// Model `agentType` from the pager's default/current model catalog entry,
     /// used when re-resolving after `s` toggles `[agent] name`.
     model_agent_type: Option<String>,
+    /// Generation for stale-action admission. Bumped on rebuild/refresh.
+    pub generation: u64,
     pub personas: Vec<PersonaDetail>,
     pub persona_selected: usize,
     pub persona_scroll: usize,
@@ -291,7 +299,8 @@ impl AgentsModalState {
         model_agent_type: Option<&str>,
         active_agent: Option<String>,
     ) -> Self {
-        let agents = build_agent_list(cwd, toggle);
+        let mut agents = build_agent_list(cwd, toggle);
+        stamp_entry_generation(&mut agents, 1);
         let personas = merge_persona_lists(bundle, cwd);
         let default_agent = resolve_default_agent_name(cwd, model_agent_type);
         Self {
@@ -312,6 +321,7 @@ impl AgentsModalState {
             default_agent,
             active_agent,
             model_agent_type: model_agent_type.map(str::to_owned),
+            generation: 1,
             personas,
             persona_selected: 0,
             persona_scroll: 0,
@@ -321,7 +331,9 @@ impl AgentsModalState {
     /// Rebuild agent list from disk after a mutation.
     fn rebuild_agents(&mut self) {
         let toggle = load_agent_toggle();
+        self.generation = self.generation.saturating_add(1);
         self.agents = build_agent_list(&self.cwd, &toggle);
+        stamp_entry_generation(&mut self.agents, self.generation);
         if self.selected >= self.agents.len() {
             self.selected = self.agents.len().saturating_sub(1);
         }
@@ -377,6 +389,13 @@ impl AgentsModalState {
         }
     }
 }
+
+fn stamp_entry_generation(entries: &mut [AgentListEntry], generation: u64) {
+    for entry in entries {
+        entry.generation = generation;
+    }
+}
+
 /// Build the full agent list: user-visible built-ins first, then
 /// file-based agents from discovery, with dedup.
 pub fn build_agent_list(cwd: &Path, toggle: &HashMap<String, bool>) -> Vec<AgentListEntry> {
@@ -394,6 +413,7 @@ pub fn build_agent_list(cwd: &Path, toggle: &HashMap<String, bool>) -> Vec<Agent
             is_builtin: true,
             expanded: false,
             definition: def,
+            generation: 0,
         });
     }
     let subagent_names: Vec<String> = BuiltinAgentName::subagent_variants()
@@ -430,6 +450,7 @@ pub fn build_agent_list(cwd: &Path, toggle: &HashMap<String, bool>) -> Vec<Agent
                     is_builtin: false,
                     expanded: false,
                     definition: def,
+                    generation: 0,
                 };
             }
         } else {
@@ -443,6 +464,7 @@ pub fn build_agent_list(cwd: &Path, toggle: &HashMap<String, bool>) -> Vec<Agent
                 is_builtin: false,
                 expanded: false,
                 definition: def,
+                generation: 0,
             });
         }
     }
@@ -773,11 +795,30 @@ pub fn toggle_agent(name: &str, enabled: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to write config.toml: {e}"))?;
     Ok(())
 }
+fn route_snapshot_for_entry(entry: &AgentListEntry) -> AgentRouteUxSnapshot {
+    let floor = entry.definition.capability_mode.map(|mode| mode.as_str());
+    snapshot_from_agent_definition(
+        &entry.name,
+        &entry.name,
+        entry.scope.label(),
+        entry.enabled,
+        false,
+        false,
+        &entry.definition,
+        floor,
+        entry.generation,
+    )
+}
+
 /// Format detail lines for an expanded agent entry.
 pub fn format_agent_detail(entry: &AgentListEntry) -> Vec<String> {
     let def = &entry.definition;
     let mut lines = Vec::new();
     lines.push(format!("  Model: {}", def.model));
+    if !def.models.is_empty() {
+        lines.push(format!("  Models: {}", def.models.join(", ")));
+    }
+    lines.extend(format_route_detail(&route_snapshot_for_entry(entry)));
     let mode_label = match def.prompt_mode {
         xai_grok_agent::config::PromptMode::Extend => "extend",
         xai_grok_agent::config::PromptMode::Full => "full",
@@ -1074,12 +1115,12 @@ fn build_agents_tab_shortcuts<'a>(state: &AgentsModalState) -> Vec<Shortcut<'a>>
             id: 0,
         },
         Shortcut {
-            label: "t toggle",
+            label: "t toggle (persist)",
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "s default",
+            label: "s default (persist)",
             clickable: false,
             id: 0,
         },
@@ -1459,6 +1500,52 @@ fn render_agents_tab(
                     (content_area.x + content_area.width).saturating_sub(x + 1) as usize;
                 if badge_remaining >= badge_text.width() {
                     buf.set_string(x + 1, row_y, &badge_text, badge_style);
+                    x += 1 + badge_text.width() as u16;
+                }
+                let snap = route_snapshot_for_entry(entry);
+                let selection = match snap.selection_mode {
+                    AgentSelectionMode::OrderedCandidates => {
+                        if snap.requested_model_refs.len() >= 2 {
+                            format!("{} candidates", snap.requested_model_refs.len())
+                        } else {
+                            "ordered".into()
+                        }
+                    }
+                    AgentSelectionMode::Exact => snap
+                        .requested_model_refs
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "exact".into()),
+                    AgentSelectionMode::Inherit => "inherit".into(),
+                };
+                let floor = snap.capability_floor.as_deref().unwrap_or("-");
+                let route_label =
+                    format!(" {} {} {}", snap.route_status.as_str(), selection, floor);
+                let route_remaining =
+                    (content_area.x + content_area.width).saturating_sub(x) as usize;
+                if route_remaining >= 1 {
+                    let mut route_style = Style::default().fg(theme.text_primary);
+                    if let Some(bg_color) = bg {
+                        route_style = route_style.bg(bg_color);
+                    }
+                    let display = if unicode_width::UnicodeWidthStr::width(route_label.as_str())
+                        > route_remaining
+                    {
+                        let mut out = String::new();
+                        let mut used = 0usize;
+                        for ch in route_label.chars() {
+                            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                            if used.saturating_add(width) > route_remaining {
+                                break;
+                            }
+                            out.push(ch);
+                            used += width;
+                        }
+                        out
+                    } else {
+                        route_label
+                    };
+                    buf.set_string(x, row_y, &display, route_style);
                 }
             }
             FlatRow::Description(idx, line) => {
@@ -2148,6 +2235,12 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
         KeyCode::Char('q') => AgentsModalOutcome::Close,
         KeyCode::Char('s') => {
             if let Some(entry) = state.agents.get(state.selected) {
+                if let Err(err) =
+                    admit_generation_bound_mutation(entry.generation, state.generation)
+                {
+                    state.message = Some(AgentsModalMessage::error(err.to_string()));
+                    return AgentsModalOutcome::Changed;
+                }
                 let name = entry.name.clone();
                 let is_already_default = load_config_agent_name().as_deref() == Some(name.as_str());
                 let new_default = if is_already_default {
@@ -2160,13 +2253,13 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                         refresh_default_agent(state);
                         state.message = Some(if is_already_default {
                             AgentsModalMessage::info(format!(
-                                "Cleared \u{2014} new sessions use '{}'",
-                                state.default_agent
+                                "Persisted: cleared default in config.toml (generation {}). New sessions use '{}'. This session is unchanged.",
+                                state.generation, state.default_agent
                             ))
                         } else {
                             AgentsModalMessage::info(format!(
-                                "New sessions will start with '{}'",
-                                state.default_agent
+                                "Persisted: new sessions will start with '{}' (config.toml, generation {}). This session is unchanged.",
+                                state.default_agent, state.generation
                             ))
                         });
                     }
@@ -2179,11 +2272,21 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
         }
         KeyCode::Char('t') => {
             if let Some(entry) = state.agents.get(state.selected) {
+                if let Err(err) =
+                    admit_generation_bound_mutation(entry.generation, state.generation)
+                {
+                    state.message = Some(AgentsModalMessage::error(err.to_string()));
+                    return AgentsModalOutcome::Changed;
+                }
                 let new_enabled = !entry.enabled;
                 let name = entry.name.clone();
                 match toggle_agent(&name, new_enabled) {
                     Ok(()) => {
                         state.rebuild_agents();
+                        state.message = Some(AgentsModalMessage::info(format!(
+                            "Persisted toggle for '{name}' to config.toml (generation {}). Active session route unchanged.",
+                            state.generation
+                        )));
                     }
                     Err(e) => {
                         state.message = Some(AgentsModalMessage::error(e));
@@ -2517,6 +2620,96 @@ mod tests {
     use super::*;
     use xai_grok_shell::agent::config::DEFAULT_AGENT_TYPE;
     #[test]
+    fn format_agent_detail_includes_route_status() {
+        let def = AgentDefinition::explore();
+        let entry = AgentListEntry {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            scope: def.scope,
+            source_path: None,
+            enabled: true,
+            is_builtin: true,
+            expanded: true,
+            definition: def,
+            generation: 1,
+        };
+        let lines = format_agent_detail(&entry);
+        assert!(
+            lines.iter().any(|line| line.contains("Route status:")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Selection:")),
+            "{lines:?}"
+        );
+    }
+    #[test]
+    fn format_agent_detail_includes_models_list() {
+        let mut def = AgentDefinition::explore();
+        def.models = vec!["review-primary".into(), "review-fallback".into()];
+        let entry = AgentListEntry {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            scope: def.scope,
+            source_path: None,
+            enabled: true,
+            is_builtin: true,
+            expanded: true,
+            definition: def,
+            generation: 1,
+        };
+        let lines = format_agent_detail(&entry);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Models: review-primary, review-fallback")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Selection: ordered_candidates")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("Lifecycle: selecting route")),
+            "idle expanded details must not claim selecting route: {lines:?}"
+        );
+    }
+    #[test]
+    fn format_agent_detail_stale_generation_refuses_toggle() {
+        let def = AgentDefinition::explore();
+        let mut state = make_persona_state(vec![], "", 0);
+        state.active_tab = AgentsTab::Agents;
+        state.agents = vec![AgentListEntry {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            scope: def.scope,
+            source_path: None,
+            enabled: true,
+            is_builtin: true,
+            expanded: false,
+            definition: def,
+            generation: 1,
+        }];
+        state.selected = 0;
+        state.generation = 2;
+        let outcome = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+        assert!(matches!(outcome, AgentsModalOutcome::Changed));
+        let message = state.message.expect("stale error");
+        assert!(
+            message.text.contains("stale generation"),
+            "{}",
+            message.text
+        );
+        assert!(state.agents[0].enabled);
+    }
+    #[test]
     fn agents_tab_next_cycles() {
         assert_eq!(AgentsTab::Agents.next(), AgentsTab::Personas);
         assert_eq!(AgentsTab::Personas.next(), AgentsTab::Agents);
@@ -2754,6 +2947,7 @@ mod tests {
                 persona_selected: 0,
                 persona_scroll: 0,
                 persona_expanded: std::collections::HashSet::new(),
+                generation: 1,
             };
             state.set_search_query(query);
             state
@@ -2795,6 +2989,7 @@ mod tests {
             persona_selected: selected,
             persona_scroll: 0,
             persona_expanded: std::collections::HashSet::new(),
+            generation: 1,
         };
         state.set_search_query(query);
         state

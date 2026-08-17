@@ -1481,7 +1481,11 @@ const PROMPT_CONTEXT_FILENAME: &str = "prompt_context.json";
 /// inspection, and post-hoc debugging of what went into a session's system prompt.
 fn save_prompt_context(session_info: &SessionInfo, prompt_context: &xai_grok_agent::PromptContext) {
     let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    save_prompt_context_in_dir(&dir, prompt_context);
+}
+
+fn save_prompt_context_in_dir(dir: &Path, prompt_context: &xai_grok_agent::PromptContext) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(?e, "failed to create session dir for prompt_context.json");
         return;
     }
@@ -1513,7 +1517,15 @@ const SYSTEM_PROMPT_FILENAME: &str = "system_prompt.txt";
 /// the content is identical, so the two writers can never produce a torn file.
 fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[ConversationItem]) {
     let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    persist_chat_history_jsonl_sync_in_dir(session_info, &dir, conversation);
+}
+
+fn persist_chat_history_jsonl_sync_in_dir(
+    session_info: &SessionInfo,
+    dir: &Path,
+    conversation: &[ConversationItem],
+) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(session_id = %session_info.id.0, ?e,
             "persist_chat_history_jsonl_sync: failed to create session dir");
         return;
@@ -1545,7 +1557,11 @@ fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[C
 /// (the conversation head is).
 fn save_system_prompt(session_info: &SessionInfo, system_prompt: &str) {
     let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    save_system_prompt_in_dir(&dir, system_prompt);
+}
+
+fn save_system_prompt_in_dir(dir: &Path, system_prompt: &str) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(?e, "failed to create session dir for system_prompt.txt");
         return;
     }

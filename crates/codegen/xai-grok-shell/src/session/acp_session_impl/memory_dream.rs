@@ -40,6 +40,10 @@ impl SessionActor {
     /// registered via the dynamic `register_mcp_tools` path which puts them in
     /// the `LocalRegistry` for dispatch. The memory backend itself is already
     /// in `Resources` (inserted by the caller before calling this method).
+    ///
+    /// Registration is transactional for the pair: if `memory_search` was
+    /// added but `memory_get` fails, only the newly-added search tool is
+    /// removed. A pre-existing `memory_get` remains untouched.
     pub(super) async fn register_memory_tools(
         &self,
         bridge: &xai_grok_tools::bridge::ToolBridge,
@@ -63,7 +67,14 @@ impl SessionActor {
                 None,
             )
             .await
-            .map_err(|e| format!("failed to register memory_get: {e}"))?;
+            .map_err(|e| {
+                let removed = bridge.unregister_tool_by_name(MEMORY_SEARCH_TOOL_NAME);
+                debug_assert!(
+                    removed,
+                    "memory_search was just registered and must be available for rollback"
+                );
+                format!("failed to register memory_get: {e}")
+            })?;
         Ok(())
     }
 

@@ -2776,6 +2776,7 @@ fn switch_model_holds_prompt_until_complete() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -2797,6 +2798,7 @@ fn switch_model_holds_prompt_until_complete() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );

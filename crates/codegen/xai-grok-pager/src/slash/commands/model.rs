@@ -5,6 +5,7 @@
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::supports_reasoning_effort_meta;
 
+use crate::acp::model_state::ModelNameResolution;
 use crate::acp::model_state::ModelState;
 use crate::app::actions::Action;
 use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
@@ -37,7 +38,7 @@ impl SlashCommand for ModelCommand {
     }
 
     fn usage(&self) -> &str {
-        "/model <name> [effort]"
+        "/model <name> [effort] [--session]"
     }
 
     fn takes_args(&self) -> bool {
@@ -49,7 +50,7 @@ impl SlashCommand for ModelCommand {
     }
 
     fn arg_placeholder(&self) -> Option<&str> {
-        Some("<model> [effort]")
+        Some("<model> [effort] [--session]")
     }
 
     fn suggest_args(&self, ctx: &AppCtx, args_query: &str) -> Option<Vec<ArgItem>> {
@@ -64,55 +65,126 @@ impl SlashCommand for ModelCommand {
         Some(build_model_items(ctx.models))
     }
 
+    fn initially_preferred_arg(&self, ctx: &AppCtx, item: &ArgItem) -> bool {
+        ctx.models
+            .current_model_id_str()
+            .is_some_and(|current| item.insert_text.trim_end() == current)
+    }
+
     fn run(&self, ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         let trimmed = args.trim();
         if trimmed.is_empty() {
-            return CommandResult::Error("Usage: /model <name> [effort]".into());
+            return CommandResult::Error("Usage: /model <name> [effort] [--session]".into());
+        }
+
+        // Parse flags via whitespace tokenization (not string suffix matching).
+        // Flags can appear anywhere in the args string.
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let mut session_only = false;
+        let mut model_args_parts: Vec<&str> = Vec::new();
+
+        for token in tokens {
+            if token.eq_ignore_ascii_case("--session") {
+                session_only = true;
+            } else {
+                model_args_parts.push(token);
+            }
+        }
+
+        let model_args = model_args_parts.join(" ");
+        if model_args.is_empty() {
+            return CommandResult::Error("Usage: /model <name> [effort] [--session]".into());
         }
 
         // Prefer an exact full-string catalog match first. Model display names
         // often contain spaces ("Grok 4.5"); if we split on the last token
         // first, a shorter catalog entry ("Grok") would steal the prefix and
         // treat "4.5" as an effort level.
-        if let Some(id) = ctx.models.resolve_by_name_or_id(trimmed) {
-            if let Some(reason) = model_not_ready_reason(ctx.models, &id) {
-                return CommandResult::Error(reason);
+        match ctx.models.resolve_unique_by_name_or_id(&model_args) {
+            ModelNameResolution::Resolved(id) => {
+                if let Some(reason) = model_not_ready_reason(ctx.models, &id) {
+                    return CommandResult::Error(reason);
+                }
+                // Session-only: use SwitchModel with no effort (does not persist).
+                // Default: use SetDefaultModel (switches + persists on success).
+                return if session_only {
+                    CommandResult::Action(Action::SwitchModel {
+                        model_id: id,
+                        effort: None,
+                        session_only: true,
+                    })
+                } else {
+                    CommandResult::Action(Action::SetDefaultModel(id))
+                };
             }
-            return CommandResult::Action(Action::SetDefaultModel(id));
+            ModelNameResolution::Ambiguous => {
+                return ambiguous_model_error(&model_args);
+            }
+            ModelNameResolution::Unknown => {}
         }
 
         // Trailing effort token + reasoning model → session-scoped switch
         // (not persisted as default). Resolve via the shared gate so a rejected
         // level (e.g. `none` on grok-4.5) surfaces the effort error with the
         // model's offered ids — not "Unknown model: … none".
-        if let Some((prefix, token)) = split_trailing_token(trimmed)
-            && let Some(id) = resolve_model(ctx.models, prefix)
-            && ctx
-                .models
-                .available
-                .get(&id)
-                .map(supports_reasoning_effort)
-                .unwrap_or(false)
+        //
+        // Reject effort + --session as conflicting. The user must choose one:
+        // - `/model <name> <effort>` → session-only with effort
+        // - `/model <name> --session` → session-only without effort
+        // - `/model <name>` → persist (default behavior)
+        if let Some((prefix, _token)) = split_trailing_token(&model_args)
+            && matches!(
+                ctx.models.resolve_unique_by_name_or_id(prefix),
+                ModelNameResolution::Ambiguous
+            )
         {
-            if let Some(reason) = model_not_ready_reason(ctx.models, &id) {
-                return CommandResult::Error(reason);
+            return ambiguous_model_error(prefix);
+        }
+        if let Some((prefix, token)) = split_trailing_token(&model_args) {
+            // Check if the last token might be an effort level.
+            if let Some(id) = resolve_model(ctx.models, prefix)
+                && ctx
+                    .models
+                    .available
+                    .get(&id)
+                    .map(supports_reasoning_effort)
+                    .unwrap_or(false)
+            {
+                if session_only {
+                    return CommandResult::Error(
+                        "Cannot use --session with effort level. Use one of:\n  /model <name> <effort> (session-only with effort)\n  /model <name> --session (session-only)\n  /model <name> (persist as default)".into(),
+                    );
+                }
+                if let Some(reason) = model_not_ready_reason(ctx.models, &id) {
+                    return CommandResult::Error(reason);
+                }
+                return match ctx.models.resolve_effort_for_model(&id, token) {
+                    Ok(effort) => CommandResult::Action(Action::SwitchModel {
+                        model_id: id,
+                        effort: Some(effort),
+                        session_only: true,
+                    }),
+                    Err(err) => CommandResult::Error(err.message()),
+                };
             }
-            return match ctx.models.resolve_effort_for_model(&id, token) {
-                Ok(effort) => CommandResult::Action(Action::SwitchModel {
-                    model_id: id,
-                    effort: Some(effort),
-                }),
-                Err(err) => CommandResult::Error(err.message()),
-            };
         }
 
-        CommandResult::Error(format!("Unknown model: {trimmed}"))
+        CommandResult::Error(format!("Unknown model: {model_args}"))
     }
+}
+
+fn ambiguous_model_error(name: &str) -> CommandResult {
+    CommandResult::Error(format!(
+        "Ambiguous model name: {name}. Use the model id shown in /model"
+    ))
 }
 
 /// Look up a model by case-insensitive display name OR model id match.
 fn resolve_model(models: &ModelState, name: &str) -> Option<acp::ModelId> {
-    models.resolve_by_name_or_id(name)
+    match models.resolve_unique_by_name_or_id(name) {
+        ModelNameResolution::Resolved(id) => Some(id),
+        ModelNameResolution::Ambiguous | ModelNameResolution::Unknown => None,
+    }
 }
 
 fn supports_reasoning_effort(info: &acp::ModelInfo) -> bool {
@@ -140,10 +212,11 @@ fn parse_model_readiness(
             .unwrap_or("")
             .to_string()
     };
-    let ready = meta
-        .and_then(|m| m.get("ready"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let ready = match meta.and_then(|m| m.get("ready")) {
+        None => true,
+        Some(serde_json::Value::Bool(ready)) => *ready,
+        Some(_) => false,
+    };
     ModelReadinessMeta {
         auth_scheme: get_str("authScheme"),
         auth_class: get_str("authClass"),
@@ -260,25 +333,34 @@ fn split_trailing_token(args: &str) -> Option<(&str, &str)> {
 /// Prefer catalog-id prefixes (picker `insert_text`), then display names.
 /// Longest prefix first so `"Grok 4.5 "` is not stolen by `"Grok "`.
 fn detect_effort_phase(models: &ModelState, args_query: &str) -> Option<acp::ModelId> {
-    let mut candidates: Vec<(acp::ModelId, String)> = Vec::new();
-    for (id, info) in &models.available {
-        if !supports_reasoning_effort(info) {
-            continue;
-        }
-        candidates.push((id.clone(), id.0.to_string()));
-        if !info.name.eq_ignore_ascii_case(id.0.as_ref()) {
-            candidates.push((id.clone(), info.name.clone()));
+    // `selectable_models`, not the raw catalog: an unavailable-resident row is
+    // presentation state and must not be typable. A display name shared by two
+    // catalog ids is dropped as a prefix so it cannot resolve to one of them.
+    let reasoning_models: Vec<_> = models
+        .selectable_models()
+        .filter(|(_, info)| supports_reasoning_effort(info))
+        .collect();
+    let mut candidates: Vec<(&acp::ModelId, &str)> = Vec::new();
+    for (id, info) in &reasoning_models {
+        candidates.push((id, id.0.as_ref()));
+        let name_is_unique = models
+            .selectable_models()
+            .filter(|(_, candidate)| candidate.name.eq_ignore_ascii_case(&info.name))
+            .count()
+            == 1;
+        if name_is_unique && !info.name.eq_ignore_ascii_case(id.0.as_ref()) {
+            candidates.push((id, info.name.as_str()));
         }
     }
-    candidates.sort_by_key(|(_, prefix)| std::cmp::Reverse(prefix.len()));
+    candidates.sort_by_key(|(_, name)| std::cmp::Reverse(name.len()));
 
     for (id, prefix) in candidates {
         if args_query.len() > prefix.len()
             && args_query.is_char_boundary(prefix.len())
-            && args_query[..prefix.len()].eq_ignore_ascii_case(&prefix)
+            && args_query[..prefix.len()].eq_ignore_ascii_case(prefix)
             && args_query[prefix.len()..].starts_with(char::is_whitespace)
         {
-            return Some(id);
+            return Some(id.clone());
         }
     }
     None
@@ -378,15 +460,25 @@ fn model_item_match_text(id: &acp::ModelId, info: &acp::ModelInfo, provider_hint
 fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
     let current_id = models.current.as_ref();
     let mut items: Vec<ArgItem> = Vec::with_capacity(models.available.len());
-    for (id, info) in &models.available {
+    for (id, info) in models.selectable_models() {
         let is_current = current_id == Some(id);
         let supports = supports_reasoning_effort(info);
         let readiness = parse_model_readiness(info.meta.as_ref());
 
-        let display = if is_current {
-            format!("{} (current)", info.name)
+        let duplicate_name = models
+            .selectable_models()
+            .filter(|(_, candidate)| candidate.name.eq_ignore_ascii_case(&info.name))
+            .count()
+            > 1;
+        let label = if duplicate_name {
+            format!("{} ({})", info.name, id.0)
         } else {
             info.name.clone()
+        };
+        let display = if is_current {
+            format!("{label} (current)")
+        } else {
+            label
         };
 
         // Trailing space on reasoning models: signals "more input
@@ -434,6 +526,9 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
 
         items.push(ArgItem {
             display,
+            // Name + catalog id + wire slug + provider hint + capability
+            // tokens (#17): the picker must be searchable by identity, not by
+            // display name alone.
             match_text: model_item_match_text(id, info, &readiness.provider_hint),
             insert_text,
             identity: id.0.to_string(),
@@ -560,6 +655,9 @@ mod tests {
         // Reasoning model has trailing space in insert_text -- this is the
         // signal the prompt widget reads to keep the dropdown open after
         // Enter so the effort sub-menu can render.
+        // Look rows up by display/identity, not by an exact `match_text`:
+        // the search index also carries slug, provider hint and capability
+        // tokens (#17), so equality on it is not a stable row selector.
         let reasoning = row_named(&items, "Reasoning X");
         assert_eq!(reasoning.insert_text, "reasoning-x ");
         assert_eq!(reasoning.identity, "reasoning-x");
@@ -568,6 +666,46 @@ mod tests {
         let plain = row_named(&items, "Grok 4.5");
         assert_eq!(plain.insert_text, "grok-4.5");
         assert_eq!(plain.identity, "grok-4.5");
+    }
+
+    #[test]
+    fn unavailable_resident_is_neither_suggested_nor_runnable() {
+        let mut state = ModelState::default();
+        let (resident_id, resident_info) = model_with_meta(
+            "retired",
+            "Retired Model",
+            serde_json::Map::from_iter([(
+                "unavailableResidentModel".into(),
+                serde_json::json!(true),
+            )]),
+        );
+        let (ready_id, ready_info) = plain_model("ready", "Ready Model");
+        state.available.insert(resident_id.clone(), resident_info);
+        state.available.insert(ready_id, ready_info);
+        state.current = Some(resident_id);
+
+        let app_ctx = AppCtx {
+            models: &state,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+        };
+        let items = ModelCommand.suggest_args(&app_ctx, "").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].match_text, "Ready Model ready");
+
+        let mut exec_ctx = dummy_exec_ctx(&state);
+        assert!(matches!(
+            ModelCommand.run(&mut exec_ctx, "Retired Model"),
+            CommandResult::Error(message) if message == "Unknown model: Retired Model"
+        ));
+        assert!(matches!(
+            ModelCommand.run(&mut exec_ctx, "retired"),
+            CommandResult::Error(message) if message == "Unknown model: retired"
+        ));
     }
 
     #[test]
@@ -588,7 +726,7 @@ mod tests {
         };
         // Args query has a trailing space -> effort phase. Items come out
         // ordered xhigh -> minimal (strongest first) per EFFORT_LEVELS.
-        let items = cmd.suggest_args(&ctx, "Reasoning X ").unwrap();
+        let items = cmd.suggest_args(&ctx, "reasoning-x ").unwrap();
         assert_eq!(items.len(), 5);
         assert_eq!(items[0].insert_text, "reasoning-x xhigh");
         assert_eq!(items[1].insert_text, "reasoning-x high");
@@ -602,6 +740,49 @@ mod tests {
         assert!(items[0].match_text.starts_with("a "));
         assert!(items[3].match_text.starts_with("d "));
         assert!(items[4].match_text.starts_with("e "));
+    }
+
+    #[test]
+    fn unique_display_name_enters_effort_phase_but_duplicate_name_does_not() {
+        let mut unique = ModelState::default();
+        let (unique_id, unique_info) = model_with_reasoning("reasoning-x", "Reasoning X");
+        unique.available.insert(unique_id, unique_info);
+        let unique_ctx = AppCtx {
+            models: &unique,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+        };
+        let items = ModelCommand
+            .suggest_args(&unique_ctx, "Reasoning X ")
+            .expect("unique label chains to effort choices");
+        assert_eq!(items[0].insert_text, "reasoning-x xhigh");
+
+        let mut duplicate = ModelState::default();
+        for id in ["provider-a/shared", "provider-b/shared"] {
+            let (id, info) = model_with_reasoning(id, "Shared Model");
+            duplicate.available.insert(id, info);
+        }
+        let duplicate_ctx = AppCtx {
+            models: &duplicate,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+        };
+        let items = ModelCommand
+            .suggest_args(&duplicate_ctx, "Shared Model ")
+            .expect("ambiguous label stays in the model phase");
+        assert!(items.iter().all(|item| item.display.contains("provider-")));
+        let id_items = ModelCommand
+            .suggest_args(&duplicate_ctx, "provider-a/shared ")
+            .expect("canonical id chains to effort choices");
+        assert_eq!(id_items[0].insert_text, "provider-a/shared xhigh");
     }
 
     #[test]
@@ -621,7 +802,7 @@ mod tests {
             screen_mode: crate::app::ScreenMode::Fullscreen,
         };
         // Still in effort phase; matcher upstream narrows to high / xhigh.
-        let items = cmd.suggest_args(&ctx, "Reasoning X h").unwrap();
+        let items = cmd.suggest_args(&ctx, "reasoning-x h").unwrap();
         assert_eq!(items.len(), 5);
     }
 
@@ -655,11 +836,90 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = ModelCommand.run(&mut ctx, "Reasoning X xhigh");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only,
+            }) => {
                 assert_eq!(model_id.0.as_ref(), "reasoning-x");
                 assert_eq!(effort, Some(ReasoningEffort::Xhigh));
+                assert!(session_only);
             }
             other => panic!("expected SwitchModel with effort, got {other:?}"),
+        }
+    }
+
+    /// #357: the chained `/model` picker is a distinct UI path from
+    /// `/effort`; lock both the Ultra row and the typed action it dispatches.
+    #[test]
+    fn chained_model_picker_renders_and_dispatches_ultra() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_meta(
+            "gpt-5.6-sol",
+            "GPT-5.6 Sol",
+            serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEffort": "low",
+                "reasoningEfforts": [
+                    { "id": "low", "value": "low", "label": "Low", "default": true },
+                    { "id": "medium", "value": "medium", "label": "Medium" },
+                    { "id": "high", "value": "high", "label": "High" },
+                    { "id": "xhigh", "value": "xhigh", "label": "Xhigh" },
+                    { "id": "max", "value": "max", "label": "Max" },
+                    {
+                        "id": "ultra",
+                        "value": "ultra",
+                        "label": "Ultra",
+                        "description": "Maximum reasoning with proactive multi-agent guidance"
+                    }
+                ]
+            })
+            .as_object()
+            .expect("Codex ACP metadata")
+            .clone(),
+        );
+        state.available.insert(id.clone(), info);
+
+        let app_ctx = AppCtx {
+            models: &state,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+        };
+        let model_rows = ModelCommand
+            .suggest_args(&app_ctx, "")
+            .expect("model picker rows");
+        assert_eq!(model_rows.len(), 1);
+        assert_eq!(model_rows[0].insert_text, "gpt-5.6-sol ");
+
+        let effort_rows = ModelCommand
+            .suggest_args(&app_ctx, "gpt-5.6-sol ")
+            .expect("chained effort rows");
+        let ultra = effort_rows
+            .iter()
+            .find(|row| row.insert_text == "gpt-5.6-sol ultra")
+            .expect("Ultra row");
+        assert_eq!(ultra.display, "Ultra");
+        assert_eq!(
+            ultra.description,
+            "Maximum reasoning with proactive multi-agent guidance"
+        );
+
+        let mut exec_ctx = dummy_exec_ctx(&state);
+        match ModelCommand.run(&mut exec_ctx, "GPT-5.6 Sol ultra") {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only,
+            }) => {
+                assert_eq!(model_id, id);
+                assert_eq!(effort, Some(ReasoningEffort::Ultra));
+                assert!(session_only);
+            }
+            other => panic!("expected Ultra SwitchModel action, got {other:?}"),
         }
     }
 
@@ -758,6 +1018,176 @@ mod tests {
                 assert_eq!(resolved_id, id);
             }
             other => panic!("expected Action::SetDefaultModel(<id>), got {other:?}"),
+        }
+    }
+
+    /// `/model <name> --session` dispatches `Action::SwitchModel` with
+    /// `effort: None`, which is session-only (does not persist to config).
+    /// This distinguishes explicit session-only selection from the default
+    /// persist-on-success behavior of `SetDefaultModel`.
+    #[test]
+    fn run_model_with_session_flag_dispatches_session_only_switch() {
+        let mut state = ModelState::default();
+        let (id, info) = plain_model("grok-4.5", "Grok 4.5");
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Grok 4.5 --session");
+        match result {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort: None,
+                session_only,
+            }) => {
+                assert_eq!(model_id, id);
+                assert!(session_only, "--session flag must set session_only to true");
+            }
+            other => panic!(
+                "expected Action::SwitchModel with effort: None for --session, got {other:?}"
+            ),
+        }
+    }
+
+    /// `/model <name> --session` with an unready model must still hard-block.
+    #[test]
+    fn run_model_session_flag_rejects_unready() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_meta(
+            "unready",
+            "Unready",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(false)),
+                (
+                    "readinessReason".into(),
+                    serde_json::json!("missing credential"),
+                ),
+            ]),
+        );
+        state.available.insert(id, info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Unready --session");
+        match result {
+            CommandResult::Error(msg) => {
+                assert_eq!(msg, "missing credential");
+            }
+            other => panic!("expected Error for unready model with --session, got {other:?}"),
+        }
+    }
+
+    /// `/model <name> --session` with ambiguous name must surface the ambiguity error.
+    #[test]
+    fn run_model_session_flag_rejects_ambiguous() {
+        let mut state = ModelState::default();
+        let (id1, info1) = plain_model("provider-a/shared", "Shared Model");
+        let (id2, info2) = plain_model("provider-b/shared", "Shared Model");
+        state.available.insert(id1, info1);
+        state.available.insert(id2, info2);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Shared Model --session");
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(msg.contains("Ambiguous model name"));
+            }
+            other => panic!("expected Error for ambiguous model with --session, got {other:?}"),
+        }
+    }
+
+    /// `/model --session <name>` (flag before model) must work (position-independent).
+    #[test]
+    fn run_model_session_flag_before_name_works() {
+        let mut state = ModelState::default();
+        let (id, info) = plain_model("grok-4.5", "Grok 4.5");
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "--session Grok 4.5");
+        match result {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort: None,
+                session_only: _,
+            }) => {
+                assert_eq!(model_id, id);
+            }
+            other => {
+                panic!("expected Action::SwitchModel with --session before name, got {other:?}")
+            }
+        }
+    }
+
+    /// `/model <name> --SESSION` (uppercase) must work (case-insensitive).
+    #[test]
+    fn run_model_session_flag_case_insensitive() {
+        let mut state = ModelState::default();
+        let (id, info) = plain_model("grok-4.5", "Grok 4.5");
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Grok 4.5 --SESSION");
+        match result {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort: None,
+                session_only: _,
+            }) => {
+                assert_eq!(model_id, id);
+            }
+            other => panic!("expected Action::SwitchModel with uppercase --SESSION, got {other:?}"),
+        }
+    }
+
+    /// `/model <name> --session --session` (duplicate flag) must work (idempotent).
+    #[test]
+    fn run_model_duplicate_session_flag_idempotent() {
+        let mut state = ModelState::default();
+        let (id, info) = plain_model("grok-4.5", "Grok 4.5");
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Grok 4.5 --session --session");
+        match result {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort: None,
+                session_only: _,
+            }) => {
+                assert_eq!(model_id, id);
+            }
+            other => panic!("expected idempotent --session --session, got {other:?}"),
+        }
+    }
+
+    /// `/model <name> <effort> --session` must reject with clear error.
+    /// Effort and --session are conflicting options:
+    /// - Effort alone is already session-only
+    /// - --session alone is session-only without effort
+    #[test]
+    fn run_model_effort_with_session_flag_rejects() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_reasoning("reasoning-x", "Reasoning X");
+        state.available.insert(id, info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "Reasoning X high --session");
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(
+                    msg.contains("Cannot use --session with effort level"),
+                    "expected conflict error, got: {msg}"
+                );
+            }
+            other => panic!("expected Error for effort + --session conflict, got {other:?}"),
+        }
+    }
+
+    /// `/model --session <name> <effort>` (flag first) must also reject.
+    #[test]
+    fn run_model_session_flag_before_effort_rejects() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_reasoning("reasoning-x", "Reasoning X");
+        state.available.insert(id, info);
+        let mut ctx = dummy_exec_ctx(&state);
+        let result = ModelCommand.run(&mut ctx, "--session Reasoning X high");
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(msg.contains("Cannot use --session with effort level"));
+            }
+            other => panic!("expected Error for --session + effort conflict, got {other:?}"),
         }
     }
 
@@ -1405,6 +1835,37 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_display_names_show_ids_and_require_id_to_run() {
+        let mut state = ModelState::default();
+        let (first_id, first_info) = plain_model("provider-a/shared", "Shared Model");
+        let (second_id, second_info) = plain_model("provider-b/shared", "Shared Model");
+        state.available.insert(first_id.clone(), first_info);
+        state.available.insert(second_id, second_info);
+
+        let items = build_model_items(&state);
+        assert!(items.iter().any(|item| {
+            item.display == "Shared Model (provider-a/shared)"
+                && item.insert_text == "provider-a/shared"
+        }));
+
+        let mut ctx = dummy_exec_ctx(&state);
+        assert!(matches!(
+            ModelCommand.run(&mut ctx, "Shared Model"),
+            CommandResult::Error(message)
+                if message.contains("Ambiguous model name") && message.contains("model id")
+        ));
+        assert!(matches!(
+            ModelCommand.run(&mut ctx, "Shared Model high"),
+            CommandResult::Error(message)
+                if message.contains("Ambiguous model name") && message.contains("model id")
+        ));
+        assert!(matches!(
+            ModelCommand.run(&mut ctx, "provider-a/shared"),
+            CommandResult::Action(Action::SetDefaultModel(id)) if id == first_id
+        ));
+    }
+
+    #[test]
     fn run_hard_blocks_invalid_auth_scheme_model() {
         let reason = r#"invalid auth_scheme "not-a-scheme": expected bearer, x_api_key, or none"#;
         let mut state = ModelState::default();
@@ -1451,5 +1912,25 @@ mod tests {
         let mut both = items.clone();
         both[0].initially_selected = true;
         assert_eq!(ArgItem::preferred_index(&both), 0);
+    }
+
+    #[test]
+    fn malformed_present_readiness_metadata_fails_closed() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_meta(
+            "malformed-ready",
+            "Malformed Ready",
+            serde_json::Map::from_iter([("ready".into(), serde_json::json!("yes"))]),
+        );
+        state.available.insert(id, info);
+
+        let items = build_model_items(&state);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].non_selectable);
+        assert_eq!(items[0].badge, "missing");
+        assert!(matches!(
+            ModelCommand.run(&mut dummy_exec_ctx(&state), "malformed-ready"),
+            CommandResult::Error(message) if message.contains("not ready")
+        ));
     }
 }

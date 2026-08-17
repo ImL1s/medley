@@ -85,6 +85,9 @@ pub struct SessionHandle {
     pub cmd_tx: mpsc::UnboundedSender<SessionCommand>,
     /// Persistence channel shared with the actor (used by extension handlers).
     pub(crate) persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
+    /// Private-to-public filesystem publication plan for a fresh session.
+    /// `None` for loaded, resumed, and subagent sessions.
+    pub(crate) fresh_publication: Option<super::persistence::FreshPublication>,
     /// Current running prompt/turn id, if any.
     ///
     /// Shared with the session actor so external cancellation paths can target
@@ -109,6 +112,10 @@ pub struct SessionHandle {
         std::sync::Arc<arc_swap::ArcSwapOption<xai_grok_sampling_types::ToolOverrides>>,
     /// Handle to the hunk tracker for this session
     pub hunk_tracker_handle: HunkTrackerHandle,
+    /// Finalized actor toolset captured at initialization. Fresh sessions use
+    /// this during their final synchronous publication commit so workspace
+    /// binding is already complete when the ACP response becomes observable.
+    pub(crate) workspace_toolset: std::sync::Arc<xai_grok_tools::registry::types::FinalizedToolset>,
     /// Actor-based chat state handle — lets callers inspect final conversation state.
     pub chat_state_handle: xai_chat_state::ChatStateHandle,
     /// Handle to session signals (used for completion tracking)

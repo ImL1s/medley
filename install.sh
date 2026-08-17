@@ -18,6 +18,9 @@
 #   MEDLEY_TARGET       force a target triple instead of detecting one
 #   MEDLEY_REPO         source repository (default: ImL1s/medley)
 #   MEDLEY_DRYRUN       set to 1 to print the plan without downloading anything
+#   GITHUB_TOKEN / GH_TOKEN
+#                       optional; sent only to github.com / api.github.com so
+#                       unauthenticated API rate limits do not fail an install
 
 set -eu
 
@@ -78,9 +81,28 @@ select_downloader() {
   fi
 }
 
+# Empty unless this is a GitHub URL and a token is present. Never printed.
+github_token_for_url() {
+  case "$1" in
+  https://api.github.com/* | https://github.com/*)
+    printf '%s' "${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    ;;
+  esac
+}
+
 fetch_to_file() {
+  ft_token="$(github_token_for_url "$1")"
   if [ "$DOWNLOADER" = curl ]; then
-    curl --fail --silent --show-error --location --retry 3 --output "$2" "$1"
+    if [ -n "$ft_token" ]; then
+      curl --fail --silent --show-error --location --retry 3 \
+        -H "Authorization: Bearer ${ft_token}" \
+        --output "$2" "$1"
+    else
+      curl --fail --silent --show-error --location --retry 3 --output "$2" "$1"
+    fi
+  elif [ -n "$ft_token" ]; then
+    wget --quiet --tries=3 --header="Authorization: Bearer ${ft_token}" \
+      --output-document="$2" "$1"
   else
     wget --quiet --tries=3 --output-document="$2" "$1"
   fi
@@ -105,20 +127,37 @@ fetch_checked() {
   fc_url="$1"
   fc_out="$2"
   fc_status=''
+  fc_token="$(github_token_for_url "$fc_url")"
 
   if [ "$DOWNLOADER" = curl ]; then
     # --write-out '%{http_code}' reports the *final* status after redirects.
-    fc_status="$(
-      curl --silent --show-error --location --retry 3 \
-        --output "$fc_out" --write-out '%{http_code}' "$fc_url" 2>/dev/null
-    )" || return 1
+    if [ -n "$fc_token" ]; then
+      fc_status="$(
+        curl --silent --show-error --location --retry 3 \
+          -H "Authorization: Bearer ${fc_token}" \
+          --output "$fc_out" --write-out '%{http_code}' "$fc_url" 2>/dev/null
+      )" || return 1
+    else
+      fc_status="$(
+        curl --silent --show-error --location --retry 3 \
+          --output "$fc_out" --write-out '%{http_code}' "$fc_url" 2>/dev/null
+      )" || return 1
+    fi
   else
     # Deliberately not --quiet: it suppresses --server-response as well, and
     # then there is no status to check. stderr is captured instead, so the
     # progress noise never reaches the user's terminal.
-    fc_headers="$(
-      wget --tries=3 --server-response --output-document="$fc_out" "$fc_url" 2>&1
-    )" || return 1
+    if [ -n "$fc_token" ]; then
+      fc_headers="$(
+        wget --tries=3 --server-response \
+          --header="Authorization: Bearer ${fc_token}" \
+          --output-document="$fc_out" "$fc_url" 2>&1
+      )" || return 1
+    else
+      fc_headers="$(
+        wget --tries=3 --server-response --output-document="$fc_out" "$fc_url" 2>&1
+      )" || return 1
+    fi
     # Last status line wins: redirects print one per hop.
     fc_status="$(
       printf '%s\n' "$fc_headers" |

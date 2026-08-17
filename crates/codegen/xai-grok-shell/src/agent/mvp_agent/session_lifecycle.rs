@@ -140,6 +140,44 @@ impl MvpAgent {
     ) -> Option<R> {
         self.session_registry.with_resident_mut(id, f)
     }
+    pub(crate) fn commit_model_switch(
+        &self,
+        id: &acp::SessionId,
+        expected_cmd_tx: &tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+        load_guard: Option<&SessionLoadGuard<'_>>,
+        unavailable_model_policy: super::UnavailableModelCommitPolicy,
+        update: impl FnOnce(&mut SessionHandle),
+    ) -> super::ModelSwitchCommitOutcome {
+        if let Some(load_guard) = load_guard
+            && !self
+                .session_registry
+                .attach_active(id)
+                .is_some_and(|active| active.same_channel(&load_guard.rx))
+        {
+            return super::ModelSwitchCommitOutcome::Superseded;
+        }
+        self.session_registry.commit_model_switch(
+            id,
+            expected_cmd_tx,
+            load_guard.is_some(),
+            unavailable_model_policy,
+            update,
+        )
+    }
+    pub(crate) fn unavailable_model_revision(&self, id: &acp::SessionId) -> Option<u64> {
+        self.session_registry.unavailable_model_revision(id)
+    }
+    pub(crate) fn session_load_in_flight(&self, id: &acp::SessionId) -> bool {
+        self.session_registry.attach_waiter(id).is_some()
+    }
+    pub(crate) fn unavailable_recovery_is_current(
+        &self,
+        id: &acp::SessionId,
+        expected: &UnavailableRecoverySnapshot,
+    ) -> bool {
+        self.session_registry
+            .unavailable_recovery_is_current(id, expected)
+    }
     pub(crate) fn resident_cmd_txs(
         &self,
     ) -> Vec<tokio::sync::mpsc::UnboundedSender<SessionCommand>> {

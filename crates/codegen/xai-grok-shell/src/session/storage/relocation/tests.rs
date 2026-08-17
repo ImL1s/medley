@@ -8,7 +8,20 @@ use nix::unistd::mkfifo;
 
 use super::*;
 use crate::session::info::Info;
+use crate::session::persistence::UNPUBLISHED_SESSION_MARKER;
 use crate::session::storage::relocation::journal::AtomicWriteFault;
+
+#[test]
+fn storage_view_excludes_unpublished_session_from_all_candidate_sets() {
+    let temp = tempfile::tempdir().unwrap();
+    let pending = create_source(temp.path(), "/pending", "session", 0);
+    fs::write(pending.join(UNPUBLISHED_SESSION_MARKER), b"").unwrap();
+
+    let view = RelocationView::load(temp.path()).unwrap();
+    assert!(view.session_dirs(None).unwrap().is_empty());
+    assert_eq!(view.find_persisted_session_dir("session").unwrap(), None);
+    assert_eq!(view.find_any_session_dir("session").unwrap(), None);
+}
 
 #[test]
 fn journal_is_validated_commit_aware_and_externally_leased() {

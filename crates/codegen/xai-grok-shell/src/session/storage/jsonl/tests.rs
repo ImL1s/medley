@@ -1357,6 +1357,8 @@ async fn test_subagent_notifications_round_trip() {
             model: None,
             resumed_from: None,
             workflow_run_id: None,
+            route_receipt_digest: None,
+            selected_catalog_id: None,
         },
         meta: None,
     };
@@ -1475,6 +1477,8 @@ async fn test_subagent_spawned_resumed_roundtrip() {
             model: None,
             resumed_from: Some("source-agent-id".to_string()),
             workflow_run_id: None,
+            route_receipt_digest: None,
+            selected_catalog_id: None,
         },
         meta: None,
     };
@@ -2112,6 +2116,23 @@ async fn list_sessions_recent_empty_dir() {
     let recent = adapter.list_sessions_recent(10).await.unwrap();
     assert!(recent.is_empty());
 }
+
+#[tokio::test]
+async fn list_sessions_recent_zero_limit_returns_without_candidates() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = crate::util::grok_home::encode_cwd_dirname("/workspace");
+    write_test_summary(
+        tmp.path(),
+        &cwd,
+        "present",
+        chrono::Utc::now(),
+        None,
+        None,
+        None,
+    );
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    assert!(adapter.list_sessions_recent(0).await.unwrap().is_empty());
+}
 #[tokio::test]
 async fn list_sessions_sorts_by_last_active_at_over_updated_at() {
     let tmp = TempDir::new().unwrap();
@@ -2403,6 +2424,31 @@ fn accept_fresh_publication_continues_only_for_committed_durability() {
     );
 }
 
+#[tokio::test]
+async fn list_sessions_recent_fills_limit_after_newer_candidate_fails_revalidation() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = crate::util::grok_home::encode_cwd_dirname("/ws");
+    let now = chrono::Utc::now();
+    let good_dir = write_test_summary(
+        tmp.path(),
+        &cwd,
+        "good",
+        now - chrono::Duration::hours(1),
+        None,
+        None,
+        None,
+    );
+    let bad_dir = tmp.path().join("sessions").join(&cwd).join("bad-newest");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    std::fs::write(bad_dir.join("summary.json"), b"not valid json!!!").unwrap();
+    set_mtime(&good_dir.join("summary.json"), now - chrono::Duration::hours(1));
+    set_mtime(&bad_dir.join("summary.json"), now);
+
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let recent = adapter.list_sessions_recent(1).await.unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].info.id, acp::SessionId::new("good"));
+}
 /// Helper: set the mtime of a file to a specific chrono DateTime.
 fn set_mtime(path: &std::path::Path, time: chrono::DateTime<chrono::Utc>) {
     use std::time::{Duration, UNIX_EPOCH};
@@ -3361,4 +3407,30 @@ async fn load_session_without_updates_survives_merged_chat_line() {
             vec!["real turn"],
             "resume succeeds; only the merged record is dropped"
         );
+}
+
+#[tokio::test]
+async fn rebindable_adapter_switches_all_future_writes_to_published_path() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let staged = temp_dir.path().join("private/staged");
+    let published = temp_dir.path().join("sessions/published");
+    let (adapter, binding) = JsonlStorageAdapter::with_rebindable_session_dir(staged.clone());
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    assert!(staged.join(super::super::SUMMARY_FILE).is_file());
+
+    std::fs::create_dir_all(published.parent().unwrap()).unwrap();
+    std::fs::rename(&staged, &published).unwrap();
+    binding.rebind(published.clone());
+    adapter
+        .update_session_title(&info, "after publish".to_owned())
+        .await
+        .unwrap();
+
+    let summary: crate::session::persistence::Summary = serde_json::from_slice(
+        &std::fs::read(published.join(super::super::SUMMARY_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(summary.generated_title.as_deref(), Some("after publish"));
+    assert!(!staged.exists());
 }

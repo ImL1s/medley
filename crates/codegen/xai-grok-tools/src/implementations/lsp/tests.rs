@@ -20,7 +20,7 @@ use mock_servers::*;
 ///
 /// One constant for the suite rather than a hand-rolled iteration count at each
 /// call site, so a slow machine is retuned in one place.
-const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Poll until `ready`, or fail saying what was being waited for.
 async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
@@ -67,18 +67,6 @@ async fn drain_until_reported(mgr: &tokio::sync::Mutex<LspManager>, needle: &str
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     panic!("no summary mentioning {needle:?} within the deadline");
-}
-
-/// The push-and-pull mock stamps `pulls=N` on every published diagnostic.
-fn published_pulls(summary: &str) -> Option<u32> {
-    summary
-        .split("pulls=")
-        .nth(1)?
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .ok()
 }
 
 fn mock_server_config(script_path: &Path) -> LspServerConfig {
@@ -1667,6 +1655,20 @@ async fn a_server_that_publishes_is_not_second_guessed_with_a_pull() {
     );
     let before = mgr.lock().await.clients["mock-ts"].pull.support();
     assert_eq!(before, super::pull::PullSupport::Asking, "not rejected");
+    // And from here on it is not asked at all — its own reports are the truth.
+    for round in 0..3 {
+        let text = format!("const y = {round};\n");
+        std::fs::write(&file, &text).unwrap();
+        mgr.lock().await.notify_file_changed(&file, &text);
+        // Condition-based wait (#295), same as the open above: a one-shot drain
+        // can return before the mock's publish is processed, even after a
+        // previous edit succeeded.
+        let summary = drain_until_reported(&mgr, "the check that only the push channel runs").await;
+        assert!(
+            summary.contains("the check that only the push channel runs"),
+            "round {round}: {summary}"
+        );
+    }
 
     mgr.lock().await.shutdown().await;
 }

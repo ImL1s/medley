@@ -247,6 +247,28 @@ mod tests {
         assert_eq!(manager.auth_remedy(), AuthRemedy::ManualLogin);
     }
 
+    /// Whitespace-only configuration is not an external refresh authority and
+    /// must never advertise an interactive provider remedy.
+    #[test]
+    fn whitespace_provider_command_needs_a_manual_login_after_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = GrokComConfig {
+            auth_provider_command: Some(" \t\n".to_owned()),
+            auth_provider_label: Some("Blank provider".to_owned()),
+            ..GrokComConfig::default()
+        };
+        let command = config.auth_provider_command.clone();
+        let manager = Arc::new(AuthManager::new(dir.path(), config));
+        manager.hot_swap(external_credential(Utc::now() - Duration::hours(1)));
+        manager.configure_refresher(command, None);
+        manager.record_permanent_failure(
+            "external".to_owned(),
+            RefreshTokenFailedReason::ProviderInteractiveRequired.into(),
+        );
+
+        assert_eq!(manager.auth_remedy(), AuthRemedy::ManualLogin);
+    }
+
     /// A refresh that fails over a token still inside the early-invalidation
     /// buffer is a *success* for [`AuthManager::silent_refresh`]: `auth()`
     /// serves the cached bearer the proxy still accepts. `current()` hides that

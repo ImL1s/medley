@@ -50,7 +50,7 @@
             .models
             .available
             .insert(id_3.clone(), make_model_info("grok-3"));
-        agent.session.models.current = Some(id_3);
+        agent.session.models.current = Some(id_3.clone());
 
         let notif = make_models_update_notif("grok-4", &["grok-3", "grok-4"]);
         handle_models_update(&notif, &mut app);
@@ -75,7 +75,118 @@
     }
 
     #[test]
-    fn models_update_keeps_unavailable_resident_when_agent_model_removed() {
+    fn models_update_preserves_unavailable_resident_as_display_only() {
+        let mut app = make_app_with_agent("sess-1");
+        let resident_id = acp::ModelId::new(std::sync::Arc::from("retired"));
+        let resident_info = acp::ModelInfo::new(
+            resident_id.clone(),
+            "Retired Model (unavailable)".to_string(),
+        )
+        .meta(
+            serde_json::json!({ "unavailableResidentModel": true })
+                .as_object()
+                .cloned(),
+        );
+        {
+            let models = &mut app
+                .agents
+                .get_mut(&AgentId(0))
+                .expect("active agent")
+                .session
+                .models;
+            models
+                .available
+                .insert(resident_id.clone(), resident_info.clone());
+            models.current = Some(resident_id.clone());
+        }
+
+        let notif = make_models_update_notif("ready", &["ready"]);
+        assert!(handle_models_update(&notif, &mut app));
+
+        let agent_models = &app.agents[&AgentId(0)].session.models;
+        assert_eq!(agent_models.current.as_ref(), Some(&resident_id));
+        assert_eq!(agent_models.available.get(&resident_id), Some(&resident_info));
+        assert_eq!(
+            agent_models.current_model_name().as_deref(),
+            Some("Retired Model (unavailable)")
+        );
+        assert!(agent_models.resolve_by_name_or_id("retired").is_none());
+        assert_eq!(
+            agent_models.next_model().as_ref().map(|id| id.0.as_ref()),
+            Some("ready"),
+            "model cycle must leave the placeholder and enter the selectable catalog"
+        );
+        assert_eq!(
+            agent_models
+                .selectable_models()
+                .map(|(id, _)| id.0.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["ready"]
+        );
+
+        assert_eq!(app.models.current.as_ref(), Some(&resident_id));
+        assert_eq!(app.models.available.get(&resident_id), Some(&resident_info));
+        let snapshot = crate::app::dispatch::build_pager_snapshot(&app);
+        assert_eq!(
+            snapshot.current_model_name.as_deref(),
+            Some("Retired Model (unavailable)")
+        );
+        assert_eq!(
+            snapshot
+                .available_models
+                .iter()
+                .map(|(_, id)| id.0.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["ready"],
+            "settings picker must exclude the display-only resident"
+        );
+    }
+
+    #[test]
+    fn models_update_refreshes_open_settings_model_rows() {
+        use crate::views::modal::ActiveModal;
+        use crate::views::settings_modal::SettingsModalState;
+
+        let mut app = make_app_with_agent("sess-1");
+        seed_models(
+            app.agents.get_mut(&AgentId(0)).expect("active agent"),
+            "old",
+            &["old", "removed"],
+        );
+        let registry = app.settings_registry.clone();
+        let ui = app.current_ui.clone();
+        let snapshot = crate::app::dispatch::build_pager_snapshot(&app);
+        app.agents.get_mut(&AgentId(0)).unwrap().active_modal =
+            Some(ActiveModal::Settings {
+                state: Box::new(SettingsModalState::new(registry, ui, snapshot)),
+            });
+
+        assert!(handle_models_update(
+            &make_models_update_notif("ready", &["ready"]),
+            &mut app,
+        ));
+
+        let Some(ActiveModal::Settings { state }) = app
+            .agents
+            .get(&AgentId(0))
+            .and_then(|agent| agent.active_modal.as_ref())
+        else {
+            panic!("settings modal must remain open");
+        };
+        let ids = state
+            .pager_snapshot
+            .available_models
+            .iter()
+            .map(|(_, id)| id.0.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["ready"]);
+    }
+
+    /// A machine-wide catalog drop keeps the agent's resident listed as a
+    /// display-only placeholder (#358/#359) and never lets the shell fallback
+    /// pose as the session's model (#332).
+    #[test]
+    fn models_update_preserves_resident_until_session_confirms_a_switch() {
         let mut app = make_app_with_agent("sess-1");
 
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -85,7 +196,7 @@
             .models
             .available
             .insert(id_3.clone(), make_model_info("grok-3"));
-        agent.session.models.current = Some(id_3);
+        agent.session.models.current = Some(id_3.clone());
 
         // grok-3 removed from catalog.
         let notif = make_models_update_notif("grok-4.3", &["grok-4.3", "grok-4.5"]);
@@ -94,11 +205,12 @@
         assert_eq!(
             app.models.current.as_ref().map(|id| id.0.as_ref()),
             Some("grok-3"),
-            "must not present the shell fallback as the resident model"
+            "a machine-wide catalog update must not invent a per-session switch"
         );
         assert_eq!(
             app.models.current_model_name().as_deref(),
-            Some("grok-3"),
+            Some("grok-3 (unavailable)"),
+            "the status surface must show the resident's own flagged identity, not the shell fallback's label"
         );
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
@@ -110,14 +222,17 @@
                 .as_ref()
                 .map(|id| id.0.as_ref()),
             Some("grok-3"),
-            "agent must keep the unavailable-resident placeholder until shell confirmation"
+            "the resident actor remains authoritative until a session notification switches it"
         );
         let placeholder = agent
             .session
             .models
             .available
-            .get(&acp::ModelId::new(std::sync::Arc::from("grok-3")))
-            .expect("placeholder listed");
+            .get(&id_3)
+            .expect("removed resident should remain as a display-only placeholder");
+        assert!(crate::acp::model_state::is_unavailable_resident_model(
+            placeholder
+        ));
         assert!(crate::slash::commands::model::is_unavailable_resident_meta(
             placeholder.meta.as_ref()
         ));
@@ -173,9 +288,10 @@
     }
 
     #[test]
-    fn models_update_non_active_agent_uses_shell_fallback_not_active_model() {
+    fn models_update_preserves_each_live_agent_resident_independently() {
         let mut app = make_app_with_agent("sess-A");
         insert_agent(&mut app, AgentId(1), Some("sess-B"));
+        let id_5 = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
 
         {
             let agent_a = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -190,13 +306,12 @@
 
         {
             let agent_b = app.agents.get_mut(&AgentId(1)).unwrap();
-            let id_5 = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
             agent_b
                 .session
                 .models
                 .available
                 .insert(id_5.clone(), make_model_info("grok-4.5"));
-            agent_b.session.models.current = Some(id_5);
+            agent_b.session.models.current = Some(id_5.clone());
         }
 
         // grok-5 removed from catalog.
@@ -219,8 +334,9 @@
             "agent A's model must be preserved"
         );
 
-        // B's grok-4.5 was removed — keep the resident placeholder, never
-        // claim A's model or the shell default as B's current.
+        // B's resident (`id_5`, grok-4.5) was removed from the catalog. Keep it
+        // as B's placeholder: a machine-wide notification cannot claim B's
+        // actor switched to A's model or to the shell default.
         let agent_b = app.agents.get(&AgentId(1)).unwrap();
         assert_eq!(
             agent_b
@@ -230,8 +346,85 @@
                 .as_ref()
                 .map(|id| id.0.as_ref()),
             Some("grok-4.5"),
-            "inactive agent must keep its unavailable resident, not the active agent's model"
+            "inactive live sessions must keep their own unavailable resident, not the active agent's model"
         );
+        assert!(crate::acp::model_state::is_unavailable_resident_model(
+            agent_b
+                .session
+                .models
+                .available
+                .get(&id_5)
+                .expect("removed resident should remain display-only")
+        ));
+    }
+
+    #[test]
+    fn model_auto_switched_confirms_the_new_resident_model() {
+        let mut app = make_app_with_agent("sess-1");
+        seed_models(
+            app.agents.get_mut(&AgentId(0)).expect("active agent"),
+            "m-old",
+            &["m-old", "m-new"],
+        );
+
+        assert!(handle_ext_notification(
+            &xai_model_switch_notif("sess-1", "model-switch-1"),
+            &mut app,
+        ));
+
+        assert_eq!(
+            app.agents[&AgentId(0)]
+                .session
+                .models
+                .current
+                .as_ref()
+                .map(|id| id.0.as_ref()),
+            Some("m-new")
+        );
+        assert_eq!(
+            app.models.current.as_ref().map(|id| id.0.as_ref()),
+            Some("m-new"),
+            "the active status model must follow the authoritative session switch"
+        );
+    }
+
+    #[test]
+    fn model_auto_switched_waits_for_catalog_without_display_drift() {
+        let mut app = make_app_with_agent("sess-1");
+        seed_models(
+            app.agents.get_mut(&AgentId(0)).expect("active agent"),
+            "m-old",
+            &["m-old"],
+        );
+
+        assert!(handle_ext_notification(
+            &xai_model_switch_notif("sess-1", "model-switch-missing"),
+            &mut app,
+        ));
+
+        let switched = &app.agents[&AgentId(0)].session.models;
+        let new_id = acp::ModelId::new(std::sync::Arc::from("m-new"));
+        assert_eq!(switched.current.as_ref(), Some(&new_id));
+        assert!(crate::acp::model_state::is_unavailable_resident_model(
+            switched
+                .available
+                .get(&new_id)
+                .expect("confirmed resident remains displayable while catalog catches up")
+        ));
+        assert_eq!(app.models.current.as_ref(), Some(&new_id));
+
+        assert!(handle_models_update(
+            &make_models_update_notif("m-new", &["m-new"]),
+            &mut app,
+        ));
+        let refreshed = &app.agents[&AgentId(0)].session.models;
+        assert_eq!(refreshed.current.as_ref(), Some(&new_id));
+        assert!(!crate::acp::model_state::is_unavailable_resident_model(
+            refreshed
+                .available
+                .get(&new_id)
+                .expect("catalog refresh replaces the temporary placeholder")
+        ));
     }
 
     /// A follower client (no in-flight switch of its own) receives the
@@ -375,35 +568,49 @@
         );
     }
 
-    /// A `ModelChanged` broadcast carrying a model id the local catalog
-    /// doesn't know about must be dropped — applying it would render an
-    /// unresolvable id in the status bar and desync the `/model` dropdown.
-    /// This can happen when leader and a follower client briefly disagree
-    /// on the model catalog (etag drift, custom-model config skew).
+    /// A per-session `ModelChanged` is authoritative even when it races ahead
+    /// of the machine-wide catalog update. Keep a non-selectable placeholder
+    /// so the status bar follows the real resident without offering a stale
+    /// catalog row, then resolve it when the catalog catches up.
     #[test]
-    fn model_changed_dropped_when_model_unknown_to_catalog() {
+    fn model_changed_before_catalog_update_uses_resident_placeholder() {
         let mut app = make_app_with_agent("sess-1");
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         seed_models(agent, "grok-3", &["grok-3", "grok-4"]);
 
         let notif = model_changed_ext("sess-1", "grok-99-unknown", None);
         let changed = handle_ext_notification(&notif, &mut app);
-        assert!(
-            !changed,
-            "unknown model must NOT trigger a redraw — no state changed"
-        );
+        assert!(changed, "authoritative session change must redraw");
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
+        let target = acp::ModelId::new(std::sync::Arc::from("grok-99-unknown"));
         assert_eq!(
+            agent.session.models.current.as_ref(),
+            Some(&target),
+            "displayed resident must follow the authoritative session event"
+        );
+        assert!(crate::acp::model_state::is_unavailable_resident_model(
             agent
                 .session
                 .models
-                .current
-                .as_ref()
-                .map(|id| id.0.as_ref()),
-            Some("grok-3"),
-            "models.current must stay on the previously-known model"
-        );
+                .available
+                .get(&target)
+                .expect("catalog-lag placeholder")
+        ));
+        assert_eq!(app.models.current.as_ref(), Some(&target));
+
+        assert!(handle_models_update(
+            &make_models_update_notif("grok-99-unknown", &["grok-99-unknown"]),
+            &mut app,
+        ));
+        assert!(!crate::acp::model_state::is_unavailable_resident_model(
+            app.agents[&AgentId(0)]
+                .session
+                .models
+                .available
+                .get(&target)
+                .expect("real catalog row replaces placeholder")
+        ));
     }
 
     /// `reasoning_effort` round-trips through the broadcast: the follower
@@ -582,4 +789,3 @@
             "placeholder must be unavailable, not ready-by-default"
         );
     }
-

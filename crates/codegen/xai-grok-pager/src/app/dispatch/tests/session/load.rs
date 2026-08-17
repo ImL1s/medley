@@ -90,6 +90,8 @@ fn restored_session_applies_deferred_switch_before_draining_prompt_queue() {
             model_id: model_id.clone(),
             effort: None,
             prev_model_id: None,
+            prev_model_id_captured: false,
+            session_only: false,
         });
         agent.session.enqueue_prompt("queued after restore".into());
     }

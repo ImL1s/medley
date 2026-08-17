@@ -85,6 +85,7 @@ impl SlashCommand for EffortCommand {
             Ok(effort) => CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: Some(effort),
+                session_only: true,
             }),
             Err(err) => CommandResult::Error(err.message()),
         }
@@ -196,9 +197,14 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = EffortCommand.run(&mut ctx, "high");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::High));
+                assert!(session_only, "effort switch must be session-only");
             }
             other => panic!("expected SwitchModel with effort, got {other:?}"),
         }
@@ -214,7 +220,11 @@ mod tests {
         state.current = Some(id.clone());
         let mut ctx = dummy_exec_ctx(&state);
         match EffortCommand.run(&mut ctx, "minimal") {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Minimal));
             }
@@ -253,11 +263,69 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = EffortCommand.run(&mut ctx, "none");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::None));
             }
             other => panic!("expected SwitchModel with none, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ultra_is_rendered_and_dispatched_when_model_menu_offers_it() {
+        let mut state = ModelState::default();
+        let id = acp::ModelId::new(Arc::from("gpt-5.6-sol"));
+        let info = acp::ModelInfo::new(id.clone(), "GPT-5.6 Sol".to_string()).meta(
+            serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEfforts": [{
+                    "value": "ultra",
+                    "label": "Ultra",
+                    "description": "Maximum reasoning with proactive multi-agent guidance",
+                    "default": true
+                }],
+            })
+            .as_object()
+            .cloned(),
+        );
+        state.available.insert(id.clone(), info);
+        state.current = Some(id.clone());
+
+        let app_ctx = AppCtx {
+            models: &state,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+        };
+        let items = EffortCommand
+            .suggest_args(&app_ctx, "")
+            .expect("Ultra model has a menu");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert_text, "ultra");
+        assert_eq!(items[0].display, "Ultra");
+        assert_eq!(
+            items[0].description,
+            "Maximum reasoning with proactive multi-agent guidance"
+        );
+
+        let mut exec_ctx = dummy_exec_ctx(&state);
+        match EffortCommand.run(&mut exec_ctx, "ultra") {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
+                assert_eq!(model_id, id);
+                assert_eq!(effort, Some(ReasoningEffort::Ultra));
+            }
+            other => panic!("expected SwitchModel Ultra, got {other:?}"),
         }
     }
 
@@ -278,7 +346,11 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         // The rendered row inserts the id; `/effort deep` must send `xhigh`.
         match EffortCommand.run(&mut ctx, "deep") {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Xhigh));
             }
@@ -423,7 +495,11 @@ mod tests {
         {
             let mut ctx = dummy_exec_ctx(&state);
             match EffortCommand.run(&mut ctx, "none") {
-                CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                CommandResult::Action(Action::SwitchModel {
+                    model_id,
+                    effort,
+                    session_only: _,
+                }) => {
                     assert_eq!(model_id, id_a);
                     assert_eq!(effort, Some(ReasoningEffort::None));
                 }
@@ -458,7 +534,11 @@ mod tests {
         {
             let mut ctx = dummy_exec_ctx(&state);
             match EffortCommand.run(&mut ctx, "minimal") {
-                CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                CommandResult::Action(Action::SwitchModel {
+                    model_id,
+                    effort,
+                    session_only: _,
+                }) => {
                     assert_eq!(model_id, id_b);
                     assert_eq!(effort, Some(ReasoningEffort::Minimal));
                 }

@@ -14,38 +14,54 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
         let shell_fallback_current = new_models.current.clone();
 
         for agent in app.agents.values_mut() {
+            // A machine-wide catalog update is not proof that this resident
+            // session actor switched. Preserve a display-only placeholder
+            // until a per-session ModelChanged/ModelAutoSwitched says it did.
             if let Some(ref current) = agent.session.models.current
                 && !new_models.available.contains_key(current)
+                && !agent
+                    .session
+                    .models
+                    .available
+                    .get(current)
+                    .is_some_and(crate::acp::model_state::is_unavailable_resident_model)
             {
                 tracing::warn!(
                     current_model = %current.0,
                     fallback = ?shell_fallback_current.as_ref().map(|m| m.0.as_ref()),
                     available_count = new_models.available.len(),
-                    "models update removed this agent's current model; keeping unavailable-resident placeholder"
+                    "models update removed this agent's current model; keeping the unavailable-resident placeholder as display-only"
                 );
             }
-            agent
-                .session
-                .models
-                .update_catalog(new_models.available.clone(), shell_fallback_current.clone());
+            agent.session.models.update_catalog_preserving_resident(
+                new_models.available.clone(),
+                shell_fallback_current.clone(),
+            );
         }
 
-        // App-level catalog mirrors the live list, plus the active agent's
-        // resident (placeholder if the catalog dropped it). Never present the
-        // shell fallback as the active model while the session still owns it.
+        // Override the app-level default with the active agent's effective
+        // model after every per-session catalog has reconciled. A running
+        // session may retain a display-only unavailable-resident placeholder;
+        // carry that exact row into app state so the status/settings surfaces
+        // never claim the actor silently switched to the shell fallback.
         let mut app_models = new_models;
         if let ActiveView::Agent(id) = app.active_view
             && let Some(agent) = app.agents.get(&id)
+            && let Some(ref agent_model) = agent.session.models.current
         {
-            app_models.current = agent.session.models.current.clone();
-            if let Some(cur) = &app_models.current
-                && !app_models.available.contains_key(cur)
-                && let Some(info) = agent.session.models.available.get(cur)
-            {
-                app_models.available.insert(cur.clone(), info.clone());
+            if let Some(agent_info) = agent.session.models.available.get(agent_model) {
+                app_models
+                    .available
+                    .insert(agent_model.clone(), agent_info.clone());
             }
+            app_models.current = Some(agent_model.clone());
+            app_models.reasoning_effort = agent.session.models.reasoning_effort;
         }
         app.models = app_models;
+        // Settings rows and an open `/model` argument picker snapshot the
+        // agent's catalog when they open. A live catalog update must rebuild
+        // both snapshots immediately so a removed model cannot remain
+        // selectable from a stale row.
         refresh_open_model_selection_surfaces(app);
         true
     } else {

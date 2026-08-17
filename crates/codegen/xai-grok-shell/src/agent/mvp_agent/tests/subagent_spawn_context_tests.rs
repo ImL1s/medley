@@ -223,7 +223,9 @@ async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting
     assert_eq!(ctx.model_id.0.as_ref(), "immediate-model");
     assert_eq!(ctx.parent_cwd, immediate_cwd);
     assert_eq!(
-        ctx.parent_session_info.as_ref().map(|info| info.cwd.as_str()),
+        ctx.parent_session_info
+            .as_ref()
+            .map(|info| info.cwd.as_str()),
         Some("/isolated-worktree")
     );
     assert_eq!(ctx.fs.root(), std::path::Path::new("/isolated-worktree"));
@@ -243,7 +245,10 @@ async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting
             .live_count(),
         1
     );
-    assert_eq!(ctx.parent_capability_mode, Some(SubagentCapabilityMode::Execute));
+    assert_eq!(
+        ctx.parent_capability_mode,
+        Some(SubagentCapabilityMode::Execute)
+    );
     assert_eq!(ctx.parent_depth, 1);
     assert_eq!(ctx.inherited_tool_overrides, Some(cutoff));
     assert_eq!(
@@ -301,29 +306,38 @@ async fn issue14_spawn_refresh_replaces_stale_parent_capabilities() {
     handle.mcp_servers = vec![issue14_stdio_server("stale-bootstrap-mcp")];
     agent.session_registry.put_resident(&sid, handle);
 
-    tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            if let SessionCommand::SnapshotSubagentCapabilities { respond_to } = cmd {
-                let _ = respond_to.send(Ok(SubagentCapabilitySnapshot {
-                    mcp_configs: vec![issue14_stdio_server("fresh-live-mcp")],
-                    mcp_pool: None,
-                    client_hooks: Default::default(),
-                    tool_definitions: vec![xai_grok_sampling_types::ToolSpec {
-                        name: "issue14_fresh_tool".to_string(),
-                        description: Some("spawn-refresh tool".to_string()),
-                        parameters: serde_json::json!({
-                            "type": "object",
-                            "properties": {}
-                        }),
-                    }],
-                    skills: vec![xai_grok_tools::implementations::skills::types::SkillInfo {
-                        name: "issue14-fresh-skill".to_string(),
-                        description: "spawn-refresh skill".to_string(),
-                        ..Default::default()
-                    }],
-                    mcp_generation: 41,
-                }));
-                break;
+    let responder = tokio::spawn(async move {
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                Some(cmd) = cmd_rx.recv() => {
+                    if let SessionCommand::SnapshotSubagentCapabilities { respond_to } = cmd {
+                        let _ = respond_to.send(Ok(SubagentCapabilitySnapshot {
+                            mcp_configs: vec![issue14_stdio_server("fresh-live-mcp")],
+                            mcp_pool: None,
+                            client_hooks: Default::default(),
+                            tool_definitions: vec![xai_grok_sampling_types::ToolSpec {
+                                name: "issue14_fresh_tool".to_string(),
+                                description: Some("spawn-refresh tool".to_string()),
+                                parameters: serde_json::json!({
+                                    "type": "object",
+                                    "properties": {}
+                                }),
+                            }],
+                            skills: vec![xai_grok_tools::implementations::skills::types::SkillInfo {
+                                name: "issue14-fresh-skill".to_string(),
+                                description: "spawn-refresh skill".to_string(),
+                                ..Default::default()
+                            }],
+                            mcp_generation: 41,
+                        }));
+                        break;
+                    }
+                }
+                () = &mut timeout => {
+                    panic!("timeout waiting for SnapshotSubagentCapabilities command");
+                }
             }
         }
     });
@@ -344,10 +358,15 @@ async fn issue14_spawn_refresh_replaces_stale_parent_capabilities() {
         .session_registry
         .resident_handle(&sid)
         .expect("parent handle should exist");
-    let refreshed = agent
-        .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
-        .await
-        .expect("capability refresh should succeed");
+    let refreshed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent.refresh_subagent_capabilities_for_spawn(&mut ctx, &handle),
+    )
+    .await
+    .expect("refresh_subagent_capabilities_for_spawn must complete within 5s")
+    .expect("capability refresh should succeed");
+    
+    responder.await.expect("responder task must complete");
 
     assert_eq!(refreshed.mcp_generation, 41);
     assert_eq!(

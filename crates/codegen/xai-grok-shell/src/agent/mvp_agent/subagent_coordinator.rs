@@ -107,12 +107,7 @@ impl coordinator::ChildRunner for ShellChildRunner {
                 skill_count = refreshed.skill_count,
                 "Refreshed parent capabilities for subagent spawn"
             );
-            crate::agent::subagent::run_shell_child(
-                run,
-                ctx,
-                &this.gateway,
-            )
-            .await
+            crate::agent::subagent::run_shell_child(run, ctx, &this.gateway).await
         })
     }
     fn validate_type(
@@ -275,8 +270,8 @@ impl MvpAgent {
         ctx.parent_mcp_configs = snapshot.mcp_configs;
         ctx.parent_mcp_pool = snapshot.mcp_pool;
         ctx.client_hooks = snapshot.client_hooks;
-        ctx.parent_tool_definitions = (!snapshot.tool_definitions.is_empty())
-            .then_some(snapshot.tool_definitions);
+        ctx.parent_tool_definitions =
+            (!snapshot.tool_definitions.is_empty()).then_some(snapshot.tool_definitions);
         // `Some(empty)` means "refresh succeeded and parent currently has none";
         // keeping `None` would trigger a stale disk/plugin rediscovery fallback.
         ctx.parent_skills = Some(snapshot.skills);
@@ -476,9 +471,7 @@ impl MvpAgent {
             .map(|handle| {
                 (
                     handle.auxiliary_model_provenance.web_search_model.clone(),
-                    handle
-                        .auxiliary_model_provenance
-                        .web_search_follows_default,
+                    handle.auxiliary_model_provenance.web_search_follows_default,
                 )
             })
             .unwrap_or_else(|| {

@@ -201,7 +201,8 @@ pub(crate) fn parse_session_scheduler_background_loops(
         .and_then(|v| v.as_bool())
 }
 /// #161: the web-search disable notice from a `session/new` / `session/load`
-/// response `_meta`. `None` means `web_search` is available.
+/// response `_meta`. `None` means the key is absent and `web_search` is
+/// available. A present malformed value fails closed with a generic notice.
 ///
 /// Sibling of [`parse_session_scheduler_background_loops`] and read the same
 /// way, because it is the same kind of value: session-scoped state the shell
@@ -217,15 +218,20 @@ pub(crate) fn parse_session_web_search_disabled(
     match serde_json::from_value(raw.clone()) {
         Ok(notice) => Some(notice),
         Err(err) => {
-            // Present-but-malformed must not collapse into "available" silently:
-            // that erases the absent-key == available contract (#161). Warn and
-            // treat as absent rather than inventing a notice from bad shape.
+            // Present-but-malformed must not collapse into "available": only
+            // an absent key carries that meaning. Keep the user-facing notice
+            // generic because malformed provider-controlled metadata is not a
+            // trustworthy source for model/reason details.
             tracing::warn!(
                 error = %err,
-                "ignoring malformed {} session meta",
+                "failing closed on malformed {} session meta",
                 xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY
             );
-            None
+            Some(xai_grok_shell::session::WebSearchDisabledNotice {
+                model_id: "unknown".to_string(),
+                reason: "invalid availability metadata".to_string(),
+                message: "web_search availability could not be verified because the session returned invalid metadata. Restart the session or check the provider and model configuration.".to_string(),
+            })
         }
     }
 }

@@ -59,6 +59,24 @@ fn find_protoc_include_dir(protoc: Option<&Path>) -> Option<PathBuf> {
 /// The encoding gate comes first so it is reachable without a filesystem that
 /// permits such a name — APFS and HFS+ reject non-UTF-8 filenames outright, so
 /// checking existence first would make that branch untestable on macOS.
+fn descriptor_sink_prefix_label() -> &'static str {
+    if cfg!(windows) { "NUL:" } else { "/dev/null:" }
+}
+
+/// Strip the makefile target that `--descriptor_set_out` wrote. Unix uses
+/// `/dev/null`; Windows uses the `NUL` device. Comparison is ASCII-case
+/// insensitive so `nul:` from protoc still matches.
+fn strip_descriptor_sink_prefix(first_line: &[u8]) -> Option<&[u8]> {
+    const CANDIDATES: &[&[u8]] = &[b"/dev/null:", b"NUL:", b"nul:"];
+    CANDIDATES
+        .iter()
+        .find(|prefix| {
+            first_line.len() >= prefix.len()
+                && first_line[..prefix.len()].eq_ignore_ascii_case(prefix)
+        })
+        .map(|prefix| &first_line[prefix.len()..])
+}
+
 fn rerun_if_changed_for_protoc(protoc: &Path) -> Option<&str> {
     let path = protoc.to_str()?;
     protoc.try_exists().unwrap_or(false).then_some(path)
@@ -177,11 +195,24 @@ impl XaiProtoBuilder {
         }
 
         // Can only process one input file when using --dependency_out=FILE.
+        // Unix can stream the makefile into stdout; Windows has no /dev/stdout,
+        // and protoc fails with "No such file or directory" if we pass it.
         for proto in protos {
+            let windows_dep_dir = if cfg!(windows) {
+                Some(tempfile::TempDir::new().context("temp dir for protoc --dependency_out")?)
+            } else {
+                None
+            };
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
-            command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+            if let Some(dir) = windows_dep_dir.as_ref() {
+                let dep_path = dir.path().join("deps.d");
+                command.arg(format!("--dependency_out={}", dep_path.display()));
+                command.arg("--descriptor_set_out=NUL");
+            } else {
+                command
+                    .arg("--dependency_out=/dev/stdout")
+                    .arg("--descriptor_set_out=/dev/null");
+            }
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -209,16 +240,22 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let mut lines = output.stdout.split(|&b| b == b'\n');
-            let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = b"/dev/null:";
-            let rem = if first_line.starts_with(prefix) {
-                &first_line[prefix.len()..]
+            let dep_bytes = if let Some(dir) = windows_dep_dir.as_ref() {
+                fs::read(dir.path().join("deps.d")).context("read protoc --dependency_out file")?
             } else {
-                return Err(anyhow::anyhow!(
-                    "protoc command output must start with /dev/null: {:?}",
-                    String::from_utf8_lossy(first_line)
-                ));
+                output.stdout
+            };
+            let mut lines = dep_bytes.split(|&b| b == b'\n');
+            let first_line = lines.next().context("protoc command output is empty")?;
+            let rem = match strip_descriptor_sink_prefix(first_line) {
+                Some(rem) => rem,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "protoc command output must start with {}: {:?}",
+                        descriptor_sink_prefix_label(),
+                        String::from_utf8_lossy(first_line)
+                    ));
+                }
             };
             for line in iter::once(rem).chain(lines) {
                 let mut line = trim_ascii(line);
@@ -485,6 +522,26 @@ mod tests {
     /// build script permanently dirty, so every downstream crate recompiles on
     /// every cargo invocation.
     #[test]
+    #[test]
+    fn strip_descriptor_sink_prefix_accepts_unix_and_windows_devices() {
+        assert_eq!(
+            strip_descriptor_sink_prefix(b"/dev/null: foo.proto"),
+            Some(&b" foo.proto"[..])
+        );
+        assert_eq!(
+            strip_descriptor_sink_prefix(b"NUL: foo.proto"),
+            Some(&b" foo.proto"[..])
+        );
+        assert_eq!(
+            strip_descriptor_sink_prefix(b"nul: foo.proto"),
+            Some(&b" foo.proto"[..])
+        );
+        assert_eq!(
+            strip_descriptor_sink_prefix(b"C:\\temp\\out.bin: foo.proto"),
+            None
+        );
+    }
+
     fn an_unresolvable_protoc_emits_nothing() {
         assert_eq!(
             rerun_if_changed_for_protoc(Path::new("/nonexistent-aXbYcZ/protoc")),

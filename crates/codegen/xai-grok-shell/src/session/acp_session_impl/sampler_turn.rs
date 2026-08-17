@@ -1157,6 +1157,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: ERROR_TYPE.to_owned(),
+                http_status: None,
                 message: message.clone(),
             },
         ))
@@ -1238,6 +1239,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: error_type.to_owned(),
+                http_status: STATUS,
                 message: message.clone(),
             },
         ))
@@ -1287,22 +1289,7 @@ impl SessionActor {
         // For HTTP 400, user_facing may carry a truncated secret-scrubbed body
         // preview (#245). Surface that preview here; never invent new text
         // from raw provider bytes at this layer.
-        let safe_provider_failure = || match error.status_code {
-            Some(status) => {
-                let mut out = format!("Provider request failed (HTTP {status}).");
-                if status == 400 {
-                    if let Some(rest) = remainder_after_http_400_prefix(&error.message) {
-                        let rest = rest.trim();
-                        if !rest.is_empty() {
-                            out.push(' ');
-                            out.push_str(rest);
-                        }
-                    }
-                }
-                out
-            }
-            None => format!("Provider request failed ({}).", error.kind.as_str()),
-        };
+        let safe_provider_failure = || safe_provider_failure_message(&error);
         if self.tool_context.task_output_token_budget.is_some() {
             self.tool_context.fail_task_output_usage_closed();
             let message = format!(
@@ -1374,6 +1361,7 @@ impl SessionActor {
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Failed {
                     error_type: "encrypted_content_mismatch".to_string(),
+                    http_status: error.status_code,
                     message: friendly.clone(),
                 },
             ))
@@ -1568,6 +1556,7 @@ impl SessionActor {
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Failed {
                     error_type: "legacy_auth".to_string(),
+                    http_status: error.status_code,
                     message: msg.clone(),
                 },
             ))
@@ -1669,6 +1658,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: error_type.to_string(),
+                http_status: error.status_code,
                 message: detailed_message.clone(),
             },
         ))
@@ -2034,6 +2024,32 @@ impl SessionActor {
             .push_assistant_response(assistant_item);
     }
 }
+
+/// Build the terminal provider message exclusively from sampler-classified,
+/// secret-scrubbed fields. For 400 responses, retain the safe provider detail
+/// only behind one of the bounded display carriers the sampler emits
+/// ([`remainder_after_http_400_prefix`]); do not scan arbitrary free-form text
+/// for a status or body.
+fn safe_provider_failure_message(error: &xai_grok_sampler::SamplingErrorInfo) -> String {
+    let Some(status) = error.status_code else {
+        return format!("Provider request failed ({}).", error.kind.as_str());
+    };
+    let mut out = format!("Provider request failed (HTTP {status}).");
+    if status != 400 {
+        return out;
+    }
+
+    let Some(detail) = remainder_after_http_400_prefix(&error.message) else {
+        return out;
+    };
+    let detail = detail.trim();
+    if !detail.is_empty() {
+        out.push(' ');
+        out.push_str(detail);
+    }
+    out
+}
+
 /// Per-tool precedence: a non-empty `over` wins, else the non-empty `seed`.
 fn prefer_non_empty<T>(
     over: Option<T>,
@@ -2144,5 +2160,49 @@ mod configured_cutoff_tests {
             let inherited = super::resolve_configured_cutoff(seed.clone(), base.as_ref());
             assert_eq!(wire_echo, inherited, "seed={seed:?} base={base:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod safe_provider_failure_tests {
+    use xai_grok_sampler::{SamplingErrorInfo, SamplingErrorKind};
+
+    fn bad_request(message: &str) -> SamplingErrorInfo {
+        SamplingErrorInfo {
+            kind: SamplingErrorKind::Api,
+            message: message.to_string(),
+            status_code: Some(400),
+            is_retryable: false,
+            retry_after_secs: None,
+            should_retry: None,
+            model_metadata: None,
+            empty_response_context: None,
+            doom_loop_triggers: None,
+            doom_loop_aborted_at_chunk: None,
+            credential: xai_grok_sampling_types::SentCredential::Unknown,
+        }
+    }
+
+    #[test]
+    fn retains_safe_400_detail_from_both_structural_prefixes() {
+        for message in [
+            "API error (status 400): invalid field `reasoning.effort`",
+            "API error (status 400 Bad Request): invalid field `reasoning.effort`",
+        ] {
+            assert_eq!(
+                super::safe_provider_failure_message(&bad_request(message)),
+                "Provider request failed (HTTP 400). invalid field `reasoning.effort`"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_promote_unstructured_400_text() {
+        assert_eq!(
+            super::safe_provider_failure_message(&bad_request(
+                "upstream said status 400: bearer secret-do-not-copy"
+            )),
+            "Provider request failed (HTTP 400)."
+        );
     }
 }

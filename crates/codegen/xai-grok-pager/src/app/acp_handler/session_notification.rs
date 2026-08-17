@@ -144,8 +144,12 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         .agents
         .get_mut(&parent_id)
         .expect("find_session_match returned an existing AgentId");
+    let meta = NotificationMeta::from_json(session_notif.meta.as_ref().and_then(|v| v.as_object()));
     if matches!(matched, SessionMatch::Child(_)) {
         let child_sid: &str = session_notif.session_id.0.as_ref();
+        if !meta.is_replay {
+            agent.mark_subagent_live(child_sid);
+        }
         let changed = handle_child_session_notification(
             session_notif.update,
             child_sid,
@@ -154,7 +158,6 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         );
         return changed && is_active;
     }
-    let meta = NotificationMeta::from_json(session_notif.meta.as_ref().and_then(|v| v.as_object()));
     if drop_unexpected_replay(
         agent,
         &meta,
@@ -189,6 +192,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         XaiSessionUpdate::ModelAutoSwitched { .. } | XaiSessionUpdate::ModelChanged { .. }
     );
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
+    let mut active_model_state_changed = false;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
     let changed = match session_notif.update {
         ref update @ (XaiSessionUpdate::AutoCompactStarted { .. }
@@ -342,6 +346,11 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             workflow_run_id,
             ..
         } => {
+            if meta.is_replay {
+                agent.mark_reload_subagent_spawn_replayed(&child_session_id);
+            } else {
+                agent.mark_subagent_live(&child_session_id);
+            }
             tracing::info!(
                 child_session_id = %child_session_id,
                 subagent_type = %subagent_type,
@@ -556,6 +565,9 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             error_count,
             ..
         } => {
+            if !meta.is_replay {
+                agent.mark_subagent_live(&child_session_id);
+            }
             if let Some(info) = agent.subagent_sessions.get_mut(&child_session_id) {
                 info.duration_ms = Some(duration_ms);
                 info.turn_count = Some(turn_count);
@@ -903,17 +915,18 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     "available_keys": available_keys,
                 })),
             );
-            let new_id = acp::ModelId::new(new_model_id.clone());
-            if !agent.session.models.available.contains_key(&new_id) {
-                agent.session.models.available.insert(
-                    new_id.clone(),
-                    crate::slash::commands::model::unavailable_resident_placeholder(
-                        &new_id,
-                        Some(new_model_id.as_str()),
-                    ),
-                );
+            // The shell is authoritative about the switch. `set_confirmed_resident`
+            // inserts a display-only placeholder when the target is not in the
+            // live catalog yet, so an uncatalogued auto-switch still shows the
+            // session's real identity instead of a ready-by-default row.
+            if !new_model_id.is_empty() {
+                let confirmed_model = acp::ModelId::new(new_model_id.clone());
+                agent
+                    .session
+                    .models
+                    .set_confirmed_resident(confirmed_model, None);
+                active_model_state_changed = is_active;
             }
-            agent.session.models.set_current(new_id, None);
             agent.scrollback.push_block(RenderBlock::session_event(
                 SessionEvent::ModelUnavailable {
                     previous_model_id,
@@ -937,21 +950,6 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             }
             use xai_grok_shell::sampling::types::ReasoningEffort;
             let new_model_id = acp::ModelId::new(model_id.clone());
-            if !agent.session.models.available.contains_key(&new_model_id) {
-                if xai_grok_shell::agent::chat_modes::process_chat_mode_enabled() {
-                    agent.session.models.available.insert(
-                        new_model_id.clone(),
-                        acp::ModelInfo::new(new_model_id.clone(), model_id.clone()),
-                    );
-                } else {
-                    tracing::warn!(
-                        session_id = session_notif.session_id.0.as_ref(),
-                        model_id = %model_id,
-                        "ignoring ModelChanged broadcast — model not in local catalog"
-                    );
-                    return false;
-                }
-            }
             let effort = reasoning_effort
                 .as_deref()
                 .and_then(|s| s.parse::<ReasoningEffort>().ok());
@@ -960,7 +958,8 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             agent
                 .session
                 .models
-                .set_current(new_model_id.clone(), effort);
+                .set_confirmed_resident(new_model_id.clone(), effort);
+            active_model_state_changed = is_active;
             agent.session.user_model_preference = Some(new_model_id.clone());
             let resolved_effort = agent.session.models.reasoning_effort;
             let actually_changed =
@@ -1102,7 +1101,17 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             return false;
         }
     };
-    if refresh_model_ui {
+    // Mirror the active agent's model state into app state *before* rebuilding
+    // any surface, so the settings modal and the `/model` arg picker read the
+    // reconciled catalog rather than the previous generation.
+    if active_model_state_changed {
+        if let Some(agent) = app.agents.get(&parent_id) {
+            app.models = agent.session.models.clone();
+        }
+    }
+    if refresh_model_ui || active_model_state_changed {
+        // Superset of `refresh_open_settings_modals`: also rebuilds an open
+        // `/model` argument picker from the live catalog generation.
         super::settings::refresh_open_model_selection_surfaces(app);
     }
     if plugins_changed_needs_skills_refetch {
@@ -1429,6 +1438,7 @@ pub(super) fn apply_retry_state(
         }
         RetryState::Failed {
             error_type,
+            http_status,
             message,
         } => {
             session.set_retry_activity(None);
@@ -1461,10 +1471,13 @@ pub(super) fn apply_retry_state(
             } else if crate::app::dispatch::scrollback_has_recent_error_banner(scrollback) {
                 // PromptResponse (or another rail) already composed the typed banner.
             } else {
-                let status = crate::app::error_display::parse_http_status(message);
+                // Pass the wire status straight through; `format_request_failure`
+                // recovers a status from the message text itself, but only for
+                // untyped wires — pre-parsing here would defeat that gate and
+                // demote a typed headline to generic status copy.
                 scrollback.push_block(RenderBlock::session_event(
                     crate::app::error_display::format_request_failure(
-                        status,
+                        *http_status,
                         Some(error_type.as_str()),
                         message,
                     )

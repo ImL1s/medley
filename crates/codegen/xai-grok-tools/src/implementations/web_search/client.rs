@@ -58,22 +58,25 @@ fn accepts_xai_session_provider(base_url: &str) -> bool {
     is_trusted_first_party_web_search_origin(base_url)
 }
 
+fn is_credential_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
+}
+
+/// True when the route already carries its own credential — as a literal in
+/// `extra_headers`, or through an `env_http_headers` mapping that resolves to
+/// a non-blank value. Such a route must never have the session bearer
+/// attached on top of the credential it declared.
 fn has_declared_credential_header(
     extra_headers: &IndexMap<String, String>,
     env_http_headers: &IndexMap<String, String>,
+    get_env: impl Fn(&str) -> Option<String>,
 ) -> bool {
-    fn is_credential_header(name: &str) -> bool {
-        name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
-    }
-
     extra_headers
         .iter()
         .any(|(name, value)| is_credential_header(name) && !value.trim().is_empty())
         || env_http_headers.iter().any(|(name, env_var)| {
             is_credential_header(name)
-                && std::env::var(env_var)
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty())
+                && get_env(env_var).is_some_and(|value| !value.trim().is_empty())
         })
 }
 
@@ -111,6 +114,37 @@ fn apply_env_http_headers(
         };
         headers.insert(header_name, header_value);
     }
+}
+
+/// Codex account/routing metadata is trusted only at the canonical ChatGPT
+/// origin.  Keep this decision separate from the wire-format profile so a
+/// future Codex-compatible transport cannot inherit first-party identity
+/// headers merely by selecting `CodexResponses`.
+fn accepts_codex_internal_metadata(base_url: &str) -> bool {
+    if base_url == CODEX_BASE_URL {
+        return true;
+    }
+
+    // Codex request tests use a loopback receiver. Production builds have no
+    // equivalent exception because `normalize_codex_base_url` rejects it.
+    #[cfg(test)]
+    {
+        normalize_codex_base_url(base_url).is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// First-party metadata must never cross an untrusted web-search transport,
+/// regardless of whether it came from static model config, an environment
+/// mapping, or a later per-request merge. The name list lives in
+/// `xai_grok_auth` so the sampler and this transport cannot drift apart;
+/// Codex account/routing names are stripped alongside it.
+fn strip_internal_metadata_headers(headers: &mut HeaderMap) {
+    xai_grok_auth::strip_internal_metadata_headers(headers);
+    strip_codex_routing_headers(headers);
 }
 
 /// Final-boundary scrub after static, environment, and dynamic headers merge.
@@ -215,6 +249,7 @@ pub struct WebSearchClient {
     api_key_provider: Option<SharedApiKeyProvider>,
     provider_scoped: bool,
     transport_profile: ApiTransportProfile,
+    sends_internal_metadata: bool,
     /// Optional 401-attribution hook. Callers can wire this so a 401
     /// from the Responses API emits an `auth_401_attribution` event
     /// with `consumer == "WebSearch"`.
@@ -227,6 +262,16 @@ impl WebSearchClient {
     pub fn new(
         config: &WebSearchConfig,
         default_api_key_provider: Option<SharedApiKeyProvider>,
+    ) -> Result<Self, xai_tool_runtime::ToolError> {
+        Self::new_with_env_resolver(config, default_api_key_provider, |name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    fn new_with_env_resolver(
+        config: &WebSearchConfig,
+        default_api_key_provider: Option<SharedApiKeyProvider>,
+        get_env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, xai_tool_runtime::ToolError> {
         let WebSearchConfig::Enabled {
             api_key,
@@ -286,11 +331,9 @@ impl WebSearchClient {
         // and unrepresentable entries are skipped rather than failing the
         // build: a mapping to a variable the user has not exported is a
         // configuration the sampler already tolerates (#160).
-        apply_env_http_headers(
-            env_http_headers,
-            |env_var| std::env::var(env_var).ok(),
-            &mut headers,
-        );
+        let route_declares_credential_header =
+            has_declared_credential_header(extra_headers, env_http_headers, &get_env);
+        apply_env_http_headers(env_http_headers, &get_env, &mut headers);
         let _ = alpha_test_key;
         let provider_scoped = api_key_provider.is_some();
         let transport_profile = api_key_provider
@@ -307,6 +350,9 @@ impl WebSearchClient {
         } else {
             base_url.clone()
         };
+        let sends_internal_metadata = (transport_profile == ApiTransportProfile::CodexResponses
+            && accepts_codex_internal_metadata(&base_url))
+            || accepts_xai_session_provider(&base_url);
         if transport_profile == ApiTransportProfile::CodexResponses {
             let content_type = headers.get(CONTENT_TYPE).cloned();
             headers.clear();
@@ -325,8 +371,12 @@ impl WebSearchClient {
         } else {
             apply_web_search_header_boundary(&mut headers, &base_url);
         }
-        let route_declares_credential_header =
-            has_declared_credential_header(extra_headers, env_http_headers);
+        if !sends_internal_metadata {
+            // Apply once after all static and environment-backed merges. The
+            // same policy is applied again to the final request below so a
+            // future dynamic merge cannot reopen this boundary.
+            strip_internal_metadata_headers(&mut headers);
+        }
         let request_api_key_provider = api_key_provider.clone().or_else(|| {
             if accepts_xai_session_provider(&base_url) && !route_declares_credential_header {
                 default_api_key_provider
@@ -372,6 +422,7 @@ impl WebSearchClient {
             api_key_provider: request_api_key_provider,
             provider_scoped,
             transport_profile,
+            sends_internal_metadata,
             attribution_callback: None,
         })
     }
@@ -524,6 +575,12 @@ impl WebSearchClient {
             strip_codex_routing_headers(request.headers_mut());
         } else {
             apply_web_search_header_boundary(request.headers_mut(), &self.base_url);
+        }
+        if !self.sends_internal_metadata {
+            // This is the authoritative wire boundary. It deliberately runs
+            // after dynamic credentials and routing cleanup, matching the
+            // sampler's post-injector enforcement point.
+            strip_internal_metadata_headers(request.headers_mut());
         }
         Ok(request)
     }
@@ -1291,6 +1348,21 @@ mod tests {
             assert!(
                 !message.contains(secret),
                 "credential-bearing destination leaked into error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_internal_metadata_trust_is_origin_scoped_not_profile_scoped() {
+        assert!(accepts_codex_internal_metadata(CODEX_BASE_URL));
+        for base_url in [
+            "https://api.openai.com/v1",
+            "https://chatgpt.com.evil.example/backend-api/codex",
+            "https://evil.example/backend-api/codex",
+        ] {
+            assert!(
+                !accepts_codex_internal_metadata(base_url),
+                "untrusted Codex-compatible origin accepted identity metadata: {base_url}"
             );
         }
     }
@@ -2139,6 +2211,23 @@ mod tests {
         "x-grok-user-id",
     ];
 
+    const INTERNAL_WEB_SEARCH_METADATA: [&str; 14] = [
+        "chatgpt-account-id",
+        "x-openai-fedramp",
+        "originator",
+        "traceparent",
+        "tracestate",
+        "baggage",
+        "x-grok-conv-id",
+        "x-grok-client-identifier",
+        "x-grok-client-version",
+        "x-compactions-remaining",
+        "x-compaction-at",
+        "x-authenticateresponse",
+        "x-xai-token-auth",
+        "x-grok-user-id",
+    ];
+
     fn identity_smuggling_headers() -> IndexMap<String, String> {
         let mut headers = IndexMap::new();
         for name in INTERNAL_METADATA {
@@ -2566,6 +2655,134 @@ mod tests {
                 .map(|value| value.to_str().unwrap()),
             Some("codex-account")
         );
+    }
+
+    /// Model switching and subagents both construct this same client from the
+    /// selected model's `WebSearchConfig`; prove the shared wire boundary strips
+    /// internal metadata after static, environment-backed, and dynamic auth
+    /// sources have all been applied.
+    #[tokio::test]
+    async fn external_web_search_strips_internal_metadata_at_final_wire_boundary() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer generic-key",
+            ))
+            .and(wiremock::matchers::header("x-provider-static", "kept"))
+            .and(wiremock::matchers::header("x-provider-env", "also-kept"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(successful_search_response("external result")),
+            )
+            .mount(&server)
+            .await;
+
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("stale-static-key".to_string()),
+            base_url: server.uri(),
+            model: "external-model".to_string(),
+            extra_headers: IndexMap::from([
+                ("x-provider-static".to_string(), "kept".to_string()),
+                (
+                    "chatgpt-account-id".to_string(),
+                    "static-account".to_string(),
+                ),
+                ("x-openai-fedramp".to_string(), "true".to_string()),
+                ("originator".to_string(), "codex_cli_rs".to_string()),
+                ("x-grok-conv-id".to_string(), "static-conv".to_string()),
+                ("x-xai-token-auth".to_string(), "static-auth".to_string()),
+                ("traceparent".to_string(), "static-trace".to_string()),
+                (
+                    "x-compactions-remaining".to_string(),
+                    "static-budget".to_string(),
+                ),
+            ]),
+            env_http_headers: IndexMap::from([
+                ("x-provider-env".to_string(), "PROVIDER_ENV".to_string()),
+                ("x-grok-client-version".to_string(), "GROK_ENV".to_string()),
+                ("tracestate".to_string(), "TRACE_ENV".to_string()),
+                ("baggage".to_string(), "BAGGAGE_ENV".to_string()),
+                ("x-compaction-at".to_string(), "COMPACTION_ENV".to_string()),
+                (
+                    "x-authenticateresponse".to_string(),
+                    "AUTH_RESPONSE_ENV".to_string(),
+                ),
+            ]),
+            alpha_test_key: None,
+            api_key_provider: Some(std::sync::Arc::new(GenericScopedProvider)),
+        };
+        let client = WebSearchClient::new_with_env_resolver(&config, None, |name| {
+            Some(
+                match name {
+                    "PROVIDER_ENV" => "also-kept",
+                    "GROK_ENV" => "env-version",
+                    "TRACE_ENV" => "env-trace",
+                    "BAGGAGE_ENV" => "env-baggage",
+                    "COMPACTION_ENV" => "env-compaction",
+                    "AUTH_RESPONSE_ENV" => "env-auth-response",
+                    unexpected => panic!("unexpected environment lookup: {unexpected}"),
+                }
+                .to_string(),
+            )
+        })
+        .expect("external client should build");
+
+        let (content, _) = client.search("query", None).await.expect("search succeeds");
+        assert_eq!(content, "external result");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        for name in INTERNAL_WEB_SEARCH_METADATA {
+            assert!(
+                requests[0].headers.get(name).is_none(),
+                "external web search received internal metadata: {name}={:?}",
+                requests[0].headers.get(name)
+            );
+        }
+    }
+
+    /// Trusted xAI origins keep the first-party identity and tracing headers
+    /// the backend requires.
+    ///
+    /// Asserted on the built request rather than against a loopback receiver:
+    /// `apply_web_search_header_boundary` re-derives trust from the live
+    /// `base_url` at request time (#354), so repointing a trusted client at a
+    /// local server is itself an untrusted origin and the scrub is correct to
+    /// fire there.
+    #[tokio::test]
+    async fn trusted_xai_web_search_preserves_required_internal_headers() {
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("xai-key".to_string()),
+            base_url: "https://api.x.ai/v1".to_string(),
+            model: "grok-model".to_string(),
+            extra_headers: IndexMap::from([
+                (
+                    "x-grok-client-identifier".to_string(),
+                    "grok-shell".to_string(),
+                ),
+                (
+                    "x-grok-client-version".to_string(),
+                    "trusted-version".to_string(),
+                ),
+                ("traceparent".to_string(), "trusted-trace".to_string()),
+            ]),
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let client = WebSearchClient::new(&config, None).expect("xAI client should build");
+        assert!(client.sends_internal_metadata);
+        let request = client
+            .build_authenticated_request(
+                "https://api.x.ai/v1/responses",
+                &serde_json::json!({"model": "grok-model"}),
+            )
+            .await
+            .expect("trusted request should build");
+        assert_eq!(request.headers()["x-grok-client-identifier"], "grok-shell");
+        assert_eq!(request.headers()["x-grok-client-version"], "trusted-version");
+        assert_eq!(request.headers()["traceparent"], "trusted-trace");
     }
     /// When the dynamic provider returns `None`, the static `api_key`
     /// from config must still be sent as the Authorization header.

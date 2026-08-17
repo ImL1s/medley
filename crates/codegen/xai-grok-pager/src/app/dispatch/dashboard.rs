@@ -1461,6 +1461,10 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
         }
 
         let dashboard_multiline = app.dashboard.as_ref().is_some_and(|d| d.multiline_mode);
+        // One pass over the catalog feeds both readers of the readiness map:
+        // the settings registry keeps the ordered `Vec` and the picker keeps
+        // the id-keyed lookup.
+        let unready_reasons = app.models.catalog_unready_reasons();
         let mut ctx = CommandExecCtx {
             models: &app.models,
             session_id: None,
@@ -1474,8 +1478,10 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 auto_mode: app.current_ui.permission_mode.as_deref() == Some("auto")
                     && !app.default_yolo,
                 current_model_name: app.models.current_model_name(),
+                current_model_id: app.models.current.clone(),
                 available_models: app.models.catalog_display_pairs(),
-                unavailable_model_reasons: app.models.catalog_unready_reasons(),
+                unavailable_model_reasons: unready_reasons.clone(),
+                model_unready_reasons: unready_reasons.into_iter().collect(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 coding_data_sharing_lock: coding_data_sharing_lock_from_app,
                 plan_mode_active: false,
@@ -1534,7 +1540,11 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
         // Both the effort-bearing (`SwitchModel`) and bare
         // (`SetDefaultModel`) forms map to the same per-spawn staging — we
         // deliberately do NOT persist a global default here.
-        CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+        CommandResult::Action(Action::SwitchModel {
+            model_id,
+            effort,
+            session_only: _,
+        }) => {
             stage_dashboard_model(app, model_id, effort);
             vec![]
         }
@@ -1718,6 +1728,8 @@ pub(super) fn apply_pending_dispatch_config(
                         effort: Some(effort),
                         // Effort-only push; no display change to roll back.
                         prev_model_id: None,
+                        prev_model_id_captured: false,
+                        session_only: false,
                     });
                 } else if let Some(agent) = app.agents.get_mut(&agent_id) {
                     // Refused at stash time: the request completes here, once,

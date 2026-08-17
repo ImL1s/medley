@@ -375,6 +375,7 @@ pub(crate) async fn create_test_actor_with_terminal(
             flush_config: crate::config::MemoryFlushConfig::default(),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+            configured_storage: None,
             storage: std::cell::RefCell::new(None),
             save_on_end: true,
             backend_params: None,

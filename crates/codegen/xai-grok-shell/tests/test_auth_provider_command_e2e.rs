@@ -19,18 +19,28 @@ use std::path::Path;
 
 use chrono::Utc;
 use xai_grok_shell::auth::{AuthMode, GrokAuth, GrokComConfig, try_ensure_fresh_auth};
+use xai_grok_test_support::EnvGuard;
 
 const SEED_TOKEN: &str = "stale-token-that-must-be-replaced";
 
-/// Point the process at a throwaway grok home. `grok_home()` memoizes into a
-/// `OnceLock`, so every phase below shares this one directory — which is why
-/// they live in a single test rather than racing each other as separate ones.
-fn use_temp_grok_home(dir: &Path) {
-    // SAFETY: single-threaded test entry, before any thread that reads the
-    // environment is spawned.
-    unsafe {
-        std::env::set_var("GROK_HOME", dir);
-    }
+/// Point every state-path input at one throwaway home. `MEDLEY_HOME` has higher
+/// precedence than the legacy `GROK_HOME`, while `GROK_AUTH_PATH` controls the
+/// auth file directly; owning all three keeps an ambient operator setting from
+/// splitting the seeded credential from the manager that reads it.
+///
+/// `grok_home()` memoizes into a `OnceLock`, so every phase below shares this
+/// one directory — which is why they live in a single test rather than racing
+/// each other as separate ones.
+fn use_temp_grok_home(dir: &Path) -> Vec<EnvGuard> {
+    vec![
+        EnvGuard::set("MEDLEY_HOME", dir),
+        EnvGuard::set("GROK_HOME", dir),
+        EnvGuard::set("GROK_AUTH_PATH", dir.join("auth.json")),
+        EnvGuard::unset("GROK_AUTH"),
+        EnvGuard::unset("XAI_API_KEY"),
+        EnvGuard::unset("GROK_CODE_XAI_API_KEY"),
+        EnvGuard::unset("GROK_DEPLOYMENT_KEY"),
+    ]
 }
 
 /// Seed an expired credential so `auth()` takes the refresh path; a cold home
@@ -74,9 +84,10 @@ async fn mint_with_provider(home: &Path, command: &str) -> String {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn auth_provider_command_mints_the_session_credential() {
     let home = tempfile::tempdir().expect("tempdir");
-    use_temp_grok_home(home.path());
+    let _env = use_temp_grok_home(home.path());
 
     // `echo <token>` is valid in both `sh -c` and `cmd /C`, so this phase needs
     // no external binary and runs identically on every platform.

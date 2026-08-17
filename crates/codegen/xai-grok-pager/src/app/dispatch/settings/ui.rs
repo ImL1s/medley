@@ -69,13 +69,29 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
         if let Some(state) = state_opt {
             let selected = state.picking_enum_selected_canonical();
             state.rebuild_rows();
-            state.ui_snapshot = ui_snapshot.clone();
-            state.pager_snapshot = crate::settings::PagerLocalSnapshot {
+            let pager_snapshot = crate::settings::PagerLocalSnapshot {
                 multiline_mode: agent.multiline_mode,
                 yolo_mode: agent.session.is_yolo(),
                 auto_mode: agent.session.is_auto(),
                 current_model_name: agent.session.models.current_model_name(),
-                available_models: agent.session.models.catalog_display_pairs(),
+                current_model_id: agent.session.models.current.clone(),
+                available_models: agent
+                    .session
+                    .models
+                    .selectable_models()
+                    .map(|(id, info)| (info.name.clone(), id.clone()))
+                    .collect(),
+                model_unready_reasons: agent
+                    .session
+                    .models
+                    .selectable_models()
+                    .filter_map(|(id, info)| {
+                        crate::slash::commands::model::unready_reason_from_model_meta(
+                            info.meta.as_ref(),
+                        )
+                        .map(|reason| (id.0.to_string(), reason))
+                    })
+                    .collect(),
                 unavailable_model_reasons: agent.session.models.catalog_unready_reasons(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 coding_data_sharing_lock: coding_data_sharing_lock_from_app,
@@ -93,6 +109,12 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                     .scheduler_background_loops
                     .unwrap_or(scheduler_background_loops_seed),
             };
+            // `replace_snapshots` installs both snapshots and re-anchors a live
+            // `PickingEnum` on the canonical it was highlighting (falling back
+            // to Browse when that canonical vanished). The explicit remap then
+            // re-applies the canonical captured before `rebuild_rows`, which is
+            // a no-op once the snapshot swap already landed on it.
+            state.replace_snapshots(ui_snapshot.clone(), pager_snapshot);
             state.remap_picking_enum_after_catalog_refresh(selected);
         }
     }
@@ -221,7 +243,22 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         yolo_mode: agent.session.is_yolo(),
         auto_mode: agent.session.is_auto(),
         current_model_name: agent.session.models.current_model_name(),
-        available_models: agent.session.models.catalog_display_pairs(),
+        current_model_id: agent.session.models.current.clone(),
+        available_models: agent
+            .session
+            .models
+            .selectable_models()
+            .map(|(id, info)| (info.name.clone(), id.clone()))
+            .collect(),
+        model_unready_reasons: agent
+            .session
+            .models
+            .selectable_models()
+            .filter_map(|(id, info)| {
+                crate::slash::commands::model::unready_reason_from_model_meta(info.meta.as_ref())
+                    .map(|reason| (id.0.to_string(), reason))
+            })
+            .collect(),
         unavailable_model_reasons: agent.session.models.catalog_unready_reasons(),
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
         coding_data_sharing_lock: coding_data_sharing_lock_from_app,
@@ -692,6 +729,15 @@ fn agent_current_model_name(app: &AppView) -> Option<String> {
     None
 }
 
+fn agent_current_model_id(app: &AppView) -> Option<agent_client_protocol::ModelId> {
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+    {
+        return agent.session.models.current.clone();
+    }
+    None
+}
+
 /// Helper to clone the `(display_name, ModelId)` pairs from the
 /// active agent's catalog. Returns an empty `Vec` when no agent is
 /// active OR when the catalog is empty.
@@ -702,11 +748,19 @@ fn agent_available_models(app: &AppView) -> Vec<(String, acp::ModelId)> {
     if let ActiveView::Agent(id) = app.active_view
         && let Some(agent) = app.agents.get(&id)
     {
-        return agent.session.models.catalog_display_pairs();
+        // `selectable_models` (not the raw catalog): the unavailable-resident
+        // placeholder is presentation state and must never reach a picker.
+        return agent
+            .session
+            .models
+            .selectable_models()
+            .map(|(id, info)| (info.name.clone(), id.clone()))
+            .collect();
     }
     Vec::new()
 }
 
+/// Pair-form readiness store consumed by the picker's disabled-row gate.
 fn agent_unavailable_model_reasons(app: &AppView) -> Vec<(String, String)> {
     if let ActiveView::Agent(id) = app.active_view
         && let Some(agent) = app.agents.get(&id)
@@ -716,6 +770,23 @@ fn agent_unavailable_model_reasons(app: &AppView) -> Vec<(String, String)> {
     Vec::new()
 }
 
+fn agent_model_unready_reasons(app: &AppView) -> std::collections::HashMap<String, String> {
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+    {
+        return agent
+            .session
+            .models
+            .selectable_models()
+            .filter_map(|(id, info)| {
+                crate::slash::commands::model::unready_reason_from_model_meta(info.meta.as_ref())
+                    .map(|reason| (id.0.to_string(), reason))
+            })
+            .collect();
+    }
+    std::collections::HashMap::new()
+}
+
 /// Build a `PagerLocalSnapshot` from the current `AppView`.
 pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocalSnapshot {
     crate::settings::PagerLocalSnapshot {
@@ -723,7 +794,9 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         yolo_mode: agent_yolo_mode(app),
         auto_mode: agent_auto_mode(app),
         current_model_name: agent_current_model_name(app),
+        current_model_id: agent_current_model_id(app),
         available_models: agent_available_models(app),
+        model_unready_reasons: agent_model_unready_reasons(app),
         unavailable_model_reasons: agent_unavailable_model_reasons(app),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         coding_data_sharing_lock: app.coding_data_sharing_lock(),
@@ -1108,6 +1181,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
                                     session_id: sid,
                                     model_id: id,
                                     effort: None,
+                                    session_only: false,
                                     request_id,
                                     prev_model_id: None,
                                 });

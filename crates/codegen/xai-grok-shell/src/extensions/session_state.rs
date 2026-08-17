@@ -1,8 +1,7 @@
 //! `x.ai/session/state` reads a session's metadata columns; `x.ai/session/import`
 //! writes them, with the transcript, to recreate a session on another host.
 
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use agent_client_protocol as acp;
 use serde::Deserialize;
@@ -49,12 +48,18 @@ pub(crate) async fn handle_state(args: &acp::ExtRequest) -> ExtResult {
     let request: StateRequest = super::parse_params(args)?;
     validate_session_uuid(&request.session_id)?;
 
-    let Some(dir) = resolve_session_dir(&request.session_id, &request.cwd) else {
+    let Some(session) = crate::session::persistence::acquire_published_session_read(
+        &request.session_id,
+        Some(&request.cwd),
+    )
+    .await
+    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
+    else {
         return Err(acp::Error::invalid_params().data("session not found"));
     };
     let mut state = serde_json::Map::new();
     for (column, rel) in COLUMNS {
-        if let Ok(text) = std::fs::read_to_string(dir.join(rel))
+        if let Ok(text) = std::fs::read_to_string(session.path().join(rel))
             && let Ok(value) = serde_json::from_str::<Value>(&text)
         {
             state.insert((*column).to_string(), value);
@@ -87,60 +92,92 @@ pub(crate) async fn handle_import_in(root: &Path, args: &acp::ExtRequest) -> Ext
     let mut request: ImportRequest = super::parse_params(args)?;
     validate_session_uuid(&request.session_id)?;
 
-    let encoded = crate::util::grok_home::encode_cwd_dirname(&request.cwd);
-    let dir = root
-        .join("sessions")
-        .join(&encoded)
+    // Same layout `session_dir` resolves for the shipped root, expressed
+    // against `root` so symlink-escape tests can drive a temporary GROK_HOME.
+    let sessions_root = root.join("sessions");
+    let dir = sessions_root
+        .join(crate::util::grok_home::encode_cwd_dirname(&request.cwd))
         .join(&request.session_id);
+    let imported = import_into_root(&mut request, &sessions_root, dir).await?;
+    super::to_raw_response(&json!({ "imported": imported }))
+}
 
-    // resolve_session_dir gates on summary.json, so an interrupted import (dir created,
-    // summary not yet written) is recreated on retry rather than skipped forever.
-    let has_local_session =
-        resolve_session_dir_in(root, &request.session_id, &request.cwd).is_some();
-    if !has_local_session {
-        let Some(summary_value) = request.state.get_mut(SUMMARY_COLUMN) else {
-            return Err(
-                acp::Error::invalid_params().data("session/import requires a summary column")
-            );
-        };
-        let Some(summary) = summary_value.as_object_mut() else {
-            return Err(
-                acp::Error::invalid_params().data("session/import summary must be an object")
-            );
-        };
-        sanitize_summary_for_host(summary, &request.session_id, &request.cwd);
-        // Reject a summary that would not load rather than persist one that bricks the
-        // session and blocks re-import.
-        if Summary::deserialize(&*summary_value).is_err() {
-            return Err(acp::Error::invalid_params().data("summary column is not a valid summary"));
+async fn import_into_root(
+    request: &mut ImportRequest,
+    sessions_root: &Path,
+    dir: std::path::PathBuf,
+) -> Result<bool, acp::Error> {
+    let mut session = crate::session::persistence::acquire_published_session_write_in_root(
+        sessions_root,
+        &request.session_id,
+        Some(&request.cwd),
+    )
+    .await
+    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+    if let Some(existing_path) = session.published_path() {
+        let existing_path = existing_path.to_path_buf();
+        let summary = session
+            .read_summary()
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
+            .ok_or_else(|| {
+                acp::Error::internal_error()
+                    .data("session/import existing winner has no readable summary")
+            })?;
+        if summary.info.id.to_string() != request.session_id
+            || summary.info.cwd != request.cwd
+            || existing_path != dir
+        {
+            return Err(acp::Error::internal_error()
+                .data("session/import existing winner identity does not match the request"));
         }
-        let _lease = xai_grok_workspace::session::id_lock::acquire_session_id_lock_sync(
-            root,
-            &request.session_id,
-        )
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-        let parent = xai_grok_workspace::session::publication_parent::ensure_publication_parent(
-            root,
-            OsStr::new(&encoded),
-        )
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-        parent
-            .revalidate()
-            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-        parent
-            .ensure_session_dir(OsStr::new(&request.session_id))
-            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-        write_cwd_sidecar(&parent, &request.cwd, &encoded)
-            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-        parent
-            .revalidate()
-            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-        write_import_checked(&dir, &request.state, &request.updates, || {
-            parent.revalidate()
-        })
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+        return Ok(false);
     }
-    super::to_raw_response(&json!({ "imported": !has_local_session }))
+
+    let Some(summary_value) = request.state.get_mut(SUMMARY_COLUMN) else {
+        return Err(acp::Error::invalid_params().data("session/import requires a summary column"));
+    };
+    let Some(summary) = summary_value.as_object_mut() else {
+        return Err(acp::Error::invalid_params().data("session/import summary must be an object"));
+    };
+    sanitize_summary_for_host(summary, &request.session_id, &request.cwd);
+    // Reject a summary that would not load rather than persist one that bricks the
+    // session and blocks re-import.
+    if Summary::deserialize(&*summary_value).is_err() {
+        return Err(acp::Error::invalid_params().data("summary column is not a valid summary"));
+    }
+    {
+        let dir = session
+            .begin_new(dir)
+            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+        write_import(dir, &request.state, &request.updates)
+            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+    }
+    reconcile_import_publication(session.publish_new_classified())
+}
+
+fn reconcile_import_publication(
+    publication: Result<(), crate::session::persistence::PublishedSessionFinalizeError>,
+) -> Result<bool, acp::Error> {
+    use crate::session::persistence::PublishedSessionFinalizeError;
+
+    match publication {
+        Ok(()) => Ok(true),
+        Err(PublishedSessionFinalizeError::NotCommitted(error)) => {
+            Err(acp::Error::internal_error().data(error.to_string()))
+        }
+        Err(PublishedSessionFinalizeError::CommittedDurability(error)) => {
+            tracing::warn!(
+                %error,
+                "session/import committed but its durability acknowledgement failed"
+            );
+            Ok(true)
+        }
+        Err(PublishedSessionFinalizeError::CommittedIdentity(error)) => {
+            Err(acp::Error::internal_error().data(format!(
+                "session/import committed outside the canonical namespace: {error}"
+            )))
+        }
+    }
 }
 
 /// Rewrite a mirrored summary's host-specific fields to describe this host.
@@ -188,30 +225,9 @@ fn set_or_remove(obj: &mut serde_json::Map<String, Value>, key: &str, value: Opt
     }
 }
 
-fn write_cwd_sidecar(
-    parent: &xai_grok_workspace::session::publication_parent::PublicationParent,
-    cwd: &str,
-    encoded: &str,
-) -> std::io::Result<()> {
-    if encoded == urlencoding::encode(cwd).as_ref() {
-        return Ok(());
-    }
-    match parent
-        .parent_anchor()
-        .create_child_file_new(OsStr::new(".cwd"))
-    {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            file.write_all(cwd.as_bytes())?;
-            file.sync_all()
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-/// Writes summary.json last, and each file to a temporary name first, so an interrupted
-/// import leaves an incomplete session that load treats as absent.
+/// Writes summary.json last and each file through an atomic temporary replacement.
+/// The caller keeps this whole tree in private staging until the final anchored
+/// directory publication, so an interrupted import is never publicly discoverable.
 fn write_import(
     dir: &Path,
     state: &std::collections::HashMap<String, Value>,
@@ -259,31 +275,35 @@ fn write_column(dir: &Path, rel: &str, value: &Value) -> std::io::Result<()> {
     st::write_bytes_atomic(&path, value.to_string().as_bytes())
 }
 
-/// The session's directory, or `None` when it isn't found on this host. Falls back to
-/// an id scan when `(id, cwd)` has no summary (subagents use their own cwd); both
-/// branches require summary.json so a bare directory doesn't count as present.
-fn resolve_session_dir(session_id: &str, cwd: &str) -> Option<PathBuf> {
-    resolve_session_dir_in(&crate::util::grok_home::grok_home(), session_id, cwd)
-}
-
-fn resolve_session_dir_in(root: &Path, session_id: &str, cwd: &str) -> Option<PathBuf> {
-    let encoded = crate::util::grok_home::encode_cwd_dirname(cwd);
-    let dir = root.join("sessions").join(encoded).join(session_id);
-    if dir.join(st::SUMMARY_FILE).is_file() {
-        return Some(dir);
-    }
-    if root == crate::util::grok_home::grok_home() {
-        crate::session::persistence::find_session_dir_by_id(session_id)
-            .filter(|found| found.join(st::SUMMARY_FILE).is_file())
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn import_request(session_id: &str, cwd: &str) -> ImportRequest {
+        let info = crate::session::info::Info {
+            id: acp::SessionId::new(session_id.to_owned()),
+            cwd: cwd.to_owned(),
+        };
+        let summary = Summary::new(&info, crate::session::persistence::default_model_id()).unwrap();
+        ImportRequest {
+            session_id: session_id.to_owned(),
+            cwd: cwd.to_owned(),
+            state: [(
+                SUMMARY_COLUMN.to_owned(),
+                serde_json::to_value(summary).unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+            updates: vec![json!({ "method": "session/update", "params": { "seq": 1 } })],
+        }
+    }
+
+    fn import_dir(sessions_root: &Path, request: &ImportRequest) -> std::path::PathBuf {
+        sessions_root
+            .join(crate::util::grok_home::encode_cwd_dirname(&request.cwd))
+            .join(&request.session_id)
+    }
 
     #[test]
     fn sanitize_summary_for_host_rewrites_host_fields() {
@@ -381,6 +401,7 @@ mod tests {
         use crate::session::storage::{JsonlStorageAdapter, StorageAdapter};
         use std::collections::BTreeMap;
         use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
 
         fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             let mut out = BTreeMap::new();
@@ -481,6 +502,177 @@ mod tests {
         assert_eq!(
             std::fs::read(outside.path().join("canary")).unwrap(),
             b"outside-untouched-340"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_publishes_summary_and_removes_visibility_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut request = import_request(
+            "019c0000-0000-7000-8000-000000000201",
+            &cwd.to_string_lossy(),
+        );
+        let dir = import_dir(&sessions_root, &request);
+
+        assert!(
+            import_into_root(&mut request, &sessions_root, dir.clone())
+                .await
+                .unwrap()
+        );
+        assert!(dir.join(st::SUMMARY_FILE).is_file());
+        assert!(
+            !dir.join(crate::session::persistence::UNPUBLISHED_SESSION_MARKER)
+                .exists()
+        );
+        let published = crate::session::persistence::acquire_published_session_read_in_root(
+            &sessions_root,
+            &request.session_id,
+            Some(&request.cwd),
+        )
+        .await
+        .unwrap()
+        .expect("import is visible after commit");
+        assert_eq!(published.path(), dir);
+    }
+
+    #[tokio::test]
+    async fn import_atomically_publishes_long_cwd_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_root = tmp.path().join("sessions");
+        let cwd = format!("/{}", "long-cwd-segment/".repeat(40));
+        let mut request = import_request("019c0000-0000-7000-8000-000000000205", &cwd);
+        let dir = import_dir(&sessions_root, &request);
+
+        assert!(
+            import_into_root(&mut request, &sessions_root, dir.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.parent().unwrap().join(".cwd")).unwrap(),
+            cwd
+        );
+        assert!(dir.join(st::SUMMARY_FILE).is_file());
+    }
+
+    #[test]
+    fn import_reports_success_only_for_committed_durability_failure() {
+        use crate::session::persistence::PublishedSessionFinalizeError;
+
+        assert!(
+            reconcile_import_publication(Err(PublishedSessionFinalizeError::CommittedDurability(
+                std::io::Error::other("injected sync failure",)
+            ),))
+            .expect("a visible canonical import remains successful")
+        );
+        assert!(
+            reconcile_import_publication(Err(PublishedSessionFinalizeError::NotCommitted(
+                std::io::Error::other("injected pre-commit failure"),
+            )))
+            .is_err()
+        );
+        assert!(
+            reconcile_import_publication(Err(PublishedSessionFinalizeError::CommittedIdentity(
+                std::io::Error::other("injected canonical identity failure"),
+            )))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_imports_publish_exactly_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session_id = "019c0000-0000-7000-8000-000000000202";
+        let mut first = import_request(session_id, &cwd.to_string_lossy());
+        let mut second = import_request(session_id, &cwd.to_string_lossy());
+        let dir = import_dir(&sessions_root, &first);
+
+        let (first_result, second_result) = tokio::join!(
+            import_into_root(&mut first, &sessions_root, dir.clone()),
+            import_into_root(&mut second, &sessions_root, dir.clone()),
+        );
+        let imported = [first_result.unwrap(), second_result.unwrap()];
+        assert_eq!(imported.into_iter().filter(|value| *value).count(), 1);
+        assert!(dir.join(st::SUMMARY_FILE).is_file());
+        assert!(
+            !dir.join(crate::session::persistence::UNPUBLISHED_SESSION_MARKER)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn import_preserves_and_rejects_stale_public_unpublished_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut request = import_request(
+            "019c0000-0000-7000-8000-000000000203",
+            &cwd.to_string_lossy(),
+        );
+        let stale_dir = sessions_root
+            .join(crate::util::grok_home::encode_cwd_dirname("/stale/import"))
+            .join(&request.session_id);
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(
+            stale_dir.join(crate::session::persistence::UNPUBLISHED_SESSION_MARKER),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(stale_dir.join("partial"), b"stale").unwrap();
+        let dir = import_dir(&sessions_root, &request);
+
+        let error = import_into_root(&mut request, &sessions_root, dir.clone())
+            .await
+            .expect_err("a public stale marker is an untrusted collision");
+        assert!(
+            error.to_string().contains("already")
+                || error.to_string().contains("collision")
+                || error.to_string().contains("present"),
+            "unexpected error: {error}"
+        );
+        assert!(stale_dir.join("partial").is_file());
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_refuses_symlinked_cwd_parent_without_touching_outside_tree() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_root = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_root).unwrap();
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let mut request = import_request(
+            "019c0000-0000-7000-8000-000000000204",
+            &cwd.to_string_lossy(),
+        );
+        let dir = import_dir(&sessions_root, &request);
+        let target_parent = dir.parent().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"untouched").unwrap();
+        symlink(&outside, target_parent).unwrap();
+
+        let error = import_into_root(&mut request, &sessions_root, dir)
+            .await
+            .expect_err("import must reject a symlinked cwd parent");
+        assert!(!error.to_string().is_empty(), "error must be actionable");
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"untouched"
+        );
+        assert!(
+            !outside.join(&request.session_id).exists(),
+            "import must not create or remove anything through the symlink"
         );
     }
 }

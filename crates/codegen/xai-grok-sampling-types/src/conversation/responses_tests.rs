@@ -621,53 +621,34 @@ fn test_response_reasoning_effort_stamped_on_assistant() {
 
 #[test]
 fn test_typed_response_max_reasoning_effort_stamped_on_assistant_as_max() {
-    use crate::rs;
-
     // Client Ultra is encoded as typed Max on the wire. A server echo of Max
     // must stay Max on the assistant item, not be widened back to Ultra.
-    let response = rs::Response {
-        background: None,
-        billing: None,
-        conversation: None,
-        created_at: 1234567890,
-        completed_at: None,
-        error: None,
-        id: "resp_ultra_echo".to_string(),
-        incomplete_details: None,
-        instructions: None,
-        max_output_tokens: None,
-        metadata: None,
-        model: "gpt-5.6-sol".to_string(),
-        object: "response".to_string(),
-        output: vec![],
-        parallel_tool_calls: None,
-        previous_response_id: None,
-        prompt: None,
-        prompt_cache_key: None,
-        prompt_cache_retention: None,
-        reasoning: Some(rs::Reasoning {
-            effort: Some(rs::ReasoningEffort::Max),
-            summary: None,
-        }),
-        safety_identifier: None,
-        service_tier: None,
-        status: rs::Status::Completed,
-        temperature: None,
-        text: None,
-        tool_choice: None,
-        tools: None,
-        top_logprobs: None,
-        top_p: None,
-        truncation: None,
-        usage: None,
-    };
+    //
+    // Built from JSON rather than an `rs::Response` struct literal so an
+    // upstream field addition cannot break this test.
+    let response: crate::rs::Response = serde_json::from_value(serde_json::json!({
+        "id": "resp_max",
+        "object": "response",
+        "created_at": 1234567890,
+        "model": "gpt-5.6-sol",
+        "status": "completed",
+        "output": [],
+        "reasoning": { "effort": "max" }
+    }))
+    .expect("typed Responses API response accepts Max");
 
     let items = response_to_conversation_items(response);
-    let ConversationItem::Assistant(a) = items.last().expect("trailing Assistant") else {
+    let ConversationItem::Assistant(assistant) = items.last().expect("trailing Assistant") else {
         panic!("Expected Assistant item");
     };
-    assert_eq!(a.reasoning_effort, Some(crate::ReasoningEffort::Max));
-    assert_ne!(a.reasoning_effort, Some(crate::ReasoningEffort::Ultra));
+    assert_eq!(
+        assistant.reasoning_effort,
+        Some(crate::ReasoningEffort::Max)
+    );
+    assert_ne!(
+        assistant.reasoning_effort,
+        Some(crate::ReasoningEffort::Ultra)
+    );
 }
 
 #[test]
@@ -1291,6 +1272,9 @@ fn test_responses_request_carries_reasoning_effort_nested() {
         (crate::ReasoningEffort::High, "high"),
         (crate::ReasoningEffort::Xhigh, "xhigh"),
         (crate::ReasoningEffort::Max, "max"),
+        // Ultra remains distinct in the app but uses the canonical client's
+        // highest typed Responses value on the wire.
+        (crate::ReasoningEffort::Ultra, "max"),
     ] {
         let req = ConversationRequest {
             reasoning_effort: Some(variant),
@@ -1304,6 +1288,33 @@ fn test_responses_request_carries_reasoning_effort_nested() {
             "{variant:?} should serialize as reasoning.effort={expected:?}; got: {json:#}",
         );
     }
+}
+
+#[test]
+fn test_response_wrapper_keeps_client_ultra_separate_from_typed_max() {
+    assert_eq!(
+        crate::CreateResponseWrapper::default().client_reasoning_effort,
+        None
+    );
+
+    let request = ConversationRequest {
+        reasoning_effort: Some(crate::ReasoningEffort::Ultra),
+        ..ConversationRequest::from_items(vec![ConversationItem::user("hi")]).with_model("test")
+    };
+    let mut wrapper = crate::CreateResponseWrapper::new((&request).into());
+    assert_eq!(wrapper.client_reasoning_effort, None);
+
+    wrapper.client_reasoning_effort = request.reasoning_effort;
+    assert_eq!(
+        wrapper.client_reasoning_effort,
+        Some(crate::ReasoningEffort::Ultra)
+    );
+    let json = serde_json::to_value(&wrapper.inner).unwrap();
+    assert_eq!(
+        json.pointer("/reasoning/effort")
+            .and_then(serde_json::Value::as_str),
+        Some("max")
+    );
 }
 
 #[test]

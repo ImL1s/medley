@@ -37,6 +37,7 @@ pub const AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 
 const CALLBACK_PATH: &str = "/auth/callback";
 const CALLBACK_TIMEOUT: StdDuration = StdDuration::from_secs(600);
+const STORE_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(20);
 const REVOKE_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const EXPIRY_FALLBACK_SECONDS: i64 = 8 * 24 * 60 * 60;
@@ -330,14 +331,6 @@ async fn bind_callback() -> Result<(TcpListener, u16), CodexOAuthError> {
         }
     }
     Err(CodexOAuthError::BindLoopback)
-}
-
-async fn wait_for_callback(
-    listener: TcpListener,
-    cancellation: CancellationToken,
-    expected_state: &str,
-) -> Result<CallbackSession, CodexOAuthError> {
-    wait_for_callback_with_timeout(listener, cancellation, expected_state, CALLBACK_TIMEOUT).await
 }
 
 async fn wait_for_callback_with_timeout(
@@ -720,6 +713,30 @@ pub async fn login_with_manager<F>(
 where
     F: FnOnce(&str),
 {
+    login_with_manager_at(
+        manager,
+        cancellation,
+        open_browser,
+        announce_url,
+        TOKEN_ENDPOINT,
+        CALLBACK_TIMEOUT,
+        STORE_LOCK_TIMEOUT,
+    )
+    .await
+}
+
+async fn login_with_manager_at<F>(
+    manager: &Arc<AuthManager>,
+    cancellation: CancellationToken,
+    open_browser: bool,
+    announce_url: F,
+    token_endpoint: &str,
+    callback_timeout: StdDuration,
+    store_lock_timeout: StdDuration,
+) -> Result<GrokAuth, CodexOAuthError>
+where
+    F: FnOnce(&str),
+{
     let (listener, port) = bind_callback().await?;
     let redirect_uri = redirect_uri(port);
     let pkce = generate_pkce();
@@ -730,12 +747,14 @@ where
         let target = authorize_url.clone();
         tokio::task::spawn_blocking(move || webbrowser::open(&target));
     }
-    let mut callback_session = wait_for_callback(listener, cancellation.clone(), &state).await?;
+    let mut callback_session =
+        wait_for_callback_with_timeout(listener, cancellation.clone(), &state, callback_timeout)
+            .await?;
     let callback = callback_session.take_callback();
     let login_result: Result<GrokAuth, CodexOAuthError> = tokio::select! {
         result = async {
             let code = validated_callback_code(callback, &state)?;
-            let tokens = exchange_code_at(TOKEN_ENDPOINT, &code, &redirect_uri, &pkce.verifier)
+            let tokens = exchange_code_at(token_endpoint, &code, &redirect_uri, &pkce.verifier)
                 .await
                 .map_err(|error| match error.status {
                     Some(status) => CodexOAuthError::TokenHttp { status },
@@ -743,7 +762,7 @@ where
                 })?;
             let auth = build_login_auth(tokens)?;
             let lock = manager
-                .try_lock_auth_file_async(StdDuration::from_secs(10))
+                .try_lock_auth_file_async(store_lock_timeout)
                 .await
                 .ok_or(CodexOAuthError::StoreBusy)?;
             if !lock.still_live(manager.auth_json_path()) {
@@ -799,7 +818,11 @@ pub fn status(manager: &AuthManager) -> CodexAuthStatus {
 
 /// Atomically snapshot the access token and account id from one credential.
 pub fn credential_snapshot(manager: &AuthManager) -> Option<ProviderCredentialSnapshot> {
-    let auth = manager.current()?;
+    // This snapshot feeds live catalog and sampler requests.  Use the same
+    // wire-valid view as request authentication so a server-rejected bearer
+    // retained after a failed durable removal cannot escape through a sync
+    // credential reader.
+    let auth = manager.current_wire_valid()?;
     Some(ProviderCredentialSnapshot {
         access_token: auth.key,
         expires_at: auth.expires_at,
@@ -962,6 +985,16 @@ impl Drop for CodexAuthPathGuard {
 /// Convenience constructor that also installs the existing single-flight OIDC
 /// refresher used by proactive and bounded 401 recovery paths.
 pub fn manager(grok_home: &Path) -> Arc<AuthManager> {
+    #[cfg(test)]
+    let manager = TEST_MANAGER_AUTH_PATH.with(|override_path| {
+        override_path
+            .borrow()
+            .as_deref()
+            .map(AuthManager::new_openai_codex_for_test_path)
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::new(AuthManager::new_openai_codex(grok_home)))
+    });
+    #[cfg(not(test))]
     let manager = Arc::new(AuthManager::new_openai_codex(grok_home));
     manager.configure_refresher(None, None);
     manager
@@ -976,9 +1009,53 @@ pub fn manager_at_path(path: PathBuf) -> Arc<AuthManager> {
 }
 
 #[cfg(test)]
+thread_local! {
+    static TEST_MANAGER_AUTH_PATH: std::cell::RefCell<Option<std::path::PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Thread-local auth-path override for tests that exercise production model
+/// resolution. Unlike mutating `GROK_AUTH_PATH`, this cannot redirect unrelated
+/// parallel tests into the same credential file.
+#[cfg(test)]
+pub(crate) struct TestManagerAuthPathGuard(Option<std::path::PathBuf>);
+
+#[cfg(test)]
+impl TestManagerAuthPathGuard {
+    pub(crate) fn install(auth_json_path: &Path) -> Self {
+        let prior = TEST_MANAGER_AUTH_PATH
+            .with(|override_path| override_path.replace(Some(auth_json_path.to_owned())));
+        Self(prior)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestManagerAuthPathGuard {
+    fn drop(&mut self) {
+        let prior = self.0.take();
+        TEST_MANAGER_AUTH_PATH.with(|override_path| {
+            override_path.replace(prior);
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_manager(grok_home: &Path) -> Arc<AuthManager> {
+        let manager = Arc::new(AuthManager::new_openai_codex_for_test_path(
+            &grok_home.join("auth.json"),
+        ));
+        manager.configure_refresher(None, None);
+        manager
+    }
+
+    fn reload_test_manager(grok_home: &Path) -> AuthManager {
+        AuthManager::new_openai_codex_for_test_path(&grok_home.join("auth.json"))
+    }
 
     #[test]
     #[serial_test::serial]
@@ -1267,6 +1344,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_login_flow_persists_provider_scoped_codex_credential() {
+        use axum::extract::Form;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path());
+        let held_lock = manager
+            .try_lock_auth_file_async(StdDuration::from_secs(1))
+            .await
+            .expect("test lock acquired");
+        let token_request = Arc::new(std::sync::Mutex::new(None));
+        let captured_request = Arc::clone(&token_request);
+        let expected_id_token = jwt(serde_json::json!({
+            AUTH_CLAIM_NAMESPACE: {
+                "chatgpt_account_id": "workspace-fixture",
+                "chatgpt_account_is_fedramp": true
+            }
+        }));
+        let token_id_token = expected_id_token.clone();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token_router = Router::new().route(
+            "/token",
+            axum::routing::post(move |Form(form): Form<HashMap<String, String>>| {
+                let captured_request = Arc::clone(&captured_request);
+                let id_token = token_id_token.clone();
+                async move {
+                    *captured_request.lock().unwrap() = Some(form);
+                    axum::Json(serde_json::json!({
+                        "access_token": "login-access-SENTINEL",
+                        "refresh_token": "login-refresh-SENTINEL",
+                        "id_token": id_token,
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let token_shutdown = CancellationToken::new();
+        let token_server = axum::serve(listener, token_router)
+            .with_graceful_shutdown(token_shutdown.clone().cancelled_owned());
+        let token_server = tokio::spawn(async move { token_server.await });
+
+        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
+        let login_manager = Arc::clone(&manager);
+        let token_endpoint = format!("http://{addr}/token");
+        let mut login = tokio::spawn(async move {
+            login_with_manager_at(
+                &login_manager,
+                CancellationToken::new(),
+                false,
+                move |raw_url| {
+                    let authorize_url = url::Url::parse(raw_url).unwrap();
+                    assert_eq!(
+                        authorize_url.as_str().split('?').next(),
+                        Some(AUTHORIZE_ENDPOINT)
+                    );
+                    let query: HashMap<_, _> = authorize_url.query_pairs().into_owned().collect();
+                    assert_eq!(query.get("client_id").map(String::as_str), Some(CLIENT_ID));
+                    assert_eq!(
+                        query.get("originator").map(String::as_str),
+                        Some(ORIGINATOR)
+                    );
+                    assert_eq!(
+                        query.get("code_challenge_method").map(String::as_str),
+                        Some("S256")
+                    );
+                    assert!(
+                        query
+                            .get("code_challenge")
+                            .is_some_and(|value| !value.is_empty())
+                    );
+                    let state = query
+                        .get("state")
+                        .filter(|value| !value.is_empty())
+                        .unwrap();
+                    let mut callback_url =
+                        url::Url::parse(query.get("redirect_uri").unwrap()).unwrap();
+                    callback_url
+                        .query_pairs_mut()
+                        .append_pair("code", "login-code")
+                        .append_pair("state", state);
+                    let request = tokio::spawn(async move {
+                        reqwest::Client::new().get(callback_url).send().await
+                    });
+                    assert!(callback_tx.send(request).is_ok());
+                },
+                &token_endpoint,
+                StdDuration::from_secs(5),
+                StdDuration::from_secs(5),
+            )
+            .await
+        });
+        let mut callback_request = tokio::time::timeout(StdDuration::from_secs(2), callback_rx)
+            .await
+            .expect("login must announce the callback URL promptly")
+            .expect("login must start the callback request");
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                assert!(
+                    !callback_request.is_finished(),
+                    "callback transport failed or reported success before persistence"
+                );
+                assert!(
+                    !login.is_finished(),
+                    "login completed while durable persistence was blocked"
+                );
+                if token_request.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local token exchange must complete promptly");
+        tokio::select! {
+            callback = &mut callback_request => {
+                panic!("callback completed before durable persistence: {callback:?}");
+            }
+            result = &mut login => {
+                panic!("login completed while durable persistence was blocked: {result:?}");
+            }
+            _ = tokio::time::sleep(StdDuration::from_millis(100)) => {}
+        }
+        assert!(
+            reload_test_manager(dir.path())
+                .current_or_expired()
+                .is_none(),
+            "Codex credential must not appear before the held store lock is released"
+        );
+        drop(held_lock);
+
+        let auth = tokio::time::timeout(StdDuration::from_secs(5), &mut login)
+            .await
+            .expect("full login must not inherit the production callback timeout")
+            .unwrap()
+            .unwrap();
+        let callback_response =
+            tokio::time::timeout(StdDuration::from_secs(5), &mut callback_request)
+                .await
+                .expect("callback response must follow durable persistence")
+                .unwrap()
+                .unwrap();
+        assert_eq!(callback_response.status(), StatusCode::OK);
+        assert_eq!(
+            callback_response.text().await.unwrap(),
+            "Signed in. You can close this window."
+        );
+        token_shutdown.cancel();
+        token_server.await.unwrap().unwrap();
+
+        let token_request = token_request.lock().unwrap().take().unwrap();
+        assert_eq!(
+            token_request.get("grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            token_request.get("code").map(String::as_str),
+            Some("login-code")
+        );
+        assert_eq!(
+            token_request.get("client_id").map(String::as_str),
+            Some(CLIENT_ID)
+        );
+        assert!(
+            token_request
+                .get("code_verifier")
+                .is_some_and(|value| value.len() >= 43)
+        );
+        assert!(
+            token_request
+                .get("redirect_uri")
+                .is_some_and(|value| value.starts_with("http://localhost:"))
+        );
+
+        assert_eq!(auth.auth_mode, AuthMode::OpenAiCodex);
+        assert!(is_codex_credential(&auth));
+        assert_eq!(auth.key, "login-access-SENTINEL");
+        assert_eq!(
+            auth.refresh_token.as_deref(),
+            Some("login-refresh-SENTINEL")
+        );
+        assert_eq!(auth.account_id.as_deref(), Some("workspace-fixture"));
+        assert!(auth.chatgpt_account_is_fedramp);
+        assert_eq!(auth.id_token.as_deref(), Some(expected_id_token.as_str()));
+        assert_eq!(auth.oidc_issuer.as_deref(), Some(ISSUER));
+        assert_eq!(auth.oidc_client_id.as_deref(), Some(CLIENT_ID));
+        assert!(auth.expires_at.is_some_and(|expiry| expiry > Utc::now()));
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("login-access-SENTINEL"));
+        assert!(!debug.contains("login-refresh-SENTINEL"));
+
+        let reloaded = reload_test_manager(dir.path());
+        let persisted = reloaded.current_or_expired().unwrap();
+        assert!(is_codex_credential(&persisted));
+        assert_eq!(persisted.auth_mode, AuthMode::OpenAiCodex);
+        assert_eq!(persisted.key, auth.key);
+        assert_eq!(persisted.refresh_token, auth.refresh_token);
+        assert_eq!(persisted.account_id, auth.account_id);
+        assert_eq!(persisted.id_token, auth.id_token);
+        assert_eq!(persisted.oidc_issuer.as_deref(), Some(ISSUER));
+        assert_eq!(persisted.oidc_client_id.as_deref(), Some(CLIENT_ID));
+        assert!(persisted.chatgpt_account_is_fedramp);
+        assert!(
+            persisted
+                .expires_at
+                .is_some_and(|expiry| expiry > Utc::now())
+        );
+        let store = super::super::storage::read_auth_json(&dir.path().join("auth.json")).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(store.contains_key(AUTH_SCOPE));
+    }
+
+    #[tokio::test]
     async fn callback_reports_failure_when_completion_does_not_persist() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1320,7 +1611,7 @@ mod tests {
         );
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let revoke_endpoint = format!("http://{addr}/revoke");
-        let manager = manager(dir.path());
+        let manager = test_manager(dir.path());
         manager
             .save_without_enrichment(GrokAuth {
                 key: "access-token".into(),
@@ -1348,7 +1639,7 @@ mod tests {
         );
         assert!(status(&manager).signed_in, "memory must remain coherent");
         assert!(
-            status(&AuthManager::new_openai_codex(dir.path())).signed_in,
+            status(&reload_test_manager(dir.path())).signed_in,
             "disk credential must remain available to another process"
         );
 
@@ -1357,7 +1648,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!status(&manager).signed_in);
-        assert!(!status(&AuthManager::new_openai_codex(dir.path())).signed_in);
+        assert!(!status(&reload_test_manager(dir.path())).signed_in);
         assert_eq!(revoke_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1378,12 +1669,12 @@ mod tests {
         )
         .unwrap();
 
-        let logout_manager = manager(dir.path());
+        let logout_manager = test_manager(dir.path());
         logout_manager
             .save_without_enrichment(previous_codex_auth())
             .await
             .unwrap();
-        let rotating_manager = manager(dir.path());
+        let rotating_manager = test_manager(dir.path());
 
         let rotation_barrier = Arc::new(Barrier::new(2));
         let rotating_task = {
@@ -1609,7 +1900,7 @@ mod tests {
             &std::collections::BTreeMap::from([("xai::scope".to_owned(), xai)]),
         )
         .unwrap();
-        let manager = manager(dir.path());
+        let manager = test_manager(dir.path());
         manager
             .save_without_enrichment(previous_codex_auth())
             .await
@@ -1882,7 +2173,7 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&older).unwrap()).unwrap();
 
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         let auth = manager
             .current_or_expired()
             .expect("older Codex record loads");
@@ -1909,7 +2200,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_codex_refresh_is_single_flight_and_persists_rotation() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         manager
             .save_without_enrichment(GrokAuth {
                 key: "expiring-access".into(),
@@ -1952,7 +2243,7 @@ mod tests {
     #[tokio::test]
     async fn near_expiry_terminal_rejection_makes_codex_unready() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         manager
             .save_without_enrichment(GrokAuth {
                 key: "expiring-access".into(),
@@ -1982,7 +2273,7 @@ mod tests {
             RefreshTokenFailedReason::Other,
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let manager = AuthManager::new_openai_codex(dir.path());
+            let manager = reload_test_manager(dir.path());
             let auth = previous_codex_auth();
             let key = auth.key.clone();
             manager.save_without_enrichment(auth).await.unwrap();
@@ -2025,7 +2316,7 @@ mod tests {
         };
         let store = std::collections::BTreeMap::from([("xai::scope".to_owned(), xai)]);
         super::super::storage::write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
-        let manager = AuthManager::new_openai_codex(dir.path());
+        let manager = reload_test_manager(dir.path());
         assert!(manager.current_or_expired().is_none());
         let stored = super::super::storage::read_auth_json(&dir.path().join("auth.json")).unwrap();
         assert_eq!(stored.get("xai::scope").unwrap().key, "xai-secret");
@@ -2175,7 +2466,7 @@ mod tests {
     #[tokio::test]
     async fn access_token_only_refresh_preserves_id_token_workspace_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         let previous = previous_codex_auth();
         manager
             .save_without_enrichment(previous.clone())
@@ -2225,7 +2516,7 @@ mod tests {
     #[tokio::test]
     async fn strict_provider_save_does_not_publish_when_atomic_write_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         let initial = GrokAuth {
             key: "initial-access".into(),
             refresh_token: Some("initial-refresh".into()),

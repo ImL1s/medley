@@ -778,6 +778,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: "auth".to_string(),
+                http_status: crate::sampling::error::http_status_from_error(&err),
                 message: message.clone(),
             },
         ))
@@ -1503,8 +1504,9 @@ impl SessionActor {
                 }
             };
         let memory_backend_impl = {
-            let g = self.memory.storage.borrow();
-            g.as_ref()
+            self.memory
+                .storage()
+                .as_ref()
                 .zip(self.memory.backend_params.as_ref())
                 .map(|(storage, params)| {
                     crate::session::memory::MemoryBackendImpl::from_session_params(
@@ -2376,6 +2378,7 @@ mod inline_auto_compact_flow_tests {
                 flush_config: crate::config::MemoryFlushConfig::default(),
                 is_flushing: std::sync::atomic::AtomicBool::new(false),
                 last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+                configured_storage: None,
                 storage: std::cell::RefCell::new(None),
                 save_on_end: true,
                 backend_params: None,
@@ -2867,6 +2870,7 @@ mod inline_auto_compact_flow_tests {
                             crate::extensions::notification::RetryState::Failed {
                                 error_type,
                                 message,
+                                ..
                             },
                         ) = &notif.update
                     {
@@ -3026,6 +3030,7 @@ mod inline_auto_compact_flow_tests {
                                 crate::extensions::notification::RetryState::Failed {
                                     error_type,
                                     message,
+                                    ..
                                 },
                             ) => {
                                 assert_eq!(error_type, "auth");
@@ -3112,6 +3117,7 @@ mod inline_auto_compact_flow_tests {
                             crate::extensions::notification::RetryState::Failed {
                                 error_type,
                                 message,
+                                ..
                             },
                         ) = &notif.update
                     {
@@ -3615,6 +3621,7 @@ mod inline_auto_compact_flow_tests {
                 .map_or_else(Default::default, |mc| mc.flush.clone()),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+            configured_storage: memory_storage.clone(),
             storage: std::cell::RefCell::new(memory_storage),
             save_on_end: true,
             backend_params: None,

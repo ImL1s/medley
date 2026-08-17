@@ -1719,6 +1719,7 @@ pub(crate) fn execute(
             effort,
             request_id,
             prev_model_id,
+            session_only,
         } => {
             let tx = acp_tx.clone();
             tasks
@@ -1770,6 +1771,7 @@ pub(crate) fn execute(
                         request_id,
                         result,
                         prev_model_id,
+                        session_only,
                     }
                 });
         }

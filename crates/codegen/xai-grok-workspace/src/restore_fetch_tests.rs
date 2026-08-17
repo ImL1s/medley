@@ -505,11 +505,22 @@ fn fetch_timeout_kills_process_group_with_grandchild() {
         start.elapsed()
     );
 
-    let grandchild: u32 = std::fs::read_to_string(&pidfile)
-        .expect("grandchild pidfile")
-        .trim()
-        .parse()
-        .expect("grandchild pid");
+    let grandchild: u32 = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&pidfile) {
+                if let Ok(pid) = contents.trim().parse() {
+                    break pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild pidfile never appeared at {}",
+                pidfile.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
     assert!(!pid_alive(leader), "leader {leader} must not remain live");
     assert!(
         !pid_alive(grandchild),

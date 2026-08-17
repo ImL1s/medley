@@ -641,8 +641,8 @@ pub(crate) struct PendingForkBanner {
 /// superseded reload can never leave the transcript blank.
 ///
 /// Restore scope: the stash covers the transcript-critical state below (plus
-/// the todo list). Satellite state the replay also mutates —
-/// `subagent_sessions`/`subagent_views`, bg/scheduled tasks,
+/// the todo list and subagent status projection). Satellite state the replay
+/// also mutates — `subagent_views`, bg/scheduled tasks,
 /// `available_commands`, context usage — is NOT restored on failure: live
 /// updates keep routing through those maps during the window, so stashing
 /// them would break mid-window routing, and they re-converge on the next
@@ -663,6 +663,9 @@ pub(crate) struct SessionReload {
     workflow_runs: Vec<crate::views::workflows::WorkflowRunSnapshot>,
     workflow_run_revisions: std::collections::HashMap<String, u64>,
     cleared_workflow_runs: std::collections::HashSet<String>,
+    /// Pre-outage child status projection. Failed reconnects restore it, then
+    /// overlay only children with authoritative live activity from the window.
+    subagent_sessions: std::collections::HashMap<String, SubagentInfo>,
     /// Reconnect cursor as of window open, restored with the stash so a
     /// later reload doesn't skip events the restored transcript never got.
     last_seen_event_id: Option<String>,
@@ -676,6 +679,10 @@ pub(crate) struct SessionReload {
     /// Whether a Plan update applied during this window: the cursor-merge
     /// outcome then keeps the staging todo list (newer) instead of the stash.
     saw_todo_update: bool,
+    /// Spawns reconstructed from durable history during this reload.
+    replayed_subagent_spawns: std::collections::HashSet<String>,
+    /// Child ids with live (non-replay) activity during this reload.
+    live_subagents_seen: std::collections::HashSet<String>,
 }
 /// Lifecycle of the inline plugin CTA. `Hidden`/`Matched` cover the idle and
 /// prompt-matched states; `Installing`/`Installed`/`Error` cover an in-TUI

@@ -785,9 +785,14 @@ impl ReasoningEffort {
             Self::Medium => crate::rs::ReasoningEffort::Medium,
             Self::High => crate::rs::ReasoningEffort::High,
             Self::Xhigh => crate::rs::ReasoningEffort::Xhigh,
-            // Ultra is a client/session tier. The pinned async-openai enum
-            // tops out at Max, and Codex Responses reject `effort=ultra`.
-            Self::Max | Self::Ultra => crate::rs::ReasoningEffort::Max,
+            Self::Max => crate::rs::ReasoningEffort::Max,
+            // The app keeps Ultra as a distinct catalog/session tier, while
+            // the pinned async-openai client currently tops out at Max and
+            // Codex Responses reject `effort=ultra` outright.
+            // `CreateResponseWrapper` retains the app value for transports
+            // that apply an Ultra-specific wire policy after typed
+            // serialization.
+            Self::Ultra => crate::rs::ReasoningEffort::Max,
         }
     }
 
@@ -1434,7 +1439,8 @@ pub struct CreateResponseWrapper {
     pub inner: crate::rs::CreateResponse,
 
     /// App-level effort before conversion into the typed Responses request.
-    /// Preserves tiers such as Ultra that share a typed representation with Max.
+    /// Preserves tiers such as Ultra that intentionally share a typed
+    /// representation with Max.
     pub client_reasoning_effort: Option<ReasoningEffort>,
 
     /// Custom header: conversation ID for tracking.
@@ -1657,7 +1663,11 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_from_str_parses_max_and_xhigh_as_distinct_tiers() {
+    fn reasoning_effort_from_str_parses_ultra_max_and_xhigh_as_distinct_tiers() {
+        assert_eq!(
+            "ultra".parse::<ReasoningEffort>().unwrap(),
+            ReasoningEffort::Ultra
+        );
         assert_eq!(
             "ultra".parse::<ReasoningEffort>().unwrap(),
             ReasoningEffort::Ultra
@@ -1856,6 +1866,8 @@ mod tests {
         );
         let unknown = as_map(serde_json::json!({"reasoningEffort": "quantum"}));
         assert_eq!(parse_reasoning_effort_meta(Some(&unknown)), None);
+        let future = as_map(serde_json::json!({"reasoningEffort": "FUTURE"}));
+        assert_eq!(parse_reasoning_effort_meta(Some(&future)), None);
     }
 
     #[test]

@@ -116,7 +116,9 @@ Switch models. Accepts a model ID or display name (case-insensitive), and for re
 
 ### `/effort <level>`
 
-Set reasoning effort on the **current** model without reselecting it. The canonical levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, and a model may also advertise its own named options — run `/effort` with no argument to list the levels the active model actually accepts. It only applies when the active model supports reasoning effort; for a custom model, declare that support with `supports_reasoning_effort` or a `reasoning_efforts` list in its `[model.<id>]` block (see [Custom Models](11-custom-models.md#reasoning-effort)).
+Set reasoning effort on the **current** model without reselecting it. The canonical levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`, and a model may also advertise its own named options — run `/effort` with no argument to list the levels the active model actually accepts. It only applies when the active model supports reasoning effort; for a custom model, declare that support with `supports_reasoning_effort` or a `reasoning_efforts` list in its `[model.<id>]` block (see [Custom Models](11-custom-models.md#reasoning-effort)). `ultra` remains a distinct client/session tier and is offered only when the active model's catalog or custom menu advertises it.
+
+On Responses-family backends, `ultra` is encoded as `max` on the wire. For an authenticated Codex session, it also adds proactive multi-agent guidance: the model decides whether the available tools and current task warrant spawning subagents, so a spawn is not guaranteed on every turn. Chat Completions and Messages send the literal `ultra` value; custom endpoints must support it. See [Reasoning Effort](11-custom-models.md#reasoning-effort) for the backend-specific contract.
 
 ```
 /effort high

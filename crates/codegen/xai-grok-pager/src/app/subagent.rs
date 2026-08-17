@@ -41,7 +41,8 @@ pub struct SubagentInfo {
     /// no progress notifications yet still sort correctly.
     pub last_progress_at: Instant,
     pub finished: bool,
-    /// "completed", "failed", or "cancelled".
+    /// "completed", "failed", "cancelled", or pager-local
+    /// "unknown_after_reconnect" for an unresolved replay-only spawn.
     pub status: Option<Arc<str>>,
     pub error: Option<Arc<str>>,
     /// Wall-clock duration in milliseconds.

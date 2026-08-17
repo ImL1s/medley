@@ -347,7 +347,9 @@ fn normalize_phrase(s: &str) -> String {
 /// Pull an HTTP error status (4xx/5xx only — prose like "status 200" or a
 /// year must never classify a failure) out of a raw dump
 /// (`API error (status 500): …`, `Unauthorized (401)`, or an
-/// already-formatted `Server error (500) — …`).
+/// already-formatted `Server error (500) — …`). The exact legacy shell shape
+/// `Provider request failed (HTTP N)` is accepted without treating arbitrary
+/// `HTTP N` prose as structured status.
 pub(crate) fn parse_http_status(raw: &str) -> Option<u16> {
     // Bounded live-shell form: `Provider request failed (HTTP 400). …`
     const PROVIDER_HTTP: &str = "Provider request failed (HTTP ";
@@ -398,6 +400,7 @@ pub(crate) fn parse_http_status(raw: &str) -> Option<u16> {
         "Rate limited (",
         "Request timed out (",
         "Conflict (",
+        "Provider request failed (HTTP ",
     ];
     for marker in MARKERS {
         if let Some(i) = find_ignore_ascii_case(raw, marker)
@@ -464,7 +467,15 @@ fn extract_error_detail(raw: &str) -> Option<String> {
         s = rest;
     }
 
-    // A remaining JSON object after prefix strips (API error + body).
+    // The API-error strip can uncover a second carrier prefix
+    // (`API error: Provider request failed (HTTP 400). …`).
+    if let Some(rest) = strip_provider_request_failed_prefix(&s) {
+        s = rest;
+    }
+
+    // A remaining JSON object after the prefix strips (API error + body), taken
+    // before the URL-clause strip: a URL inside a JSON string would otherwise
+    // split the body at its own ": " and leave garbage.
     if let Some(json_start) = s.find('{')
         && let Some(extracted) = extract_from_json(&s[json_start..])
     {
@@ -496,12 +507,26 @@ fn extract_error_detail(raw: &str) -> Option<String> {
 
 /// Strip the bounded `Provider request failed (HTTP N).` carrier, leaving
 /// only the already-sanitized trailing detail (if any).
+///
+/// Tolerant about *where* the carrier sits and about its ASCII case — an ACP
+/// `Internal error:` envelope or an `API error` wrapper can carry it, and the
+/// JSON unwrap above hands it over mid-string. Strict about the code: it must
+/// be a three-digit 4xx/5xx status closed by `)`, so arbitrary `HTTP N` prose
+/// (`(HTTP 40x)`, `(timeout)`) is never treated as a structured carrier and
+/// its text is left intact for the noise filter to judge.
+///
+/// A bare carrier with nothing after it yields `Some("")` rather than `None`,
+/// so the carrier is dropped and the banner falls back to the canned
+/// status copy — carrier text can never reach the user even if
+/// [`is_noise_detail`]'s list changes.
 fn strip_provider_request_failed_prefix(s: &str) -> Option<String> {
     const HEAD: &str = "Provider request failed (HTTP ";
     let start = find_ignore_ascii_case(s, HEAD)?;
     let after = &s[start + HEAD.len()..];
-    let close = after.find(')')?;
-    let rest = after[close + 1..].trim_start_matches('.').trim();
+    // Proves three ASCII digits in 400..600 with `)` at index 3, so the
+    // slice below is in bounds and on a char boundary.
+    parse_status_digits(after, true)?;
+    let rest = after[4..].trim_start_matches('.').trim();
     Some(rest.to_string())
 }
 
@@ -853,6 +878,24 @@ mod tests {
             parse_http_status("Server error (500) \u{2014} Something went wrong on our side."),
             Some(500)
         );
+        assert_eq!(
+            parse_http_status(
+                "Provider request failed (HTTP 400). invalid field `reasoning.effort`"
+            ),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn formats_legacy_provider_400_as_bad_request_with_safe_detail() {
+        let formatted = format_request_failure(
+            None,
+            Some("api"),
+            "Provider request failed (HTTP 400). invalid field `reasoning.effort`",
+        );
+        assert_eq!(formatted.status, Some(400));
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert_eq!(formatted.detail, "invalid field `reasoning.effort`");
     }
 
     #[test]
@@ -894,6 +937,14 @@ mod tests {
         assert_eq!(parse_http_status("status 2024 items processed"), None);
         assert_eq!(
             parse_http_status("merge conflict (300 files changed)"),
+            None
+        );
+        assert_eq!(
+            parse_http_status("proxy noted HTTP 400 in free-form prose"),
+            None
+        );
+        assert_eq!(
+            parse_http_status("Provider request failed (HTTP 40x). malformed"),
             None
         );
         // A later occurrence still parses.

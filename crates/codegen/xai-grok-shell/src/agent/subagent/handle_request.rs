@@ -353,6 +353,7 @@ pub(crate) async fn run_shell_child(
         .parent_session_info
         .as_ref()
         .map(|i| std::path::Path::new(&i.cwd));
+    let has_explicit_reasoning_effort = request.runtime_overrides.reasoning_effort.is_some();
     let mut effective_runtime = xai_grok_subagent_resolution::resolve_runtime_config(
         &request.subagent_type,
         &request.runtime_overrides,
@@ -682,14 +683,26 @@ pub(crate) async fn run_shell_child(
             )
         });
     }
-    let mut prepared_model = resolve_request_prepared_model(
+    let mut prepared_model = match resolve_request_prepared_model_with_native_route(
         request.fork_context,
         effective_runtime.model.as_deref(),
         &request.subagent_type,
-        &definition.model,
+        &definition,
+        &selected_harness_definition,
         &ctx,
+        Some(request.id.as_str()),
+        None,
+        resume_source.is_none(),
     )
-    .await;
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(msg) => {
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+    };
+    let mut native_route_receipt = prepared_model.receipt.take();
+    let mut prepared_model = prepared_model.prepared;
     let mut effective_sampling_config = prepared_model.sampling_config.clone();
     let mut effective_model_id = prepared_model.model_id.clone();
     let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
@@ -740,6 +753,28 @@ pub(crate) async fn run_shell_child(
                 return child_run_output(failure_result(&request, &msg), completion_data, None);
             }
         }
+        native_route_receipt = native_route_live::stamp_receipt_for_selection(
+            &definition,
+            &ctx,
+            &native_route_live::synthetic_catalog_from_available_models(&ctx.available_models),
+            effective_model_id.0.as_ref(),
+            Some(request.id.as_str()),
+            Some(ResumePin {
+                source_catalog_id: resume_model_id.to_string(),
+                source_receipt_digest: native_route_live::resume_source_receipt_digest(
+                    load_subagent_meta(
+                        &source.subagent_id,
+                        &ctx.parent_session_id,
+                        &ctx.parent_cwd,
+                    )
+                    .as_ref(),
+                ),
+                // Live catalog `route_key` is the catalog id, not the wire slug
+                // stored on `CatalogIdentity.route`.
+                source_route_key: Some(resume_model_id.to_string()),
+            }),
+            native_route_now_ms(),
+        );
     }
     // A resident parent keeps its immutable sampling config across catalog
     // refreshes. A new child must instead honor the fresh prepared menu, or a
@@ -770,7 +805,14 @@ pub(crate) async fn run_shell_child(
                 requested_model_matches_effective(model)
             }
             xai_grok_agent::config::ModelOverride::Inherit => false,
-        };
+        }
+        || native_route_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.selection_mode != "inherit")
+        || definition
+            .models
+            .iter()
+            .any(|model| requested_model_matches_effective(model));
     let is_resume = resume_source.is_some();
     let has_committed_resume_model = resume_source
         .as_ref()
@@ -865,11 +907,22 @@ pub(crate) async fn run_shell_child(
             raw,
         ) {
             effective_sampling_config.reasoning_effort = Some(effort);
+        } else if has_explicit_reasoning_effort {
+            let msg = format!(
+                "Cannot spawn subagent '{}' with model '{}': reasoning_effort '{}' is not offered by that model.",
+                request.subagent_type, prepared_model.model_id.0, raw,
+            );
+            tracing::warn!(
+                value = raw,
+                model_id = %prepared_model.model_id.0,
+                "subagent reasoning_effort rejected because the selected model does not offer it"
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
         } else {
             tracing::warn!(
                 value = raw,
                 model_id = %prepared_model.model_id.0,
-                "subagent reasoning_effort is invalid or unavailable for model; ignoring override"
+                "subagent reasoning_effort is invalid or unavailable for model; ignoring inherited default"
             );
         }
     }
@@ -965,6 +1018,7 @@ pub(crate) async fn run_shell_child(
         effective_model_route: Some(prepared_model.catalog_identity.route.clone()),
         effective_model_agent_type: (!prepared_model.agent_type.is_empty())
             .then(|| prepared_model.agent_type.clone()),
+        native_route_receipt: native_route_receipt.clone(),
     };
     write_subagent_meta(&subagent_meta_dir, &subagent_meta);
     if let (Some(bucket_url), Some(upload_method)) = (&ctx.gcs_bucket_url, &ctx.gcs_upload_method) {
@@ -1024,6 +1078,12 @@ pub(crate) async fn run_shell_child(
             model: Some(effective_model_id.0.to_string()),
             resumed_from: request.resume_from.clone(),
             workflow_run_id: request.owner.workflow_run_id().map(str::to_string),
+            route_receipt_digest: native_route_receipt
+                .as_ref()
+                .map(|receipt| receipt.route_digest.clone()),
+            selected_catalog_id: native_route_receipt
+                .as_ref()
+                .map(|receipt| receipt.selected_catalog_id.clone()),
         },
         ctx.parent_cmd_tx.as_ref(),
     );
@@ -1513,6 +1573,8 @@ pub(crate) async fn run_shell_child(
         false,
         false,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        crate::session::SessionPublicationGate::published(),
+        crate::agent::folder_trust::project_scope_allowed(&ctx.parent_cwd),
         definition,
         subagent_session_default_agent_profile,
         if inherit_skills {

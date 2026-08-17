@@ -256,11 +256,11 @@ pub(crate) fn build_refresher(
     diagnostic_uploader: Option<DiagnosticUploader>,
 ) -> Arc<dyn TokenRefresher> {
     match auth_provider_command {
-        Some(cmd) => {
+        Some(cmd) if super::has_nonblank_auth_provider_command(Some(&cmd)) => {
             let runner: Arc<dyn ExternalCommandRunner> = auth_manager;
             Arc::new(ExternalBinaryRefresher::new(runner, cmd))
         }
-        None => {
+        Some(_) | None => {
             let snapshot: Arc<dyn AuthSnapshot> = auth_manager;
             let refresher = OidcRefresher::new(snapshot);
             match diagnostic_uploader {
@@ -276,6 +276,21 @@ mod tests {
     use super::*;
     use crate::auth::{AuthMode, GrokAuth, GrokComConfig};
     use chrono::{Duration, Utc};
+
+    #[tokio::test]
+    async fn whitespace_external_command_uses_oidc_refresher() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(crate::auth::AuthManager::new(
+            dir.path(),
+            GrokComConfig::default(),
+        ));
+        let refresher = build_refresher(manager, Some(" \t\n".to_owned()), None);
+
+        assert!(matches!(
+            refresher.refresh(RefreshReason::PreRequest).await,
+            RefreshOutcome::TransientFailure { .. }
+        ));
+    }
 
     #[test]
     fn tried_disk_relation_truth_table_is_exhaustive() {

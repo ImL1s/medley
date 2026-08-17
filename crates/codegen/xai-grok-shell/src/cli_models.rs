@@ -31,10 +31,23 @@ impl AuthStatus {
     /// [`crate::agent::auth_method::should_advertise_xai_api_key`] so
     /// `disable_api_key_auth` is honored.
     pub fn resolve(agent_config: &AgentConfig) -> Self {
+        #[cfg(test)]
+        let auth_manager = TEST_XAI_AUTH_HOME.with(|override_home| {
+            override_home
+                .borrow()
+                .as_deref()
+                .map(|home| {
+                    crate::auth::AuthManager::new(home, agent_config.grok_com_config.clone())
+                        .with_proxy_base_url(&agent_config.endpoints.proxy_url())
+                })
+                .unwrap_or_else(|| agent_config.create_auth_manager())
+        });
+        #[cfg(not(test))]
+        let auth_manager = agent_config.create_auth_manager();
         if crate::agent::auth_method::has_xai_api_key_env() {
             return Self::ApiKey;
         }
-        if agent_config.create_auth_manager().current().is_some() {
+        if auth_manager.current().is_some() {
             let origin = &agent_config.grok_com_config.grok_ws_origin;
             let host = origin
                 .strip_prefix("https://")
@@ -66,6 +79,35 @@ impl AuthStatus {
             (_, true) => Self::OpenAiCodex,
             (true, false) | (false, false) => Self::NotAuthenticated,
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_XAI_AUTH_HOME: std::cell::RefCell<Option<std::path::PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+struct TestXaiAuthHomeGuard(Option<std::path::PathBuf>);
+
+#[cfg(test)]
+impl TestXaiAuthHomeGuard {
+    fn install(home: &std::path::Path) -> Self {
+        let prior =
+            TEST_XAI_AUTH_HOME.with(|override_home| override_home.replace(Some(home.to_owned())));
+        Self(prior)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestXaiAuthHomeGuard {
+    fn drop(&mut self) {
+        let prior = self.0.take();
+        TEST_XAI_AUTH_HOME.with(|override_home| {
+            override_home.replace(prior);
+        });
     }
 }
 
@@ -113,28 +155,41 @@ mod tests {
     use serial_test::serial;
     use xai_grok_test_support::EnvGuard;
 
-    /// Isolate process-global auth sources that `AuthStatus::resolve` consults.
+    struct IsolatedAuthSourceGuards {
+        _env: [EnvGuard; 6],
+        _xai_home: TestXaiAuthHomeGuard,
+        _codex_path: crate::auth::openai_codex::TestManagerAuthPathGuard,
+    }
+
+    /// Isolate the auth sources that `AuthStatus::resolve` consults, without
+    /// changing `GROK_AUTH_PATH` process-wide.
     ///
-    /// xAI `AuthManager::new` still honors `GROK_AUTH_PATH` because `grok_home()`
-    /// is OnceLock-cached. Codex constructors in this crate's test cfg ignore
-    /// that env and take the thread-local pin instead (#343).
+    /// Three seams, none of them the same one: `TestXaiAuthHomeGuard` for the
+    /// xAI home (`grok_home()` is OnceLock-cached, so the env cannot move it),
+    /// `TestManagerAuthPathGuard` for `openai_codex::manager`, and the
+    /// `CodexAuthPathGuard` pin for Codex constructors that resolve the
+    /// auth.json path themselves (#343).
     fn isolate_auth_sources() -> (
         tempfile::TempDir,
         crate::auth::openai_codex::CodexAuthPathGuard,
-        [EnvGuard; 7],
+        IsolatedAuthSourceGuards,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("no-auth.json");
         let pin = crate::auth::openai_codex::CodexAuthPathGuard::pin(auth_path.clone());
-        let guards = [
+        let env = [
             EnvGuard::unset(XAI_API_KEY_ENV_VAR),
             EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR),
             EnvGuard::unset("GROK_AUTH"),
-            EnvGuard::set("GROK_AUTH_PATH", auth_path.to_str().unwrap()),
             EnvGuard::unset("GROK_DEPLOYMENT_KEY"),
             EnvGuard::unset("GROK_WS_ORIGIN"),
             EnvGuard::unset("GROK_DISABLE_API_KEY_AUTH"),
         ];
+        let guards = IsolatedAuthSourceGuards {
+            _env: env,
+            _xai_home: TestXaiAuthHomeGuard::install(dir.path()),
+            _codex_path: crate::auth::openai_codex::TestManagerAuthPathGuard::install(&auth_path),
+        };
         (dir, pin, guards)
     }
 

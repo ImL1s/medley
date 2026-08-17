@@ -1177,6 +1177,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
                 session_id: hydrate_sid.clone(),
                 model_id: switch.model_id,
                 effort: switch.effort,
+                session_only: switch.session_only,
                 request_id,
                 prev_model_id: switch.prev_model_id,
             });

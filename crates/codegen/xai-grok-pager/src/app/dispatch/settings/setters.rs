@@ -1633,7 +1633,7 @@ pub(in crate::app::dispatch) fn set_default_model_inner(
             return false;
         }
         // Update the agent's session model state's current pointer so
-        // subsequent reads (e.g. `current_model_name` via the pager
+        // subsequent reads (e.g. `current_model_id` via the pager
         // snapshot) reflect the new selection without waiting for the
         // ACP roundtrip.
         //
@@ -1712,6 +1712,8 @@ pub(in crate::app::dispatch) fn set_default_model(
             id = ?new_id,
             "Action::SetDefaultModel dispatched with model id not in catalog —              validator skew; no-op",
         );
+        // Single source of truth for the wording; `settings_modal::input`
+        // shows the same toast on the picker path.
         app.show_toast(crate::slash::commands::model::CATALOG_CHANGED_TOAST);
         return vec![];
     }
@@ -1783,6 +1785,7 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
     };
 
     if !available_has_new {
+        app.show_toast("The model catalog changed; choose an available model and try again");
         return vec![];
     }
     if prev_id.as_ref() == Some(&new_id) {
@@ -1851,6 +1854,7 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
             session_id: sid,
             model_id: new_id,
             effort: None,
+            session_only: false,
             request_id: request_id.expect("live session opened a model-switch transaction"),
             prev_model_id: prev_id.clone(),
         });
@@ -1868,7 +1872,7 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
         // persisted a preference for a model that had not changed.
         agent
             .session
-            .stash_deferred_model_switch(new_id, None, prev_id);
+            .stash_deferred_model_switch(new_id, None, prev_id, false);
     }
     effects
 }
@@ -1965,7 +1969,7 @@ pub(in crate::app::dispatch) fn set_fork_secondary_model(
         );
         return vec![];
     };
-    let (new_display, available_has_new) = {
+    let (new_display, not_ready_reason) = {
         let Some(agent) = app.agents.get(&aid) else {
             tracing::error!(
                 target: "settings",
@@ -1975,17 +1979,19 @@ pub(in crate::app::dispatch) fn set_fork_secondary_model(
             return vec![];
         };
         let display = agent.session.models.display_name_for(&new_id);
-        let has = agent.session.models.available.contains_key(&new_id);
-        (display, has)
+        let reason =
+            crate::slash::commands::model::model_not_ready_reason(&agent.session.models, &new_id);
+        (display, reason)
     };
-    if !available_has_new {
+    if let Some(reason) = not_ready_reason {
         tracing::error!(
             target: "settings",
             key = "fork_secondary_model",
             id = ?new_id,
-            "Action::SetForkSecondaryModel dispatched with id not in catalog — \
-             validator skew; no-op",
+            reason = %reason,
+            "Action::SetForkSecondaryModel dispatched with unavailable model — no-op",
         );
+        app.show_toast(&reason);
         return vec![];
     }
     // Mirror, idempotency, persist, and rollback all use the model ID

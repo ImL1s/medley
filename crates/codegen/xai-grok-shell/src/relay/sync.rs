@@ -10,6 +10,7 @@
 
 use crate::agent::relay::{RelayConfig, spawn_relay_connection};
 use crate::relay::types::AgentType;
+use crate::session::SessionPublicationGate;
 use crate::tprintln;
 use agent_client_protocol as acp;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,108 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+struct RelayPublicationWaitTestHook {
+    entered_tx: tokio::sync::oneshot::Sender<()>,
+    exited_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+struct RelayPublicationWaitExitNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+
+#[cfg(test)]
+impl Drop for RelayPublicationWaitExitNotifier {
+    fn drop(&mut self) {
+        if let Some(exited_tx) = self.0.take() {
+            let _ = exited_tx.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+fn relay_publication_wait_test_hooks()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, RelayPublicationWaitTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, RelayPublicationWaitTestHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+struct RelayPublicationWaitTestController {
+    session_id: String,
+    entered_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    exited_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl RelayPublicationWaitTestController {
+    async fn wait_until_entered(&mut self) {
+        self.entered_rx
+            .take()
+            .expect("relay publication-wait test hook may be entered only once")
+            .await
+            .expect("relay task exited before reaching the publication wait");
+    }
+
+    async fn wait_until_exited(&mut self) {
+        self.exited_rx
+            .take()
+            .expect("relay publication-wait task exit may be awaited only once")
+            .await
+            .expect("relay publication-wait exit notifier was dropped without firing");
+    }
+}
+
+#[cfg(test)]
+impl Drop for RelayPublicationWaitTestController {
+    fn drop(&mut self) {
+        relay_publication_wait_test_hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+#[cfg(test)]
+fn install_relay_publication_wait_test_hook(
+    session_id: &str,
+) -> RelayPublicationWaitTestController {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+    let previous = relay_publication_wait_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            session_id.to_owned(),
+            RelayPublicationWaitTestHook {
+                entered_tx,
+                exited_tx,
+            },
+        );
+    assert!(
+        previous.is_none(),
+        "only one relay publication-wait hook may be installed per session id"
+    );
+    RelayPublicationWaitTestController {
+        session_id: session_id.to_owned(),
+        entered_rx: Some(entered_rx),
+        exited_rx: Some(exited_rx),
+    }
+}
+
+#[cfg(test)]
+fn enter_relay_publication_wait_test_hook(
+    session_id: &str,
+) -> Option<RelayPublicationWaitExitNotifier> {
+    let hook = relay_publication_wait_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id)?;
+    let _ = hook.entered_tx.send(());
+    Some(RelayPublicationWaitExitNotifier(Some(hook.exited_tx)))
+}
 
 /// Maximum pending notifications before dropping oldest.
 const MAX_PENDING: usize = 256;
@@ -237,6 +340,46 @@ impl RelaySync {
         session_dir: Option<PathBuf>,
         status_cb: Option<StatusCallback>,
     ) -> RelaySync {
+        Self::new_gated(
+            session_id,
+            config,
+            agent_type,
+            session_dir,
+            status_cb,
+            SessionPublicationGate::published(),
+        )
+    }
+
+    /// Build a relay owned by a provisional `/new` session.  The task exists
+    /// locally so persistence may queue early initialization updates, but it
+    /// cannot connect, handshake, upsert, or expose a share URL until the
+    /// caller publishes the gate after its final auth seal.
+    pub(crate) fn new_deferred(
+        session_id: String,
+        config: RelayConfig,
+        agent_type: AgentType,
+        session_dir: Option<PathBuf>,
+        status_cb: Option<StatusCallback>,
+        publication_gate: SessionPublicationGate,
+    ) -> RelaySync {
+        Self::new_gated(
+            session_id,
+            config,
+            agent_type,
+            session_dir,
+            status_cb,
+            publication_gate,
+        )
+    }
+
+    fn new_gated(
+        session_id: String,
+        config: RelayConfig,
+        agent_type: AgentType,
+        session_dir: Option<PathBuf>,
+        status_cb: Option<StatusCallback>,
+        publication_gate: SessionPublicationGate,
+    ) -> RelaySync {
         let (tx, rx) = mpsc::unbounded_channel();
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
         let cancel = CancellationToken::new();
@@ -246,19 +389,33 @@ impl RelaySync {
         let cancel_task = cancel.clone();
         let pending_count_task = pending_count.clone();
 
-        tokio::spawn(relay_sync_task(
-            RelaySyncTaskConfig {
-                session_id: session_id_task,
-                config,
-                agent_type,
-                session_dir,
-                status_cb,
-            },
-            rx,
-            state_tx,
-            cancel_task,
-            pending_count_task,
-        ));
+        tokio::spawn(async move {
+            #[cfg(test)]
+            let _publication_wait_exit = enter_relay_publication_wait_test_hook(&session_id_task);
+            let cancel_before_publication = cancel_task.clone();
+            let published = tokio::select! {
+                biased;
+                _ = cancel_before_publication.cancelled() => false,
+                published = publication_gate.wait_until_published() => published,
+            };
+            if !published {
+                return;
+            }
+            relay_sync_task(
+                RelaySyncTaskConfig {
+                    session_id: session_id_task,
+                    config,
+                    agent_type,
+                    session_dir,
+                    status_cb,
+                },
+                rx,
+                state_tx,
+                cancel_task,
+                pending_count_task,
+            )
+            .await;
+        });
 
         RelaySync {
             tx,
@@ -640,6 +797,116 @@ fn handle_relay_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_probe() -> (tokio::net::TcpListener, std::net::TcpListener) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind relay probe");
+        probe
+            .set_nonblocking(true)
+            .expect("make relay probe nonblocking");
+        let async_listener = tokio::net::TcpListener::from_std(
+            probe.try_clone().expect("clone relay probe listener"),
+        )
+        .expect("register relay probe with tokio");
+        (async_listener, probe)
+    }
+
+    fn assert_listener_idle(listener: &std::net::TcpListener) {
+        match listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("relay probe failed unexpectedly: {error}"),
+            Ok(_) => panic!("a provisional relay opened a socket"),
+        }
+    }
+
+    fn test_relay_config(addr: std::net::SocketAddr) -> RelayConfig {
+        let auth = crate::auth::GrokAuth {
+            auth_mode: crate::auth::AuthMode::Oidc,
+            oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_owned()),
+            ..crate::auth::GrokAuth::test_default()
+        };
+        let cfg = crate::auth::GrokComConfig {
+            grok_ws_url: format!("ws://{addr}"),
+            grok_ws_origin: format!("http://{addr}"),
+            ..Default::default()
+        };
+        RelayConfig::for_session(&auth, &cfg, None, None)
+            .expect("x.ai OIDC fixture must be relay-eligible")
+    }
+
+    #[tokio::test]
+    async fn deferred_relay_does_not_connect_before_publication() {
+        const SESSION_ID: &str = "pending-relay";
+        let (listener, probe) = relay_probe();
+        let mut wait_hook = install_relay_publication_wait_test_hook(SESSION_ID);
+        let gate = SessionPublicationGate::pending();
+        let sync = RelaySync::new_deferred(
+            SESSION_ID.to_owned(),
+            test_relay_config(listener.local_addr().expect("probe address")),
+            AgentType::Tui,
+            None,
+            None,
+            gate.clone(),
+        );
+
+        wait_hook.wait_until_entered().await;
+        assert_listener_idle(&probe);
+        assert_eq!(sync.connection_state(), ConnectionState::Disconnected);
+
+        gate.publish();
+        let _connection =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                .await
+                .expect("published relay must attempt a connection")
+                .expect("accept published relay connection");
+        assert_eq!(sync.connection_state(), ConnectionState::Connecting);
+    }
+
+    #[tokio::test]
+    async fn aborted_deferred_relay_exits_without_connecting() {
+        const SESSION_ID: &str = "aborted-relay";
+        let (listener, probe) = relay_probe();
+        let mut wait_hook = install_relay_publication_wait_test_hook(SESSION_ID);
+        let gate = SessionPublicationGate::pending();
+        let sync = RelaySync::new_deferred(
+            SESSION_ID.to_owned(),
+            test_relay_config(listener.local_addr().expect("probe address")),
+            AgentType::Tui,
+            None,
+            None,
+            gate.clone(),
+        );
+
+        wait_hook.wait_until_entered().await;
+        gate.abort();
+        wait_hook.wait_until_exited().await;
+
+        assert_listener_idle(&probe);
+        assert_eq!(sync.connection_state(), ConnectionState::Disconnected);
+        gate.publish();
+        assert_listener_idle(&probe);
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_relay_terminates_publication_wait() {
+        const SESSION_ID: &str = "dropped-pending-relay";
+        let (listener, probe) = relay_probe();
+        let mut wait_hook = install_relay_publication_wait_test_hook(SESSION_ID);
+        let gate = SessionPublicationGate::pending();
+        let sync = RelaySync::new_deferred(
+            SESSION_ID.to_owned(),
+            test_relay_config(listener.local_addr().expect("probe address")),
+            AgentType::Tui,
+            None,
+            None,
+            gate,
+        );
+
+        wait_hook.wait_until_entered().await;
+        assert_listener_idle(&probe);
+        drop(sync);
+        wait_hook.wait_until_exited().await;
+        assert_listener_idle(&probe);
+    }
 
     // ===== Connection State Machine Tests =====
 

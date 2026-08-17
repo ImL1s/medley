@@ -189,7 +189,7 @@ use crate::session::swap_policy::{
     record_swap_decision, record_toolset_swap,
 };
 use crate::session::tool_config::resolve_session_toolset;
-use crate::session::{WorkspaceSession, WorkspaceShared};
+use crate::session::{WorkspaceSession, WorkspaceSessionRegistry, WorkspaceShared};
 use crate::telemetry::dc_log;
 use crate::workspace_ops::{
     GetFileEntry, GetFileResult, GetFilesRes, PutFileEntry, PutFileResult, PutFilesRes,
@@ -450,6 +450,7 @@ impl WorkspaceLocalSessionReservation {
     ) -> WorkspaceResult<()> {
         self.promote_with_external_toolset_after(cwd, hunk_tracker, toolset, capability, || Ok(()))
     }
+
     /// Run `before_publish` (the publication finalizer) before taking the
     /// session-map write lock, then promote atomically on success.
     ///
@@ -458,11 +459,52 @@ impl WorkspaceLocalSessionReservation {
     /// session: visibility happens only after it returns `Ok` and `promote`
     /// installs the entry.
     pub(crate) fn promote_with_external_toolset_after(
+        self,
+        cwd: std::path::PathBuf,
+        hunk_tracker: HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+        capability: CapabilityMode,
+        before_publish: impl FnOnce() -> WorkspaceResult<()>,
+    ) -> WorkspaceResult<()> {
+        self.promote_with_external_toolset_after_lock_hook(
+            cwd,
+            hunk_tracker,
+            toolset,
+            capability,
+            || {},
+            before_publish,
+        )
+    }
+
+    /// [`Self::promote_with_external_toolset_after`] with a test-only hook
+    /// fired at the immediate pre-lock boundary, so a test holding the
+    /// session-map write lock can observe the promoter blocked on it.
+    #[cfg(test)]
+    pub(crate) fn promote_with_external_toolset_after_lock_attempt_for_test(
+        self,
+        cwd: std::path::PathBuf,
+        hunk_tracker: HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+        capability: CapabilityMode,
+        before_lock: impl FnOnce(),
+    ) -> WorkspaceResult<()> {
+        self.promote_with_external_toolset_after_lock_hook(
+            cwd,
+            hunk_tracker,
+            toolset,
+            capability,
+            before_lock,
+            || Ok(()),
+        )
+    }
+
+    fn promote_with_external_toolset_after_lock_hook(
         mut self,
         cwd: std::path::PathBuf,
         hunk_tracker: HunkTrackerHandle,
         toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
         capability: CapabilityMode,
+        before_lock: impl FnOnce(),
         before_publish: impl FnOnce() -> WorkspaceResult<()>,
     ) -> WorkspaceResult<()> {
         let shared = self
@@ -495,6 +537,7 @@ impl WorkspaceLocalSessionReservation {
         if let Err(error) = before_publish() {
             return Err(error);
         }
+        before_lock();
         let mut sessions = shared.sessions.write();
         if shared.activity_tracker.is_draining() {
             sessions.cancel_reservation(&self.session_id, &self.claim);
@@ -642,7 +685,6 @@ impl WorkspaceHandle {
         tool_defs_enabled: bool,
         identity: crate::upload::environment::WorkspaceIdentity,
     ) -> WorkspaceResult<Self> {
-        let sessions = crate::session::WorkspaceSessionRegistry::new();
         let local_registry = xai_computer_hub_sdk::LocalRegistry::new();
         let capacity = if config.event_buffer_capacity == 0 {
             DEFAULT_EVENT_BUFFER_CAPACITY
@@ -736,7 +778,7 @@ impl WorkspaceHandle {
             require_explicit_toolset: config.require_explicit_toolset,
             confine_fs_to_workspace_root: config.confine_fs_to_workspace_root,
             root_cwd: config.root_cwd.clone(),
-            sessions: parking_lot::RwLock::new(sessions),
+            sessions: parking_lot::RwLock::new(WorkspaceSessionRegistry::new()),
             session_factory: config.session_factory,
             mcp_tools_snapshot: arc_swap::ArcSwap::new(Arc::new(vec![])),
             events,

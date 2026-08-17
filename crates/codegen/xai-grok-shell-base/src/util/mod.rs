@@ -1,3 +1,4 @@
+pub mod anchored_directory;
 pub mod changelog;
 pub mod event_id;
 pub mod grok_home;

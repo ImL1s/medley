@@ -697,6 +697,11 @@ pub struct DeferredModelSwitch {
     /// Displayed model at stash time — the rollback target
     /// (`Effect::SwitchModel.prev_model_id`) if the switch fails.
     pub prev_model_id: Option<acp::ModelId>,
+    /// Distinguishes "no predecessor captured yet" from "captured that no
+    /// model was displayed". The latter must survive rapid pre-session picks.
+    pub prev_model_id_captured: bool,
+    /// Session-only switch: does not persist to the global preferred model
+    pub session_only: bool,
 }
 /// Per-agent business logic (ACP session, models, state).
 ///
@@ -898,56 +903,34 @@ impl AgentSession {
     pub(crate) fn set_auto_mode_for_test(&mut self, on: bool) {
         self.auto_mode = on;
     }
-    /// Stash a model pick made before the session id exists, keeping the
-    /// rollback target of the *first* pick in a rapid sequence.
-    ///
-    /// Only `prev_model_id` coalesces. `model_id` and `effort` are last-wins,
-    /// so a staged effort from the dashboard is dropped when the user then
-    /// picks the same model with no effort. Pre-existing, but the name reads
-    /// like the whole struct is preserved.
-    ///
-    /// The observable effect is on the **success** path, not the failure path.
-    /// A failed switch restores the display from `ModelSwitchRollback`, which
-    /// `begin_deferred_model_switch` captures with `get_or_insert_with` and so
-    /// already holds the first pick's predecessor. What reads `prev_model_id`
-    /// is `handle_switch_model_complete`'s `model_changed`, in preference to
-    /// that snapshot: without coalescing, A→B→A through the settings modal
-    /// reported "Switched to A" and emitted `PersistPreferredModel` for a model
-    /// that never changed.
-    ///
-    /// The `.or(prev_model_id)` tail is right for two of the three ways a prior
-    /// can hold `None` — a CLI seed (`app_view.rs`) and the dashboard's
-    /// effort-only push (`dashboard.rs`), neither of which ever captured a
-    /// target, so the displayed model is the honest one. It is **wrong** for
-    /// the third: a first pre-session pick made while nothing is displayed
-    /// captures `None` legitimately, and the next pick then adopts the model
-    /// the first pick installed. That is #143, it is still live, and this
-    /// two-state field cannot tell "never captured" from "captured nothing".
-    /// Reachable without any CLI seed: `acp/model_state.rs` sets `current` to
-    /// `None` whenever the shell's reported model is absent from
-    /// `available_models`, leaving the catalog populated.
+    /// Stash a pre-session model pick while preserving the rollback target of
+    /// the first pick in a rapid sequence. `model_id` and `effort` remain
+    /// last-wins.
     ///
     /// Both pre-session *pick* entry points go through here
     /// (`Action::SwitchModel`'s router arm and `set_default_model_confirmed`).
-    /// They used to disagree: only the router coalesced, so the settings path
-    /// overwrote the target with the model its own previous pick had just
-    /// installed. `dashboard.rs` is a third pre-session writer and deliberately
-    /// does not — it overwrites the stash outright to beat a CLI `-m`.
+    /// The captured flag preserves a legitimate `None` rollback target across
+    /// rapid picks. Direct seeds (CLI/dashboard) leave it false so the first
+    /// user pick can capture the model currently on display.
     pub(crate) fn stash_deferred_model_switch(
         &mut self,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
         prev_model_id: Option<acp::ModelId>,
+        session_only: bool,
     ) {
-        let rollback_prev = self
-            .deferred_model_switch
-            .take()
-            .and_then(|prior| prior.prev_model_id)
-            .or(prev_model_id);
+        let prior = self.deferred_model_switch.take();
+        let rollback_prev = prior
+            .as_ref()
+            .filter(|prior| prior.prev_model_id_captured)
+            .map(|prior| prior.prev_model_id.clone())
+            .unwrap_or(prev_model_id);
         self.deferred_model_switch = Some(DeferredModelSwitch {
             model_id,
             effort,
             prev_model_id: rollback_prev,
+            prev_model_id_captured: true,
+            session_only,
         });
     }
     /// Process an ACP session update. Returns true if scrollback was modified.

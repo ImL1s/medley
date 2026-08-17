@@ -261,6 +261,8 @@ pub(crate) fn take_deferred_model_switch(
         model_id,
         mut effort,
         prev_model_id,
+        prev_model_id_captured,
+        session_only,
     }) = stashed
     {
         let effort_error = match cli_effort_token {
@@ -280,6 +282,8 @@ pub(crate) fn take_deferred_model_switch(
                 model_id,
                 effort,
                 prev_model_id,
+                prev_model_id_captured,
+                session_only,
             }),
             effort_error,
         };
@@ -306,6 +310,8 @@ pub(crate) fn take_deferred_model_switch(
                 model_id: current,
                 effort: Some(effort),
                 prev_model_id: None,
+                prev_model_id_captured: false,
+                session_only: false,
             }),
             effort_error: None,
         },
@@ -1534,6 +1540,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 session_id: session_id_clone.clone(),
                 model_id: switch.model_id,
                 effort: switch.effort,
+                session_only: switch.session_only,
                 request_id,
                 prev_model_id: switch.prev_model_id,
             });
@@ -1739,6 +1746,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
                 session_id: session_id_clone.clone(),
                 model_id: switch.model_id,
                 effort: switch.effort,
+                session_only: switch.session_only,
                 request_id,
                 prev_model_id: switch.prev_model_id,
             });
@@ -1973,6 +1981,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
     request_id: u64,
     result: Result<(), SwitchModelError>,
     prev_model_id: Option<acp::ModelId>,
+    session_only: bool,
 ) -> Vec<Effect> {
     let Some(transaction) = app
         .model_switch_transaction
@@ -2074,7 +2083,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     };
                     agent.show_toast(&toast);
                 }
-                if unchanged || !persist_preferred_model {
+                if unchanged || !persist_preferred_model || session_only {
                     vec![]
                 } else {
                     vec![Effect::PersistPreferredModel {
@@ -2190,6 +2199,8 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
                     model_id,
                     effort,
                     prev_model_id: None,
+                    prev_model_id_captured: false,
+                    session_only: false,
                 });
             }
         }
@@ -2253,6 +2264,8 @@ pub(in crate::app::dispatch) fn dispatch_auth_class_switch_answered(
             effort,
             // Rollback target is the model on display when the switch was stashed.
             prev_model_id: agent.session.models.current.clone(),
+            prev_model_id_captured: true,
+            session_only: false,
         });
         return vec![];
     };
@@ -2270,6 +2283,7 @@ pub(in crate::app::dispatch) fn dispatch_auth_class_switch_answered(
         session_id,
         model_id,
         effort,
+        session_only: false,
         request_id,
         prev_model_id: None,
     }]
