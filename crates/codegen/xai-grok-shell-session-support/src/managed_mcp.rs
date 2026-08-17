@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Agent-level cache for managed MCP gateway tool catalogs.
-
 pub enum ManagedMcpCache {
     NotFetched,
     Fetching,
