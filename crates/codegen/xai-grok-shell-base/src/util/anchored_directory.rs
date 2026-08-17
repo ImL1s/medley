@@ -679,17 +679,15 @@ mod platform {
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
-    use windows::Win32::Security::Authorization::{
-        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
-    };
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows::Win32::Security::GetTokenInformation;
     use windows::Win32::Security::{
         ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-        EqualSid, GetLengthSid, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
-        SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        GetLengthSid, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+        SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     };
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,

@@ -514,9 +514,7 @@ fn with_windows_owner_only_acl(
     use windows::Win32::Security::Authorization::{
         EXPLICIT_ACCESS_W, SET_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
-    use windows::Win32::Security::{
-        ACE_FLAGS, ACL, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    };
+    use windows::Win32::Security::{ACL, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
