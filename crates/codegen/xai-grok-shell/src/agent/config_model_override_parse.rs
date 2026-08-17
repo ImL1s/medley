@@ -353,6 +353,21 @@ fn parse_model_override_table(
         }
     }
 
+    if let Some(ref env_keys) = entry.env_key {
+        let (_, rejected) = crate::agent::config::EnvKeys::normalize(env_keys.names());
+        for rejected_key in rejected {
+            warnings.push(ConfigWarning::model(
+                model_key,
+                Some("env_key"),
+                ConfigWarningKind::InvalidValue,
+                format!(
+                    "invalid environment variable name '{}': {}",
+                    rejected_key.name, rejected_key.reason
+                ),
+            ));
+        }
+    }
+
     (entry, warnings)
 }
 
