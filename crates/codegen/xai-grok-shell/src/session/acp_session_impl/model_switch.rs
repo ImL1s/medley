@@ -685,6 +685,9 @@ impl SessionActor {
         reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
         summary_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
     ) -> Result<(), &'static str> {
+        if self.notifications.persistence_is_noop {
+            return Ok(());
+        }
         let (respond_to, acknowledgement) = tokio::sync::oneshot::channel();
         self.notifications
             .persistence_tx
