@@ -1724,6 +1724,8 @@ jobs:
           run_nonzero -p xai-grok-workspace --lib \
             clone_drop_does_not_cancel_sibling_publication -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
+            concurrent_uncommitted_clone_drops_remove_private_stage -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
             session::publication_parent -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             dynamic_enum_choices_disables_by_model_id_not_display_name -- --nocapture

@@ -112,6 +112,15 @@ impl std::error::Error for FreshPublicationFinalizeError {
     }
 }
 
+/// Shared stage owner. `Drop` runs exactly once when the last
+/// [`FreshPublication`] clone is gone, so concurrent uncommitted drops cannot
+/// all observe `strong_count > 1` and skip cleanup.
+struct FreshPublicationShared {
+    stage_container_anchor: Mutex<Option<AnchoredDirectory>>,
+    stage_session_anchor: Mutex<Option<AnchoredDirectory>>,
+    committed: AtomicBool,
+}
+
 /// Physical publication plan for one fresh session.
 #[derive(Clone)]
 pub struct FreshPublication {
@@ -120,11 +129,9 @@ pub struct FreshPublication {
     stage_session: PathBuf,
     published_parent: PathBuf,
     published_session: PathBuf,
-    stage_container_anchor: Arc<Mutex<Option<AnchoredDirectory>>>,
-    stage_session_anchor: Arc<Mutex<Option<AnchoredDirectory>>>,
+    shared: Arc<FreshPublicationShared>,
     published_parent_name: OsString,
     session_name: OsString,
-    committed: Arc<AtomicBool>,
     publish_attempts: Arc<AtomicUsize>,
 }
 
@@ -168,11 +175,13 @@ impl FreshPublication {
             stage_session: stage_session.clone(),
             published_parent: published_parent.clone(),
             published_session: published_parent.join(&session_name),
-            stage_container_anchor: Arc::new(Mutex::new(Some(stage_container_anchor))),
-            stage_session_anchor: Arc::new(Mutex::new(Some(stage_session_anchor))),
+            shared: Arc::new(FreshPublicationShared {
+                stage_container_anchor: Mutex::new(Some(stage_container_anchor)),
+                stage_session_anchor: Mutex::new(Some(stage_session_anchor)),
+                committed: AtomicBool::new(false),
+            }),
             published_parent_name: published_parent_name.to_owned(),
             session_name,
-            committed: Arc::new(AtomicBool::new(false)),
             publish_attempts: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -186,7 +195,7 @@ impl FreshPublication {
     }
 
     pub fn is_committed(&self) -> bool {
-        self.committed.load(Ordering::Acquire)
+        self.shared.committed.load(Ordering::Acquire)
     }
 
     /// Number of physical no-replace publication attempts performed.
@@ -242,6 +251,7 @@ impl FreshPublication {
         }
 
         let stage_session_anchor = self
+            .shared
             .stage_session_anchor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -260,7 +270,7 @@ impl FreshPublication {
             .remove_marker(OsStr::new(UNPUBLISHED_SESSION_MARKER))
             .and_then(|()| stage_session_anchor.sync())
         {
-            restore_stage(&self.stage_session_anchor, stage_session_anchor);
+            restore_stage(&self.shared.stage_session_anchor, stage_session_anchor);
             return Err(FreshPublicationFinalizeError::not_committed(
                 FinalizeStage::PreCommit,
                 FinalizeOperation::RemoveMarker,
@@ -269,7 +279,7 @@ impl FreshPublication {
         }
 
         if let Err(error) = AnchoredDirectory::open_root(&self.root_dir) {
-            restore_stage(&self.stage_session_anchor, stage_session_anchor);
+            restore_stage(&self.shared.stage_session_anchor, stage_session_anchor);
             return Err(FreshPublicationFinalizeError::not_committed(
                 FinalizeStage::PreCommit,
                 FinalizeOperation::OpenRoot,
@@ -280,7 +290,7 @@ impl FreshPublication {
             match ensure_publication_parent(&self.root_dir, &self.published_parent_name) {
                 Ok(parent) => parent,
                 Err(error) => {
-                    restore_stage(&self.stage_session_anchor, stage_session_anchor);
+                    restore_stage(&self.shared.stage_session_anchor, stage_session_anchor);
                     return Err(FreshPublicationFinalizeError::not_committed(
                         FinalizeStage::PreCommit,
                         FinalizeOperation::OpenPublishedParent,
@@ -289,7 +299,7 @@ impl FreshPublication {
                 }
             };
         if let Err(error) = publication_parent.revalidate() {
-            restore_stage(&self.stage_session_anchor, stage_session_anchor);
+            restore_stage(&self.shared.stage_session_anchor, stage_session_anchor);
             return Err(FreshPublicationFinalizeError::not_committed(
                 FinalizeStage::PreCommit,
                 FinalizeOperation::OpenPublishedParent,
@@ -351,7 +361,7 @@ impl FreshPublication {
                     }
                 }
                 Ok(false) => {
-                    restore_stage(&self.stage_session_anchor, failure.source);
+                    restore_stage(&self.shared.stage_session_anchor, failure.source);
                     Err(FreshPublicationFinalizeError::not_committed(
                         FinalizeStage::Commit,
                         FinalizeOperation::NoReplaceRename,
@@ -359,7 +369,7 @@ impl FreshPublication {
                     ))
                 }
                 Err(error) => {
-                    restore_stage(&self.stage_session_anchor, failure.source);
+                    restore_stage(&self.shared.stage_session_anchor, failure.source);
                     Err(FreshPublicationFinalizeError::not_committed(
                         FinalizeStage::Commit,
                         FinalizeOperation::ReconcileIdentity,
@@ -368,7 +378,7 @@ impl FreshPublication {
                 }
             },
             Err(_) => {
-                restore_stage(&self.stage_session_anchor, failure.source);
+                restore_stage(&self.shared.stage_session_anchor, failure.source);
                 Err(FreshPublicationFinalizeError::not_committed(
                     FinalizeStage::Commit,
                     FinalizeOperation::NoReplaceRename,
@@ -405,11 +415,12 @@ impl FreshPublication {
     }
 
     fn mark_committed(&self) {
-        self.committed.store(true, Ordering::Release);
+        self.shared.committed.store(true, Ordering::Release);
     }
 
     fn drop_stage_container(&self) {
         if let Some(container) = self
+            .shared
             .stage_container_anchor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -424,22 +435,19 @@ impl FreshPublication {
     }
 }
 
-impl Drop for FreshPublication {
+impl Drop for FreshPublicationShared {
     fn drop(&mut self) {
-        if self.is_committed() {
+        if self.committed.load(Ordering::Acquire) {
             return;
         }
-        // Clones share the stage. Only the last owner may cancel it.
-        if Arc::strong_count(&self.committed) > 1 {
-            return;
-        }
+        // Last Arc owner: elect cleanup without a racy strong_count snapshot.
         self.stage_session_anchor
-            .lock()
+            .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(container) = self
             .stage_container_anchor
-            .lock()
+            .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
             && let Err(error) = container.remove_tree_self()
@@ -569,6 +577,28 @@ mod tests {
             .expect("surviving owner still publishes");
         assert!(publication.is_committed());
         assert!(publication.published_session().join(SUMMARY_FILE).is_file());
+    }
+
+    #[test]
+    fn concurrent_uncommitted_clone_drops_remove_private_stage() {
+        let (_root, publication) = prepare();
+        let stage = publication.stage_session().to_path_buf();
+        let container = stage
+            .parent()
+            .expect("stage lives in a container")
+            .to_path_buf();
+        assert!(stage.is_dir());
+        let a = publication.clone();
+        let b = publication.clone();
+        let first = std::thread::spawn(move || drop(a));
+        let second = std::thread::spawn(move || drop(b));
+        drop(publication);
+        first.join().expect("first clone drop");
+        second.join().expect("second clone drop");
+        assert!(
+            !stage.exists() && !container.exists(),
+            "last shared owner must remove the private stage"
+        );
     }
 
     #[test]
