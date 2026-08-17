@@ -2,11 +2,8 @@
 # #[serial_test::serial]. First-slice bootstrap for issue #319.
 # Remove an entry when the test is annotated. Stale entries fail CI.
 
-crates/codegen/xai-grok-shell/src/agent/config.rs::remote_settings_disarm_requires_prod_proxy_when_keys_embedded
-crates/codegen/xai-grok-shell/src/agent/config.rs::set_env_key_shadows_warm_provider_at_resolve_time
 crates/codegen/xai-grok-shell/src/auth/manager_tests.rs::is_dark_wake_env_override_forces_both_states
 crates/codegen/xai-grok-shell/src/auth/manager_tests.rs::is_dark_wake_false_when_power_listener_not_started
-crates/codegen/xai-grok-shell/src/session/compaction.rs::prefire_lead_percent_defaults_to_10
 crates/codegen/xai-grok-shell/src/util/config/hints.rs::contextual_hints_env_master_forces_all_on
 crates/codegen/xai-grok-shell/src/util/config/hints.rs::contextual_hints_env_master_zero_forces_all_off
 crates/codegen/xai-grok-shell/src/util/config/permissions.rs::effective_auto_for_launch_cli_auto_not_yolo

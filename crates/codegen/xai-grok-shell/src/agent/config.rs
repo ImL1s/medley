@@ -9188,6 +9188,7 @@ reasoning_effort = "low"
     /// A set `env_key` shadows even a warm provider cache at resolve time, so
     /// the static credential wins on the wire and the provider never governs.
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_env_key_shadows_warm_provider_at_resolve_time() {
         use xai_grok_test_support::EnvGuard;
         let var = "GROK_TEST_ENVKEY_SHADOW";
@@ -17649,7 +17650,7 @@ default = "grok-4.5"
     }
     /// Keyed path: prod proxy origin can disarm; env override cannot.
     #[test]
-    #[serial_test::serial(remote_sig_disarm)]
+    #[serial_test::serial]
     fn remote_settings_disarm_requires_prod_proxy_when_keys_embedded() {
         xai_grok_config::signed_policy::apply_remote_managed_config_signature_verification(
             Some(true),
