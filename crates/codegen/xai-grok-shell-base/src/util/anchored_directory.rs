@@ -679,11 +679,14 @@ mod platform {
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    #[allow(unused_imports)]
     use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    #[allow(unused_imports)]
     use windows::Win32::Security::Authorization::{
         GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows::Win32::Security::GetTokenInformation;
+    #[allow(unused_imports)]
     use windows::Win32::Security::{
         ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
         EqualSid, GetLengthSid, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
