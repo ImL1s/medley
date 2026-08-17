@@ -2396,7 +2396,7 @@ impl Config {
 /// Serde `rename` + `alias` treat both keys as one field, so a merged
 /// config that still carries the legacy key fails before any precedence
 /// logic can run (Codex P2 3788601733). Public key wins.
-fn prefer_readline_mode_in_toml(root: &mut toml::Value) {
+pub fn prefer_readline_mode_in_toml(root: &mut toml::Value) {
     let Some(ui) = root.get_mut("ui").and_then(toml::Value::as_table_mut) else {
         return;
     };

@@ -280,6 +280,29 @@ mod tests {
             "scalar [toolset] must be replaced so the write lands"
         );
     }
+
+    #[test]
+    fn load_config_from_toml_keeps_compact_mode_when_both_ui_keys_present() {
+        let root: TomlValue = toml::from_str(
+            r#"
+            [ui]
+            readline_mode = true
+            simple_mode = false
+            compact_mode = true
+            "#,
+        )
+        .unwrap();
+        let cfg = load_config_from_toml(&root);
+        assert_eq!(
+            cfg.ui.simple_mode,
+            Some(true),
+            "public readline_mode must win"
+        );
+        assert!(
+            cfg.ui.compact_mode,
+            "dual-key [ui] must not fall back to UiConfig::default and drop compact_mode"
+        );
+    }
     #[test]
     fn transport_oauth_client_id_takes_priority_over_block() {
         let json = r#"{

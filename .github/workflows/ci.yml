@@ -1783,6 +1783,8 @@ jobs:
             simple_mode_alias_loads_legacy_ui_key_issue66 -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             new_from_toml_cfg_accepts_both_readline_mode_and_simple_mode_issue66 -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            load_config_from_toml_keeps_compact_mode_when_both_ui_keys_present -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             simple_mode_alias_prefers_public_key_issue66 -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
