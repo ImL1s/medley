@@ -1,6 +1,9 @@
 # Optional plugin-facing native subagent route contract
 
-**Status:** Proposed  
+**Status:** Shipped — the contract landed on `providers` via #386, #387 and #388.  
+This page is the 2026-08-09 design record, kept as written. For the surface that
+actually shipped — including what was deliberately left out — see
+[`docs/architecture/native-subagent-route-contract.md`](../architecture/native-subagent-route-contract.md).  
 **Date:** 2026-08-09  
 **Target branch:** `providers`  
 **Tracking issue:** [ImL1s/medley#287](https://github.com/ImL1s/medley/issues/287)  
