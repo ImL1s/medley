@@ -1063,7 +1063,7 @@ mod platform {
             | windows::Win32::Storage::FileSystem::READ_CONTROL
             | windows::Win32::Storage::FileSystem::WRITE_DAC)
             .0;
-        let share_access = (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0;
+        let share_access = (FILE_SHARE_READ | FILE_SHARE_WRITE).0;
         let mut security =
             OwnerOnlySecurity::new_with_inheritance(windows::Win32::Security::ACE_FLAGS(0))?;
         let file = match open_relative_with_share(
