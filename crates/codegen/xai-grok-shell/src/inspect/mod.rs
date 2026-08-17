@@ -78,6 +78,20 @@ pub(crate) struct InspectReport {
     /// Invalid or ignored `[mcp_servers.*]` entries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mcp_config_problems: Vec<crate::util::config::McpServerConfigProblem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_auth_scheme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_credential_source: Option<String>,
+    /// #123: origins the local user/managed config tiers declare trusted for
+    /// ambient xAI credentials. Empty unless the user widened their
+    /// credential's blast radius — the report is how they can see that they
+    /// did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trusted_xai_origins: Vec<String>,
+    /// `trusted_xai_origins` entries that were refused, as
+    /// `"<sanitized entry> (<reason>)"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trusted_xai_origins_rejected: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -394,6 +408,54 @@ async fn build_report(cwd: &Path) -> InspectReport {
         .unwrap_or_default();
     let mcp_config_problems = crate::util::config::load_mcp_server_problems_with_project(cwd);
 
+    let trusted_xai_origins = crate::agent::trusted_origins::TrustedXaiOrigins::load();
+    let trusted_xai_origins_rejected = trusted_xai_origins
+        .rejected()
+        .iter()
+        .map(|(entry, reason)| format!("{entry} ({reason})"))
+        .collect();
+    let trusted_xai_origins = trusted_xai_origins.declared_display();
+
+    let (catalog_auth_scheme, catalog_credential_source) = if let Some(ref cfg) = parsed_config {
+        let catalog_auth = cfg.models.catalog_auth_config().unwrap_or_default();
+        let scheme_str = catalog_auth.auth_scheme.map(|s| match s {
+            xai_grok_sampler::AuthScheme::Bearer => "bearer".to_string(),
+            xai_grok_sampler::AuthScheme::XApiKey => "x_api_key".to_string(),
+            xai_grok_sampler::AuthScheme::None => "none".to_string(),
+        });
+
+        let source_str = if let Some(ref scheme) = catalog_auth.auth_scheme {
+            match scheme {
+                xai_grok_sampler::AuthScheme::None => Some("none".to_string()),
+                xai_grok_sampler::AuthScheme::Bearer | xai_grok_sampler::AuthScheme::XApiKey => {
+                    if let Some(ref env_keys) = catalog_auth.env_key {
+                        Some(format!("env:{}", env_keys.names().join(",")))
+                    } else {
+                        Some("missing".to_string())
+                    }
+                }
+            }
+        } else {
+            let endpoints = &cfg.endpoints;
+            let has_session = cfg.auth.is_some();
+            let fetch_auth = crate::agent::models::ModelFetchAuth::resolve(endpoints, has_session);
+            let custom = endpoints.has_custom_endpoint();
+            let is_apikey_fetch = fetch_auth == crate::agent::models::ModelFetchAuth::ApiKey;
+            let is_xai_bearer =
+                crate::util::is_xai_api_bearer_url(&endpoints.resolve_models_list_url());
+            if custom || is_apikey_fetch {
+                Some("env:XAI_API_KEY".to_string())
+            } else if is_xai_bearer {
+                Some("session".to_string())
+            } else {
+                Some("env:XAI_API_KEY".to_string())
+            }
+        };
+        (scheme_str, source_str)
+    } else {
+        (None, None)
+    };
+
     InspectReport {
         grok_version: xai_grok_version::VERSION.to_string(),
         channel: crate::util::config::channel_name_from_cache()
@@ -416,6 +478,10 @@ async fn build_report(cwd: &Path) -> InspectReport {
         external_compat,
         config_warnings,
         mcp_config_problems,
+        catalog_auth_scheme,
+        catalog_credential_source,
+        trusted_xai_origins,
+        trusted_xai_origins_rejected,
     }
 }
 
@@ -1437,6 +1503,27 @@ fn print_human(r: &InspectReport) {
         "  {TREE} api_key_auth_disabled: {}",
         r.login_policy.api_key_auth_disabled
     );
+
+    println!();
+    println!("  Model Catalog Auth");
+    println!(
+        "  {TREE} Scheme: {}",
+        r.catalog_auth_scheme.as_deref().unwrap_or("(default)")
+    );
+    if let Some(ref src) = r.catalog_credential_source {
+        println!("  {TREE} Credential source: {}", src);
+    }
+
+    if !r.trusted_xai_origins.is_empty() || !r.trusted_xai_origins_rejected.is_empty() {
+        println!();
+        println!("  Trusted xAI Origins (user-declared)");
+        for origin in &r.trusted_xai_origins {
+            println!("  {TREE} {origin} — ambient xAI credentials are forwarded here");
+        }
+        for rejected in &r.trusted_xai_origins_rejected {
+            println!("  {TREE} ignored: {rejected}");
+        }
+    }
 
     print_columns(
         "Skills",

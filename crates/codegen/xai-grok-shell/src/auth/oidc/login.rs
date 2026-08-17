@@ -543,10 +543,21 @@ pub async fn run_login_flow_with_config(
 }
 
 /// Successful OIDC callback payload.
-#[derive(Debug, PartialEq, Eq)]
+// No `Debug` in the derive: the manual impl below reports `code_present` /
+// `state_present` instead of the values. Upstream's derive would print both.
+#[derive(PartialEq, Eq)]
 struct Callback {
     code: String,
     state: String,
+}
+
+impl std::fmt::Debug for Callback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Callback")
+            .field("code_present", &!self.code.is_empty())
+            .field("state_present", &!self.state.is_empty())
+            .finish()
+    }
 }
 
 /// Result from the OIDC callback: either a [`Callback`] or an IdP error message.

@@ -114,10 +114,20 @@ struct NewConnectionChannels {
 }
 
 /// Query parameters for WebSocket connection.
-#[derive(Debug, serde::Deserialize, Default)]
+// No `Debug` in the derive: the manual impl below reports
+// `server_key_present` instead of the key. Upstream's derive would print it.
+#[derive(serde::Deserialize, Default)]
 pub(crate) struct WsQueryParams {
     #[serde(rename = "server-key")]
     pub server_key: Option<String>,
+}
+
+impl std::fmt::Debug for WsQueryParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsQueryParams")
+            .field("server_key_present", &self.server_key.is_some())
+            .finish()
+    }
 }
 
 /// Validate the bearer token from request headers or query parameters.

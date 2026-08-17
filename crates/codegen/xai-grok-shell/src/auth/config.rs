@@ -54,7 +54,9 @@ pub enum PreferredAuthMethod {
     /// including devbox-minted OIDC).
     Oidc,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// No `Debug` in the derive: the manual impl below reports `*_configured`
+// booleans instead of the values. Upstream's derive would print them.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GrokComConfig {
     pub grok_ws_origin: String,
@@ -92,6 +94,36 @@ pub struct GrokComConfig {
     /// multi-method fallthrough. Config.toml only (`[auth] preferred_method`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_method: Option<PreferredAuthMethod>,
+}
+
+impl std::fmt::Debug for GrokComConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrokComConfig")
+            .field(
+                "grok_ws_origin_configured",
+                &!self.grok_ws_origin.is_empty(),
+            )
+            .field("grok_ws_url_configured", &!self.grok_ws_url.is_empty())
+            .field("token_header_configured", &!self.token_header.is_empty())
+            .field("oidc_configured", &self.oidc.is_some())
+            .field("oauth2_configured", &self.oauth2.is_some())
+            .field(
+                "auth_provider_command_configured",
+                &self.auth_provider_command.is_some(),
+            )
+            .field(
+                "auth_provider_label_configured",
+                &self.auth_provider_label.is_some(),
+            )
+            .field("auth_token_ttl", &self.auth_token_ttl)
+            .field("disable_api_key_auth", &self.disable_api_key_auth)
+            .field(
+                "force_login_team_configured",
+                &self.force_login_team_uuid.is_some(),
+            )
+            .field("preferred_method", &self.preferred_method)
+            .finish()
+    }
 }
 /// Team login restriction. TOML string or array; an empty array fails closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

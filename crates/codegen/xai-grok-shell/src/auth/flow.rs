@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use tokio::io::AsyncBufReadExt as _;
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::auth::config::LEGACY_AUTH_SCOPE;
@@ -12,6 +12,91 @@ use crate::util::grok_home;
 use xai_grok_telemetry::events::{LoginFailed, LoginFailureKind};
 
 pub(crate) type StderrCallback = Box<dyn Fn(&str)>;
+
+const EXTERNAL_PROVIDER_STDERR_LINE_CAP: usize = 16 * 1024;
+
+/// Browser target extracted from provider UX output. The URL may contain
+/// short-lived OAuth state, so its Debug representation is deliberately
+/// presence-only and the raw value is used solely for `webbrowser::open`.
+struct ExternalProviderBrowserTarget(url::Url);
+
+impl std::fmt::Debug for ExternalProviderBrowserTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalProviderBrowserTarget")
+            .field("url_present", &true)
+            .finish()
+    }
+}
+
+fn external_provider_browser_target(line: &str) -> Option<ExternalProviderBrowserTarget> {
+    line.split_whitespace().find_map(|token| {
+        let token = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';'
+            )
+        });
+        let url = url::Url::parse(token).ok()?;
+        let scheme_allowed = url.scheme() == "https"
+            || (url.scheme() == "http"
+                && url
+                    .host_str()
+                    .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1")));
+        (scheme_allowed && url.username().is_empty() && url.password().is_none())
+            .then_some(ExternalProviderBrowserTarget(url))
+    })
+}
+
+async fn drain_external_provider_stderr(
+    mut stderr: impl tokio::io::AsyncRead + Unpin,
+) -> std::io::Result<bool> {
+    let mut chunk = [0_u8; 4096];
+    let mut line = Vec::with_capacity(1024);
+    let mut line_overflowed = false;
+    let mut browser_opened = false;
+
+    loop {
+        let read = stderr.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        for byte in &chunk[..read] {
+            if *byte == b'\n' {
+                if !line_overflowed && !browser_opened {
+                    browser_opened = maybe_open_external_provider_browser(&line).await;
+                }
+                line.clear();
+                line_overflowed = false;
+            } else if !line_overflowed {
+                if line.len() < EXTERNAL_PROVIDER_STDERR_LINE_CAP {
+                    line.push(*byte);
+                } else {
+                    line.clear();
+                    line_overflowed = true;
+                }
+            }
+        }
+    }
+
+    if !line.is_empty() && !line_overflowed && !browser_opened {
+        browser_opened = maybe_open_external_provider_browser(&line).await;
+    }
+    Ok(browser_opened)
+}
+
+async fn maybe_open_external_provider_browser(line: &[u8]) -> bool {
+    let Some(target) = std::str::from_utf8(line)
+        .ok()
+        .and_then(external_provider_browser_target)
+    else {
+        return false;
+    };
+    let target = target.0.to_string();
+    matches!(
+        tokio::task::spawn_blocking(move || webbrowser::open(&target)).await,
+        Ok(Ok(_))
+    )
+}
 
 /// Reject a cached credential for reuse if it lacks `oidc_issuer`, has a
 /// mismatched issuer, or its team principal violates the `force_login_team_uuid`
@@ -211,12 +296,15 @@ async fn run_external_auth_provider(
     over_stale_credential: bool,
     on_stderr: Option<StderrCallback>,
 ) -> anyhow::Result<(GrokAuth, bool)> {
-    let inherit_stderr = on_stderr.is_none();
     tracing::info!(
-        cmd = %command,
+        // Deliberately not `cmd = %command`: an operator's auth-provider
+        // command line can carry a token in its arguments, and this record is
+        // written wherever tracing goes. Presence is the diagnostic value;
+        // the string is not.
+        command_present = !command.trim().is_empty(),
         over_stale_credential,
-        inherit_stderr,
-        "auth: running external auth provider (interactive login)"
+        tui_bridge_present = on_stderr.is_some(),
+        "auth: running external auth provider"
     );
 
     // `sh -c` on unix, `cmd /C` on Windows — a hardcoded `sh` cannot spawn on a
@@ -225,18 +313,18 @@ async fn run_external_auth_provider(
     let mut cmd = crate::util::subprocess::shell_c(command);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     // TODO: `kill_on_drop` SIGKILLs only the direct shell child; a provider that
     // backgrounds work (setsid / `&`) leaks the grandchild on shutdown-cancel.
     // Proper fix: pgid-kill via xai-tty-utils.
 
-    // TUI: pipe stderr and forward via callback — inherit would corrupt the
-    // alternate screen. CLI / headless: inherit so URLs and progress appear in
-    // real time; piping without a reader hides output and can deadlock the child.
-    if inherit_stderr {
-        cmd.stderr(std::process::Stdio::inherit());
+    // Command mode renders a fixed waiting state; provider-controlled stderr is
+    // never forwarded to the TUI/CLI. Notify the bridge without its payload.
+    if let Some(cb) = on_stderr.as_ref() {
+        cb("");
     } else {
-        cmd.stderr(std::process::Stdio::piped());
+        eprintln!("External authentication started; continue in the browser or provider UI.");
     }
 
     xai_grok_tools::util::detach_command(&mut cmd);
@@ -245,47 +333,30 @@ async fn run_external_auth_provider(
     #[allow(clippy::disallowed_methods)] // auth provider child; see the process-group note above
     let mut child = cmd
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to start auth provider `{command}`: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to start external auth provider: {e}"))?;
 
-    let stderr_task = if let Some(cb) = on_stderr {
-        let stderr = child.stderr.take().expect("stderr was set to piped");
-        Some(tokio::task::spawn_local(async move {
-            let mut reader = tokio::io::BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let trimmed = line.trim_end();
-                        tracing::debug!(line = trimmed, "auth: provider stderr");
-                        cb(trimmed);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "auth: error reading provider stderr");
-                        break;
-                    }
-                }
-            }
-        }))
-    } else {
-        None
-    };
+    // Always drain stderr so a noisy helper cannot deadlock. A URL is consumed
+    // only as a browser-open target; raw provider text is never retained,
+    // logged, inherited, or surfaced because it may contain credentials.
+    let stderr = child.stderr.take().expect("stderr was set to piped");
+    let stderr_task = tokio::spawn(drain_external_provider_stderr(stderr));
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
         child.wait_with_output(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("external auth provider `{command}` timed out after 300s"))?
-    .map_err(|e| anyhow::anyhow!("external auth provider `{command}` IO error: {e}"))?;
+    .map_err(|_| anyhow::anyhow!("external auth provider timed out after 300s"))?
+    .map_err(|e| anyhow::anyhow!("external auth provider IO error: {e}"))?;
 
-    if let Some(task) = stderr_task {
-        let _ = task.await;
+    match stderr_task.await {
+        Ok(Ok(true)) => tracing::info!("auth: external provider browser opened"),
+        Ok(Ok(false)) => {}
+        _ => tracing::warn!("auth: provider stderr drain failed"),
     }
 
     let mut auth = parse_output(&output)
-        .map_err(|e| anyhow::anyhow!("external auth provider `{command}`: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("external auth provider output rejected: {e}"))?;
 
     // Verify the team pin before any persist (parity with the OIDC / device-code
     // completion paths). A mismatch fails the login and writes nothing.
@@ -316,7 +387,13 @@ async fn run_external_auth_provider(
     Ok((auth, true))
 }
 
-/// GUI auth: bridges external provider stderr to `url_tx`, pipes code submission via `code_rx`.
+/// GUI auth: reports a fixed command-mode status without forwarding provider
+/// stderr, and pipes code submission via `code_rx`.
+///
+/// Upstream's comment says this bridges provider stderr to `url_tx`. The body
+/// below names its callback parameter `_discarded` and sends an empty URL with
+/// a fixed `AuthUrlMode::Command`, so it does not. Kept ours on the sync
+/// because it describes the shared body; the visibility change is upstream's.
 pub(crate) async fn run_auth_flow_with_stderr_bridge(
     auth_manager: &Arc<AuthManager>,
     grok_com_config: &GrokComConfig,
@@ -326,65 +403,28 @@ pub(crate) async fn run_auth_flow_with_stderr_bridge(
     login_override: LoginTransportOverride,
 ) -> anyhow::Result<(GrokAuth, bool)> {
     let url_tx = Rc::new(RefCell::new(channels.url_tx));
-    let stderr_lines: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-
-    let writer = stderr_lines.clone();
-    let on_stderr: StderrCallback = Box::new(move |line: &str| {
-        writer.borrow_mut().push(line.to_owned());
+    let command_url_tx = url_tx.clone();
+    let on_stderr: StderrCallback = Box::new(move |_discarded: &str| {
+        if let Some(tx) = command_url_tx.borrow_mut().take() {
+            let _ = tx.send(AuthUrlInfo {
+                url: String::new(),
+                mode: AuthUrlMode::Command,
+            });
+        }
     });
 
-    let reader = stderr_lines.clone();
-    let url_tx_bridge = url_tx.clone();
-    let bridge = async move {
-        loop {
-            tokio::task::yield_now().await;
-            let content = {
-                let lines = reader.borrow();
-                if lines.is_empty() {
-                    None
-                } else {
-                    Some(lines.join("\n"))
-                }
-            };
-            if let Some(joined) = content
-                && let Some(tx) = url_tx_bridge.borrow_mut().take()
-            {
-                // The external binary may print preamble text alongside the
-                // URL (e.g. "Visit the following link to sign in: https://…").
-                // Extract just the first https:// URL so the TUI displays a
-                // clean, clickable link.
-                let url = joined
-                    .split_whitespace()
-                    .find(|w| w.starts_with("https://"))
-                    .map(|u| u.to_owned())
-                    .unwrap_or(joined);
-                let _ = tx.send(AuthUrlInfo {
-                    url,
-                    mode: AuthUrlMode::Command,
-                });
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    };
-
     if force_interactive {
-        let auth = run_auth_flow_interactive(
+        run_auth_flow_interactive(
             auth_manager,
             grok_com_config,
             Some(on_stderr),
             Some(url_tx),
             Some(channels.code_rx),
             login_override,
-        );
-        tokio::select! {
-            r = auth => r,
-            _ = bridge => {
-                tracing::error!("auth stderr bridge exited unexpectedly during interactive login");
-                Err(anyhow::anyhow!("Login failed. Please try again."))
-            },
-        }
+        )
+        .await
     } else {
-        let auth = run_auth_flow(
+        run_auth_flow(
             auth_manager,
             grok_com_config,
             reauth,
@@ -392,14 +432,8 @@ pub(crate) async fn run_auth_flow_with_stderr_bridge(
             Some(url_tx),
             Some(channels.code_rx),
             login_override,
-        );
-        tokio::select! {
-            r = auth => r,
-            _ = bridge => {
-                tracing::error!("auth stderr bridge exited unexpectedly during login");
-                Err(anyhow::anyhow!("Login failed. Please try again."))
-            },
-        }
+        )
+        .await
     }
 }
 
@@ -743,7 +777,15 @@ async fn run_auth_flow_steps(
         "auth: no OAuth2 configuration available (neither enterprise OIDC nor xAI OAuth2 configured)"
     );
     anyhow::bail!(
-        "No OAuth2 configuration available. Run `grok login` to authenticate, or contact your administrator if you use enterprise SSO."
+        "{}",
+        crate::auth::with_login_instruction(
+            |prog| {
+                format!(
+                    "No OAuth2 configuration available. Run `{prog} login` to authenticate, or contact your administrator if you use enterprise SSO."
+                )
+            },
+            "No OAuth2 configuration available. Sign in to authenticate, or contact your administrator if you use enterprise SSO.",
+        )
     )
 }
 
@@ -2108,43 +2150,82 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_url_from_external_provider_stderr() {
-        let extract = |input: &str| -> String {
-            input
-                .split_whitespace()
-                .find(|w| w.starts_with("https://"))
-                .map(|u| u.to_owned())
-                .unwrap_or_else(|| input.to_owned())
-        };
-
-        // Preamble text with URL
-        assert_eq!(
-            extract(
-                "Visit the following link to sign into Grok: https://auth.example.com/login?code=abc"
-            ),
-            "https://auth.example.com/login?code=abc"
-        );
-
-        // Multi-line with URL on second line
-        assert_eq!(
-            extract("Please sign in below\nhttps://auth.example.com/sso"),
-            "https://auth.example.com/sso"
-        );
-
-        // Just a bare URL
-        assert_eq!(
-            extract("https://auth.example.com/login"),
-            "https://auth.example.com/login"
-        );
-
-        // No URL at all — fallback to full content
-        assert_eq!(extract("some opaque output"), "some opaque output");
+    fn assert_secret_absent(rendered: &str, secret: &str) {
+        assert!(!rendered.contains(secret), "leaked full secret: {rendered}");
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel window");
+            assert!(
+                !rendered.contains(window),
+                "leaked secret window {window}: {rendered}"
+            );
+        }
     }
 
-    /// CLI `grok login` passes `on_stderr=None`; stderr must be inherited so
-    /// sign-in URLs appear in real time. Piped stderr with no reader deadlocks
-    /// once the child writes past the pipe buffer (~64 KiB).
+    #[tokio::test]
+    async fn external_provider_tui_bridge_never_forwards_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(
+            AuthManager::new(dir.path(), GrokComConfig::default())
+                .with_proxy_base_url(&dead_proxy_url()),
+        );
+        let stderr_secret = "GB002-provider-stderr-Q7w5E3r1T9y7";
+        let observed = Rc::new(RefCell::new(Vec::<String>::new()));
+        let writer = observed.clone();
+        let callback: StderrCallback = Box::new(move |value| {
+            writer.borrow_mut().push(value.to_owned());
+        });
+        let command = format!("printf '%s' '{stderr_secret}' >&2; printf token");
+
+        let (auth, _) = run_external_auth_provider(&command, &mgr, false, Some(callback))
+            .await
+            .expect("provider should mint while stderr is discarded");
+        assert_eq!(auth.key, "token");
+        let rendered = observed.borrow().join("\n");
+        assert_eq!(rendered, "", "the TUI bridge receives status only");
+        assert_secret_absent(&rendered, stderr_secret);
+    }
+
+    #[test]
+    fn external_provider_browser_target_is_consumed_but_never_debugged() {
+        const STATE_SECRET: &str = "GB002-provider-state-A7s5D3f1G9h7";
+        let line = format!(
+            "Open https://login.example.test/authorize?state={STATE_SECRET} in your browser"
+        );
+        let target = external_provider_browser_target(&line).expect("valid browser target");
+
+        assert!(target.0.as_str().contains(STATE_SECRET));
+        let rendered = format!("{target:?}");
+        assert_eq!(
+            rendered,
+            "ExternalProviderBrowserTarget { url_present: true }"
+        );
+        assert_secret_absent(&rendered, STATE_SECRET);
+        assert!(
+            external_provider_browser_target("https://user:password@login.example.test/authorize")
+                .is_none()
+        );
+        assert!(external_provider_browser_target("http://example.test/login").is_none());
+        assert!(external_provider_browser_target("http://127.0.0.1:9000/login").is_some());
+    }
+
+    #[tokio::test]
+    async fn external_provider_error_never_echoes_command_or_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+        let command_secret = "GB002-inline-command-A7s5D3f1G9h7";
+        let stderr_secret = "GB002-failed-stderr-Z9x7C5v3B1n9";
+        let command = format!("printf '%s' '{stderr_secret}' >&2; exit 7 # {command_secret}");
+
+        let error = run_external_auth_provider(&command, &mgr, false, None)
+            .await
+            .expect_err("nonzero provider must fail");
+        let rendered = format!("{error:?}\n{error}");
+        assert_secret_absent(&rendered, command_secret);
+        assert_secret_absent(&rendered, stderr_secret);
+    }
+
+    /// CLI `grok login` passes `on_stderr=None`; provider-controlled stderr is
+    /// drained and discarded so it cannot leak or deadlock on a full pipe.
     #[tokio::test]
     async fn external_provider_cli_path_does_not_deadlock_on_large_stderr() {
         let dir = tempfile::tempdir().unwrap();
@@ -2155,7 +2236,7 @@ mod tests {
         let cmd = r#"sh -c 'i=0; while [ $i -lt 2000 ]; do printf "%s" "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" >&2; i=$((i+1)); done; printf token'"#;
         let (auth, _) = run_external_auth_provider(cmd, &mgr, false, None)
             .await
-            .expect("CLI path must inherit stderr so large stderr does not deadlock");
+            .expect("CLI path must drain stderr so large output does not deadlock");
         assert_eq!(auth.key, "token");
     }
 

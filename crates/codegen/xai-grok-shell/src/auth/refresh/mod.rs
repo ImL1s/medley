@@ -154,8 +154,8 @@ impl SuspectConsumedRt {
     }
 }
 
-/// Redacted: `RefreshOutcome` derives `Debug` and is formatted into logs and
-/// test panics; the full RT must never ride along.
+/// Redacted: `RefreshOutcome` implements `Debug` and is formatted into logs
+/// and test panics; the full RT must never ride along.
 impl std::fmt::Debug for SuspectConsumedRt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SuspectConsumedRt")
@@ -166,7 +166,8 @@ impl std::fmt::Debug for SuspectConsumedRt {
 }
 
 /// Outcome of a refresh attempt. Data only -- `refresh_chain` handles mutations.
-#[derive(Debug)]
+// No `Debug` in a derive: the manual impl below reports presence booleans for
+// every credential-bearing field. Upstream's derive would print the tokens.
 #[must_use = "RefreshOutcome encodes a state transition; route it through refresh_chain"]
 pub(crate) enum RefreshOutcome {
     /// Authority returned a fresh token. Caller persists via `update()`.
@@ -203,6 +204,46 @@ pub(crate) enum RefreshOutcome {
         message: String,
         suspect_consumed_rt: Option<SuspectConsumedRt>,
     },
+}
+
+impl std::fmt::Debug for RefreshOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success(auth) => f
+                .debug_struct("Success")
+                .field("access_token_present", &!auth.key.is_empty())
+                .field("refresh_token_present", &auth.refresh_token.is_some())
+                .finish(),
+            Self::PermanentFailure {
+                error,
+                tried_key,
+                tried_refresh_token,
+            } => f
+                .debug_struct("PermanentFailure")
+                .field("error", error)
+                .field("tried_key_present", &tried_key.is_some())
+                .field(
+                    "tried_refresh_token_present",
+                    &tried_refresh_token.is_some(),
+                )
+                .finish(),
+            // `suspect_consumed_rt` carries the RT that was on the wire, so it
+            // is reported presence-only rather than delegated to its own
+            // `Debug` -- that impl is upstream-owned and prints a token suffix
+            // whenever a sync reverts the fork's redaction.
+            Self::TransientFailure {
+                suspect_consumed_rt,
+                ..
+            } => f
+                .debug_struct("TransientFailure")
+                .field("message_redacted", &true)
+                .field(
+                    "suspect_consumed_rt_present",
+                    &suspect_consumed_rt.is_some(),
+                )
+                .finish(),
+        }
+    }
 }
 
 impl RefreshOutcome {

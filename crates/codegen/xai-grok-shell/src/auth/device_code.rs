@@ -78,7 +78,9 @@ fn detect_cli_surface() -> ClientSurface {
 /// Result of requesting a device code from the server.
 /// Callers display `verification_uri` + `user_code` to the user,
 /// then pass this struct to `complete_device_code_login`.
-#[derive(Debug, Clone)]
+// No `Debug` in the derive: the manual impl below redacts `user_code` and
+// `device_code`. Upstream's derive would print both verbatim.
+#[derive(Clone)]
 pub(crate) struct DeviceCode {
     pub verification_uri: String,
     pub verification_uri_complete: Option<String>,
@@ -86,6 +88,25 @@ pub(crate) struct DeviceCode {
     device_code: String,
     interval: i32,
     expires_in: i64,
+}
+
+impl std::fmt::Debug for DeviceCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCode")
+            .field(
+                "verification_uri_configured",
+                &(!self.verification_uri.is_empty()),
+            )
+            .field(
+                "verification_uri_complete_configured",
+                &self.verification_uri_complete.is_some(),
+            )
+            .field("user_code", &"<redacted>")
+            .field("device_code", &"<redacted>")
+            .field("interval", &self.interval)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 // --- Wire types (serde) ---
