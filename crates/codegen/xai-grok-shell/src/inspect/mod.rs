@@ -332,7 +332,7 @@ async fn build_report(cwd: &Path) -> InspectReport {
         table.remove("compat");
     }
     let parsed_config =
-        crate::agent::config::Config::new_from_toml_cfg(&config_without_compat).ok();
+        crate::agent::config::Config::new_from_toml_cfg_offline(&config_without_compat).ok();
 
     let git_root = git2::Repository::discover(cwd)
         .ok()
@@ -2229,6 +2229,33 @@ mod tests {
             alias_warning["reason"]
                 .as_str()
                 .is_some_and(|r| !r.is_empty())
+        );
+    }
+
+    #[test]
+    fn issue15_inspect_config_load_does_not_attempt_live_codex_catalog_fetch() {
+        crate::agent::model_providers::reset_live_codex_catalog_fetch_attempts();
+        let effective: toml::Value = toml::from_str(
+            r#"
+            [model.local]
+            model = "local"
+            base_url = "http://127.0.0.1:11434/v1"
+            auth_scheme = "none"
+            "#,
+        )
+        .unwrap();
+        let mut without_compat = effective;
+        if let Some(table) = without_compat.as_table_mut() {
+            table.remove("compat");
+        }
+        assert!(
+            crate::agent::config::Config::new_from_toml_cfg_offline(&without_compat).is_ok(),
+            "inspect must still parse a local keyless model offline"
+        );
+        assert_eq!(
+            crate::agent::model_providers::live_codex_catalog_fetch_attempts(),
+            0,
+            "grok inspect must not GET /models"
         );
     }
 

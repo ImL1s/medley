@@ -1769,6 +1769,8 @@ jobs:
             issue15_inspect_model_routes_from_toml_is_empty_when_config_parse_fails -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue15_inspect_model_routes_from_toml_does_not_attempt_live_codex_catalog_fetch -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue15_inspect_config_load_does_not_attempt_live_codex_catalog_fetch -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             issue17_run_commits_focused_catalog_id_when_display_names_collide -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
