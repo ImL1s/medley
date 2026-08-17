@@ -565,7 +565,7 @@ impl xai_tool_runtime::Tool for TaskTool {
                     &id,
                     &input.subagent_type,
                     &input.description,
-                    &task_output_name,
+                    task_output_name,
                     continue_parent,
                 )
                 .into(),

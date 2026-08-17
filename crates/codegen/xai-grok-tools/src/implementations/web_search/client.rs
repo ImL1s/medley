@@ -203,10 +203,12 @@ pub struct WebSearchClient {
     /// When set it governs the search and the model's per-call `allowed_domains`
     /// is ignored (see [`Self::resolve_filters`]). Mutually exclusive with
     /// `default_excluded_domains`.
+    #[allow(dead_code)]
     default_allowed_domains: Option<Vec<String>>,
     /// Authoritative domain blocklist from `[toolset.web_search] excluded_domains`.
     /// The model cannot un-set it by naming a blocked domain in its own
     /// `allowed_domains`. Mutually exclusive with `default_allowed_domains`.
+    #[allow(dead_code)]
     default_excluded_domains: Option<Vec<String>>,
     api_key_provider: Option<SharedApiKeyProvider>,
     provider_scoped: bool,
@@ -424,6 +426,7 @@ impl WebSearchClient {
     /// The config source guarantees at most one list is set (the resolver drops
     /// one, and deserialize rejects both), but should both ever be present the
     /// allowlist wins, matching the resolver's tiebreak so the two paths agree.
+    #[allow(dead_code)]
     fn resolve_filters(
         &self,
         model_allowed: Option<Vec<String>>,
@@ -450,6 +453,7 @@ impl WebSearchClient {
     /// `excluded_domains` is injected into the tool's `filters` after
     /// serialization (the backend Responses API accepts it). The request always
     /// carries exactly one tool (`web_search`) at index 0.
+    #[allow(dead_code)]
     fn build_request_json(
         &self,
         query: &str,

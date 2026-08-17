@@ -736,6 +736,7 @@ impl std::fmt::Debug for VideoGenConfig {
                     &zdr_video_output_s3.is_some(),
                 )
                 .field("tier_restricted", tier_restricted)
+                .field("zdr_restricted", zdr_restricted)
                 .finish(),
         }
     }
