@@ -135,7 +135,12 @@ pub fn dynamic_enum_choices(
                     .iter()
                     .find(|(key, _)| key == id_key)
                     .map(|(_, reason)| reason.as_str())
-                    .or_else(|| snapshot.model_unready_reasons.get(id_key).map(String::as_str));
+                    .or_else(|| {
+                        snapshot
+                            .model_unready_reasons
+                            .get(id_key)
+                            .map(String::as_str)
+                    });
                 // Display names are labels, not identity: disambiguate a
                 // collision by catalog id so two rows never read the same.
                 let duplicate_name = snapshot

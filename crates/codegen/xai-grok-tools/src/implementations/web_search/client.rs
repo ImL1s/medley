@@ -2781,7 +2781,10 @@ mod tests {
             .await
             .expect("trusted request should build");
         assert_eq!(request.headers()["x-grok-client-identifier"], "grok-shell");
-        assert_eq!(request.headers()["x-grok-client-version"], "trusted-version");
+        assert_eq!(
+            request.headers()["x-grok-client-version"],
+            "trusted-version"
+        );
         assert_eq!(request.headers()["traceparent"], "trusted-trace");
     }
     /// When the dynamic provider returns `None`, the static `api_key`
