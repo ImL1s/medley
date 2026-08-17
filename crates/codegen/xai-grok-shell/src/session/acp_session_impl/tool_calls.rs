@@ -2342,29 +2342,63 @@ impl SessionActor {
             self.send_update(acp::SessionUpdate::Plan(acp_plan), None)
                 .await;
         }
+        let ToolRunResult {
+            output,
+            prompt_text,
+            mut trusted_prompt_suffix,
+            ..
+        } = result;
         #[allow(unused_mut)]
-        let mut prompt_text = if concatenated_json_count > 0 && !self.is_cursor_harness() {
+        let mut prompt_text = if trusted_prompt_suffix.is_empty() {
+            prompt_text
+        } else {
+            match split_and_rewrite_trusted_suffix(
+                prompt_text,
+                &trusted_prompt_suffix,
+                path_rewriter.as_ref(),
+            ) {
+                Ok((raw, rewritten_suffix)) => {
+                    trusted_prompt_suffix = rewritten_suffix;
+                    raw
+                }
+                Err(prompt_text) => {
+                    tracing::error!(
+                        session_id = %self.session_info.id,
+                        tool = requested_tool_name,
+                        "trusted tool reminder suffix did not match prompt text; treating all text as untrusted"
+                    );
+                    trusted_prompt_suffix.clear();
+                    prompt_text
+                }
+            }
+        };
+        if concatenated_json_count > 0 && !self.is_cursor_harness() {
             let remaining = concatenated_json_count - 1;
-            format!(
-                "{}\n\n<system-reminder>\nIMPORTANT: Your tool call contained {} concatenated JSON \
+            let reminder = format!(
+                "<system-reminder>\nIMPORTANT: Your tool call contained {} concatenated JSON \
                  objects, but only the best-matching one was executed. The remaining {} \
                  were ignored. You MUST use separate tool calls (one per operation) \
                  instead of concatenating multiple JSON objects in a single call's \
                  arguments. Make {} individual tool call{} for the remaining \
                  operations.\n</system-reminder>",
-                result.prompt_text,
                 concatenated_json_count,
                 remaining,
                 remaining,
                 if remaining == 1 { "" } else { "s" },
-            )
-        } else {
-            result.prompt_text
-        };
+            );
+            if trusted_prompt_suffix.is_empty() {
+                if !prompt_text.is_empty() {
+                    trusted_prompt_suffix.push_str("\n\n");
+                }
+            } else {
+                trusted_prompt_suffix.push_str("\n\n");
+            }
+            trusted_prompt_suffix.push_str(&reminder);
+        }
         let mut inline_images: Vec<ContentPart> = Vec::new();
         let extraction = if !self.is_cursor_harness()
             && !matches!(
-                result.output,
+                output,
                 ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(_))
                     | ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(_))
             ) {
@@ -2384,7 +2418,7 @@ impl SessionActor {
         let mut prompt_text = maybe_rewrite(path_rewriter.as_ref(), extraction.text);
         if !self.is_cursor_harness()
             && let ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(ref image_content)) =
-                result.output
+                output
         {
             let path = tool_parsed_args
                 .get("target_file")
@@ -2416,7 +2450,7 @@ impl SessionActor {
             }
         }
         if !self.is_cursor_harness()
-            && let ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(ref pdf)) = result.output
+            && let ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(ref pdf)) = output
         {
             for page in &pdf.pages {
                 let url = format!("data:{};base64,{}", page.mime_type, page.data);
@@ -2444,7 +2478,11 @@ impl SessionActor {
                 inline_images,
             )
         };
-        self.chat_state_handle.push_tool_result(tool_chat, None);
+        self.chat_state_handle.push_tool_result_with_trusted_suffix(
+            tool_chat,
+            self.tool_result_truncation_policy(),
+            (!trusted_prompt_suffix.is_empty()).then_some(trusted_prompt_suffix),
+        );
         let mut deferred_followups = Vec::new();
         if !extracted_images.is_empty() {
             let count = extracted_images.len();
@@ -2901,6 +2939,63 @@ impl SessionActor {
         let tool_chat = ConversationItem::tool_result(model_call_id.to_owned(), reason);
         self.chat_state_handle.push_tool_result(tool_chat, None);
         Ok(())
+    }
+}
+fn split_and_rewrite_trusted_suffix(
+    mut prompt_text: String,
+    trusted_suffix: &str,
+    path_rewriter: Option<&crate::session::acp_conversion::PathRewriter>,
+) -> Result<(String, String), String> {
+    let Some(raw_len) = prompt_text.strip_suffix(trusted_suffix).map(str::len) else {
+        return Err(prompt_text);
+    };
+    prompt_text.truncate(raw_len);
+    Ok((
+        prompt_text,
+        crate::session::acp_conversion::maybe_rewrite(path_rewriter, trusted_suffix.to_owned()),
+    ))
+}
+#[cfg(test)]
+mod trusted_suffix_path_rewrite_tests {
+    use super::split_and_rewrite_trusted_suffix;
+    use crate::session::acp_conversion::{PathRewriter, maybe_rewrite};
+
+    #[test]
+    fn trusted_reminder_suffix_uses_display_cwd_without_losing_provenance() {
+        let real_cwd = "/tmp/.grok/worktrees/project/fork-123";
+        let display_cwd = "/Users/me/project";
+        let reminder = format!(
+            "\n\n<system-reminder>\nCommand: cd {real_cwd} && cargo test\nOutput file: {real_cwd}/task.log\n</system-reminder>"
+        );
+        let prompt_text = format!("raw tool output from {real_cwd}{reminder}");
+        let rewriter = PathRewriter::new(real_cwd, Some(display_cwd)).unwrap();
+
+        let (raw, trusted_suffix) =
+            split_and_rewrite_trusted_suffix(prompt_text, &reminder, Some(&rewriter)).unwrap();
+        let rewritten_raw = maybe_rewrite(Some(&rewriter), raw);
+
+        assert!(rewritten_raw.contains(display_cwd));
+        assert!(trusted_suffix.contains(display_cwd));
+        assert!(!trusted_suffix.contains(real_cwd));
+        assert!(trusted_suffix.starts_with("\n\n<system-reminder>"));
+    }
+
+    #[test]
+    fn trusted_reminder_suffix_is_split_without_cloning_oversized_prompt() {
+        let reminder = "\n\n<system-reminder>trusted</system-reminder>";
+        let mut prompt_text = String::with_capacity(1024 * 1024);
+        prompt_text.push_str(&"x".repeat(128 * 1024));
+        prompt_text.push_str(reminder);
+        let original_ptr = prompt_text.as_ptr();
+        let original_capacity = prompt_text.capacity();
+
+        let (raw, trusted_suffix) =
+            split_and_rewrite_trusted_suffix(prompt_text, reminder, None).unwrap();
+
+        assert_eq!(raw.as_ptr(), original_ptr);
+        assert_eq!(raw.capacity(), original_capacity);
+        assert_eq!(raw.len(), 128 * 1024);
+        assert_eq!(trusted_suffix, reminder);
     }
 }
 /// Execute tool-call display parts. The title peels a redundant leading
