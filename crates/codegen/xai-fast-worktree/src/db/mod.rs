@@ -6,7 +6,6 @@
 mod queries;
 mod schema;
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 

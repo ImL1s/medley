@@ -22,12 +22,14 @@ use std::path::Path;
 /// directory to **read**, so it has to be something a file tool can open —
 /// neither `~/.medley/...` nor `$MEDLEY_HOME/...` survives that, because the
 /// model expands neither.
+#[allow(dead_code)]
 fn user_guide_dir() -> String {
     user_guide_dir_in(&xai_grok_config::grok_home())
 }
 
 /// Pure half of [`user_guide_dir`], so the resolution can be tested without
 /// touching the process environment.
+#[allow(dead_code)]
 fn user_guide_dir_in(home: &Path) -> String {
     home.join("docs").join("user-guide").display().to_string()
 }
