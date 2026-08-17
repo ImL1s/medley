@@ -345,6 +345,7 @@ pub fn reclaim_lock_if_unheld(lock_path: &Path, socket_path: Option<&Path>) -> R
         Ok(()) => {
             // Still holding the lock here: unlink before releasing.
             let removed = fs::remove_file(lock_path).is_ok();
+            #[allow(clippy::collapsible_if)]
             if removed {
                 if let Some(sock) = socket_path {
                     let _ = fs::remove_file(sock);
