@@ -401,6 +401,45 @@ pub async fn reap_killed_bounded(
     }
 }
 
+/// True when `pid` is gone or a zombie awaiting reap — i.e. no longer running.
+/// Test/assertion observation only — production liveness checks must use
+/// [`ProcessGroup::has_live_members`], which counts zombies as live.
+#[cfg(unix)]
+pub fn process_not_running(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            // State is the first field after the parenthesized comm.
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .and_then(|rest| rest.trim_start().chars().next())
+                .is_some_and(|state| state == 'Z'),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        {
+            // Can't tell; report "running" so callers fail loudly.
+            Err(_) => false,
+            Ok(out) => {
+                let stat = String::from_utf8_lossy(&out.stdout);
+                let stat = stat.trim();
+                stat.is_empty() || stat.starts_with('Z')
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn process_not_running(_pid: u32) -> bool {
+    true
+}
+
 /// Configure a command so the spawned child becomes the leader of a new
 /// process group.
 pub fn new_process_group(cmd: &mut tokio::process::Command) {
@@ -912,7 +951,7 @@ pub fn dup_tui_stderr() -> io::Result<std::fs::File> {
         // `DuplicateHandle` — avoiding the `from_raw_handle` footgun
         // where `File` would take ownership of the process stderr handle
         // and close it on drop.
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use std::os::windows::io::FromRawHandle;
         let stderr_handle = unsafe {
             windows::Win32::System::Console::GetStdHandle(
                 windows::Win32::System::Console::STD_ERROR_HANDLE,

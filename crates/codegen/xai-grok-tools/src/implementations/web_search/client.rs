@@ -2424,6 +2424,8 @@ mod tests {
                 ),
             ]),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: Some(std::sync::Arc::new(GenericScopedProvider)),
         };
         let client = WebSearchClient::new_with_env_resolver(&config, None, |name| {
@@ -2492,6 +2494,8 @@ mod tests {
             ]),
             env_http_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
             api_key_provider: None,
         };
         let mut client = WebSearchClient::new(&config, None).expect("xAI client should build");
