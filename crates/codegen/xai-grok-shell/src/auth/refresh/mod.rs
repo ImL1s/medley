@@ -17,10 +17,51 @@ pub(crate) use oidc_refresher::OidcRefresher;
 pub(crate) type DiagnosticUploader =
     Arc<dyn Fn(Vec<u8>, String, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Exhaustive relation between the credential an OIDC attempt used and the
+/// latest credential observed on disk. Access and refresh relations must be
+/// computed separately because either credential can rotate independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TriedDiskRelation {
+    BothMissing,
+    TriedMissing,
+    DiskMissing,
+    Same,
+    Different,
+}
+
+impl TriedDiskRelation {
+    pub(crate) fn compare(tried: Option<&str>, disk: Option<&str>) -> Self {
+        match (tried, disk) {
+            (None, None) => Self::BothMissing,
+            (None, Some(_)) => Self::TriedMissing,
+            (Some(_), None) => Self::DiskMissing,
+            (Some(tried), Some(disk)) if tried == disk => Self::Same,
+            (Some(_), Some(_)) => Self::Different,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::BothMissing => "both_missing",
+            Self::TriedMissing => "tried_missing",
+            Self::DiskMissing => "disk_missing",
+            Self::Same => "same",
+            Self::Different => "different",
+        }
+    }
+
+    pub(crate) const fn tried_present(self) -> bool {
+        matches!(self, Self::DiskMissing | Self::Same | Self::Different)
+    }
+
+    pub(crate) const fn disk_present(self) -> bool {
+        matches!(self, Self::TriedMissing | Self::Same | Self::Different)
+    }
+}
+
 /// Read-only view of `AuthManager` for refreshers. Enforces the
 /// no-mutation contract on *credential* state at the type level: refreshers
-/// hold `Arc<dyn AuthSnapshot>` and physically cannot call `update()`,
-/// `clear()`, `hot_swap()`, or `refresh_chain()`.
+/// observe manager/disk state but cannot call mutating methods.
 pub(crate) trait AuthSnapshot: Send + Sync {
     /// Read the current in-memory bearer outside the early-invalidation buffer.
     fn current(&self) -> Option<GrokAuth>;
@@ -246,11 +287,11 @@ pub(crate) fn build_refresher(
     diagnostic_uploader: Option<DiagnosticUploader>,
 ) -> Arc<dyn TokenRefresher> {
     match auth_provider_command {
-        Some(cmd) => {
+        Some(cmd) if super::has_nonblank_auth_provider_command(Some(&cmd)) => {
             let runner: Arc<dyn ExternalCommandRunner> = auth_manager;
             Arc::new(ExternalBinaryRefresher::new(runner, cmd))
         }
-        None => {
+        Some(_) | None => {
             let snapshot: Arc<dyn AuthSnapshot> = auth_manager;
             let refresher = OidcRefresher::new(snapshot);
             match diagnostic_uploader {
@@ -266,6 +307,74 @@ mod tests {
     use super::*;
     use crate::auth::{AuthMode, GrokAuth, GrokComConfig};
     use chrono::{Duration, Utc};
+
+    #[tokio::test]
+    async fn whitespace_external_command_uses_oidc_refresher() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(crate::auth::AuthManager::new(
+            dir.path(),
+            GrokComConfig::default(),
+        ));
+        let refresher = build_refresher(manager, Some(" \t\n".to_owned()), None);
+
+        assert!(matches!(
+            refresher.refresh(RefreshReason::PreRequest).await,
+            RefreshOutcome::TransientFailure { .. }
+        ));
+    }
+
+    #[test]
+    fn tried_disk_relation_truth_table_is_exhaustive() {
+        assert_eq!(
+            TriedDiskRelation::compare(None, None),
+            TriedDiskRelation::BothMissing
+        );
+        assert_eq!(
+            TriedDiskRelation::compare(None, Some("disk")),
+            TriedDiskRelation::TriedMissing
+        );
+        assert_eq!(
+            TriedDiskRelation::compare(Some("tried"), None),
+            TriedDiskRelation::DiskMissing
+        );
+        assert_eq!(
+            TriedDiskRelation::compare(Some("same"), Some("same")),
+            TriedDiskRelation::Same
+        );
+        assert_eq!(
+            TriedDiskRelation::compare(Some("a"), Some("b")),
+            TriedDiskRelation::Different
+        );
+    }
+
+    #[test]
+    fn refresh_outcome_debug_redacts_secret_values() {
+        let access = "access-SENTINEL-0123456789";
+        let refresh = "refresh-SENTINEL-9876543210";
+        let auth = GrokAuth {
+            key: access.into(),
+            refresh_token: Some(refresh.into()),
+            ..GrokAuth::test_default()
+        };
+        let success = format!("{:?}", RefreshOutcome::success(auth.clone()));
+        let failure = format!(
+            "{:?}",
+            RefreshOutcome::permanent_for(
+                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+                &auth,
+            )
+        );
+        for debug in [success, failure] {
+            assert!(
+                !debug.contains(access),
+                "debug leaked access token: {debug}"
+            );
+            assert!(
+                !debug.contains(refresh),
+                "debug leaked refresh token: {debug}"
+            );
+        }
+    }
 
     /// auth_token_ttl makes is_token_expired use create_time + ttl for
     /// External tokens without expires_at, instead of the 30-day fallback.

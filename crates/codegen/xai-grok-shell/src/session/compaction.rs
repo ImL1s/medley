@@ -736,6 +736,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: "auth".to_string(),
+                http_status: crate::sampling::error::http_status_from_error(&err),
                 message: message.clone(),
             },
         ))
@@ -1459,8 +1460,9 @@ impl SessionActor {
                 }
             };
         let memory_backend_impl = {
-            let g = self.memory.storage.borrow();
-            g.as_ref()
+            self.memory
+                .storage()
+                .as_ref()
                 .zip(self.memory.backend_params.as_ref())
                 .map(|(storage, params)| {
                     crate::session::memory::MemoryBackendImpl::from_session_params(

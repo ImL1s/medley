@@ -5,8 +5,8 @@ use crate::auth::{AuthManager, GrokAuth};
 /// Require xAI auth from a sync context, accepting tokens in the client-side buffer window.
 pub(crate) fn require_xai_auth(
     auth_manager: &AuthManager,
-    missing_message: &'static str,
-    non_xai_message: &'static str,
+    missing_message: &str,
+    non_xai_message: &str,
 ) -> Result<GrokAuth, acp::Error> {
     let auth = auth_manager
         .current_or_expired()

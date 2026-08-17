@@ -605,12 +605,14 @@ impl SlashController {
         // when the cursor is past the command token.
         if input.cursor_in_command {
             let matches = self.command_suggestions(&input.query, models);
-            snapshot.selected = Self::carry_selection(&previous, &matches, true, &input);
+            snapshot.selected = Self::carry_selection(&previous, &matches, true, &input, None);
             snapshot.open = !matches.is_empty();
             snapshot.matches = matches;
         } else if input.args_range.is_some() {
-            let matches = self.arg_suggestions_for_input(text, &input, models);
-            snapshot.selected = Self::carry_selection(&previous, &matches, false, &input);
+            let (matches, initially_preferred) =
+                self.arg_suggestions_for_input(text, &input, models);
+            snapshot.selected =
+                Self::carry_selection(&previous, &matches, false, &input, initially_preferred);
             snapshot.open = !matches.is_empty();
             snapshot.matches = matches;
         }
@@ -689,7 +691,7 @@ impl SlashController {
                     args_range: None,
                     args_query: String::new(),
                 };
-                let selected = Self::carry_selection(previous, &matches, true, &input);
+                let selected = Self::carry_selection(previous, &matches, true, &input, None);
                 SlashSnapshot {
                     active: true,
                     open: !matches.is_empty(),
@@ -799,7 +801,8 @@ impl SlashController {
             String::new()
         };
 
-        let arg_matches = self.arg_suggestions(command.as_ref(), models, &args_query);
+        let (arg_matches, initially_preferred) =
+            self.arg_suggestions(command.as_ref(), models, &args_query);
         let args_range = Some(start..args_end);
         let input = SlashInput {
             command_range: token.range.clone(),
@@ -813,7 +816,13 @@ impl SlashController {
         snapshot.args_range = args_range;
         snapshot.open = !arg_matches.is_empty();
         snapshot.matches = arg_matches;
-        snapshot.selected = Self::carry_selection(previous, &snapshot.matches, false, &input);
+        snapshot.selected = Self::carry_selection(
+            previous,
+            &snapshot.matches,
+            false,
+            &input,
+            initially_preferred,
+        );
         if args_empty {
             snapshot.args_placeholder = command.arg_placeholder().map(|s| s.to_string());
         }
@@ -857,6 +866,7 @@ impl SlashController {
         matches: &[SuggestionRow],
         cursor_in_command: bool,
         input: &SlashInput,
+        initially_preferred: Option<usize>,
     ) -> usize {
         if matches.is_empty() {
             return 0;
@@ -865,9 +875,14 @@ impl SlashController {
         let same_context = if cursor_in_command {
             previous.cursor_in_command && previous.query == input.query
         } else {
-            !previous.cursor_in_command && previous.args_range == input.args_range
+            !previous.cursor_in_command
+                && previous.query == input.query
+                && previous.args_range == input.args_range
         };
         if !same_context || previous.matches.is_empty() {
+            if !cursor_in_command && input.args_query.trim().is_empty() {
+                return initially_preferred.unwrap_or(0);
+            }
             return 0;
         }
 
@@ -1132,14 +1147,14 @@ impl SlashController {
         text: &str,
         input: &SlashInput,
         models: &ModelState,
-    ) -> Vec<SuggestionRow> {
+    ) -> (Vec<SuggestionRow>, Option<usize>) {
         let Some(invocation) = parse_invocation(text) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         // Clone the Arc to release the borrow on self.registry before
         // calling arg_suggestions (which needs &mut self for the matcher).
         let Some(command) = self.registry.get(invocation.token).cloned() else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         // Hidden commands never produce arg suggestions either.
         let offered = {
@@ -1147,7 +1162,7 @@ impl SlashController {
             command_offered(command.as_ref(), &visible_ctx, self.hide_session_scoped)
         };
         if !offered {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         self.arg_suggestions(command.as_ref(), models, &input.args_query)
     }
@@ -1171,33 +1186,48 @@ impl SlashController {
         command: &dyn SlashCommand,
         models: &ModelState,
         query: &str,
-    ) -> Vec<SuggestionRow> {
+    ) -> (Vec<SuggestionRow>, Option<usize>) {
         let ctx = self.app_ctx(models);
         if !command.takes_args_now(&ctx) {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let Some(items) = command.suggest_args(&ctx, query) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         if items.is_empty() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let trimmed = query.trim();
+        let mut preferred_indices = items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| command.initially_preferred_arg(&ctx, item).then_some(idx));
+        let initially_preferred = preferred_indices
+            .next()
+            .and_then(|idx| preferred_indices.next().is_none().then_some(idx));
         if trimmed.is_empty() {
-            return items.iter().map(SuggestionRow::from_arg).collect();
+            return (
+                items.iter().map(SuggestionRow::from_arg).collect(),
+                initially_preferred,
+            );
         }
         let hits = self
             .matcher
             .rank(items.as_slice(), trimmed, items.len(), |item| {
                 item.match_text.as_str()
             });
-        hits.into_iter()
+        let rows = hits
+            .into_iter()
             .map(|(idx, _)| {
-                let mut row = SuggestionRow::from_arg(&items[idx]);
+                let item = &items[idx];
+                let mut row = SuggestionRow::from_arg(item);
                 row.indices = self.argument_highlight_indices(trimmed, &row.display);
                 row
             })
-            .collect()
+            .collect();
+        // Typed queries always start at fuzzy-rank zero, so the item-index
+        // preference is intentionally not translated into ranked-row space.
+        (rows, None)
     }
 }
 
@@ -2031,6 +2061,125 @@ mod tests {
                 .any(|row| row.display.contains("Example"))
         );
         assert!(snapshot.args_range.is_some());
+    }
+
+    fn two_model_picker_state() -> ModelState {
+        let mut models = ModelState::default();
+        for (id, name) in [("alpha", "Alpha"), ("zulu", "Zulu")] {
+            let model_id = acp::ModelId::new(Arc::from(id));
+            models.available.insert(
+                model_id.clone(),
+                acp::ModelInfo::new(model_id, name.to_string()),
+            );
+        }
+        models.current = Some(acp::ModelId::new(Arc::from("zulu")));
+        models
+    }
+
+    #[test]
+    fn model_picker_initially_selects_current_model() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = two_model_picker_state();
+
+        ctrl.refresh(&state, "/model ", 7, &models);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.selected, 1, "catalog order keeps Zulu second");
+        assert_eq!(
+            snapshot.selection().map(|row| row.insert_text.trim_end()),
+            Some("zulu")
+        );
+    }
+
+    #[test]
+    fn model_picker_nonempty_query_keeps_fuzzy_rank_selection() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = two_model_picker_state();
+
+        let text = "/model alpha";
+        ctrl.refresh(&state, text, text.len(), &models);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.selected, 0);
+        assert_eq!(
+            snapshot.selection().map(|row| row.insert_text.trim_end()),
+            Some("alpha"),
+            "a typed query must use fuzzy rank, not the current-model preference"
+        );
+    }
+
+    #[test]
+    fn model_picker_refresh_preserves_user_navigation() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = two_model_picker_state();
+
+        ctrl.refresh(&state, "/model ", 7, &models);
+        ctrl.move_selection(&state, 1);
+        assert_eq!(
+            state
+                .snapshot()
+                .selection()
+                .map(|row| row.insert_text.trim_end().to_string()),
+            Some("alpha".to_string()),
+            "navigation wraps from preferred Zulu to Alpha"
+        );
+
+        ctrl.refresh(&state, "/model ", 7, &models);
+
+        assert_eq!(
+            state
+                .snapshot()
+                .selection()
+                .map(|row| row.insert_text.trim_end().to_string()),
+            Some("alpha".to_string()),
+            "refresh must carry the user's selection instead of reapplying preference"
+        );
+    }
+
+    #[test]
+    fn model_picker_preference_applies_after_same_range_command_change() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = two_model_picker_state();
+
+        ctrl.refresh(&state, "/theme ", 7, &models);
+        assert!(
+            state.snapshot().open,
+            "theme picker must establish args state"
+        );
+
+        ctrl.refresh(&state, "/model ", 7, &models);
+
+        assert_eq!(
+            state
+                .snapshot()
+                .selection()
+                .map(|row| row.insert_text.trim_end().to_string()),
+            Some("zulu".to_string()),
+            "same args range from another command is a fresh model context"
+        );
+    }
+
+    #[test]
+    fn model_picker_without_catalog_current_falls_back_to_first_row() {
+        for current in [None, Some(acp::ModelId::new(Arc::from("not-in-catalog")))] {
+            let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+            let state = SlashState::default();
+            let mut models = two_model_picker_state();
+            models.current = current;
+
+            ctrl.refresh(&state, "/model ", 7, &models);
+
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot.selected, 0);
+            assert_eq!(
+                snapshot.selection().map(|row| row.insert_text.trim_end()),
+                Some("alpha")
+            );
+        }
     }
 
     #[test]

@@ -961,7 +961,7 @@ impl SessionActor {
         );
         let active_session_config = self.reconstruct_full_config().await;
         let resolved_describe = self
-            .resolve_aux_sampler_config(&self.image_description_model)
+            .resolve_aux_sampler_config(&self.image_description_model.borrow())
             .await;
         let (describe_model, sampler_config) =
             crate::agent::config::finalize_image_describe_sampler_config(

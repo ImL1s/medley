@@ -34,7 +34,7 @@ Grok processes the prompt, runs any necessary tools, and prints the result to st
 | `--tools <TOOLS>`       | Allowlist of built-in tools (comma-separated). MCP meta-tools remain available unless denied. Headless only. |
 | `--disallowed-tools <TOOLS>` | Denylist of built-in tools to remove (comma-separated). Supports `Agent` entries. Headless only. |
 | `--max-turns <N>`       | Maximum number of agentic turns before stopping. Headless only. |
-| `--reasoning-effort` / `--effort <LEVEL>` | Reasoning effort for reasoning models. Canonical levels: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (each a distinct tier; a model only accepts the levels its menu advertises). Also accepts per-model menu option ids (e.g. `deep` → mapped wire value), same as `/effort`. Works in TUI and headless. On a model without reasoning-effort support the flag is dropped with a stderr note naming the `supports_reasoning_effort` config switch; an unknown level is a hard error. |
+| `--reasoning-effort` / `--effort <LEVEL>` | Reasoning effort for reasoning models. Canonical levels: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` (each a distinct tier; a model only accepts the levels its menu advertises). Also accepts per-model menu option ids (e.g. `deep` → mapped wire value), same as `/effort`. Works in TUI and headless. On a model without reasoning-effort support the flag is dropped with a stderr note naming the `supports_reasoning_effort` config switch; an unknown level is a hard error. |
 | `--permission-mode <MODE>` | Permission mode. `bypassPermissions` enables always-approve (see [Permissions and safety](22-permissions-and-safety.md#permission-modes)); for deny-by-default use `defaultMode` in `.claude/settings.json`. |
 | `--allow <RULE>`        | Permission allow rule with glob patterns (repeatable). Works in TUI and headless. |
 | `--deny <RULE>`         | Permission deny rule with glob patterns (repeatable). Works in TUI and headless. |
@@ -45,6 +45,8 @@ Grok processes the prompt, runs any necessary tools, and prints the result to st
 | `--sandbox <PROFILE>`   | Sandbox profile for filesystem/network access         |
 
 > **Note:** `--tools`, `--disallowed-tools`, `--max-turns`, and `--agents` are headless-only flags. If used in the interactive TUI, a warning is printed and the flag is ignored. `--reasoning-effort`/`--effort`, `--permission-mode`, `--allow`, and `--deny` work in both modes. For more flags (agents and worktrees), see [Additional Headless Flags](#additional-headless-flags).
+
+`ultra` is accepted only for a model whose advertised effort menu includes it. It remains distinct in the client and saved session, while Responses-family requests encode it as `max`. In an authenticated Codex session, `ultra` also enables proactive multi-agent guidance. The model decides whether the task and available tools justify spawning subagents; it does not spawn on every turn, and `--disallowed-tools "Agent"` still blocks spawning.
 
 ### Tool Filtering
 

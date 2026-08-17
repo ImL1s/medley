@@ -135,11 +135,55 @@ pub struct TaskWakeAdmission {
     pub respond_to: oneshot::Sender<bool>,
     pub fallback: TaskWakeFallback,
 }
+/// Immutable inputs prepared by the ACP handler for one actor-owned model
+/// switch transaction. The actor revalidates harness compatibility and all
+/// zero-turn prerequisites before mutating either harness or model state.
+pub struct PreparedModelSwitch {
+    pub catalog_identity: xai_chat_state::CatalogIdentity,
+    pub resolved_model: crate::agent::config::ModelEntry,
+    pub sampling_config: xai_grok_sampler::SamplerConfig,
+    pub use_concise: bool,
+    pub auto_compact_threshold_percent: u8,
+    pub required_agent_type: String,
+    pub required_definition: Option<xai_grok_agent::AgentDefinition>,
+    /// `Some` only when the summary lane inherits the operative model.
+    pub summary_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    /// Whether the web-search lane inherits the operative model. Its sampling
+    /// config remains `None` when the inherited target is not usable.
+    pub replace_inherited_web_search: bool,
+    pub web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    /// Disable reason produced by the same preflight that prepared the client.
+    pub web_search_disable_notice: Option<crate::session::WebSearchDisabledNotice>,
+    pub web_search_alpha_test_key: Option<String>,
+    /// `Some` only when image description inherits the operative model.
+    pub image_description_model: Option<String>,
+}
+
+/// Web-search state committed as part of a model switch.
+#[derive(Debug)]
+pub struct AppliedWebSearchState {
+    pub enabled: bool,
+    pub disable_notice: Option<crate::session::WebSearchDisabledNotice>,
+}
+
+/// Receipt returned only after the actor has committed the complete switch.
+#[derive(Debug)]
+pub struct AppliedModelSwitch {
+    pub previous_model_id: acp::ModelId,
+    pub catalog_model_id: acp::ModelId,
+    pub did_rebuild: bool,
+    pub active_agent_type: Option<String>,
+    pub web_search: Option<AppliedWebSearchState>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownKind {
     /// Running work survives (idle unload, process quiesce, subagent teardown).
     Graceful,
     CancelRunningTurn,
+    /// Tear down an actor that never passed the resident publication gate.
+    /// Skips session-end hooks, memory, feedback, and normal persistence.
+    AbortUnpublished,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelTrigger {
@@ -151,7 +195,6 @@ pub enum CancelTrigger {
     SessionDelete,
     Client(String),
 }
-/// What a cancel means for the session, derived from its trigger by [`CancelTrigger::kind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelKind {
     StopGesture,
@@ -178,6 +221,10 @@ impl CancelTrigger {
             Self::Shutdown | Self::SessionClose | Self::SessionDelete => CancelKind::Teardown,
         }
     }
+    /// Stop gesture (Esc/Ctrl+C/`Client`); unrecognized wire names fail closed.
+    pub fn is_stop_gesture(&self) -> bool {
+        matches!(self, Self::Esc | Self::CtrlC | Self::Client(_))
+    }
     pub fn as_str(&self) -> &str {
         match self {
             Self::Esc => "esc",
@@ -195,9 +242,30 @@ pub struct CancelOptions {
     pub cancel_subagents: bool,
     pub kill_background_tasks: bool,
     pub rewind_if_no_output: bool,
+    /// [`CancelTrigger::is_stop_gesture`] arms the task-wake barrier.
     pub trigger: Option<CancelTrigger>,
-    /// Drives the cancel-rate metric, and marks an untriggered cancel as the user's.
+    /// Drives the cancel-rate metric.
     pub user_initiated: bool,
+}
+/// Atomic parent-session capability snapshot used at subagent spawn.
+///
+/// Captured by the session actor immediately before child construction so
+/// subagents inherit current MCP/tool/skill capabilities instead of the
+/// session-handle bootstrap snapshot.
+#[derive(Clone)]
+pub struct SubagentCapabilitySnapshot {
+    /// Live MCP server configs (`mcp_state.configs`) at snapshot time.
+    pub mcp_configs: Vec<acp::McpServer>,
+    /// Optional inherited MCP pool snapshot for child-client reuse.
+    pub mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
+    /// Client-registered hooks inherited by the child.
+    pub client_hooks: crate::extensions::hooks::ClientHooks,
+    /// Parent session's resolved tool schema for verbatim forks.
+    pub tool_definitions: Vec<xai_grok_sampling_types::ToolSpec>,
+    /// Parent session's current slash-skill baseline.
+    pub skills: Vec<xai_grok_tools::implementations::skills::types::SkillInfo>,
+    /// MCP generation observed when this snapshot stabilized.
+    pub mcp_generation: u64,
 }
 pub enum SessionCommand {
     Initialize {
@@ -266,46 +334,16 @@ pub enum SessionCommand {
         session_mode: acp::SessionModeId,
         responds_to: oneshot::Sender<()>,
     },
-    SetSessionModel {
-        sampling_config: xai_grok_sampler::SamplerConfig,
-        use_concise: bool,
-        /// When `false`, skip the system prompt rewrite (concise/default swap).
-        /// Set to `false` for forked sessions so mid-session model switches
-        /// cannot contaminate the inherited prompt configuration.
-        apply_prompt_override: bool,
-        /// When `true`, suppress the system prompt rewrite even though
-        /// `apply_prompt_override` may be `true`. Set by the model-switch
-        /// orchestrator immediately after a successful
-        /// `RebuildAgentForDefinition` so the fresh harness's prompt
-        /// (already installed by the rebuild handler) is not clobbered by
-        /// the concise/default swap below.
-        skip_prompt_rewrite: bool,
-        /// Re-resolved auto-compact threshold for the new model. Computed
-        /// by `MvpAgent` against the new model id so per-model remote settings
-        /// and per-model user TOML overrides target the right model after a
-        /// `/model` switch. The session actor stores this on
-        /// `compaction.threshold_percent` (which is `Cell<u8>` so it can
-        /// update without `&mut self`).
-        auto_compact_threshold_percent: u8,
-        responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
-    },
-    /// Zero-turn harness rebuild: build a brand-new `Agent` from the
-    /// session's `AgentRebuildSpec` and the new `AgentDefinition`,
-    /// re-register MCP tools, swap the live `Agent`, rewrite the
-    /// system message in the conversation, persist the new prompt
-    /// artifacts, and update `active_agent_type`.
-    ///
-    /// Triggered by `MvpAgent::set_session_model` when the new model's
-    /// `agent_type` differs from the session's current one and no user
-    /// message has been sent yet (`turn_count == 0`).
-    RebuildAgentForDefinition {
-        definition: xai_grok_agent::AgentDefinition,
-        responds_to: oneshot::Sender<Result<(), acp::Error>>,
+    /// Atomically validate, prepare, and commit a model switch. A required
+    /// zero-turn harness replacement is built before any live state changes.
+    ApplyModelSwitch {
+        prepared: Box<PreparedModelSwitch>,
+        responds_to: oneshot::Sender<Result<AppliedModelSwitch, acp::Error>>,
     },
     /// Override the model name and optionally inject extra HTTP headers
     /// into the session's sampling config.
     ///
-    /// Unlike `SetSessionModel` (which requires a fully resolved `ModelEntry`
+    /// Unlike `ApplyModelSwitch` (which requires a fully resolved `ModelEntry`
     /// and does NOT update `primaryModelId` in signals — the resolved model
     /// is already tracked via inference responses), this command also calls
     /// `set_primary_model()` so that signals report the override model
@@ -461,13 +499,6 @@ pub enum SessionCommand {
         mcp_servers: Vec<acp::McpServer>,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
-    /// Re-apply per-attachment policy (MCP init strategy, delivery tools)
-    /// from a resident `session/load` whose request carried explicit
-    /// `startupHints`. Spawn-time structural hints are NOT touched. Sent
-    /// fire-and-forget alongside `UpdateMcpServers` on the reconnect rail.
-    UpdateAttachPolicy {
-        startup_hints: Box<crate::session::StartupHints>,
-    },
     /// Toggle an MCP server on/off within the session actor's event loop.
     /// Atomic read-modify-write avoids TOCTOU races with background config
     /// refreshes that can change `mcp_state.configs` between a snapshot read
@@ -501,6 +532,14 @@ pub enum SessionCommand {
     /// Snapshot the session's live MCP client pool for subagent inheritance.
     SnapshotMcpPool {
         respond_to: oneshot::Sender<Option<crate::session::mcp_servers::SharedMcpPool>>,
+    },
+    /// Snapshot the parent capabilities a subagent inherits at spawn.
+    ///
+    /// Returns an error when the snapshot cannot be stabilized (e.g. MCP
+    /// generation churn while collecting multi-surface state), so callers fail
+    /// the spawn instead of silently falling back to stale bootstrap copies.
+    SnapshotSubagentCapabilities {
+        respond_to: oneshot::Sender<Result<SubagentCapabilitySnapshot, String>>,
     },
     /// Snapshot the session's client-registered hooks so a subagent inherits the same
     /// PreToolUse gate and observe hooks over the parent's connection.
@@ -539,6 +578,11 @@ pub enum SessionCommand {
         respond_to: oneshot::Sender<Result<(), String>>,
     },
     RetryAuthRequiredServers {
+        respond_to: oneshot::Sender<()>,
+    },
+    /// Close restricted external-tool dispatch before a managed gateway
+    /// catalog fetch can change the ownership of an exact tool identity.
+    BeginManagedGatewayAdmission {
         respond_to: oneshot::Sender<()>,
     },
     RefreshMcpSearchIndex,
@@ -715,6 +759,9 @@ pub enum SessionCommand {
     /// Re-discover skills from disk, update the SkillManager baseline,
     /// and re-advertise slash commands to the client.
     ReloadSkills,
+    /// Drop the memoized per-model auth facts so the next reconstruct
+    /// re-resolves `auth_scheme` / BYOK after a catalog hot-reload.
+    InvalidateModelAuthMemo,
     /// Dispatch session_start hook using the actor's loaded HookRegistry.
     DispatchSessionStartHook {
         /// "new" for brand new sessions, "load" for sessions loaded from disk.
@@ -854,23 +901,16 @@ pub enum SessionCommand {
 }
 #[cfg(test)]
 mod cancel_trigger_tests {
-    use super::{CancelKind, CancelTrigger};
+    use super::CancelTrigger;
     #[test]
-    fn classifies_every_trigger() {
-        for (trigger, expected) in [
-            (CancelTrigger::Esc, CancelKind::StopGesture),
-            (CancelTrigger::CtrlC, CancelKind::StopGesture),
-            (CancelTrigger::from_client("mouse"), CancelKind::StopGesture),
-            (
-                CancelTrigger::from_client("some_future_gesture"),
-                CancelKind::StopGesture,
-            ),
-            (CancelTrigger::SendNow, CancelKind::Replace),
-            (CancelTrigger::Shutdown, CancelKind::Teardown),
-            (CancelTrigger::SessionClose, CancelKind::Teardown),
-            (CancelTrigger::SessionDelete, CancelKind::Teardown),
-        ] {
-            assert_eq!(trigger.kind(), expected, "{trigger:?}");
-        }
+    fn only_stop_gestures_arm_the_wake_barrier() {
+        assert!(!CancelTrigger::SendNow.is_stop_gesture());
+        assert!(!CancelTrigger::SessionDelete.is_stop_gesture());
+        assert!(!CancelTrigger::Shutdown.is_stop_gesture());
+        assert!(!CancelTrigger::SessionClose.is_stop_gesture());
+        assert!(CancelTrigger::Esc.is_stop_gesture());
+        assert!(CancelTrigger::CtrlC.is_stop_gesture());
+        assert!(CancelTrigger::from_client("mouse").is_stop_gesture());
+        assert!(CancelTrigger::from_client("some_future_gesture").is_stop_gesture());
     }
 }

@@ -24,6 +24,7 @@ pub(crate) struct NotificationSender {
     /// Persistence channel for writing updates to disk.
     pub persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
     pub disk_full: watch::Receiver<bool>,
+    pub persistence_is_noop: bool,
 }
 
 impl NotificationSender {

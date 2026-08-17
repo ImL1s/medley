@@ -255,7 +255,13 @@ fn read_modify_write(summary_path: &Path, patch: &SummaryPatch) -> io::Result<bo
 }
 
 fn open_lock_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
+    let mut options = OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.share_mode(0x0000_0007);
+    }
+    options
         .read(true)
         .write(true)
         .create(true)

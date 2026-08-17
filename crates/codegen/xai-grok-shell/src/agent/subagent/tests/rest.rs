@@ -3,6 +3,19 @@ use super::*;
 use crate::test_support::lsp_runtime::{ctx_with_toggle, test_gateway};
 use crate::upload::trace::SubagentSpawnedRef;
 use xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend;
+
+fn test_catalog_identity(
+    model_id: &str,
+    route: &str,
+    lineage: xai_chat_state::CatalogResolutionLineage,
+) -> xai_chat_state::CatalogIdentity {
+    xai_chat_state::CatalogIdentity {
+        model_id: model_id.to_string(),
+        route: route.to_string(),
+        lineage,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    }
+}
 #[test]
 fn normalize_forked_context_strips_project_layout() {
     use xai_grok_sampling_types::conversation::ConversationItem;
@@ -346,13 +359,23 @@ fn resumed_from_field_in_meta_roundtrips() {
         child_cwd: None,
         worktree_path: None,
         snapshot_ref: None,
-        effective_model_id: None,
+        effective_model_id: Some("gpt-5.3-codex-spark".into()),
+        effective_model_route: Some("gpt-5.3-codex-spark".into()),
+        effective_model_agent_type: Some("grok-build-plan".into()),
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("resumed_from"));
     assert!(json.contains("prev-subagent-id"));
     let parsed: SubagentMeta = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.resumed_from.as_deref(), Some("prev-subagent-id"));
+    assert_eq!(
+        parsed.effective_model_route.as_deref(),
+        Some("gpt-5.3-codex-spark"),
+    );
+    assert_eq!(
+        parsed.effective_model_agent_type.as_deref(),
+        Some("grok-build-plan"),
+    );
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
         None,
@@ -366,8 +389,15 @@ fn resumed_from_field_in_meta_roundtrips() {
         0,
     );
     assert_eq!(gcs.resumed_from.as_deref(), Some("prev-subagent-id"));
+    assert_eq!(
+        gcs.model_route.as_deref(),
+        Some("gpt-5.3-codex-spark"),
+    );
+    assert_eq!(gcs.model_agent_type.as_deref(), Some("grok-build-plan"));
     let gcs_json = serde_json::to_string(&gcs).unwrap();
     assert!(gcs_json.contains("resumedFrom"));
+    assert!(gcs_json.contains("modelRoute"));
+    assert!(gcs_json.contains("modelAgentType"));
 }
 #[test]
 fn resumed_from_none_not_serialized_in_meta() {
@@ -394,6 +424,8 @@ fn resumed_from_none_not_serialized_in_meta() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(
@@ -415,6 +447,8 @@ fn backward_compat_meta_without_resumed_from() {
         }"#;
     let meta: SubagentMeta = serde_json::from_str(json).unwrap();
     assert!(meta.resumed_from.is_none());
+    assert!(meta.effective_model_route.is_none());
+    assert!(meta.effective_model_agent_type.is_none());
 }
 #[test]
 fn snapshot_ref_field_in_meta_roundtrips() {
@@ -441,6 +475,8 @@ fn snapshot_ref_field_in_meta_roundtrips() {
         worktree_path: Some("/tmp/grok-wt/sa-snap".into()),
         snapshot_ref: Some("refs/grok/subagent-snapshots/sa-snap".into()),
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("snapshot_ref"));
@@ -491,6 +527,8 @@ fn snapshot_test_meta(id: &str) -> SubagentMeta {
         worktree_path: Some("/tmp/grok-wt/subagent-x".into()),
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     }
 }
 /// The follow-up writer persists `snapshot_ref` into an already-finalized
@@ -686,6 +724,8 @@ fn subagent_session_metadata_roundtrip() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -746,6 +786,8 @@ fn subagent_session_metadata_non_forked() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -810,6 +852,8 @@ fn upload_lifecycle_spawn_then_completion_preserves_fields() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let spawn_gcs = SubagentSessionMetadata::from_meta(
         &spawn_meta,
@@ -893,6 +937,8 @@ fn upload_lifecycle_failure_preserves_error() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -941,6 +987,8 @@ fn session_metadata_session_kind_for_resumed() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -1027,8 +1075,8 @@ fn resume_source_worktree_reuse() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
-        model_agent_type: None,
         model_route: None,
+        model_agent_type: None,
     };
     let worktree = source_with_worktree.worktree_path.clone();
     assert_eq!(
@@ -1047,8 +1095,8 @@ fn resume_source_worktree_reuse() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
-        model_agent_type: None,
         model_route: None,
+        model_agent_type: None,
     };
     assert!(
             source_without_worktree.worktree_path.is_none(),
@@ -1093,8 +1141,8 @@ fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
-        model_agent_type: None,
         model_route: None,
+        model_agent_type: None,
     };
     assert_eq!(
             resume_inherited_cwd(Some(&present)),
@@ -1126,8 +1174,8 @@ fn select_override_cwd_resume_never_falls_through_to_request_cwd() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
-        model_agent_type: None,
         model_route: None,
+        model_agent_type: None,
     };
     assert_eq!(select_override_cwd(Some(&source), Some("/x")), None);
 }
@@ -1242,6 +1290,8 @@ fn durable_fallback_roundtrips_child_cwd_and_worktree() {
         worktree_path: Some("/tmp/grok-wt/sa-dur".into()),
         snapshot_ref: None,
         effective_model_id: Some("grok-3".into()),
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();
@@ -1281,6 +1331,8 @@ fn durable_fallback_rejects_running_status() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     write_subagent_meta(&parent_dir, &meta);
     let data = std::fs::read_to_string(parent_dir.join("meta.json")).unwrap();
@@ -1297,25 +1349,15 @@ fn durable_fallback_rejects_running_status() {
 fn drain_cancelled_finish_cmds(
     cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
     id: &str,
-    expected_error: &str,
 ) -> usize {
     let mut count = 0;
     while let Ok(cmd) = cmd_rx.try_recv() {
         if let SessionCommand::XaiSessionNotification { notification } = cmd
-            && let SessionUpdate::SubagentFinished {
-                subagent_id,
-                status,
-                error,
-                will_wake,
-                ..
-            } = &notification.update && subagent_id == id
+            && let SessionUpdate::SubagentFinished { subagent_id, status, error, .. } = &notification
+                .update && subagent_id == id
         {
             assert_eq!(status, "cancelled");
-            assert_eq!(error.as_deref(), Some(expected_error));
-            assert!(
-                    !*will_wake,
-                    "synthesized orphan finish must not auto-wake"
-                );
+            assert_eq!(error.as_deref(), Some("interrupted by process restart"));
             count += 1;
         }
     }
@@ -1339,14 +1381,10 @@ fn drain_cancelled_finish_broadcasts(
                 args.request.params.get(),
             )
             .expect("params must deserialize as SessionNotification");
-        if let SessionUpdate::SubagentFinished { subagent_id, status, will_wake, .. } = &notification
+        if let SessionUpdate::SubagentFinished { subagent_id, status, .. } = &notification
             .update && subagent_id == id
         {
             assert_eq!(status, "cancelled");
-            assert!(
-                    !*will_wake,
-                    "synthesized orphan finish must not auto-wake"
-                );
             count += 1;
         }
     }
@@ -1377,6 +1415,8 @@ fn running_test_meta(id: &str, parent_session_id: &str) -> SubagentMeta {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     }
 }
 fn inspection(id: &str, status: SubagentSnapshotStatus) -> SubagentInspection {
@@ -1424,60 +1464,9 @@ async fn reconcile_with_inspections(
                 "parent-x",
                 gateway,
                 parent_cmd_tx,
-                ORPHAN_RECONCILE_REASON,
-                std::sync::Arc::new(tokio::sync::Mutex::new(())),
             ),
             respond,
         );
-}
-async fn live_reconcile_with_inspections(
-    inspections: HashMap<String, Option<SubagentInspection>>,
-    session_dir: &Path,
-    gateway: &GatewaySender,
-    parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
-) {
-    live_reconcile_with_heal_lock(
-            inspections,
-            session_dir,
-            gateway,
-            parent_cmd_tx,
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        )
-        .await
-}
-async fn live_reconcile_with_heal_lock(
-    inspections: HashMap<String, Option<SubagentInspection>>,
-    session_dir: &Path,
-    gateway: &GatewaySender,
-    parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
-    heal_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-) {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let backend = ChannelBackend::new(event_tx);
-    let respond = tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            let SubagentEvent::Inspect(request) = event else {
-                continue;
-            };
-            let value = inspections.get(&request.subagent_id).cloned().flatten();
-            let _ = request.respond_to.send(value);
-        }
-    });
-    tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            reconcile_live_orphaned_subagents(
-                &backend,
-                session_dir,
-                "parent-x",
-                gateway,
-                parent_cmd_tx,
-                heal_lock,
-            ),
-        )
-        .await
-        .expect("live reconcile must not hang");
-    drop(backend);
-    let _ = respond.await;
 }
 #[tokio::test]
 async fn reconcile_orphan_flips_running_meta_to_cancelled() {
@@ -1503,10 +1492,7 @@ async fn reconcile_orphan_flips_running_meta_to_cancelled() {
     assert_eq!(reread.status, "cancelled");
     assert_eq!(reread.tool_calls, Some(0));
     assert_eq!(reread.turns, Some(0));
-    assert_eq!(
-            drain_cancelled_finish_cmds(&mut cmd_rx, id, ORPHAN_RECONCILE_REASON),
-            1
-        );
+    assert_eq!(drain_cancelled_finish_cmds(&mut cmd_rx, id), 1);
     assert_eq!(
             drain_cancelled_finish_broadcasts(&mut gateway_rx, id),
             1
@@ -1583,344 +1569,7 @@ async fn reconcile_reemits_shared_actor_terminal_outcome() {
             &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
         )
         .unwrap();
-    assert_eq!(reread.status, "completed");
-    assert_eq!(reread.tool_calls, Some(7));
-    assert_eq!(reread.turns, Some(2));
-}
-#[tokio::test]
-async fn live_reconcile_finalizes_running_meta_not_in_coordinator() {
-    use crate::test_support::lsp_runtime::test_gateway_with_receiver;
-    let session_dir = tempfile::TempDir::new().unwrap();
-    let id = "sa-live-orphan";
-    let sub_dir = session_dir.path().join("subagents").join(id);
-    write_subagent_meta(&sub_dir, &running_test_meta(id, "parent-x"));
-    let (gateway, mut gateway_rx) = test_gateway_with_receiver();
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-    live_reconcile_with_inspections(
-            HashMap::from([(id.to_string(), None)]),
-            session_dir.path(),
-            &gateway,
-            Some(&cmd_tx),
-        )
-        .await;
-    let reread: SubagentMeta = serde_json::from_str(
-            &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
-        )
-        .unwrap();
-    assert_eq!(reread.status, "cancelled");
-    assert_eq!(reread.tool_calls, Some(0));
-    assert_eq!(reread.turns, Some(0));
-    assert_eq!(
-            drain_cancelled_finish_cmds(&mut cmd_rx, id, LIVE_ORPHAN_RECONCILE_REASON),
-            1
-        );
-    assert_eq!(
-            drain_cancelled_finish_broadcasts(&mut gateway_rx, id),
-            1
-        );
-}
-#[tokio::test]
-async fn live_reconcile_skips_live_coordinator_child() {
-    let session_dir = tempfile::TempDir::new().unwrap();
-    let id = "sa-live-keep";
-    let sub_dir = session_dir.path().join("subagents").join(id);
-    write_subagent_meta(&sub_dir, &running_test_meta(id, "parent-x"));
-    live_reconcile_with_inspections(
-            HashMap::from([
-                (
-                    id.to_string(),
-                    Some(
-                        inspection(
-                            id,
-                            SubagentSnapshotStatus::Running {
-                                turn_count: 1,
-                                tool_call_count: 0,
-                                tokens_used: 0,
-                                context_window_tokens: 0,
-                                context_usage_pct: 0,
-                                tools_used: Vec::new(),
-                                error_count: 0,
-                            },
-                        ),
-                    ),
-                ),
-            ]),
-            session_dir.path(),
-            &test_gateway(),
-            None,
-        )
-        .await;
-    let reread: SubagentMeta = serde_json::from_str(
-            &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
-        )
-        .unwrap();
     assert_eq!(reread.status, "running");
-}
-#[tokio::test]
-async fn live_reconcile_reemitted_finish_has_will_wake_false() {
-    let session_dir = tempfile::TempDir::new().unwrap();
-    let id = "sa-live-raced";
-    let sub_dir = session_dir.path().join("subagents").join(id);
-    write_subagent_meta(&sub_dir, &running_test_meta(id, "parent-x"));
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-    live_reconcile_with_inspections(
-            HashMap::from([
-                (
-                    id.to_string(),
-                    Some(
-                        inspection(
-                            id,
-                            SubagentSnapshotStatus::Completed {
-                                output: "done".to_string(),
-                                tool_calls: 3,
-                                turns: 1,
-                                worktree_path: None,
-                            },
-                        ),
-                    ),
-                ),
-            ]),
-            session_dir.path(),
-            &test_gateway(),
-            Some(&cmd_tx),
-        )
-        .await;
-    let finish = std::iter::from_fn(|| cmd_rx.try_recv().ok())
-        .find_map(|command| {
-            let SessionCommand::XaiSessionNotification { notification } = command else {
-                return None;
-            };
-            let SessionUpdate::SubagentFinished { status, will_wake, .. } = notification
-                .update else {
-                return None;
-            };
-            Some((status, will_wake))
-        });
-    assert_eq!(finish, Some(("completed".to_string(), false)));
-    let reread: SubagentMeta = serde_json::from_str(
-            &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
-        )
-        .unwrap();
-    assert_eq!(reread.status, "completed");
-    assert_eq!(reread.tool_calls, Some(3));
-    assert_eq!(reread.turns, Some(1));
-}
-#[tokio::test]
-async fn live_reconcile_persists_terminal_meta_so_second_tick_is_noop() {
-    let session_dir = tempfile::TempDir::new().unwrap();
-    let id = "sa-live-once";
-    let sub_dir = session_dir.path().join("subagents").join(id);
-    write_subagent_meta(&sub_dir, &running_test_meta(id, "parent-x"));
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-    let completed = inspection(
-        id,
-        SubagentSnapshotStatus::Completed {
-            output: "done".to_string(),
-            tool_calls: 4,
-            turns: 2,
-            worktree_path: None,
-        },
-    );
-    live_reconcile_with_inspections(
-            HashMap::from([(id.to_string(), Some(completed.clone()))]),
-            session_dir.path(),
-            &test_gateway(),
-            Some(&cmd_tx),
-        )
-        .await;
-    assert_eq!(
-            std::iter::from_fn(|| cmd_rx.try_recv().ok())
-                .filter(|command| matches!(
-                    command,
-                    SessionCommand::XaiSessionNotification {
-                        notification: SessionNotification {
-                            update: SessionUpdate::SubagentFinished { .. },
-                            ..
-                        }
-                    }
-                ))
-                .count(),
-            1
-        );
-    let reread: SubagentMeta = serde_json::from_str(
-            &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
-        )
-        .unwrap();
-    assert_eq!(reread.status, "completed");
-    assert_eq!(reread.tool_calls, Some(4));
-    live_reconcile_with_inspections(
-            HashMap::from([(id.to_string(), Some(completed))]),
-            session_dir.path(),
-            &test_gateway(),
-            Some(&cmd_tx),
-        )
-        .await;
-    assert!(cmd_rx.try_recv().is_err(), "second tick must not re-emit");
-    live_reconcile_with_inspections(
-            HashMap::from([(id.to_string(), None)]),
-            session_dir.path(),
-            &test_gateway(),
-            Some(&cmd_tx),
-        )
-        .await;
-    let reread: SubagentMeta = serde_json::from_str(
-            &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
-        )
-        .unwrap();
-    assert_eq!(reread.status, "completed");
-    assert_eq!(reread.tool_calls, Some(4));
-    assert!(cmd_rx.try_recv().is_err());
-}
-#[tokio::test]
-async fn live_reconcile_overlapping_ticks_emit_once() {
-    use crate::test_support::lsp_runtime::test_gateway_with_receiver;
-    let session_dir = tempfile::TempDir::new().unwrap();
-    let id = "sa-live-race";
-    let sub_dir = session_dir.path().join("subagents").join(id);
-    write_subagent_meta(&sub_dir, &running_test_meta(id, "parent-x"));
-    let (gateway, mut gateway_rx) = test_gateway_with_receiver();
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-    let completed = inspection(
-        id,
-        SubagentSnapshotStatus::Completed {
-            output: "done".to_string(),
-            tool_calls: 4,
-            turns: 2,
-            worktree_path: None,
-        },
-    );
-    let inspections = HashMap::from([(id.to_string(), Some(completed))]);
-    let heal_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-    tokio::join!(
-            live_reconcile_with_heal_lock(
-                inspections.clone(),
-                session_dir.path(),
-                &gateway,
-                Some(&cmd_tx),
-                heal_lock.clone(),
-            ),
-            live_reconcile_with_heal_lock(
-                inspections,
-                session_dir.path(),
-                &gateway,
-                Some(&cmd_tx),
-                heal_lock,
-            ),
-        );
-    let cmd_finishes = std::iter::from_fn(|| cmd_rx.try_recv().ok())
-        .filter(|command| {
-            matches!(
-                    command,
-                    SessionCommand::XaiSessionNotification {
-                        notification: SessionNotification {
-                            update: SessionUpdate::SubagentFinished { .. },
-                            ..
-                        }
-                    }
-                )
-        })
-        .count();
-    assert_eq!(cmd_finishes, 1);
-    let mut gateway_finishes = 0;
-    while let Ok(msg) = gateway_rx.try_recv() {
-        let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg else {
-            continue;
-        };
-        let notification: SessionNotification = serde_json::from_str(
-                args.request.params.get(),
-            )
-            .unwrap();
-        if matches!(
-                notification.update,
-                SessionUpdate::SubagentFinished { ref subagent_id, .. } if subagent_id == id
-            ) {
-            gateway_finishes += 1;
-        }
-    }
-    assert_eq!(gateway_finishes, 1);
-    let reread: SubagentMeta = serde_json::from_str(
-            &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
-        )
-        .unwrap();
-    assert_eq!(reread.status, "completed");
-    assert_eq!(reread.tool_calls, Some(4));
-}
-#[tokio::test]
-async fn live_reconcile_ignores_terminal_on_disk_meta() {
-    for status in ["completed", "failed", "cancelled"] {
-        let session_dir = tempfile::TempDir::new().unwrap();
-        let id = format!("sa-term-{status}");
-        let sub_dir = session_dir.path().join("subagents").join(&id);
-        let mut meta = running_test_meta(&id, "parent-x");
-        meta.status = status.to_string();
-        write_subagent_meta(&sub_dir, &meta);
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        live_reconcile_with_inspections(
-                HashMap::from([(id.clone(), None)]),
-                session_dir.path(),
-                &test_gateway(),
-                Some(&cmd_tx),
-            )
-            .await;
-        let reread: SubagentMeta = serde_json::from_str(
-                &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(reread.status, status);
-        assert!(
-                cmd_rx.try_recv().is_err(),
-                "terminal on-disk meta must not emit on a live tick ({status})"
-            );
-    }
-}
-#[tokio::test]
-async fn live_reconcile_persists_failed_and_cancelled_inspection() {
-    let cases = [
-        (
-            SubagentSnapshotStatus::Failed {
-                error: "boom".to_string(),
-            },
-            "failed",
-        ),
-        (
-            SubagentSnapshotStatus::Cancelled {
-                reason: Some("stop".to_string()),
-            },
-            "cancelled",
-        ),
-    ];
-    for (status, expected) in cases {
-        let session_dir = tempfile::TempDir::new().unwrap();
-        let id = format!("sa-insp-{expected}");
-        let sub_dir = session_dir.path().join("subagents").join(&id);
-        write_subagent_meta(&sub_dir, &running_test_meta(&id, "parent-x"));
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        live_reconcile_with_inspections(
-                HashMap::from([(id.clone(), Some(inspection(&id, status)))]),
-                session_dir.path(),
-                &test_gateway(),
-                Some(&cmd_tx),
-            )
-            .await;
-        let finish = std::iter::from_fn(|| cmd_rx.try_recv().ok())
-            .find_map(|command| {
-                let SessionCommand::XaiSessionNotification { notification } = command
-                else {
-                    return None;
-                };
-                let SessionUpdate::SubagentFinished { status, will_wake, .. } = notification
-                    .update else {
-                    return None;
-                };
-                Some((status, will_wake))
-            });
-        assert_eq!(finish, Some((expected.to_string(), false)));
-        let reread: SubagentMeta = serde_json::from_str(
-                &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(reread.status, expected);
-    }
 }
 #[tokio::test]
 async fn reconcile_dedups_replay_and_running_meta_sources() {
@@ -1937,10 +1586,7 @@ async fn reconcile_dedups_replay_and_running_meta_sources() {
             Some(&cmd_tx),
         )
         .await;
-    assert_eq!(
-            drain_cancelled_finish_cmds(&mut cmd_rx, id, ORPHAN_RECONCILE_REASON),
-            1
-        );
+    assert_eq!(drain_cancelled_finish_cmds(&mut cmd_rx, id), 1);
 }
 #[test]
 fn resume_rejects_conflicting_subagent_type() {
@@ -1953,8 +1599,8 @@ fn resume_rejects_conflicting_subagent_type() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
-        model_agent_type: None,
         model_route: None,
+        model_agent_type: None,
     };
     let request_type = "explore";
     assert_ne!(
@@ -1973,8 +1619,8 @@ fn resume_rejects_conflicting_persona() {
         subagent_type: "general-purpose".into(),
         persona: Some("implementer".into()),
         model_id: None,
-        model_agent_type: None,
         model_route: None,
+        model_agent_type: None,
     };
     let request_persona = Some("reviewer".to_string());
     let conflict = request_persona.as_deref() != source.persona.as_deref();
@@ -1991,8 +1637,8 @@ fn resume_allows_matching_identity() {
         subagent_type: "general-purpose".into(),
         persona: Some("implementer".into()),
         model_id: Some("grok-3".into()),
-        model_agent_type: None,
         model_route: None,
+        model_agent_type: None,
     };
     assert_eq!("general-purpose", source.subagent_type);
     assert_eq!(Some("implementer"), source.persona.as_deref());
@@ -2009,8 +1655,8 @@ fn resume_identity_does_not_gate_on_model() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: Some("grok-3".into()),
-        model_agent_type: None,
         model_route: None,
+        model_agent_type: None,
     };
     assert!(
             xai_grok_subagent_resolution::validate_resume_identity(
@@ -2055,6 +1701,8 @@ fn durable_meta_roundtrips_effective_model_id() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: Some("grok-3".into()),
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();
@@ -2211,7 +1859,12 @@ fn ctx_with_parent_chat_state(
 ) -> SubagentSpawnContext {
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new(session_model_id);
-    ctx.parent_chat_state = Some(spawn_test_parent_chat_state(inference_slug));
+    ctx.sampling_config_model_id = acp::ModelId::new(session_model_id);
+    ctx.sampling_config.model = inference_slug.to_string();
+    ctx.parent_chat_state = Some(spawn_test_parent_chat_state_with_catalog_identity(
+        session_model_id,
+        inference_slug,
+    ));
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
         available_models.clone(),
@@ -2233,24 +1886,66 @@ async fn read_parent_sampling_config_keeps_auto_catalog_id_with_routing_slug() {
 }
 #[tokio::test]
 async fn read_parent_sampling_config_keeps_auto_when_catalog_has_slug_key_only() {
-    let mut models = indexmap::IndexMap::new();
-    let mut entry = test_model_entry("grok-4.5");
-    entry.info.supports_backend_search = true;
-    models.insert("grok-4.5".to_string(), entry);
-    let ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
-    ctx.parent_chat_state
-        .as_ref()
-        .unwrap()
-        .update_sampling_config(xai_grok_sampling_types::SamplingConfig {
-            api_backend: crate::sampling::ApiBackend::Responses,
-            base_url: "https://api.x.ai/v1".to_string(),
-            ..test_sampling_config("grok-4.5")
+    use xai_grok_sampler::AuthScheme;
+
+    for (committed_auth, remapped_auth, expected_identity_auth) in [
+        (
+            xai_chat_state::CatalogAuthScheme::Bearer,
+            AuthScheme::None,
+            xai_chat_state::CatalogAuthScheme::None,
+        ),
+        (
+            xai_chat_state::CatalogAuthScheme::None,
+            AuthScheme::Bearer,
+            xai_chat_state::CatalogAuthScheme::Bearer,
+        ),
+    ] {
+        let mut models = indexmap::IndexMap::new();
+        let mut remapped = test_model_entry("grok-4.5");
+        remapped.info.auth_scheme = remapped_auth;
+        models.insert("grok-4.5".to_string(), remapped);
+        let ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
+        let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+        let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+        snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+            model_id: "auto".to_string(),
+            route: "grok-4.5".to_string(),
+            lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+            auth_scheme: Some(committed_auth),
         });
-    let (config, model_id) = read_parent_sampling_config(&ctx).await;
-    assert_eq!(config.model, "grok-4.5");
-    assert_eq!(model_id.0.as_ref(), "auto");
-    assert!(config.supports_backend_search);
-    assert_eq!(config.extra_response_includes, ["no_inline_citations"]);
+        chat.restore_snapshot(snapshot);
+        let prepared = read_parent_prepared_model(&ctx).await;
+        assert_eq!(prepared.sampling_config.model, "grok-4.5");
+        assert_eq!(prepared.model_id.0.as_ref(), "grok-4.5");
+        assert_eq!(
+            prepared.catalog_identity.auth_scheme,
+            Some(expected_identity_auth),
+            "a UniqueRoute remap must commit the remapped entry's auth with its new id"
+        );
+
+        let mut nested = ctx_with_parent_chat_state(
+            "grok-4.5",
+            "grok-4.5",
+            "grok-4.5",
+            indexmap::IndexMap::new(),
+        );
+        nested.sampling_config.auth_scheme = match remapped_auth {
+            AuthScheme::Bearer => AuthScheme::None,
+            AuthScheme::None => AuthScheme::Bearer,
+            AuthScheme::XApiKey => unreachable!("table excludes x-api-key"),
+        };
+        let nested_chat = nested.parent_chat_state.as_ref().expect("nested chat state");
+        let mut nested_snapshot = nested_chat.snapshot().await.expect("nested chat snapshot");
+        nested_snapshot.catalog_identity = Some(prepared.catalog_identity);
+        nested_chat.restore_snapshot(nested_snapshot);
+
+        let nested_prepared = read_parent_prepared_model(&nested).await;
+        assert_eq!(
+            nested_prepared.sampling_config.auth_scheme,
+            remapped_auth,
+            "a grandchild catalog miss must retain the auth committed by the remap"
+        );
+    }
 }
 #[tokio::test]
 async fn read_parent_sampling_config_fallback_uses_session_model_id() {
@@ -2258,6 +1953,7 @@ async fn read_parent_sampling_config_fallback_uses_session_model_id() {
     models.insert("composer-2-fast".to_string(), test_model_entry("composer-2-fast"));
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new("composer-2-fast");
+    ctx.sampling_config_model_id = acp::ModelId::new("composer-2-fast");
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.available_models = models;
@@ -2272,6 +1968,79 @@ async fn read_parent_sampling_config_fallback_uses_session_model_id() {
     assert_eq!(config.model, "composer-2-fast");
     assert_eq!(model_id.0.as_ref(), "composer-2-fast");
     assert_ne!(model_id.0.as_ref(), "auto");
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_binds_caps_to_startup_model() {
+    let startup_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let switched_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut startup = test_model_entry("startup-routing-model");
+    startup.info.codex_wire = Some(startup_caps.clone());
+    let mut switched = test_model_entry("switched-routing-model");
+    switched.info.codex_wire = Some(switched_caps);
+    let mut models = indexmap::IndexMap::new();
+    models.insert("startup-model".to_string(), startup);
+    models.insert("switched-model".to_string(), switched);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.model_id = acp::ModelId::new("switched-model");
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-model");
+    ctx.sampling_config.model = "startup-routing-model".to_string();
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("switched-model"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "startup-model");
+    assert_eq!(config.model, "startup-routing-model");
+    assert_eq!(config.codex_wire, Some(startup_caps));
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_reused_key_keeps_baseline_wire() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut replacement = test_model_entry("replacement-routing-model");
+    replacement.info.codex_wire = Some(replacement_caps);
+    let mut models = indexmap::IndexMap::new();
+    models.insert("auto".to_string(), replacement);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.model_id = acp::ModelId::new("auto");
+    ctx.sampling_config_model_id = acp::ModelId::new("auto");
+    ctx.sampling_config.model = "old-routing-model".to_string();
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "auto");
+    assert_eq!(config.model, "old-routing-model");
+    assert_eq!(config.codex_wire, Some(baseline_caps));
 }
 #[tokio::test]
 async fn read_parent_sampling_config_ignores_global_default() {
@@ -2308,6 +2077,39 @@ async fn read_parent_sampling_config_fallback_wires_bearer_resolver() {
     let (config, _) = read_parent_sampling_config(&ctx).await;
     assert!(config.bearer_resolver.is_some());
 }
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_binds_auth_to_selected_catalog_entry() {
+    let shared_slug = "shared-routing-slug";
+    let mut selected = test_model_entry(shared_slug);
+    selected.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+    let mut shadow = test_model_entry("unrelated-routing-slug");
+    shadow.api_key = Some("shadow-byok-key".to_string());
+    shadow.info.auth_scheme = xai_grok_sampler::AuthScheme::None;
+    let mut models = indexmap::IndexMap::new();
+    models.insert("selected-entry".to_string(), selected);
+    models.insert(shared_slug.to_string(), shadow);
+    let mut ctx = ctx_with_parent_chat_state(
+        "selected-entry",
+        shared_slug,
+        "selected-entry",
+        models,
+    );
+    ctx.parent_chat_state = None;
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    ctx.sampling_config.base_url = "https://api.x.ai/v1".to_string();
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "selected-entry");
+    assert_eq!(config.auth_scheme, xai_grok_sampler::AuthScheme::Bearer);
+    assert!(
+        config.bearer_resolver.is_some(),
+        "fallback auth must use the same selected entry as its capabilities"
+    );
+}
 /// The inherit-live path honors `would_strip_fallback_key` like the
 /// other two paths (it used to install the resolver unconditionally,
 /// stripping a no-session parent's env-key fallback).
@@ -2322,7 +2124,7 @@ async fn read_parent_sampling_config_live_never_strips_a_fallback_key() {
     chat.update_credentials(xai_chat_state::Credentials::bound(
         Some("xai-env-fallback".to_string()),
         xai_chat_state::AuthType::SessionToken,
-        xai_grok_sampling_types::CredentialSource::None,
+        xai_grok_sampler::CredentialSource::XaiSession,
     ));
     ctx.parent_chat_state = Some(chat);
     let (config, _) = read_parent_sampling_config(&ctx).await;
@@ -2331,6 +2133,129 @@ async fn read_parent_sampling_config_live_never_strips_a_fallback_key() {
             "with no session, the live path must not displace a fallback key"
         );
     assert_eq!(config.api_key.as_deref(), Some("xai-env-fallback"));
+}
+/// #136 steps 2–3: the live parent inherit must surface the provenance
+/// bound onto parent credentials when no declared header is present.
+/// Header re-derivation alone left ordinary session-token parents
+/// unlabelled (`None`), which is the under-restricting direction for L3.
+#[tokio::test]
+async fn read_parent_sampling_config_live_carries_stored_session_source() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    let chat = spawn_test_parent_chat_state("grok-4.5");
+    if let Some(mut cfg) = chat.get_sampling_config().await {
+        cfg.base_url = "https://api.x.ai/v1".to_string();
+        chat.update_sampling_config(cfg);
+    }
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("parent-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
+    ctx.parent_chat_state = Some(chat);
+    let (config, _) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.credential_source,
+        Some(xai_grok_sampler::CredentialSource::XaiSession),
+        "live inherit must re-emit the parent's stored provenance, not None"
+    );
+    assert_eq!(config.api_key.as_deref(), Some("parent-session-jwt"));
+}
+/// Same as the session case for a BYOK parent key.
+#[tokio::test]
+async fn read_parent_sampling_config_live_carries_stored_byok_source() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+    );
+    let chat = spawn_test_parent_chat_state("grok-4.5");
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("parent-byok-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+    ctx.parent_chat_state = Some(chat);
+    let (config, _) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.credential_source,
+        Some(xai_grok_sampler::CredentialSource::ModelApiKey),
+        "live inherit must re-emit the parent's stored BYOK provenance, not None"
+    );
+    assert_eq!(config.api_key.as_deref(), Some("parent-byok-key"));
+}
+/// #180 seam: dual-auth parent — model `api_key` plus a declared credential
+/// header still in the maps. `read_parent_sampling_config` must keep the
+/// stored `ModelApiKey` label, not invent `ExplicitHeader` from the maps
+/// while leaving `api_key` set (the L3 false-refuse on External).
+///
+/// Cheap fixture: same parent-chat spawn as the BYOK / declared-header
+/// siblings. Also asserts `SamplingClient::new` accepts the inherited
+/// config — coverage through the crate boundary.
+#[tokio::test]
+async fn read_parent_sampling_config_dual_auth_keeps_model_api_key_not_explicit_header() {
+    const MODEL_KEY: &str = "sk-upstream-byok";
+    const EDGE_HEADER: &str = "x-api-key";
+    const EDGE_VALUE: &str = "sk-gateway-edge";
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+    );
+    let chat = spawn_test_parent_chat_state("grok-4.5");
+    let mut cfg = chat
+        .get_sampling_config()
+        .await
+        .expect("test parent has a sampling config");
+    cfg.base_url = "https://gateway.example/v1".to_string();
+    cfg.endpoint_trust = Some(xai_grok_sampler::EndpointTrustClass::External);
+    cfg.extra_headers
+        .insert(EDGE_HEADER.to_string(), EDGE_VALUE.to_string());
+    chat.update_sampling_config(cfg);
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some(MODEL_KEY.to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+    ctx.parent_chat_state = Some(chat);
+
+    let (inherited, _) = read_parent_sampling_config(&ctx).await;
+    assert!(
+        matches!(
+            inherited.credential_source,
+            Some(xai_grok_sampler::CredentialSource::ModelApiKey)
+        ),
+        "dual-auth parent inherit must keep stored ModelApiKey; inventing \
+         ExplicitHeader from the maps while api_key remains is the #180 L3 \
+         false-refuse. got={:?}",
+        inherited.credential_source
+    );
+    assert!(
+        !matches!(
+            inherited.credential_source,
+            Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+        ),
+        "dual-auth parent inherit must not invent ExplicitHeader from the \
+         header maps. (Value withheld.)"
+    );
+    assert!(
+        inherited.api_key.as_deref() == Some(MODEL_KEY),
+        "dual-auth parent inherit must keep the model-owned api_key. \
+         (Value withheld.)"
+    );
+    assert!(
+        inherited
+            .extra_headers
+            .get(EDGE_HEADER)
+            .is_some_and(|v| v.as_str() == EDGE_VALUE),
+        "declared gateway edge header must still ship in extra_headers. \
+         (Value withheld.)"
+    );
+    xai_grok_sampler::SamplingClient::new(inherited).expect(
+        "dual-auth parent inherit with stored ModelApiKey must construct on \
+         an external origin; re-labelling ExplicitHeader while keeping \
+         api_key is the #180 L3 false-refuse",
+    );
 }
 /// `would_strip_fallback_key` on the inherit-fallback path: the baseline
 /// keeps the env `XAI_API_KEY` even while `auth_type` flips to
@@ -2362,6 +2287,41 @@ async fn read_parent_sampling_config_fallback_no_resolver_for_api_key_method() {
     let (config, _) = read_parent_sampling_config(&ctx).await;
     assert!(config.bearer_resolver.is_none());
 }
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_catalog_miss_keeps_bound_byok_source_terminal() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    ctx.auth = Some(crate::auth::GrokAuth {
+        key: "session-jwt".to_string(),
+        ..crate::auth::GrokAuth::test_default()
+    });
+    ctx.sampling_config_model_id = acp::ModelId::new("removed-byok-entry");
+    ctx.sampling_config.model = "removed-byok-route".to_string();
+    ctx.sampling_config.base_url = "https://api.x.ai/v1".to_string();
+    ctx.sampling_config.api_key = Some("provider-model-key".to_string());
+    ctx.sampling_config.credential_source = Some(
+        xai_grok_sampler::CredentialSource::AuthProvider {
+            name: "removed-provider".to_string(),
+        },
+    );
+    ctx.available_models.clear();
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-byok-entry");
+    assert_eq!(
+        prepared.sampling_config.api_key.as_deref(),
+        Some("provider-model-key")
+    );
+    assert!(
+        prepared.sampling_config.bearer_resolver.is_none(),
+        "actor-unavailable fallback must not replace bound provider auth with the session resolver"
+    );
+}
 /// The override path wires the resolver for a session key regardless of
 /// freshness. Hard-expired (the post-sleep 401 window) is the case that
 /// matters: gating on wire-validity would freeze the subagent for life;
@@ -2391,6 +2351,63 @@ fn resolve_model_override_wires_resolver_for_fresh_and_hard_expired_session_keys
         let (config, _) = resolve_model_override_to_config("grok-4.5", &ctx).unwrap();
         assert!(config.bearer_resolver.is_some(), "key={key}");
     }
+}
+
+#[test]
+fn resolve_model_override_prepared_carries_authoritative_reasoning_menu() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    let mut entry = test_model_entry("reasoning-model");
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "max".into(),
+        value: ReasoningEffort::Max,
+        label: "Maximum".into(),
+        description: None,
+        default: true,
+    }];
+    ctx.available_models
+        .insert("reasoning-model".to_string(), entry);
+
+    let prepared = resolve_model_override_to_prepared("reasoning-model", &ctx).unwrap();
+    assert!(prepared.supports_reasoning_effort);
+    assert_eq!(prepared.reasoning_efforts.len(), 1);
+    assert_eq!(prepared.reasoning_efforts[0].value, ReasoningEffort::Max);
+}
+/// #110: the pinned-model override path is a separate branch from live
+/// parent inheritance, and it wires the parent session resolver too. A pinned
+/// model authenticated only by a header the user declared must not get one:
+/// `SamplingClient::post` treats the resolver as the sole auth source and
+/// removes the declared header before sending.
+#[test]
+fn resolve_model_override_keeps_a_declared_header_over_the_session() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth_method_id =
+        acp::AuthMethodId::new(crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID);
+    ctx.auth = Some(crate::auth::GrokAuth {
+        key: "session-jwt".into(),
+        ..crate::auth::GrokAuth::test_default()
+    });
+    let mut entry = test_model_entry("grok-4.5");
+    entry
+        .info
+        .extra_headers
+        .insert("Authorization".into(), "Bearer vendor-sentinel".into());
+    ctx.available_models.insert("grok-4.5".to_string(), entry);
+
+    let (config, _) = resolve_model_override_to_config("grok-4.5", &ctx).unwrap();
+    assert!(
+        config.bearer_resolver.is_none(),
+        "a declared header must not be replaced by the session resolver"
+    );
+    assert_eq!(
+        config.credential_source,
+        Some(xai_grok_sampler::CredentialSource::ExplicitHeader {
+            header: "authorization".to_owned(),
+            env: None,
+        })
+    );
 }
 /// `would_strip_fallback_key` on the override path. `XAI_API_KEY`'s
 /// presence varies by environment, so assert the rule itself rather
@@ -2425,6 +2442,55 @@ fn resolve_model_override_to_config_no_resolver_for_byok_model() {
     assert!(config.bearer_resolver.is_none());
     assert_eq!(config.api_key.as_deref(), Some("sk-byok"));
 }
+
+#[test]
+fn explicit_subagent_model_rejects_unavailable_custom_harness() {
+    let active = xai_grok_agent::AgentDefinition::grok_build_plan();
+    assert_eq!(
+        validate_subagent_model_harness(&active, "missing-custom-harness", None),
+        Err(SubagentModelHarnessError::Unavailable),
+    );
+}
+
+#[test]
+fn explicit_subagent_model_rejects_incompatible_resolved_harness() {
+    let active = xai_grok_agent::AgentDefinition::grok_build_plan();
+    let required = xai_grok_agent::AgentDefinition::codex();
+    assert_eq!(
+        validate_subagent_model_harness(&active, "codex", Some(&required)),
+        Err(SubagentModelHarnessError::Incompatible),
+    );
+}
+
+#[test]
+fn explicit_subagent_model_resolves_and_rejects_same_named_external_harness() {
+    let mut active = xai_grok_agent::AgentDefinition::default_grok_build();
+    active.plugin_name = Some("plugin-one".to_owned());
+    active.source_path = Some(std::path::PathBuf::from(
+        "/plugins/plugin-one/agents/grok-build.md",
+    ));
+    active.prompt_body = Some("Plugin-owned grok-build prompt".to_owned());
+    let cwd = tempfile::tempdir().unwrap();
+    assert_eq!(
+        resolve_and_validate_subagent_model_harness(&active, "grok-build", cwd.path(), None),
+        Err(SubagentModelHarnessError::Incompatible),
+    );
+}
+
+#[test]
+fn explicit_subagent_model_accepts_exact_or_stock_compatible_harness() {
+    let active = xai_grok_agent::AgentDefinition::codex();
+    assert_eq!(
+        validate_subagent_model_harness(&active, "codex", None),
+        Ok(()),
+    );
+    let stock = xai_grok_agent::AgentDefinition::grok_build_plan();
+    let required_stock = xai_grok_agent::AgentDefinition::default_grok_build();
+    assert_eq!(
+        validate_subagent_model_harness(&stock, "grok-build", Some(&required_stock)),
+        Ok(()),
+    );
+}
 #[tokio::test]
 async fn read_parent_sampling_config_resolves_backend_search_from_catalog() {
     let mut entry = test_model_entry("grok-4.5");
@@ -2440,37 +2506,1102 @@ async fn read_parent_sampling_config_resolves_backend_search_from_catalog() {
         );
 }
 #[tokio::test]
-async fn read_parent_sampling_config_fallback_resolves_backend_search_from_catalog() {
+async fn read_parent_sampling_config_resolves_codex_wire_from_the_catalog_not_the_parent() {
+    // The two values must DIFFER or this test passes without proving
+    // anything — the parent and a subagent usually run the same model,
+    // which is exactly why #277 sat unnoticed.
+    //
+    // The asymmetry is real: `supports_reasoning_summary_parameter` is
+    // `Some(false)` for Spark, which rejects `reasoning.summary`, and
+    // `Some(true)` for the Sol preset, which accepts it. A subagent handed
+    // the parent's capabilities sends a field its own model rejects.
+    let child_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
     let mut entry = test_model_entry("grok-4.5");
+    entry.info.codex_wire = Some(child_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("auto".to_string(), entry);
+    let mut ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
+    ctx.sampling_config.codex_wire = Some(parent_caps);
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.codex_wire,
+        Some(child_caps),
+        "the subagent's wire capabilities must come from its own catalog \
+         entry, not from whatever model the parent happened to be running"
+    );
+}
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_resolves_backend_search_from_catalog() {
+    let mut entry = test_model_entry("composer-2-fast");
     entry.info.supports_backend_search = true;
     let mut models = indexmap::IndexMap::new();
-    models.insert("grok-4.5".to_string(), entry);
+    models.insert("composer-2-fast".to_string(), entry);
     let mut ctx = ctx_with_toggle(HashMap::new());
-    ctx.model_id = acp::ModelId::new("auto");
+    ctx.model_id = acp::ModelId::new("composer-2-fast");
+    ctx.sampling_config_model_id = acp::ModelId::new("composer-2-fast");
     ctx.parent_chat_state = None;
-    ctx.sampling_config.model = "grok-4.5".to_string();
-    ctx.sampling_config.api_backend = crate::sampling::ApiBackend::Responses;
-    ctx.sampling_config.base_url = "https://api.x.ai/v1".to_string();
+    ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.sampling_config.supports_backend_search = false;
+    ctx.available_models = models.clone();
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
         models,
-        acp::ModelId::new("auto"),
+        acp::ModelId::new("composer-2-fast"),
         ctx.auth_manager.clone(),
         crate::agent::config::Config::default(),
     );
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
-    assert_eq!(model_id.0.as_ref(), "auto");
-    assert!(config.supports_backend_search);
-    assert_eq!(config.extra_response_includes, ["no_inline_citations"]);
+    assert_eq!(model_id.0.as_ref(), "composer-2-fast");
+    assert!(
+            config.supports_backend_search,
+            "fallback path should also resolve backend-tools capability from the catalog"
+        );
 }
+/// The fallback path (parent chat-state unavailable) re-resolves the other
+/// three catalog facts, so it must re-resolve this one too — the live-path
+/// test alone left half the surface uncovered.
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_resolves_codex_wire_from_catalog() {
+    let child_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut entry = test_model_entry("composer-2-fast");
+    entry.info.codex_wire = Some(child_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("composer-2-fast".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("composer-2-fast");
+    ctx.sampling_config_model_id = acp::ModelId::new("composer-2-fast");
+    ctx.parent_chat_state = None;
+    ctx.sampling_config.model = "composer-2-fast".to_string();
+    ctx.sampling_config.codex_wire = Some(parent_caps);
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("composer-2-fast"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.codex_wire,
+        Some(child_caps),
+        "the fallback path must resolve wire capabilities from the catalog too"
+    );
+}
+
+/// Fall back to the parent's wire only when this identity is absent from
+/// the catalog (a runtime-only model, #159). A present entry whose
+/// `codex_wire` is `None` is not a miss — that is authoritative empty
+/// metadata (#282); see
+/// `read_parent_sampling_config_fallback_present_none_does_not_keep_parent_wire`.
+#[tokio::test]
+async fn read_parent_sampling_config_catalog_miss_keeps_parent_wire_for_the_same_model() {
+    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("runtime-only-model");
+    ctx.sampling_config_model_id = acp::ModelId::new("runtime-only-model");
+    ctx.parent_chat_state = None;
+    ctx.sampling_config.model = "runtime-only-model".to_string();
+    ctx.sampling_config.codex_wire = Some(parent_caps.clone());
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        indexmap::IndexMap::new(),
+        acp::ModelId::new("runtime-only-model"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.codex_wire,
+        Some(parent_caps),
+        "same model, catalog miss: the parent's value is the right one"
+    );
+}
+
+/// Same identity as the spawn baseline, but the catalog entry exists and
+/// advertises no wire capabilities. That `None` is authoritative: the
+/// actor-unavailable path must not keep the stale spawn-baseline `Some`.
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_present_none_does_not_keep_parent_wire() {
+    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut entry = test_model_entry("runtime-catalog-model");
+    entry.info.codex_wire = None;
+    let mut models = indexmap::IndexMap::new();
+    models.insert("runtime-catalog-model".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("runtime-catalog-model");
+    ctx.sampling_config_model_id = acp::ModelId::new("runtime-catalog-model");
+    ctx.parent_chat_state = None;
+    ctx.sampling_config.model = "runtime-catalog-model".to_string();
+    ctx.sampling_config.codex_wire = Some(parent_caps);
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("runtime-catalog-model"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(model_id.0.as_ref(), "runtime-catalog-model");
+    assert_eq!(
+        config.codex_wire,
+        None,
+        "a present entry with no wire metadata must not keep the parent's stale Some"
+    );
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_live_catalog_miss_keeps_same_model_baseline_wire() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut ctx = ctx_with_parent_chat_state(
+        "runtime-only-model",
+        "runtime-only-model",
+        "runtime-only-model",
+        indexmap::IndexMap::new(),
+    );
+    ctx.sampling_config.model = "runtime-only-model".to_string();
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "runtime-only-model");
+    assert_eq!(config.codex_wire, Some(baseline_caps));
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_reused_startup_key_different_route_rejects_baseline_wire() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut ctx = ctx_with_parent_chat_state(
+        "reused-key",
+        "startup-routing-model",
+        "reused-key",
+        indexmap::IndexMap::new(),
+    );
+    ctx.sampling_config.model = "startup-routing-model".to_string();
+    ctx.sampling_config.supports_backend_search = true;
+    ctx.sampling_config.codex_wire = Some(baseline_caps);
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "switched-routing-model".to_string();
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "reused-key",
+        "switched-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "reused-key");
+    assert_eq!(config.model, "switched-routing-model");
+    assert!(!config.supports_backend_search);
+    assert_eq!(config.codex_wire, None);
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_uses_live_catalog_after_same_route_refresh() {
+    use xai_grok_sampler::AuthScheme;
+
+    let frozen_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut frozen = test_model_entry("stable-routing-model");
+    frozen.api_key = Some("stale-model-key".to_string());
+    frozen.info.agent_type = "stale-harness".to_string();
+    frozen.info.auth_scheme = AuthScheme::Bearer;
+    frozen.info.supports_reasoning_effort = true;
+    frozen.info.auto_compact_threshold_percent = Some(70);
+    frozen.info.codex_wire = Some(frozen_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("stable-entry".to_string(), frozen);
+    let ctx = ctx_with_parent_chat_state(
+        "stable-entry",
+        "stable-routing-model",
+        "stable-entry",
+        models,
+    );
+
+    let mut refreshed = test_model_entry("stable-routing-model");
+    refreshed.info.agent_type = "live-harness".to_string();
+    refreshed.info.auth_scheme = AuthScheme::None;
+    refreshed.info.supports_reasoning_effort = false;
+    refreshed.info.auto_compact_threshold_percent = Some(90);
+    refreshed.info.supports_backend_search = true;
+    let refreshed_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    refreshed.info.codex_wire = Some(refreshed_caps.clone());
+    ctx.models_manager.insert_test_entry("stable-entry", refreshed);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+    let config = prepared.sampling_config;
+    let model_id = prepared.model_id;
+
+    assert_eq!(model_id.0.as_ref(), "stable-entry");
+    assert_eq!(config.auth_scheme, AuthScheme::None);
+    assert!(config.supports_backend_search);
+    assert_eq!(config.codex_wire, Some(refreshed_caps));
+    assert_ne!(config.codex_wire, Some(frozen_caps));
+    assert!(
+        !prepared.supports_reasoning_effort,
+        "reasoning overrides must follow the live prepared catalog snapshot"
+    );
+    assert!(!prepared.model_has_own_credentials);
+    assert_eq!(prepared.agent_type, "live-harness");
+    assert_eq!(prepared.auto_compact_threshold_percent, Some(90));
+}
+
+#[tokio::test]
+async fn inherited_subagent_effort_reconciles_after_catalog_refresh() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    let mut frozen = test_model_entry("stable-routing-model");
+    frozen.info.supports_reasoning_effort = true;
+    frozen.info.reasoning_effort = Some(ReasoningEffort::High);
+    frozen.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "high".into(),
+        value: ReasoningEffort::High,
+        label: "High".into(),
+        description: None,
+        default: true,
+    }];
+    let ctx = ctx_with_parent_chat_state(
+        "stable-entry",
+        "stable-routing-model",
+        "stable-entry",
+        indexmap::IndexMap::from([("stable-entry".to_string(), frozen)]),
+    );
+    let chat = ctx.parent_chat_state.as_ref().expect("parent chat state");
+    let mut snapshot = chat.snapshot().await.expect("parent snapshot");
+    snapshot.sampling_config.reasoning_effort = Some(ReasoningEffort::High);
+    chat.restore_snapshot(snapshot);
+
+    let mut refreshed = test_model_entry("stable-routing-model");
+    refreshed.info.supports_reasoning_effort = true;
+    refreshed.info.reasoning_effort = Some(ReasoningEffort::Low);
+    refreshed.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "low".into(),
+        value: ReasoningEffort::Low,
+        label: "Low".into(),
+        description: None,
+        default: true,
+    }];
+    ctx.models_manager.insert_test_entry("stable-entry", refreshed);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+    assert_eq!(
+        prepared.sampling_config.reasoning_effort,
+        Some(ReasoningEffort::High),
+        "the resident parent remains immutable after catalog refresh"
+    );
+    assert_eq!(prepared.reasoning_efforts.len(), 1);
+    assert_eq!(prepared.reasoning_efforts[0].value, ReasoningEffort::Low);
+
+    let mut child = prepared.sampling_config.clone();
+    reconcile_inherited_subagent_reasoning_effort(
+        &mut child,
+        prepared.supports_reasoning_effort,
+        &prepared.reasoning_efforts,
+    );
+    assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(
+        chat.snapshot()
+            .await
+            .expect("parent snapshot after child preparation")
+            .sampling_config
+            .reasoning_effort,
+        Some(ReasoningEffort::High),
+        "child reconciliation must not mutate the resident parent"
+    );
+
+    let mut legacy_minimal = prepared.sampling_config.clone();
+    legacy_minimal.reasoning_effort = Some(ReasoningEffort::Minimal);
+    reconcile_inherited_subagent_reasoning_effort(&mut legacy_minimal, true, &[]);
+    assert_eq!(
+        legacy_minimal.reasoning_effort,
+        Some(ReasoningEffort::Minimal),
+        "menu-less legacy models still offer minimal"
+    );
+
+    let none_menu = [ReasoningEffortOption {
+        id: "none".into(),
+        value: ReasoningEffort::None,
+        label: "None".into(),
+        description: None,
+        default: true,
+    }];
+    let mut explicit_none = prepared.sampling_config.clone();
+    explicit_none.reasoning_effort = Some(ReasoningEffort::None);
+    reconcile_inherited_subagent_reasoning_effort(&mut explicit_none, true, &none_menu);
+    assert_eq!(explicit_none.reasoning_effort, Some(ReasoningEffort::None));
+
+    let ultra_menu = [ReasoningEffortOption {
+        id: "ultra".into(),
+        value: ReasoningEffort::Ultra,
+        label: "Ultra".into(),
+        description: Some("Maximum reasoning with proactive multi-agent guidance".into()),
+        default: true,
+    }];
+    let mut inherited_ultra = prepared.sampling_config.clone();
+    inherited_ultra.reasoning_effort = Some(ReasoningEffort::Ultra);
+    reconcile_inherited_subagent_reasoning_effort(&mut inherited_ultra, true, &ultra_menu);
+    assert_eq!(
+        inherited_ultra.reasoning_effort,
+        Some(ReasoningEffort::Ultra),
+        "a child must retain Ultra when its selected model advertises Ultra"
+    );
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_survivor() {
+    use xai_grok_sampler::AuthScheme;
+
+    let committed_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let survivor_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut survivor = test_model_entry("shared-routing-model");
+    survivor.info.auth_scheme = AuthScheme::None;
+    survivor.info.codex_wire = Some(survivor_caps);
+    let mut models = indexmap::IndexMap::new();
+    models.insert("surviving-entry".to_string(), survivor);
+    let mut ctx = ctx_with_parent_chat_state(
+        "startup-entry",
+        "shared-routing-model",
+        "surviving-entry",
+        models,
+    );
+    ctx.sampling_config.model = "shared-routing-model".to_string();
+    ctx.sampling_config.auth_scheme = AuthScheme::Bearer;
+    ctx.sampling_config.codex_wire = Some(committed_caps.clone());
+    ctx.sampling_config.supports_backend_search = true;
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "removed-entry",
+        "shared-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
+    snapshot
+        .catalog_identity
+        .as_mut()
+        .expect("catalog identity")
+        .auth_scheme = Some(xai_chat_state::CatalogAuthScheme::None);
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "removed-entry");
+    assert_eq!(config.auth_scheme, AuthScheme::None);
+    assert!(config.api_key.is_none());
+    assert!(!config.supports_backend_search);
+    assert_eq!(config.codex_wire, None);
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_legacy_committed_identity_missing_auth_fails_closed() {
+    use xai_grok_sampler::AuthScheme;
+
+    let mut ctx = ctx_with_parent_chat_state(
+        "startup-bearer-entry",
+        "legacy-removed-route",
+        "startup-bearer-entry",
+        indexmap::IndexMap::new(),
+    );
+    ctx.sampling_config.auth_scheme = AuthScheme::Bearer;
+    ctx.sampling_config.api_key = Some("startup-bearer-key".to_string());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("legacy-committed-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+        model_id: "legacy-removed-entry".to_string(),
+        route: "legacy-removed-route".to_string(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: None,
+    });
+    chat.restore_snapshot(snapshot);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "legacy-removed-entry");
+    assert_eq!(prepared.sampling_config.auth_scheme, AuthScheme::None);
+    assert!(
+        prepared.sampling_config.api_key.is_none(),
+        "a legacy committed identity with unknown auth must not borrow startup credentials"
+    );
+    assert!(prepared.sampling_config.bearer_resolver.is_none());
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_legacy_identity_recovers_exact_auth_for_nested_miss() {
+    use xai_grok_sampler::AuthScheme;
+
+    let mut recovered = test_model_entry("legacy-route");
+    recovered.info.auth_scheme = AuthScheme::XApiKey;
+    let mut models = indexmap::IndexMap::new();
+    models.insert("legacy-entry".to_string(), recovered);
+    let ctx = ctx_with_parent_chat_state(
+        "legacy-entry",
+        "legacy-route",
+        "legacy-entry",
+        models,
+    );
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+        model_id: "legacy-entry".to_string(),
+        route: "legacy-route".to_string(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: None,
+    });
+    chat.restore_snapshot(snapshot);
+
+    let recovered_prepared = read_parent_prepared_model(&ctx).await;
+    assert_eq!(recovered_prepared.sampling_config.auth_scheme, AuthScheme::XApiKey);
+    assert_eq!(
+        recovered_prepared.catalog_identity.auth_scheme,
+        Some(xai_chat_state::CatalogAuthScheme::XApiKey),
+        "an exact catalog hit must upgrade a legacy identity with the authoritative auth"
+    );
+
+    let mut nested = ctx_with_parent_chat_state(
+        "legacy-entry",
+        "legacy-route",
+        "legacy-entry",
+        indexmap::IndexMap::new(),
+    );
+    nested.sampling_config.auth_scheme = AuthScheme::None;
+    let nested_chat = nested.parent_chat_state.as_ref().expect("nested chat state");
+    let mut nested_snapshot = nested_chat.snapshot().await.expect("nested chat snapshot");
+    nested_snapshot.catalog_identity = Some(recovered_prepared.catalog_identity);
+    nested_chat.restore_snapshot(nested_snapshot);
+
+    let nested_prepared = read_parent_prepared_model(&nested).await;
+    assert_eq!(nested_prepared.sampling_config.auth_scheme, AuthScheme::XApiKey);
+    assert_eq!(
+        nested_prepared.catalog_identity.auth_scheme,
+        Some(xai_chat_state::CatalogAuthScheme::XApiKey)
+    );
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_removed_switched_bearer_ignores_none_startup_auth() {
+    use xai_grok_sampler::AuthScheme;
+
+    let mut ctx = ctx_with_parent_chat_state(
+        "startup-none-entry",
+        "switched-bearer-route",
+        "startup-none-entry",
+        indexmap::IndexMap::new(),
+    );
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-none-entry");
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.sampling_config.api_key = None;
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("switched-live-bearer".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+        model_id: "removed-bearer-entry".to_string(),
+        route: "switched-bearer-route".to_string(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    });
+    chat.restore_snapshot(snapshot);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-bearer-entry");
+    assert_eq!(prepared.catalog_identity.model_id, "removed-bearer-entry");
+    assert_eq!(prepared.sampling_config.auth_scheme, AuthScheme::Bearer);
+    assert_eq!(
+        prepared.sampling_config.api_key.as_deref(),
+        Some("switched-live-bearer")
+    );
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_removed_switched_byok_never_attaches_session_resolver() {
+    use xai_grok_sampler::AuthScheme;
+
+    let mut ctx = ctx_with_parent_chat_state(
+        "startup-session-entry",
+        "switched-byok-route",
+        "startup-session-entry",
+        indexmap::IndexMap::new(),
+    );
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    ctx.auth = Some(crate::auth::GrokAuth {
+        key: "startup-session-token".to_string(),
+        ..crate::auth::GrokAuth::test_default()
+    });
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut live_config = chat
+        .get_sampling_config()
+        .await
+        .expect("test parent has sampling config");
+    live_config.base_url = "https://api.x.ai/v1".to_string();
+    chat.update_sampling_config(live_config);
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("switched-model-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+        model_id: "removed-byok-entry".to_string(),
+        route: "switched-byok-route".to_string(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    });
+    chat.restore_snapshot(snapshot);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-byok-entry");
+    assert_eq!(
+        prepared.sampling_config.api_key.as_deref(),
+        Some("switched-model-key")
+    );
+    assert_eq!(
+        prepared.sampling_config.credential_source,
+        Some(xai_grok_sampler::CredentialSource::ModelApiKey)
+    );
+    assert!(
+        prepared.sampling_config.bearer_resolver.is_none(),
+        "bound model-key provenance must remain terminal after its catalog entry disappears"
+    );
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_opaque_name_override_keeps_committed_capabilities() {
+    let committed_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut entry = test_model_entry("catalog-routing-model");
+    entry.info.supports_backend_search = true;
+    entry.info.codex_wire = Some(committed_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("catalog-entry".to_string(), entry);
+    let mut colliding = test_model_entry("opaque-backend-routing-hint");
+    colliding.info.codex_wire = Some(xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    });
+    models.insert("colliding-entry".to_string(), colliding);
+    let ctx = ctx_with_parent_chat_state(
+        "catalog-entry",
+        "catalog-routing-model",
+        "catalog-entry",
+        models,
+    );
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "opaque-backend-routing-hint".to_string();
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "catalog-entry");
+    assert_eq!(config.model, "opaque-backend-routing-hint");
+    assert!(config.supports_backend_search);
+    assert_eq!(config.codex_wire, Some(committed_caps.clone()));
+
+    // The inherited child stores the catalog's original route rather than
+    // its opaque sampling override, so a grandchild resolves the same entry.
+    let catalog_identity = ctx
+        .parent_chat_state
+        .as_ref()
+        .expect("chat state")
+        .get_sampling_config_with_model_id()
+        .await
+        .and_then(|(_, identity)| identity)
+        .expect("selected catalog identity");
+    let (mock, _persistence_rx) = xai_chat_state::MockChatPersistence::new();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let nested_chat = xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
+        vec![],
+        test_sampling_config(&config.model),
+        Some(catalog_identity),
+        xai_chat_state::PruningConfig::default(),
+        Box::new(mock),
+        event_tx,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let mut nested_ctx = ctx;
+    nested_ctx.model_id = model_id.clone();
+    nested_ctx.sampling_config_model_id = model_id;
+    nested_ctx.sampling_config = config;
+    nested_ctx.parent_chat_state = Some(nested_chat);
+
+    let (nested_config, nested_model_id) = read_parent_sampling_config(&nested_ctx).await;
+
+    assert_eq!(nested_model_id.0.as_ref(), "catalog-entry");
+    assert_eq!(nested_config.model, "opaque-backend-routing-hint");
+    assert!(nested_config.supports_backend_search);
+    assert_eq!(nested_config.codex_wire, Some(committed_caps));
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_switched_entry_opaque_override_keeps_capabilities() {
+    let switched_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut switched = test_model_entry("switched-routing-model");
+    switched.info.codex_wire = Some(switched_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("switched-entry".to_string(), switched);
+    let mut ctx = ctx_with_parent_chat_state(
+        "switched-entry",
+        "switched-routing-model",
+        "switched-entry",
+        models,
+    );
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-entry");
+    ctx.sampling_config.model = "startup-routing-model".to_string();
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "opaque-switched-routing-hint".to_string();
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "switched-entry",
+        "switched-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "switched-entry");
+    assert_eq!(config.model, "opaque-switched-routing-hint");
+    assert_eq!(config.codex_wire, Some(switched_caps));
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_unique_route_remaps_through_opaque_override() {
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut replacement = test_model_entry("retained-routing-model");
+    replacement.info.supports_backend_search = true;
+    replacement.info.codex_wire = Some(replacement_caps.clone());
+    let mut colliding = test_model_entry("removed-alias");
+    colliding.info.codex_wire = Some(xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    });
+    let mut models = indexmap::IndexMap::new();
+    models.insert("replacement-entry".to_string(), replacement);
+    models.insert("colliding-entry".to_string(), colliding);
+    let mut ctx = ctx_with_parent_chat_state(
+        "removed-alias",
+        "retained-routing-model",
+        "startup-entry",
+        models,
+    );
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-entry");
+    ctx.sampling_config.model = "startup-routing-model".to_string();
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "removed-alias".to_string();
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "removed-alias",
+        "retained-routing-model",
+        xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+    ));
+    chat.restore_snapshot(snapshot);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "replacement-entry");
+    assert_eq!(
+        prepared.sampling_config.model,
+        "removed-alias"
+    );
+    assert!(prepared.sampling_config.supports_backend_search);
+    assert_eq!(prepared.sampling_config.codex_wire, Some(replacement_caps));
+    assert_eq!(prepared.catalog_identity.model_id, "replacement-entry");
+    assert_eq!(
+        prepared.catalog_identity.route,
+        "retained-routing-model"
+    );
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_opaque_override_rejects_reused_committed_key() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut replacement = test_model_entry("replacement-routing-model");
+    replacement.info.codex_wire = Some(replacement_caps);
+    let mut models = indexmap::IndexMap::new();
+    models.insert("catalog-entry".to_string(), replacement);
+    let mut ctx = ctx_with_parent_chat_state(
+        "catalog-entry",
+        "original-routing-model",
+        "catalog-entry",
+        models,
+    );
+    ctx.sampling_config.model = "original-routing-model".to_string();
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "opaque-backend-routing-hint".to_string();
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "catalog-entry",
+        "original-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "catalog-entry");
+    assert_eq!(config.codex_wire, Some(baseline_caps));
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_missing_id_ignores_same_route_survivor() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut survivor = test_model_entry("shared-routing-model");
+    survivor.info.codex_wire = Some(xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    });
+    let mut models = indexmap::IndexMap::new();
+    models.insert("surviving-entry".to_string(), survivor);
+    let mut ctx = ctx_with_parent_chat_state(
+        "removed-entry",
+        "shared-routing-model",
+        "surviving-entry",
+        models,
+    );
+    ctx.parent_chat_state = None;
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+    let config = prepared.sampling_config;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-entry");
+    assert_eq!(prepared.catalog_identity.model_id, "removed-entry");
+    assert_eq!(prepared.catalog_identity.route, "shared-routing-model");
+    assert_eq!(
+        prepared.catalog_identity.lineage,
+        xai_chat_state::CatalogResolutionLineage::ExactKey
+    );
+    assert_eq!(config.codex_wire, Some(baseline_caps));
+}
+
+/// A refreshed catalog can replace a retained catalog id (`auto`) with the
+/// routing slug key. That is still the same inherited model, and the child
+/// must use the refreshed entry's capabilities rather than losing them.
+#[tokio::test]
+async fn read_parent_sampling_config_resolves_wire_after_catalog_id_becomes_slug_key() {
+    let refreshed_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let stale_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut entry = test_model_entry("grok-4.5");
+    entry.info.codex_wire = Some(refreshed_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("grok-4.5".to_string(), entry);
+    let mut ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
+    ctx.sampling_config.model = "grok-4.5".to_string();
+    ctx.sampling_config.codex_wire = Some(stale_caps);
+    let mut selection_catalog = indexmap::IndexMap::new();
+    selection_catalog.insert("auto".to_string(), test_model_entry("grok-4.5"));
+    let selected_identity = crate::agent::models::resolve_catalog_identity(
+        &selection_catalog,
+        &acp::ModelId::new("grok-4.5"),
+    )
+    .expect("unique route selection");
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(selected_identity);
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "grok-4.5");
+    assert_eq!(
+        config.codex_wire,
+        Some(refreshed_caps),
+        "a retained catalog id and its refreshed routing-slug key are the same model"
+    );
+}
+
+/// An exact stable key is not an alias merely because its routing slug differs.
+/// If refresh removes that key, a same-route survivor must not inherit the
+/// prepared session's auth or wire capabilities.
+#[tokio::test]
+async fn read_parent_sampling_config_exact_stable_key_never_remaps_to_same_route_survivor() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut selection_catalog = indexmap::IndexMap::new();
+    selection_catalog.insert(
+        "prod-grok-build".to_string(),
+        test_model_entry("grok-4.5"),
+    );
+    let selected_identity = crate::agent::models::resolve_catalog_identity(
+        &selection_catalog,
+        &acp::ModelId::new("prod-grok-build"),
+    )
+    .expect("exact production catalog selection");
+    assert_eq!(
+        selected_identity.lineage,
+        xai_chat_state::CatalogResolutionLineage::ExactKey
+    );
+
+    let mut survivor = test_model_entry("grok-4.5");
+    survivor.info.codex_wire = Some(replacement_caps);
+    let mut refreshed_catalog = indexmap::IndexMap::new();
+    refreshed_catalog.insert("replacement".to_string(), survivor);
+    let mut ctx = ctx_with_parent_chat_state(
+        "prod-grok-build",
+        "grok-4.5",
+        "replacement",
+        refreshed_catalog,
+    );
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(selected_identity);
+    chat.restore_snapshot(snapshot);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+    let config = prepared.sampling_config;
+    assert_eq!(prepared.model_id.0.as_ref(), "prod-grok-build");
+    assert_eq!(prepared.catalog_identity.model_id, "prod-grok-build");
+    assert_eq!(prepared.catalog_identity.route, "grok-4.5");
+    assert_eq!(config.codex_wire, Some(baseline_caps));
+}
+
+/// A present catalog entry with no wire metadata is authoritative (#282).
+/// After a session switch it must not fall through to the process startup
+/// model's baseline capabilities.
+#[tokio::test]
+async fn read_parent_sampling_config_present_none_never_inherits_startup_model_wire() {
+    let startup_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut models = indexmap::IndexMap::new();
+    models.insert("switched-model".to_string(), test_model_entry("switched-model"));
+    let mut ctx = ctx_with_parent_chat_state(
+        "switched-model",
+        "switched-model",
+        "switched-model",
+        models,
+    );
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-model");
+    ctx.sampling_config.model = "startup-model".to_string();
+    ctx.sampling_config.codex_wire = Some(startup_caps);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "switched-model");
+    assert_eq!(
+        config.codex_wire, None,
+        "a present entry with no wire metadata must not inherit the startup model's flags"
+    );
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_same_entry_none_overrides_stale_baseline_wire() {
+    let stale_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut models = indexmap::IndexMap::new();
+    models.insert(
+        "same-catalog-entry".to_string(),
+        test_model_entry("same-routing-model"),
+    );
+    let mut ctx = ctx_with_parent_chat_state(
+        "same-catalog-entry",
+        "same-routing-model",
+        "same-catalog-entry",
+        models,
+    );
+    ctx.sampling_config.codex_wire = Some(stale_caps);
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "same-catalog-entry",
+        "same-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "same-catalog-entry");
+    assert_eq!(config.codex_wire, None);
+}
+
+/// The actor commits a switch before the outer session handle. A spawn in
+/// that window must use the model identity from the live actor snapshot for
+/// both routing and wire capabilities.
+#[tokio::test]
+async fn read_parent_sampling_config_inflight_switch_uses_live_model_wire() {
+    let old_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let new_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut old_entry = test_model_entry("shared-routing-model");
+    old_entry.info.codex_wire = Some(old_caps);
+    let mut new_entry = test_model_entry("shared-routing-model");
+    new_entry.info.codex_wire = Some(new_caps.clone());
+    new_entry.info.supports_backend_search = true;
+    let mut models = indexmap::IndexMap::new();
+    models.insert("old-catalog-id".to_string(), old_entry);
+    models.insert("new-catalog-id".to_string(), new_entry);
+    let mut ctx = ctx_with_parent_chat_state(
+        "old-catalog-id",
+        "shared-routing-model",
+        "old-catalog-id",
+        models,
+    );
+    ctx.sampling_config.model = "shared-routing-model".to_string();
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "new-catalog-id",
+        "shared-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(config.model, "shared-routing-model");
+    assert_eq!(model_id.0.as_ref(), "new-catalog-id");
+    assert_eq!(
+        config.codex_wire,
+        Some(new_caps),
+        "wire flags must be resolved from the live model snapshot, not the stale session handle"
+    );
+    assert!(config.supports_backend_search);
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire() {
+    let old_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut replacement = test_model_entry("replacement-routing-model");
+    replacement.info.codex_wire = Some(replacement_caps);
+    let mut old = test_model_entry("old-routing-model");
+    old.info.codex_wire = Some(old_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("auto".to_string(), replacement.clone());
+    // Exact-key shadow: the sampled routing slug is itself a key for an
+    // unrelated entry. Route resolution must find `legacy-entry` instead.
+    models.insert("old-routing-model".to_string(), replacement);
+    models.insert("legacy-entry".to_string(), old);
+    let mut ctx = ctx_with_parent_chat_state("auto", "old-routing-model", "auto", models);
+    ctx.sampling_config.codex_wire = Some(old_caps.clone());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "auto",
+        "old-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "auto");
+    assert_eq!(config.model, "old-routing-model");
+    assert_eq!(config.codex_wire, Some(old_caps));
+
+    let mut baseline_snapshot = chat.snapshot().await.expect("chat snapshot");
+    baseline_snapshot.catalog_identity = None;
+    chat.restore_snapshot(baseline_snapshot);
+    let (baseline_config, baseline_model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(baseline_model_id.0.as_ref(), "legacy-entry");
+    assert_eq!(baseline_config.codex_wire, config.codex_wire);
+}
+
 #[tokio::test]
 async fn read_parent_sampling_config_resolves_compactions_remaining_from_catalog() {
     use xai_grok_sampling_types::CompactionsRemaining;
     let mut entry = test_model_entry("grok-4.5");
     entry.info.compactions_remaining = Some(CompactionsRemaining::Dynamic(true));
     let mut models = indexmap::IndexMap::new();
-    models.insert("grok-4.5".to_string(), entry);
+    models.insert("auto".to_string(), entry);
     let mut ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
     ctx.sampling_config.compactions_remaining = None;
     let (config, _model_id) = read_parent_sampling_config(&ctx).await;
@@ -2483,15 +3614,87 @@ async fn read_parent_sampling_config_resolves_compactions_remaining_from_catalog
 #[tokio::test]
 async fn read_parent_sampling_config_fallback_resolves_compactions_remaining_from_catalog() {
     use xai_grok_sampling_types::CompactionsRemaining;
-    let mut entry = test_model_entry("grok-4.5");
+    let mut entry = test_model_entry("composer-2-fast");
     entry.info.compactions_remaining = Some(CompactionsRemaining::Dynamic(true));
     let mut models = indexmap::IndexMap::new();
-    models.insert("grok-4.5".to_string(), entry);
+    models.insert("composer-2-fast".to_string(), entry);
     let mut ctx = ctx_with_toggle(HashMap::new());
-    ctx.model_id = acp::ModelId::new("auto");
+    ctx.model_id = acp::ModelId::new("composer-2-fast");
+    ctx.sampling_config_model_id = acp::ModelId::new("composer-2-fast");
     ctx.parent_chat_state = None;
-    ctx.sampling_config.model = "grok-4.5".to_string();
+    ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.sampling_config.compactions_remaining = None;
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("composer-2-fast"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(model_id.0.as_ref(), "composer-2-fast");
+    assert_eq!(
+            config.compactions_remaining,
+            Some(CompactionsRemaining::Dynamic(true)),
+            "fallback path should also resolve compactions-remaining capability from the catalog"
+        );
+}
+#[tokio::test]
+async fn read_parent_sampling_config_strips_api_key_for_auth_scheme_none() {
+    use xai_grok_sampler::AuthScheme;
+    let inference_slug = "local-none-model";
+    let chat_state = spawn_test_parent_chat_state(inference_slug);
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("stale-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
+    let mut models = indexmap::IndexMap::new();
+    let mut entry = test_model_entry(inference_slug);
+    entry.info.auth_scheme = AuthScheme::None;
+    models.insert("local-none".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("local-none");
+    ctx.parent_chat_state = Some(chat_state);
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(config.auth_scheme, AuthScheme::None);
+    assert!(
+        config.api_key.is_none(),
+        "stale chat_state JWT must not inherit onto AuthScheme::None subagent"
+    );
+}
+#[tokio::test]
+async fn read_parent_sampling_config_prefers_catalog_key_over_shared_wire_slug() {
+    use xai_grok_sampler::AuthScheme;
+    let shared_slug = "shared-routing-slug";
+    let chat_state = spawn_test_parent_chat_state(shared_slug);
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("stale-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
+    let mut models = indexmap::IndexMap::new();
+    let mut bearer_entry = test_model_entry(shared_slug);
+    bearer_entry.info.auth_scheme = AuthScheme::Bearer;
+    models.insert("builtin-bearer".to_string(), bearer_entry);
+    let mut none_entry = test_model_entry(shared_slug);
+    none_entry.info.auth_scheme = AuthScheme::None;
+    models.insert("none-alias".to_string(), none_entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("none-alias");
+    ctx.parent_chat_state = Some(chat_state);
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.available_models = models.clone();
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
         models,
@@ -2500,12 +3703,197 @@ async fn read_parent_sampling_config_fallback_resolves_compactions_remaining_fro
         crate::agent::config::Config::default(),
     );
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
-    assert_eq!(model_id.0.as_ref(), "auto");
+    assert_eq!(model_id.0.as_ref(), "none-alias");
+    assert_eq!(config.auth_scheme, AuthScheme::None);
+    assert!(
+        config.api_key.is_none(),
+        "catalog None alias must win over the shared-slug Bearer entry"
+    );
+}
+
+/// Capability and auth facts must come from the same catalog entry. An exact
+/// key equal to the routing slug must not shadow the selected entry's BYOK
+/// classification and suppress its xAI session resolver.
+#[tokio::test]
+async fn read_parent_sampling_config_binds_bearer_gate_to_selected_catalog_entry() {
+    let shared_slug = "shared-routing-slug";
+    let mut selected = test_model_entry(shared_slug);
+    selected.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+    let mut shadow = test_model_entry("unrelated-routing-slug");
+    shadow.api_key = Some("shadow-byok-key".to_string());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("selected-entry".to_string(), selected);
+    models.insert(shared_slug.to_string(), shadow);
+    let mut ctx = ctx_with_parent_chat_state(
+        "selected-entry",
+        shared_slug,
+        "selected-entry",
+        models,
+    );
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.base_url = "https://api.x.ai/v1".to_string();
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "selected-entry");
+    assert!(
+        config.bearer_resolver.is_some(),
+        "the unrelated exact-key BYOK entry must not shadow selected-entry auth facts"
+    );
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_catalog_miss_respects_parent_auth_scheme_none() {
+    use xai_grok_sampler::AuthScheme;
+    let inference_slug = "not-in-effective-catalog-xyz";
+    let chat_state = spawn_test_parent_chat_state(inference_slug);
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("stale-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("no-catalog-model");
+    ctx.parent_chat_state = Some(chat_state);
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        indexmap::IndexMap::new(),
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
     assert_eq!(
-            config.compactions_remaining,
-            Some(CompactionsRemaining::Dynamic(true)),
-            "fallback path should also resolve compactions-remaining capability from the catalog"
-        );
+        config.auth_scheme,
+        AuthScheme::None,
+        "catalog miss must not silently default to Bearer when parent baseline is None"
+    );
+    assert!(
+        config.api_key.is_none(),
+        "stale chat_state JWT must not survive catalog miss on AuthScheme::None parent"
+    );
+}
+#[tokio::test]
+async fn read_parent_sampling_config_available_models_none_strips_with_bearer_parent_baseline() {
+    use xai_grok_sampler::AuthScheme;
+    let inference_slug = "local-none-resolved";
+    let chat_state = spawn_test_parent_chat_state(inference_slug);
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("stale-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
+    let mut models = indexmap::IndexMap::new();
+    let mut entry = test_model_entry(inference_slug);
+    entry.info.auth_scheme = AuthScheme::None;
+    models.insert("local-none".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("local-none");
+    ctx.parent_chat_state = Some(chat_state);
+    // Parent spawn baseline is still Bearer (agent-level snapshot).
+    ctx.sampling_config.auth_scheme = AuthScheme::Bearer;
+    ctx.sampling_config.api_key = Some("parent-bearer-must-not-win".to_string());
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.auth_scheme,
+        AuthScheme::None,
+        "available_models auth_scheme must win over parent Bearer baseline"
+    );
+    assert!(
+        config.api_key.is_none(),
+        "stale JWT must strip when available_models resolves AuthScheme::None"
+    );
+}
+#[tokio::test]
+async fn read_parent_sampling_config_stale_none_baseline_keeps_bearer_from_catalog() {
+    use xai_grok_sampler::AuthScheme;
+    let inference_slug = "switched-bearer-model";
+    let chat_state = spawn_test_parent_chat_state(inference_slug);
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("live-session-bearer".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
+    let mut models = indexmap::IndexMap::new();
+    let mut entry = test_model_entry(inference_slug);
+    entry.info.auth_scheme = AuthScheme::Bearer;
+    models.insert("bearer-model".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("bearer-model");
+    ctx.parent_chat_state = Some(chat_state);
+    // Stale agent-level snapshot from startup on a None model.
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.auth_scheme,
+        AuthScheme::Bearer,
+        "catalog Bearer must win over stale None parent baseline"
+    );
+    assert_eq!(
+        config.api_key.as_deref(),
+        Some("live-session-bearer"),
+        "child must inherit live credentials when catalog resolves Bearer"
+    );
+}
+#[tokio::test]
+async fn read_parent_sampling_config_stale_none_baseline_keeps_x_api_key_from_catalog() {
+    use xai_grok_sampler::AuthScheme;
+    let inference_slug = "switched-x-api-key-model";
+    let chat_state = spawn_test_parent_chat_state(inference_slug);
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("live-byok-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+    let mut models = indexmap::IndexMap::new();
+    let mut entry = test_model_entry(inference_slug);
+    entry.info.auth_scheme = AuthScheme::XApiKey;
+    models.insert("x-api-key-model".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("x-api-key-model");
+    ctx.parent_chat_state = Some(chat_state);
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.auth_scheme,
+        AuthScheme::XApiKey,
+        "catalog XApiKey must win over stale None parent baseline"
+    );
+    assert_eq!(
+        config.api_key.as_deref(),
+        Some("live-byok-key"),
+        "child must inherit live credentials when catalog resolves XApiKey"
+    );
 }
 /// Drive the REAL precedence path
 /// (`resolve_effective_model_config`, which `run_shell_child`
@@ -2565,6 +3953,50 @@ async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
             config.model, "pinned-model",
             "an unknown override falls through to the pin",
         );
+}
+
+#[tokio::test]
+async fn forked_request_never_falls_through_missing_parent_key_to_model_pins() {
+    use xai_grok_agent::config::ModelOverride;
+
+    let mut models = indexmap::IndexMap::new();
+    for key in ["runtime-pin", "config-pin", "definition-pin"] {
+        models.insert(key.to_string(), test_model_entry(key));
+    }
+    let mut ctx = ctx_with_parent_chat_state(
+        "removed-parent-key",
+        "parent-routing-model",
+        "runtime-pin",
+        models,
+    );
+    ctx.subagent_model_overrides
+        .insert("explore".to_string(), "config-pin".to_string());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("parent-model-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+
+    let prepared = resolve_request_prepared_model(
+        true,
+        Some("runtime-pin"),
+        "explore",
+        &ModelOverride::Override("definition-pin".to_string()),
+        &ctx,
+    )
+    .await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-parent-key");
+    assert_eq!(prepared.sampling_config.model, "parent-routing-model");
+    assert_eq!(
+        prepared.sampling_config.api_key.as_deref(),
+        Some("parent-model-key")
+    );
+    assert!(
+        prepared.agent_type.is_empty(),
+        "the spawn path must fail closed when the removed parent key has no live harness facts"
+    );
 }
 /// A `fork_context = true` spawn must infer on the parent session model
 /// (`ctx.model_id`) for per-model radix reuse, even when a
@@ -2633,6 +4065,7 @@ async fn resolve_subagent_inherits_parent_model_without_pins() {
         let mut ctx = ctx_with_toggle(HashMap::new());
         ctx.sampling_config.model = parent_model.to_string();
         ctx.model_id = acp::ModelId::new(parent_model);
+        ctx.sampling_config_model_id = acp::ModelId::new(parent_model);
         let (config, model_id) = resolve_subagent_sampling_config(
                 "explore",
                 &ModelOverride::Inherit,
@@ -2725,6 +4158,7 @@ async fn resolve_subagent_config_override_unknown_model_falls_through_to_inherit
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.sampling_config.model = "grok-4.5".to_string();
     ctx.model_id = acp::ModelId::new("grok-4.5");
+    ctx.sampling_config_model_id = acp::ModelId::new("grok-4.5");
     ctx.subagent_model_overrides
         .insert("explore".to_string(), "does-not-exist".to_string());
     let (config, model_id) = resolve_subagent_sampling_config(
@@ -2744,6 +4178,7 @@ async fn resolve_subagent_agent_definition_unknown_model_falls_through_to_inheri
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.sampling_config.model = "grok-4.5".to_string();
     ctx.model_id = acp::ModelId::new("grok-4.5");
+    ctx.sampling_config_model_id = acp::ModelId::new("grok-4.5");
     let agent_model = ModelOverride::Override("does-not-exist".to_string());
     let (config, model_id) = resolve_subagent_sampling_config(
             "explore",
@@ -2789,7 +4224,10 @@ async fn subagent_override_provider_model_spawns_cache_only_credentials() {
             config.api_key, None,
             "a cold cache spawns with no key, never the parent session key"
         );
-    provider.ensure_fresh_token(None).await.rotated().unwrap();
+    provider
+        .ensure_fresh_token(None)
+        .await
+        .expect_rotated(&provider, "subagent spawn helper mint");
     let (config, _) = resolve_subagent_sampling_config(
             "explore",
             &ModelOverride::Inherit,
@@ -2800,23 +4238,42 @@ async fn subagent_override_provider_model_spawns_cache_only_credentials() {
     assert_eq!(config.base_url, "https://gateway.example/v1");
 }
 #[test]
-fn key_prefix_truncates_to_8_chars() {
-    let key = Some("eyJ0eXAiOiJhbGciOiJSUzI1NiJ9".to_string());
-    assert_eq!(key_prefix(&key), "eyJ0eXAi");
-}
-#[test]
-fn key_prefix_short_key_not_truncated() {
-    let key = Some("abc".to_string());
-    assert_eq!(key_prefix(&key), "abc");
-}
-#[test]
-fn key_prefix_none_returns_placeholder() {
-    assert_eq!(key_prefix(&None), "<none>");
-}
-#[test]
-fn key_prefix_empty_string() {
-    let key = Some(String::new());
-    assert_eq!(key_prefix(&key), "");
+fn subagent_resolution_diagnostics_never_emit_parent_or_child_credentials() {
+    // Keep the sentinel high-entropy: embedding diagnostic field names such as
+    // `credential` would make an 8-byte-window assertion match the safe JSON
+    // key rather than leaked secret material.
+    let parent_secret = "GB002P-Q7w5E3r1T9y7Z6x4C2v8";
+    let child_secret = "GB002C-A7s5D3f1G9h7J6k4L2m8";
+    let parent = xai_grok_sampler::SamplerConfig {
+        model: "parent-model".to_string(),
+        base_url: "https://api.x.ai/v1".to_string(),
+        api_key: Some(parent_secret.to_string()),
+        ..xai_grok_sampler::SamplerConfig::default()
+    };
+    let child = xai_grok_sampler::SamplerConfig {
+        model: "child-model".to_string(),
+        base_url: "https://provider.example/v1".to_string(),
+        api_key: Some(child_secret.to_string()),
+        ..xai_grok_sampler::SamplerConfig::default()
+    };
+
+    let context = subagent_model_resolution_context(
+        "executor",
+        "config_override",
+        &child,
+        &acp::ModelId::new("child-model"),
+        &parent,
+    );
+    assert_eq!(context["child_credential_present"], true);
+    assert_eq!(context["parent_credential_present"], true);
+    assert_eq!(context["keys_match"], false);
+    let rendered = context.to_string();
+    for secret in [parent_secret, child_secret] {
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            assert!(!rendered.contains(std::str::from_utf8(window).unwrap()));
+        }
+    }
 }
 #[test]
 fn non_cursor_persona_injected_as_system_reminder() {
@@ -3179,6 +4636,68 @@ fn plugin_agents_inherit_parent_mcp_pool_by_default() {
         )
         .expect("plugin children inherit parent pool with mcpInheritance=all");
     assert_eq!(pool_names(&inherited), vec!["atlassian", "github"]);
+}
+#[test]
+fn restricted_children_reject_agent_owned_mcp_servers_before_session_spawn() {
+    use xai_tool_types::SubagentCapabilityMode;
+
+    let mut definition = xai_grok_agent::config::AgentDefinition::parse(
+        r#"---
+name: restricted-mcp
+description: restricted MCP admission fixture
+mcpServers:
+  - parent-server
+  - inline-server:
+      type: stdio
+      command: sh
+      args: ["-c", "exit 0"]
+---
+fixture
+"#,
+    )
+    .expect("agent definition fixture must parse");
+    for mode in [
+        SubagentCapabilityMode::ReadOnly,
+        SubagentCapabilityMode::ReadWrite,
+        SubagentCapabilityMode::Execute,
+    ] {
+        let error = super::agent_owned_mcp_server_admission_error(&definition, Some(mode))
+            .expect("restricted mode must reject agent-owned MCP startup");
+        assert!(error.contains("mcpServers"));
+        assert!(error.contains("All"));
+    }
+    assert!(
+        super::agent_owned_mcp_server_admission_error(
+            &definition,
+            Some(SubagentCapabilityMode::All)
+        )
+        .is_none()
+    );
+    assert!(super::agent_owned_mcp_server_admission_error(&definition, None).is_none());
+
+    definition.plugin_name = Some("fixture-plugin".into());
+    assert!(
+        super::agent_owned_mcp_server_admission_error(
+            &definition,
+            Some(SubagentCapabilityMode::ReadOnly)
+        )
+        .is_none(),
+        "plugin-owned configs keep the existing ignore path"
+    );
+
+    definition.plugin_name = None;
+    definition.mcp_servers.clear();
+    definition.mcp_inheritance = xai_grok_agent::config::McpInheritance::All;
+    assert!(
+        super::agent_owned_mcp_server_admission_error(
+            &definition,
+            Some(SubagentCapabilityMode::ReadOnly)
+        )
+        .is_none(),
+        "already-connected parent MCP inheritance must remain available"
+    );
+    assert!(super::agent_owned_mcp_servers_allowed(false));
+    assert!(!super::agent_owned_mcp_servers_allowed(true));
 }
 #[test]
 fn plugin_agents_can_opt_out_via_mcp_inheritance_none() {

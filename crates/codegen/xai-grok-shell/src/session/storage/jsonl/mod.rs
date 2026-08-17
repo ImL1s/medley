@@ -2,22 +2,55 @@ use super::{PersistedData, SessionUpdateEnvelope, StorageAdapter};
 use crate::sampling::types::ChatRequestMessage;
 use crate::sampling::{ContentPart, ConversationItem};
 use crate::session::info::Info;
-use crate::session::persistence::{CHAT_FORMAT_VERSION, Summary};
+use crate::session::persistence::{CHAT_FORMAT_VERSION, SessionIdLock, Summary};
 use crate::tools::todo::TodoState;
 use agent_client_protocol as acp;
 use async_trait::async_trait;
 use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, Write};
+
+fn jsonl_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    // Windows cannot publish (rename) a session directory while a child is
+    // open unless the child shares delete access.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.share_mode(0x0000_0007);
+    }
+    options
+}
 use std::path::{Path, PathBuf};
 use xai_chat_state::StrictAppendAck;
 use xai_grok_workspace::session::file_state::RewindPoint;
+mod model_switch;
+#[cfg(test)]
+use model_switch::ModelSwitchCommitStep;
 mod copy;
-pub(crate) mod model_switch;
 #[derive(Clone)]
 enum SessionDirMode {
     FromRoot(PathBuf),
-    Explicit(PathBuf),
+    Explicit(SessionPathBinding),
+}
+
+/// Shared physical path used by a fresh session while it moves from its
+/// private staging directory into the published session namespace.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionPathBinding(std::sync::Arc<parking_lot::RwLock<PathBuf>>);
+
+impl SessionPathBinding {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self(std::sync::Arc::new(parking_lot::RwLock::new(path)))
+    }
+
+    pub(crate) fn path(&self) -> PathBuf {
+        self.0.read().clone()
+    }
+
+    pub(crate) fn rebind(&self, path: PathBuf) {
+        *self.0.write() = path;
+    }
 }
 #[derive(Clone, Copy)]
 pub(crate) enum AppendDurability {
@@ -32,11 +65,15 @@ pub struct JsonlStorageAdapter {
     update_append_probe: Option<std::sync::Arc<AppendProbe>>,
     #[cfg(test)]
     model_switch_probe: Option<std::sync::Arc<ModelSwitchProbe>>,
+    #[cfg(test)]
+    session_sync_probe: Option<std::sync::Arc<SessionSyncProbe>>,
 }
 #[cfg(test)]
 type AppendProbe = dyn Fn(AppendDurability) -> io::Result<()> + Send + Sync;
 #[cfg(test)]
 type ModelSwitchProbe = dyn Fn(model_switch::ModelSwitchCommitStep) -> io::Result<()> + Send + Sync;
+#[cfg(test)]
+type SessionSyncProbe = dyn Fn() -> io::Result<()> + Send + Sync;
 impl Default for JsonlStorageAdapter {
     fn default() -> Self {
         Self::new()
@@ -50,6 +87,8 @@ impl JsonlStorageAdapter {
             update_append_probe: None,
             #[cfg(test)]
             model_switch_probe: None,
+            #[cfg(test)]
+            session_sync_probe: None,
         }
     }
     pub fn with_root(root_dir: PathBuf) -> Self {
@@ -59,19 +98,33 @@ impl JsonlStorageAdapter {
             update_append_probe: None,
             #[cfg(test)]
             model_switch_probe: None,
+            #[cfg(test)]
+            session_sync_probe: None,
         }
     }
     /// Create an adapter that writes directly to `session_dir`, bypassing
-    /// the `{root}/sessions/{cwd}/{id}/` path computation. Used for subagent
-    /// child sessions (top-level dirs; only their metadata nests under the
-    /// parent's session dir).
+    /// the `{root}/sessions/{cwd}/{id}/` path computation.
+    ///
+    /// Used for subagent child sessions whose files live under the parent's
+    /// session directory: `{parent_session_dir}/subagents/{subagent_id}/`.
     pub fn with_explicit_session_dir(session_dir: PathBuf) -> Self {
+        Self::with_session_path_binding(SessionPathBinding::new(session_dir))
+    }
+
+    pub(crate) fn with_rebindable_session_dir(session_dir: PathBuf) -> (Self, SessionPathBinding) {
+        let binding = SessionPathBinding::new(session_dir);
+        (Self::with_session_path_binding(binding.clone()), binding)
+    }
+
+    pub(crate) fn with_session_path_binding(binding: SessionPathBinding) -> Self {
         Self {
-            dir_mode: SessionDirMode::Explicit(session_dir),
+            dir_mode: SessionDirMode::Explicit(binding),
             #[cfg(test)]
             update_append_probe: None,
             #[cfg(test)]
             model_switch_probe: None,
+            #[cfg(test)]
+            session_sync_probe: None,
         }
     }
     #[cfg(test)]
@@ -80,20 +133,34 @@ impl JsonlStorageAdapter {
         append_probe: impl Fn(AppendDurability) -> io::Result<()> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            dir_mode: SessionDirMode::Explicit(session_dir),
+            dir_mode: SessionDirMode::Explicit(SessionPathBinding::new(session_dir)),
             update_append_probe: Some(std::sync::Arc::new(append_probe)),
             model_switch_probe: None,
+            session_sync_probe: None,
         }
     }
     #[cfg(test)]
     pub(crate) fn with_model_switch_probe(
-        session_dir: PathBuf,
-        model_switch_probe: impl Fn(model_switch::ModelSwitchCommitStep) -> io::Result<()> + Send + Sync + 'static,
+        root_dir: PathBuf,
+        probe: impl Fn(ModelSwitchCommitStep) -> io::Result<()> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            dir_mode: SessionDirMode::Explicit(session_dir),
+            dir_mode: SessionDirMode::FromRoot(root_dir),
             update_append_probe: None,
-            model_switch_probe: Some(std::sync::Arc::new(model_switch_probe)),
+            model_switch_probe: Some(std::sync::Arc::new(probe)),
+            session_sync_probe: None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_session_sync_probe(
+        session_dir: PathBuf,
+        probe: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            dir_mode: SessionDirMode::Explicit(SessionPathBinding::new(session_dir)),
+            update_append_probe: None,
+            model_switch_probe: None,
+            session_sync_probe: Some(std::sync::Arc::new(probe)),
         }
     }
     /// Load chat history from a specific directory.
@@ -102,27 +169,18 @@ impl JsonlStorageAdapter {
         &self,
         dir: &std::path::Path,
     ) -> std::io::Result<Vec<ConversationItem>> {
+        self.recover_model_switch_in_dir_sync(dir)?;
         let chat_file = dir.join(super::CHAT_HISTORY_FILE);
         self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)
     }
     fn session_dir(&self, info: &Info) -> PathBuf {
         match &self.dir_mode {
-            SessionDirMode::FromRoot(root) => {
-                crate::util::grok_home::sessions_cwd_dir_in(root, &info.cwd)
-                    .join(info.id.to_string())
-            }
-            SessionDirMode::Explicit(dir) => dir.clone(),
+            SessionDirMode::FromRoot(root) => root
+                .join("sessions")
+                .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+                .join(info.id.to_string()),
+            SessionDirMode::Explicit(binding) => binding.path(),
         }
-    }
-    /// Create `info`'s session dir owner-only. `FromRoot` also ensures the
-    /// `<encoded-cwd>` shield + root; `Explicit` parents are caller-owned.
-    fn create_session_dir_owner_only(&self, info: &Info) -> io::Result<PathBuf> {
-        let dir = self.session_dir(info);
-        if let SessionDirMode::FromRoot(root) = &self.dir_mode {
-            let _ = crate::util::grok_home::ensure_sessions_cwd_dir_in(root, &info.cwd);
-        }
-        crate::util::grok_home::create_dir_all_owner_only(&dir)?;
-        Ok(dir)
     }
     pub(super) fn updates_file(&self, info: &Info) -> PathBuf {
         self.session_dir(info).join(super::UPDATES_FILE)
@@ -199,16 +257,8 @@ impl JsonlStorageAdapter {
         let session_dirs = self.scan_session_dirs(cwd)?;
         let mut summaries = Vec::new();
         for session_dir in session_dirs {
-            let summary_path = session_dir.join(super::SUMMARY_FILE);
-            match std::fs::read(&summary_path) {
-                Ok(bytes) => {
-                    if let Ok(summary) = serde_json::from_slice::<Summary>(&bytes)
-                        && !summary.is_hidden()
-                    {
-                        summaries.push(summary);
-                    }
-                }
-                Err(_) => continue,
+            if let Some(summary) = self.read_summary_for_listing(&session_dir)? {
+                summaries.push(summary);
             }
         }
         summaries.sort_by_cached_key(|s| {
@@ -219,6 +269,64 @@ impl JsonlStorageAdapter {
         });
         Ok(summaries)
     }
+
+    fn try_lock_session_for_listing(
+        &self,
+        session_dir: &Path,
+    ) -> io::Result<Option<SessionIdLock>> {
+        let SessionDirMode::FromRoot(root_dir) = &self.dir_mode else {
+            return Ok(None);
+        };
+        let Some(session_id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        crate::session::persistence::try_acquire_session_id_read_lock_sync(root_dir, session_id)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to check publication lock for session {session_id}: {error}"),
+                )
+            })
+    }
+
+    fn read_summary_for_listing(&self, session_dir: &Path) -> io::Result<Option<Summary>> {
+        let Some(_session_id_lock) = self.try_lock_session_for_listing(session_dir)? else {
+            return Ok(None);
+        };
+        self.read_summary_for_listing_locked(session_dir)
+    }
+
+    /// Read a listing candidate while the caller retains its per-session
+    /// shared visibility lock.
+    fn read_summary_for_listing_locked(&self, session_dir: &Path) -> io::Result<Option<Summary>> {
+        // Revalidate after taking the lock. The initial directory/mtime scan is
+        // intentionally unleased so a large history does not consume one file
+        // descriptor per session; a creator may have changed publication state
+        // while we waited.
+        if std::fs::symlink_metadata(
+            session_dir.join(crate::session::persistence::UNPUBLISHED_SESSION_MARKER),
+        )
+        .is_ok()
+        {
+            return Ok(None);
+        }
+        if let Err(error) = self.recover_model_switch_in_dir_sync(session_dir) {
+            tracing::warn!(
+                session_dir = %session_dir.display(),
+                ?error,
+                "failed recovering pending model-switch intent before listing session summary"
+            );
+            return Ok(None);
+        }
+        let summary_path = session_dir.join(super::SUMMARY_FILE);
+        let Some(bytes) = std::fs::read(&summary_path).ok() else {
+            return Ok(None);
+        };
+        let Some(summary) = serde_json::from_slice::<Summary>(&bytes).ok() else {
+            return Ok(None);
+        };
+        Ok((!summary.is_hidden()).then_some(summary))
+    }
     /// List the N most recently modified session summaries across all
     /// workspaces.
     ///
@@ -228,7 +336,13 @@ impl JsonlStorageAdapter {
     /// this reduces cold-boot `workspace_list` from ~3s to ~200ms.
     /// Final order among candidates uses `last_active_at` else `updated_at`.
     pub async fn list_sessions_recent(&self, limit: usize) -> io::Result<Vec<Summary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let session_dirs = self.scan_session_dirs(None)?;
+        // Do not retain a lock (and therefore an open lock-file descriptor) for
+        // every historical session. A user with ~12K sessions can otherwise
+        // exhaust the process FD limit before we truncate to `limit`.
         let mut candidates: Vec<(PathBuf, std::time::SystemTime)> =
             Vec::with_capacity(session_dirs.len());
         for session_dir in session_dirs {
@@ -236,22 +350,20 @@ impl JsonlStorageAdapter {
             if let Ok(meta) = std::fs::metadata(&summary_path)
                 && let Ok(mtime) = meta.modified()
             {
-                candidates.push((summary_path, mtime));
+                candidates.push((session_dir, mtime));
             }
         }
         candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        candidates.truncate(limit);
-        let mut summaries = Vec::with_capacity(candidates.len());
-        for (summary_path, _) in candidates {
-            match std::fs::read(&summary_path) {
-                Ok(bytes) => {
-                    if let Ok(summary) = serde_json::from_slice::<Summary>(&bytes)
-                        && !summary.is_hidden()
-                    {
-                        summaries.push(summary);
-                    }
-                }
-                Err(_) => continue,
+        let mut summaries = Vec::with_capacity(limit.min(candidates.len()));
+        for (session_dir, _) in candidates {
+            if summaries.len() == limit {
+                break;
+            }
+            let Some(_session_id_lock) = self.try_lock_session_for_listing(&session_dir)? else {
+                continue;
+            };
+            if let Some(summary) = self.read_summary_for_listing_locked(&session_dir)? {
+                summaries.push(summary);
             }
         }
         summaries.sort_by_cached_key(|s| {
@@ -301,14 +413,6 @@ impl JsonlStorageAdapter {
     /// the torn record is terminated as its own (single) corrupt line. This
     /// bounds the damage of any torn write to exactly one record, which the
     /// lenient readers (e.g. [`Self::read_chat_history_sync`]) then skip.
-    async fn sync_file_path_durable(path: PathBuf) -> io::Result<()> {
-        tokio::task::spawn_blocking(move || {
-            let file = OpenOptions::new().read(true).open(&path)?;
-            Self::sync_file_durable(&file)
-        })
-        .await
-        .map_err(io::Error::other)?
-    }
     fn append_jsonl_line_sync(
         path: &Path,
         line: Vec<u8>,
@@ -328,7 +432,7 @@ impl JsonlStorageAdapter {
         debug_assert!(line.ends_with(b"\n"), "JSONL record must end with \\n");
         let lock = Self::lock_append(path)?;
         let result = (|| {
-            let mut file = OpenOptions::new()
+            let mut file = jsonl_open_options()
                 .read(true)
                 .create(true)
                 .append(true)
@@ -382,40 +486,39 @@ impl JsonlStorageAdapter {
                     "working-directory switch item must carry a nonzero generation",
                 ))
             })?;
-        let disposition = tokio::task::spawn_blocking(move || {
-            Self::append_cwd_switch_line_sync_with(
+        let adapter = self.clone();
+        let info = info.clone();
+        tokio::task::spawn_blocking(move || {
+            let _model_switch_gate = adapter
+                .lock_model_switch_mutation_sync(&info)
+                .map_err(super::AppendCwdSwitchError::NotCommitted)?;
+            let disposition = Self::append_cwd_switch_line_sync_with(
                 &path,
                 line,
                 generation,
                 Self::sync_file_durable,
                 || Self::sync_parent_directory(&path),
+            )?;
+            super::summary_write::apply_patch_locked_durable(
+                &adapter.summary_file(&info),
+                &adapter.summary_lock_file(&info),
+                &super::summary_write::SummaryPatch {
+                    record_activity: matches!(&disposition, StrictAppendAck::Appended),
+                    chat_messages: matches!(&disposition, StrictAppendAck::Appended)
+                        .then_some(super::summary_write::CounterOp::Increment(1)),
+                    chat_format_version: Some(CHAT_FORMAT_VERSION),
+                    cwd_switch_bookkeeping_generation: Some(generation),
+                    ..Default::default()
+                },
             )
-        })
-        .await
-        .map_err(|error| super::AppendCwdSwitchError::NotCommitted(io::Error::other(error)))??;
-        self.apply_summary_patch(
-            info,
-            super::summary_write::SummaryPatch {
-                record_activity: matches!(&disposition, StrictAppendAck::Appended),
-                chat_messages: matches!(&disposition, StrictAppendAck::Appended)
-                    .then_some(super::summary_write::CounterOp::Increment(1)),
-                chat_format_version: Some(CHAT_FORMAT_VERSION),
-                cwd_switch_bookkeeping_generation: Some(generation),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|source| super::AppendCwdSwitchError::Committed {
-            acknowledgement: disposition.clone(),
-            source,
-        })?;
-        Self::sync_file_path_durable(self.summary_file(info))
-            .await
             .map_err(|source| super::AppendCwdSwitchError::Committed {
                 acknowledgement: disposition.clone(),
                 source,
             })?;
-        Ok(disposition)
+            Ok(disposition)
+        })
+        .await
+        .map_err(|error| super::AppendCwdSwitchError::NotCommitted(io::Error::other(error)))?
     }
     fn find_cwd_switch_generation(
         path: &Path,
@@ -445,7 +548,7 @@ impl JsonlStorageAdapter {
             {
                 return Ok(StrictAppendAck::AlreadyPresent(authoritative));
             }
-            let mut file = OpenOptions::new()
+            let mut file = jsonl_open_options()
                 .read(true)
                 .create(true)
                 .append(true)
@@ -489,7 +592,7 @@ impl JsonlStorageAdapter {
     /// Lock tail healing, append, and barriers through `<target>.jsonl.lock`.
     /// Full-file [`Self::write_jsonl`] atomic-rename rewrites bypass this append-only lock.
     fn lock_append(path: &Path) -> io::Result<std::fs::File> {
-        let lock = OpenOptions::new()
+        let lock = jsonl_open_options()
             .read(true)
             .write(true)
             .create(true)
@@ -640,6 +743,7 @@ impl JsonlStorageAdapter {
         super::write_bytes_atomic(&summary_path, &bytes)
     }
     fn read_summary_sync(&self, info: &Info) -> io::Result<Summary> {
+        self.recover_model_switch_sync(info)?;
         let path = self.summary_file(info);
         let bytes = std::fs::read(&path)?;
         if bytes.is_empty() {
@@ -694,22 +798,63 @@ impl JsonlStorageAdapter {
             }
             Err(error) => return Err(error),
         };
+        // Three bounds, in three different domains. Conflating them is #162:
+        // the scan bound used to be a `.take()` on raw dirents, so a run of
+        // cleared tombstones at the newest end consumed the whole budget and
+        // the older valid runs behind them were never reached -- silently,
+        // because the only warning fired on the *restore* cap, which that
+        // path never reaches.
+        //
+        // 1. `MAX_RESTORED_WORKFLOW_RUNS` bounds successfully restored runs.
+        //    A symlink or invalid sibling must not steal a slot from a valid
+        //    run (see workflow_restore_rejects_symlinks_and_caps_run_count).
+        //
+        // 2. `MAX_SCANNED_WORKFLOW_ENTRIES` bounds entries that cost a
+        //    *manifest read*. Cheap rejections -- symlink, non-directory,
+        //    tombstone -- are one `symlink_metadata` each and deliberately do
+        //    not consume it. `remove()` writes a `cleared` marker and deletes
+        //    `state.json` but leaves the directory, so tombstones accumulate
+        //    forever and are the expected bulk of a long-lived session.
+        //
+        // 3. `MAX_EXAMINED_WORKFLOW_ENTRIES` is the absolute stop, so the walk
+        //    still terminates on a pathological directory. It is generous
+        //    because the per-entry cost below it is one stat.
+        //
+        // Each bound warns distinctly when it is what stopped us short, so a
+        // truncated restore is never indistinguishable from an empty one.
+        const MAX_SCANNED_WORKFLOW_ENTRIES: usize = MAX_RESTORED_WORKFLOW_RUNS * 8;
+        const MAX_EXAMINED_WORKFLOW_ENTRIES: usize = MAX_RESTORED_WORKFLOW_RUNS * 64;
         let mut entries: Vec<_> = std::fs::read_dir(&workflows_dir)?
             .filter_map(Result::ok)
-            .take(MAX_RESTORED_WORKFLOW_RUNS.saturating_add(1))
             .collect();
-        let entries_truncated = entries.len() > MAX_RESTORED_WORKFLOW_RUNS;
-        entries.truncate(MAX_RESTORED_WORKFLOW_RUNS);
         entries.sort_by_key(|entry| entry.file_name());
-        if entries_truncated {
-            tracing::warn!(
-                path = %workflows_dir.display(),
-                limit = MAX_RESTORED_WORKFLOW_RUNS,
-                "workflow restore run-count cap reached; ignoring remaining entries"
-            );
-        }
         let mut restored = Vec::new();
-        for entry in entries {
+        let mut skipped_after_cap = false;
+        let mut hit_scan_cap = false;
+        let mut hit_examined_cap = false;
+        // `scanned` stays an explicit counter because it only advances past the
+        // cheap rejections; `examined` is every iteration, so it comes from
+        // `enumerate()` -- it is read before the increment point either way.
+        let mut scanned = 0usize;
+        // Newest first. Run ids are `wf_` + a UUIDv7 `simple()`, whose leading
+        // 48 bits are a big-endian millisecond timestamp rendered as
+        // fixed-width hex -- so lexicographic order *is* chronological order,
+        // and walking ascending would keep the oldest runs and silently drop
+        // everything recent. For a resume feature that is exactly backwards.
+        // Display order is unaffected: the consumer re-sorts by `history.first().at`.
+        for (examined, entry) in entries.into_iter().rev().enumerate() {
+            if restored.len() >= MAX_RESTORED_WORKFLOW_RUNS {
+                skipped_after_cap = true;
+                break;
+            }
+            if examined >= MAX_EXAMINED_WORKFLOW_ENTRIES {
+                hit_examined_cap = true;
+                break;
+            }
+            if scanned >= MAX_SCANNED_WORKFLOW_ENTRIES {
+                hit_scan_cap = true;
+                break;
+            }
             let run_dir = entry.path();
             let Ok(run_meta) = std::fs::symlink_metadata(&run_dir) else {
                 continue;
@@ -722,6 +867,9 @@ impl JsonlStorageAdapter {
             {
                 continue;
             }
+            // Past the cheap rejections: everything below costs a file read,
+            // so this is what `MAX_SCANNED_WORKFLOW_ENTRIES` bounds.
+            scanned += 1;
             let manifest_path = run_dir.join("state.json");
             let manifest = match read_bounded_nofollow(&manifest_path, MAX_WORKFLOW_MANIFEST_BYTES)
                 .and_then(|bytes| {
@@ -784,6 +932,35 @@ impl JsonlStorageAdapter {
                 script,
                 args,
             });
+        }
+        if skipped_after_cap {
+            tracing::warn!(
+                path = %workflows_dir.display(),
+                limit = MAX_RESTORED_WORKFLOW_RUNS,
+                "workflow restore run-count cap reached; ignoring remaining entries"
+            );
+        }
+        // These two say something different from the one above: there was room
+        // to restore more and we stopped looking anyway, so whatever is behind
+        // the cut is hidden rather than merely surplus. Reported separately for
+        // that reason -- #162 is exactly this case going unreported.
+        if hit_scan_cap {
+            tracing::warn!(
+                path = %workflows_dir.display(),
+                limit = MAX_SCANNED_WORKFLOW_ENTRIES,
+                restored = restored.len(),
+                "workflow restore stopped at the manifest-read budget with room left; \
+                 older runs behind the cut were not restored"
+            );
+        }
+        if hit_examined_cap {
+            tracing::warn!(
+                path = %workflows_dir.display(),
+                limit = MAX_EXAMINED_WORKFLOW_ENTRIES,
+                restored = restored.len(),
+                "workflow restore stopped at the absolute directory-scan bound with room \
+                 left; older runs behind the cut were not restored"
+            );
         }
         Ok(restored)
     }
@@ -956,8 +1133,7 @@ impl JsonlStorageAdapter {
         Ok(())
     }
     /// Like [`Self::apply_summary_patch`], but returns whether a
-    /// `generated_title_if_absent` was applied or a manual pin was
-    /// cleared by `reset_title_to_auto` (see [`Summary::apply_patch`]).
+    /// `generated_title_if_absent` was applied (see [`Summary::apply_patch`]).
     async fn apply_summary_patch_reporting(
         &self,
         info: &Info,
@@ -971,6 +1147,93 @@ impl JsonlStorageAdapter {
         .await
         .map_err(io::Error::other)?
     }
+}
+
+fn sync_session_tree_durable(session_dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fn sync_directory_entry(directory: &Path) -> io::Result<()> {
+        std::fs::File::open(directory)?.sync_all()
+    }
+
+    #[cfg(windows)]
+    fn sync_directory_entry(_directory: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn sync_directory_entry(_directory: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable directory sync is unsupported on this platform",
+        ))
+    }
+
+    fn visit(dir: &Path, directories: &mut Vec<PathBuf>) -> io::Result<()> {
+        directories.push(dir.to_path_buf());
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to sync symlink in session directory: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if file_type.is_dir() {
+                visit(&path, directories)?;
+            } else if file_type.is_file() {
+                if path.extension().and_then(|s| s.to_str()) == Some("lock") {
+                    continue;
+                }
+                #[cfg(windows)]
+                let file = {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .share_mode(1 | 2 | 4)
+                        .open(&path)
+                    {
+                        Ok(f) => Some(f),
+                        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => None,
+                        Err(e) => return Err(e),
+                    }
+                };
+                #[cfg(not(windows))]
+                let file = Some(std::fs::File::open(&path)?);
+
+                if let Some(file) = file {
+                    if let Err(e) = super::sync_file_durable(&file) {
+                        #[cfg(windows)]
+                        if e.kind() == io::ErrorKind::PermissionDenied {
+                            // On Windows, FlushFileBuffers requires write access; if denied, continue
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to sync non-file session entry: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let mut directories = Vec::new();
+    visit(session_dir, &mut directories)?;
+    for directory in directories.into_iter().rev() {
+        sync_directory_entry(&directory)?;
+    }
+    super::sync_parent_directory(session_dir)
 }
 /// Rewrite the session id an update carries. Shared by the fork copy and the
 fn transform_session_id_in_update(
@@ -1009,13 +1272,12 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
 #[async_trait]
 impl StorageAdapter for JsonlStorageAdapter {
     async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary> {
-        self.create_session_dir_owner_only(info)?;
+        let dir = self.session_dir(info);
+        std::fs::create_dir_all(&dir)?;
         let summary_path = self.summary_file(info);
         if Path::new(&summary_path).exists() {
             tracing::info!("Loading existing session from JSONL");
-            let bytes = tokio::fs::read(&summary_path).await?;
-            serde_json::from_slice::<Summary>(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            self.read_summary_sync(info)
         } else {
             tracing::info!("Creating new session in JSONL");
             let mut summary = Summary::new(info, model_id)?;
@@ -1094,17 +1356,29 @@ impl StorageAdapter for JsonlStorageAdapter {
             .await
     }
     async fn append_chat_message(&self, info: &Info, message: &ConversationItem) -> io::Result<()> {
-        self.append_jsonl(self.chat_file(info), message).await?;
-        self.apply_summary_patch(
-            info,
-            super::summary_write::SummaryPatch {
-                record_activity: true,
-                chat_messages: Some(super::summary_write::CounterOp::Increment(1)),
-                chat_format_version: Some(CHAT_FORMAT_VERSION),
-                ..Default::default()
-            },
-        )
+        let adapter = self.clone();
+        let info = info.clone();
+        let path = adapter.chat_file(&info);
+        let mut line = serde_json::to_vec(message)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        line.push(b'\n');
+        tokio::task::spawn_blocking(move || {
+            let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
+            Self::append_jsonl_line_sync(&path, line, AppendDurability::Buffered)?;
+            super::summary_write::apply_patch_locked(
+                &adapter.summary_file(&info),
+                &adapter.summary_lock_file(&info),
+                &super::summary_write::SummaryPatch {
+                    record_activity: true,
+                    chat_messages: Some(super::summary_write::CounterOp::Increment(1)),
+                    chat_format_version: Some(CHAT_FORMAT_VERSION),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
         .await
+        .map_err(io::Error::other)?
     }
     async fn append_cwd_switch_commit_aware(
         &self,
@@ -1120,18 +1394,64 @@ impl StorageAdapter for JsonlStorageAdapter {
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<xai_grok_sampling_types::ReasoningEffort>>,
     ) -> io::Result<()> {
-        self.apply_summary_patch(
-            info,
-            super::summary_write::SummaryPatch {
-                model: Some(super::summary_write::ModelPatch {
-                    model_id: model_id.clone(),
-                    agent_name: agent_name.map(String::from),
-                    reasoning_effort,
-                }),
-                ..Default::default()
-            },
-        )
+        let adapter = self.clone();
+        let info = info.clone();
+        let model_id = model_id.clone();
+        let agent_name = agent_name.map(String::from);
+        tokio::task::spawn_blocking(move || {
+            let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
+            super::summary_write::apply_patch_locked(
+                &adapter.summary_file(&info),
+                &adapter.summary_lock_file(&info),
+                &super::summary_write::SummaryPatch {
+                    model: Some(super::summary_write::ModelPatch {
+                        model_id,
+                        agent_name,
+                        reasoning_effort,
+                    }),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
         .await
+        .map_err(io::Error::other)?
+    }
+    async fn backup_chat_history_before_strip(&self, info: &Info) -> io::Result<()> {
+        let path = self.chat_file(info);
+        let backup = path.with_extension("jsonl.pre-strip");
+        if !tokio::fs::try_exists(&path).await? || tokio::fs::try_exists(&backup).await? {
+            return Ok(());
+        }
+        let staging = path.with_extension("jsonl.pre-strip.tmp");
+        tokio::fs::copy(&path, &staging).await?;
+        tokio::fs::rename(&staging, &backup).await?;
+        Ok(())
+    }
+    async fn commit_model_switch(
+        &self,
+        info: &Info,
+        messages: &[ConversationItem],
+        model_id: &acp::ModelId,
+        agent_name: Option<&str>,
+        reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+    ) -> Result<(), super::ModelSwitchCommitError> {
+        let adapter = self.clone();
+        let info = info.clone();
+        let messages = messages.to_vec();
+        let model_id = model_id.clone();
+        let agent_name = agent_name.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            adapter.commit_model_switch_sync(
+                &info,
+                &messages,
+                &model_id,
+                agent_name.as_deref(),
+                reasoning_effort,
+            )
+        })
+        .await
+        .map_err(|error| super::ModelSwitchCommitError::NotCommitted(io::Error::other(error)))?
     }
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()> {
         self.apply_summary_patch(
@@ -1454,60 +1774,51 @@ impl StorageAdapter for JsonlStorageAdapter {
         let info_clone = info.clone();
         let adapter_clone = self.clone();
         tokio::task::spawn_blocking(move || -> io::Result<()> {
-            use std::fs::OpenOptions;
             let adapter = adapter_clone;
-            let files_to_sync = [
-                adapter.updates_file(&info_clone),
-                adapter.chat_file(&info_clone),
-                adapter.summary_file(&info_clone),
-                adapter.plan_file(&info_clone),
-                adapter.rewind_points_file(&info_clone),
-            ];
-            for file_path in &files_to_sync {
-                if file_path.exists()
-                    && let Ok(file) = OpenOptions::new().write(true).open(file_path)
-                {
-                    let _ = file.sync_all();
-                }
+            #[cfg(test)]
+            if let Some(probe) = &adapter.session_sync_probe {
+                probe()?;
             }
-            Ok(())
+            sync_session_tree_durable(&adapter.session_dir(&info_clone))
         })
         .await
         .map_err(io::Error::other)?
-    }
-    async fn backup_chat_history_before_strip(&self, info: &Info) -> io::Result<()> {
-        let path = self.chat_file(info);
-        let backup = path.with_extension("jsonl.pre-strip");
-        if !tokio::fs::try_exists(&path).await? || tokio::fs::try_exists(&backup).await? {
-            return Ok(());
-        }
-        let staging = path.with_extension("jsonl.pre-strip.tmp");
-        tokio::fs::copy(&path, &staging).await?;
-        tokio::fs::rename(&staging, &backup).await?;
-        Ok(())
     }
     async fn replace_chat_history(
         &self,
         info: &Info,
         messages: &[ConversationItem],
     ) -> io::Result<()> {
-        self.write_jsonl(self.chat_file(info), messages).await?;
+        let adapter = self.clone();
+        let info = info.clone();
+        let messages = messages.to_vec();
         let new_count = messages.len();
         let cwd_switch_bookkeeping_generation = messages
             .iter()
             .filter_map(ConversationItem::working_directory_switch_generation)
             .max()
             .unwrap_or(0);
-        self.apply_summary_patch(
-            info,
-            super::summary_write::SummaryPatch {
-                chat_messages: Some(super::summary_write::CounterOp::Set(new_count)),
-                chat_format_version: Some(CHAT_FORMAT_VERSION),
-                cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
-                ..Default::default()
-            },
-        )
+        tokio::task::spawn_blocking(move || {
+            let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
+            let chat_path = adapter.chat_file(&info);
+            let chat_lock = Self::lock_append(&chat_path)?;
+            let write_result = super::write_jsonl_atomic(&chat_path, &messages);
+            let _ = chat_lock.unlock();
+            write_result?;
+            super::summary_write::apply_patch_locked(
+                &adapter.summary_file(&info),
+                &adapter.summary_lock_file(&info),
+                &super::summary_write::SummaryPatch {
+                    chat_messages: Some(super::summary_write::CounterOp::Set(new_count)),
+                    chat_format_version: Some(CHAT_FORMAT_VERSION),
+                    cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
         .await
+        .map_err(io::Error::other)?
     }
     async fn copy_session_data(
         &self,

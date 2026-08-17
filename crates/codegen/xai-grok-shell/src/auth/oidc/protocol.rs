@@ -33,9 +33,9 @@ pub(super) enum OidcError {
     CallbackAuthFailed(String),
     #[error("failed to parse pasted input: {0}")]
     InvalidPastedInput(String),
-    #[error("OIDC token exchange failed: HTTP {status} — {body}")]
+    #[error("OIDC token exchange failed: HTTP {status}")]
     TokenExchangeHttp { status: u16, body: String },
-    #[error("OIDC token refresh failed: HTTP {status} — {body}")]
+    #[error("OIDC token refresh failed: HTTP {status}")]
     TokenRefreshHttp { status: u16, body: String },
     #[error("OIDC authentication failed: state mismatch")]
     StateMismatch,

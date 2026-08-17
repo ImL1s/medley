@@ -23,7 +23,7 @@ pub(crate) mod token_type;
 pub(crate) use api_key_probe::{
     DEFAULT_PROBE_TIMEOUT, first_party_env_key_allows_advertise, should_probe_first_party_env_key,
 };
-pub use auth_provider::{AuthProviderConfig, AuthProviderRef};
+pub use auth_provider::{AuthProviderConfig, AuthProviderRef, ProviderCredentialSnapshot};
 pub(crate) use auth_provider::{
     PROVIDER_TIMEOUT_CEILING_SECS, PROVIDER_TOKEN_EXPIRY_SKEW_SECS, ProviderRefreshOutcome,
 };
@@ -46,12 +46,26 @@ pub use flow::{
 };
 pub use jwt::{is_jwt_expired_or_near, parse_jwt_expiration};
 mod meta;
-pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
 pub(crate) use error::with_login_instruction;
+pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
 pub use manager::{AuthManager, shared_api_key_provider};
-pub(crate) use manager::{AuthRemedy, SilentRefresh};
+pub(crate) use manager::{
+    AuthRemedy, AuthSelectionSeal, AuthSelectionSnapshot, FirstPartySessionEligibility,
+    SilentRefresh,
+};
 pub use meta::{AuthMeta, GateInfo};
 pub use model::{AuthMode, GrokAuth, lookup_auth};
 pub(crate) use model::{TOKEN_TTL, UserInfo, default_coding_data_retention_opt_out, is_expired};
 pub(crate) use refresh::DiagnosticUploader;
-pub use storage::{clear_api_key, read_api_key, read_auth_json, store_api_key};
+pub use storage::{
+    clear_api_key, read_api_key, read_auth_json, read_token_by_scope, store_api_key,
+};
+
+/// Whether an external auth-provider command names an executable action.
+///
+/// Configuration loaders preserve the operator's string verbatim, so every
+/// refresh-authority decision must reject missing, empty, and whitespace-only
+/// commands through this single predicate.
+pub(crate) fn has_nonblank_auth_provider_command(command: Option<&str>) -> bool {
+    command.is_some_and(|command| !command.trim().is_empty())
+}

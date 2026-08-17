@@ -27,8 +27,8 @@ use xai_grok_sampling_types::error::{
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    ResponseModelMetadata, Result, SamplingError, SentCredential, build_messages_request,
-    is_check_event, messages, rs,
+    ReasoningEffort, ResponseModelMetadata, Result, SamplingError, SentCredential,
+    build_messages_request, is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, EndpointTrustClass, OriginClientInfo, SamplerConfig};
@@ -50,6 +50,7 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION: &str = "<multi_agent_mode>Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.</multi_agent_mode>";
 const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-id");
 const OPENAI_FEDRAMP: HeaderName = HeaderName::from_static("x-openai-fedramp");
 const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
@@ -1678,6 +1679,39 @@ impl SamplingClient {
     // Responses API
     // =========================================================================
 
+    /// Apply the Codex-only Responses contract after typed serialization.
+    ///
+    /// The client-side Ultra tier intentionally shares the provider's `max`
+    /// wire effort. Its distinct behavior is conveyed through a developer
+    /// instruction and must never cross the generic Responses boundary.
+    fn prepare_codex_response_request(
+        &self,
+        request: &CreateResponseWrapper,
+        body: &mut serde_json::Value,
+    ) {
+        if !self.is_codex() {
+            return;
+        }
+
+        xai_grok_sampling_types::patch_codex_instructions(body);
+        if request.client_reasoning_effort == Some(ReasoningEffort::Ultra) {
+            let existing = body
+                .get("instructions")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !existing.contains(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION) {
+                body["instructions"] = serde_json::Value::String(if existing.is_empty() {
+                    CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION.to_owned()
+                } else {
+                    format!("{existing}\n\n{CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION}")
+                });
+            }
+        }
+        if let Some(caps) = self.defaults.codex_wire.as_ref() {
+            xai_grok_sampling_types::apply_codex_wire_capabilities(body, caps);
+        }
+    }
+
     /// Apply default configuration to a Responses API request.
     fn apply_response_defaults(&self, request: &mut CreateResponseWrapper) -> Result<()> {
         // Apply model default if not specified
@@ -1768,12 +1802,7 @@ impl SamplingClient {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
-        if self.is_codex() {
-            xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
-            if let Some(caps) = self.defaults.codex_wire.as_ref() {
-                xai_grok_sampling_types::apply_codex_wire_capabilities(&mut request_body, caps);
-            }
-        }
+        self.prepare_codex_response_request(&request, &mut request_body);
         if !self.sends_xai_identity_headers() {
             anonymize_prompt_cache_key(&mut request_body);
         }
@@ -1902,12 +1931,7 @@ impl SamplingClient {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
-        if self.is_codex() {
-            xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
-            if let Some(caps) = self.defaults.codex_wire.as_ref() {
-                xai_grok_sampling_types::apply_codex_wire_capabilities(&mut request_body, caps);
-            }
-        }
+        self.prepare_codex_response_request(&request, &mut request_body);
         if !self.sends_xai_identity_headers() {
             anonymize_prompt_cache_key(&mut request_body);
         }
@@ -2425,6 +2449,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
+        let client_reasoning_effort = request.reasoning_effort;
 
         // The hosted tools travel as raw JSON, spliced in after serialization by
         // `splice_extra_tool_entries`, whose doc explains why each one does.
@@ -2433,6 +2458,7 @@ impl SamplingClient {
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
+        wrapper.client_reasoning_effort = client_reasoning_effort;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
@@ -2462,6 +2488,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
+        let client_reasoning_effort = request.reasoning_effort;
 
         // The hosted tools travel as raw JSON, spliced in by `create_response` through
         // `splice_extra_tool_entries`, whose doc explains why each one does.
@@ -2470,6 +2497,7 @@ impl SamplingClient {
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
+        wrapper.client_reasoning_effort = client_reasoning_effort;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
@@ -4451,6 +4479,94 @@ mod tests {
     }
 
     #[test]
+    fn codex_ultra_preparation_preserves_max_wire_effort_and_injects_marker_once() {
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: CODEX_BASE_URL.to_owned(),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(Arc::new(CodexCredentialResolver {
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            })),
+            ..minimal_config()
+        })
+        .expect("Codex client should build");
+        let request = CreateResponseWrapper {
+            client_reasoning_effort: Some(ReasoningEffort::Ultra),
+            ..CreateResponseWrapper::default()
+        };
+        let mut body = serde_json::json!({
+            "instructions": "existing guidance",
+            "reasoning": { "effort": "max" }
+        });
+
+        client.prepare_codex_response_request(&request, &mut body);
+        client.prepare_codex_response_request(&request, &mut body);
+
+        let instructions = body["instructions"].as_str().expect("instructions string");
+        assert!(instructions.starts_with("existing guidance\n\n"));
+        assert_eq!(
+            instructions
+                .matches(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            body.pointer("/reasoning/effort"),
+            Some(&serde_json::json!("max"))
+        );
+    }
+
+    #[test]
+    fn codex_non_ultra_preparation_does_not_inject_proactive_marker() {
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: CODEX_BASE_URL.to_owned(),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(Arc::new(CodexCredentialResolver {
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            })),
+            ..minimal_config()
+        })
+        .expect("Codex client should build");
+        let request = CreateResponseWrapper {
+            client_reasoning_effort: Some(ReasoningEffort::Max),
+            ..CreateResponseWrapper::default()
+        };
+        let mut body = serde_json::json!({"instructions": "existing guidance"});
+
+        client.prepare_codex_response_request(&request, &mut body);
+
+        assert_eq!(body["instructions"], "existing guidance");
+        assert!(
+            !body
+                .to_string()
+                .contains(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION)
+        );
+    }
+
+    #[test]
+    fn generic_responses_never_receive_codex_ultra_proactive_marker() {
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: "https://api.openai.com/v1".to_owned(),
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        })
+        .expect("generic Responses client should build");
+        let request = CreateResponseWrapper {
+            client_reasoning_effort: Some(ReasoningEffort::Ultra),
+            ..CreateResponseWrapper::default()
+        };
+        let mut body = serde_json::json!({"instructions": "existing guidance"});
+
+        client.prepare_codex_response_request(&request, &mut body);
+
+        assert_eq!(body["instructions"], "existing guidance");
+        assert!(
+            !body
+                .to_string()
+                .contains(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION)
+        );
+    }
+
+    #[test]
     fn generic_responses_preserve_sampling_parameters() {
         let client = SamplingClient::new(SamplerConfig {
             base_url: "https://api.openai.com/v1".to_owned(),
@@ -4723,6 +4839,11 @@ mod tests {
                 content: rs::EasyInputContent::Text("hello".to_owned()),
             }),
         ]);
+        request.inner.reasoning = Some(rs::Reasoning {
+            effort: Some(rs::ReasoningEffort::Max),
+            summary: Some(rs::ReasoningSummary::Concise),
+        });
+        request.client_reasoning_effort = Some(ReasoningEffort::Ultra);
         request.x_grok_conv_id = Some("must-not-leak".to_owned());
         request.x_grok_req_id = Some("must-not-leak".to_owned());
         request.extra_tool_entries = vec![serde_json::json!({"type": "x_search"})];
@@ -4743,7 +4864,15 @@ mod tests {
         assert!(headers.get("x-grok-conv-id").is_none());
         assert!(headers.get(DOOM_LOOP_CHECK_HEADER).is_none());
         let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
-        assert_eq!(body["instructions"], "system guidance");
+        let instructions = body["instructions"].as_str().expect("instructions string");
+        assert!(instructions.starts_with("system guidance\n\n"));
+        assert_eq!(
+            instructions
+                .matches(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION)
+                .count(),
+            1,
+            "Codex Ultra must append the proactive multi-agent instruction exactly once"
+        );
         assert!(
             body["input"]
                 .as_array()
@@ -4755,6 +4884,11 @@ mod tests {
                 .is_some_and(|items| items.iter().any(|item| item["role"] == "user"))
         );
         assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(
+            body.pointer("/reasoning/effort"),
+            Some(&serde_json::json!("max")),
+            "Codex Ultra is a client mode; its provider reasoning tier is max"
+        );
         assert!(
             body.get("temperature").is_none(),
             "Codex request must omit unsupported temperature: {body}"

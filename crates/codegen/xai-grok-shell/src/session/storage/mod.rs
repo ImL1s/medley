@@ -122,11 +122,17 @@ pub(crate) fn replace_file_atomic_durable(src: &Path, dst: &Path) -> io::Result<
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ModelSwitchCommitError {
+pub enum ModelSwitchCommitError {
     #[error("committed model switch failure: {0}")]
     Committed(io::Error),
     #[error("uncommitted model switch failure: {0}")]
     NotCommitted(io::Error),
+}
+
+impl ModelSwitchCommitError {
+    pub fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
 }
 
 /// Async sibling of [`write_bytes_atomic`].
@@ -1128,6 +1134,50 @@ pub trait StorageAdapter: Send + Sync {
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
     ) -> io::Result<()>;
+
+    async fn update_current_model_identity_and_agent(
+        &self,
+        info: &Info,
+        model_id: &acp::ModelId,
+        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
+        agent_name: Option<&str>,
+        reasoning_effort: Option<Option<ReasoningEffort>>,
+    ) -> io::Result<()> {
+        let _ = catalog_identity;
+        self.update_current_model_and_agent(info, model_id, agent_name, reasoning_effort)
+            .await
+    }
+
+    /// Atomically commit the chat/model generation used by a model switch.
+    /// Once durable intent is installed, errors are reported as `Committed`
+    /// and load must replay that intent before returning session data.
+    async fn commit_model_switch(
+        &self,
+        _info: &Info,
+        _messages: &[ConversationItem],
+        _model_id: &acp::ModelId,
+        _agent_name: Option<&str>,
+        _reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<(), ModelSwitchCommitError> {
+        Err(ModelSwitchCommitError::NotCommitted(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic model-switch persistence is unsupported",
+        )))
+    }
+
+    async fn commit_model_switch_with_identity(
+        &self,
+        info: &Info,
+        messages: &[ConversationItem],
+        model_id: &acp::ModelId,
+        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
+        agent_name: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<(), ModelSwitchCommitError> {
+        let _ = catalog_identity;
+        self.commit_model_switch(info, messages, model_id, agent_name, reasoning_effort)
+            .await
+    }
 
     /// Update the collection ID for telemetry tracing
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()>;

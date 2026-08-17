@@ -25,6 +25,10 @@ pub(crate) fn has_relocation_journal(grok_home: &Path, session_id: &str) -> bool
     journal::journal_path(grok_home, session_id).is_file()
 }
 
+pub(crate) fn publish_directory_no_replace(source: &Path, target: &Path) -> Result<()> {
+    fs::rename_no_replace(source, target)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RelocationError {
     #[error("invalid relocation {field}: {value:?}")]

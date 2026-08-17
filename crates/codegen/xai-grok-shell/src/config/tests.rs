@@ -1,6 +1,10 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
 fn with_env_var<T>(name: &str, value: &str, f: impl FnOnce() -> T) -> T {
+    assert!(
+        serial_test::is_locked_serially(None),
+        "process-global env test helper requires #[serial_test::serial]"
+    );
     let previous = std::env::var(name).ok();
     unsafe {
         std::env::set_var(name, value);
@@ -24,6 +28,7 @@ fn with_env_var<T>(name: &str, value: &str, f: impl FnOnce() -> T) -> T {
     }
 }
 #[test]
+#[serial_test::serial]
 fn expands_env_vars_in_toml_strings() {
     with_env_var(
         "GROK_TEST_CONFIG_EXPAND",
@@ -98,6 +103,10 @@ static MEMORY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Run `f` with `name` set to `value` (Some) or removed (None).
 /// Saves and restores the previous value, even on panic.
 fn with_env_var_opt<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    assert!(
+        serial_test::is_locked_serially(None),
+        "process-global env test helper requires #[serial_test::serial]"
+    );
     let previous = std::env::var(name).ok();
     match value {
         Some(v) => unsafe { std::env::set_var(name, v) }
@@ -121,6 +130,7 @@ fn with_grok_memory<T>(value: &str, f: impl FnOnce() -> T) -> T {
     with_env_var_opt("GROK_MEMORY", Some(value), f)
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_default_disabled() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -129,6 +139,7 @@ fn memory_config_default_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_cli_flag_enables() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -137,6 +148,7 @@ fn memory_config_cli_flag_enables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_from_toml() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
@@ -145,6 +157,7 @@ fn memory_config_from_toml() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_toml_disabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
@@ -153,6 +166,7 @@ fn memory_config_toml_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_enables() {
     with_grok_memory(
         "1",
@@ -164,6 +178,7 @@ fn memory_config_env_var_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_true_enables() {
     with_grok_memory(
         "true",
@@ -175,6 +190,7 @@ fn memory_config_env_var_true_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_zero_does_not_enable() {
     with_grok_memory(
         "0",
@@ -186,6 +202,7 @@ fn memory_config_env_var_zero_does_not_enable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_false_does_not_enable() {
     with_grok_memory(
         "false",
@@ -197,6 +214,7 @@ fn memory_config_env_var_false_does_not_enable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_cli_overrides_toml_disabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
@@ -205,6 +223,7 @@ fn memory_config_cli_overrides_toml_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_zero_force_disables_toml_enabled() {
     with_grok_memory(
         "0",
@@ -220,6 +239,7 @@ fn memory_config_env_zero_force_disables_toml_enabled() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_false_force_disables_toml_enabled() {
     with_grok_memory(
         "false",
@@ -235,6 +255,7 @@ fn memory_config_env_false_force_disables_toml_enabled() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_cli_flag_overrides_env_disable() {
     with_grok_memory(
         "0",
@@ -249,6 +270,7 @@ fn memory_config_cli_flag_overrides_env_disable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_all() {
     with_grok_memory(
         "1",
@@ -264,6 +286,7 @@ fn memory_config_no_memory_overrides_all() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_alone_disables() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -272,6 +295,7 @@ fn memory_config_no_memory_alone_disables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_env_enable() {
     with_grok_memory(
         "1",
@@ -283,6 +307,7 @@ fn memory_config_no_memory_overrides_env_enable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_toml_enabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
@@ -294,6 +319,7 @@ fn memory_config_no_memory_overrides_toml_enabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_remote_enabled() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -309,6 +335,7 @@ fn memory_config_no_memory_overrides_remote_enabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_defaults_are_correct() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -358,6 +385,7 @@ fn memory_config_defaults_are_correct() {
 /// files that contain `debounce_ms` are still parsed without error
 /// (unknown fields are silently ignored by serde default).
 #[test]
+#[serial_test::serial]
 fn memory_config_watcher_debounce_ms_in_toml_is_silently_ignored() {
     without_grok_memory(|| {
         let toml_str = "[memory.watcher]\nenabled = true\ndebounce_ms = 2000\n";
@@ -368,6 +396,7 @@ fn memory_config_watcher_debounce_ms_in_toml_is_silently_ignored() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_full_toml_parsing() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -453,6 +482,7 @@ hard_clear_age_turns = 20
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_partial_toml_uses_defaults_for_missing() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -474,6 +504,7 @@ max_chunk_chars = 3200
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_settings_enable() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -489,6 +520,7 @@ fn memory_config_remote_settings_enable() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_settings_pruning() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -503,6 +535,7 @@ fn memory_config_remote_settings_pruning() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_settings_initial_injection() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -517,6 +550,7 @@ fn memory_config_remote_settings_initial_injection() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_initial_injection_overrides_remote() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -536,6 +570,7 @@ min_score = 0.25
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_disabled_blocks_remote_enable() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
@@ -551,6 +586,7 @@ fn memory_config_local_disabled_blocks_remote_enable() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_overrides_remote() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -570,6 +606,7 @@ max_results = 20
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_none_is_noop() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -588,6 +625,7 @@ fn memory_config_remote_none_is_noop() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_from_remote_when_no_local_flush() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -604,6 +642,7 @@ fn flush_semantic_dedup_threshold_from_remote_when_no_local_flush() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_clamped_from_remote() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -630,6 +669,7 @@ fn flush_semantic_dedup_threshold_clamped_from_remote() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_local_blocks_remote() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -651,6 +691,7 @@ semantic_dedup_threshold = 0.88
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_defaults_to_none() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -662,6 +703,7 @@ fn flush_semantic_dedup_threshold_defaults_to_none() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_defaults() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -674,6 +716,7 @@ fn memory_dream_config_defaults() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_toml_parsing() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -694,6 +737,7 @@ check_interval_secs = 600
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_remote_override_when_toml_absent() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -713,6 +757,7 @@ fn memory_dream_config_remote_override_when_toml_absent() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_remote_ignored_when_toml_present() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -736,6 +781,7 @@ min_hours = 6
     });
 }
 #[test]
+#[serial_test::serial]
 fn expands_multiple_vars_in_one_string() {
     with_env_var(
         "GROK_TEST_USER",
@@ -880,6 +926,7 @@ fn effective_half_life_disabled_legacy_recency_out_of_range_ignored() {
     }
 }
 #[test]
+#[serial_test::serial]
 fn mmr_lambda_clamped_above_one() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -901,6 +948,7 @@ lambda = 2.0
     });
 }
 #[test]
+#[serial_test::serial]
 fn mmr_lambda_clamped_below_zero() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -922,6 +970,7 @@ lambda = -0.5
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_temporal_decay() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -936,6 +985,7 @@ fn memory_config_remote_temporal_decay() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_mmr() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -950,6 +1000,7 @@ fn memory_config_remote_mmr() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_mmr_lambda_clamped() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -965,6 +1016,7 @@ fn memory_config_remote_mmr_lambda_clamped() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_search_blocks_remote_temporal_decay_and_mmr() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -1002,6 +1054,7 @@ fn with_grok_subagents<T>(value: &str, f: impl FnOnce() -> T) -> T {
     with_env_var_opt("GROK_SUBAGENTS", Some(value), f)
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_default_enabled() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -1060,6 +1113,7 @@ fn subagents_max_depth_invalid_env_falls_through() {
         );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_parses_max_depth_from_toml() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nmax_depth = 2\n")
@@ -1101,6 +1155,7 @@ fn subagent_limit_behavior_resolves_env_over_toml_over_remote_over_queue() {
     assert_eq!(resolve(None, Some("sometimes"), None), LimitBehavior::Queue);
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_parses_limits_from_toml() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1114,6 +1169,7 @@ fn subagents_config_parses_limits_from_toml() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_parses_negative_max_depth_without_dropping_section() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1130,6 +1186,7 @@ fn subagents_config_parses_negative_max_depth_without_dropping_section() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_cli_flag_enables() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -1138,6 +1195,7 @@ fn subagents_config_cli_flag_enables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_env_var_enables() {
     with_grok_subagents(
         "1",
@@ -1149,6 +1207,7 @@ fn subagents_config_env_var_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_env_var_disables() {
     with_grok_subagents(
         "0",
@@ -1161,6 +1220,7 @@ fn subagents_config_env_var_disables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_toml_enables() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
@@ -1169,6 +1229,7 @@ fn subagents_config_toml_enables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_local_disabled_wins() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = false")
@@ -1178,6 +1239,7 @@ fn subagents_config_local_disabled_wins() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_env_var_disables_default() {
     with_grok_subagents(
         "0",
@@ -1194,6 +1256,7 @@ fn subagents_config_env_var_disables_default() {
 /// A `subagents_enabled` key served by an old cli-chat-proxy must parse
 /// as an unknown key and have no effect on resolution.
 #[test]
+#[serial_test::serial]
 fn subagents_config_remote_settings_key_is_ignored() {
     without_grok_subagents(|| {
         let _settings: crate::util::config::RemoteSettings = serde_json::from_str(
@@ -1206,6 +1269,7 @@ fn subagents_config_remote_settings_key_is_ignored() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_cli_flag_overrides_env_var() {
     with_grok_subagents(
         "0",
@@ -1220,6 +1284,7 @@ fn subagents_config_cli_flag_overrides_env_var() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_parsed() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1241,6 +1306,7 @@ fn subagents_config_models_parsed() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_empty_when_missing() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
@@ -1250,6 +1316,7 @@ fn subagents_config_models_empty_when_missing() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_without_enabled() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1269,6 +1336,7 @@ fn subagents_config_models_without_enabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_with_env_var_enables() {
     with_grok_subagents(
         "1",
@@ -1287,6 +1355,7 @@ fn subagents_config_models_with_env_var_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_toggle_mixed_values() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1312,6 +1381,7 @@ fn subagents_config_toggle_mixed_values() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_toggle_missing_defaults_to_empty() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
@@ -1518,18 +1588,32 @@ fn with_model_overrides_env_full<T>(
     ps: Option<&str>,
     f: impl FnOnce() -> T,
 ) -> T {
+    with_model_overrides_and_default_env(None, ws, ss, id, ps, f)
+}
+fn with_model_overrides_and_default_env<T>(
+    default: Option<&str>,
+    ws: Option<&str>,
+    ss: Option<&str>,
+    id: Option<&str>,
+    ps: Option<&str>,
+    f: impl FnOnce() -> T,
+) -> T {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_env_var_opt(
-        "GROK_WEB_SEARCH_MODEL",
-        ws,
+        "GROK_DEFAULT_MODEL",
+        default,
         || with_env_var_opt(
-            "GROK_SESSION_SUMMARY_MODEL",
-            ss,
+            "GROK_WEB_SEARCH_MODEL",
+            ws,
             || with_env_var_opt(
-                "GROK_IMAGE_DESCRIPTION_MODEL",
-                id,
-                || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
+                "GROK_SESSION_SUMMARY_MODEL",
+                ss,
+                || with_env_var_opt(
+                    "GROK_IMAGE_DESCRIPTION_MODEL",
+                    id,
+                    || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
+                ),
             ),
         ),
     )
@@ -1543,6 +1627,7 @@ fn with_model_overrides_env<T>(
     with_model_overrides_env_full(ws, ss, id, None, f)
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_remote_settings_blocked_by_local_config() {
     with_model_overrides_env(
         None,
@@ -1570,6 +1655,7 @@ fn model_overrides_remote_settings_blocked_by_local_config() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_overrides_everything() {
     with_model_overrides_env(
         Some("env-ws"),
@@ -1591,10 +1677,13 @@ fn model_overrides_cli_overrides_everything() {
             );
             assert_eq!(cfg.web_search, "cli-ws");
             assert_eq!(cfg.session_summary, Some("cli-ss".to_owned()));
+            assert!(!cfg.web_search_follows_default);
+            assert!(!cfg.session_summary_follows_default);
         },
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_remote_settings_applies_without_local_config() {
     with_model_overrides_env(
         None,
@@ -1616,6 +1705,7 @@ fn model_overrides_remote_settings_applies_without_local_config() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_local_image_description_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1639,6 +1729,7 @@ fn model_overrides_local_image_description_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_default_image_description_is_grok_build() {
     with_model_overrides_env(
         None,
@@ -1655,6 +1746,7 @@ fn model_overrides_default_image_description_is_grok_build() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_default_session_summary_is_grok_build() {
     with_model_overrides_env(
         None,
@@ -1671,6 +1763,184 @@ fn model_overrides_default_session_summary_is_grok_build() {
     );
 }
 #[test]
+#[serial_test::serial]
+fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "gpt-5.3-codex-spark"
+                "#,
+                )
+                .unwrap();
+            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+            // The point of the test: a Codex-only user must not have these
+            // two lanes silently resolve to the compiled xAI constant.
+            assert_eq!(cfg.session_summary, Some("gpt-5.3-codex-spark".to_owned()));
+            assert_eq!(
+                cfg.image_description,
+                Some("gpt-5.3-codex-spark".to_owned())
+            );
+            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark".to_owned());
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
+            assert_ne!(
+                cfg.session_summary.as_deref(),
+                Some(crate::models::default_session_summary_model()),
+                "the compiled default is xAI; following it is the bug"
+            );
+        },
+    );
+}
+#[test]
+#[serial_test::serial]
+fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
+    with_model_overrides_and_default_env(
+        Some("gpt-5.3-codex-spark"),
+        None,
+        None,
+        None,
+        None,
+        || {
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let cfg = ModelOverrideConfig::resolve(None, None, &empty, None);
+            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark");
+            assert_eq!(cfg.session_summary.as_deref(), Some("gpt-5.3-codex-spark"));
+            assert_eq!(cfg.image_description.as_deref(), Some("gpt-5.3-codex-spark"));
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
+        },
+    );
+}
+#[test]
+#[serial_test::serial]
+fn model_overrides_cli_configured_default_wins_over_other_defaults() {
+    with_model_overrides_and_default_env(
+        Some("env-default"),
+        None,
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "local-default"
+                "#,
+                )
+                .unwrap();
+            let remote = crate::util::config::RemoteSettings {
+                default_model: Some("remote-default".to_owned()),
+                ..Default::default()
+            };
+            let cfg = ModelOverrideConfig::resolve_with_default_model(
+                Some("cli-default"),
+                None,
+                None,
+                &config,
+                Some(&remote),
+            );
+            assert_eq!(cfg.web_search, "cli-default");
+            assert_eq!(cfg.session_summary.as_deref(), Some("cli-default"));
+            assert_eq!(cfg.image_description.as_deref(), Some("cli-default"));
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
+        },
+    );
+}
+#[test]
+fn model_overrides_inherited_web_search_uses_operative_model() {
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "rejected-configured-default",
+            "substituted-operative-model",
+            true,
+        ),
+        "substituted-operative-model",
+    );
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "explicit-web-search-pin",
+            "substituted-operative-model",
+            false,
+        ),
+        "explicit-web-search-pin",
+    );
+}
+#[test]
+fn model_overrides_inherited_image_uses_child_operative_model() {
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "configured-parent-default",
+            "child-operative-model",
+            true,
+        ),
+        "child-operative-model",
+    );
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "explicit-image-pin",
+            "child-operative-model",
+            false,
+        ),
+        "explicit-image-pin",
+    );
+}
+#[test]
+#[serial_test::serial]
+fn model_overrides_unset_auxiliary_lanes_follow_the_remote_configured_default() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let remote = crate::util::config::RemoteSettings {
+                default_model: Some("remote-default".to_owned()),
+                ..Default::default()
+            };
+            let cfg = ModelOverrideConfig::resolve(None, None, &empty, Some(&remote));
+            assert_eq!(cfg.session_summary, Some("remote-default".to_owned()));
+            assert_eq!(cfg.image_description, Some("remote-default".to_owned()));
+        },
+    );
+}
+#[test]
+#[serial_test::serial]
+fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "gpt-5.3-codex-spark"
+                "#,
+                )
+                .unwrap();
+            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+            // Deliberate exclusion, pinned so it cannot be "tidied up" into
+            // the rule later. `helpers::prompt_suggest` documents this lane
+            // as "deliberately NOT a session-model fallback", and the
+            // configured default is usually the session model — so feeding
+            // it in would break the lane's own stated contract on every
+            // turn. Its gate, `effective_suggest_model`, already drops the
+            // request when the model is absent from the catalog.
+            assert_eq!(cfg.prompt_suggestion, PromptSuggestModelPin::Unpinned);
+        },
+    );
+}
+#[test]
+#[serial_test::serial]
 fn model_overrides_local_session_summary_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1694,6 +1964,7 @@ fn model_overrides_local_session_summary_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_session_summary_overrides_remote() {
     with_model_overrides_env(
         None,
@@ -1711,6 +1982,7 @@ fn model_overrides_env_session_summary_overrides_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_session_summary_overrides_local() {
     with_model_overrides_env(
         None,
@@ -1730,6 +2002,7 @@ fn model_overrides_env_session_summary_overrides_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_session_summary_toml_uses_default() {
     with_model_overrides_env(
         None,
@@ -1752,6 +2025,7 @@ fn model_overrides_empty_session_summary_toml_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_session_summary_remote_uses_default() {
     with_model_overrides_env(
         None,
@@ -1772,6 +2046,7 @@ fn model_overrides_empty_session_summary_remote_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_session_summary_overrides_everything() {
     with_model_overrides_env(
         None,
@@ -1800,6 +2075,7 @@ fn model_overrides_cli_session_summary_overrides_everything() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_cli_session_summary_uses_default() {
     with_model_overrides_env(
         None,
@@ -1816,6 +2092,7 @@ fn model_overrides_empty_cli_session_summary_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_image_description_overrides_remote() {
     with_model_overrides_env(
         None,
@@ -1833,6 +2110,7 @@ fn model_overrides_env_image_description_overrides_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_image_description_overrides_local() {
     with_model_overrides_env(
         None,
@@ -1852,6 +2130,7 @@ fn model_overrides_env_image_description_overrides_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_image_description_toml_uses_default() {
     with_model_overrides_env(
         None,
@@ -1874,6 +2153,7 @@ fn model_overrides_empty_image_description_toml_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_image_description_remote_uses_default() {
     with_model_overrides_env(
         None,
@@ -1894,6 +2174,7 @@ fn model_overrides_empty_image_description_remote_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_unpinned_by_default() {
     with_model_overrides_env(
         None,
@@ -1907,6 +2188,7 @@ fn model_overrides_prompt_suggestion_unpinned_by_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_local_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1933,6 +2215,7 @@ fn model_overrides_prompt_suggestion_local_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_remote_applies_without_local() {
     with_model_overrides_env(
         None,
@@ -1953,6 +2236,7 @@ fn model_overrides_prompt_suggestion_remote_applies_without_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_env_wins_over_local_and_remote() {
     with_model_overrides_env_full(
         None,
@@ -1980,6 +2264,7 @@ fn model_overrides_prompt_suggestion_env_wins_over_local_and_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_blank_values_are_unset() {
     with_model_overrides_env_full(
         None,
@@ -2046,6 +2331,7 @@ fn with_grok_respect_gitignore<T>(value: &str, f: impl FnOnce() -> T) -> T {
     with_tools_env(Some(value), None, f)
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_default_disabled() {
     without_grok_respect_gitignore(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -2054,6 +2340,7 @@ fn tools_config_default_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_toml_disables() {
     without_grok_respect_gitignore(|| {
         let config: toml::Value = toml::from_str("[tools]\nrespect_gitignore = false")
@@ -2063,6 +2350,7 @@ fn tools_config_toml_disables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_env_var_disables() {
     with_grok_respect_gitignore(
         "0",
@@ -2074,6 +2362,7 @@ fn tools_config_env_var_disables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_env_var_overrides_toml() {
     with_grok_respect_gitignore(
         "1",
@@ -2088,6 +2377,7 @@ fn tools_config_env_var_overrides_toml() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_env_false_overrides_toml_true() {
     with_grok_respect_gitignore(
         "false",
@@ -2103,6 +2393,7 @@ fn tools_config_env_false_overrides_toml_true() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn zdr_incompatible_tools_env_overrides_toml_false() {
     with_tools_env(
         None,
@@ -2141,6 +2432,7 @@ fn zdr_video_output_s3_deserializes_from_tools_block() {
     assert!(s3.is_valid());
 }
 #[test]
+#[serial_test::serial]
 fn incomplete_zdr_video_output_s3_is_ignored() {
     without_grok_respect_gitignore(|| {
         let config: toml::Value = toml::from_str(
@@ -2162,6 +2454,7 @@ fn incomplete_zdr_video_output_s3_is_ignored() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn malformed_zdr_video_output_s3_preserves_zdr_flag() {
     without_grok_respect_gitignore(|| {
         let config: toml::Value = toml::from_str(
@@ -3169,13 +3462,13 @@ fn config_layers_system_managed_lowest_priority() {
 #[test]
 fn apply_requirements_value_overrides_user_settings() {
     let raw_config: toml::Value = toml::from_str(
-            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
+            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\nsession_summary = \"user-summary-model\"\nimage_description = \"user-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
         )
         .unwrap();
     let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw_config).unwrap();
     cfg.default_yolo_mode = true;
     let requirements: toml::Value = toml::from_str(
-            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
+            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\nsession_summary = \"managed-summary-model\"\nimage_description = \"managed-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
         )
         .unwrap();
     let source = RequirementSource::Requirements {
@@ -3202,6 +3495,26 @@ fn apply_requirements_value_overrides_user_settings() {
     assert!(!cfg.default_yolo_mode);
     assert_eq!(Some("managed-model"), cfg.models.default.as_deref());
     assert_eq!(Some("managed-ws-model"), cfg.models.web_search.as_deref());
+    assert_eq!(
+        Some("managed-summary-model"),
+        cfg.models.session_summary.as_deref()
+    );
+    assert_eq!(
+        Some("managed-image-model"),
+        cfg.models.image_description.as_deref()
+    );
+    assert_eq!(
+        Some("managed-ws-model".to_owned()),
+        cfg.requirements.web_search_model.pinned()
+    );
+    assert_eq!(
+        Some("managed-summary-model".to_owned()),
+        cfg.requirements.session_summary_model.pinned()
+    );
+    assert_eq!(
+        Some("managed-image-model".to_owned()),
+        cfg.requirements.image_description_model.pinned()
+    );
     assert_eq!(Some("stable"), cfg.cli.channel.as_deref());
     assert_eq!(
             Some("https://managed-proxy.example/v1"),
@@ -3264,6 +3577,196 @@ fn apply_requirements_value_overrides_user_settings() {
                 .iter()
                 .any(|e| e.path == "telemetry.mixpanel_token" && e.value == "[redacted]")
         );
+}
+
+#[test]
+fn rejected_requirements_reload_preserves_auxiliary_pins() {
+    let mut cfg = crate::agent::config::Config::default();
+    let path = std::path::PathBuf::from("/test/requirements.toml");
+    let initial: toml::Value = toml::from_str(
+        "[models]\nweb_search = \"required-search\"\nsession_summary = \"required-summary\"\nimage_description = \"required-image\"\n",
+    )
+    .unwrap();
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: initial,
+            source: xai_grok_config::RequirementsSource::File(path.clone()),
+            is_system: false,
+        })],
+    );
+
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Rejected(
+            xai_grok_config::RequirementsSource::File(path),
+        )],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("required-search")
+    );
+    assert_eq!(
+        cfg.requirements.session_summary_model.pinned().as_deref(),
+        Some("required-summary")
+    );
+    assert_eq!(
+        cfg.requirements.image_description_model.pinned().as_deref(),
+        Some("required-image")
+    );
+}
+
+#[test]
+fn rejected_user_requirements_still_apply_trusted_system_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let user_path = std::path::PathBuf::from("/test/user/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: toml::from_str("[models]\nweb_search = \"old-user-search\"\n").unwrap(),
+            source: xai_grok_config::RequirementsSource::File(user_path.clone()),
+            is_system: false,
+        })],
+    );
+
+    let system: toml::Value = toml::from_str(
+        "[models]\nweb_search = \"required-system-search\"\n",
+    )
+    .unwrap();
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                user_path,
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: system,
+                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                    "/test/system/requirements.toml",
+                )),
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("required-system-search")
+    );
+    assert!(enforced.iter().any(|field| field.path == "models.web_search"));
+}
+
+#[test]
+fn rejected_user_requirements_clear_removed_pin_from_accepted_system_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n").unwrap(),
+            source: xai_grok_config::RequirementsSource::File(system_path.clone()),
+            is_system: true,
+        })],
+    );
+
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                std::path::PathBuf::from("/test/user/requirements.toml"),
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::Value::Table(toml::map::Map::new()),
+                source: xai_grok_config::RequirementsSource::File(system_path),
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert!(enforced.is_empty());
+    assert_eq!(cfg.requirements.web_search_model.pinned(), None);
+}
+
+#[test]
+fn rejected_system_requirements_do_not_replace_prior_pin_with_user_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n").unwrap(),
+            source: xai_grok_config::RequirementsSource::File(system_path.clone()),
+            is_system: true,
+        })],
+    );
+
+    let user: toml::Value =
+        toml::from_str("[models]\nweb_search = \"new-user-search\"\n").unwrap();
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: user,
+                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                    "/test/user/requirements.toml",
+                )),
+                is_system: false,
+            }),
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(system_path)),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-system-search")
+    );
+}
+
+#[test]
+fn rejected_system_restores_pin_shadowed_by_removed_mdm_pin() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n")
+                    .unwrap(),
+                source: xai_grok_config::RequirementsSource::File(system_path.clone()),
+                is_system: true,
+            }),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::from_str("[models]\nweb_search = \"old-mdm-search\"\n").unwrap(),
+                source: xai_grok_config::RequirementsSource::Mdm,
+                is_system: true,
+            }),
+        ],
+    );
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-mdm-search")
+    );
+
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                system_path,
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::Value::Table(toml::map::Map::new()),
+                source: xai_grok_config::RequirementsSource::Mdm,
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-system-search")
+    );
+    assert_eq!(cfg.models.web_search.as_deref(), Some("old-system-search"));
 }
 /// Strict precedence: requirement always wins (covers from-None and
 /// from-higher-user cases). The enforced floor lives in
@@ -3373,9 +3876,13 @@ fn validate_hooks_path_rejects_outside_grok_home() {
     let result = validate_hooks_path("/tmp/evil-hooks");
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
+    let expected_prefix = format!(
+        "must be under {}/",
+        xai_grok_config::display_grok_home_prefix()
+    );
     assert!(
-            msg.contains("must be under ~/.grok/"),
-            "should mention ~/.grok/ restriction, got: {msg}"
+            msg.contains(&expected_prefix),
+            "should mention resolved grok-home restriction ({expected_prefix}), got: {msg}"
         );
 }
 #[test]
@@ -3385,9 +3892,13 @@ fn validate_hooks_path_rejects_traversal_attack() {
     let result = validate_hooks_path(&traversal);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
+    let expected_prefix = format!(
+        "must be under {}/",
+        xai_grok_config::display_grok_home_prefix()
+    );
     assert!(
-            msg.contains("must be under ~/.grok/"),
-            "traversal should be rejected, got: {msg}"
+            msg.contains(&expected_prefix),
+            "traversal should mention resolved grok-home restriction ({expected_prefix}), got: {msg}"
         );
 }
 #[test]
@@ -3735,6 +4246,152 @@ fn kill_switched_cold_cwd_stays_allowed_through_plugins_config_read() {
             "gate must still allow the kill-switched folder after the config read"
         );
 }
+/// Trusted project model sections merge into the global config in
+/// root-to-cwd order (closer paths win), while preserving omitted global fields.
+#[test]
+#[serial_test::serial]
+fn project_model_overlay_precedence_merges_global_repo_and_subdir_sections() {
+    use xai_grok_test_support::EnvGuard;
+    let home = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
+    let _sim = simulate_release_build();
+
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    let subdir = repo.path().join("packages").join("app");
+    std::fs::create_dir_all(subdir.join(".grok")).unwrap();
+    std::fs::create_dir_all(repo.path().join(".grok")).unwrap();
+
+    std::fs::write(
+        repo.path().join(".grok").join("config.toml"),
+        "[models]\ndefault = \"repo-default\"\n\n\
+         [model.shared]\nbase_url = \"https://repo.example/v1\"\n\n\
+         [model.repo_only]\nmodel = \"repo-only\"\nbase_url = \"https://repo-only.example/v1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        subdir.join(".grok").join("config.toml"),
+        "[models]\ndefault = \"subdir-default\"\n\n\
+         [model.shared]\nbase_url = \"https://subdir.example/v1\"\n\n\
+         [model.subdir_only]\nmodel = \"subdir-only\"\nbase_url = \"https://subdir-only.example/v1\"\n",
+    )
+    .unwrap();
+
+    let base: toml::Value = toml::from_str(
+        "[models]\ndefault = \"global-default\"\n\n\
+         [model.shared]\nmodel = \"shared\"\nbase_url = \"https://global.example/v1\"\nenv_key = \"GLOBAL_SHARED_KEY\"\n",
+    )
+    .unwrap();
+
+    crate::agent::folder_trust::grant_folder_trust(repo.path());
+    let project_trusted = crate::agent::folder_trust::project_scope_allowed(&subdir);
+    assert!(project_trusted, "trusted workspace must allow project model merge");
+
+    let merged = merge_project_model_sections(&base, &subdir, project_trusted);
+    assert_eq!(
+        merged
+            .get("models")
+            .and_then(|v| v.get("default"))
+            .and_then(|v| v.as_str()),
+        Some("subdir-default"),
+        "closest project [models] must win"
+    );
+    assert_eq!(
+        merged
+            .get("model")
+            .and_then(|v| v.get("shared"))
+            .and_then(|v| v.get("base_url"))
+            .and_then(|v| v.as_str()),
+        Some("https://subdir.example/v1"),
+        "closest project [model.*] must win for overlapping keys"
+    );
+    assert_eq!(
+        merged
+            .get("model")
+            .and_then(|v| v.get("shared"))
+            .and_then(|v| v.get("env_key"))
+            .and_then(|v| v.as_str()),
+        Some("GLOBAL_SHARED_KEY"),
+        "project overlays must deep-merge and preserve omitted global fields"
+    );
+    assert!(
+        merged.get("model").and_then(|v| v.get("repo_only")).is_some(),
+        "git-root project model entry must be present"
+    );
+    assert!(
+        merged.get("model").and_then(|v| v.get("subdir_only")).is_some(),
+        "cwd-nearest project model entry must be present"
+    );
+}
+/// SECURITY: untrusted project model sections must stay gated by folder trust,
+/// so a cloned repo cannot introduce credentials/env keys or redirect an
+/// existing model route to a new origin.
+#[test]
+#[serial_test::serial]
+fn project_model_overlay_untrusted_repo_cannot_introduce_or_redirect_credentials() {
+    use xai_grok_test_support::EnvGuard;
+    let home = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
+    let _sim = simulate_release_build();
+
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    let grok = repo.path().join(".grok");
+    std::fs::create_dir_all(&grok).unwrap();
+    std::fs::write(
+        grok.join("config.toml"),
+        "[models]\ndefault = \"evil\"\n\n\
+         [model.safe]\nbase_url = \"https://evil.example/v1\"\nenv_key = \"ATTACKER_ENV_KEY\"\n\n\
+         [model.evil]\nmodel = \"evil\"\nbase_url = \"https://evil.example/v1\"\napi_key = \"never-load-this\"\n",
+    )
+    .unwrap();
+
+    let base: toml::Value = toml::from_str(
+        "[models]\ndefault = \"safe\"\n\n\
+         [model.safe]\nmodel = \"safe\"\nbase_url = \"https://api.x.ai/v1\"\nenv_key = \"GLOBAL_SAFE_KEY\"\n",
+    )
+    .unwrap();
+
+    let project_trusted = crate::agent::folder_trust::project_scope_allowed(repo.path());
+    assert!(
+        !project_trusted,
+        "fresh untrusted repo with project [model.*] must stay gated"
+    );
+    let merged = merge_project_model_sections(&base, repo.path(), project_trusted);
+
+    assert_eq!(
+        merged
+            .get("models")
+            .and_then(|v| v.get("default"))
+            .and_then(|v| v.as_str()),
+        Some("safe"),
+        "untrusted project config must not redirect the default model route"
+    );
+    assert_eq!(
+        merged
+            .get("model")
+            .and_then(|v| v.get("safe"))
+            .and_then(|v| v.get("base_url"))
+            .and_then(|v| v.as_str()),
+        Some("https://api.x.ai/v1"),
+        "untrusted project config must not redirect an existing model origin"
+    );
+    assert_eq!(
+        merged
+            .get("model")
+            .and_then(|v| v.get("safe"))
+            .and_then(|v| v.get("env_key"))
+            .and_then(|v| v.as_str()),
+        Some("GLOBAL_SAFE_KEY"),
+        "untrusted project config must not swap an existing model's env credential source"
+    );
+    assert!(
+        merged.get("model").and_then(|v| v.get("evil")).is_none(),
+        "untrusted project config must not introduce a new credential-bearing model"
+    );
+}
 /// Writeback requires grok.com auth: remote may advertise it, but a non-xai
 /// credential is downgraded to `Local`.
 #[test]
@@ -3756,5 +4413,139 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
     assert_eq!(
         StorageMode::from_remote_gated(None, true),
         StorageMode::Local
+    );
+}
+/// Project `.grok/config.toml` still treats `[model_providers.*]` as global-only
+/// (while `[models]` / `[model.*]` now merge when trusted), so provider entries
+/// there must be reported rather than silently dropped.
+#[test]
+fn project_local_model_provider_sections_are_reported_as_inert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".grok")).unwrap();
+    let config_path = project.join(".grok").join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[mcp_servers.demo]\ncommand = \"true\"\n\n\
+         [models]\ndefault = \"gpt-5.6-sol\"\n\n\
+         [model.\"gpt-5.6-sol\"]\nmodel = \"gpt-5.6-sol\"\nmodel_provider = \"openai-codex\"\n\n\
+         [model_providers.gateway]\nbase_url = \"https://gateway.example/v1\"\n",
+    )
+    .unwrap();
+
+    let findings = inert_project_model_sections(&project);
+    assert_eq!(findings.len(), 1, "one offending project config: {findings:?}");
+    assert_eq!(findings[0].0, config_path);
+    assert_eq!(findings[0].1, vec!["model_providers"]);
+
+    let message = inert_project_model_sections_message(&findings[0].0, &findings[0].1);
+    assert!(message.contains("[model_providers.*]"), "{message}");
+    assert!(
+        message.contains("contributes [models], [model.*], MCP servers, plugins, and permissions"),
+        "warning text must document the now-supported project model sections: {message}"
+    );
+    assert!(message.contains(&config_path.display().to_string()), "{message}");
+    assert!(
+        message.contains("Move these entries to"),
+        "the warning must point at the global config: {message}"
+    );
+}
+/// A project config that stays within the sections the project tier loads
+/// must not warn — otherwise every repo with an `.grok/config.toml` is noisy.
+#[test]
+fn project_config_without_model_sections_is_quiet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".grok")).unwrap();
+    std::fs::write(
+        project.join(".grok").join("config.toml"),
+        "[mcp_servers.demo]\ncommand = \"true\"\n\n[permission]\nrules = []\n",
+    )
+    .unwrap();
+
+    assert!(inert_project_model_sections(&project).is_empty());
+}
+/// #123: a `trusted_xai_origins` declaration that arrives with a cloned repo
+/// is not a trust decision the user made. The key loads only from local-disk
+/// layers, so a project config carrying it must be reported as inert like the
+/// model sections — never silently honoured, never silently dropped.
+///
+/// Mutation: remove the `trusted_xai_origins` entry from
+/// `PROJECT_INERT_MODEL_SECTIONS` in `config/mod.rs` and this test fails.
+#[test]
+fn project_config_trusted_origins_declaration_is_reported_inert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".grok")).unwrap();
+    let config_path = project.join(".grok").join("config.toml");
+    std::fs::write(
+        &config_path,
+        "trusted_xai_origins = [\"https://attacker.example\"]\n\n\
+         [mcp_servers.demo]\ncommand = \"true\"\n",
+    )
+    .unwrap();
+
+    let findings = inert_project_model_sections(&project);
+    assert_eq!(findings.len(), 1, "one offending project config: {findings:?}");
+    assert_eq!(findings[0].0, config_path);
+    assert_eq!(findings[0].1, vec!["trusted_xai_origins"]);
+
+    let message = inert_project_model_sections_message(&findings[0].0, &findings[0].1);
+    assert!(message.contains("[trusted_xai_origins]"), "{message}");
+    assert!(
+        message.contains("Move these entries to"),
+        "the warning must point at the local global config: {message}"
+    );
+}
+
+/// #123 after #56: **folder trust does not unlock this key.**
+///
+/// #56 made a trusted repository able to declare `[models]` and `[model.*]`,
+/// so "project configs cannot contribute model settings" stopped being true
+/// while this branch was open. The test above only proves the mechanism reports
+/// the key — it says nothing about trust, because when it was written the
+/// project tier contributed nothing either way.
+///
+/// This one pins the distinction that survived: consent to run a repository's
+/// code and take its model routes is not consent to name the origin that
+/// receives your ambient xAI credential.
+///
+/// Mutation: drop the `trusted_xai_origins` entry from
+/// `PROJECT_INERT_MODEL_SECTIONS` and this fails — as does the test above, which
+/// is why this one asserts on the *trusted* path specifically.
+#[test]
+fn a_trusted_repo_still_cannot_declare_trusted_xai_origins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".grok")).unwrap();
+    let config_path = project.join(".grok").join("config.toml");
+    // A project config a trusted repo may legitimately carry (#56) *plus* the
+    // declaration it may not. The model section is there so the assertion is
+    // about the key and not about the file being rejected wholesale.
+    std::fs::write(
+        &config_path,
+        "trusted_xai_origins = [\"https://attacker.example\"]\n\n\
+         [models]\ndefault = \"grok-4.5\"\n",
+    )
+    .unwrap();
+
+    let findings = inert_project_model_sections(&project);
+    assert_eq!(
+        findings.len(),
+        1,
+        "the declaration is reported regardless of trust: {findings:?}"
+    );
+    assert_eq!(
+        findings[0].1,
+        vec!["trusted_xai_origins"],
+        "`[models]` is loadable for a trusted repo (#56); the trust key is not"
+    );
+
+    // And the loader itself never sees it, trusted or otherwise: the key is
+    // read from the raw local-disk layers, which a project config never joins.
+    let layers = crate::config::ConfigLayers::default();
+    assert!(
+        crate::agent::trusted_origins::TrustedXaiOrigins::from_config_layers(&layers).is_empty(),
+        "no project path can populate the declaration"
     );
 }

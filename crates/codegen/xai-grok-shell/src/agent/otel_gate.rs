@@ -90,8 +90,9 @@ pub(crate) fn is_session_pending(
     grok_com_config: &crate::auth::GrokComConfig,
 ) -> bool {
     !has_session
-        && (grok_com_config.auth_provider_command.is_some()
-            || crate::auth::devbox_login::is_devbox_environment())
+        && (crate::auth::has_nonblank_auth_provider_command(
+            grok_com_config.auth_provider_command.as_deref(),
+        ) || crate::auth::devbox_login::is_devbox_environment())
 }
 
 /// Opens the gate at startup once [`should_open_at_startup`] holds; a later session re-resolves via [`OtelGate::resolve`].
@@ -229,6 +230,30 @@ mod tests {
         assert!(
             opens(applies, false, false),
             "no session and none pending: nothing will query the channel yet"
+        );
+    }
+
+    #[test]
+    fn blank_external_provider_is_not_a_pending_session() {
+        for command in [None, Some(""), Some(" \t\n")] {
+            let config = crate::auth::GrokComConfig {
+                auth_provider_command: command.map(str::to_owned),
+                ..Default::default()
+            };
+            assert!(
+                !is_session_pending(false, &config),
+                "missing or blank provider cannot mint a pending session: {command:?}"
+            );
+        }
+
+        let config = crate::auth::GrokComConfig {
+            auth_provider_command: Some("acme-auth".to_owned()),
+            ..Default::default()
+        };
+        assert!(is_session_pending(false, &config));
+        assert!(
+            !is_session_pending(true, &config),
+            "an existing session is never pending"
         );
     }
 

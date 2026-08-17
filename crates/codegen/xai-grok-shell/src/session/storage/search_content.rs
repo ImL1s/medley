@@ -334,6 +334,7 @@ pub(super) fn test_summary(
         num_messages: 0,
         num_chat_messages: 0,
         current_model_id: acp::ModelId::new("test"),
+        catalog_identity: None,
         parent_session_id: None,
         forked_at: None,
         collection_id: None,

@@ -11,31 +11,56 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
             "models updated via x.ai/models/update"
         );
 
-        app.models.update_catalog(new_models.available.clone());
-        let stale = app
-            .models
-            .current
-            .as_ref()
-            .is_none_or(|id| !app.models.available.contains_key(id));
-        if stale && let Some(id) = new_models.current {
-            app.models.set_current(id, None);
-        }
+        let shell_fallback_current = new_models.current.clone();
 
         for agent in app.agents.values_mut() {
+            // A machine-wide catalog update is not proof that this resident
+            // session actor switched. Preserve a display-only placeholder
+            // until a per-session ModelChanged/ModelAutoSwitched says it did.
             if let Some(ref current) = agent.session.models.current
                 && !new_models.available.contains_key(current)
+                && !agent
+                    .session
+                    .models
+                    .available
+                    .get(current)
+                    .is_some_and(crate::acp::model_state::is_unavailable_resident_model)
             {
-                tracing::debug!(
+                tracing::warn!(
                     current_model = %current.0,
+                    fallback = ?shell_fallback_current.as_ref().map(|m| m.0.as_ref()),
                     available_count = new_models.available.len(),
-                    "models update dropped this session's model from the catalog; keeping it displayed"
+                    "models update removed this agent's current model; preserving resident display"
                 );
             }
-            agent
-                .session
-                .models
-                .update_catalog(new_models.available.clone());
+            agent.session.models.update_catalog_preserving_resident(
+                new_models.available.clone(),
+                shell_fallback_current.clone(),
+            );
         }
+
+        // Override the app-level default with the active agent's effective
+        // model after every per-session catalog has reconciled. A running
+        // session may retain a display-only unavailable-resident placeholder;
+        // carry that exact row into app state so the status/settings surfaces
+        // never claim the actor silently switched to the shell fallback.
+        let mut app_models = new_models;
+        if let ActiveView::Agent(id) = app.active_view
+            && let Some(agent) = app.agents.get(&id)
+            && let Some(ref agent_model) = agent.session.models.current
+            && let Some(agent_info) = agent.session.models.available.get(agent_model)
+        {
+            app_models
+                .available
+                .insert(agent_model.clone(), agent_info.clone());
+            app_models.current = Some(agent_model.clone());
+            app_models.reasoning_effort = agent.session.models.reasoning_effort;
+        }
+        app.models = app_models;
+        // Settings rows snapshot each agent's catalog when the modal opens.
+        // A live catalog update must rebuild those snapshots immediately so a
+        // removed model cannot remain selectable from a stale modal row.
+        crate::app::dispatch::refresh_open_settings_modals(app);
         true
     } else {
         tracing::warn!("Failed to parse x.ai/models/update");

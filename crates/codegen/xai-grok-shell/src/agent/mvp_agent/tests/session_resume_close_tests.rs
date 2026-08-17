@@ -164,7 +164,7 @@ fn the_sweep_leaves_an_evicted_session_mid_attach() {
         agent
             .session_registry
             .set_thread(&sid, exited_thread().await);
-        let _attach = agent.begin_session_load(&sid);
+        let _attach = agent.begin_session_load(&sid).expect("load claim");
         agent.sweep_dead_sessions();
         assert!(
             agent.session_registry.has_thread(&sid),
@@ -185,7 +185,7 @@ fn the_sweep_still_reaps_a_resident_session_whose_actor_died_mid_attach() {
         agent
             .session_registry
             .set_thread(&sid, exited_thread().await);
-        let _attach = agent.begin_session_load(&sid);
+        let _attach = agent.begin_session_load(&sid).expect("load claim");
         agent.sweep_dead_sessions();
         assert!(
             !agent.is_resident(&sid),
@@ -231,7 +231,7 @@ fn a_failed_attach_leaves_no_trace() {
         let agent = super::build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-attaching");
         {
-            let _guard = agent.begin_session_load(&sid);
+            let _guard = agent.begin_session_load(&sid).expect("load claim");
             assert_eq!(
                 agent.session_live_state_for(&sid),
                 Some(SessionLiveState::Attaching),
@@ -259,7 +259,7 @@ fn close_waits_for_an_in_flight_load_to_settle() {
     super::run_local_for_bridge_test(|| async {
         let agent = super::build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-cold-load");
-        let guard = agent.begin_session_load(&sid);
+        let guard = agent.begin_session_load(&sid).expect("load claim");
         let (handle, _tx, _rx) = super::make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
         let mut close = std::pin::pin!(agent.close_active_session(&sid));
@@ -284,8 +284,8 @@ fn an_attach_over_a_running_turn_settles_back_to_working() {
         agent.insert_resident(&sid, handle);
         agent.set_session_live_state(&sid, SessionLiveState::Working);
         {
-            let _first = agent.begin_session_load(&sid);
-            let _second = agent.begin_session_load(&sid);
+            let _first = agent.begin_session_load(&sid).expect("load claim");
+            let _second = agent.begin_session_load(&sid).expect("load claim");
         }
         assert_eq!(
             agent.session_live_state_for(&sid),
@@ -301,8 +301,8 @@ fn a_superseded_load_leaves_the_newer_attach_attaching() {
     super::run_local_for_bridge_test(|| async {
         let agent = super::build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-superseded-load");
-        let first = agent.begin_session_load(&sid);
-        let _second = agent.begin_session_load(&sid);
+        let first = agent.begin_session_load(&sid).expect("load claim");
+        let _second = agent.begin_session_load(&sid).expect("load claim");
         drop(first);
         assert_eq!(
             agent.session_live_state_for(&sid),
@@ -352,7 +352,7 @@ fn close_answers_within_the_aggregate_budget() {
         let sid = acp::SessionId::new("sess-aggregate-budget");
         let (handle, _tx, _rx) = super::make_live_session_handle(&sid, Some("turn-1"));
         agent.insert_resident(&sid, handle);
-        let _stuck_load = agent.begin_session_load(&sid);
+        let _stuck_load = agent.begin_session_load(&sid).expect("load claim");
         let intake = agent.dispatch_lock(&sid);
         let _never_released = intake.lock().await;
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -507,7 +507,7 @@ fn settle_attach_restores_displaced_working() {
         agent.insert_resident(&sid, handle);
         agent.set_session_live_state(&sid, SessionLiveState::Working);
         {
-            let _guard = agent.begin_session_load(&sid);
+            let _guard = agent.begin_session_load(&sid).expect("load claim");
             assert_eq!(
                 agent.session_live_state_for(&sid),
                 Some(SessionLiveState::Attaching)
@@ -528,7 +528,7 @@ fn settle_attach_is_a_noop_once_the_session_is_already_resident() {
     super::run_local_for_bridge_test(|| async {
         let agent = super::build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-fail-attach-noop");
-        let guard = agent.begin_session_load(&sid);
+        let guard = agent.begin_session_load(&sid).expect("load claim");
         let (handle, _tx, _rx) = super::make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
         agent.set_session_live_state(&sid, SessionLiveState::IdleResident);
@@ -563,7 +563,7 @@ fn fail_attach_keeps_the_displaced_running_thread() {
             })),
         );
         {
-            let _guard = agent.begin_session_load(&sid);
+            let _guard = agent.begin_session_load(&sid).expect("load claim");
             assert!(
                 agent.session_registry.has_thread(&sid),
                 "begin_attach must keep the running thread reachable via displaced"
@@ -586,7 +586,7 @@ fn set_live_does_not_retire_an_in_flight_attach() {
     super::run_local_for_bridge_test(|| async {
         let agent = super::build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-cold-load-set-live");
-        let guard = agent.begin_session_load(&sid);
+        let guard = agent.begin_session_load(&sid).expect("load claim");
         let (handle, _tx, _rx) = super::make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
         agent.set_session_live_state(&sid, SessionLiveState::IdleResident);
@@ -621,7 +621,7 @@ fn disconnect_eviction_does_not_erase_a_mid_attach() {
         let sid = acp::SessionId::new("sess-disconnect-mid-attach");
         let (handle, _tx, _rx) = super::make_live_session_handle(&sid, Some("turn-1"));
         agent.insert_resident(&sid, handle);
-        let guard = agent.begin_session_load(&sid);
+        let guard = agent.begin_session_load(&sid).expect("load claim");
         agent.set_session_live_state(&sid, SessionLiveState::Working);
         assert!(
             agent.session_registry.is_attaching(&sid),
@@ -655,7 +655,7 @@ fn a_settled_attach_does_not_resurrect_an_unloaded_resident() {
         let sid = acp::SessionId::new("sess-unload-mid-attach");
         let (handle, _tx, rx) = super::make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
-        let guard = agent.begin_session_load(&sid);
+        let guard = agent.begin_session_load(&sid).expect("load claim");
         let _ = agent.session_registry.take_resident(&sid);
         drop(rx);
         drop(guard);
@@ -693,7 +693,7 @@ fn a_settled_attach_keeps_the_thread_it_adopted() {
     super::run_local_for_bridge_test(|| async {
         let agent = super::build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-adopted-thread");
-        let guard = agent.begin_session_load(&sid);
+        let guard = agent.begin_session_load(&sid).expect("load claim");
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         agent.session_registry.set_thread(
             &sid,
@@ -719,7 +719,7 @@ fn disconnect_does_not_unload_a_session_mid_attach() {
         let sid = acp::SessionId::new("sess-evict-mid-attach");
         let (handle, _tx, _rx) = super::make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
-        let _attach = agent.begin_session_load(&sid);
+        let _attach = agent.begin_session_load(&sid).expect("load claim");
         super::drive_disconnect_many(&agent, &[&sid]).await;
         assert!(
             agent.resident_handle(&sid).is_some(),
@@ -728,6 +728,52 @@ fn disconnect_does_not_unload_a_session_mid_attach() {
         assert!(
             agent.session_registry.is_attaching(&sid),
             "and the attach must still be in flight"
+        );
+    });
+}
+
+/// A caller-chosen `/new` id is an exclusive creation reservation. A racing
+/// load must fail without stealing its owner-bound bypass; after the creator
+/// installs a handle, only that creator can observe it until its guard settles.
+#[test]
+fn load_cannot_replace_an_exclusive_new_session_claim() {
+    super::run_local_for_bridge_test(|| async {
+        let agent = super::build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("sess-exclusive-new");
+        let creator = agent
+            .begin_new_session_claim(&sid)
+            .expect("new-session claim");
+
+        let err = match agent.begin_session_load(&sid) {
+            Ok(_) => panic!("load must not displace an exclusive creation claim"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, acp::Error::invalid_params().code);
+        assert_eq!(
+            err.data,
+            Some(json!(
+                "The requested sessionId is still being created and cannot be loaded"
+            ))
+        );
+        assert_eq!(
+            agent.session_live_state_for(&sid),
+            Some(SessionLiveState::Attaching),
+            "the creator's marker must remain installed"
+        );
+
+        let (handle, _tx, _rx) = super::make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        assert!(
+            agent.session_handle_during_load(&sid, &creator).is_some(),
+            "the rejected load must not steal the creator's owner-bound lookup"
+        );
+
+        drop(creator);
+        assert!(agent.is_resident(&sid));
+        assert_eq!(
+            agent.session_live_state_for(&sid),
+            Some(SessionLiveState::IdleResident),
+            "settling the creator must publish the committed resident"
         );
     });
 }

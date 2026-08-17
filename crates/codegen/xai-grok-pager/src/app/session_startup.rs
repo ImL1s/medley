@@ -1773,6 +1773,8 @@ mod tests {
     }
     #[tokio::test]
     async fn remote_miss_worktree_without_restore_code_suppresses_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let cwd = temp_dir.path().to_str().expect("valid UTF-8");
         let id = "no such remote target";
         let out = materialize_startup_for_cwd(
             remote_miss_ctx(false, true),
@@ -1780,7 +1782,7 @@ mod tests {
                 session_id: Some(id.into()),
                 most_recent_for_cwd: false,
             },
-            "/nonexistent/cwd/for/remote-miss-wt-no-code",
+            cwd,
         )
         .await
         .unwrap();

@@ -41,6 +41,7 @@ fn test_messages_request_wire_format_for_supported_variants() {
         (crate::ReasoningEffort::High, "high"),
         (crate::ReasoningEffort::Xhigh, "xhigh"),
         (crate::ReasoningEffort::Max, "max"),
+        (crate::ReasoningEffort::Ultra, "ultra"),
     ] {
         let req = messages_test_request(Some(variant));
         let msgs = build_messages_request(&req);

@@ -86,6 +86,7 @@ async fn create_test_actor(
         is_chat_kind: false,
         state,
         notifications: NotificationSender {
+                    persistence_is_noop: true,
             gateway: GatewaySender::new(gateway_tx),
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
@@ -105,6 +106,8 @@ async fn create_test_actor(
         )),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
+        catalog_model_id: std::cell::Cell::new(String::new()),
+        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -130,6 +133,7 @@ async fn create_test_actor(
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
+            configured_storage: None,
             flush_config: crate::config::MemoryFlushConfig::default(),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
@@ -212,6 +216,7 @@ async fn create_test_actor(
         pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
+                managed_mcp_expires_at: std::sync::Mutex::new(None),
         initial_client_mcp_servers: vec![],
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
         mcp_announced_servers: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -255,7 +260,7 @@ async fn create_test_actor(
         pending_image_strip: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-        image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+        image_description_model: std::cell::RefCell::new(crate::test_support::TEST_MODEL.to_owned()),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(std::collections::HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
@@ -607,6 +612,7 @@ async fn surface_compact_auth_failure_emits_reauthable_retry_state() {
                         crate::extensions::notification::RetryState::Failed {
                             error_type,
                             message,
+                            ..
                         },
                     ) = &notif.update
                 {
@@ -759,6 +765,7 @@ async fn e2e_auto_compact_401_suppresses_auth_and_surfaces_reauth() {
                             crate::extensions::notification::RetryState::Failed {
                                 error_type,
                                 message,
+                                ..
                             },
                         ) => {
                             assert_eq!(error_type, "auth");
@@ -844,6 +851,7 @@ async fn e2e_model_switch_compact_401_surfaces_reauth() {
                         crate::extensions::notification::RetryState::Failed {
                             error_type,
                             message,
+                            ..
                         },
                     ) = &notif.update
                 {
@@ -1334,6 +1342,7 @@ async fn create_test_actor_with_memory(
     )
     .await;
     actor.memory = crate::session::memory_state::SessionMemory {
+            configured_storage: None,
         flush_config: memory_config
             .as_ref()
             .map_or_else(Default::default, |mc| mc.flush.clone()),

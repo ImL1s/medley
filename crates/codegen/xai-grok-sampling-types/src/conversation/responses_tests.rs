@@ -473,6 +473,29 @@ fn test_response_reasoning_effort_stamped_on_assistant() {
 }
 
 #[test]
+fn test_typed_response_max_reasoning_effort_stamped_on_assistant_as_max() {
+    let response: crate::rs::Response = serde_json::from_value(serde_json::json!({
+        "id": "resp_max",
+        "object": "response",
+        "created_at": 1234567890,
+        "model": "gpt-5.6-sol",
+        "status": "completed",
+        "output": [],
+        "reasoning": { "effort": "max" }
+    }))
+    .expect("typed Responses API response accepts Max");
+
+    let items = response_to_conversation_items(response);
+    let ConversationItem::Assistant(assistant) = items.last().expect("trailing Assistant") else {
+        panic!("Expected Assistant item");
+    };
+    assert_eq!(
+        assistant.reasoning_effort,
+        Some(crate::ReasoningEffort::Max)
+    );
+}
+
+#[test]
 fn test_tool_calls_to_responses_api() {
     let req = ConversationRequest::from_items(vec![
         ConversationItem::system("System"),
@@ -1093,6 +1116,9 @@ fn test_responses_request_carries_reasoning_effort_nested() {
         (crate::ReasoningEffort::High, "high"),
         (crate::ReasoningEffort::Xhigh, "xhigh"),
         (crate::ReasoningEffort::Max, "max"),
+        // Ultra remains distinct in the app but uses the canonical client's
+        // highest typed Responses value on the wire.
+        (crate::ReasoningEffort::Ultra, "max"),
     ] {
         let req = ConversationRequest {
             reasoning_effort: Some(variant),
@@ -1106,6 +1132,33 @@ fn test_responses_request_carries_reasoning_effort_nested() {
             "{variant:?} should serialize as reasoning.effort={expected:?}; got: {json:#}",
         );
     }
+}
+
+#[test]
+fn test_response_wrapper_keeps_client_ultra_separate_from_typed_max() {
+    assert_eq!(
+        crate::CreateResponseWrapper::default().client_reasoning_effort,
+        None
+    );
+
+    let request = ConversationRequest {
+        reasoning_effort: Some(crate::ReasoningEffort::Ultra),
+        ..ConversationRequest::from_items(vec![ConversationItem::user("hi")]).with_model("test")
+    };
+    let mut wrapper = crate::CreateResponseWrapper::new((&request).into());
+    assert_eq!(wrapper.client_reasoning_effort, None);
+
+    wrapper.client_reasoning_effort = request.reasoning_effort;
+    assert_eq!(
+        wrapper.client_reasoning_effort,
+        Some(crate::ReasoningEffort::Ultra)
+    );
+    let json = serde_json::to_value(&wrapper.inner).unwrap();
+    assert_eq!(
+        json.pointer("/reasoning/effort")
+            .and_then(serde_json::Value::as_str),
+        Some("max")
+    );
 }
 
 #[test]

@@ -169,6 +169,14 @@ fn load_candidates(sessions_root: &Path) -> Result<(SessionCandidates, SessionCa
             if !file_type.is_dir() || file_type.is_symlink() || id.starts_with('.') {
                 continue;
             }
+            let unpublished = path.join(crate::session::persistence::UNPUBLISHED_SESSION_MARKER);
+            match fs::symlink_metadata(&unpublished) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(super::fs::io_error("inspect", &unpublished, error));
+                }
+            }
             all.entry(id.clone()).or_default().push(path.clone());
             let summary = path.join(super::super::SUMMARY_FILE);
             match fs::symlink_metadata(&summary) {

@@ -23,6 +23,7 @@ pub(crate) fn effort_description(level: ReasoningEffort) -> &'static str {
         ReasoningEffort::High => "Heavy reasoning",
         ReasoningEffort::Xhigh => "Extended reasoning",
         ReasoningEffort::Max => "Maximum reasoning",
+        ReasoningEffort::Ultra => "Maximum reasoning with proactive multi-agent guidance",
     }
 }
 

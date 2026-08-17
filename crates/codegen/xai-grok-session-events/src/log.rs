@@ -25,6 +25,7 @@ pub struct EventWriter {
 }
 
 struct EventWriterInner {
+    path: Option<std::path::PathBuf>,
     file: Mutex<Option<File>>,
     error_logged: AtomicBool,
 }
@@ -32,18 +33,10 @@ struct EventWriterInner {
 impl EventWriter {
     pub fn open(session_dir: &Path) -> Self {
         let path = session_dir.join(EVENTS_FILE);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| {
-                tracing::warn!(path = %path.display(), error = %e, "failed to open {EVENTS_FILE}");
-                e
-            })
-            .ok();
         Self {
             inner: Arc::new(EventWriterInner {
-                file: Mutex::new(file),
+                path: Some(path),
+                file: Mutex::new(None),
                 error_logged: AtomicBool::new(false),
             }),
         }
@@ -53,6 +46,7 @@ impl EventWriter {
     pub fn noop() -> Self {
         Self {
             inner: Arc::new(EventWriterInner {
+                path: None,
                 file: Mutex::new(None),
                 error_logged: AtomicBool::new(true), // suppress error logging
             }),
@@ -72,6 +66,23 @@ impl EventWriter {
         let Ok(mut guard) = self.inner.file.lock() else {
             return;
         };
+        if guard.is_none() && let Some(ref path) = self.inner.path {
+            let mut options = std::fs::OpenOptions::new();
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                options.share_mode(0x0000_0007);
+            }
+            *guard = options
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to open {EVENTS_FILE}");
+                    e
+                })
+                .ok();
+        }
         if let Some(ref mut f) = *guard
             && let Err(e) = f.write_all(&line)
             && !self.inner.error_logged.swap(true, Ordering::Relaxed)

@@ -2,10 +2,23 @@
 //! facts/gates and retry, sampler config reconstruction, sampling-failure
 //! recovery, and per-response usage recording.
 use super::*;
-const CLASSIFIER_REQUEST_TOKEN_RESERVE: u64 = 16_384;
-fn classifier_request_fits_context(input_tokens: u64, context_window: u64) -> bool {
-    input_tokens <= context_window.saturating_sub(CLASSIFIER_REQUEST_TOKEN_RESERVE)
+
+/// Whether a resolved [`ModelAuthFacts`] may be frozen in
+/// [`SessionActor::model_auth_memo`].
+///
+/// Only `byok = Unknown` is non-cacheable. Production resolution binds
+/// incomplete knowledge (`CatalogUnavailable` / empty id → `UnidentifiedModel`)
+/// to `byok = Unknown` already, so a readiness-side clause would be redundant
+/// for live resolves and would only disarm hand-seeded memos that deliberately
+/// pair a definite `NotByok` with a transient readiness for regression coverage
+/// (#159 F2). A genuine authoritative `NotInCatalog` stays `NotByok` and may
+/// cache; catalog-generation invalidation (F1) prevents that freeze from
+/// outliving a refresh that restores the model.
+fn model_auth_facts_are_cacheable(facts: &crate::agent::config::ModelAuthFacts) -> bool {
+    use crate::agent::auth_method::ModelByok;
+    facts.byok != ModelByok::Unknown
 }
+
 /// Auth-failure detector for tool errors. Matches strictly on HTTP 401
 /// when the error carries a structured status code, mirroring
 /// `SamplingError::is_auth_error` in xai-grok-sampling-types: 403 is
@@ -18,12 +31,20 @@ fn classifier_request_fits_context(input_tokens: u64, context_window: u64) -> bo
 /// going through the structured `HttpFailure` path (e.g. JSON-only
 /// `invalid_token` payloads, BYOK key-validation messages).
 pub(super) fn is_auth_tool_error(err: &xai_tool_runtime::ToolError) -> bool {
-    if let Some(details) = &err.details
-        && let Some(status) = details
+    if let Some(details) = &err.details {
+        if details
+            .get(xai_grok_tools::types::PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY)
+            .and_then(|handled| handled.as_bool())
+            == Some(true)
+        {
+            return false;
+        }
+        if let Some(status) = details
             .get(HTTP_STATUS_DETAILS_KEY)
             .and_then(|s| s.as_u64())
-    {
-        return status == 401;
+        {
+            return status == 401;
+        }
     }
     let lower = err.to_string().to_ascii_lowercase();
     lower.contains("unauthorized")
@@ -40,6 +61,14 @@ struct SessionTokenAuthGate {
     /// BYOK status still refresh against cli-chat-proxy / `*.x.ai` without
     /// risking a session-token leak to a third-party BYOK endpoint.
     endpoint_is_first_party: bool,
+    /// Active model's transport auth scheme. `AuthScheme::None` forces the
+    /// gate off so session bearers are never attached or refreshed after a
+    /// model switch to a keyless local endpoint.
+    auth_scheme: xai_grok_sampler::AuthScheme,
+    /// The model is authenticated by a credential header the user declared.
+    /// That is terminal auth: the session must neither be attached on top of
+    /// it nor invoked to "recover" when the provider rejects it (#110).
+    declared_credential_header: bool,
 }
 impl SessionTokenAuthGate {
     /// Single place `is_session_based` / `endpoint_is_first_party` are derived,
@@ -48,15 +77,47 @@ impl SessionTokenAuthGate {
         auth_method_id: Option<&acp::AuthMethodId>,
         model_byok: crate::agent::auth_method::ModelByok,
         base_url: &str,
+        endpoint_trust: Option<xai_grok_sampler::EndpointTrustClass>,
+        auth_scheme: xai_grok_sampler::AuthScheme,
+        extra_headers: &indexmap::IndexMap<String, String>,
+        env_http_headers: &indexmap::IndexMap<String, String>,
     ) -> Self {
         Self {
             is_session_based: auth_method_id
                 .is_some_and(crate::agent::auth_method::is_session_based_method),
             model_byok,
-            endpoint_is_first_party: crate::util::is_xai_api_url(base_url),
+            // An explicit trust class wins, mirroring `resolve_endpoint_trust`
+            // in the sampler, so the two layers cannot disagree about the same
+            // config. Otherwise derive it from the URL with the *attach-side*
+            // predicate: https required and loopback refused, unlike the
+            // refusal-side `is_xai_api_url` this used to call (#110).
+            // `UserDeclared` (#123) counts as attach-allowed: the user named
+            // the origin in local config precisely so the session bearer may
+            // reach it and stay refreshed.
+            endpoint_is_first_party: match endpoint_trust {
+                Some(trust) => matches!(
+                    trust,
+                    xai_grok_sampler::EndpointTrustClass::FirstPartyXai
+                        | xai_grok_sampler::EndpointTrustClass::UserDeclared
+                ),
+                None => crate::util::is_xai_api_bearer_url(base_url),
+            },
+            auth_scheme,
+            // Derived here rather than passed in, for the same reason
+            // `endpoint_is_first_party` is: a call site that has to remember
+            // to compute it is a call site that will eventually forget.
+            declared_credential_header: crate::agent::config::explicit_credential_header_in(
+                extra_headers,
+                env_http_headers,
+            )
+            .is_some(),
         }
     }
     fn active(self) -> bool {
+        if self.auth_scheme == xai_grok_sampler::AuthScheme::None || self.declared_credential_header
+        {
+            return false;
+        }
         crate::agent::auth_method::session_token_auth_gate(
             self.is_session_based,
             self.model_byok,
@@ -231,8 +292,14 @@ impl SessionActor {
     pub(crate) fn invalidate_model_auth_memo(&self) {
         self.model_auth_memo.replace(None);
     }
-    /// Reads and populates [`Self::model_auth_memo`]; a fresh `Unknown`
-    /// falls back to the last definite entry (see the field's contract).
+    /// Reads and populates [`Self::model_auth_memo`].
+    ///
+    /// A definite memo for the same model id at the current catalog generation
+    /// is returned without re-resolve. Incomplete lookups (`byok = Unknown`)
+    /// are never written; they return live so a later complete catalog can
+    /// re-classify the model. (There is no "fresh Unknown falls back to last
+    /// definite" arm: a same-id definite memo at the current generation would
+    /// already have been served above.)
     fn model_auth_state(
         &self,
         model_id: &str,
@@ -240,39 +307,54 @@ impl SessionActor {
         crate::agent::config::ModelAuthFacts,
         Option<crate::auth::AuthProviderRef>,
     ) {
-        use crate::agent::auth_method::ModelByok;
         use crate::session::acp_session::ModelAuthMemo;
+        let catalog_generation = self.models_manager.catalog_generation();
         if let Some(memo) = self.model_auth_memo.borrow().as_ref()
             && memo.model_id == model_id
-            && memo.facts.byok != ModelByok::Unknown
+            && memo.catalog_generation == catalog_generation
+            && model_auth_facts_are_cacheable(&memo.facts)
         {
             return (memo.facts.clone(), memo.provider.clone());
         }
+        // Authoritative session catalog (defaults + prefetched + overrides).
+        // Passing this is what keeps a remote-only model from being judged
+        // NotInCatalog by a config-only re-resolve (#159).
+        // Note: ModelsManager may retain-out `disabled_models` while a bare
+        // config-only `resolve_model_list` does not — disabled entries can
+        // therefore affect the auth verdict when the runtime catalog is used.
         let runtime_catalog = self.models_manager.models();
         let (fresh, provider) = crate::agent::config::resolve_model_auth_facts_and_provider(
             model_id,
             Some(&runtime_catalog),
         );
-        if fresh.byok == ModelByok::Unknown {
-            if let Some(memo) = self.model_auth_memo.borrow().as_ref()
-                && memo.model_id == model_id
-            {
-                return (memo.facts.clone(), memo.provider.clone());
-            }
+        if !model_auth_facts_are_cacheable(&fresh) {
+            // Incomplete: do not freeze as a definite memo entry.
             return (fresh, provider);
         }
         *self.model_auth_memo.borrow_mut() = Some(ModelAuthMemo {
             model_id: model_id.to_string(),
             facts: fresh.clone(),
             provider: provider.clone(),
+            catalog_generation,
         });
         (fresh, provider)
     }
     /// The single writer of a provider mint/rotation into chat-state credentials.
-    async fn set_chat_api_key(&self, new_key: String) {
-        let mut creds = self.chat_state_handle.get_credentials().await;
-        let new_creds = creds.clone().rebind(Some(new_key), creds.auth_type(), creds.source_cloned().unwrap_or(xai_grok_sampling_types::CredentialSource::None));
-        self.chat_state_handle.update_credentials(new_creds);
+    ///
+    /// Uses [`Credentials::rebind`] rather than [`Credentials::replace_api_key`]:
+    /// the secret being written is provider-minted, not a rotation of whatever
+    /// label chat-state already holds (which may be `Missing` from a pre-login
+    /// spawn). Preserving that label would lie about provenance (#136).
+    async fn set_chat_api_key(&self, new_key: String, provider_name: &str) {
+        let creds = self.chat_state_handle.get_credentials().await;
+        let creds = creds.rebind(
+            Some(new_key),
+            xai_chat_state::AuthType::ApiKey,
+            xai_grok_sampler::CredentialSource::AuthProvider {
+                name: provider_name.to_string(),
+            },
+        );
+        self.chat_state_handle.update_credentials(creds);
     }
     /// Pre-turn arm for a provider-backed model: mint on a cold cache,
     /// re-mint near expiry, and adopt a rotation chat-state missed. No-op
@@ -291,7 +373,7 @@ impl SessionActor {
                     cold = current_key.is_none(),
                     "auth provider token rotated pre-turn"
                 );
-                self.set_chat_api_key(new_key).await;
+                self.set_chat_api_key(new_key, &provider.name).await;
             }
             crate::auth::ProviderRefreshOutcome::Unchanged => {}
             crate::auth::ProviderRefreshOutcome::MintFailed => {
@@ -314,16 +396,30 @@ impl SessionActor {
             crate::auth::ProviderRefreshOutcome::Unusable => {}
         }
     }
-    /// 401 arm for a provider-backed model: re-run the helper once and
-    /// resubmit. A missing key means the cold mint failed and the request
-    /// went out unauthenticated, so mint instead. Returns `false` when the
-    /// fresh-mint guard blocked the re-run or the helper failed; the 401
-    /// then surfaces as a terminal error.
-    async fn try_provider_401_recovery(&self, provider: &crate::auth::AuthProviderRef) -> bool {
-        let rejected_key = self.chat_state_handle.get_credentials().await.api_key_cloned();
-        let recovered = match rejected_key {
-            Some(ref key) => provider.recover_rejected_token(key).await,
-            None => provider.ensure_fresh_token(None).await.rotated(),
+    /// 401 arm for a provider-backed model. Recovery is based on the
+    /// credential relationship captured from the actual rejected request,
+    /// never chat-state's potentially stale snapshot.
+    async fn try_provider_401_recovery(
+        &self,
+        provider: &crate::auth::AuthProviderRef,
+        request_credential: xai_grok_sampling_types::SentCredential,
+    ) -> bool {
+        let cached = provider.cached_token();
+        let action = provider_401_recovery_action(request_credential, cached.is_some());
+        let recovered = match action {
+            Provider401RecoveryAction::AdoptCached => cached,
+            Provider401RecoveryAction::RefreshServerRejected => {
+                provider
+                    .recover_rejected_token(
+                        cached
+                            .as_deref()
+                            .expect("recovery action requires a current provider credential"),
+                    )
+                    .await
+            }
+            Provider401RecoveryAction::EnsureFresh => {
+                provider.ensure_fresh_token(None).await.rotated()
+            }
         };
         let Some(new_key) = recovered else {
             tracing::warn!(
@@ -348,17 +444,33 @@ impl SessionActor {
             Some(self.session_info.id.0.as_ref()),
             None,
         );
-        self.set_chat_api_key(new_key).await;
+        self.set_chat_api_key(new_key, &provider.name).await;
         true
     }
     /// Gate inputs for `model_id` routed to `base_url`. See
     /// [`crate::agent::auth_method::session_token_auth_gate`] for the rationale
     /// (`base_url` keeps an `Unknown` BYOK status refreshable only
-    /// against first-party xAI hosts).
-    fn auth_gate(&self, model_id: &str, base_url: &str) -> SessionTokenAuthGate {
-        let byok = self.model_auth_facts(model_id).byok;
+    /// against first-party xAI hosts). Also inactive for
+    /// [`xai_grok_sampler::AuthScheme::None`].
+    fn auth_gate(
+        &self,
+        model_id: &str,
+        base_url: &str,
+        endpoint_trust: Option<xai_grok_sampler::EndpointTrustClass>,
+        extra_headers: &indexmap::IndexMap<String, String>,
+        env_http_headers: &indexmap::IndexMap<String, String>,
+    ) -> SessionTokenAuthGate {
+        let facts = self.model_auth_facts(model_id);
         let auth_method = self.auth_method_id.load();
-        SessionTokenAuthGate::new(auth_method.as_deref(), byok, base_url)
+        SessionTokenAuthGate::new(
+            auth_method.as_deref(),
+            facts.byok,
+            base_url,
+            endpoint_trust,
+            facts.auth_scheme,
+            extra_headers,
+            env_http_headers,
+        )
     }
     /// Emit a unified-log breadcrumb whenever the session-token refresh gate is
     /// evaluated with an **`Unknown`** per-model BYOK status on a session-based
@@ -381,7 +493,6 @@ impl SessionActor {
             "is_session_based": gate.is_session_based,
             "endpoint_is_first_party": gate.endpoint_is_first_party,
             "refresh_active": refresh_active,
-            "base_url": base_url,
         });
         let sid = Some(self.session_info.id.0.as_ref());
         if refresh_active {
@@ -425,6 +536,7 @@ impl SessionActor {
                 max_completion_tokens: None,
                 temperature: None,
                 top_p: None,
+                endpoint_trust: None,
                 api_backend: Default::default(),
                 extra_headers: Default::default(),
                 query_params: Default::default(),
@@ -432,26 +544,149 @@ impl SessionActor {
                 context_window: std::num::NonZeroU64::new(256_000).unwrap(),
                 reasoning_effort: None,
                 stream_tool_calls: None,
-                endpoint_trust: Default::default(),
             });
         let creds = self.chat_state_handle.get_credentials().await;
-        let model_facts = self.model_auth_facts(cfg.model.as_str());
+        let catalog_model_id = self.catalog_model_id_str();
+        let (model_facts, model_auth_provider) = self.model_auth_state(&catalog_model_id);
         let auth_method = self.auth_method_id.load();
-        let gate =
-            SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
-        let use_bearer_resolver = gate.active();
+        let gate = SessionTokenAuthGate::new(
+            auth_method.as_deref(),
+            model_facts.byok,
+            &cfg.base_url,
+            cfg.endpoint_trust,
+            model_facts.auth_scheme,
+            &cfg.extra_headers,
+            &cfg.env_http_headers,
+        );
+        // Security boundary: never attach a live session bearer (or rely on
+        // gate.active alone) when the active model is keyless — even if the
+        // ACP method is still session-based after a model switch.
+        //
+        // Readiness is tri-state (#133):
+        // - `Unusable`: strip ambient credentials; prefer a prepare-time error
+        //   over silently converting the turn to keyless on a non-xAI origin.
+        // - `Unknown`: do NOT blanket-strip. Preserve a credential already
+        //   bound to this model/endpoint (declared header / chat-state key
+        //   when not borrowing ambient); refuse to BORROW session/provider
+        //   ambient without catalog knowledge.
+        let mut auth_scheme = model_facts.auth_scheme;
+        // #110 / #136 / #180: provenance comes from `Credentials` alone.
+        // After #136 the chat-state secret is bound with its source; after
+        // #180 we must not re-derive `ExplicitHeader` from the header maps
+        // here. A dual-auth gateway (model `api_key` + declared credential
+        // header) is labelled `ModelApiKey` by `classify_credential_source`
+        // and keeps its key — inventing `ExplicitHeader` from the maps while
+        // leaving `api_key` in place made L3 treat a legitimate route as the
+        // post-strip mislabel and refuse it.
+        //
+        // `declared_credential_header` still drives resolver attach and
+        // identity gating (header still ships on the wire). Only the
+        // provenance *label* stops coming from it. Without
+        // `creds.source_cloned()`, ordinary Ready-model turns would emit
+        // `credential_source: None` — the #151 hole on
+        // `Unknown(CatalogUnavailable)`.
+        let declared_credential_header = crate::agent::config::explicit_credential_header_in(
+            &cfg.extra_headers,
+            &cfg.env_http_headers,
+        );
+        let mut use_session_bearer_resolver = gate.active()
+            && declared_credential_header.is_none()
+            && auth_scheme != xai_grok_sampler::AuthScheme::None;
+        let mut use_provider_bearer_resolver = cfg.api_backend
+            == xai_grok_sampling_types::ApiBackend::CodexResponses
+            && model_auth_provider.is_some()
+            && auth_scheme != xai_grok_sampler::AuthScheme::None;
+        let mut credential_source = creds.source_cloned();
+        match &model_facts.readiness {
+            crate::agent::auth_method::ModelReadiness::Ready => {}
+            // The catalog answered and does not have this model. Before the
+            // tri-state this was `ready = false`, i.e. stripped unconditionally,
+            // and it must stay that way: this is the final wire choke point, and
+            // "the catalog does not know this model" is exactly as much reason
+            // to withhold as "chat state does not persist readiness" was. An
+            // earlier version of this arm withheld only for session-based ACP
+            // methods, which retained the chat-state key for `XAI_API_KEY`,
+            // keyless and unrecognised methods -- and left `credential_source`
+            // unset, so `SamplingClient::new` could not catch it either.
+            crate::agent::auth_method::ModelReadiness::Unknown(
+                crate::agent::auth_method::UnknownReason::NotInCatalog,
+            ) => {
+                tracing::warn!(
+                    model = %catalog_model_id,
+                    "reconstruct_full_config: model absent from the catalog; stripping credentials"
+                );
+                auth_scheme = xai_grok_sampler::AuthScheme::None;
+                use_session_bearer_resolver = false;
+                use_provider_bearer_resolver = false;
+                // Credentials are gone. Do not keep a stored ambient/BYOK
+                // source: that would claim a credential the strip just
+                // removed. A declared credential header still ships in
+                // `extra_headers` and must be labelled `ExplicitHeader`
+                // (post-strip meaning); otherwise `Missing`.
+                credential_source = match &declared_credential_header {
+                    Some((header, env)) => {
+                        Some(xai_grok_sampler::CredentialSource::ExplicitHeader {
+                            header: header.clone(),
+                            env: env.clone(),
+                        })
+                    }
+                    None => Some(xai_grok_sampler::CredentialSource::Missing),
+                };
+            }
+            // Knowledge is temporarily unobtainable, or there is no identified
+            // target yet. Both were `ready = true` before the tri-state, and
+            // both must stay that way: `session_token_auth_gate` documents that
+            // an `Unknown` classification "must not demote a live session to
+            // non-refreshable api-key mode", and clearing the resolvers here
+            // does worse than that -- it sends no credential at all, so a
+            // half-written `config.toml` 401s every turn until restart.
+            //
+            // This is the distinction the three `UnknownReason` variants exist
+            // for. Collapsing them into one arm is what made the strip both
+            // fail open (above) and fail closed (here) at the same time.
+            //
+            // #151: the chat-state key survives here, so the stored source
+            // (set above) must survive with it — previously this path left
+            // `credential_source: None` and L3 could not refuse ambient bytes
+            // on an external origin.
+            crate::agent::auth_method::ModelReadiness::Unknown(reason) => {
+                tracing::debug!(
+                    model = %catalog_model_id,
+                    unknown = reason.as_str(),
+                    "reconstruct_full_config: readiness unknown but not absent; leaving the session intact"
+                );
+            }
+            crate::agent::auth_method::ModelReadiness::Unusable(reason) => {
+                tracing::warn!(
+                    model = %catalog_model_id,
+                    reason = %reason.as_str(),
+                    "reconstruct_full_config: active model unusable; stripping credentials"
+                );
+                auth_scheme = xai_grok_sampler::AuthScheme::None;
+                use_session_bearer_resolver = false;
+                use_provider_bearer_resolver = false;
+                // Label the gap on Unusable alone, never on Unknown (#133).
+                // A declared credential header still ships in `extra_headers`
+                // and must be labelled `ExplicitHeader`; any other stored
+                // source is overwritten with `Missing`.
+                credential_source = match &declared_credential_header {
+                    Some((header, env)) => {
+                        Some(xai_grok_sampler::CredentialSource::ExplicitHeader {
+                            header: header.clone(),
+                            env: env.clone(),
+                        })
+                    }
+                    None => Some(xai_grok_sampler::CredentialSource::Missing),
+                };
+            }
+        }
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
-        if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
+        // Refresh before taking the initial bearer snapshot. The dynamic
+        // resolver handles later rotations, while this keeps the first request
+        // from starting with a stale chat-state credential.
+        if use_session_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
             let _ = am.auth().await;
         }
-        let api_key = if use_bearer_resolver {
-            self.auth_manager
-                .as_ref()
-                .and_then(|am| am.current_wire_valid().map(|a| a.key))
-        } else {
-            creds.api_key_cloned()
-        };
-        let auth_scheme = model_facts.auth_scheme;
         let mut extra_headers = cfg.extra_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,
@@ -482,11 +717,69 @@ impl SessionActor {
                 extra_headers.insert("x-compaction-at".to_string(), value.to_string());
             }
         }
-        let extra_response_includes = crate::agent::config::response_include_extensions(
-            self.supports_backend_search.get(),
-            &cfg.api_backend,
-            &cfg.base_url,
-        );
+        // Security boundary: strip chat-state credentials for keyless/unusable
+        // models so a stale session JWT cannot survive onto a custom endpoint.
+        // For session-token auth, snapshot the freshly refreshed wire-valid
+        // bearer; the resolver below supplies subsequent rotations.
+        //
+        // `Unknown`: preserve a bound credential (declared header already in
+        // `credential_source`, or chat-state key when we are not borrowing
+        // ambient). Ambient session/provider borrow was disabled above.
+        // The first arm is what makes the strip unconditional: whatever cleared
+        // `auth_scheme` above -- Unusable, or absent from the catalog -- meant
+        // the credential too, for every auth method. An earlier version added a
+        // later arm asking whether the ACP method was session-based instead,
+        // which let the chat-state key through for `XAI_API_KEY`, keyless and
+        // unrecognised methods.
+        let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
+            None
+        } else if use_provider_bearer_resolver {
+            model_auth_provider
+                .as_ref()
+                .and_then(crate::auth::AuthProviderRef::cached_token)
+        } else if use_session_bearer_resolver {
+            self.auth_manager
+                .as_ref()
+                .and_then(|am| am.current_wire_valid().map(|a| a.key))
+        } else {
+            creds.api_key_cloned()
+        };
+        // #136 step 4: a bound resolver *is* credential material. L3 refuses
+        // `Missing`/`None` labels paired with material, so the label must name
+        // the path that actually supplies the secret — not a pre-login gap
+        // still sitting in chat state. Overwrite only when a resolver is
+        // attached; BYOK / ExplicitHeader turns keep the stored source.
+        if use_session_bearer_resolver {
+            credential_source = Some(xai_grok_sampler::CredentialSource::XaiSession);
+        } else if use_provider_bearer_resolver && let Some(provider) = model_auth_provider.as_ref()
+        {
+            credential_source = Some(xai_grok_sampler::CredentialSource::AuthProvider {
+                name: provider.name.clone(),
+            });
+        }
+        // Identity headers: gate on endpoint + credential-provider scope, not
+        // catalog readiness (#133). Omit when no first-party identity is in play.
+        let identity_in_scope = gate.endpoint_is_first_party
+            && auth_scheme != xai_grok_sampler::AuthScheme::None
+            && (use_session_bearer_resolver
+                || use_provider_bearer_resolver
+                || (api_key.is_some() && declared_credential_header.is_none()));
+        let deployment_id = if identity_in_scope {
+            crate::managed_config::resolve_deployment_id(
+                crate::managed_config::resolve_deployment_key().as_deref(),
+            )
+        } else {
+            None
+        };
+        let user_id = if identity_in_scope {
+            self.auth_manager
+                .as_ref()
+                .and_then(|am| am.current_or_expired())
+                .filter(|a| a.is_xai_auth())
+                .map(|a| a.user_id)
+        } else {
+            None
+        };
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
@@ -494,35 +787,30 @@ impl SessionActor {
             max_completion_tokens: cfg.max_completion_tokens,
             temperature: cfg.temperature,
             top_p: cfg.top_p,
+            endpoint_trust: cfg.endpoint_trust,
+            credential_source,
             api_backend: cfg.api_backend,
             auth_scheme,
             extra_headers,
-            extra_response_includes,
             query_params: cfg.query_params.clone(),
             env_http_headers: cfg.env_http_headers.clone(),
             context_window: cfg.context_window.get(),
-            client_version: creds.client_version().map(String::from),
-            codex_wire: None,
-            credential_source: None,
-            endpoint_trust: Default::default(),
+            client_version: creds.client_version_cloned(),
             reasoning_effort: cfg.reasoning_effort,
             force_http1: false,
             max_retries: Some(self.max_retries),
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
             idle_timeout_secs: None,
             client_identifier: self.client_identifier.clone(),
-            deployment_id: crate::managed_config::resolve_deployment_id(
-                crate::managed_config::resolve_deployment_key().as_deref(),
-            ),
-            user_id: self
-                .auth_manager
-                .as_ref()
-                .and_then(|am| am.current_or_expired())
-                .filter(|a| a.is_xai_auth())
-                .map(|a| a.user_id),
+            deployment_id,
+            user_id,
             origin_client: self.origin_client.clone(),
             attribution_callback: self.attribution_callback.clone(),
-            bearer_resolver: if use_bearer_resolver {
+            bearer_resolver: if use_provider_bearer_resolver {
+                model_auth_provider
+                    .as_ref()
+                    .map(crate::auth::AuthProviderRef::bearer_resolver)
+            } else if use_session_bearer_resolver {
                 self.auth_manager.as_ref().map(|am| {
                     crate::auth::credential_provider::WireValidBearerResolver::shared(am.clone())
                 })
@@ -534,6 +822,14 @@ impl SessionActor {
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+            // Live catalog lookup so a model switch's wire caps follow the
+            // selected entry rather than the session-start SamplingConfig (#245).
+            codex_wire: self
+                .models_manager
+                .models()
+                .get(catalog_model_id.as_str())
+                .and_then(|e| e.info.codex_wire.clone()),
+            extra_response_includes: Vec::new(),
         }
     }
     /// Install auto-mode permission classifier with a live LLM side-query
@@ -563,7 +859,7 @@ impl SessionActor {
         let effective_supports_re = crate::agent::config::effective_classifier_supports_re(
             aux_classifier_sampler
                 .as_ref()
-                .map(|(_, model, _)| model.as_str()),
+                .map(|(_, model)| model.as_str()),
             &session_model,
             &models,
         );
@@ -580,20 +876,22 @@ impl SessionActor {
         tokio::task::spawn_local(async move {
             while let Some((messages, respond_to)) = rx.recv().await {
                 let result = async {
-                    let (sampling_client, model, context_window) = match &aux_classifier_sampler {
-                        Some((client, model, context_window)) => {
-                            (client.clone(), model.clone(), *context_window)
-                        }
+                    let (sampling_client, model) = match &aux_classifier_sampler {
+                        Some((client, model)) => (client.clone(), model.clone()),
                         None => {
-                            session.refresh_token_if_expired().await;
-                            let config = session.reconstruct_full_config().await;
-                            let context_window = config.context_window;
-                            let model = config.model.clone();
-                            let client = xai_grok_sampler::SamplingClient::new(config)
+                            let client = session
+                                .prepare_chat_completion(false)
+                                .await
                                 .map_err(|e| xai_grok_workspace::permission::ClassifierFailure::TransportError(
                                     e.to_string(),
                                 ))?;
-                            (client, model, context_window)
+                            let model = session
+                                .chat_state_handle
+                                .get_sampling_config()
+                                .await
+                                .map(|c| c.model)
+                                .unwrap_or_default();
+                            (client, model)
                         }
                     };
                     let session_id = session.session_info.id.to_string();
@@ -608,17 +906,6 @@ impl SessionActor {
                             }
                         })
                         .collect::<Vec<_>>();
-                    let input_tokens = xai_chat_state::estimate_conversation_tokens(
-                        &items,
-                    );
-                    if !classifier_request_fits_context(input_tokens, context_window) {
-                        return Err(
-                            xai_grok_workspace::permission::ClassifierFailure::TransportError(
-                                "permission auto classifier request exceeds context window"
-                                    .to_owned(),
-                            ),
-                        );
-                    }
                     let request = ConversationRequest {
                         items,
                         tools: vec![],
@@ -692,15 +979,16 @@ impl SessionActor {
             .as_ref()
             .map(|am| am.grok_com_config().api_key_auth_disabled())
             .unwrap_or(false);
-        crate::agent::config::resolve_aux_model_sampling_config(
+        crate::agent::config::resolve_aux_model_sampling_config_preflight(
             slug,
             &models,
             &endpoints,
             session_key.as_deref(),
             disable_api_key_auth,
             creds.alpha_test_key_cloned(),
-            creds.client_version().map(String::from),
+            creds.client_version_cloned(),
         )
+        .await
     }
     /// Resolve a dedicated sampler for the Auto-mode classifier model `slug`,
     /// stamping session-local auth/attribution like image-describe (which relies
@@ -710,7 +998,7 @@ impl SessionActor {
     async fn resolve_auto_classifier_sampler(
         &self,
         slug: &str,
-    ) -> Option<(xai_grok_sampler::SamplingClient, String, u64)> {
+    ) -> Option<(xai_grok_sampler::SamplingClient, String)> {
         let active_session_config = self.reconstruct_full_config().await;
         let mut cfg = self.resolve_aux_sampler_config(slug).await?;
         crate::agent::config::stamp_session_local_sampler_fields(
@@ -720,13 +1008,12 @@ impl SessionActor {
             Some(self.max_retries),
         );
         let model = cfg.model.clone();
-        let context_window = cfg.context_window;
         let client = xai_grok_sampler::SamplingClient::new(cfg)
             .map_err(|e| {
                 tracing::warn!(error = %e, "auto classifier aux sampler build failed; using session model")
             })
             .ok()?;
-        Some((client, model, context_window))
+        Some((client, model))
     }
     #[tracing::instrument(
         name = "session.prepare_chat_completion",
@@ -739,6 +1026,16 @@ impl SessionActor {
     ) -> Result<xai_grok_sampler::SamplingClient, acp::Error> {
         self.refresh_token_if_expired().await;
         let mut full_config = self.reconstruct_full_config().await;
+        if let Err(message) = self.unusable_external_route(&full_config) {
+            // Deliberately not `fail_turn_unusable_route`. This seam serves
+            // compaction, goals, memory-dream and the laziness classifier --
+            // background work, not a user turn. A `RetryState::Failed` here
+            // would tell the pager a turn failed when none was running and
+            // fire the `agent_error` hook for housekeeping. Callers that do
+            // owe the client a terminal report send their own, as
+            // `compaction.rs` does.
+            return Err(acp::Error::invalid_params().data(message));
+        }
         full_config.force_http1 = force_http1;
         let sampling_client =
             xai_grok_sampler::SamplingClient::new(full_config).map_err(|e| self.to_acp_error(e))?;
@@ -755,9 +1052,12 @@ impl SessionActor {
     /// newly issued session token. The previous client cache inside
     /// the sampler actor is invalidated automatically by
     /// `update_config`.
-    pub(crate) async fn prepare_sampler_for_turn(&self) {
+    pub(crate) async fn prepare_sampler_for_turn(&self) -> Result<(), acp::Error> {
         self.refresh_token_if_expired().await;
         let mut sampler_config = self.reconstruct_full_config().await;
+        if let Err(message) = self.unusable_external_route(&sampler_config) {
+            return Err(self.fail_turn_unusable_route(message).await);
+        }
         if self.tool_context.task_output_token_budget.is_some()
             || self.tool_context.sampler_retry_only_before_output
         {
@@ -765,6 +1065,73 @@ impl SessionActor {
         }
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
         self.sampler_handle.update_config(sampler_config);
+        Ok(())
+    }
+    /// #133: a catalogued-but-unusable model pointed at a non-xAI origin must
+    /// fail locally before a request is built. Key on `Unusable` alone —
+    /// `Unknown` (uncatalogued / unloadable) must still proceed.
+    /// Terminal failure for a route refused before any request is built.
+    ///
+    /// `run_turn_via_sampler` documents that every `Err` it returns has
+    /// **already been reported**, and `handle_sampling_failure` is itself the
+    /// terminal reporter. Both reach `prepare_sampler_for_turn` through `?`,
+    /// so returning unreported from there would break that postcondition at
+    /// three call sites.
+    ///
+    /// The user still sees a turn-failed block either way -- the pager's
+    /// PromptResponse arm is a catch-all and none of its suppression flags
+    /// fire for this error type. What reporting buys is the rest of the
+    /// terminal contract: `log_terminal_failure` emits `turn.terminal_failure`
+    /// to the unified log, and `RetryState::Failed` is what raises the
+    /// `agent_error` hook. Without it this failure class is the only terminal
+    /// one that is invisible to telemetry and to user hooks.
+    ///
+    /// `model_not_ready` rather than `auth`: `is_reauthable_failure` keys on
+    /// `auth`, and an unusable model configuration is not an auth failure --
+    /// raising `/login` would send the user to fix the wrong thing.
+    async fn fail_turn_unusable_route(&self, message: String) -> acp::Error {
+        const ERROR_TYPE: &str = "model_not_ready";
+        self.log_terminal_failure(ERROR_TYPE, None, &message);
+        self.send_xai_notification(XaiSessionUpdate::RetryState(
+            crate::extensions::notification::RetryState::Failed {
+                error_type: ERROR_TYPE.to_owned(),
+                http_status: None,
+                message: message.clone(),
+            },
+        ))
+        .await;
+        acp::Error::invalid_params().data(message)
+    }
+    /// `Err(reason)` when this route must be refused. Returns the message
+    /// rather than a built `acp::Error` so the single caller reports it before
+    /// propagating -- see [`Self::fail_turn_unusable_route`].
+    fn unusable_external_route(&self, config: &SamplingConfig) -> Result<(), String> {
+        let catalog_model_id = self.catalog_model_id_str();
+        let facts = self.model_auth_facts(&catalog_model_id);
+        let Some(reason) = facts.readiness.unusable_reason() else {
+            return Ok(());
+        };
+        let first_party = match config.endpoint_trust {
+            // `UserDeclared` (#123) behaves like first-party here: the declared
+            // gateway fronts xAI for this user, so an unusable route surfaces
+            // the provider's 401 rather than a local refusal — the same
+            // behaviour `api.x.ai` gets.
+            Some(xai_grok_sampler::EndpointTrustClass::FirstPartyXai)
+            | Some(xai_grok_sampler::EndpointTrustClass::UserDeclared) => true,
+            Some(_) => false,
+            None => crate::util::is_xai_api_bearer_url(&config.base_url),
+        };
+        if first_party {
+            return Ok(());
+        }
+        tracing::warn!(
+            model = %catalog_model_id,
+            %reason,
+            "refusing unusable model on a non-first-party endpoint"
+        );
+        Err(format!(
+            "model '{catalog_model_id}' is not ready ({reason})"
+        ))
     }
     /// Fold an auth remedy into a turn failure: its advice becomes the tail of
     /// the message, and its `turn_error_type` the classification the client
@@ -810,6 +1177,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: error_type.to_owned(),
+                http_status: STATUS,
                 message: message.clone(),
             },
         ))
@@ -832,7 +1200,8 @@ impl SessionActor {
                 "status_code": status_code,
                 "reauthable": reauthable,
                 "auth_mode": auth.as_ref().map(|a| format!("{:?}", a.auth_mode)),
-                "key_prefix": auth.as_ref().map(|a| xai_grok_auth::bearer_suffix(&a.key).to_owned()),
+                "access_token_present": auth.as_ref().is_some_and(|a| !a.key.is_empty()),
+                "refresh_token_present": auth.as_ref().is_some_and(|a| a.refresh_token.is_some()),
                 "expires_at": auth
                     .as_ref()
                     .and_then(|a| a.expires_at.map(|e| e.to_rfc3339())),
@@ -844,12 +1213,26 @@ impl SessionActor {
         self: &Arc<Self>,
         error: xai_grok_sampler::SamplingErrorInfo,
     ) -> Result<SamplerFailureRecovery, acp::Error> {
+        self.handle_sampling_failure_with_codex_retry_policy(error, true)
+            .await
+    }
+
+    pub(super) async fn handle_sampling_failure_with_codex_retry_policy(
+        self: &Arc<Self>,
+        error: xai_grok_sampler::SamplingErrorInfo,
+        codex_retry_available: bool,
+    ) -> Result<SamplerFailureRecovery, acp::Error> {
         use xai_grok_sampler::SamplingErrorKind;
+        // Sampler messages for Api are `API error (status N): <user_facing>`.
+        // For HTTP 400, user_facing may carry a truncated secret-scrubbed body
+        // preview (#245). Surface that preview here; never invent new text
+        // from raw provider bytes at this layer.
+        let safe_provider_failure = || safe_provider_failure_message(&error);
         if self.tool_context.task_output_token_budget.is_some() {
             self.tool_context.fail_task_output_usage_closed();
             let message = format!(
-                "budgeted workflow child model request failed; output grant exhausted: {}",
-                error.message
+                "Budgeted workflow child model request failed; output grant exhausted. {}",
+                safe_provider_failure()
             );
             self.log_terminal_failure("output_budget_usage_unknown", error.status_code, &message);
             return Err(acp::Error::internal_error().data(message));
@@ -860,8 +1243,8 @@ impl SessionActor {
                 let _ = handle.mark_usage_incomplete(true, true).await;
             });
             let message = format!(
-                "workflow child model request failed; usage may understate real spend: {}",
-                error.message
+                "Workflow child model request failed; usage may understate real spend. {}",
+                safe_provider_failure()
             );
             self.log_terminal_failure(
                 "workflow_child_sampling_failed",
@@ -900,7 +1283,9 @@ impl SessionActor {
                 return Ok(SamplerFailureRecovery::CompactAndResubmit);
             }
         }
-        let detailed_message = error.message.clone();
+        let is_model_404 =
+            error.status_code == Some(404) && error.message.contains("does not exist");
+        let detailed_message = safe_provider_failure();
         if matches!(error.kind, SamplingErrorKind::Api)
             && error.status_code == Some(400)
             && error.message.contains("encrypted_content")
@@ -914,6 +1299,7 @@ impl SessionActor {
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Failed {
                     error_type: "encrypted_content_mismatch".to_string(),
+                    http_status: error.status_code,
                     message: friendly.clone(),
                 },
             ))
@@ -937,11 +1323,18 @@ impl SessionActor {
             .data(detailed_message);
             return Err(acp_err);
         }
-        let (failed_model_id, failed_base_url) = self
+        let (failed_model_id, failed_base_url, failed_endpoint_trust, failed_headers) = self
             .chat_state_handle
             .get_sampling_config()
             .await
-            .map(|c| (c.model, c.base_url))
+            .map(|c| {
+                (
+                    self.catalog_model_id_str(),
+                    c.base_url,
+                    c.endpoint_trust,
+                    (c.extra_headers, c.env_http_headers),
+                )
+            })
             .unwrap_or_default();
         let auth_provider =
             if matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401) {
@@ -950,7 +1343,13 @@ impl SessionActor {
                 None
             };
         let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
-            let gate = self.auth_gate(&failed_model_id, &failed_base_url);
+            let gate = self.auth_gate(
+                &failed_model_id,
+                &failed_base_url,
+                failed_endpoint_trust,
+                &failed_headers.0,
+                &failed_headers.1,
+            );
             let eligible = gate.active();
             self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
             if !eligible && auth_provider.is_none() {
@@ -1003,7 +1402,7 @@ impl SessionActor {
                     Some(self.session_info.id.0.as_ref()),
                     None,
                 );
-                self.prepare_sampler_for_turn().await;
+                self.prepare_sampler_for_turn().await?;
                 return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
                     credential: error.credential,
                     store: RecoveredStore::SessionToken,
@@ -1016,14 +1415,27 @@ impl SessionActor {
                 None,
             );
         }
-        if let Some(ref provider) = auth_provider
-            && self.try_provider_401_recovery(provider).await
-        {
-            self.prepare_sampler_for_turn().await;
-            return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
-                credential: error.credential,
-                store: RecoveredStore::AuthProvider,
-            });
+        let is_codex_provider = auth_provider.as_ref().is_some_and(|provider| {
+            provider.name == crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID
+        });
+        let codex_retry_exhausted = is_codex_provider && !codex_retry_available;
+        if let Some(ref provider) = auth_provider {
+            if codex_retry_exhausted {
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    provider = %provider.name,
+                    "auth recovery: Codex 401 retry already consumed; surfacing failure"
+                );
+            } else if self
+                .try_provider_401_recovery(provider, error.credential)
+                .await
+            {
+                self.prepare_sampler_for_turn().await?;
+                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                    credential: error.credential,
+                    store: RecoveredStore::AuthProvider,
+                });
+            }
         }
         if matches!(error.kind, SamplingErrorKind::IdleTimeout) {
             self.signals_handle().record_idle_timeout();
@@ -1063,25 +1475,32 @@ impl SessionActor {
         let auth_mode_str = format!("{auth_mode:?}");
         let client_version = xai_grok_version::VERSION;
         if auth_mode == crate::auth::AuthMode::WebLogin {
+            let fix_instruction = crate::auth::with_login_instruction(
+                |prog| {
+                    format!(
+                        "run `{prog} logout` then `{prog} login` to re-authenticate with OAuth2."
+                    )
+                },
+                "log out then sign in again to re-authenticate with OAuth2.",
+            );
             let msg = format!(
                 "{detailed_message}\n\n\
                  You are using a deprecated authentication method (WebLogin).\n\
                  This auth method is no longer supported and will cause errors.\n\n\
-                 To fix: run `grok update`, then `grok logout`, then `grok login` to re-authenticate with OAuth2.\n\n\
+                 To fix: {fix_instruction}\n\n\
                  Version: {client_version}"
             );
             self.log_terminal_failure("legacy_auth", error.status_code, &msg);
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Failed {
                     error_type: "legacy_auth".to_string(),
+                    http_status: error.status_code,
                     message: msg.clone(),
                 },
             ))
             .await;
             return Err(acp::Error::internal_error().data(msg));
         }
-        let is_model_404 =
-            error.status_code == Some(404) && detailed_message.contains("does not exist");
         let is_auth_401 =
             error.status_code == Some(401) || matches!(error.kind, SamplingErrorKind::Auth);
         let detailed_message = if is_model_404 || is_auth_401 {
@@ -1130,18 +1549,54 @@ impl SessionActor {
         } else {
             error.kind.as_str()
         };
-        let (error_type, detailed_message) = match self.auth_manager.as_ref() {
-            Some(auth_manager) if error_type == "auth" => self.apply_auth_remedy(
-                &auth_manager.auth_remedy(),
-                detailed_message,
-                error.status_code,
-            ),
-            _ => (error_type, detailed_message),
+        // Codex has its own login verb, and the generic remedy advice does not
+        // know it: `provider_login_message` says "Run /login", which cannot
+        // renew a Codex credential. Keep these two arms ahead of upstream's
+        // classification; everything else falls through to it.
+        //
+        // The hand-rolled `auth_transient` arm that used to sit here is gone:
+        // `AuthRemedy::SelfHealing` carries the same error type and the same
+        // message verbatim, on a stricter condition (it also requires a live
+        // credential when an external provider mints sessions).
+        let (error_type, detailed_message) = if codex_retry_exhausted {
+            let sign_in_hint = crate::auth::with_login_instruction(
+                |prog| format!("Sign in again with `{prog} login --provider openai-codex`."),
+                "Sign in again with the OpenAI Codex login flow.",
+            );
+            (
+                "auth",
+                format!(
+                    "{detailed_message}\n\nOpenAI Codex rejected the refreshed credential. \
+                     {sign_in_hint}"
+                ),
+            )
+        } else if is_codex_provider && error_type == "auth" {
+            let sign_in_hint = crate::auth::with_login_instruction(
+                |prog| format!("sign in again with `{prog} login --provider openai-codex`."),
+                "sign in again with the OpenAI Codex login flow.",
+            );
+            (
+                "auth",
+                format!(
+                    "{detailed_message}\n\nOpenAI Codex authentication could not recover. \
+                     Retry once after a network interruption; if it persists, {sign_in_hint}"
+                ),
+            )
+        } else {
+            match self.auth_manager.as_ref() {
+                Some(auth_manager) if error_type == "auth" => self.apply_auth_remedy(
+                    &auth_manager.auth_remedy(),
+                    detailed_message,
+                    error.status_code,
+                ),
+                _ => (error_type, detailed_message),
+            }
         };
         self.log_terminal_failure(error_type, error.status_code, &detailed_message);
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: error_type.to_string(),
+                http_status: error.status_code,
                 message: detailed_message.clone(),
             },
         ))
@@ -1169,8 +1624,9 @@ impl SessionActor {
     pub(crate) async fn run_turn_via_sampler(
         self: &Arc<Self>,
         request: ConversationRequest,
+        codex_retry_available: bool,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
-        self.prepare_sampler_for_turn().await;
+        self.prepare_sampler_for_turn().await?;
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);
@@ -1210,7 +1666,10 @@ impl SessionActor {
             Err(rich_err) => {
                 self.turn_stream_drained.lock().take();
                 let info = xai_grok_sampler::SamplingErrorInfo::from(&rich_err);
-                match self.handle_sampling_failure(info).await? {
+                match self
+                    .handle_sampling_failure_with_codex_retry_policy(info, codex_retry_available)
+                    .await?
+                {
                     SamplerFailureRecovery::CompactAndResubmit => {
                         Ok(SamplerTurnOutcome::CompactAndResubmit)
                     }
@@ -1231,20 +1690,61 @@ impl SessionActor {
     /// Soft failures with a still-usable access token still return here
     /// (grace / optimistic send); 401 recovery remains the safety net.
     pub(crate) async fn refresh_token_if_expired(&self) {
+        let current_model_id = self.catalog_model_id_str();
+        if let Some(provider) = self.model_auth_provider(&current_model_id)
+            && provider.name == crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID
+        {
+            let current_key = self
+                .chat_state_handle
+                .get_credentials()
+                .await
+                .api_key_cloned();
+            self.refresh_provider_token_pre_turn(
+                &provider,
+                current_key.as_deref(),
+                &current_model_id,
+            )
+            .await;
+            return;
+        }
         if let Some(ref am) = self.auth_manager {
             let creds = self.chat_state_handle.get_credentials().await;
-            let (model_id, base_url) = self
+            let catalog_model_id = current_model_id.clone();
+            let (base_url, endpoint_trust, headers) = self
                 .chat_state_handle
                 .get_sampling_config()
                 .await
-                .map(|c| (c.model, c.base_url))
+                .map(|c| {
+                    (
+                        c.base_url,
+                        c.endpoint_trust,
+                        (c.extra_headers, c.env_http_headers),
+                    )
+                })
                 .unwrap_or_default();
-            if self.auth_gate(&model_id, &base_url).active() {
+            if self
+                .auth_gate(
+                    &catalog_model_id,
+                    &base_url,
+                    endpoint_trust,
+                    &headers.0,
+                    &headers.1,
+                )
+                .active()
+            {
                 match am.get_valid_token().await {
                     Ok(key) => {
-                        if creds.api_key().as_deref() != Some(&key) {
-                            let new_creds = creds.clone().rebind(Some(key), creds.auth_type(), creds.source_cloned().unwrap_or(xai_grok_sampling_types::CredentialSource::None));
-                            self.chat_state_handle.update_credentials(new_creds);
+                        if creds.api_key() != Some(key.as_str()) {
+                            // Ambient xAI session JWT — rebind, do not
+                            // `replace_api_key`. Chat-state may still carry
+                            // `Missing` from a pre-login spawn; preserving that
+                            // label would disarm L3 (#136 / #151).
+                            let creds = creds.rebind(
+                                Some(key),
+                                xai_chat_state::AuthType::SessionToken,
+                                xai_grok_sampler::CredentialSource::XaiSession,
+                            );
+                            self.chat_state_handle.update_credentials(creds);
                         }
                         self.clear_auth_compact_suppression();
                         return;
@@ -1252,13 +1752,14 @@ impl SessionActor {
                     Err(e) => {
                         let hard_expired = !am.has_usable_token();
                         if hard_expired && creds.api_key().is_some() {
-                            let cleared = creds.clone().rebind(None, creds.auth_type(), creds.source_cloned().unwrap_or(xai_grok_sampling_types::CredentialSource::None));
+                            let mut cleared = creds;
+                            cleared.clear_api_key();
                             self.chat_state_handle.update_credentials(cleared);
                         }
                         tracing::warn!(
                             error = %e,
                             hard_expired,
-                            model = %model_id,
+                            model = %catalog_model_id,
                             "auth: preflight get_valid_token failed"
                         );
                         xai_grok_telemetry::unified_log::warn(
@@ -1267,7 +1768,7 @@ impl SessionActor {
                             Some(serde_json::json!({
                                 "error": format!("{e}"),
                                 "hard_expired": hard_expired,
-                                "model": model_id,
+                                "model": catalog_model_id,
                             })),
                         );
                         return;
@@ -1285,12 +1786,6 @@ impl SessionActor {
         const REFRESH_THRESHOLD: chrono::Duration = chrono::Duration::minutes(5);
         let creds = self.chat_state_handle.get_credentials().await;
         let current_key = creds.api_key_cloned();
-        let current_model_id = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
-            .unwrap_or_default();
         if let Some(provider) = self.model_auth_provider(&current_model_id) {
             self.refresh_provider_token_pre_turn(
                 &provider,
@@ -1325,7 +1820,7 @@ impl SessionActor {
             remaining_secs,
             "JWT near expiry, refreshing from config.toml"
         );
-        let Some(new_key) = self.reload_api_key_from_config(&current_model_id) else {
+        let Some((new_key, source)) = self.reload_api_key_from_config(&current_model_id) else {
             return;
         };
         if key == &new_key {
@@ -1343,11 +1838,26 @@ impl SessionActor {
             key_len = new_key.len(),
             "Refreshed API token from config.toml"
         );
+        // Honesty, not the ambient-bytes bug fixed above. `reload_api_key_from_config`
+        // reads only `[model.*]`'s own `api_key`/`env_key`, so this site can never
+        // write ambient session bytes. Under `replace_api_key` its worst case is
+        // labelling those non-ambient bytes with whatever provenance the session
+        // already held (e.g. `XaiSession` after a first-party model later gains
+        // its own key) — over-restricting, the safe direction, and today without
+        // behavioural consequence. Rebind so the stored source matches which
+        // own-credential arm actually resolved.
         let creds = self.chat_state_handle.get_credentials().await;
-        let new_creds = creds.clone().rebind(Some(new_key), creds.auth_type(), creds.source_cloned().unwrap_or(xai_grok_sampling_types::CredentialSource::None));
-        self.chat_state_handle.update_credentials(new_creds);
+        let creds = creds.rebind(Some(new_key), xai_chat_state::AuthType::ApiKey, source);
+        self.chat_state_handle.update_credentials(creds);
     }
-    fn reload_api_key_from_config(&self, current_model_id: &str) -> Option<String> {
+    /// Resolve the model's own credential from config.toml, plus the
+    /// [`CredentialSource`] for whichever `first_own_credential` arm won:
+    /// non-empty `api_key` → `ModelApiKey`; else the winning `env_key`
+    /// variable → `EnvKey { name }`.
+    fn reload_api_key_from_config(
+        &self,
+        current_model_id: &str,
+    ) -> Option<(String, xai_grok_sampler::CredentialSource)> {
         let raw_config = crate::config::load_effective_config()
             .map_err(|e| tracing::warn!(error = %e, "Failed to reload config"))
             .ok()?;
@@ -1367,18 +1877,33 @@ impl SessionActor {
             );
             return None;
         };
-        let key = crate::agent::config::first_own_credential(
-            model.api_key.as_deref(),
-            model.env_key.as_ref(),
-        );
-        if key.is_none() {
-            tracing::warn!(
-                model = %current_model_id,
-                env_key = ?model.env_key,
-                "No api_key or env_key resolved for model"
-            );
+        // Same two arms as `first_own_credential`, with the source that arm implies.
+        if let Some(key) = model.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+            return Some((
+                key.to_owned(),
+                xai_grok_sampler::CredentialSource::ModelApiKey,
+            ));
         }
-        key
+        if let Some(env_keys) = model.env_key.as_ref() {
+            for name in env_keys.names() {
+                if let Ok(value) = std::env::var(name)
+                    && !value.trim().is_empty()
+                {
+                    return Some((
+                        value,
+                        xai_grok_sampler::CredentialSource::EnvKey {
+                            name: name.to_owned(),
+                        },
+                    ));
+                }
+            }
+        }
+        tracing::warn!(
+            model = %current_model_id,
+            env_key = ?model.env_key,
+            "No api_key or env_key resolved for model"
+        );
+        None
     }
     /// Propagate the model-reported token usage from a turn response into
     /// chat state, the per-prompt usage ledger, and per-turn signals.
@@ -1437,6 +1962,41 @@ impl SessionActor {
             .push_assistant_response(assistant_item);
     }
 }
+
+/// Build the terminal provider message exclusively from sampler-classified,
+/// secret-scrubbed fields. For 400 responses, retain the safe provider detail
+/// only behind one of the two exact API display prefixes emitted by the
+/// sampler; do not scan arbitrary free-form text for a status or body.
+fn safe_provider_failure_message(error: &xai_grok_sampler::SamplingErrorInfo) -> String {
+    let Some(status) = error.status_code else {
+        return format!("Provider request failed ({}).", error.kind.as_str());
+    };
+    let mut out = format!("Provider request failed (HTTP {status}).");
+    if status != 400 {
+        return out;
+    }
+
+    const PREFIXES: &[&str] = &[
+        "API error (status 400): ",
+        "API error (status 400 Bad Request): ",
+    ];
+    let Some(mut detail) = PREFIXES
+        .iter()
+        .find_map(|prefix| error.message.strip_prefix(prefix))
+    else {
+        return out;
+    };
+    detail = detail
+        .strip_prefix("Request failed (HTTP 400).")
+        .unwrap_or(detail)
+        .trim();
+    if !detail.is_empty() {
+        out.push(' ');
+        out.push_str(detail);
+    }
+    out
+}
+
 /// Per-tool precedence: a non-empty `over` wins, else the non-empty `seed`.
 fn prefer_non_empty<T>(
     over: Option<T>,
@@ -1461,24 +2021,6 @@ fn resolve_configured_cutoff(
     ToolOverrides {
         x_search: prefer_non_empty(over_x, seed_x, XSearchOptions::is_empty),
         web_search: prefer_non_empty(over_w, seed_w, WebSearchOptions::is_empty),
-    }
-}
-#[cfg(test)]
-mod classifier_request_bound_tests {
-    use super::{CLASSIFIER_REQUEST_TOKEN_RESERVE, classifier_request_fits_context};
-    #[test]
-    fn enforces_reserved_threshold_with_saturating_arithmetic() {
-        let window = 12_000 + CLASSIFIER_REQUEST_TOKEN_RESERVE;
-        for (input, context_window, expected) in [
-            (12_000, window, true),
-            (12_001, window, false),
-            (u64::MAX, u64::MAX, false),
-        ] {
-            assert_eq!(
-                classifier_request_fits_context(input, context_window),
-                expected
-            );
-        }
     }
 }
 #[cfg(test)]
@@ -1568,5 +2110,50 @@ mod configured_cutoff_tests {
             let inherited = super::resolve_configured_cutoff(seed.clone(), base.as_ref());
             assert_eq!(wire_echo, inherited, "seed={seed:?} base={base:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod safe_provider_failure_tests {
+    use xai_grok_sampler::{SamplingErrorInfo, SamplingErrorKind};
+
+    fn bad_request(message: &str) -> SamplingErrorInfo {
+        SamplingErrorInfo {
+            kind: SamplingErrorKind::Api,
+            error_code: None,
+            message: message.to_string(),
+            status_code: Some(400),
+            is_retryable: false,
+            retry_after_secs: None,
+            should_retry: None,
+            model_metadata: None,
+            empty_response_context: None,
+            doom_loop_triggers: None,
+            doom_loop_aborted_at_chunk: None,
+            credential: xai_grok_sampling_types::SentCredential::Unknown,
+        }
+    }
+
+    #[test]
+    fn retains_safe_400_detail_from_both_structural_prefixes() {
+        for message in [
+            "API error (status 400): invalid field `reasoning.effort`",
+            "API error (status 400 Bad Request): invalid field `reasoning.effort`",
+        ] {
+            assert_eq!(
+                super::safe_provider_failure_message(&bad_request(message)),
+                "Provider request failed (HTTP 400). invalid field `reasoning.effort`"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_promote_unstructured_400_text() {
+        assert_eq!(
+            super::safe_provider_failure_message(&bad_request(
+                "upstream said status 400: bearer secret-do-not-copy"
+            )),
+            "Provider request failed (HTTP 400)."
+        );
     }
 }

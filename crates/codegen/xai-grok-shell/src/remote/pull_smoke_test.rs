@@ -6,7 +6,6 @@
 mod tests {
     use crate::auth::GrokAuth;
     use crate::remote::client::BackendClient;
-    use crate::session::storage::{JsonlStorageAdapter, StorageAdapter};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -47,6 +46,8 @@ mod tests {
             title: Some(test_title.into()),
             cwd: test_cwd.clone(),
             model_id: Some("grok-3".into()),
+            catalog_identity: None,
+            agent_name: None,
             created_at: Some(chrono::Utc::now().to_rfc3339()),
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
             total_messages: None,
@@ -92,14 +93,30 @@ mod tests {
         assert_eq!(remote.title.as_deref(), Some(test_title));
         assert!(loaded.messages.as_ref().map_or(0, |m| m.len()) >= 2);
 
-        // PULL back to local
-        let result = crate::remote::pull_session_to_local(&session_id, &client)
-            .await
-            .expect("pull failed");
-        let pulled = match result {
-            crate::remote::PullResult::Hydrated(info) => info,
-            crate::remote::PullResult::NotFound => panic!("pull returned NotFound"),
+        // PULL back through the production load-on-miss path. This path fetches
+        // without filesystem I/O, hydrates behind the canonical exclusive
+        // publication claim, then hands the actor a lifetime shared lease.
+        let requested = crate::session::info::Info {
+            id: sid,
+            cwd: test_cwd.clone(),
         };
+        let sampling_client =
+            crate::sampling::Client::new(xai_grok_sampler::SamplerConfig::default())
+                .expect("sampling client");
+        let (persisted, persistence) = crate::session::persistence::load_light(
+            &requested,
+            sampling_client,
+            crate::config::StorageMode::Local,
+            None,
+            Some(&client),
+            None,
+            None,
+            String::new(),
+            None,
+        )
+        .await
+        .expect("pull through load-on-miss failed");
+        let pulled = persisted.summary.info.clone();
         assert_eq!(pulled.cwd, test_cwd);
 
         // Verify local storage loads
@@ -107,12 +124,7 @@ mod tests {
         assert!(local_dir.join("summary.json").exists());
         assert!(local_dir.join("updates.jsonl").exists());
 
-        let storage = JsonlStorageAdapter::default();
-        let data = storage
-            .load_session_without_updates(&pulled)
-            .await
-            .expect("storage load failed");
-        assert_eq!(data.summary.session_summary, test_title);
+        assert_eq!(persisted.summary.session_summary, test_title);
 
         // Verify chat_history has both turns
         let chat =
@@ -121,6 +133,7 @@ mod tests {
         assert!(chat.contains("agent"), "chat_history missing agent turn");
 
         // Cleanup
+        drop(persistence);
         drop(sync);
         let _ = client.delete_session_data(&session_id).await;
         let _ = std::fs::remove_dir_all(&local_dir);

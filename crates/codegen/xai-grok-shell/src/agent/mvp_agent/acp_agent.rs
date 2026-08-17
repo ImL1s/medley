@@ -4,8 +4,111 @@
 //! Co-located child of `mvp_agent` (`use super::*`).
 use super::*;
 use crate::auth::SilentRefresh;
-use crate::upload::trace::PromptMetadataParams;
 use crate::leader::protocol::InternalMethod;
+use crate::upload::trace::PromptMetadataParams;
+
+#[cfg(test)]
+type PromptDispatchBoundaryHook = Box<dyn FnOnce() + 'static>;
+
+#[cfg(test)]
+type PromptRecoveryBoundaryHook = Box<dyn FnOnce(&acp::ModelId) + 'static>;
+
+#[cfg(test)]
+thread_local! {
+    static PROMPT_DISPATCH_BOUNDARY_HOOKS: std::cell::RefCell<
+        std::collections::HashMap<String, PromptDispatchBoundaryHook>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static PROMPT_RECOVERY_BOUNDARY_HOOKS: std::cell::RefCell<
+        std::collections::HashMap<String, PromptRecoveryBoundaryHook>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+pub(crate) fn install_prompt_dispatch_boundary_hook(
+    session_id: &acp::SessionId,
+    hook: impl FnOnce() + 'static,
+) {
+    PROMPT_DISPATCH_BOUNDARY_HOOKS.with(|hooks| {
+        hooks
+            .borrow_mut()
+            .insert(session_id.0.to_string(), Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_prompt_dispatch_boundary_hook(session_id: &acp::SessionId) {
+    let hook = PROMPT_DISPATCH_BOUNDARY_HOOKS
+        .with(|hooks| hooks.borrow_mut().remove(session_id.0.as_ref()));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_prompt_recovery_boundary_hook(
+    session_id: &acp::SessionId,
+    hook: impl FnOnce(&acp::ModelId) + 'static,
+) {
+    PROMPT_RECOVERY_BOUNDARY_HOOKS.with(|hooks| {
+        hooks
+            .borrow_mut()
+            .insert(session_id.0.to_string(), Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_prompt_recovery_boundary_hook(
+    session_id: &acp::SessionId,
+    restore_model_id: &acp::ModelId,
+) {
+    let hook = PROMPT_RECOVERY_BOUNDARY_HOOKS
+        .with(|hooks| hooks.borrow_mut().remove(session_id.0.as_ref()));
+    if let Some(hook) = hook {
+        hook(restore_model_id);
+    }
+}
+
+pub(super) fn normalize_resident_model_if_unchanged(
+    resident: &mut SessionHandle,
+    expected_model: &acp::ModelId,
+    normalized_model: &acp::ModelId,
+) -> bool {
+    if resident.model_id != *expected_model {
+        return false;
+    }
+    resident.model_id = normalized_model.clone();
+    true
+}
+
+pub(super) fn has_advertised_auth_provider_command(
+    config: &crate::auth::GrokComConfig,
+) -> bool {
+    crate::auth::has_nonblank_auth_provider_command(config.auth_provider_command.as_deref())
+}
+
+/// The single model-restore edge used by `session/load` after registration and
+/// before its load guard is released. Keeping this wrapper in the load module
+/// prevents restore callers from accidentally taking the external wait path.
+/// The bypass is bound to the load's own guard, so a superseded duplicate
+/// load cannot resolve its handle through a newer load's marker.
+pub(super) async fn restore_registered_session_model(
+    agent: &MvpAgent,
+    request: acp::SetSessionModelRequest,
+    load_guard: &SessionLoadGuard<'_>,
+    restored_model: Option<(
+        xai_chat_state::CatalogIdentity,
+        crate::agent::config::ModelEntry,
+    )>,
+) -> Result<acp::SetSessionModelResponse, acp::Error> {
+    crate::agent::handlers::model_switch::apply_during_session_load(
+        agent,
+        request,
+        load_guard,
+        restored_model,
+    )
+    .await
+}
+
 /// Which `x_search` sub-tools enforce the date cutoff, sent in `initialize`. `x_user_search` and
 /// `x_thread_fetch` are `false`: they don't honor it yet.
 #[derive(serde::Serialize)]
@@ -25,6 +128,62 @@ fn tool_overrides_capability() -> serde_json::Value {
     serde_json::to_value(TOOL_OVERRIDES_CAPABILITY)
         .expect("ToolOverridesCapability is always serializable")
 }
+async fn read_applied_tool_overrides(
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+) -> Option<xai_grok_sampling_types::ToolOverrides> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if cmd_tx
+        .send(SessionCommand::GetToolOverrides {
+            respond_to: tx,
+        })
+        .is_err()
+    {
+        tracing::warn!("tool-overrides echo: session actor command channel closed");
+        return None;
+    }
+    match rx.await {
+        Ok(overrides) => overrides,
+        Err(_) => {
+            tracing::warn!("tool-overrides echo: session actor dropped the response channel");
+            None
+        }
+    }
+}
+fn insert_applied_tool_overrides(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    echo: Option<&xai_grok_sampling_types::ToolOverrides>,
+) {
+    if let Some(overrides) = echo {
+        meta.insert(
+            "toolOverrides".to_string(),
+            serde_json::to_value(overrides)
+                .expect("ToolOverrides is always serializable"),
+        );
+    }
+}
+
+pub(super) fn auth_init_disk_refresh_context(
+    pre: Option<&crate::auth::GrokAuth>,
+    post: Option<&crate::auth::GrokAuth>,
+) -> serde_json::Value {
+    let access_relation = crate::auth::refresh::TriedDiskRelation::compare(
+        pre.map(|auth| auth.key.as_str()),
+        post.map(|auth| auth.key.as_str()),
+    );
+    let refresh_relation = crate::auth::refresh::TriedDiskRelation::compare(
+        pre.and_then(|auth| auth.refresh_token.as_deref()),
+        post.and_then(|auth| auth.refresh_token.as_deref()),
+    );
+    serde_json::json!({
+        "access_relation": access_relation.as_str(),
+        "access_pre_present": access_relation.tried_present(),
+        "access_post_present": access_relation.disk_present(),
+        "refresh_relation": refresh_relation.as_str(),
+        "refresh_pre_present": refresh_relation.tried_present(),
+        "refresh_post_present": refresh_relation.disk_present(),
+    })
+}
+
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
     /// In the meta, we provide
@@ -77,9 +236,10 @@ impl acp::Agent for MvpAgent {
         tokio::task::spawn_blocking(|| {
             crate::session::persistence::cleanup_stale_sessions(None);
         });
-        self.apply_session_search_gate();
-        crate::session::storage::search::SEARCH_INDEX_MANAGER
-            .bootstrap_once(crate::util::grok_home::grok_home());
+        {
+            let root = crate::util::grok_home::grok_home();
+            crate::session::storage::search::SEARCH_INDEX_MANAGER.bootstrap_once(root);
+        }
         const PERMISSION_CLEANUP_TTL_DAYS: u64 = 30;
         static CLEANUP_PERMISSIONS_ONCE: std::sync::Once = std::sync::Once::new();
         CLEANUP_PERMISSIONS_ONCE
@@ -102,10 +262,10 @@ impl acp::Agent for MvpAgent {
                 None,
                 Some(
                     serde_json::json!({
-                    "user_id": user_id,
+                    "user_id_present": !user_id.is_empty(),
                     "needs_user_info": needs_user_info,
-                    "key_prefix": xai_grok_auth::bearer_suffix(&auth.key),
-                    "rt_prefix": auth.refresh_token.as_deref().map(xai_grok_auth::bearer_suffix),
+                    "access_token_present": !auth.key.is_empty(),
+                    "refresh_token_present": auth.refresh_token.is_some(),
                 }),
                 ),
             );
@@ -189,39 +349,13 @@ impl acp::Agent for MvpAgent {
         if self.initialize_request.set(arguments).is_err() {
             tracing::info!("Initialize called on reconnect (already initialized)");
         }
-        let pre = self
-            .auth_manager
-            .current()
-            .map(|a| (
-                xai_grok_auth::bearer_suffix(&a.key).to_owned(),
-                a
-                    .refresh_token
-                    .as_deref()
-                    .map(|t| xai_grok_auth::bearer_suffix(t).to_owned()),
-            ));
+        let pre = self.auth_manager.current();
         self.auth_manager.force_reload_from_disk();
-        let post = self
-            .auth_manager
-            .current()
-            .map(|a| (
-                xai_grok_auth::bearer_suffix(&a.key).to_owned(),
-                a
-                    .refresh_token
-                    .as_deref()
-                    .map(|t| xai_grok_auth::bearer_suffix(t).to_owned()),
-            ));
+        let post = self.auth_manager.current();
         xai_grok_telemetry::unified_log::info(
             "auth init disk refresh",
             None,
-            Some(
-                serde_json::json!({
-                "pre_key": pre.as_ref().map(|p| &p.0),
-                "pre_rt": pre.as_ref().and_then(|p| p.1.as_deref()),
-                "post_key": post.as_ref().map(|p| &p.0),
-                "post_rt": post.as_ref().and_then(|p| p.1.as_deref()),
-                "changed": pre.as_ref().map(|p| &p.0) != post.as_ref().map(|p| &p.0),
-            }),
-            ),
+            Some(auth_init_disk_refresh_context(pre.as_ref(), post.as_ref())),
         );
         xai_grok_telemetry::unified_log::info(
             "auth: initialize() refreshed auth state from disk",
@@ -276,7 +410,7 @@ impl acp::Agent for MvpAgent {
             .models_manager
             .models()
             .values()
-            .any(crate::agent::config::ModelEntry::has_own_credentials);
+            .any(|model| model.has_own_credentials() && !model.is_openai_codex_profile());
         let first_party_env_ok = if crate::auth::should_probe_first_party_env_key(
             disable_api_key_auth,
             has_byok,
@@ -291,7 +425,8 @@ impl acp::Agent for MvpAgent {
         } else {
             true
         };
-        self.auth_manager.set_first_party_env_api_key_ok(first_party_env_ok);
+        self.models_manager
+            .apply_first_party_env_api_key_probe_result(first_party_env_ok);
         let has_external_api_key = auth_method::should_advertise_xai_api_key_with_env_ok(
             disable_api_key_auth,
             self.models_manager.models().values(),
@@ -326,7 +461,7 @@ impl acp::Agent for MvpAgent {
             let issuer = cfg.grok_com_config.oidc.as_ref().map(|o| o.issuer.clone());
             (
                 cfg.grok_com_config.auth_provider_label.clone(),
-                cfg.grok_com_config.auth_provider_command.is_some(),
+                has_advertised_auth_provider_command(&cfg.grok_com_config),
                 cfg.grok_com_config.oidc.is_some(),
                 issuer,
             )
@@ -337,14 +472,11 @@ impl acp::Agent for MvpAgent {
                 .expect(
                     "enterprise_oidc_issuer must be Some when has_enterprise_oidc is true",
                 );
-            tracing::info!(
-                issuer = %issuer,
-                "auth: advertising enterprise OIDC auth method",
-            );
+            tracing::info!(issuer_present = !issuer.is_empty(), "auth: advertising enterprise OIDC auth method");
             xai_grok_telemetry::unified_log::info(
                 "auth: advertising enterprise OIDC auth method",
                 None,
-                Some(serde_json::json!({ "issuer": issuer })),
+                Some(serde_json::json!({ "issuer_present": !issuer.is_empty() })),
             );
         } else {
             tracing::info!(
@@ -397,6 +529,8 @@ impl acp::Agent for MvpAgent {
                 "disable_api_key_auth": disable_api_key_auth,
                 "has_cached_token": has_cached_token,
                 "has_enterprise_oidc": has_enterprise_oidc,
+                "selected_model_is_no_auth": selected_model_is_no_auth,
+                "has_openai_codex_credential": has_openai_codex_credential,
                 "init_has_current": init_has_current,
                 "init_is_expired": init_is_expired,
                 "auth_mode": self.auth_manager.current().map(|a| format!("{:?}", a.auth_mode)),
@@ -442,6 +576,11 @@ impl acp::Agent for MvpAgent {
         let current_working_directory = self.launch_cwd.clone();
         let hostname = gethostname::gethostname();
         let mcp_servers: Vec<crate::extensions::mcp::McpServerEntry> = Vec::new();
+        let fetch_managed_mcps = self.cfg.borrow().managed_mcps_enabled
+            && self.can_fetch_managed_mcps();
+        if self.cfg.borrow().managed_mcps_enabled && !fetch_managed_mcps {
+            tracing::info!("Managed MCP fetch: DISABLED");
+        }
         self.spawn_initialize_launch_mcp_setup();
         self.spawn_managed_gateway_tool_catalog_fetch();
         {
@@ -500,7 +639,12 @@ impl acp::Agent for MvpAgent {
                 .auth_methods(auth_methods)
                 .meta({
                     let metadata = parse_json_object_env("GROK_AGENT_METADATA");
-                    serde_json::json!({
+                    // #131. Only set when the configured default was not seated;
+                    // a preference that was honoured — including one kept while
+                    // unready — leaves this omitted rather than sent as null.
+                    // Republished (or cleared as null) on `x.ai/models/update`
+                    // when the catalog self-corrects.
+                    let mut init_meta = serde_json::json!({
                     "grokShell": true,
                     // Re-deriving this precedence client-side has regressed OIDC
                     // refresh, so clients consume the agent's choice from here.
@@ -530,7 +674,16 @@ impl acp::Agent for MvpAgent {
                     "voiceMode": self.cfg.borrow().is_voice_mode_enabled(),
                 })
                         .as_object()
-                        .cloned()
+                        .cloned();
+                    if let Some(map) = init_meta.as_mut() {
+                        // #131: top-level response `_meta` (sibling of
+                        // `modelState`). `x.ai/models/update` carries the same
+                        // key on `SessionModelState._meta` instead — see
+                        // `ModelsManager::notify_models_updated`.
+                        self.models_manager
+                            .write_substituted_default_model_meta(map, false);
+                    }
+                    init_meta
                 }),
         )
     }
@@ -569,6 +722,21 @@ impl acp::Agent for MvpAgent {
             }
         }
         match arguments.method_id.0.as_ref() {
+            auth_method::LOCAL_NONE_METHOD_ID => {
+                // Keyless selected model: succeed without reading or storing a key.
+                self.set_auth_method(arguments.method_id.clone());
+                self.sync_process_static_api_key(None);
+                self.ensure_telemetry_client();
+                if crate::agent::chat_modes::process_chat_mode_enabled() {
+                    self.chat_modes.warm_in_background();
+                }
+                emit_login_span(true, "local_none", None, None);
+                log_event(xai_grok_telemetry::events::Login {
+                    auth_method: "local.none".to_string(),
+                    user_id: None,
+                });
+                Ok(Default::default())
+            }
             auth_method::XAI_API_KEY_METHOD_ID => {
                 if self.cfg.borrow().grok_com_config.api_key_auth_disabled() {
                     emit_login_span(false, "api_key", None, Some("disabled_by_admin"));
@@ -1005,81 +1173,366 @@ impl acp::Agent for MvpAgent {
                 .await;
             return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
-        let latched_model = self
+        if self
             .session_registry
-            .unavailable_model(&arguments.session_id);
-        if let Some(unavailable_model) = latched_model {
-            let models = self.models_manager.models();
-            let available = self.models_manager.available();
-            let restore_model_id = selectable_catalog_key_for_persisted(
+            .unavailable_model(&arguments.session_id)
+            .is_none()
+        {
+            let presentation = self.models_manager.presentation_snapshot();
+            let resident_model = handle.model_id.clone();
+            let resolved_model = crate::agent::models::resolve_catalog_key(
+                &presentation.catalog,
+                &resident_model,
+            );
+            let normalized_model = resolved_model
+                .clone()
+                .unwrap_or_else(|| resident_model.clone());
+            let resident_snapshot_is_current = self
+                .with_resident_mut(&arguments.session_id, |resident| {
+                    normalize_resident_model_if_unchanged(
+                        resident,
+                        &resident_model,
+                        &normalized_model,
+                    )
+                })
+                .unwrap_or(false);
+            if resident_snapshot_is_current {
+                let visible_model = resolved_model.as_ref().and_then(|model_id| {
+                    presentation
+                        .available
+                        .contains_key(model_id)
+                        .then(|| presentation.catalog.get(model_id.0.as_ref()))
+                        .flatten()
+                });
+                let ready = visible_model
+                    .is_some_and(|model| crate::agent::config::model_readiness(model).0);
+                if !ready {
+                    let catalog_identity = resolved_model.as_ref().and_then(|model_id| {
+                        crate::agent::models::resolve_catalog_identity(
+                            &presentation.catalog,
+                            model_id,
+                        )
+                    });
+                    self.session_registry.set_unavailable_model_with_identity(
+                        &arguments.session_id,
+                        normalized_model.clone(),
+                        catalog_identity,
+                        Some(handle.agent_name.clone()),
+                    );
+                    tracing::warn!(
+                        session_id = %arguments.session_id.0,
+                        resident_model_id = %resident_model.0,
+                        normalized_model_id = %normalized_model.0,
+                        present = resolved_model.is_some(),
+                        auth_visible = resolved_model
+                            .as_ref()
+                            .is_some_and(|model_id| presentation.available.contains_key(model_id)),
+                        "prompt: resident model became unavailable; latching before actor dispatch"
+                    );
+                }
+            }
+        }
+        let latched_recovery = self
+            .session_registry
+            .unavailable_recovery_snapshot(&arguments.session_id);
+        if let Some(recovery_snapshot) = latched_recovery {
+            let unavailable_model = recovery_snapshot.unavailable_model.clone();
+            let presentation = self.models_manager.presentation_snapshot();
+            let models = presentation.catalog;
+            let available = presentation.available;
+            let latched_identity = recovery_snapshot.catalog_identity.clone();
+            let mut reconciled_snapshot = latched_identity.as_ref().and_then(|identity| {
+                reconcile_latched_catalog_snapshot(&models, &available, identity)
+            });
+            let persisted_agent_name = recovery_snapshot.agent_name.clone();
+            if !latched_recovery_has_required_harness(
+                latched_identity.as_ref(),
+                persisted_agent_name.as_deref(),
+            ) {
+                tracing::warn!(
+                    session_id = %arguments.session_id.0,
+                    "prompt: identity-backed recovery lacks a persisted harness; keeping block"
+                );
+                reconciled_snapshot = None;
+            } else if let (Some(persisted_agent_name), Some((_, _, model))) =
+                (persisted_agent_name, reconciled_snapshot.as_ref())
+            {
+                let plugin_registry = self.plugin_registry_handle.snapshot();
+                let active_definition = {
+                    let cfg = self.cfg.borrow();
+                    Self::resolve_agent_definition_with_plugins(
+                        std::path::Path::new(&handle.info.cwd),
+                        cfg.agent_profile_path.as_deref(),
+                        &cfg.agent,
+                        None,
+                        Some(&persisted_agent_name),
+                        plugin_registry.as_deref(),
+                    )
+                };
+                let required_agent_type = model.info().agent_type.as_str();
+                let required_definition =
+                    xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                        required_agent_type,
+                        std::path::Path::new(&handle.info.cwd),
+                        plugin_registry.as_deref(),
+                    );
+                if !recovered_model_harness_is_compatible(
+                    &active_definition,
+                    model,
+                    required_definition.as_ref(),
+                ) {
+                    tracing::warn!(
+                        session_id = %arguments.session_id.0,
+                        persisted_agent_name,
+                        required_agent_type,
+                        "prompt: recovered model requires an incompatible persisted harness; keeping block"
+                    );
+                    reconciled_snapshot = None;
+                }
+            }
+            let resolution = if latched_identity.is_some() {
+                reconciled_snapshot
+                    .as_ref()
+                    .map(|(model_id, _, _)| {
+                        crate::agent::models::PersistedCatalogKeyResolution::Resolved(
+                            model_id.clone(),
+                        )
+                    })
+                    .unwrap_or(crate::agent::models::PersistedCatalogKeyResolution::Missing)
+            } else {
+                crate::agent::models::selectable_catalog_resolution_for_persisted(
                     &models,
                     &available,
                     &unavailable_model,
                 )
-                .unwrap_or(unavailable_model.clone());
-            if available.contains_key(&restore_model_id) {
-                tracing::info!(
-                    session_id = %arguments.session_id.0,
-                    model_id = %restore_model_id.0,
-                    "prompt: previously-unavailable model is back in the catalog; restoring it and unblocking the session"
-                );
-                xai_grok_telemetry::unified_log::info(
-                    "prompt: previously-unavailable model recovered, unblocking session",
-                    Some(arguments.session_id.0.as_ref()),
-                    Some(
-                        serde_json::json!({
-                        "model_id": restore_model_id.0.as_ref(),
-                    }),
-                    ),
-                );
-                self.session_registry.take_unavailable_model(&arguments.session_id);
-                if let Err(e) = crate::agent::handlers::model_switch::apply(
-                        self,
-                        acp::SetSessionModelRequest::new(
-                            arguments.session_id.clone(),
-                            restore_model_id.clone(),
-                        ),
-                    )
-                    .await
-                {
-                    tracing::warn!(
+            };
+            match resolution {
+                crate::agent::models::PersistedCatalogKeyResolution::Resolved(restore_model_id) => {
+                    let restore_ready = reconciled_snapshot
+                        .as_ref()
+                        .map(|(_, _, model)| crate::agent::config::model_readiness(model).0)
+                        .unwrap_or_else(|| {
+                            self.resolve_model_id(&restore_model_id)
+                                .ok()
+                                .is_some_and(|m| crate::agent::config::model_readiness(&m).0)
+                        });
+                    if !restore_ready {
+                        tracing::warn!(
+                            session_id = %arguments.session_id.0,
+                            model_id = %restore_model_id.0,
+                            "prompt: previously-unavailable model is back but still not ready; keeping block"
+                        );
+                        self.send_model_auto_switched(
+                                &arguments.session_id,
+                                &acp::ModelId::new(String::new()),
+                                &acp::ModelId::new(String::new()),
+                                "Your previous model is still not ready (missing credentials or invalid auth_scheme).",
+                            )
+                            .await;
+                        return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                    }
+                    tracing::info!(
                         session_id = %arguments.session_id.0,
                         model_id = %restore_model_id.0,
-                        error = ?e,
-                        "prompt: failed to restore previously-unavailable model; continuing with the session's current model"
+                        "prompt: previously-unavailable model is back in the catalog; attempting recovery"
                     );
-                }
-            } else {
-                tracing::warn!(
-                    session_id = %arguments.session_id.0,
-                    unavailable_model = %unavailable_model.0,
-                    available_count = available.len(),
-                    available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
-                    "prompt blocked: session model unavailable since load and still missing from the catalog"
-                );
-                xai_grok_telemetry::unified_log::warn(
-                    "prompt blocked: model unavailable",
-                    Some(arguments.session_id.0.as_ref()),
-                    Some(
-                        serde_json::json!({
-                        "unavailable_model": unavailable_model.0.as_ref(),
-                        "available_count": available.len(),
-                    }),
-                    ),
-                );
-                self.send_model_auto_switched(
+                    let request = acp::SetSessionModelRequest::new(
+                        arguments.session_id.clone(),
+                        restore_model_id.clone(),
+                    );
+                    #[cfg(test)]
+                    run_prompt_recovery_boundary_hook(
                         &arguments.session_id,
-                        &acp::ModelId::new(String::new()),
-                        &acp::ModelId::new(String::new()),
-                        "Your previous model is no longer available and could not \
-                     be switched to a compatible model. Please start a new session.",
+                        &restore_model_id,
+                    );
+                    let restored_model = reconciled_snapshot
+                        .map(|(_, identity, model)| (identity, model));
+                    match crate::agent::handlers::model_switch::apply_recovery(
+                        self,
+                        request,
+                        recovery_snapshot,
+                        restored_model,
                     )
-                    .await;
-                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                    .await
+                    {
+                        Ok(Some(_)) => {
+                            tracing::info!(
+                                session_id = %arguments.session_id.0,
+                                model_id = %restore_model_id.0,
+                                "prompt: restored previously-unavailable model and unblocked the session"
+                            );
+                            xai_grok_telemetry::unified_log::info(
+                                "prompt: previously-unavailable model recovered, unblocking session",
+                                Some(arguments.session_id.0.as_ref()),
+                                Some(serde_json::json!({
+                                    "model_id": restore_model_id.0.as_ref(),
+                                })),
+                            );
+                        }
+                        Ok(None) => {
+                            tracing::info!(
+                                session_id = %arguments.session_id.0,
+                                model_id = %restore_model_id.0,
+                                "prompt: stale unavailable-model recovery was superseded"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %arguments.session_id.0,
+                                model_id = %restore_model_id.0,
+                                error = ?e,
+                                "prompt: failed to restore previously-unavailable model; keeping block"
+                            );
+                            self.send_model_auto_switched(
+                                &arguments.session_id,
+                                &acp::ModelId::new(String::new()),
+                                &acp::ModelId::new(String::new()),
+                                "Could not restore your previous model; prompts stay blocked until a successful switch.",
+                            )
+                            .await;
+                            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                        }
+                    }
+                }
+                crate::agent::models::PersistedCatalogKeyResolution::AmbiguousSlug {
+                    matches,
+                    ..
+                } => {
+                    let options = matches
+                        .iter()
+                        .map(|id| id.0.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tracing::warn!(
+                        session_id = %arguments.session_id.0,
+                        unavailable_model = %unavailable_model.0,
+                        matching_catalog_ids = ?matches.iter().map(|id| id.0.as_ref()).collect::<Vec<_>>(),
+                        "prompt blocked: persisted legacy model slug is ambiguous"
+                    );
+                    self.send_model_auto_switched(
+                            &arguments.session_id,
+                            &acp::ModelId::new(String::new()),
+                            &acp::ModelId::new(String::new()),
+                            &format!(
+                                "Your previous model slug \"{}\" matches multiple configured models ({}). \
+                                 Use /model with one of those catalog IDs to continue.",
+                                unavailable_model.0, options
+                            ),
+                        )
+                        .await;
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                }
+                crate::agent::models::PersistedCatalogKeyResolution::Missing => {
+                    let auth_hidden = crate::agent::models::resolve_catalog_key(
+                        &models,
+                        &unavailable_model,
+                    )
+                    .is_some();
+                    let user_notice = if auth_hidden {
+                        "Your session model is not available for the current authentication mode. Sign in with the required account or choose another visible model."
+                    } else {
+                        "Your previous model is no longer available and could not be switched to a compatible model. Please start a new session."
+                    };
+                    tracing::warn!(
+                        session_id = %arguments.session_id.0,
+                        unavailable_model = %unavailable_model.0,
+                        auth_hidden,
+                        available_count = available.len(),
+                        available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
+                        "prompt blocked: resident model is absent from the auth-visible catalog"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "prompt blocked: model unavailable",
+                        Some(arguments.session_id.0.as_ref()),
+                        Some(
+                            serde_json::json!({
+                            "unavailable_model": unavailable_model.0.as_ref(),
+                            "available_count": available.len(),
+                        }),
+                        ),
+                    );
+                    self.send_model_auto_switched(
+                            &arguments.session_id,
+                            &acp::ModelId::new(String::new()),
+                            &acp::ModelId::new(String::new()),
+                            user_notice,
+                        )
+                        .await;
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                }
             }
         }
         let dispatch_lock = self.dispatch_lock(&arguments.session_id);
         let dispatch_guard = dispatch_lock.lock().await;
+        #[cfg(test)]
+        run_prompt_dispatch_boundary_hook(&arguments.session_id);
+        if self.session_load_in_flight(&arguments.session_id) {
+            tracing::warn!(
+                session_id = %arguments.session_id.0,
+                "prompt: session load started before serialized dispatch"
+            );
+            drop(dispatch_guard);
+            self.send_model_auto_switched(
+                &arguments.session_id,
+                &acp::ModelId::new(String::new()),
+                &acp::ModelId::new(String::new()),
+                "This session is still restoring; retry the prompt after restoration completes.",
+            )
+            .await;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        if let Some(blocked_model) = self
+            .session_registry
+            .unavailable_model(&arguments.session_id)
+        {
+            tracing::warn!(
+                session_id = %arguments.session_id.0,
+                unavailable_model = %blocked_model.0,
+                "prompt: unavailable-model block is still current after serialized recovery"
+            );
+            drop(dispatch_guard);
+            self.send_model_auto_switched(
+                &arguments.session_id,
+                &acp::ModelId::new(String::new()),
+                &acp::ModelId::new(String::new()),
+                "Your session model is still unavailable; choose a ready model or restore its credentials.",
+            )
+            .await;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        // A model switch may have completed while this prompt waited for the
+        // dispatch lock. Re-read the resident under serialization and capture
+        // auth/catalog authority before sending any actor command.
+        let handle = self
+            .resident_handle(&arguments.session_id)
+            .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
+        let prompt_dispatch_authority = match self
+            .models_manager
+            .model_dispatch_authority(&handle.model_id)
+        {
+            Ok(authority) => authority,
+            Err(reason) => {
+                let catalog_identity = crate::agent::models::resolve_catalog_identity(
+                    &self.models_manager.models(),
+                    &handle.model_id,
+                );
+                self.session_registry.set_unavailable_model_with_identity(
+                    &arguments.session_id,
+                    handle.model_id.clone(),
+                    catalog_identity,
+                    Some(handle.agent_name.clone()),
+                );
+                drop(dispatch_guard);
+                self.send_model_auto_switched(
+                    &arguments.session_id,
+                    &acp::ModelId::new(String::new()),
+                    &acp::ModelId::new(String::new()),
+                    &format!("Prompt blocked because the resident model is unavailable: {reason}"),
+                )
+                .await;
+                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+            }
+        };
         let meta_prompt_mode = arguments
             .meta
             .as_ref()
@@ -1187,7 +1640,6 @@ impl acp::Agent for MvpAgent {
                     .session_handle
                     .reasoning_effort
                     .map(|e| e.as_str().to_string()),
-                experiment_id: None,
                 host_os: std::env::consts::OS.to_string(),
                 host_arch: std::env::consts::ARCH.to_string(),
                 prompt_has_image: Some(!prompt_images.is_empty()),
@@ -1297,9 +1749,41 @@ impl acp::Agent for MvpAgent {
                 }
             }
         };
-        handle
-            .cmd_tx
-            .send(SessionCommand::Prompt {
+        if self.session_load_in_flight(&arguments.session_id) {
+            tracing::warn!(
+                session_id = %arguments.session_id.0,
+                "prompt: session load started during prompt preparation"
+            );
+            drop(dispatch_guard);
+            self.send_model_auto_switched(
+                &arguments.session_id,
+                &acp::ModelId::new(String::new()),
+                &acp::ModelId::new(String::new()),
+                "This session began restoring while the prompt was prepared; retry after restoration completes.",
+            )
+            .await;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        if let Some(blocked_model) = self
+            .session_registry
+            .unavailable_model(&arguments.session_id)
+        {
+            tracing::warn!(
+                session_id = %arguments.session_id.0,
+                unavailable_model = %blocked_model.0,
+                "prompt: unavailable-model block changed during prompt preparation"
+            );
+            drop(dispatch_guard);
+            self.send_model_auto_switched(
+                &arguments.session_id,
+                &acp::ModelId::new(String::new()),
+                &acp::ModelId::new(String::new()),
+                "Your session model became unavailable while preparing this prompt; choose a ready model or restore its credentials.",
+            )
+            .await;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        let prompt_command = SessionCommand::Prompt {
                 prompt_id: prompt_id.clone(),
                 prompt_blocks: arguments.prompt.clone(),
                 prompt_mode,
@@ -1317,11 +1801,36 @@ impl acp::Agent for MvpAgent {
                 respond_to: tx,
                 persist_ack: None,
                 parsed_prompt_tx,
-            })
-            .map_err(|e| {
-                acp::Error::internal_error()
-                    .data(format!("failed to dispatch prompt to session: {e}"))
-            })?;
+            };
+        let prompt_dispatch = self
+            .models_manager
+            .commit_model_dispatch(&prompt_dispatch_authority, || {
+                handle.cmd_tx.send(prompt_command).map_err(|_| ())
+            });
+        match prompt_dispatch {
+            Ok(Ok(())) => {}
+            Ok(Err(())) => {
+                return Err(acp::Error::internal_error()
+                    .data("failed to dispatch prompt: session actor closed"));
+            }
+            Err(reason) => {
+                self.session_registry.set_unavailable_model_with_identity(
+                    &arguments.session_id,
+                    handle.model_id.clone(),
+                    Some(prompt_dispatch_authority.catalog_identity.clone()),
+                    Some(handle.agent_name.clone()),
+                );
+                drop(dispatch_guard);
+                self.send_model_auto_switched(
+                    &arguments.session_id,
+                    &acp::ModelId::new(String::new()),
+                    &acp::ModelId::new(String::new()),
+                    &format!("Prompt blocked because model authorization changed: {reason}"),
+                )
+                .await;
+                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+            }
+        }
         drop(dispatch_guard);
         self.push_roster_activity_delta(
             &arguments.session_id,
@@ -2154,33 +2663,20 @@ impl acp::Agent for MvpAgent {
         &self,
         args: acp::SetSessionModelRequest,
     ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-        let model = match self.resolve_model_id(&args.model_id) {
-            Ok(model) => model,
-            Err(_) => {
-                self.models_manager.wait_for_first_catalog().await;
-                self.resolve_model_id(&args.model_id)?
-            }
-        };
-        if !model.info.user_selectable {
-            return Err(
-                acp::Error::invalid_params()
-                    .data("This model isn't allowed by your allowed_models setting."),
+        // Own failure telemetry until the public ACP validation gates pass.
+        // `apply` creates the actor-phase guard after this handoff, so every
+        // rejection emits exactly once without misclassifying validation as a
+        // harness rebuild failure.
+        let mut validation_failure_telemetry =
+            crate::agent::handlers::model_switch::FailureTelemetry::new(
+                &args.session_id,
+                &args.model_id,
             );
-        }
-        let session_id = args.session_id.clone();
-        let res = crate::agent::handlers::model_switch::apply(self, args).await;
-        if res.is_ok()
-            && let Some(unavailable) = self
-                .session_registry
-                .take_unavailable_model(&session_id)
-        {
-            tracing::info!(
-                session_id = %session_id.0,
-                previously_unavailable_model = %unavailable.0,
-                "set_session_model: user model switch cleared the model-unavailable block"
-            );
-        }
-        res
+        // Authorization is deliberately deferred to `apply`, after it owns
+        // the session dispatch lock. A picker snapshot here would race auth,
+        // allowlist, and catalog mutation before actor dispatch.
+        validation_failure_telemetry.disarm();
+        crate::agent::handlers::model_switch::apply(self, args).await
     }
     #[tracing::instrument(
         name = "agent.ext_method",
@@ -2211,9 +2707,6 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/workspaces/list" => {
                 crate::agent::handlers::workspaces::handle(self, &args).await
-            }
-            "x.ai/models/list" => {
-                crate::agent::handlers::models::handle(self, &args).await
             }
             "x.ai/session/updates" => {
                 crate::extensions::session_updates::handle(&args, &self.gateway).await
@@ -2267,7 +2760,10 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    &crate::auth::with_login_instruction(
+                        |prog| format!("Run `{prog} login` to authenticate."),
+                        "Sign in again to authenticate.",
+                    ),
                 )?;
                 let params: serde_json::Value = serde_json::from_str(args.params.get())
                     .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
@@ -2299,7 +2795,10 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    &crate::auth::with_login_instruction(
+                        |prog| format!("Run `{prog} login` to authenticate."),
+                        "Sign in again to authenticate.",
+                    ),
                 )?;
                 let sandbox_client = crate::remote::SandboxClient::new(
                     self.cli_chat_proxy_base_url(),
@@ -2324,7 +2823,10 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    &crate::auth::with_login_instruction(
+                        |prog| format!("Run `{prog} login` to authenticate."),
+                        "Sign in again to authenticate.",
+                    ),
                 )?;
                 let params: serde_json::Value = serde_json::from_str(args.params.get())
                     .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
@@ -2381,7 +2883,10 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    &crate::auth::with_login_instruction(
+                        |prog| format!("Run `{prog} login` to authenticate."),
+                        "Sign in again to authenticate.",
+                    ),
                 )?;
                 let params: serde_json::Value = serde_json::from_str(args.params.get())
                     .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
@@ -2441,7 +2946,10 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    &crate::auth::with_login_instruction(
+                        |prog| format!("Run `{prog} login` to authenticate."),
+                        "Sign in again to authenticate.",
+                    ),
                 )?;
                 let params: serde_json::Value = serde_json::from_str(args.params.get())
                     .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;

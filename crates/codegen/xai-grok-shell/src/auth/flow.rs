@@ -512,6 +512,16 @@ fn failure_kind(transport: TransportFailureKind, is_decode: bool) -> LoginFailur
     }
 }
 
+/// Returns the configured external provider only when it names an executable
+/// action. Keeping this projection at the flow boundary prevents an empty or
+/// whitespace-only value from acquiring provider authority.
+fn external_auth_provider_command(config: &GrokComConfig) -> Option<&str> {
+    config
+        .auth_provider_command
+        .as_deref()
+        .filter(|command| super::has_nonblank_auth_provider_command(Some(command)))
+}
+
 async fn run_auth_flow_steps(
     auth_manager: &Arc<AuthManager>,
     grok_com_config: &GrokComConfig,
@@ -525,7 +535,7 @@ async fn run_auth_flow_steps(
     tracing::info!(
         has_oidc = grok_com_config.oidc.is_some(),
         has_oauth2 = grok_com_config.oauth2.is_some(),
-        has_external_auth = grok_com_config.auth_provider_command.is_some(),
+        has_external_auth = external_auth_provider_command(grok_com_config).is_some(),
         reauth,
         "auth: starting auth flow"
     );
@@ -636,7 +646,7 @@ async fn run_auth_flow_steps(
         }
     }
 
-    if let Some(ref cmd) = grok_com_config.auth_provider_command {
+    if let Some(cmd) = external_auth_provider_command(grok_com_config) {
         let over_stale_credential = reauth || auth_manager.is_expired();
         match run_external_auth_provider(cmd, auth_manager, over_stale_credential, on_stderr).await
         {
@@ -831,7 +841,7 @@ pub(crate) async fn mint_session_noninteractive(
         return None;
     }
 
-    if let Some(cmd) = grok_com_config.auth_provider_command.as_deref() {
+    if let Some(cmd) = external_auth_provider_command(grok_com_config) {
         match run_external_auth_provider(cmd, auth_manager, false, None).await {
             Ok((auth, _)) => return Some(auth),
             Err(e) => {
@@ -1177,6 +1187,27 @@ mod tests {
     use crate::auth::config::XAI_OAUTH2_ISSUER;
     use crate::env::EnvVarGuard;
     use chrono::Utc;
+
+    #[test]
+    fn blank_external_provider_never_reaches_the_execution_path() {
+        for command in [None, Some(""), Some(" \t\n")] {
+            let config = GrokComConfig {
+                auth_provider_command: command.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(
+                external_auth_provider_command(&config),
+                None,
+                "missing or blank command must not be returned to an execution call site: {command:?}"
+            );
+        }
+
+        let config = GrokComConfig {
+            auth_provider_command: Some("acme-auth".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(external_auth_provider_command(&config), Some("acme-auth"));
+    }
 
     /// `os_error` and the reqwest classification are covered in
     /// `xai-grok-http`; what's local is which `LoginFailureKind` each maps to,

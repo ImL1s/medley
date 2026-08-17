@@ -105,6 +105,9 @@ pub(crate) static TASK_COMPLETED: LazyLock<String> = LazyLock::new(|| {
     })
 });
 
+pub(crate) static AVAILABLE_COMMANDS_UPDATE_PREFIX: LazyLock<String> =
+    LazyLock::new(|| format!(r#"{{"sessionUpdate":"{}""#, *AVAILABLE_COMMANDS_UPDATE));
+
 /// The `"sessionUpdate":"user_message_chunk"` key/value pair as serialized (no
 /// leading `{`). Built from [`USER_MESSAGE_CHUNK`] so the literal isn't hand-
 /// maintained; the quoted key means it can't false-match the bare discriminant

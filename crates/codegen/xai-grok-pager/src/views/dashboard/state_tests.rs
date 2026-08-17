@@ -4184,7 +4184,7 @@ fn slash_model_dropdown_click_selects_model_not_session_row() {
         acp::ModelId::new("alpha-model"),
         acp::ModelInfo::new(acp::ModelId::new("alpha-model"), "Alpha Model"),
     );
-    state.models.update_catalog(available);
+    state.models.update_catalog(available, None);
     state.models.set_current(model_id, None);
     // Mirror how the real dashboard types into the dispatch box:
     // caret at end so `/model ` is in the args phase.
@@ -4253,7 +4253,7 @@ fn slash_dropdown_mouse_move_sets_hover() {
         model_id.clone(),
         acp::ModelInfo::new(model_id.clone(), "Hover Model"),
     );
-    state.models.update_catalog(available);
+    state.models.update_catalog(available, None);
     state.models.set_current(model_id, None);
     state.dispatch.set_text("/model ");
     let end = state.dispatch.text().len();

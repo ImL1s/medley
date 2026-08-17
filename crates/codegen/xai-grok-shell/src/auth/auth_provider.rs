@@ -839,7 +839,11 @@ impl AuthProviderRef {
             return None;
         }
         if let Some(manager) = &self.native_codex {
-            let auth = manager.current()?;
+            // Native Codex credentials can remain durably present after a
+            // provider rejection when strict removal fails.  Every wire-facing
+            // snapshot must honor the manager's key-scoped suppression verdict
+            // rather than exporting that retained bearer through this cache.
+            let auth = manager.current_wire_valid()?;
             return Some(ProviderCredentialSnapshot {
                 access_token: auth.key,
                 expires_at: auth.expires_at,
@@ -935,9 +939,13 @@ impl AuthProviderRef {
     /// bypasses).
     pub(crate) async fn recover_rejected_token(&self, rejected_key: &str) -> Option<String> {
         if let Some(manager) = &self.native_codex {
+            // A hard-expired or suppressed bearer can still carry the refresh
+            // authority needed to rotate the exact request credential.  It is
+            // never itself a valid replacement for a request sent with another
+            // key, so that adoption branch uses the suppression-aware view.
             let current = manager.current_or_expired()?;
             if current.key != rejected_key {
-                return Some(current.key);
+                return manager.current_wire_valid().map(|auth| auth.key);
             }
             let token_type = crate::auth::token_type::TokenType::from_auth(Some(&current));
             return manager

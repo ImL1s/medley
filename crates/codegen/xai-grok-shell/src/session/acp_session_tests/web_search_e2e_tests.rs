@@ -67,6 +67,7 @@ async fn web_search_uses_model_override_from_config_end_to_end() {
         None,
         None,
         None,
+        &Default::default(),
     );
     let web_search_sampling = crate::tools::config::web_search_sampling_config(resolved);
 

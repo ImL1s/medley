@@ -133,6 +133,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     nudges_used_this_session: 0,
                 }),
                 notifications: NotificationSender {
+                    persistence_is_noop: true,
                     gateway: GatewaySender::new(gateway_tx),
                     gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                     persistence_tx: persistence.tx.clone(),
@@ -156,6 +157,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
+        catalog_model_id: std::cell::Cell::new(String::new()),
+        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 compactions_remaining: std::cell::Cell::new(None),
@@ -184,6 +187,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+                    configured_storage: None,
                     storage: std::cell::RefCell::new(None),
                     save_on_end: true,
                     backend_params: None,
@@ -266,6 +270,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
+                managed_mcp_expires_at: std::sync::Mutex::new(None),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
                 mcp_announced_servers: Mutex::new(HashMap::new()),
@@ -307,7 +312,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-                image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+                image_description_model: std::cell::RefCell::new(crate::test_support::TEST_MODEL.to_owned()),
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
@@ -622,6 +627,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     nudges_used_this_session: 0,
                 }),
                 notifications: NotificationSender {
+                    persistence_is_noop: true,
                     gateway: GatewaySender::new(gateway_tx),
                     gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                     persistence_tx: persistence.tx.clone(),
@@ -645,6 +651,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
+        catalog_model_id: std::cell::Cell::new(String::new()),
+        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 compactions_remaining: std::cell::Cell::new(None),
@@ -673,6 +681,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+                    configured_storage: Some(memory_storage.clone()),
                     storage: std::cell::RefCell::new(Some(memory_storage)),
                     save_on_end: true,
                     backend_params: Some(memory_backend_params),
@@ -758,6 +767,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
+                managed_mcp_expires_at: std::sync::Mutex::new(None),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
                 mcp_announced_servers: Mutex::new(HashMap::new()),
@@ -799,7 +809,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-                image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+                image_description_model: std::cell::RefCell::new(crate::test_support::TEST_MODEL.to_owned()),
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
@@ -909,6 +919,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 is_chat_kind: false,
                 state,
                 notifications: NotificationSender {
+                    persistence_is_noop: true,
                     gateway: GatewaySender::new(gateway_tx),
                     gateway_enabled: std::sync::Arc::new(
                         std::sync::atomic::AtomicBool::new(true),
@@ -938,6 +949,8 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
+        catalog_model_id: std::cell::Cell::new(String::new()),
+        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(
                     arc_swap::ArcSwapOption::empty(),
@@ -970,6 +983,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+                    configured_storage: None,
                     storage: std::cell::RefCell::new(None),
                     save_on_end: true,
                     backend_params: None,
@@ -1061,6 +1075,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
+                managed_mcp_expires_at: std::sync::Mutex::new(None),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
@@ -1112,7 +1127,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-                image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+                image_description_model: std::cell::RefCell::new(crate::test_support::TEST_MODEL.to_owned()),
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
@@ -2047,8 +2062,7 @@ async fn assert_stop_trigger_arms_wake_barrier(trigger: &str) {
                     user_initiated: true,
                     ..Default::default()
                 })
-                .await
-                .barrier;
+                .await;
             assert_eq!(
                 barrier,
                 super::tasks_cancel::WakeBarrier::Armed,
@@ -2165,8 +2179,7 @@ async fn non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier() {
                         user_initiated: true,
                         ..Default::default()
                     })
-                    .await
-                    .barrier;
+                    .await;
                 assert_eq!(
                     barrier,
                     super::tasks_cancel::WakeBarrier::Clear,
@@ -2444,6 +2457,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 is_chat_kind: false,
                 state,
                 notifications: NotificationSender {
+                    persistence_is_noop: true,
                     gateway: GatewaySender::new(gateway_tx),
                     gateway_enabled: std::sync::Arc::new(
                         std::sync::atomic::AtomicBool::new(true),
@@ -2473,6 +2487,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
+        catalog_model_id: std::cell::Cell::new(String::new()),
+        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(
                     arc_swap::ArcSwapOption::empty(),
@@ -2505,6 +2521,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+                    configured_storage: None,
                     storage: std::cell::RefCell::new(None),
                     save_on_end: true,
                     backend_params: None,
@@ -2596,6 +2613,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
+                managed_mcp_expires_at: std::sync::Mutex::new(None),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
@@ -2647,7 +2665,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: sampler_handle.clone(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-                image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+                image_description_model: std::cell::RefCell::new(crate::test_support::TEST_MODEL.to_owned()),
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),

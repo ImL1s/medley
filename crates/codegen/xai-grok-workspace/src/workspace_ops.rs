@@ -1390,6 +1390,66 @@ impl WorkspaceOp for WorktreeDbStatsReq {
 ///
 /// - **`Proxy`** — wraps a [`WorkspaceClient`] connected to a remote hub.
 ///   Everything routes through hub WebSocket to a remote workspace server.
+#[must_use = "dropping a local session reservation cancels it"]
+pub struct LocalSessionReservation {
+    local: Option<crate::handle::WorkspaceLocalSessionReservation>,
+}
+
+impl std::fmt::Debug for LocalSessionReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalSessionReservation")
+            .field("local", &self.local.is_some())
+            .finish()
+    }
+}
+
+impl LocalSessionReservation {
+    /// Build and publish the reserved local workspace session.
+    ///
+    /// Promotion rechecks workspace drain state while holding the session-map
+    /// write lock, closing the last-session-evict race after reservation.
+    /// Proxy-mode reservations remain no-ops.
+    pub fn commit(
+        self,
+        cwd: std::path::PathBuf,
+        hunk_tracker: xai_hunk_tracker::HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+    ) -> WorkspaceResult<()> {
+        let Some(local) = self.local else {
+            return Ok(());
+        };
+        let capability_mode = toolset.capability_policy().mode().into();
+        local.promote_with_external_toolset(cwd, hunk_tracker, toolset, capability_mode)
+    }
+
+    /// Run the final persistence step and publish the reserved local session in
+    /// one session-map critical section. The callback is not invoked after a
+    /// terminal workspace drain starts, and a callback error cancels the
+    /// reservation without exposing a live workspace session.
+    ///
+    /// The callback runs while the workspace session-map write lock is held and
+    /// therefore must not call workspace session lookup or mutation APIs.
+    pub fn commit_after(
+        self,
+        cwd: std::path::PathBuf,
+        hunk_tracker: xai_hunk_tracker::HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+        before_publish: impl FnOnce() -> WorkspaceResult<()>,
+    ) -> WorkspaceResult<()> {
+        let Some(local) = self.local else {
+            return before_publish();
+        };
+        let capability_mode = toolset.capability_policy().mode().into();
+        local.promote_with_external_toolset_after(
+            cwd,
+            hunk_tracker,
+            toolset,
+            capability_mode,
+            before_publish,
+        )
+    }
+}
+
 #[derive(Clone)]
 pub enum WorkspaceOps {
     /// Local in-process mode — extensions through the handle, tool calls
@@ -1483,6 +1543,22 @@ impl WorkspaceOps {
         session.replace(session.effective_tool_config(), toolset);
         Ok(())
     }
+    /// Reserve a new local session identity without exposing it through the
+    /// workspace's live-session APIs.
+    ///
+    /// A local collision (including another unpublished reservation) fails
+    /// closed and preserves the current owner. Dropping the returned value
+    /// silently cancels the claim. Proxy mode returns a no-op reservation.
+    pub fn reserve_new_local_session(
+        &self,
+        session_id: &str,
+    ) -> WorkspaceResult<LocalSessionReservation> {
+        let local = match self {
+            Self::Local { handle } => Some(handle.reserve_new_local_session(session_id)?),
+            Self::Proxy { .. } => None,
+        };
+        Ok(LocalSessionReservation { local })
+    }
     /// Release the workspace session. No-op in proxy mode.
     pub fn end_local_session(&self, session_id: &str) {
         let Self::Local { handle } = self else {
@@ -1490,7 +1566,7 @@ impl WorkspaceOps {
         };
         handle.on_session_ended(session_id);
         if let Err(e) = handle.drop_session(session_id, session_id) {
-            tracing::debug!(%session_id, error = %e, "end_local_session: drop_session failed (expected if never bound)");
+            tracing::debug!(error = %e, "end_local_session: drop_session failed (expected if never bound)");
         }
     }
     pub async fn on_before_turn(
@@ -1990,6 +2066,216 @@ mod tests {
             "end_local_session must drop the toolset (no leaked holder)"
         );
     }
+    #[tokio::test]
+    async fn local_session_reservation_is_invisible_exclusive_and_atomic() {
+        let ops = WorkspaceOps::for_test();
+        let WorkspaceOps::Local { handle } = &ops else {
+            unreachable!("for_test builds a local handle");
+        };
+        let existing_sid = "existing-owner";
+        let existing = handle
+            .create_session(existing_sid)
+            .expect("existing owner should be created");
+        let collision = ops
+            .reserve_new_local_session(existing_sid)
+            .expect_err("a live session identity cannot be reserved");
+        assert!(matches!(
+            collision,
+            crate::error::WorkspaceError::SessionAlreadyExists(ref id) if id == existing_sid
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &handle.session(existing_sid).expect("owner remains live"),
+            &existing
+        ));
+
+        let sid = "reserved-new-bind";
+        let cwd = handle.root_cwd().unwrap();
+        let baseline_count = handle.session_count();
+        let reservation = ops
+            .reserve_new_local_session(sid)
+            .expect("new identity should be reserved");
+        assert!(handle.session(sid).is_none());
+        assert!(!handle.session_ids().iter().any(|id| id == sid));
+        assert_eq!(handle.session_count(), baseline_count);
+
+        let duplicate = ops
+            .reserve_new_local_session(sid)
+            .expect_err("a second reservation must lose");
+        assert!(matches!(
+            duplicate,
+            crate::error::WorkspaceError::SessionAlreadyExists(ref id) if id == sid
+        ));
+        let ordinary_creator = handle
+            .create_session(sid)
+            .expect_err("ordinary creators must also respect reservations");
+        assert!(matches!(
+            ordinary_creator,
+            crate::error::WorkspaceError::SessionAlreadyExists(ref id) if id == sid
+        ));
+        assert!(handle.session(sid).is_none());
+
+        drop(reservation);
+        assert!(handle.session(sid).is_none());
+        assert_eq!(handle.session_count(), baseline_count);
+
+        let reservation = ops
+            .reserve_new_local_session(sid)
+            .expect("cancelled claim should be reusable");
+        let toolset = std::sync::Arc::new(
+            xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
+        );
+        reservation
+            .commit(
+                cwd.clone(),
+                xai_hunk_tracker::HunkTrackerHandle::noop(),
+                toolset.clone(),
+            )
+            .expect("commit should publish while the workspace is live");
+        let committed = handle.session(sid).expect("commit publishes the session");
+        assert!(handle.session_ids().iter().any(|id| id == sid));
+        assert_eq!(handle.session_count(), baseline_count + 1);
+        assert!(std::sync::Arc::ptr_eq(&committed.toolset(), &toolset));
+        assert!(std::sync::Arc::ptr_eq(
+            &handle.session(existing_sid).expect("owner remains live"),
+            &existing
+        ));
+    }
+    #[tokio::test]
+    async fn local_session_reservation_cannot_promote_after_last_session_starts_drain() {
+        let ops = WorkspaceOps::for_test();
+        let WorkspaceOps::Local { handle } = &ops else {
+            unreachable!("for_test builds a local handle");
+        };
+        let existing_sid = "last-live-session";
+        handle
+            .create_session(existing_sid)
+            .expect("last live session should be created");
+        let reserved_sid = "reserved-during-evict";
+        let reservation = ops
+            .reserve_new_local_session(reserved_sid)
+            .expect("reservation should precede the drain");
+
+        // Hold the exact lock used by the hub's last-session evict critical
+        // section. The test-only callback signals at the immediate pre-lock
+        // boundary, so the promoter cannot decide until eviction has removed
+        // the final live session and latched draining.
+        let mut sessions = handle.shared.sessions.write();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let cwd = handle.root_cwd().unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        let local = reservation.local.expect("local reservation");
+        let toolset = std::sync::Arc::new(
+            xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
+        );
+        let capability = toolset.capability_policy().mode().into();
+        let promoter = std::thread::spawn(move || {
+            let _runtime_guard = runtime.enter();
+            local.promote_with_external_toolset_after_lock_attempt_for_test(
+                cwd,
+                xai_hunk_tracker::HunkTrackerHandle::noop(),
+                toolset,
+                capability,
+                || attempted_tx.send(()).unwrap(),
+            )
+        });
+        attempted_rx
+            .recv()
+            .expect("promoter should reach the locked critical section");
+        assert!(sessions.remove(existing_sid).is_some());
+        assert!(sessions.is_empty());
+        handle.shared.activity_tracker.set_draining();
+        drop(sessions);
+
+        let error = promoter
+            .join()
+            .expect("promoter thread should not panic")
+            .expect_err("promotion must fail once the workspace starts draining");
+        assert!(matches!(error, crate::error::WorkspaceError::ShuttingDown));
+        assert!(handle.session(reserved_sid).is_none());
+        assert!(handle.session_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_session_reservation_runs_finalizer_before_atomic_promotion() {
+        let ops = WorkspaceOps::for_test();
+        let WorkspaceOps::Local { handle } = &ops else {
+            unreachable!("for_test builds a local handle");
+        };
+        let sid = "reserved-finalizer";
+        let cwd = handle.root_cwd().unwrap();
+
+        let reservation = ops
+            .reserve_new_local_session(sid)
+            .expect("identity should be reservable");
+        let error = reservation
+            .commit_after(
+                cwd.clone(),
+                xai_hunk_tracker::HunkTrackerHandle::noop(),
+                std::sync::Arc::new(
+                    xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
+                ),
+                || Err(crate::error::WorkspaceError::Finalize("injected".into())),
+            )
+            .expect_err("failed finalization must cancel promotion");
+        assert!(matches!(error, crate::error::WorkspaceError::Finalize(_)));
+        assert!(handle.session(sid).is_none());
+
+        let finalizer_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = finalizer_ran.clone();
+        ops.reserve_new_local_session(sid)
+            .expect("failed finalization must release the identity")
+            .commit_after(
+                cwd,
+                xai_hunk_tracker::HunkTrackerHandle::noop(),
+                std::sync::Arc::new(
+                    xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
+                ),
+                || {
+                    // `commit_after` deliberately invokes this callback while
+                    // holding the session-map write lock. Re-entering through
+                    // `handle.session` here would deadlock on its read lock.
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .expect("successful finalization should promote");
+        assert!(finalizer_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(handle.session(sid).is_some());
+    }
+
+    #[tokio::test]
+    async fn local_session_reservation_releases_identity_when_finalizer_panics() {
+        let ops = WorkspaceOps::for_test();
+        let WorkspaceOps::Local { handle } = &ops else {
+            unreachable!("for_test builds a local handle");
+        };
+        let sid = "reserved-panicking-finalizer";
+        let cwd = handle.root_cwd().unwrap();
+        let reservation = ops
+            .reserve_new_local_session(sid)
+            .expect("identity should be reservable");
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = reservation.commit_after(
+                cwd,
+                xai_hunk_tracker::HunkTrackerHandle::noop(),
+                std::sync::Arc::new(
+                    xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
+                ),
+                || panic!("injected finalizer panic"),
+            );
+        }));
+        assert!(
+            panic.is_err(),
+            "the injected panic must unwind to the caller"
+        );
+        assert!(handle.session(sid).is_none());
+        drop(
+            ops.reserve_new_local_session(sid)
+                .expect("panic unwinding must release the reservation"),
+        );
+    }
+
     #[tokio::test]
     async fn bind_local_session_preserves_restricted_capability_for_forks() {
         let ops = WorkspaceOps::for_test();

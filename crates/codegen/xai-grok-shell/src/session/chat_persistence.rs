@@ -71,7 +71,7 @@ impl ChatPersistence for ChannelChatPersistence {
         let (respond_to, receiver) = oneshot::channel();
         if self
             .tx
-            .send(PersistenceMsg::ReplaceChatHistoryForStripAndAck {
+            .send(PersistenceMsg::ReplaceChatHistoryAndAck {
                 messages: items.to_vec(),
                 respond_to,
             })
@@ -146,7 +146,7 @@ mod tests {
         let mut persistence = ChannelChatPersistence::new(tx);
         let ack = persistence.replace_history_for_strip_and_ack(&[ConversationItem::system("s")]);
         let msg = rx.recv().await.unwrap();
-        let PersistenceMsg::ReplaceChatHistoryForStripAndAck { respond_to, .. } = msg else {
+        let PersistenceMsg::ReplaceChatHistoryAndAck { respond_to, .. } = msg else {
             panic!("expected acked strip rewrite, got {msg:?}");
         };
         respond_to.send(Ok(())).unwrap();

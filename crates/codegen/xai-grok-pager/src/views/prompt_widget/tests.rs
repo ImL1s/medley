@@ -1717,12 +1717,13 @@
         assert!(snap.open, "arg suggestions should be open");
         assert!(snap.args_range.is_some());
 
-        // Accept arg completion → should replace "gr" with "Grok 4.5".
+        // Accept arg completion → replace "gr" with the catalog id, not the
+        // display name (slash model suggestions insert the id).
         pw.accept_slash_completion(&models);
         let text = pw.textarea.text().to_string();
         assert!(
-            text.contains("Grok 4.5"),
-            "arg should be replaced, got: {:?}",
+            text.contains("grok-4.5"),
+            "arg should be replaced with the catalog id, got: {:?}",
             text
         );
         assert!(text.starts_with("/model "));

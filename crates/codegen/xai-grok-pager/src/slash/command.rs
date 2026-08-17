@@ -241,6 +241,16 @@ pub trait SlashCommand: Send + Sync {
         None
     }
 
+    /// Whether an argument row should be selected when its picker first opens.
+    ///
+    /// The controller only honors a single preferred row in a fresh, empty
+    /// argument context. Typed queries still select the fuzzy-ranked first row,
+    /// and an existing user selection is carried across refreshes.
+    #[allow(unused_variables)]
+    fn initially_preferred_arg(&self, ctx: &AppCtx, item: &ArgItem) -> bool {
+        false
+    }
+
     /// Whether this command is currently visible / executable.
     ///
     /// Default is `true` (every command is visible). Override to gate a

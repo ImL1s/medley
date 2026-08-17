@@ -238,7 +238,41 @@ pub(crate) fn parse_session_scheduler_background_loops(
         })
         .and_then(|v| v.as_bool())
 }
-
+/// #161: the web-search disable notice from a `session/new` / `session/load`
+/// response `_meta`. `None` means the key is absent and `web_search` is
+/// available. A present malformed value fails closed with a generic notice.
+///
+/// Sibling of [`parse_session_scheduler_background_loops`] and read the same
+/// way, because it is the same kind of value: session-scoped state the shell
+/// resolves at spawn and publishes on the response rather than announcing.
+/// Returns the whole notice, not just `message`: the pager's renderer logs
+/// `model_id` and `reason` via `tracing::warn!` before pushing the block, and
+/// dropping them would leave the warning without the two fields that make it
+/// actionable.
+pub(crate) fn parse_session_web_search_disabled(
+    resp_meta: Option<&acp::Meta>,
+) -> Option<xai_grok_shell::session::WebSearchDisabledNotice> {
+    let raw = resp_meta.and_then(|m| m.get(xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY))?;
+    match serde_json::from_value(raw.clone()) {
+        Ok(notice) => Some(notice),
+        Err(err) => {
+            // Present-but-malformed must not collapse into "available": only
+            // an absent key carries that meaning. Keep the user-facing notice
+            // generic because malformed provider-controlled metadata is not a
+            // trustworthy source for model/reason details.
+            tracing::warn!(
+                error = %err,
+                "failing closed on malformed {} session meta",
+                xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY
+            );
+            Some(xai_grok_shell::session::WebSearchDisabledNotice {
+                model_id: "unknown".to_string(),
+                reason: "invalid availability metadata".to_string(),
+                message: "web_search availability could not be verified because the session returned invalid metadata. Restart the session or check the provider and model configuration.".to_string(),
+            })
+        }
+    }
+}
 /// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
 pub(crate) fn is_disk_full_error(raw: &str) -> bool {
     raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)
@@ -249,7 +283,7 @@ pub(crate) fn is_disk_full_error(raw: &str) -> bool {
 ///
 /// Strips protocol jargon (ACP, JSON-RPC) and other technical noise that would
 /// be meaningless in a toast, and collapses known disk-full markers.
-pub fn sanitize_user_error(raw: &str) -> String {
+pub(crate) fn sanitize_user_error(raw: &str) -> String {
     if is_disk_full_error(raw) {
         return xai_fast_worktree::ENOSPC_OS_MESSAGE.to_string();
     }
@@ -1095,14 +1129,6 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
-        "follow_up_behavior" => {
-            let SettingValue::Enum(s) = value else {
-                return Err(kind_mismatch("follow_up_behavior", "Enum", &value));
-            };
-            xai_grok_shell::util::config::set_follow_up_behavior(s.to_string())
-                .await
-                .map_err(|e| e.to_string())
-        }
         "show_timeline" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("show_timeline", "Bool", &value));
@@ -1742,7 +1768,7 @@ pub(super) fn unregister_active_session_best_effort_in(
     root: &Path,
     session_id: &acp::SessionId,
 ) {
-    match xai_grok_active_sessions::try_unregister_in(root, session_id) {
+    match xai_grok_shell::active_sessions::try_unregister_in(root, session_id) {
         Ok(true) => {}
         Ok(false) => {
             tracing::debug!(

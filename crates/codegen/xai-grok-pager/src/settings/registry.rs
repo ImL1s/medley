@@ -92,6 +92,9 @@ pub struct OwnedEnumChoice {
     pub canonical: String,
     pub display: String,
     pub description: String,
+    /// Present when the row should remain visible for diagnostics but must not
+    /// be committed (for example, a model missing required authentication).
+    pub disabled_reason: Option<String>,
 }
 
 /// Source of runtime choices for a `SettingKind::DynamicEnum`.
@@ -118,12 +121,34 @@ pub fn dynamic_enum_choices(
                 canonical: String::new(),
                 display: "(no override)".to_string(),
                 description: "Inherit the default model (no per-user override).".to_string(),
+                disabled_reason: None,
             });
-            for (name, _id) in &snapshot.available_models {
+            for (name, id) in &snapshot.available_models {
+                let duplicate_name = snapshot
+                    .available_models
+                    .iter()
+                    .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                    .count()
+                    > 1;
+                let unready_reason = snapshot.model_unready_reasons.get(id.0.as_ref());
+                let display = if duplicate_name {
+                    format!("{name} ({})", id.0)
+                } else {
+                    name.clone()
+                };
                 out.push(OwnedEnumChoice {
-                    canonical: name.clone(),
-                    display: name.clone(),
-                    description: String::new(),
+                    canonical: id.0.to_string(),
+                    display: if unready_reason.is_some() {
+                        format!("{display} [unavailable]")
+                    } else {
+                        display
+                    },
+                    description: if let Some(reason) = unready_reason {
+                        format!("{} · {reason}", id.0)
+                    } else {
+                        id.0.to_string()
+                    },
+                    disabled_reason: unready_reason.cloned(),
                 });
             }
             out
@@ -261,10 +286,17 @@ pub struct PagerLocalSnapshot {
     /// Currently-selected model's display name, or `None` if no catalog
     /// has loaded yet.
     pub current_model_name: Option<String>,
+    /// Stable catalog id for the selected model. Settings canonicals use this
+    /// value; display names are labels only and need not be unique.
+    pub current_model_id: Option<acp::ModelId>,
     /// `(display_name, ModelId)` pairs from the active session's catalog.
     /// Cloned into the snapshot so the modal's validator/resolver is
     /// self-contained (the modal outlives the borrow on `app.agents`).
     pub available_models: Vec<(String, acp::ModelId)>,
+    /// Unavailable model ids and their actionable readiness reason. The model
+    /// remains visible in settings, but the picker labels it before dispatch
+    /// applies the authoritative readiness gate.
+    pub model_unready_reasons: std::collections::HashMap<String, String>,
     /// Whether the user has opted OUT of coding data sharing.
     /// Lives in auth metadata (no `UiConfig` field). Inverted mapping:
     /// `opt_out == false` → canonical "opt-in". Snapshot default is
@@ -314,7 +346,9 @@ impl Default for PagerLocalSnapshot {
             yolo_mode: false,
             auto_mode: false,
             current_model_name: None,
+            current_model_id: None,
             available_models: Vec::new(),
+            model_unready_reasons: std::collections::HashMap::new(),
             coding_data_sharing_opt_out: true,
             coding_data_sharing_lock: None,
             plan_mode_active: false,
@@ -385,19 +419,33 @@ impl PagerLocalSnapshot {
         self.available_models.iter().map(|(name, _)| name.as_str())
     }
 
-    /// Resolve a user-supplied name to a `ModelId` via the snapshot.
-    /// Case-insensitive ASCII match against display names only (ids
-    /// aren't carried in the snapshot's primary key — callers needing
-    /// id-based resolution should reach for `ModelState::resolve_by_name_or_id`).
-    pub fn resolve_model_name(&self, query: &str) -> Option<acp::ModelId> {
-        self.available_models.iter().find_map(|(name, id)| {
-            if name.eq_ignore_ascii_case(query) {
-                Some(id.clone())
-            } else {
-                None
-            }
-        })
+    /// Resolve a canonical model id or an unambiguous display name.
+    pub fn resolve_model_name(&self, query: &str) -> ModelResolution {
+        if let Some((_, id)) = self
+            .available_models
+            .iter()
+            .find(|(_, id)| id.0.as_ref().eq_ignore_ascii_case(query))
+        {
+            return ModelResolution::Resolved(id.clone());
+        }
+        let mut matches = self
+            .available_models
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(query))
+            .map(|(_, id)| id.clone());
+        match (matches.next(), matches.next()) {
+            (Some(id), None) => ModelResolution::Resolved(id),
+            (Some(_), Some(_)) => ModelResolution::Ambiguous,
+            _ => ModelResolution::Unknown,
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelResolution {
+    Resolved(acp::ModelId),
+    Ambiguous,
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -683,7 +731,11 @@ pub fn current_value_for(
         // default_model: reads from pager snapshot (not UiConfig).
         // None (no catalog yet) → empty string.
         "default_model" => Some(SettingValue::String(
-            pager.current_model_name.clone().unwrap_or_default(),
+            pager
+                .current_model_id
+                .as_ref()
+                .map(|id| id.0.to_string())
+                .unwrap_or_default(),
         )),
         // max_thoughts_width: `u16` widened to `i64`.
         "max_thoughts_width" => Some(SettingValue::Int(ui.max_thoughts_width as i64)),
@@ -701,20 +753,13 @@ pub fn current_value_for(
         "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
         "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(true))),
         // fork_secondary_model: baseline value folds to empty string. The
-        // mirror persists the ModelId slug but the DynamicEnum canonicals
-        // are catalog display names, so resolve via the snapshot; a stale
-        // id passes through raw.
+        // mirror and DynamicEnum canonicals both use the ModelId slug.
         "fork_secondary_model" => Some(SettingValue::String({
             let baseline = xai_grok_shell::models::default_model();
             if ui.fork_secondary_model == baseline {
                 String::new()
             } else {
-                pager
-                    .available_models
-                    .iter()
-                    .find(|(_, id)| id.0.as_ref() == ui.fork_secondary_model.as_str())
-                    .map(|(name, _)| name.clone())
-                    .unwrap_or_else(|| ui.fork_secondary_model.clone())
+                ui.fork_secondary_model.clone()
             }
         })),
 
@@ -1477,12 +1522,10 @@ mod tests {
         assert_eq!(value, SettingValue::Enum("groknight"));
     }
 
-    /// The persisted `fork_secondary_model` slug resolves to the catalog
-    /// display name (matching the `default_model` row and the DynamicEnum
-    /// picker canonicals); the baseline still folds to the empty sentinel
-    /// and a slug missing from the catalog passes through raw.
+    /// Persisted model settings retain the stable model id used by the picker.
+    /// The baseline still folds to the empty sentinel.
     #[test]
-    fn fork_secondary_model_current_value_resolves_display_name() {
+    fn fork_secondary_model_current_value_retains_model_id() {
         let slug = "grok-4.5-fast";
         assert_ne!(
             slug,
@@ -1502,7 +1545,7 @@ mod tests {
         };
         assert_eq!(
             current_value_for("fork_secondary_model", &ui, &pager),
-            Some(SettingValue::String("Grok 4.5 Fast".to_string())),
+            Some(SettingValue::String(slug.to_string())),
         );
 
         // Baseline folds to the empty "no override" sentinel.
@@ -1519,6 +1562,44 @@ mod tests {
         assert_eq!(
             current_value_for("fork_secondary_model", &stale_ui, &pager),
             Some(SettingValue::String("retired-model".to_string())),
+        );
+    }
+
+    #[test]
+    fn active_model_choices_use_ids_and_duplicate_names_are_ambiguous() {
+        let first = acp::ModelId::new(std::sync::Arc::from("provider-a/shared"));
+        let second = acp::ModelId::new(std::sync::Arc::from("provider-b/shared"));
+        let pager = PagerLocalSnapshot {
+            available_models: vec![
+                ("Shared Model".to_string(), first.clone()),
+                ("Shared Model".to_string(), second.clone()),
+            ],
+            model_unready_reasons: std::collections::HashMap::from([(
+                second.0.to_string(),
+                "missing PROVIDER_B_API_KEY".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let choices = dynamic_enum_choices(DynamicEnumSource::ActiveModelCatalog, &pager);
+        assert_eq!(choices[1].canonical, "provider-a/shared");
+        assert_eq!(choices[1].display, "Shared Model (provider-a/shared)");
+        assert_eq!(
+            choices[2].display,
+            "Shared Model (provider-b/shared) [unavailable]"
+        );
+        assert!(
+            choices[2]
+                .description
+                .contains("missing PROVIDER_B_API_KEY")
+        );
+        assert_eq!(
+            pager.resolve_model_name("Shared Model"),
+            ModelResolution::Ambiguous
+        );
+        assert_eq!(
+            pager.resolve_model_name("provider-a/shared"),
+            ModelResolution::Resolved(first),
         );
     }
 

@@ -543,7 +543,8 @@ impl SessionActor {
                     xai_grok_sampler::stream_chat_completions(raw, meta, request_id, idle_timeout);
                 xai_grok_sampler::collect_response(events).await
             }
-            crate::sampling::ApiBackend::Responses => {
+            crate::sampling::ApiBackend::Responses
+            | crate::sampling::ApiBackend::CodexResponses => {
                 let (raw, meta, doom_loop) = sampling_client
                     .conversation_stream_responses(request)
                     .await
@@ -564,9 +565,6 @@ impl SessionActor {
                     .ok()?;
                 let events = xai_grok_sampler::stream_messages(raw, meta, request_id, idle_timeout);
                 xai_grok_sampler::collect_response(events).await
-            }
-            _ => {
-                return None;
             }
         };
 
@@ -674,8 +672,11 @@ impl SessionActor {
 
         let response = match sampling_client.conversation_collect(request).await {
             Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "prompt suggest inference failed");
+            Err(_) => {
+                tracing::debug!(
+                    error_class = "sampling_request",
+                    "prompt suggest inference failed"
+                );
                 return None;
             }
         };
@@ -692,7 +693,8 @@ impl SessionActor {
             suggestion = None;
         }
         tracing::debug!(
-            raw_preview = %xai_grok_tools::util::truncate_str(raw.trim(), 60),
+            response_present = !raw.trim().is_empty(),
+            response_len = raw.len(),
             accepted = suggestion.is_some(),
             "prompt suggest: response"
         );

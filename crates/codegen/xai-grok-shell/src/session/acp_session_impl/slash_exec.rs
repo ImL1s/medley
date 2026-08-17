@@ -139,9 +139,9 @@ impl SessionActor {
             }
             BuiltinAction::HooksAdd { path } => {
                 if path.is_empty() {
-                    let home = xai_grok_config::display_grok_home_prefix();
                     self.send_host_turn_slash_command_output(&format!(
-                        "Usage: /hooks add <path>\nProvide a path to a hook JSON file or directory under {home}."
+                        "Usage: /hooks add <path>\nProvide a path to a hook JSON file or directory under {}/.",
+                        xai_grok_config::display_grok_home_prefix()
                     ))
                     .await;
                 } else {
@@ -679,7 +679,7 @@ impl SessionActor {
             }
             BuiltinAction::Feedback { text } => self.execute_feedback_command(text).await,
             BuiltinAction::MemoryBrowse => {
-                let file_infos = if let Some(ref storage) = *self.memory.storage.borrow() {
+                let file_infos = if let Some(storage) = self.memory.storage() {
                     match storage.list_memory_files() {
                         Ok(files) => files
                             .into_iter()
@@ -743,10 +743,13 @@ impl SessionActor {
                 );
                 let msg = if enabled && !self.memory.is_enabled() {
                     if let Some(ref params) = self.memory.backend_params {
-                        let storage = crate::session::memory::MemoryStorage::new(
-                            std::path::Path::new(&self.session_info.cwd),
-                            None,
-                        );
+                        let Some(storage) = self.memory.configured_storage() else {
+                            self.send_host_turn_slash_command_output(
+                                "Memory cannot be enabled (storage is not configured for this session).",
+                            )
+                            .await;
+                            return ok_end_turn(0, None);
+                        };
                         if let Err(e) = storage.ensure_initialized() {
                             tracing::warn!(error = %e, "failed to initialize memory storage on re-enable");
                             format!("Memory could not be enabled: {e}")
@@ -756,18 +759,22 @@ impl SessionActor {
                                     storage.clone(),
                                     params,
                                 );
-                            *self.memory.search_counter.borrow_mut() =
-                                Some(backend.search_counter.clone());
+                            let search_counter = backend.search_counter.clone();
                             let backend: std::sync::Arc<
                                 dyn xai_grok_tools::types::memory_backend::MemoryBackend,
                             > = std::sync::Arc::new(backend);
                             let bridge = self.agent.borrow().tool_bridge().clone();
                             bridge.update_resource(backend.clone()).await;
-                            if let Err(e) = self.register_memory_tools(&bridge).await {
-                                tracing::warn!(error = %e, "memory tool registration failed during toggle");
+                            match self.register_memory_tools(&bridge).await {
+                                Ok(()) => {
+                                    self.memory.enable(search_counter);
+                                    "Memory enabled for this session.".to_owned()
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "memory tool registration failed during toggle");
+                                    format!("Memory could not be enabled: {e}")
+                                }
                             }
-                            *self.memory.storage.borrow_mut() = Some(storage);
-                            "Memory enabled for this session.".to_owned()
                         }
                     } else {
                         "Memory cannot be enabled (not configured for this session).".to_owned()
@@ -784,8 +791,7 @@ impl SessionActor {
                     ) {
                         tracing::debug!("memory_get tool was not registered during unregister");
                     }
-                    *self.memory.storage.borrow_mut() = None;
-                    *self.memory.search_counter.borrow_mut() = None;
+                    self.memory.disable();
                     "Memory disabled for this session.".to_owned()
                 } else {
                     let state = if enabled { "enabled" } else { "disabled" };
@@ -980,7 +986,7 @@ impl SessionActor {
         );
         let model_id = sampling_config.map(|c| c.model);
         let resolved_model_id = model_metadata.resolved_model_id;
-        let client_version = credentials.client_version().map(String::from);
+        let client_version = credentials.client_version_cloned();
 
         use crate::session::feedback_manager::{SessionFeedbackData, SubmitOutcome};
         let outcome = self

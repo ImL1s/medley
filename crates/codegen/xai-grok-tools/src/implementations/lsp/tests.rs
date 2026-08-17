@@ -20,7 +20,7 @@ use mock_servers::*;
 ///
 /// One constant for the suite rather than a hand-rolled iteration count at each
 /// call site, so a slow machine is retuned in one place.
-const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Poll until `ready`, or fail saying what was being waited for.
 async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
@@ -1661,10 +1661,12 @@ async fn a_server_that_publishes_is_not_second_guessed_with_a_pull() {
         let text = format!("const y = {round};\n");
         std::fs::write(&file, &text).unwrap();
         mgr.lock().await.notify_file_changed(&file, &text);
-        let summary = drain_lsp_diagnostics(&mgr, std::time::Duration::from_secs(2)).await;
+        // Same wait as the open above: a one-shot drain can return before the
+        // mock's publish is processed, even after a previous edit succeeded.
+        let summary = drain_until_reported(&mgr, "the check that only the push channel runs").await;
         assert!(
-            summary.is_some_and(|s| s.text.contains("the check that only the push channel runs")),
-            "round {round}: the pushed report is what the reader gets"
+            summary.contains("the check that only the push channel runs"),
+            "round {round}: {summary}"
         );
     }
 

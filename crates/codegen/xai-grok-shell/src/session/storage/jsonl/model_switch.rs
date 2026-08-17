@@ -201,7 +201,13 @@ impl JsonlStorageAdapter {
     }
 
     fn open_model_switch_lock(&self, session_dir: &Path) -> io::Result<std::fs::File> {
-        OpenOptions::new()
+        let mut options = OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            options.share_mode(0x0000_0007);
+        }
+        options
             .read(true)
             .write(true)
             .create(true)

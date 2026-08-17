@@ -14,17 +14,29 @@ impl SessionActor {
         if err.is_auth_error() {
             let method_guard = self.auth_method_id.load();
             let method = method_guard.as_deref();
-            let msg = if method.is_some_and(crate::agent::auth_method::is_session_based_method) {
-                crate::agent::auth_method::auth_error_session_expired()
-            } else {
-                crate::agent::auth_method::auth_error_api_key()
-            };
+            // An unready model (including ambient-origin refusal, #123) already
+            // has an actionable readiness reason. Prefer that over the generic
+            // session-expired / api-key messages: a withheld credential is not
+            // an expired login, and a config typo is not either.
+            let catalog_model_id = self.catalog_model_id_str();
+            let runtime_catalog = self.models_manager.models();
+            let msg = crate::agent::config::unready_reason_for_model_id(
+                &catalog_model_id,
+                Some(&runtime_catalog),
+            )
+            .unwrap_or_else(|| {
+                if method.is_some_and(crate::agent::auth_method::is_session_based_method) {
+                    crate::agent::auth_method::auth_error_session_expired()
+                } else {
+                    crate::agent::auth_method::auth_error_api_key()
+                }
+            });
             xai_grok_telemetry::unified_log::error(
                 "sampling auth error",
                 Some(self.session_info.id.0.as_ref()),
                 Some(serde_json::json!({
                     "method": method.map(|id| id.0.as_ref()),
-                    "error": format!("{err}"),
+                    "error_class": "auth_rejected",
                 })),
             );
             return acp::Error::auth_required().data(msg);
@@ -119,10 +131,10 @@ impl SessionActor {
         const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let (prefix, source) = match tokio::time::timeout(WAIT_TIMEOUT, &mut handle).await {
             Ok(Ok(p)) => (p, "background"),
-            Ok(Err(join_err)) => {
+            Ok(Err(_)) => {
                 tracing::warn!(
                     session_id = %self.session_info.id.0,
-                    error = %join_err,
+                    error_class = "background_task_failed",
                     "ensure_prefix_ready: background task panicked, sync fallback"
                 );
                 (self.build_user_message_prefix().await, "sync_fallback")
@@ -380,7 +392,7 @@ impl SessionActor {
         };
         let current_model = &current_config.model;
         let base_url = &current_config.base_url;
-        if !crate::util::is_cli_chat_proxy_url(base_url) {
+        if !crate::util::is_xai_api_bearer_url(base_url) {
             return;
         }
         tracing::info!(
@@ -400,8 +412,10 @@ impl SessionActor {
                 None,
             ),
         );
-        let middleware_client =
-            crate::http::with_auth_retry(crate::http::shared_client(), provider);
+        let middleware_client = crate::http::with_auth_retry(
+            crate::remote::client::models_catalog_async_client(),
+            provider,
+        );
         let url = format!("{}/models-v2", base_url);
         let parse_models_response =
             |json: serde_json::Value| -> Option<(std::num::NonZeroU64, Option<u32>)> {
@@ -426,16 +440,22 @@ impl SessionActor {
             .timeout(std::time::Duration::from_secs(5));
         let built = match request.build() {
             Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to build idle-refresh models request");
+            Err(_) => {
+                tracing::warn!(
+                    error_class = "request_build_failed",
+                    "Failed to build idle-refresh models request"
+                );
                 return;
             }
         };
-        let (response, stamp) =
+        let (response, comparison) =
             match xai_grok_auth::execute_with_auth_relation(&middleware_client, built).await {
                 Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to fetch models for idle refresh");
+                Err(_) => {
+                    tracing::warn!(
+                        error_class = "request_transport_failed",
+                        "Failed to fetch models for idle refresh"
+                    );
                     return;
                 }
             };
@@ -445,7 +465,7 @@ impl SessionActor {
                 None,
                 crate::auth::attribution::ConsumerKind::IdleResumeModelRefresh,
                 "",
-                Some(stamp.relation.as_str()),
+                None,
             );
         }
         let result = if !response.status().is_success() {

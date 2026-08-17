@@ -934,18 +934,14 @@
         );
     }
 
-    /// Characterization (leader-relaunch orphan rows): a reconnect reload whose
+    /// Regression (leader-relaunch orphan rows): a reconnect reload whose
     /// replay contains `SubagentSpawned` with NO `SubagentFinished` (the
     /// subagent died with the old leader, or is still running on the surviving
-    /// one) leaves the row `finished == false` after the success swap — the
-    /// window finalize force-idles only the ROOT transcript, nothing resolves
-    /// or expires subagent rows. Pager-side child tracking itself stays
-    /// functional: a live child update delivered after the swap still renders
-    /// into the child view, so a post-reconnect freeze would be leader route
-    /// loss (see the `leader::server` child-route backfill tests), not pager
-    /// state.
+    /// one) must not render replay-only history as live work indefinitely.
+    /// With no live roster evidence, finalize retires the row to an explicit
+    /// unknown reconnect state. A later live child delta revives it.
     #[test]
-    fn reload_replayed_spawn_without_finished_keeps_unresolved_running_row() {
+    fn reload_replayed_spawn_without_finished_is_unknown_until_live_activity() {
         let mut app = make_app_with_agent("sess-sub");
         let id = AgentId(0);
         {
@@ -976,10 +972,16 @@
             .subagent_sessions
             .get("child-sub")
             .expect("replayed spawn registers the subagent row");
-        assert!(
-            !info.finished,
-            "no Finished in the replay → the row stays running indefinitely \
-             (current behavior: nothing resolves it after the swap)"
+        assert!(info.finished, "replay-only spawn is not live work");
+        assert_eq!(
+            info.status.as_deref(),
+            Some("unknown_after_reconnect"),
+            "unresolved history is explicitly stale/unknown"
+        );
+        assert_eq!(
+            crate::views::dashboard::classify_subagent(info),
+            crate::views::dashboard::RowState::Inactive,
+            "dashboard must not render the unresolved replay row as Working"
         );
         assert!(
             agent.subagent_views.contains_key("child-sub"),
@@ -996,6 +998,92 @@
         assert!(
             app.agents[&id].subagent_views["child-sub"].scrollback.len() > child_len_before,
             "a delivered live child update must render into the child view"
+        );
+        let info = &app.agents[&id].subagent_sessions["child-sub"];
+        assert!(!info.finished, "live child activity revives the stale row");
+        assert_eq!(info.status, None);
+        assert_eq!(
+            crate::views::dashboard::classify_subagent(info),
+            crate::views::dashboard::RowState::Working
+        );
+
+        // A separate reload that receives authoritative live progress before
+        // finalize must never retire that genuinely live child.
+        let mut app = make_app_with_agent("sess-sub-live");
+        let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().begin_session_reload(2);
+
+        let payload = SessionNotification {
+            session_id: acp::SessionId::new("sess-sub-live"),
+            update: test_subagent_spawned("sess-sub-live", "child-live"),
+            meta: Some(serde_json::json!({ "isReplay": true, "eventId": "sess-sub-live-3" })),
+        };
+        let notif = acp::ExtNotification::new(
+            "x.ai/session_notification",
+            serde_json::value::to_raw_value(&payload).unwrap().into(),
+        );
+        assert!(handle_ext_notification(&notif, &mut app));
+
+        let live_payload = SessionNotification {
+            session_id: acp::SessionId::new("sess-sub-live"),
+            update: test_subagent_progress("sess-sub-live", "child-live"),
+            meta: Some(serde_json::json!({ "eventId": "sess-sub-live-4" })),
+        };
+        let live_notif = acp::ExtNotification::new(
+            "x.ai/session_notification",
+            serde_json::value::to_raw_value(&live_payload).unwrap().into(),
+        );
+        assert!(handle_ext_notification(&live_notif, &mut app));
+
+        let agent = app.agents.get_mut(&id).unwrap();
+        assert!(agent.finish_session_reload(2, true));
+        let info = &agent.subagent_sessions["child-live"];
+        assert!(!info.finished, "live reconnect activity wins over replay history");
+        assert_eq!(
+            crate::views::dashboard::classify_subagent(info),
+            crate::views::dashboard::RowState::Working
+        );
+    }
+
+    #[test]
+    fn failed_reload_preserves_previously_live_subagent() {
+        let mut app = make_app_with_agent("sess-sub-failed");
+        let id = AgentId(0);
+        let live_spawn = SessionNotification {
+            session_id: acp::SessionId::new("sess-sub-failed"),
+            update: test_subagent_spawned("sess-sub-failed", "child-live"),
+            meta: Some(serde_json::json!({ "eventId": "sess-sub-failed-1" })),
+        };
+        let live_notif = acp::ExtNotification::new(
+            "x.ai/session_notification",
+            serde_json::value::to_raw_value(&live_spawn).unwrap().into(),
+        );
+        assert!(handle_ext_notification(&live_notif, &mut app));
+        assert!(!app.agents[&id].subagent_sessions["child-live"].finished);
+
+        app.agents.get_mut(&id).unwrap().begin_session_reload(9);
+        let replay_spawn = SessionNotification {
+            session_id: acp::SessionId::new("sess-sub-failed"),
+            update: test_subagent_spawned("sess-sub-failed", "child-live"),
+            meta: Some(serde_json::json!({
+                "isReplay": true,
+                "eventId": "sess-sub-failed-2"
+            })),
+        };
+        let replay_notif = acp::ExtNotification::new(
+            "x.ai/session_notification",
+            serde_json::value::to_raw_value(&replay_spawn).unwrap().into(),
+        );
+        assert!(handle_ext_notification(&replay_notif, &mut app));
+
+        let agent = app.agents.get_mut(&id).unwrap();
+        assert!(agent.finish_session_reload(9, false));
+        let info = &agent.subagent_sessions["child-live"];
+        assert!(!info.finished, "failed reload restores the live child snapshot");
+        assert_ne!(info.status.as_deref(), Some("unknown_after_reconnect"));
+        assert_eq!(
+            crate::views::dashboard::classify_subagent(info),
+            crate::views::dashboard::RowState::Working
         );
     }
 
@@ -1066,13 +1154,12 @@
         assert!(agent.session.state.is_idle());
     }
 
-    /// Apply-only cursor rule (xAI path): a `ModelChanged` the catalog can't
-    /// resolve is ignored, so it must NOT advance the reconnect cursor or the
-    /// dedup highwater — a later reconnect (catalog now has the model) must
-    /// still replay it. An applied follower switch advances both. Mirrors the
-    /// ACP path's `advance_reconnect_cursor`.
+    /// Apply-only cursor rule (xAI path): authoritative `ModelChanged` events
+    /// apply even when they arrive before the catalog row, so both the
+    /// placeholder switch and an ordinary known-model switch advance the
+    /// reconnect cursor and dedup highwater.
     #[test]
-    fn ignored_model_changed_does_not_advance_cursor_applied_one_does() {
+    fn model_changed_before_catalog_and_known_switch_both_advance_cursor() {
         let mut app = make_app_with_agent("sess-1");
         let id = AgentId(0);
         {
@@ -1080,18 +1167,20 @@
             seed_models(agent, "grok-3", &["grok-3", "grok-4"]);
         }
 
-        // Unknown model → ignored → both markers untouched.
-        assert!(!handle_ext_notification(
+        // Catalog-lag target → display-only resident placeholder → applied.
+        assert!(handle_ext_notification(
             &model_changed_ext_with_event("sess-1", "grok-99-unknown", "sess-1-7"),
             &mut app
         ));
         assert_eq!(
-            app.agents[&id].last_seen_event_id, None,
-            "an ignored ModelChanged must not advance the reconnect cursor"
+            app.agents[&id].last_seen_event_id.as_deref(),
+            Some("sess-1-7"),
+            "an authoritative catalog-lag switch advances the reconnect cursor"
         );
         assert_eq!(
-            app.agents[&id].last_applied_xai_event_seq, None,
-            "an ignored ModelChanged must not advance the dedup highwater"
+            app.agents[&id].last_applied_xai_event_seq,
+            Some(7),
+            "an authoritative catalog-lag switch advances the dedup highwater"
         );
 
         // Known model → applied → both markers advance.
@@ -1134,4 +1223,3 @@
         );
         assert_eq!(app.agents[&id].last_applied_event_seq, Some(8));
     }
-

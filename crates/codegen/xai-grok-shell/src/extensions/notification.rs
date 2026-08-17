@@ -559,7 +559,9 @@ pub enum SessionUpdate {
         event_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_name: Option<String>,
-        /// Keeps a delayed turn-end batch off the wrong turn's marker.
+        /// The prompt turn this batch belongs to, when known; lets the
+        /// client keep a delayed `stop`/`stop_failure` batch off the wrong
+        /// turn's marker.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
         runs: Vec<HookRunEntryDto>,
@@ -868,6 +870,13 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments_delta: Option<String>,
     },
+    /// A streamed sampling attempt was abandoned for retry.
+    ///
+    /// Clients must drop any agent-message / thought / partial tool-call
+    /// UI produced for the abandoned attempt so a successful retry does
+    /// not show duplicated output. Mirrors
+    /// [`xai_grok_sampler::SamplingEvent::AttemptDiscarded`].
+    AttemptDiscarded,
     /// One or more prompt images were resized to fit within API limits.
     ImageCompressed {
         images: Vec<ImageCompressedEntry>,
@@ -877,6 +886,17 @@ pub enum SessionUpdate {
     /// Prompt images dropped before send (integrity / upscale-cap). The
     /// model is told via a system-reminder; this surfaces them to the UI.
     ImageDropped { notes: Vec<String> },
+    /// `web_search` was withheld from the toolset because its model could not
+    /// be resolved or was not ready (#57). Shown once as a system scrollback
+    /// line so the silent disable is legible.
+    WebSearchDisabled {
+        /// Model id that was tried.
+        model_id: String,
+        /// Actionable rejection reason.
+        reason: String,
+        /// Pre-formatted user-facing notice (model + reason).
+        message: String,
+    },
     /// Memory file listing for the pager's /memory modal.
     MemoryFiles { files: Vec<MemoryFileInfo> },
     WorkflowUpdated {
@@ -1188,6 +1208,10 @@ pub enum RetryState {
     Failed {
         /// Category of the error (e.g., "auth", "invalid_params", "server")
         error_type: String,
+        /// Parsed HTTP status when the failure originated from a provider
+        /// response. Older persisted notifications omit this field.
+        #[serde(default)]
+        http_status: Option<u16>,
         /// Human-readable error message
         message: String,
     },
@@ -1729,6 +1753,27 @@ mod tests {
         assert_eq!(json["tokens_used"], 75_000);
     }
 
+    /// #44: wire shape for the sampling-attempt retraction.
+    #[test]
+    fn attempt_discarded_round_trips_on_wire() {
+        let update = SessionUpdate::AttemptDiscarded;
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"sessionUpdate": "attempt_discarded"})
+        );
+        let parsed: SessionUpdate = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, SessionUpdate::AttemptDiscarded);
+
+        let envelope = r#"{
+            "sessionId": "sess-1",
+            "update": {"sessionUpdate": "attempt_discarded"}
+        }"#;
+        let notification: SessionNotification = serde_json::from_str(envelope).unwrap();
+        assert_eq!(notification.session_id.0.as_ref(), "sess-1");
+        assert_eq!(notification.update, SessionUpdate::AttemptDiscarded);
+    }
+
     #[test]
     fn unknown_variant_deserializes_from_removed_git_branch_update() {
         let json = r#"{"sessionUpdate": "git_branch_update", "branch": "main"}"#;
@@ -1786,7 +1831,20 @@ mod tests {
         let update: SessionUpdate = serde_json::from_str(json).unwrap();
         assert!(matches!(
             update,
-            SessionUpdate::RetryState(RetryState::Failed { .. })
+            SessionUpdate::RetryState(RetryState::Failed {
+                http_status: None,
+                ..
+            })
+        ));
+
+        let json = r#"{"sessionUpdate":"retry_state","type":"failed","error_type":"api","http_status":400,"message":"bad request"}"#;
+        let update: SessionUpdate = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            update,
+            SessionUpdate::RetryState(RetryState::Failed {
+                http_status: Some(400),
+                ..
+            })
         ));
     }
 

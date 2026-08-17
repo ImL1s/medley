@@ -741,6 +741,51 @@ fn parse_session_load_restore_meta_rejects_unknown_degree() {
     let (_, _, degree) = parse_session_load_restore_meta(meta.as_object());
     assert!(degree.is_none());
 }
+/// #161 write→parse bridge: the shell publishes `WebSearchDisabledNotice` under
+/// `WEB_SEARCH_DISABLED_META_KEY`; the pager must recover the same shape. This
+/// is the production parser dispatch tests skip when they inject
+/// `TaskResult::SessionLoaded { web_search_disabled: Some(...) }` directly.
+#[test]
+fn parse_session_web_search_disabled_round_trips_shared_notice() {
+    let notice = xai_grok_shell::session::WebSearchDisabledNotice {
+        model_id: "grok-4-fast".into(),
+        reason: "model is not ready".into(),
+        message: "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)".into(),
+    };
+    let mut meta = acp::Meta::new();
+    meta.insert(
+        xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY.into(),
+        serde_json::to_value(&notice).expect("notice serializes"),
+    );
+    let parsed = parse_session_web_search_disabled(Some(&meta))
+        .expect("well-formed meta must parse");
+    assert_eq!(parsed, notice);
+}
+/// Absent key means available — must not invent a notice.
+#[test]
+fn parse_session_web_search_disabled_absent_key_is_none() {
+    let meta = acp::Meta::new();
+    assert!(parse_session_web_search_disabled(Some(&meta)).is_none());
+    assert!(parse_session_web_search_disabled(None).is_none());
+}
+/// Present-but-malformed fails closed with a generic actionable notice. This
+/// is deliberately distinct from an absent key, which means available.
+#[test]
+fn parse_session_web_search_disabled_malformed_fails_closed() {
+    let mut meta = acp::Meta::new();
+    meta.insert(
+        xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY.into(),
+        serde_json::json!("not-an-object"),
+    );
+    let notice = parse_session_web_search_disabled(Some(&meta))
+        .expect("present malformed metadata must not mean available");
+    assert_eq!(notice.model_id, "unknown");
+    assert_eq!(notice.reason, "invalid availability metadata");
+    assert_eq!(
+        notice.message,
+        "web_search availability could not be verified because the session returned invalid metadata. Restart the session or check the provider and model configuration."
+    );
+}
 /// Unknown keys return a descriptive error.
 #[tokio::test]
 async fn persist_setting_unknown_key_returns_err() {
@@ -867,7 +912,7 @@ fn setup_grok_home_in_tempdir() -> tempfile::TempDir {
     tmp
 }
 fn register_session_in(root: &std::path::Path, id: &str) -> acp::SessionId {
-    use xai_grok_active_sessions::{ActiveSession, register_in};
+    use xai_grok_shell::active_sessions::{ActiveSession, register_in};
     let session_id = acp::SessionId::new(id);
     register_in(
             root,
@@ -888,7 +933,7 @@ fn unregister_best_effort_removes_entry_when_lock_free() {
     let sid = register_session_in(dir.path(), "s1");
     unregister_active_session_best_effort_in(dir.path(), &sid);
     assert!(
-            xai_grok_active_sessions::list_in(dir.path())
+            xai_grok_shell::active_sessions::list_in(dir.path())
                 .expect("list")
                 .is_empty(),
             "lock-free unregister must remove the entry",
@@ -927,7 +972,7 @@ fn unregister_best_effort_is_nonblocking_under_lock_contention() {
             "contended unregister blocked on the shared flock instead of skipping",
         );
     assert_eq!(
-            xai_grok_active_sessions::list_in(dir.path())
+            xai_grok_shell::active_sessions::list_in(dir.path())
                 .expect("list")
                 .len(),
             1,

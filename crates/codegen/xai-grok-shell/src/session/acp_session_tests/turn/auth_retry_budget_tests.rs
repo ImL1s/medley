@@ -179,6 +179,7 @@ async fn session_token_actor(
                 readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: None,
+            catalog_generation: 0,
         }));
 
     actor

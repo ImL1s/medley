@@ -43,6 +43,14 @@ pub fn bootstrap(
         init_process(&cfg, auth_manager);
     }
     xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::ModelCatalog);
+    // Arm the first auth-refresh waiter before model construction. Successful
+    // proactive refreshes use `notify_waiters`, which is intentionally not a
+    // stored permit; creating this future first makes a refresh that lands
+    // between the final construction generation check and watcher startup
+    // observable instead of permanently losing catalog reconciliation.
+    let auth_refresh_notify = auth_manager.refresh_notifier();
+    let mut first_auth_refresh = Box::pin(auth_refresh_notify.clone().notified_owned());
+    first_auth_refresh.as_mut().enable();
     let models_manager = {
         let _timer = crate::instrumentation_timer!("startup.bootstrap.models_manager");
         ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?
@@ -50,7 +58,7 @@ pub fn bootstrap(
 
     // Refresh on every auth refresh — the FSEvents watcher can silently die after
     // macOS sleep, stranding the catalog on bundled defaults.
-    models_manager.start_auth_refresh_watcher(auth_manager.refresh_notifier());
+    models_manager.start_auth_refresh_watcher_with_first(auth_refresh_notify, first_auth_refresh);
 
     Ok((cfg, models_manager))
 }

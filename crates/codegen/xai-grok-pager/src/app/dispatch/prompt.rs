@@ -548,12 +548,25 @@ pub(super) fn dispatch_send_prompt_inner(
                     yolo_mode: agent.session.is_yolo(),
                     auto_mode: agent.session.is_auto(),
                     current_model_name: agent.session.models.current_model_name(),
+                    current_model_id: agent.session.models.current.clone(),
                     available_models: agent
                         .session
                         .models
                         .available
                         .iter()
                         .map(|(id, info)| (info.name.clone(), id.clone()))
+                        .collect(),
+                    model_unready_reasons: agent
+                        .session
+                        .models
+                        .available
+                        .iter()
+                        .filter_map(|(id, info)| {
+                            crate::slash::commands::model::unready_reason_from_model_meta(
+                                info.meta.as_ref(),
+                            )
+                            .map(|reason| (id.0.to_string(), reason))
+                        })
                         .collect(),
                     coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                     coding_data_sharing_lock: coding_data_sharing_lock_from_app,

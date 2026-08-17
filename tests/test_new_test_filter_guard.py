@@ -201,6 +201,40 @@ class Selected(unittest.TestCase):
                      {"slash::commands::model::"})
         )
 
+    def test_module_path_filter_respects_component_boundaries(self):
+        """`session::` names a module, not every filename starting with session.
+
+        Cargo does not select `extensions::session_state::tests::*` with the
+        filter `session::`. Treating the file path as one undelimited string
+        gave this exact case a false green in the new-test guard.
+        """
+        self.assertFalse(
+            selected(
+                "import_publishes_summary_and_removes_visibility_marker",
+                "crates/codegen/xai-grok-shell/src/extensions/session_state.rs",
+                {"session::"},
+            )
+        )
+
+    def test_module_path_filter_matches_an_exact_directory_component(self):
+        self.assertTrue(
+            selected(
+                "anything",
+                "crates/codegen/xai-grok-shell/src/session/persistence.rs",
+                {"session::"},
+            )
+        )
+
+    def test_path_included_tests_file_keeps_declaring_module_approximation(self):
+        """Sibling `*_tests.rs` files are commonly included from their module."""
+        self.assertTrue(
+            selected(
+                "anything",
+                "crates/codegen/xai-grok-workspace/src/restore_fetch_tests.rs",
+                {"restore_fetch::"},
+            )
+        )
+
 
 class EndToEnd(unittest.TestCase):
     SCRIPT = REPO / "scripts" / "check_new_tests_are_filtered.py"

@@ -23,6 +23,7 @@ pub use mutations::{REFRESH_SCAN_LOG_PREFIX, REFRESH_SKIP_LOG_PREFIX};
 mod tests;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -196,7 +197,35 @@ impl HunkTrackerActor {
         mode: TrackingMode,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> HunkTrackerHandle {
+        Self::spawn_when_ready(
+            session_id,
+            working_dir,
+            event_tx,
+            mode,
+            cancellation_token,
+            async { true },
+        )
+    }
+
+    /// Spawn the actor, but do not start it until `readiness` resolves to true.
+    ///
+    /// The handle is returned immediately so callers can wire it into dependent
+    /// components before publishing the session. If the cancellation token is
+    /// cancelled before readiness, or readiness resolves to false, the actor is
+    /// dropped without its startup scan or any queued command processing.
+    pub fn spawn_when_ready<R>(
+        session_id: String,
+        working_dir: PathBuf,
+        event_tx: mpsc::UnboundedSender<HunkEvent>,
+        mode: TrackingMode,
+        cancellation_token: tokio_util::sync::CancellationToken,
+        readiness: R,
+    ) -> HunkTrackerHandle
+    where
+        R: Future<Output = bool> + Send + 'static,
+    {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let cancellation = cancellation_token.clone();
         let actor = Self::new(
             session_id,
             working_dir,
@@ -206,8 +235,16 @@ impl HunkTrackerActor {
             cancellation_token,
         );
 
-        // Spawn the actor task
-        tokio::spawn(actor.run());
+        tokio::spawn(async move {
+            let ready = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => false,
+                ready = readiness => ready,
+            };
+            if ready {
+                actor.run().await;
+            }
+        });
 
         HunkTrackerHandle::new(cmd_tx)
     }

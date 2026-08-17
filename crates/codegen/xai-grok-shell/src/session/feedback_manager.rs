@@ -278,6 +278,26 @@ impl FeedbackManager {
         feedback_client: Option<FeedbackClient>,
         config: FeedbackManagerConfig,
     ) -> Self {
+        Self::new_inner(session_id, feedback_client, config, true)
+    }
+
+    /// Create a feedback manager for an actor that has not passed its
+    /// publication gate yet. The manager retains the eventual session id, but
+    /// construction must not publish that provisional identity through tracing.
+    pub(crate) fn new_unpublished(
+        session_id: impl Into<String>,
+        feedback_client: Option<FeedbackClient>,
+        config: FeedbackManagerConfig,
+    ) -> Self {
+        Self::new_inner(session_id, feedback_client, config, false)
+    }
+
+    fn new_inner(
+        session_id: impl Into<String>,
+        feedback_client: Option<FeedbackClient>,
+        config: FeedbackManagerConfig,
+        trace_initialization: bool,
+    ) -> Self {
         let (signals_handle, actor) = SessionSignalsActor::with_sync_interval(config.sync_interval);
 
         // Spawn the signals actor
@@ -285,15 +305,7 @@ impl FeedbackManager {
 
         let session_id = session_id.into();
         let feedback_client = feedback_client.map(|c| c.with_session_id(session_id.clone()));
-        tracing::info!(
-            session_id = %session_id,
-            feedback_enabled = config.feedback_enabled,
-            telemetry_enabled = config.telemetry_enabled,
-            has_client = feedback_client.is_some(),
-            "FeedbackManager initialized"
-        );
-
-        Self {
+        let manager = Self {
             session_id,
             signals_handle,
             heuristics: Arc::new(RwLock::new(FeedbackHeuristics::new())),
@@ -301,7 +313,21 @@ impl FeedbackManager {
             config,
             config_loaded: Arc::new(AtomicBool::new(false)),
             upload_queue_stats: std::sync::OnceLock::new(),
+        };
+        if trace_initialization {
+            manager.trace_initialized();
         }
+        manager
+    }
+
+    pub(crate) fn trace_initialized(&self) {
+        tracing::info!(
+            session_id = %self.session_id,
+            feedback_enabled = self.config.feedback_enabled,
+            telemetry_enabled = self.config.telemetry_enabled,
+            has_client = self.feedback_client.is_some(),
+            "FeedbackManager initialized"
+        );
     }
 
     /// Create a feedback manager without a REST client (local tracking only).

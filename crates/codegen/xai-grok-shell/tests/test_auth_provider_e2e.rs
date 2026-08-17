@@ -5,8 +5,8 @@
 //! script the test writes to disk). The harness's `XAI_API_KEY` stands in for
 //! the session-tier credential.
 //!
-//! `#[ignore]` (needs a built binary). The CI lifecycle lanes run it against
-//! the release artifact via `GROK_BINARY`; run locally (auto-builds the pager):
+//! `#[ignore]` (needs a built binary). CI builds the production entry point
+//! and supplies it through `GROK_BINARY`; run locally (auto-builds the pager):
 //! ```bash
 //! cargo test -p xai-grok-shell --test test_auth_provider_e2e -- --ignored
 //! ```
@@ -15,6 +15,212 @@
 #![cfg(unix)]
 
 use xai_grok_test_support::*;
+
+const UNPUBLISHED_SESSION_MARKER: &str = ".unpublished";
+
+fn published_session_dirs(grok_home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let sessions_root = grok_home.join("sessions");
+    let mut sessions = Vec::new();
+    for cwd_dir in std::fs::read_dir(&sessions_root)
+        .unwrap_or_else(|e| panic!("read sessions root {}: {e}", sessions_root.display()))
+        .flatten()
+    {
+        if !cwd_dir.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        for session_dir in std::fs::read_dir(cwd_dir.path())
+            .unwrap_or_else(|e| panic!("read cwd session dir {}: {e}", cwd_dir.path().display()))
+            .flatten()
+        {
+            if session_dir.file_type().is_ok_and(|kind| kind.is_dir()) {
+                sessions.push(session_dir.path());
+            }
+        }
+    }
+    sessions
+}
+
+/// Regression for fresh-session publication through the production binary:
+/// creating a Codex-harness session, resolving its external provider token,
+/// and completing the first Responses request must leave one complete public
+/// tree rather than exposing a partial or marker-bearing session directory.
+#[tokio::test]
+#[ignore] // requires pre-built binary
+async fn codex_provider_prompt_publishes_one_complete_session_tree() {
+    const FIXTURE_TOKEN: &str = "fixture-token";
+    const PROMPT: &str = "publication-auth-fixture-prompt";
+
+    let server = MockInferenceServer::start_with_required_auth(
+        vec![
+            MockModelEntry::with_agent_type("mock-codex-model", "codex")
+                .with_api_backend("responses"),
+        ],
+        FIXTURE_TOKEN,
+    )
+    .await
+    .expect("start authenticated mock server");
+    let mut sandbox = TestSandbox::builder().git().mock_url(server.url()).build();
+    sandbox.remove_env("GROK_LEADER_SOCKET");
+
+    let grok_home = sandbox.grok_home().to_path_buf();
+    let helper = grok_home.join("fixture-auth.sh");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\nprintf '%s' '{FIXTURE_TOKEN}'\n"),
+    )
+    .expect("write fixture auth provider");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+            .expect("make fixture auth provider executable");
+    }
+
+    std::fs::write(
+        grok_home.join("config.toml"),
+        format!(
+            r#"[auth_provider.fixture]
+command = "{helper}"
+token_ttl_secs = 3600
+
+[model.fixture-codex]
+model = "mock-codex-model"
+base_url = "{base}"
+context_window = 200000
+agent_type = "codex"
+api_backend = "responses"
+auth_provider = "fixture"
+
+[models]
+default = "fixture-codex"
+"#,
+            helper = helper.display(),
+            base = server.url(),
+        ),
+    )
+    .expect("write fixture model config");
+
+    let mut cmd = tokio::process::Command::new(grok_binary());
+    cmd.args([
+        "-p",
+        PROMPT,
+        "--yolo",
+        "--model",
+        "fixture-codex",
+        "--max-turns",
+        "1",
+        "--output-format",
+        "json",
+    ])
+    .arg("--cwd")
+    .arg(sandbox.workspace())
+    .current_dir(sandbox.workspace())
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true);
+
+    let result = run_headless_in_sandbox_borrowed(cmd, &sandbox).await;
+    assert_headless_success(
+        &result,
+        "Codex provider prompt publication e2e",
+        Some(&server),
+    );
+    assert_no_crashes(&result.stderr);
+
+    let responses: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.path == "/v1/responses")
+        .collect();
+    assert!(
+        !responses.is_empty(),
+        "expected at least one Responses sampling request:\n{}",
+        server.request_log_summary()
+    );
+    let prompt_requests: Vec<_> = responses
+        .iter()
+        .filter(|request| {
+            request
+                .body
+                .as_ref()
+                .is_some_and(|body| body.to_string().contains(PROMPT))
+        })
+        .collect();
+    assert!(
+        !prompt_requests.is_empty(),
+        "a Responses request must carry the fixture prompt"
+    );
+    assert!(
+        prompt_requests
+            .iter()
+            .any(|request| request.authorization.as_deref() == Some("Bearer fixture-token")),
+        "at least one prompt-bearing Responses request must use the fixture provider token; requests: {:?}",
+        responses
+            .iter()
+            .map(|request| (
+                request.header("x-grok-turn-idx"),
+                request.header("x-grok-req-id"),
+                request.authorization.as_deref(),
+                request
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| body.to_string().contains(PROMPT)),
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    let session_dirs = published_session_dirs(&grok_home);
+    assert_eq!(
+        session_dirs.len(),
+        1,
+        "expected one published session tree under {}; got {session_dirs:?}",
+        grok_home.join("sessions").display()
+    );
+    let session_dir = &session_dirs[0];
+    assert!(
+        !session_dir.join(UNPUBLISHED_SESSION_MARKER).exists(),
+        "published session must not retain {UNPUBLISHED_SESSION_MARKER}: {}",
+        session_dir.display()
+    );
+
+    let summary: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(session_dir.join("summary.json")).expect("read summary.json"),
+    )
+    .expect("summary.json must contain valid JSON");
+    assert!(summary.is_object(), "summary.json must be a JSON object");
+
+    let prompt_context: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(session_dir.join("prompt_context.json")).expect("read prompt_context.json"),
+    )
+    .expect("prompt_context.json must contain valid JSON");
+    assert!(
+        prompt_context.is_object(),
+        "prompt_context.json must be a JSON object"
+    );
+
+    let system_prompt = std::fs::read_to_string(session_dir.join("system_prompt.txt"))
+        .expect("read system_prompt.txt");
+    assert!(
+        !system_prompt.trim().is_empty(),
+        "system_prompt.txt must not be empty"
+    );
+
+    let history = std::fs::read_to_string(session_dir.join("chat_history.jsonl"))
+        .expect("read chat_history.jsonl");
+    assert!(
+        history.contains(PROMPT),
+        "chat history must contain the submitted prompt"
+    );
+    let history_entries: Vec<serde_json::Value> = history
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("chat history line must be valid JSON"))
+        .collect();
+    assert!(
+        !history_entries.is_empty(),
+        "chat_history.jsonl must contain at least one JSON entry"
+    );
+}
 
 #[tokio::test]
 #[ignore]

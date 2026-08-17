@@ -221,6 +221,7 @@ pub(super) fn handle_session_notification_with_origin(
         return false;
     }
     let mut plugins_changed_needs_skills_refetch = false;
+    let mut active_model_state_changed = false;
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
     let mut deferred_subagent_finish: Option<SessionNotification> = None;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
@@ -1073,6 +1074,14 @@ pub(super) fn handle_session_notification_with_origin(
                     "available_keys": available_keys,
                 })),
             );
+            if !new_model_id.is_empty() {
+                let confirmed_model = acp::ModelId::new(new_model_id.clone());
+                agent
+                    .session
+                    .models
+                    .set_confirmed_resident(confirmed_model, None);
+                active_model_state_changed = is_active;
+            }
             agent.scrollback.push_block(RenderBlock::session_event(
                 SessionEvent::ModelUnavailable {
                     previous_model_id,
@@ -1119,7 +1128,8 @@ pub(super) fn handle_session_notification_with_origin(
             agent
                 .session
                 .models
-                .set_current(new_model_id.clone(), effort);
+                .set_confirmed_resident(new_model_id.clone(), effort);
+            active_model_state_changed = is_active;
             agent.session.user_model_preference = Some(new_model_id.clone());
             let resolved_effort = agent.session.models.reasoning_effort;
             let actually_changed =
@@ -1261,6 +1271,12 @@ pub(super) fn handle_session_notification_with_origin(
             return false;
         }
     };
+    if active_model_state_changed {
+        if let Some(agent) = app.agents.get(&parent_id) {
+            app.models = agent.session.models.clone();
+        }
+        crate::app::dispatch::refresh_open_settings_modals(app);
+    }
     if plugins_changed_needs_skills_refetch {
         if let Some(agent) = app.agents.get(&parent_id)
             && let Some(session_id) = agent.session.session_id.clone()
@@ -1574,6 +1590,7 @@ pub(super) fn apply_retry_state(
         }
         RetryState::Failed {
             error_type,
+            http_status,
             message,
         } => {
             session.set_retry_activity(None);
@@ -1581,7 +1598,7 @@ pub(super) fn apply_retry_state(
             if wire == crate::app::error_display::WireErrorType::EncryptedContentMismatch {
                 session.model_incompatible = true;
             }
-            is_credit_limit = super::super::dispatch::is_credit_limit_error(None, message);
+            is_credit_limit = super::super::dispatch::is_credit_limit_error(*http_status, message);
             if is_credit_limit {
                 session.credit_limit_blocked = true;
             } else if is_reauthable_failure(Some(error_type.as_str()), message) {
@@ -1606,7 +1623,7 @@ pub(super) fn apply_retry_state(
             } else {
                 scrollback.push_block(RenderBlock::session_event(
                     crate::app::error_display::format_request_failure(
-                        None,
+                        *http_status,
                         Some(error_type.as_str()),
                         message,
                     )

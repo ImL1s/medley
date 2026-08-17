@@ -295,7 +295,9 @@ fn normalize_phrase(s: &str) -> String {
 /// Pull an HTTP error status (4xx/5xx only — prose like "status 200" or a
 /// year must never classify a failure) out of a raw dump
 /// (`API error (status 500): …`, `Unauthorized (401)`, or an
-/// already-formatted `Server error (500) — …`).
+/// already-formatted `Server error (500) — …`). The exact legacy shell shape
+/// `Provider request failed (HTTP N)` is accepted without treating arbitrary
+/// `HTTP N` prose as structured status.
 pub(crate) fn parse_http_status(raw: &str) -> Option<u16> {
     // Every "status " occurrence, so "status unknown; … status 503" still
     // finds the code.
@@ -330,6 +332,7 @@ pub(crate) fn parse_http_status(raw: &str) -> Option<u16> {
         "Rate limited (",
         "Request timed out (",
         "Conflict (",
+        "Provider request failed (HTTP ",
     ];
     for marker in MARKERS {
         if let Some(i) = find_ignore_ascii_case(raw, marker)
@@ -379,6 +382,10 @@ fn extract_error_detail(raw: &str) -> Option<String> {
         s = rest;
     }
 
+    if let Some(rest) = strip_provider_request_failed_prefix(&s) {
+        s = rest;
+    }
+
     // JSON before the URL-clause strip: a URL inside a JSON string would
     // otherwise split the body at its own ": " and leave garbage.
     if let Some(json_start) = s.find('{')
@@ -421,6 +428,17 @@ fn strip_api_error_prefix(s: &str) -> Option<String> {
     let after = &s[start + "API error (status ".len()..];
     let colon = after.find("): ")?;
     Some(after[colon + 3..].trim().to_string())
+}
+
+/// Strip only the shell's exact terminal provider prefix. This deliberately
+/// does not recognize arbitrary `HTTP N` prose, and the code must remain a
+/// 4xx/5xx three-digit status before any following text is treated as detail.
+fn strip_provider_request_failed_prefix(s: &str) -> Option<String> {
+    const PREFIX: &str = "Provider request failed (HTTP ";
+    let after = s.strip_prefix(PREFIX)?;
+    parse_status_digits(after, true)?;
+    let rest = after.get(4..)?.strip_prefix('.')?.trim();
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
 fn strip_from_url_clause(s: &str) -> String {
@@ -744,6 +762,24 @@ mod tests {
             parse_http_status("Server error (500) \u{2014} Something went wrong on our side."),
             Some(500)
         );
+        assert_eq!(
+            parse_http_status(
+                "Provider request failed (HTTP 400). invalid field `reasoning.effort`"
+            ),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn formats_legacy_provider_400_as_bad_request_with_safe_detail() {
+        let formatted = format_request_failure(
+            None,
+            Some("api"),
+            "Provider request failed (HTTP 400). invalid field `reasoning.effort`",
+        );
+        assert_eq!(formatted.status, Some(400));
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert_eq!(formatted.detail, "invalid field `reasoning.effort`");
     }
 
     #[test]
@@ -785,6 +821,14 @@ mod tests {
         assert_eq!(parse_http_status("status 2024 items processed"), None);
         assert_eq!(
             parse_http_status("merge conflict (300 files changed)"),
+            None
+        );
+        assert_eq!(
+            parse_http_status("proxy noted HTTP 400 in free-form prose"),
+            None
+        );
+        assert_eq!(
+            parse_http_status("Provider request failed (HTTP 40x). malformed"),
             None
         );
         // A later occurrence still parses.

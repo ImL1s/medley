@@ -100,6 +100,58 @@ pub fn ensure_owner_only_permissions(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Ensure a directory is accessible only by the current user.
+///
+/// Unix directories require execute permission for traversal, so this uses
+/// `0o700` rather than the `0o600` file mode. Windows uses the same protected
+/// owner-only ACL as secure files.
+pub fn ensure_owner_only_directory_permissions(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "owner-only directory path is not a real directory",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owner-only directory path is a reparse point",
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "owner-only directory is not owned by the current user",
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o777 != 0o700 {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(path, permissions)?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        secure_windows_directory_on_handle(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Ensure the object referenced by an already-open file handle is owner-only.
 ///
 /// Strict credential writers use this after exclusive creation and before
@@ -173,7 +225,7 @@ pub fn set_windows_secure_permissions(path: &Path) -> io::Result<()> {
         .chain(std::iter::once(0))
         .collect();
 
-    with_windows_owner_only_acl(|new_acl| unsafe {
+    with_windows_owner_only_acl(windows::Win32::Security::ACE_FLAGS(0), |new_acl| unsafe {
         SetNamedSecurityInfoW(
             PCWSTR::from_raw(wide_path.as_ptr()),
             SE_FILE_OBJECT,
@@ -187,6 +239,248 @@ pub fn set_windows_secure_permissions(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+pub(crate) fn enable_windows_privilege(name: windows::core::PCWSTR) -> io::Result<()> {
+    use windows::Win32::Foundation::LUID;
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .map_err(io::Error::other)?;
+        let token = WindowsHandle(token);
+        let mut luid = LUID::default();
+        LookupPrivilegeValueW(None, name, &mut luid).map_err(io::Error::other)?;
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        AdjustTokenPrivileges(token.0, false, Some(&privileges), 0, None, None)
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows::Win32::Security::{
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL, WRITE_DAC,
+    };
+
+    // Administrators tokens have these privileges assigned but disabled.
+    // Taking ownership of a GHA temp directory requires them to be enabled.
+    let _ = enable_windows_privilege(windows::core::w!("SeTakeOwnershipPrivilege"));
+    let _ = enable_windows_privilege(windows::core::w!("SeRestorePrivilege"));
+
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    let directory = OpenOptions::new()
+        .access_mode((READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES).0 | WRITE_OWNER)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(path)?;
+    let handle = HANDLE(directory.as_raw_handle());
+    unsafe {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        GetFileInformationByHandle(handle, &mut info).map_err(io::Error::other)?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owner-only directory path is a reparse point",
+            ));
+        }
+
+        let current_user = current_windows_user()?;
+        let current_sid = current_user.sid();
+        with_windows_owner_only_acl(CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE, |new_acl| {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                Some(current_sid),
+                None,
+                Some(new_acl),
+                None,
+            )
+        })?;
+        verify_windows_directory_acl(handle, current_sid)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_windows_directory_acl(
+    handle: windows::Win32::Foundation::HANDLE,
+    current_sid: windows::Win32::Security::PSID,
+) -> io::Result<()> {
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorControl, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
+
+    unsafe {
+        let mut dacl = std::ptr::null_mut();
+        let mut raw_descriptor = PSECURITY_DESCRIPTOR::default();
+        let status = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut raw_descriptor),
+        );
+        if status.0 != 0 {
+            return Err(io::Error::from_raw_os_error(status.0 as i32));
+        }
+        let _descriptor = WindowsLocalAllocation::new(raw_descriptor.0);
+
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        GetSecurityDescriptorControl(raw_descriptor, &mut control, &mut revision)
+            .map_err(io::Error::other)?;
+        let protected = control & SE_DACL_PROTECTED.0 != 0;
+
+        let ace_count = if dacl.is_null() { 0 } else { (*dacl).AceCount };
+        let required_flags = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE).0 as u8;
+        let mut current_user_full_control = false;
+        let mut foreign_allow = false;
+        for index in 0..ace_count {
+            let mut raw_ace = std::ptr::null_mut();
+            if GetAce(dacl, u32::from(index), &mut raw_ace).is_err() || raw_ace.is_null() {
+                continue;
+            }
+            let ace = &*(raw_ace as *const ACCESS_ALLOWED_ACE);
+            if ace.Header.AceType != 0 {
+                continue;
+            }
+            let ace_sid =
+                windows::Win32::Security::PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast());
+            let full_control = ace.Mask == 0x10000000 || ace.Mask & 0x001f01ff == 0x001f01ff;
+            let inherited = ace.Header.AceFlags & required_flags == required_flags;
+            if EqualSid(ace_sid, current_sid).is_ok() {
+                if full_control && inherited {
+                    current_user_full_control = true;
+                }
+            } else {
+                foreign_allow = true;
+            }
+        }
+        if !protected || !current_user_full_control || foreign_allow {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "owner-only directory ACL verification failed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsLocalAllocation(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl WindowsLocalAllocation {
+    fn new(pointer: *mut std::ffi::c_void) -> Self {
+        Self(pointer)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsLocalAllocation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = windows::Win32::Foundation::LocalFree(Some(
+                    windows::Win32::Foundation::HLOCAL(self.0),
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsCurrentUser {
+    // `usize` storage provides sufficient alignment for `TOKEN_USER` and its SID.
+    buffer: Vec<usize>,
+}
+
+#[cfg(windows)]
+impl WindowsCurrentUser {
+    fn sid(&self) -> windows::Win32::Security::PSID {
+        unsafe {
+            (*(self.buffer.as_ptr() as *const windows::Win32::Security::TOKEN_USER))
+                .User
+                .Sid
+        }
+    }
+}
+
+#[cfg(windows)]
+fn current_windows_user() -> io::Result<WindowsCurrentUser> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(io::Error::other)?;
+        let token = WindowsHandle(token);
+        let mut length = 0;
+        let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut length);
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let word_size = std::mem::size_of::<usize>();
+        let mut buffer = vec![0usize; (length as usize).div_ceil(word_size)];
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            length,
+            &mut length,
+        )
+        .map_err(io::Error::other)?;
+        Ok(WindowsCurrentUser { buffer })
+    }
+}
+
+#[cfg(windows)]
 fn set_windows_secure_permissions_for_file(file: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
@@ -196,7 +490,7 @@ fn set_windows_secure_permissions_for_file(file: &File) -> io::Result<()> {
     };
 
     let handle = HANDLE(file.as_raw_handle());
-    with_windows_owner_only_acl(|new_acl| unsafe {
+    with_windows_owner_only_acl(windows::Win32::Security::ACE_FLAGS(0), |new_acl| unsafe {
         SetSecurityInfo(
             handle,
             SE_FILE_OBJECT,
@@ -211,11 +505,12 @@ fn set_windows_secure_permissions_for_file(file: &File) -> io::Result<()> {
 
 #[cfg(windows)]
 fn with_windows_owner_only_acl(
+    inheritance: windows::Win32::Security::ACE_FLAGS,
     apply_acl: impl FnOnce(
         *mut windows::Win32::Security::ACL,
     ) -> windows::Win32::Foundation::WIN32_ERROR,
 ) -> io::Result<()> {
-    use windows::Win32::Foundation::{CloseHandle, HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{
         EXPLICIT_ACCESS_W, SET_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
@@ -226,27 +521,29 @@ fn with_windows_owner_only_acl(
 
     unsafe {
         // Get current process token
-        let mut token_handle = windows::Win32::Foundation::HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
+        let mut raw_token = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token)
             .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+        let token_handle = WindowsHandle(raw_token);
 
         // Get token user size
         let mut return_length = 0u32;
-        let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut return_length);
+        let _ = GetTokenInformation(token_handle.0, TokenUser, None, 0, &mut return_length);
+        if return_length == 0 {
+            return Err(io::Error::last_os_error());
+        }
 
         // Get token user (current user's SID)
-        let mut token_user_buffer = vec![0u8; return_length as usize];
+        let word_size = std::mem::size_of::<usize>();
+        let mut token_user_buffer = vec![0usize; (return_length as usize).div_ceil(word_size)];
         GetTokenInformation(
-            token_handle,
+            token_handle.0,
             TokenUser,
             Some(token_user_buffer.as_mut_ptr() as *mut _),
             return_length,
             &mut return_length,
         )
-        .map_err(|e| {
-            let _ = CloseHandle(token_handle);
-            io::Error::new(io::ErrorKind::PermissionDenied, e)
-        })?;
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
 
         // The TOKEN_USER structure starts with a SID_AND_ATTRIBUTES which has PSID as first field
         let token_user = &*(token_user_buffer.as_ptr() as *const TOKEN_USER);
@@ -257,7 +554,7 @@ fn with_windows_owner_only_acl(
         let explicit_access = EXPLICIT_ACCESS_W {
             grfAccessPermissions: 0x10000000, // GENERIC_ALL
             grfAccessMode: SET_ACCESS,
-            grfInheritance: ACE_FLAGS(0), // No inheritance for files
+            grfInheritance: inheritance,
             Trustee: TRUSTEE_W {
                 pMultipleTrustee: std::ptr::null_mut(),
                 MultipleTrusteeOperation:
@@ -272,7 +569,6 @@ fn with_windows_owner_only_acl(
         let mut new_acl: *mut ACL = std::ptr::null_mut();
         let result = SetEntriesInAclW(Some(&[explicit_access]), None, &mut new_acl);
         if result.0 != 0 {
-            let _ = CloseHandle(token_handle);
             return Err(io::Error::from_raw_os_error(result.0 as i32));
         }
 
@@ -280,7 +576,6 @@ fn with_windows_owner_only_acl(
 
         // Clean up
         let _ = LocalFree(Some(HLOCAL(new_acl as *mut _)));
-        let _ = CloseHandle(token_handle);
 
         if result.0 != 0 {
             return Err(io::Error::from_raw_os_error(result.0 as i32));
@@ -384,5 +679,152 @@ mod tests {
             0o600
         );
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "new secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_owner_only_directory_keeps_traversal_and_removes_group_access() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let directory = temp_dir.path().join("private-stage");
+        fs::create_dir(&directory).unwrap();
+        let mut loose = fs::metadata(&directory).unwrap().permissions();
+        loose.set_mode(0o755);
+        fs::set_permissions(&directory, loose).unwrap();
+
+        ensure_owner_only_directory_permissions(&directory).unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::write(directory.join("probe"), b"ok").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_owner_only_directory_rejects_symlink() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = temp_dir.path().join("target");
+        let link = temp_dir.path().join("private-stage");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = ensure_owner_only_directory_permissions(&link).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(windows)]
+    fn has_single_current_user_ace(path: &Path) -> io::Result<bool> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+        use windows::Win32::Security::{
+            ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, PSECURITY_DESCRIPTOR,
+        };
+
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        };
+
+        let object = OpenOptions::new()
+            .access_mode(READ_CONTROL.0)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+            .open(path)?;
+        let current_user = current_windows_user()?;
+        unsafe {
+            let mut dacl = std::ptr::null_mut();
+            let mut raw_descriptor = PSECURITY_DESCRIPTOR::default();
+            let status = GetSecurityInfo(
+                HANDLE(object.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                Some(&mut raw_descriptor),
+            );
+            if status.0 != 0 {
+                return Err(io::Error::from_raw_os_error(status.0 as i32));
+            }
+            let _descriptor = WindowsLocalAllocation::new(raw_descriptor.0);
+            if dacl.is_null() {
+                return Ok(false);
+            }
+            let current_sid = current_user.sid();
+            let mut current_user_full_control = false;
+            let mut foreign_allow = false;
+            for index in 0..(*dacl).AceCount {
+                let mut raw_ace = std::ptr::null_mut();
+                if GetAce(dacl, u32::from(index), &mut raw_ace).is_err() || raw_ace.is_null() {
+                    continue;
+                }
+                let ace = &*(raw_ace as *const ACCESS_ALLOWED_ACE);
+                if ace.Header.AceType != 0 {
+                    continue;
+                }
+                let ace_sid = windows::Win32::Security::PSID(
+                    std::ptr::addr_of!(ace.SidStart).cast_mut().cast(),
+                );
+                let full_control = ace.Mask == 0x10000000 || ace.Mask & 0x001f01ff == 0x001f01ff;
+                if EqualSid(ace_sid, current_sid).is_ok() {
+                    if full_control {
+                        current_user_full_control = true;
+                    }
+                } else {
+                    foreign_allow = true;
+                }
+            }
+            Ok(current_user_full_control && !foreign_allow)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ensure_owner_only_directory_acl_is_inherited_by_children() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let directory = temp_dir.path().join("private-stage");
+        fs::create_dir(&directory).unwrap();
+
+        ensure_owner_only_directory_permissions(&directory).unwrap();
+        let child_directory = directory.join("child");
+        let child_file = directory.join("probe");
+        fs::create_dir(&child_directory).unwrap();
+        fs::write(&child_file, b"ok").unwrap();
+
+        assert!(has_single_current_user_ace(&child_directory).unwrap());
+        assert!(has_single_current_user_ace(&child_file).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ensure_owner_only_directory_rejects_reparse_point() {
+        use std::process::Command;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = temp_dir.path().join("target");
+        let link = temp_dir.path().join("private-stage");
+        fs::create_dir(&target).unwrap();
+        // A junction is a directory reparse point and does not require the
+        // developer-mode/symlink privilege that would make this test silently
+        // vacuous on locked-down Windows runners.
+        let mut command = Command::new("cmd");
+        command.args(["/C", "mklink", "/J"]).arg(&link).arg(&target);
+        xai_tty_utils::detach_std_command(&mut command);
+        let output = command
+            .output()
+            .expect("create junction with cmd /C mklink");
+        assert!(
+            output.status.success(),
+            "failed to create test junction: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let error = ensure_owner_only_directory_permissions(&link).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

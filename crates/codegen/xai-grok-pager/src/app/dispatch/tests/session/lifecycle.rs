@@ -986,6 +986,7 @@ fn switch_model_deferred_when_no_session_id() {
             model_id,
             effort: None,
             prev_model_id: None,
+            prev_model_id_captured: true,
         })
     );
     assert!(!app.agents[&id].session.model_switch_pending);
@@ -1319,6 +1320,7 @@ fn deferred_switch_prefers_authoritative_current_as_prev() {
         model_id: model_b.clone(),
         effort: None,
         prev_model_id: None,
+        prev_model_id_captured: false,
     });
     agent.session.models.current = Some(server_model.clone());
     let effects = dispatch(
@@ -1352,6 +1354,7 @@ fn deferred_model_switch_applied_on_session_created() {
         model_id: model_id.clone(),
         effort: None,
         prev_model_id: None,
+        prev_model_id_captured: false,
     });
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionCreated {
@@ -1413,6 +1416,7 @@ fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
             model_id: model_new.clone(),
             effort: None,
             prev_model_id: Some(model_old.clone()),
+            prev_model_id_captured: false,
         });
         agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
             request_id: None,
@@ -1493,6 +1497,7 @@ fn deferred_switch_dropped_at_apply_releases_stash_time_slot() {
             model_id: acp::ModelId::new(std::sync::Arc::from("gone-model")),
             effort: None,
             prev_model_id: None,
+            prev_model_id_captured: false,
         });
     }
     // The stash-time claim: this agent owns the slot, no request id yet.
@@ -1580,6 +1585,7 @@ fn a_refused_deferred_switch_restores_the_truth_not_a_stale_snapshot() {
                 model_id: model_new.clone(),
                 effort: None,
                 prev_model_id: Some(model_old.clone()),
+                prev_model_id_captured: false,
             });
             agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
                 request_id: None,
@@ -1698,6 +1704,7 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
             model_id: model_c.clone(),
             effort: None,
             prev_model_id: Some(model_a.clone()),
+            prev_model_id_captured: true,
         }),
     );
 
@@ -1859,6 +1866,73 @@ fn rapid_no_session_model_choice_failure_restores_original_model() {
         Some(&model_a)
     );
 }
+
+#[test]
+fn rapid_no_session_model_choice_failure_restores_original_none_end_to_end() {
+    use super::super::super::settings::setters::set_default_model_confirmed;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_b = acp::ModelId::new("none-origin-b");
+    let model_c = acp::ModelId::new("none-origin-c");
+    let infos = [&model_b, &model_c]
+        .into_iter()
+        .map(|model| acp::ModelInfo::new(model.clone(), model.0.to_string()))
+        .collect::<Vec<_>>();
+    for info in &infos {
+        app.models
+            .available
+            .insert(info.model_id.clone(), info.clone());
+        app.agents[&id]
+            .session
+            .models
+            .available
+            .insert(info.model_id.clone(), info.clone());
+    }
+    app.models.current = None;
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.models.current = None;
+        agent.session.session_id = None;
+    }
+
+    set_default_model_confirmed(&mut app, model_b.clone());
+    set_default_model_confirmed(&mut app, model_c.clone());
+    let deferred = app.agents[&id]
+        .session
+        .deferred_model_switch
+        .as_ref()
+        .expect("rapid picks remain deferred before session creation");
+    assert!(deferred.prev_model_id_captured);
+    assert_eq!(
+        deferred.prev_model_id, None,
+        "the original None is preserved"
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: acp::SessionId::new("none-origin-session"),
+            models: Some(acp::SessionModelState::new(model_b, infos)),
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    let request_id = switch_model_request_id(&effects);
+    dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_c,
+            effort: None,
+            request_id,
+            result: Err(SwitchModelError::Other("rejected".into())),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+    assert_eq!(app.models.current, None);
+    assert_eq!(app.agents[&id].session.models.current, None);
+}
 #[test]
 fn deferred_model_switch_applied_on_worktree_session_created() {
     let mut app = test_app_git();
@@ -1881,6 +1955,7 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
         model_id: model_id.clone(),
         effort: None,
         prev_model_id: None,
+        prev_model_id_captured: false,
     });
     let session_id: acp::SessionId = "wt-session".into();
     let effects = dispatch(

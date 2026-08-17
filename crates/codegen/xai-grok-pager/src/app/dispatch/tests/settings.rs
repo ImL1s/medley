@@ -1146,6 +1146,78 @@ fn refresh_open_settings_modals_updates_reset_confirm_settings_state() {
         _ => panic!("expected ResetSettingsConfirm still active"),
     }
 }
+
+/// A live model-catalog refresh can remove the row currently highlighted in an
+/// open dynamic picker. The picker must not retain its old numeric index: that
+/// leaves no rendered focus row and makes Enter silently close without a
+/// commit. Returning to Browse forces an explicit choice from the new catalog.
+#[test]
+fn refresh_open_settings_modals_exits_dynamic_picker_when_highlighted_model_disappears() {
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::{
+        SettingsKeyOutcome, SettingsModalMode, handle_settings_key,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::Arc;
+
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let first_id = acp::ModelId::new(Arc::from("catalog/a"));
+    let removed_id = acp::ModelId::new(Arc::from("catalog/z"));
+    {
+        let models = &mut app.agents.get_mut(&agent_id).unwrap().session.models;
+        models.available.clear();
+        models.available.insert(
+            first_id.clone(),
+            acp::ModelInfo::new(first_id.clone(), "Model A".to_string()),
+        );
+        models.available.insert(
+            removed_id.clone(),
+            acp::ModelInfo::new(removed_id.clone(), "Model Z".to_string()),
+        );
+        models.set_current(first_id.clone(), None);
+    }
+    let _ = dispatch(Action::OpenSettings, &mut app);
+    {
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        let Some(ActiveModal::Settings { state }) = &mut agent.active_modal else {
+            panic!("settings modal must be open")
+        };
+        assert!(state.focus_key("default_model"));
+        assert!(state.try_enter_picking_enum());
+        assert!(matches!(
+            handle_settings_key(state, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),),
+            SettingsKeyOutcome::Changed
+        ));
+        assert!(matches!(
+            state.mode(),
+            SettingsModalMode::PickingEnum { choices_idx: 2, .. }
+        ));
+    }
+
+    app.agents
+        .get_mut(&agent_id)
+        .unwrap()
+        .session
+        .models
+        .available
+        .shift_remove(&removed_id);
+    refresh_open_settings_modals(&mut app);
+
+    let agent = app.agents.get(&agent_id).unwrap();
+    let Some(ActiveModal::Settings { state }) = &agent.active_modal else {
+        panic!("settings modal must remain open")
+    };
+    assert!(
+        matches!(state.mode(), SettingsModalMode::Browse),
+        "catalog removal must leave the invalid picker instead of retaining a stale index"
+    );
+    assert_eq!(
+        state.focused_setting().map(|(key, _)| key),
+        Some("default_model"),
+        "returning to Browse must keep focus on the affected setting"
+    );
+}
 /// The
 /// dispatch-arm bail-out path is verified directly via
 /// `#[should_panic]` in debug mode rather than the previous
@@ -1346,6 +1418,60 @@ fn set_default_model_resolves_known_name() {
     ));
     assert_eq!(app.agents[&agent_id].session.models.current, Some(id));
 }
+
+#[test]
+fn stale_settings_model_choice_reports_catalog_change() {
+    let mut app = test_app_with_agent();
+    let id = acp::ModelId::new(std::sync::Arc::from("removed-after-modal-open"));
+
+    let effects = dispatch(Action::SetDefaultModel(id), &mut app);
+
+    assert!(effects.is_empty());
+    let toast = app.agents[&AgentId(0)]
+        .toast
+        .as_ref()
+        .map(|(message, _)| message.as_str());
+    assert_eq!(
+        toast,
+        Some("The model catalog changed; choose an available model and try again")
+    );
+}
+
+#[test]
+fn settings_snapshot_displays_but_does_not_offer_unavailable_resident() {
+    use agent_client_protocol as acp;
+    use std::sync::Arc;
+
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let resident_id = acp::ModelId::new(Arc::from("retired"));
+    let resident_info = acp::ModelInfo::new(resident_id.clone(), "Retired Model".to_string()).meta(
+        serde_json::json!({ "unavailableResidentModel": true })
+            .as_object()
+            .cloned(),
+    );
+    let ready_id = acp::ModelId::new(Arc::from("ready"));
+    let ready_info = acp::ModelInfo::new(ready_id.clone(), "Ready Model".to_string());
+    {
+        let models = &mut app.agents.get_mut(&agent_id).unwrap().session.models;
+        models.available.insert(resident_id.clone(), resident_info);
+        models.available.insert(ready_id.clone(), ready_info);
+        models.current = Some(resident_id);
+    }
+
+    let snapshot = build_pager_snapshot(&app);
+    assert_eq!(
+        snapshot.current_model_name.as_deref(),
+        Some("Retired Model"),
+        "settings must continue to display the session's actual resident model"
+    );
+    assert_eq!(
+        snapshot.available_models,
+        vec![("Ready Model".to_string(), ready_id)],
+        "the displayed-only resident placeholder must not become a settings choice"
+    );
+}
+
 fn model_with_readiness_meta(
     id: &str,
     name: &str,
@@ -1953,6 +2079,36 @@ fn set_simple_mode_no_op_when_no_active_agent() {
         other => panic!("expected PersistSetting, got {other:?}"),
     }
     assert_eq!(app.current_ui.simple_mode, Some(true));
+}
+
+#[test]
+fn fork_secondary_model_rejects_unready_catalog_entry_without_mutation_or_persist() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_id = acp::ModelId::new(std::sync::Arc::from("provider/unready"));
+    let mut meta = serde_json::Map::new();
+    meta.insert("ready".into(), serde_json::json!(false));
+    meta.insert(
+        "readinessReason".into(),
+        serde_json::json!("Codex authentication required"),
+    );
+    let info =
+        acp::ModelInfo::new(model_id.clone(), "Unavailable Codex".to_string()).meta(Some(meta));
+    app.agents[&id]
+        .session
+        .models
+        .available
+        .insert(model_id.clone(), info);
+    let before = app.current_ui.fork_secondary_model.clone();
+
+    let effects = dispatch(Action::SetForkSecondaryModel(model_id), &mut app);
+
+    assert!(
+        effects.is_empty(),
+        "unready model must not emit persistence"
+    );
+    assert_eq!(app.current_ui.fork_secondary_model, before);
+    assert_eq!(read_toast(&app), "Codex authentication required");
 }
 /// `set_simple_mode_inner` propagates to **every** agent, not just
 /// the active one — without iterating

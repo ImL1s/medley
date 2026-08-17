@@ -211,6 +211,56 @@ impl TestHarness {
     }
 }
 
+#[tokio::test]
+async fn gated_spawn_cancelled_before_readiness_does_not_scan_or_drain() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let working_dir = temp_dir.path().to_path_buf();
+    git(&working_dir, &["init"]);
+    git(&working_dir, &["config", "user.name", "Test User"]);
+    git(&working_dir, &["config", "user.email", "test@test.com"]);
+    git(
+        &working_dir,
+        &["commit", "--allow-empty", "-m", "Initial commit"],
+    );
+
+    let dirty_path = working_dir.join("dirty.txt");
+    std::fs::write(&dirty_path, "dirty\n").expect("write dirty file");
+
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let handle = HunkTrackerActor::spawn_when_ready(
+        "gated-test-session".to_string(),
+        working_dir,
+        event_tx,
+        TrackingMode::AllDirty,
+        cancellation_token.clone(),
+        async move { ready_rx.await.unwrap_or(false) },
+    );
+
+    // This command would emit events if the actor drained it. AllDirty startup
+    // would independently emit events for the untracked dirty file.
+    handle.record_agent_write(dirty_path, "dirty\n".to_string(), 0, None);
+    cancellation_token.cancel();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !handle.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("gated actor did not exit after cancellation");
+
+    assert!(
+        ready_tx.send(true).is_err(),
+        "readiness future should be dropped on cancellation"
+    );
+    assert!(
+        event_rx.try_recv().is_err(),
+        "cancelled gated actor must not scan or drain queued commands"
+    );
+}
+
 // =========================================================================
 // Basic Hunk Tracking Tests
 // =========================================================================

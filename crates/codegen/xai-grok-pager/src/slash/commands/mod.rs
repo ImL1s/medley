@@ -553,15 +553,20 @@ mod tests {
         let cmd = model::ModelCommand;
         let items = cmd.suggest_args(&ctx, "").expect("should have suggestions");
         assert_eq!(items.len(), 2);
+        // Insert catalog IDs, not display names, so /model grok-4.5 stays
+        // unambiguous after a live-catalog name change. The current model
+        // is marked in display (#359).
         assert!(
-            items
-                .iter()
-                .any(|i| i.display.starts_with("Grok 4.5") && i.insert_text == "Grok 4.5")
+            items.iter().any(|i| i.display.starts_with("Grok 4.5")
+                && i.display.contains("(current)")
+                && i.insert_text == "grok-4.5"),
+            "items: {items:?}"
         );
         assert!(
             items
                 .iter()
-                .any(|i| i.display == "Grok 4.3" && i.insert_text == "Grok 4.3")
+                .any(|i| i.display == "Grok 4.3" && i.insert_text == "grok-4.3"),
+            "items: {items:?}"
         );
     }
     #[test]

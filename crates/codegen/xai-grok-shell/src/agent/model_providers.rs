@@ -1,10 +1,864 @@
 use indexmap::IndexMap;
+use reqwest::header::HeaderValue;
 
 use super::config::{ConfigModelOverride, EnvKeys};
 use super::config_model_override_parse::{ConfigWarning, ConfigWarningKind};
 use crate::sampling::ApiBackend;
 
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+/// Reserved first-party provider profile for ChatGPT Codex OAuth traffic.
+pub const OPENAI_CODEX_PROVIDER_ID: &str = "openai-codex";
+
+/// Catalog key and routing slug of the built-in Codex preset. The two are the
+/// same string so a user's `[model."gpt-5.6-sol"]` in the global config
+/// replaces the preset in place instead of adding a second entry.
+pub const OPENAI_CODEX_PRESET_MODEL_ID: &str = "gpt-5.6-sol";
+
+/// Conservative context window for the built-in fallback preset.
+///
+/// A successful account-scoped catalog refresh replaces this estimate with
+/// the server's `context_window` metadata. Under-reporting is the safe degraded
+/// behavior when neither a live nor saved catalog is available because it only
+/// makes auto-compaction start earlier.
+const OPENAI_CODEX_PRESET_CONTEXT_WINDOW: u64 = 200_000;
+const OPENAI_CODEX_MODELS_CATALOG_DESCRIPTION: &str = "OpenAI Codex via a ChatGPT subscription";
+const OPENAI_CODEX_CATALOG_CACHE_DIR: &str = "codex-model-catalog";
+const OPENAI_CODEX_CATALOG_CACHE_SCHEMA: u32 = 1;
+pub(crate) const OPENAI_CODEX_CATALOG_DEGRADED_MARKER: &str = "Catalog degraded: ";
+const OPENAI_CODEX_SAVED_CATALOG_REASON: &str =
+    "live refresh failed; using the last saved catalog for this account";
+const OPENAI_CODEX_BUILTIN_FALLBACK_REASON: &str =
+    "live refresh failed and no saved catalog exists for this account; using the built-in fallback";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CodexCatalogCache {
+    schema: u32,
+    payload: serde_json::Value,
+}
+
+struct CodexCatalogCredential {
+    access_token: String,
+    account_id: Option<String>,
+    chatgpt_account_is_fedramp: bool,
+    source: xai_grok_sampler::CredentialSource,
+}
+
+struct CodexCatalogCacheIdentity {
+    account_id: Option<String>,
+    chatgpt_account_is_fedramp: bool,
+}
+
+fn codex_catalog_cache_path(
+    home: &std::path::Path,
+    identity: &CodexCatalogCacheIdentity,
+) -> Option<std::path::PathBuf> {
+    let account_id = identity.account_id.as_deref()?;
+    // The filename is stable for one account and origin, but never exposes the
+    // raw account id. FedRAMP is part of the identity boundary as well: the
+    // same account label must not bridge those two catalog authorities.
+    let identity = format!(
+        "v1\0{}\0{}\0{}",
+        crate::auth::openai_codex::CODEX_API_BASE_URL,
+        identity.chatgpt_account_is_fedramp,
+        account_id
+    );
+    let key = blake3::hash(identity.as_bytes()).to_hex();
+    Some(
+        home.join(OPENAI_CODEX_CATALOG_CACHE_DIR)
+            .join(format!("{key}.json")),
+    )
+}
+
+fn load_codex_catalog_cache(
+    path: &std::path::Path,
+) -> Option<IndexMap<String, ConfigModelOverride>> {
+    let bytes = std::fs::read(path).ok()?;
+    let cache: CodexCatalogCache = serde_json::from_slice(&bytes).ok()?;
+    if cache.schema != OPENAI_CODEX_CATALOG_CACHE_SCHEMA {
+        tracing::debug!(path = %path.display(), "Codex catalog cache schema mismatch");
+        return None;
+    }
+    let models = parse_openai_codex_catalog_models(&cache.payload);
+    (!models.is_empty()).then_some(models)
+}
+
+fn persist_codex_catalog_cache(path: &std::path::Path, payload: &serde_json::Value) {
+    let cache = CodexCatalogCache {
+        schema: OPENAI_CODEX_CATALOG_CACHE_SCHEMA,
+        payload: payload.clone(),
+    };
+    let Ok(bytes) = serde_json::to_vec_pretty(&cache) else {
+        tracing::warn!("Codex catalog cache serialization failed");
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    #[cfg(unix)]
+    let cache_directory_created = !parent.exists();
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        tracing::warn!(error = %error, "Codex catalog cache directory creation failed");
+        return;
+    }
+    #[cfg(unix)]
+    if cache_directory_created
+        && let Some(home) = parent.parent()
+        && let Err(error) = std::fs::File::open(home).and_then(|directory| directory.sync_all())
+    {
+        tracing::warn!(error = %error, "Codex catalog cache parent directory sync failed");
+    }
+    static CACHE_WRITE_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{sequence}", std::process::id()));
+    if let Err(error) = write_codex_catalog_cache_tmp(&tmp, &bytes) {
+        tracing::warn!(error = %error, "Codex catalog cache write failed");
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Err(error) = replace_codex_catalog_cache(&tmp, path) {
+        tracing::warn!(error = %error, "Codex catalog cache publish failed");
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    #[cfg(unix)]
+    if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        tracing::warn!(error = %error, "Codex catalog cache directory sync failed");
+    }
+}
+
+fn write_codex_catalog_cache_tmp(tmp: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let open = || {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(tmp)
+    };
+    let mut file = match open() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(tmp)?;
+            open()?
+        }
+        Err(error) => return Err(error),
+    };
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn replace_codex_catalog_cache(
+    tmp: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if !path.exists() {
+            return std::fs::rename(tmp, path);
+        }
+
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        use windows::core::PCWSTR;
+
+        let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(once(0)).collect();
+        let to: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        unsafe {
+            MoveFileExW(
+                PCWSTR::from_raw(from.as_ptr()),
+                PCWSTR::from_raw(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, path)
+    }
+}
+
+fn mark_codex_catalog_degraded(
+    mut models: IndexMap<String, ConfigModelOverride>,
+    reason: &str,
+) -> IndexMap<String, ConfigModelOverride> {
+    for model in models.values_mut() {
+        model.catalog_degraded_reason = Some(reason.to_owned());
+    }
+    models
+}
+
+fn codex_catalog_fallback_models(
+    cache_path: Option<&std::path::Path>,
+) -> IndexMap<String, ConfigModelOverride> {
+    if let Some(models) = cache_path.and_then(load_codex_catalog_cache) {
+        tracing::warn!(
+            count = models.len(),
+            "Codex catalog live refresh failed; using account-scoped last-good cache"
+        );
+        return mark_codex_catalog_degraded(models, OPENAI_CODEX_SAVED_CATALOG_REASON);
+    }
+    tracing::warn!("Codex catalog live refresh failed; using visible built-in fallback");
+    mark_codex_catalog_degraded(
+        openai_codex_preset_models(),
+        OPENAI_CODEX_BUILTIN_FALLBACK_REASON,
+    )
+}
+
+fn load_codex_catalog_when_remote_fetch_disabled(
+    cache_path: Option<&std::path::Path>,
+) -> Option<IndexMap<String, ConfigModelOverride>> {
+    let models = cache_path.and_then(load_codex_catalog_cache)?;
+    tracing::info!(
+        count = models.len(),
+        "Codex catalog live refresh skipped; using account-scoped saved catalog"
+    );
+    Some(models)
+}
+
+impl std::fmt::Debug for CodexCatalogCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexCatalogCredential")
+            .field("access_token_present", &!self.access_token.is_empty())
+            .field("account_id_present", &self.account_id.is_some())
+            .field(
+                "chatgpt_account_is_fedramp",
+                &self.chatgpt_account_is_fedramp,
+            )
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+fn codex_catalog_credential_source_is_valid(source: &xai_grok_sampler::CredentialSource) -> bool {
+    matches!(
+        source,
+        xai_grok_sampler::CredentialSource::AuthProvider { name }
+            if name == OPENAI_CODEX_PROVIDER_ID
+    )
+}
+
+fn codex_catalog_credential_from_snapshot(
+    snapshot: xai_grok_sampler::config::ProviderCredentialSnapshot,
+) -> Option<CodexCatalogCredential> {
+    let access_token = snapshot.access_token.trim();
+    if access_token.is_empty() {
+        return None;
+    }
+    let account_id = snapshot
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    Some(CodexCatalogCredential {
+        access_token: access_token.to_owned(),
+        account_id,
+        chatgpt_account_is_fedramp: snapshot.chatgpt_account_is_fedramp,
+        source: xai_grok_sampler::CredentialSource::AuthProvider {
+            name: OPENAI_CODEX_PROVIDER_ID.to_owned(),
+        },
+    })
+}
+
+fn codex_catalog_access_from_manager(
+    manager: &crate::auth::AuthManager,
+) -> Option<(CodexCatalogCacheIdentity, Option<CodexCatalogCredential>)> {
+    // Retain the verified account boundary even when the bearer has entered
+    // the refresh window or expired. It is safe for cache lookup only; the
+    // live request below still requires credential_snapshot/current().
+    let retained = manager.current_or_expired()?;
+    let identity = CodexCatalogCacheIdentity {
+        account_id: retained
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        chatgpt_account_is_fedramp: retained.chatgpt_account_is_fedramp,
+    };
+    let live = crate::auth::openai_codex::credential_snapshot(manager)
+        .and_then(codex_catalog_credential_from_snapshot);
+    Some((identity, live))
+}
+
+fn codex_catalog_access(
+    home: &std::path::Path,
+) -> Option<(CodexCatalogCacheIdentity, Option<CodexCatalogCredential>)> {
+    let manager = crate::auth::AuthManager::new_openai_codex(home);
+    codex_catalog_access_from_manager(&manager)
+}
+
+/// `GET /models` rejects a request without this query parameter — HTTP 400,
+/// `{"loc": ("query", "client_version"), "msg": "Field required"}` — so leaving
+/// it off makes the fetch fail every time and fall silently back to the
+/// built-in preset, which looks exactly like having no catalog at all.
+///
+/// `0.0.0` is what this fork's Codex user-agent already claims
+/// (`codex_cli_rs/0.0.0`), and the endpoint accepts it. Verified against the
+/// live endpoint on 2026-08-08: HTTP 200, nine models. Entries carry a
+/// `minimal_client_version`, so a future server-side floor could start
+/// rejecting this; the failure is loud in the log and falls back to the preset.
+const OPENAI_CODEX_CATALOG_CLIENT_VERSION: &str = "0.0.0";
+
+fn apply_codex_catalog_auth_headers(
+    request: reqwest::blocking::RequestBuilder,
+    credential: &CodexCatalogCredential,
+) -> Option<reqwest::blocking::RequestBuilder> {
+    if !codex_catalog_credential_source_is_valid(&credential.source) {
+        tracing::warn!("Codex catalog fetch refused: invalid credential source label");
+        return None;
+    }
+    let mut request = request
+        .header(
+            "Authorization",
+            format!("Bearer {}", credential.access_token),
+        )
+        .header("originator", crate::auth::openai_codex::ORIGINATOR);
+    if let Some(account_id) = credential.account_id.as_deref() {
+        match HeaderValue::from_str(account_id) {
+            Ok(value) => request = request.header("chatgpt-account-id", value),
+            Err(_) => {
+                tracing::warn!(
+                    "Codex catalog fetch: skipped invalid chatgpt-account-id header value"
+                );
+            }
+        }
+    }
+    if credential.chatgpt_account_is_fedramp {
+        request = request.header("x-openai-fedramp", "true");
+    }
+    Some(request)
+}
+
+fn codex_catalog_string(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Keys tried in order when reading a Codex catalog entry's session budget.
+///
+/// `max_context_window` is the operative token capacity and is first.
+/// `context_window` is the billing/pricing threshold, not capacity: on
+/// `gpt-5.4` that is 272_000 against a 1_000_000 operative window. CamelCase
+/// aliases are tolerances for a shape this endpoint does not currently return.
+///
+/// This array *is* the selection order. A test asserts `max_context_window`
+/// precedes `context_window` so inverting the fields fails without having to
+/// rewrite the lookup.
+const CODEX_CATALOG_CONTEXT_WINDOW_KEYS: &[&str] = &[
+    "max_context_window",
+    "maxContextWindow",
+    "context_window",
+    "contextWindow",
+];
+
+/// The window a session is budgeted against.
+///
+/// On the live Codex catalog, `max_context_window` is the operative token
+/// capacity and is tried first. `context_window` is the billing/pricing
+/// threshold, not capacity. Measured 2026-08-08: eight of nine models report
+/// the two fields equal, and `gpt-5.4` reports `context_window: 272000`
+/// against `max_context_window: 1000000`. Budgeting the pricing field — which
+/// #258 did — fires auto-compact at ~27% of the tokens the model accepts.
+///
+/// `context_window` stays as a fallback for an entry that reports only the
+/// pricing threshold. No window at all falls back to the preset constant.
+fn codex_catalog_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    CODEX_CATALOG_CONTEXT_WINDOW_KEYS
+        .iter()
+        .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_u64))
+        .filter(|value| *value > 0)
+}
+
+fn codex_catalog_bool(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<bool> {
+    obj.get(key).and_then(serde_json::Value::as_bool)
+}
+
+fn codex_catalog_string_list(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the catalog's model-specific reasoning menu. The observed endpoint
+/// shape is an array of `{ "effort": "...", "description": "..." }`
+/// objects, matching the reference Codex client's `ReasoningEffortPreset`.
+/// Unknown future effort tiers are skipped rather than widened into values our
+/// wire enum cannot represent.
+fn codex_catalog_reasoning_efforts(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<xai_grok_sampling_types::ReasoningEffortOption>> {
+    let raw = obj.get("supported_reasoning_levels")?;
+    let Some(levels) = raw.as_array() else {
+        tracing::warn!(value = %raw, "Codex catalog supported_reasoning_levels was not an array");
+        return Some(Vec::new());
+    };
+    Some(
+        levels
+            .iter()
+            .filter_map(|level| {
+                let Some(level) = level.as_object() else {
+                    tracing::warn!(value = %level, "Codex catalog reasoning level was not an object");
+                    return None;
+                };
+                let Some(effort) = codex_catalog_string(level, "effort") else {
+                    tracing::warn!("Codex catalog reasoning level omitted effort");
+                    return None;
+                };
+                let Ok(value) = effort.parse::<xai_grok_sampling_types::ReasoningEffort>() else {
+                    tracing::warn!(effort = %effort, "Codex catalog reasoning level is not supported by this client");
+                    return None;
+                };
+                Some(xai_grok_sampling_types::ReasoningEffortOption {
+                    id: value.as_str().to_owned(),
+                    value,
+                    label: match value {
+                        xai_grok_sampling_types::ReasoningEffort::Xhigh => "Xhigh".to_owned(),
+                        _ => {
+                            let mut chars = value.as_str().chars();
+                            chars
+                                .next()
+                                .map(|first| first.to_uppercase().chain(chars).collect())
+                                .unwrap_or_default()
+                        }
+                    },
+                    description: codex_catalog_string(level, "description"),
+                    default: false,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Read the load-bearing per-model wire flags from a live catalog entry.
+///
+/// The preset (`openai_codex_provider`) was written for one model; catalog
+/// entries differ on these fields and inheriting the preset wholesale is how
+/// non-preset models 400 (#245).
+fn codex_catalog_wire_capabilities(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> xai_grok_sampling_types::CodexWireCapabilities {
+    xai_grok_sampling_types::CodexWireCapabilities {
+        use_responses_lite: codex_catalog_bool(obj, "use_responses_lite"),
+        tool_mode: codex_catalog_string(obj, "tool_mode"),
+        supports_reasoning_summary_parameter: codex_catalog_bool(
+            obj,
+            "supports_reasoning_summary_parameter",
+        ),
+        supports_image_detail_original: codex_catalog_bool(obj, "supports_image_detail_original"),
+        input_modalities: codex_catalog_string_list(obj, "input_modalities"),
+        default_reasoning_level: codex_catalog_string(obj, "default_reasoning_level"),
+        truncation_policy: codex_catalog_truncation_policy(obj),
+    }
+}
+
+fn codex_catalog_truncation_policy(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<xai_grok_sampling_types::TruncationPolicyConfig> {
+    let value = obj.get("truncation_policy")?;
+    let policy = match serde_json::from_value::<xai_grok_sampling_types::TruncationPolicyConfig>(
+        value.clone(),
+    ) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(%error, "ignoring invalid Codex catalog truncation_policy");
+            return None;
+        }
+    };
+    if policy.limit <= 0 {
+        tracing::warn!(
+            limit = policy.limit,
+            "ignoring non-positive Codex catalog truncation_policy limit"
+        );
+        return None;
+    }
+    Some(policy)
+}
+
+fn parse_openai_codex_catalog_entry(
+    value: &serde_json::Value,
+) -> Option<(String, ConfigModelOverride)> {
+    let obj = value.as_object()?;
+    // `slug` is what the live payload actually keys on; `id` and `model` are
+    // kept as tolerances, not as the expected shape.
+    let key = codex_catalog_string(obj, "slug")
+        .or_else(|| codex_catalog_string(obj, "id"))
+        .or_else(|| codex_catalog_string(obj, "model"))?;
+    let model = codex_catalog_string(obj, "model").unwrap_or_else(|| key.clone());
+    let context_window =
+        codex_catalog_context_window(obj).unwrap_or(OPENAI_CODEX_PRESET_CONTEXT_WINDOW);
+    let codex_wire = codex_catalog_wire_capabilities(obj);
+    let advertised_reasoning_efforts = codex_catalog_reasoning_efforts(obj);
+    let has_advertised_reasoning_efforts = advertised_reasoning_efforts.is_some();
+    let mut reasoning_efforts = advertised_reasoning_efforts.unwrap_or_default();
+    let advertised_default = codex_wire
+        .default_reasoning_level
+        .as_deref()
+        .and_then(|level| {
+            level
+                .parse::<xai_grok_sampling_types::ReasoningEffort>()
+                .ok()
+        });
+    // A catalog default is only usable when the same entry advertises it. If a
+    // malformed catalog points outside its own menu, select the first supported
+    // tier instead of sending a value the model says it rejects.
+    let reasoning_effort = if has_advertised_reasoning_efforts {
+        let default_index = advertised_default.and_then(|default| {
+            reasoning_efforts
+                .iter()
+                .position(|option| option.value == default)
+        });
+        let selected_index = default_index.or_else(|| (!reasoning_efforts.is_empty()).then_some(0));
+        if advertised_default.is_some() && default_index.is_none() {
+            tracing::warn!(
+                model = %model,
+                default_reasoning_level = ?codex_wire.default_reasoning_level,
+                "Codex catalog default reasoning level is not in supported_reasoning_levels; using the first supported level"
+            );
+        }
+        selected_index.map(|index| {
+            reasoning_efforts[index].default = true;
+            reasoning_efforts[index].value
+        })
+    } else {
+        advertised_default
+    };
+    let supports_reasoning_effort = if has_advertised_reasoning_efforts {
+        Some(!reasoning_efforts.is_empty())
+    } else {
+        reasoning_effort.map(|_| true)
+    };
+    Some((
+        key,
+        ConfigModelOverride {
+            model: Some(model.clone()),
+            model_provider: Some(OPENAI_CODEX_PROVIDER_ID.to_owned()),
+            name: codex_catalog_string(obj, "display_name")
+                .or_else(|| codex_catalog_string(obj, "name"))
+                .or(Some(model)),
+            description: codex_catalog_string(obj, "description")
+                .or(Some(OPENAI_CODEX_MODELS_CATALOG_DESCRIPTION.to_owned())),
+            context_window: Some(context_window),
+            reasoning_effort,
+            supports_reasoning_effort,
+            reasoning_efforts,
+            codex_wire: Some(codex_wire),
+            ..ConfigModelOverride::default()
+        },
+    ))
+}
+
+fn parse_openai_codex_catalog_models(
+    payload: &serde_json::Value,
+) -> IndexMap<String, ConfigModelOverride> {
+    // The live payload is `{"models": [...]}`. `data` and a bare array are
+    // tolerances for shapes this endpoint does not currently return.
+    let Some(entries) = payload
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| payload.get("data").and_then(serde_json::Value::as_array))
+        .or_else(|| payload.as_array())
+    else {
+        return IndexMap::new();
+    };
+    entries
+        .iter()
+        .filter_map(parse_openai_codex_catalog_entry)
+        .collect()
+}
+
+fn fetch_openai_codex_catalog_models_blocking(
+    credential: CodexCatalogCredential,
+    url: String,
+) -> Option<(serde_json::Value, IndexMap<String, ConfigModelOverride>)> {
+    let client = crate::remote::client::models_catalog_blocking_client();
+    let request = apply_codex_catalog_auth_headers(client.get(url), &credential)?;
+    let response = match request.send() {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(error = %error, "Codex catalog fetch failed");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(
+            status = response.status().as_u16(),
+            "Codex catalog fetch failed"
+        );
+        return None;
+    }
+    let payload: serde_json::Value = match response.json() {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(error = %error, "Codex catalog response was not valid JSON");
+            return None;
+        }
+    };
+    let models = parse_openai_codex_catalog_models(&payload);
+    if models.is_empty() {
+        tracing::warn!("Codex catalog fetch returned no usable models");
+        return None;
+    }
+    Some((payload, models))
+}
+
+/// Run the complete reqwest blocking request outside any caller's Tokio
+/// context. Isolating only `Client::build` is insufficient: reqwest's blocking
+/// `RequestBuilder::send` also creates and drops a private runtime while it
+/// waits, which Tokio rejects when config discovery happens inside async
+/// startup (#291).
+fn fetch_openai_codex_catalog_models_on_native_thread(
+    credential: CodexCatalogCredential,
+    url: String,
+) -> Option<(serde_json::Value, IndexMap<String, ConfigModelOverride>)> {
+    let worker = match std::thread::Builder::new()
+        .name("codex-model-catalog".to_owned())
+        .spawn(move || fetch_openai_codex_catalog_models_blocking(credential, url))
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            tracing::warn!(error = %error, "Codex catalog worker could not start");
+            return None;
+        }
+    };
+    match worker.join() {
+        Ok(models) => models,
+        Err(_) => {
+            tracing::warn!("Codex catalog worker panicked");
+            None
+        }
+    }
+}
+
+fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOverride>> {
+    if cfg!(test) {
+        return None;
+    }
+    let home = crate::util::grok_home::grok_home();
+    let (cache_identity, credential) = codex_catalog_access(&home)?;
+    let cache_path = codex_catalog_cache_path(&home, &cache_identity);
+    if !crate::util::config::resolve_remote_fetch_enabled() {
+        return load_codex_catalog_when_remote_fetch_disabled(cache_path.as_deref());
+    }
+    let Some(credential) = credential else {
+        return Some(codex_catalog_fallback_models(cache_path.as_deref()));
+    };
+    let url = format!(
+        "{}/models?client_version={}",
+        crate::auth::openai_codex::CODEX_API_BASE_URL,
+        OPENAI_CODEX_CATALOG_CLIENT_VERSION
+    );
+    match fetch_openai_codex_catalog_models_on_native_thread(credential, url) {
+        Some((payload, models)) => {
+            if let Some(path) = cache_path.as_deref() {
+                persist_codex_catalog_cache(path, &payload);
+            } else {
+                tracing::warn!(
+                    "Codex catalog has no verified account id; not persisting account-scoped cache"
+                );
+            }
+            Some(models)
+        }
+        None => Some(codex_catalog_fallback_models(cache_path.as_deref())),
+    }
+}
+
+fn effective_openai_codex_presets(
+    fetched: Option<IndexMap<String, ConfigModelOverride>>,
+) -> IndexMap<String, ConfigModelOverride> {
+    fetched
+        .filter(|models| !models.is_empty())
+        .unwrap_or_else(openai_codex_preset_models)
+}
+
+fn openai_codex_provider() -> ModelProviderConfig {
+    ModelProviderConfig {
+        base_url: Some(crate::auth::openai_codex::CODEX_API_BASE_URL.to_owned()),
+        api_backend: Some(ApiBackend::CodexResponses),
+        ..ModelProviderConfig::default()
+    }
+}
+
+/// Built-in `[model.*]` entries bound to the reserved `openai-codex` provider.
+///
+/// Without these, `grok login --provider openai-codex` succeeds into a session
+/// with no Codex model at all: the reserved provider ships no catalog entries,
+/// so the user has to hand-write a `[model.<id>]` block in the *global*
+/// `$GROK_HOME/config.toml` before anything is selectable.
+///
+/// Folded into the user's `[model.*]` table by
+/// [`merge_openai_codex_presets`]. They carry no credential of their own —
+/// readiness gates on the provider-scoped OAuth snapshot exactly like a
+/// hand-written entry does, which is what surfaces them as unready with a
+/// "sign in" reason before login.
+fn openai_codex_preset_models() -> IndexMap<String, ConfigModelOverride> {
+    IndexMap::from([(
+        OPENAI_CODEX_PRESET_MODEL_ID.to_owned(),
+        ConfigModelOverride {
+            model: Some(OPENAI_CODEX_PRESET_MODEL_ID.to_owned()),
+            model_provider: Some(OPENAI_CODEX_PROVIDER_ID.to_owned()),
+            name: Some("GPT-5.6 Sol (Codex)".to_owned()),
+            description: Some("OpenAI Codex via a ChatGPT subscription".to_owned()),
+            context_window: Some(OPENAI_CODEX_PRESET_CONTEXT_WINDOW),
+            ..ConfigModelOverride::default()
+        },
+    )])
+}
+
+impl ConfigModelOverride {
+    /// Whether this entry names where its traffic goes and what authenticates
+    /// it, rather than leaving both to a preset or provider.
+    fn declares_own_routing(&self) -> bool {
+        self.model_provider.is_some()
+            || self.base_url.is_some()
+            || self.api_base_url.is_some()
+            || self.api_key.is_some()
+            || self.env_key.is_some()
+            || self.auth_provider.is_some()
+    }
+}
+
+/// Fold the built-in Codex presets into the user's parsed `[model.*]` table.
+///
+/// A key the user never declared gets the preset outright.
+///
+/// A key the user *did* declare keeps their entry, but a metadata-only
+/// override — a new `name`, a bigger `context_window` — names no endpoint and
+/// no credential. Letting it replace the preset wholesale would strip the
+/// `model_provider` binding, and the entry would then resolve as a plain xAI
+/// catalog model: routed to the xAI inference endpoint and authenticated with
+/// the user's xAI session token, under a key the docs describe as Codex. So
+/// the preset's routing is backfilled underneath such an override.
+///
+/// An override that declares its own provider, endpoint, or credential has
+/// taken ownership of the key and is left exactly as written — redefining
+/// `[model."gpt-5.6-sol"]` as some other provider's model stays possible.
+pub(crate) fn merge_openai_codex_presets(
+    config_models: &mut IndexMap<String, ConfigModelOverride>,
+) {
+    merge_openai_codex_preset_entries(
+        config_models,
+        effective_openai_codex_presets(fetch_openai_codex_catalog_models()),
+    );
+}
+
+fn merge_openai_codex_preset_entries(
+    config_models: &mut IndexMap<String, ConfigModelOverride>,
+    presets: IndexMap<String, ConfigModelOverride>,
+) {
+    for (key, preset) in presets {
+        let Some(user_entry) = config_models.get_mut(&key) else {
+            config_models.insert(key, preset);
+            continue;
+        };
+        if user_entry.declares_own_routing() {
+            continue;
+        }
+        // Overlay the user's fields on the whole preset, not just its routing:
+        // `context_window = 400000` alone must not also blank the shipped
+        // display name and description out of the picker.
+        let ConfigModelOverride {
+            model,
+            model_provider,
+            name,
+            description,
+            context_window,
+            reasoning_effort,
+            supports_reasoning_effort,
+            reasoning_efforts,
+            codex_wire,
+            catalog_degraded_reason,
+            ..
+        } = preset;
+        user_entry.model_provider = model_provider;
+        user_entry.model.get_or_insert(model.unwrap_or(key));
+        if let Some(name) = name {
+            user_entry.name.get_or_insert(name);
+        }
+        if let Some(description) = description {
+            user_entry.description.get_or_insert(description);
+        }
+        if let Some(context_window) = context_window {
+            user_entry.context_window.get_or_insert(context_window);
+        }
+        let user_reasoning_support = user_entry.supports_reasoning_effort;
+        let reasoning_disabled = user_reasoning_support == Some(false)
+            || (user_reasoning_support.is_none() && supports_reasoning_effort == Some(false));
+        if reasoning_disabled {
+            // Explicit disable is authoritative for both the menu and scalar;
+            // An explicitly empty catalog menu is also authoritative unless
+            // the user explicitly opts back in to legacy scalar support.
+            user_entry.reasoning_effort = None;
+            user_entry.reasoning_efforts.clear();
+        } else if user_entry.reasoning_effort.is_none() {
+            user_entry.reasoning_effort = reasoning_effort;
+        }
+        if user_entry.supports_reasoning_effort.is_none() {
+            user_entry.supports_reasoning_effort = supports_reasoning_effort;
+        }
+        if user_entry.reasoning_efforts.is_empty()
+            && user_entry.supports_reasoning_effort != Some(false)
+        {
+            user_entry.reasoning_efforts = reasoning_efforts;
+        }
+        // Reconcile against the final menu, regardless of whether that menu
+        // came from metadata or the catalog. An inherited catalog scalar can
+        // otherwise survive a narrower user menu and reach the wire rejected.
+        if !user_entry.reasoning_efforts.is_empty() {
+            let selected_index = user_entry
+                .reasoning_effort
+                .and_then(|effort| {
+                    user_entry
+                        .reasoning_efforts
+                        .iter()
+                        .position(|option| option.value == effort)
+                })
+                .or_else(|| {
+                    user_entry
+                        .reasoning_efforts
+                        .iter()
+                        .position(|option| option.default)
+                })
+                .unwrap_or(0);
+            user_entry.reasoning_effort = Some(user_entry.reasoning_efforts[selected_index].value);
+            for (index, option) in user_entry.reasoning_efforts.iter_mut().enumerate() {
+                option.default = index == selected_index;
+            }
+        }
+        if user_entry.codex_wire.is_none() {
+            user_entry.codex_wire = codex_wire;
+        }
+        user_entry.catalog_degraded_reason = catalog_degraded_reason;
+    }
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct ModelProviderConfig {
     pub base_url: Option<String>,
@@ -21,6 +875,27 @@ pub struct ModelProviderConfig {
     pub auth_provider: Option<String>,
     pub auth: Option<crate::auth::AuthProviderConfig>,
     pub context_window: Option<u64>,
+}
+
+impl std::fmt::Debug for ModelProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelProviderConfig")
+            .field("base_url_present", &self.base_url.is_some())
+            .field("api_base_url_present", &self.api_base_url.is_some())
+            .field("env_key_present", &self.env_key.is_some())
+            .field("api_key_present", &self.api_key.is_some())
+            .field("api_backend", &self.api_backend)
+            .field("extra_headers_present", &!self.extra_headers.is_empty())
+            .field("query_params_present", &!self.query_params.is_empty())
+            .field(
+                "env_http_headers_present",
+                &!self.env_http_headers.is_empty(),
+            )
+            .field("auth_provider_present", &self.auth_provider.is_some())
+            .field("auth_present", &self.auth.is_some())
+            .field("context_window", &self.context_window)
+            .finish()
+    }
 }
 
 pub(crate) fn model_provider_auth_name(provider_id: &str) -> String {
@@ -69,6 +944,7 @@ pub(crate) fn parse_model_providers(
     raw_config: &toml::Value,
 ) -> (IndexMap<String, ModelProviderConfig>, Vec<ConfigWarning>) {
     let mut providers = IndexMap::new();
+    providers.insert(OPENAI_CODEX_PROVIDER_ID.to_owned(), openai_codex_provider());
     let mut warnings = Vec::new();
     let Some(section) = raw_config.get("model_providers") else {
         return (providers, warnings);
@@ -85,6 +961,15 @@ pub(crate) fn parse_model_providers(
         return (providers, warnings);
     };
     for (id, value) in table {
+        if id == OPENAI_CODEX_PROVIDER_ID {
+            warnings.push(ConfigWarning::model_provider(
+                id,
+                None,
+                ConfigWarningKind::ConflictingFields,
+                "reserved built-in provider; user configuration ignored".to_owned(),
+            ));
+            continue;
+        }
         let mut unknown = Vec::new();
         match serde_ignored::deserialize::<_, _, ModelProviderConfig>(value.clone(), |path| {
             unknown.push(path.to_string());
@@ -97,6 +982,36 @@ pub(crate) fn parse_model_providers(
                         ConfigWarningKind::UnknownField,
                         "unrecognized key; field ignored".to_owned(),
                     ));
+                }
+                let mut provider = provider;
+                // #13: same env_key normalization + path-specific warnings as
+                // `[model.*]` — do not silently keep whitespace / illegal names.
+                if let Some(raw_keys) = provider.env_key.take() {
+                    let candidates: Vec<String> =
+                        raw_keys.names().into_iter().map(str::to_owned).collect();
+                    let (normalized, rejected) = EnvKeys::normalize(candidates);
+                    for rejected in rejected {
+                        let reason = if rejected.name.is_empty() {
+                            format!(
+                                "invalid env_key entry ({}); ignored — not used as a credential source",
+                                rejected.reason
+                            )
+                        } else {
+                            format!(
+                                "invalid env_key name {:?}: {}; ignored — not used as a credential source",
+                                rejected.name, rejected.reason
+                            )
+                        };
+                        warnings.push(ConfigWarning::model_provider(
+                            id,
+                            Some("env_key"),
+                            ConfigWarningKind::InvalidValue,
+                            reason,
+                        ));
+                    }
+                    if !normalized.is_empty() {
+                        provider.env_key = Some(normalized);
+                    }
                 }
                 if let Some(auth) = &provider.auth {
                     for (field, kind, reason) in auth_config_issues(auth) {
@@ -229,7 +1144,126 @@ impl ConfigModelOverride {
 
 #[cfg(test)]
 mod tests {
+    use agent_client_protocol as acp;
+
+    use super::*;
     use crate::agent::config::{Config, resolve_credentials, resolve_model_list};
+
+    const CODEX_CATALOG_RUNTIME_CHILD: &str = "__XAI_CODEX_CATALOG_RUNTIME_CHILD";
+    const CODEX_CATALOG_RUNTIME_PASS: &str = "codex-catalog-runtime-fetch-ok";
+
+    /// Child-process body for #291. The fresh process prevents another test
+    /// from warming reqwest's process-wide blocking client before Tokio starts.
+    #[test]
+    fn codex_catalog_runtime_first_fetch_child() {
+        if std::env::var_os(CODEX_CATALOG_RUNTIME_CHILD).is_none() {
+            return;
+        }
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind catalog server");
+        let address = listener.local_addr().expect("catalog server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept catalog request");
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).expect("read catalog request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /models?client_version=0.0.0 HTTP/1.1"));
+            assert!(request.contains("authorization: Bearer catalog-test-token"));
+            let body =
+                r#"{"models":[{"slug":"gpt-test","model":"gpt-test","context_window":12345}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write catalog response");
+        });
+        let credential = CodexCatalogCredential {
+            access_token: "catalog-test-token".to_owned(),
+            account_id: Some("catalog-test-account".to_owned()),
+            chatgpt_account_is_fedramp: false,
+            source: xai_grok_sampler::CredentialSource::AuthProvider {
+                name: OPENAI_CODEX_PROVIDER_ID.to_owned(),
+            },
+        };
+        let url = format!("http://{address}/models?client_version=0.0.0");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build child Tokio runtime");
+        let (_, models) = runtime
+            .block_on(
+                async move { fetch_openai_codex_catalog_models_on_native_thread(credential, url) },
+            )
+            .expect("fetch catalog inside Tokio");
+        server.join().expect("catalog server thread");
+        assert_eq!(models["gpt-test"].context_window, Some(12_345));
+        println!("{CODEX_CATALOG_RUNTIME_PASS}");
+    }
+
+    /// Launch an exact child test so both the reqwest client and its first
+    /// authenticated request are exercised from a fresh process under Tokio.
+    #[test]
+    fn codex_catalog_runtime_first_fetch_parent() {
+        if std::env::var_os(CODEX_CATALOG_RUNTIME_CHILD).is_some() {
+            return;
+        }
+        let filter = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        let mut command = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        command
+            .arg("--exact")
+            .arg(format!("{filter}::codex_catalog_runtime_first_fetch_child"))
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CODEX_CATALOG_RUNTIME_CHILD, "1")
+            .stdin(std::process::Stdio::null());
+        xai_tty_utils::detach_std_command(&mut command);
+        let output = command.output().expect("spawn catalog fetch child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && !stderr.contains("panicked at"),
+            "fresh-process Codex catalog fetch failed under Tokio \
+             (status: {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains(CODEX_CATALOG_RUNTIME_PASS),
+            "child did not execute the catalog fetch path\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn provider_debug_is_presence_only() {
+        // Sentinel must not share an 8-byte window with Debug field names
+        // (`auth_provider_present`, `api_key_present`, …) or the scan false-fails.
+        let secret = "GB002-cfg-sentinel-Q7w5E3r1T9y7U2i4";
+        let config = ModelProviderConfig {
+            base_url: Some(format!(
+                "https://user:{secret}@example.test/?token={secret}"
+            )),
+            api_base_url: Some(secret.to_owned()),
+            api_key: Some(secret.to_owned()),
+            extra_headers: IndexMap::from([("Authorization".to_owned(), secret.to_owned())]),
+            query_params: IndexMap::from([("token".to_owned(), secret.to_owned())]),
+            env_http_headers: IndexMap::from([("X-Secret".to_owned(), secret.to_owned())]),
+            auth_provider: Some(secret.to_owned()),
+            ..ModelProviderConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window: {window}"
+            );
+        }
+    }
     #[test]
     fn model_inherits_provider_connection_defaults() {
         let raw_config: toml::Value = toml::from_str(
@@ -262,9 +1296,15 @@ mod tests {
             model.has_own_credentials(),
             "a custom endpoint without a credential is BYOK, not session-authed"
         );
-        assert_eq!(
-            resolve_credentials(model, Some("session-jwt")).api_key,
-            None,
+        // `assert!(..is_none())`, not `assert_eq!(.., None)`: on failure the
+        // latter formats the left value, and for a model with an
+        // `auth_provider` that value is the developer's live OAuth access
+        // token. A test that prints the credential it is guarding is not a
+        // guard.
+        assert!(
+            resolve_credentials(model, Some("session-jwt"))
+                .api_key
+                .is_none(),
             "the session token must not leak to the provider's custom endpoint"
         );
     }
@@ -505,7 +1545,8 @@ mod tests {
         let raw_config: toml::Value = toml::from_str(r#"model_providers = "oops""#).unwrap();
         let cfg = Config::new_from_toml_cfg(&raw_config)
             .expect("a non-table model_providers must not fail the config");
-        assert!(cfg.model_providers.is_empty());
+        assert_eq!(cfg.model_providers.len(), 1);
+        assert!(cfg.model_providers.contains_key(OPENAI_CODEX_PROVIDER_ID));
         assert!(
             cfg.config_warnings.iter().any(|w| {
                 matches!(w.target, WarningTarget::ModelProviderSection)
@@ -715,9 +1756,10 @@ mod tests {
         let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
         let resolved = resolve_model_list(&cfg, None);
         let model = resolved.get("via-gateway").expect("model should exist");
-        assert_eq!(
-            resolve_credentials(model, Some("session-jwt")).api_key,
-            None,
+        assert!(
+            resolve_credentials(model, Some("session-jwt"))
+                .api_key
+                .is_none(),
             "an unresolved declared credential must not fall back to the session token"
         );
     }
@@ -785,9 +1827,10 @@ mod tests {
             effective.config.command.is_empty(),
             "the fail-closed ref is unusable"
         );
-        assert_eq!(
-            resolve_credentials(model, Some("session-jwt")).api_key,
-            None,
+        assert!(
+            resolve_credentials(model, Some("session-jwt"))
+                .api_key
+                .is_none(),
             "must not fall back to the session token"
         );
     }
@@ -813,9 +1856,10 @@ mod tests {
         let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
         let resolved = resolve_model_list(&cfg, None);
         let model = resolved.get("via-gateway").expect("model should exist");
-        assert_eq!(
-            resolve_credentials(model, Some("session-jwt")).api_key,
-            None,
+        assert!(
+            resolve_credentials(model, Some("session-jwt"))
+                .api_key
+                .is_none(),
             "a fail-closed ref must never resolve a colliding auth_provider table"
         );
         let effective = model
@@ -1006,5 +2050,1737 @@ mod tests {
             Some("model"),
             "a model that sets its own query params inherits none of the provider's"
         );
+    }
+
+    #[test]
+    fn openai_codex_is_reserved_and_cannot_be_overridden() {
+        let toml_cfg: toml::Value = toml::from_str(
+            r#"
+            [model_providers.openai-codex]
+            base_url = "https://attacker.invalid/v1"
+            api_key = "must-not-survive"
+
+            [model.codex]
+            model = "supported-codex-model"
+            model_provider = "openai-codex"
+            base_url = "https://attacker.invalid/model"
+            api_base_url = "https://api.openai.com/v1"
+            api_key = "platform-key-must-not-survive"
+            env_key = "OPENAI_API_KEY"
+            api_backend = "responses"
+
+            [model.codex.extra_headers]
+            X-Grok-User-Id = "must-not-survive"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let provider = cfg
+            .model_providers
+            .get(OPENAI_CODEX_PROVIDER_ID)
+            .expect("built-in provider remains registered");
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some(crate::auth::openai_codex::CODEX_API_BASE_URL)
+        );
+        assert_eq!(provider.api_backend, Some(ApiBackend::CodexResponses));
+        assert!(provider.api_key.is_none());
+        assert!(cfg.config_warnings.iter().any(|warning| {
+            matches!(
+                &warning.target,
+                crate::agent::config_model_override_parse::WarningTarget::ModelProvider {
+                    id,
+                    field: None,
+                } if id == OPENAI_CODEX_PROVIDER_ID
+            )
+        }));
+
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("codex").expect("Codex model should exist");
+        assert_eq!(
+            model.info.base_url,
+            crate::auth::openai_codex::CODEX_API_BASE_URL
+        );
+        assert_eq!(model.info.api_backend, ApiBackend::CodexResponses);
+        assert_eq!(model.info.auth_scheme, xai_grok_sampler::AuthScheme::Bearer);
+        assert!(model.api_base_url.is_none());
+        assert!(model.api_key.is_none());
+        assert!(model.env_key.is_none());
+        assert!(model.info.extra_headers.is_empty());
+        assert_eq!(
+            model
+                .auth_provider
+                .as_ref()
+                .map(|provider| provider.name.as_str()),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+    }
+
+    #[test]
+    fn direct_openai_codex_auth_provider_cannot_authenticate_a_custom_origin() {
+        let toml_cfg: toml::Value = toml::from_str(
+            r#"
+            [model.exfiltration]
+            model = "attacker-model"
+            base_url = "https://attacker.invalid/v1"
+            api_backend = "responses"
+            auth_provider = "openai-codex"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get("exfiltration")
+            .expect("custom model should remain visible but fail closed");
+        assert!(
+            !model.config_validation_errors.is_empty(),
+            "the reserved native provider must require model_provider provenance"
+        );
+        assert!(
+            model
+                .auth_provider
+                .as_ref()
+                .is_some_and(crate::auth::AuthProviderRef::is_fail_closed)
+        );
+
+        let credentials = resolve_credentials(model, Some("ambient-xai-session"));
+        assert_eq!(credentials.api_key, None);
+        let sampler = crate::agent::config::sampling_config_for_model(
+            model,
+            credentials,
+            None,
+            None,
+            None,
+            None,
+            &crate::agent::trusted_origins::TrustedXaiOrigins::default(),
+        );
+        assert_eq!(sampler.base_url, "https://attacker.invalid/v1");
+        assert_eq!(sampler.auth_scheme, xai_grok_sampler::AuthScheme::None);
+        assert!(sampler.api_key.is_none());
+        assert!(sampler.bearer_resolver.is_none());
+
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let manager = std::sync::Arc::new(crate::auth::AuthManager::new_openai_codex(temp.path()));
+        manager.hot_swap(crate::auth::GrokAuth {
+            key: "native-codex-secret".to_owned(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            ..crate::auth::GrokAuth::default()
+        });
+        let live_native_provider = crate::auth::AuthProviderRef::openai_codex(manager);
+        assert_eq!(
+            live_native_provider.cached_token().as_deref(),
+            Some("native-codex-secret")
+        );
+        let mut custom_entry = model.clone();
+        custom_entry.config_validation_errors.clear();
+        custom_entry.auth_provider = Some(live_native_provider);
+        let prefetched = IndexMap::from([("custom-native-ref".to_owned(), custom_entry)]);
+        let isolated = resolve_model_list(&Config::default(), Some(prefetched));
+        let isolated = &isolated["custom-native-ref"];
+        assert!(
+            isolated
+                .auth_provider
+                .as_ref()
+                .is_some_and(crate::auth::AuthProviderRef::is_fail_closed)
+        );
+        assert!(
+            resolve_credentials(isolated, None).api_key.is_none(),
+            "even a live native Codex token is detached from a custom-origin entry"
+        );
+    }
+
+    /// Auth home holding the credential a successful `grok login --provider
+    /// openai-codex` writes.
+    fn live_codex_auth_home() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let auth = crate::auth::GrokAuth {
+            key: "live-access-token".to_owned(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            refresh_token: Some("rotating-refresh-token".to_owned()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+            account_id: Some("account-id".to_owned()),
+            ..crate::auth::GrokAuth::default()
+        };
+        let auth_map = std::collections::HashMap::from([(
+            crate::auth::openai_codex::AUTH_SCOPE.to_owned(),
+            auth,
+        )]);
+        std::fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec(&auth_map).unwrap(),
+        )
+        .unwrap();
+        temp
+    }
+
+    /// The preset's readiness must be decided by the credential in `auth_home`,
+    /// not by whatever `$GROK_HOME` the test runner happens to have.
+    fn preset_entry_with_auth_home(
+        cfg: &Config,
+        auth_home: &std::path::Path,
+    ) -> crate::agent::config::ModelEntry {
+        let mut resolved = resolve_model_list(cfg, None);
+        let mut model = resolved
+            .shift_remove(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("built-in Codex preset should resolve");
+        model.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
+            crate::auth::openai_codex::manager(auth_home),
+        ));
+        model
+    }
+
+    #[test]
+    fn builtin_openai_codex_preset_exists_without_user_config() {
+        let cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("an empty config should parse");
+        let preset = cfg
+            .config_models
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the Codex preset must ship without any user config");
+        assert_eq!(preset.model.as_deref(), Some(OPENAI_CODEX_PRESET_MODEL_ID));
+        assert_eq!(
+            preset.model_provider.as_deref(),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+        assert!(
+            preset.api_key.is_none() && preset.env_key.is_none() && preset.base_url.is_none(),
+            "the preset must carry no credential or origin of its own"
+        );
+
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the preset must resolve into the catalog");
+        assert_eq!(
+            model.info.base_url,
+            crate::auth::openai_codex::CODEX_API_BASE_URL
+        );
+        assert_eq!(model.info.api_backend, ApiBackend::CodexResponses);
+        assert_eq!(
+            model
+                .auth_provider
+                .as_ref()
+                .map(|provider| provider.name.as_str()),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+        assert!(
+            model.is_openai_codex_profile(),
+            "the preset must be excluded from the xAI/BYOK key predicates"
+        );
+    }
+
+    #[test]
+    fn builtin_openai_codex_preset_is_unready_before_login() {
+        let cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("an empty config should parse");
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let model = preset_entry_with_auth_home(&cfg, temp.path());
+
+        let (ready, reason) = crate::agent::config::model_readiness(&model);
+        assert!(!ready, "the preset must not be selectable before login");
+        let reason = reason.expect("an unready preset must say why");
+        // The program name is whatever we were invoked as -- under a unit test
+        // that is the test binary, which is the point: the instruction must
+        // name the command the user actually has, not a hardcoded `grok` that
+        // may belong to a different installed program (#117).
+        let expected = format!(
+            "{} login --provider openai-codex",
+            xai_grok_config::program_name::program_name()
+        );
+        assert!(
+            reason.contains(&expected),
+            "the reason must name the login command as invoked, expected {expected:?}, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn builtin_openai_codex_preset_is_selectable_after_login() {
+        let cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("an empty config should parse");
+        let temp = live_codex_auth_home();
+        let model = preset_entry_with_auth_home(&cfg, temp.path());
+
+        assert_eq!(crate::agent::config::model_readiness(&model), (true, None));
+        assert_eq!(
+            resolve_credentials(&model, Some("xai-session-token"))
+                .api_key
+                .as_deref(),
+            Some("live-access-token"),
+            "the preset must sample with the Codex bearer, never the xAI session token"
+        );
+    }
+
+    #[test]
+    fn user_global_config_overrides_the_builtin_openai_codex_preset() {
+        let toml_cfg: toml::Value = toml::from_str(&format!(
+            r#"
+            [model."{OPENAI_CODEX_PRESET_MODEL_ID}"]
+            model = "{OPENAI_CODEX_PRESET_MODEL_ID}"
+            model_provider = "{OPENAI_CODEX_PROVIDER_ID}"
+            name = "My Codex"
+            context_window = 123456
+            "#
+        ))
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        assert_eq!(
+            cfg.config_models.len(),
+            1,
+            "the preset must merge into the user's entry, not sit alongside it"
+        );
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the user's entry keeps the preset key");
+        assert_eq!(model.info.name.as_deref(), Some("My Codex"));
+        assert_eq!(model.info.context_window.get(), 123_456);
+    }
+
+    /// The docs tell users to redeclare the preset key to retune its metadata.
+    /// Such an override names no endpoint and no credential, so it must not
+    /// take the Codex routing down with it: without the preset underneath, the
+    /// entry resolves as a plain xAI catalog model and authenticates with the
+    /// user's xAI session token under a key documented as Codex.
+    #[test]
+    fn metadata_only_override_keeps_the_preset_codex_routing() {
+        let toml_cfg: toml::Value = toml::from_str(&format!(
+            r#"
+            [model."{OPENAI_CODEX_PRESET_MODEL_ID}"]
+            name = "Codex"
+            context_window = 400000
+            "#
+        ))
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let auth_home = tempfile::tempdir().expect("temporary auth home");
+        let model = preset_entry_with_auth_home(&cfg, auth_home.path());
+
+        assert_eq!(model.info.name.as_deref(), Some("Codex"));
+        assert_eq!(model.info.context_window.get(), 400_000);
+        assert_eq!(
+            model.info.base_url,
+            crate::auth::openai_codex::CODEX_API_BASE_URL,
+            "a metadata-only override must not re-point the key at xAI"
+        );
+        assert_eq!(model.info.api_backend, ApiBackend::CodexResponses);
+        assert_eq!(
+            model
+                .auth_provider
+                .as_ref()
+                .map(|provider| provider.name.as_str()),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+        assert!(
+            resolve_credentials(&model, Some("xai-session-token"))
+                .api_key
+                .is_none(),
+            "the xAI session token must never authenticate a Codex-keyed model"
+        );
+    }
+
+    /// Drift guard: every field the preset ships must survive a metadata-only
+    /// override. A preset field that [`merge_openai_codex_presets`] forgets to
+    /// overlay would silently disappear from the picker.
+    #[test]
+    fn every_preset_field_survives_a_metadata_only_override() {
+        let preset = openai_codex_preset_models()
+            .shift_remove(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the preset should be keyed by its model id");
+        let preset_value = toml::Value::try_from(&preset).expect("preset serializes");
+        let preset_table = preset_value.as_table().expect("preset is a table");
+
+        // Sets one field the preset does not, and declares no routing.
+        let mut models = IndexMap::from([(
+            OPENAI_CODEX_PRESET_MODEL_ID.to_owned(),
+            ConfigModelOverride {
+                top_p: Some(0.5),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        merge_openai_codex_presets(&mut models);
+        let merged_value = toml::Value::try_from(&models[OPENAI_CODEX_PRESET_MODEL_ID])
+            .expect("merged serializes");
+        let merged_table = merged_value.as_table().expect("merged is a table");
+
+        for (field, value) in preset_table {
+            assert_eq!(
+                merged_table.get(field),
+                Some(value),
+                "preset field `{field}` was dropped by a metadata-only override; \
+                 overlay it in merge_openai_codex_presets"
+            );
+        }
+        assert_eq!(
+            merged_table.get("top_p").and_then(toml::Value::as_float),
+            Some(0.5),
+            "the user's own field must survive the overlay"
+        );
+    }
+
+    /// The flip side: an override that names its own endpoint and credential
+    /// has taken the key over, so the preset must not clamp it back onto Codex
+    /// (which would silently strip that endpoint and key).
+    #[test]
+    fn override_declaring_its_own_endpoint_is_left_alone() {
+        let toml_cfg: toml::Value = toml::from_str(&format!(
+            r#"
+            [model."{OPENAI_CODEX_PRESET_MODEL_ID}"]
+            model = "gpt-5.6-sol"
+            base_url = "https://api.openai.com/v1"
+            env_key = "OPENAI_API_KEY"
+            context_window = 200000
+            "#
+        ))
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the user's entry should resolve");
+
+        assert_eq!(model.info.base_url, "https://api.openai.com/v1");
+        assert_eq!(
+            model.env_key.as_ref().map(|keys| keys.names()),
+            Some(vec!["OPENAI_API_KEY"]),
+            "the preset must not strip a credential the user declared"
+        );
+        assert_ne!(model.info.api_backend, ApiBackend::CodexResponses);
+    }
+
+    #[test]
+    fn openai_codex_model_without_a_live_credential_is_unready() {
+        let toml_cfg: toml::Value = toml::from_str(
+            r#"
+            [model.codex]
+            model = "supported-codex-model"
+            model_provider = "openai-codex"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let mut resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get_mut("codex").expect("Codex model should exist");
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        model.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
+            crate::auth::openai_codex::manager(temp.path()),
+        ));
+
+        let (ready, reason) = crate::agent::config::model_readiness(model);
+        assert!(!ready);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("login"))
+        );
+        assert!(
+            resolve_credentials(model, Some("xai-session-token"))
+                .api_key
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_refreshable_openai_codex_credential_stays_selectable() {
+        let toml_cfg: toml::Value = toml::from_str(
+            r#"
+            [model.codex]
+            model = "supported-codex-model"
+            model_provider = "openai-codex"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let mut resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get_mut("codex").expect("Codex model should exist");
+
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let auth = crate::auth::GrokAuth {
+            key: "expired-access-token".to_owned(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            refresh_token: Some("rotating-refresh-token".to_owned()),
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+            account_id: Some("account-id".to_owned()),
+            ..crate::auth::GrokAuth::default()
+        };
+        let auth_map = std::collections::HashMap::from([(
+            crate::auth::openai_codex::AUTH_SCOPE.to_owned(),
+            auth,
+        )]);
+        std::fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec(&auth_map).unwrap(),
+        )
+        .unwrap();
+        model.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
+            crate::auth::openai_codex::manager(temp.path()),
+        ));
+
+        assert_eq!(crate::agent::config::model_readiness(model), (true, None));
+        assert!(
+            resolve_credentials(model, Some("xai-session-token"))
+                .api_key
+                .is_none(),
+            "an expired Codex bearer must refresh pre-turn, never fall back to xAI"
+        );
+    }
+
+    /// The shape below is not invented: it is the live `GET /models` response,
+    /// captured 2026-08-08, trimmed to the fields this parser reads. Three
+    /// things in it are the whole point, because a parser written from the
+    /// issue text got all three wrong and would have fallen silently back to
+    /// the built-in preset forever:
+    ///
+    ///   - the array is under `models`, not `data`
+    ///   - entries key on `slug`, and carry no `id` or `model` at all
+    ///   - the human label is `display_name`, not `name`
+    #[test]
+    fn codex_catalog_parser_reads_the_shape_the_endpoint_actually_returns() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6 Sol",
+                    "description": "Flagship",
+                    "context_window": 272000,
+                    "max_context_window": 272000
+                },
+                {
+                    "slug": "gpt-5.3-codex-spark",
+                    "display_name": "GPT-5.3 Codex Spark",
+                    "context_window": 128000
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        assert_eq!(presets.len(), 2, "both live entries must parse");
+
+        let sol = presets.get("gpt-5.6-sol").expect("slug is the catalog key");
+        assert_eq!(sol.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            sol.model_provider.as_deref(),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+        assert_eq!(sol.name.as_deref(), Some("GPT-5.6 Sol"));
+        assert_eq!(sol.context_window, Some(272_000));
+
+        let spark = presets
+            .get("gpt-5.3-codex-spark")
+            .expect("a second model must not be lost — one entry is the bug");
+        assert_eq!(spark.context_window, Some(128_000));
+    }
+
+    /// #245: catalog entries that differ from the Sol preset on wire flags
+    /// must not be collapsed onto the preset's capabilities. The live table
+    /// in the issue is the fixture; the point is that Spark's flags reach
+    /// `codex_wire` instead of being dropped at parse time.
+    #[test]
+    fn codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6 Sol",
+                    "context_window": 272000,
+                    "use_responses_lite": true,
+                    "tool_mode": "code_mode_only",
+                    "supports_reasoning_summary_parameter": true,
+                    "supports_image_detail_original": true,
+                    "input_modalities": ["text", "image"],
+                    "default_reasoning_level": "low"
+                },
+                {
+                    "slug": "gpt-5.3-codex-spark",
+                    "display_name": "GPT-5.3 Codex Spark",
+                    "context_window": 128000,
+                    "use_responses_lite": false,
+                    "tool_mode": null,
+                    "supports_reasoning_summary_parameter": false,
+                    "supports_image_detail_original": false,
+                    "input_modalities": ["text"],
+                    "default_reasoning_level": "high"
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let sol = presets
+            .get("gpt-5.6-sol")
+            .expect("sol")
+            .codex_wire
+            .as_ref()
+            .expect("sol wire caps");
+        let spark = presets
+            .get("gpt-5.3-codex-spark")
+            .expect("spark")
+            .codex_wire
+            .as_ref()
+            .expect("spark wire caps");
+
+        assert_eq!(sol.use_responses_lite, Some(true));
+        assert_eq!(spark.use_responses_lite, Some(false));
+        assert_eq!(sol.tool_mode.as_deref(), Some("code_mode_only"));
+        assert_eq!(spark.tool_mode, None);
+        assert_eq!(sol.supports_reasoning_summary_parameter, Some(true));
+        assert_eq!(spark.supports_reasoning_summary_parameter, Some(false));
+        assert_eq!(
+            sol.input_modalities,
+            vec!["text".to_owned(), "image".to_owned()]
+        );
+        assert_eq!(spark.input_modalities, vec!["text".to_owned()]);
+        assert_eq!(sol.default_reasoning_level.as_deref(), Some("low"));
+        assert_eq!(spark.default_reasoning_level.as_deref(), Some("high"));
+        assert!(
+            !spark.include_reasoning_summary(),
+            "Spark must not inherit Sol's summary parameter"
+        );
+        assert!(sol.include_reasoning_summary());
+
+        let spark_entry = presets.get("gpt-5.3-codex-spark").unwrap();
+        assert_eq!(
+            spark_entry.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::High),
+            "catalog default_reasoning_level must become reasoning_effort"
+        );
+    }
+
+    #[test]
+    fn codex_catalog_parser_reads_and_validates_truncation_policy() {
+        use xai_grok_sampling_types::{TruncationMode, TruncationPolicyConfig};
+
+        let valid = parse_openai_codex_catalog_entry(&serde_json::json!({
+            "slug": "gpt-5.6-sol",
+            "truncation_policy": { "mode": "tokens", "limit": 10000 }
+        }))
+        .expect("valid catalog entry")
+        .1;
+        let capabilities = valid.codex_wire.expect("Codex wire capabilities");
+        assert_eq!(
+            capabilities.truncation_policy,
+            Some(TruncationPolicyConfig {
+                mode: TruncationMode::Tokens,
+                limit: 10_000,
+            })
+        );
+        let round_trip: xai_grok_sampling_types::CodexWireCapabilities = serde_json::from_value(
+            serde_json::to_value(&capabilities).expect("serialize capabilities"),
+        )
+        .expect("deserialize capabilities");
+        assert_eq!(round_trip, capabilities);
+
+        for invalid in [
+            serde_json::json!({ "mode": "characters", "limit": 10000 }),
+            serde_json::json!({ "mode": "tokens", "limit": 0 }),
+            serde_json::json!({ "mode": "bytes", "limit": -1 }),
+        ] {
+            let parsed = parse_openai_codex_catalog_entry(&serde_json::json!({
+                "slug": "invalid-policy-model",
+                "truncation_policy": invalid,
+            }))
+            .expect("entry remains usable when its policy is invalid")
+            .1;
+            assert_eq!(
+                parsed.codex_wire.and_then(|wire| wire.truncation_policy),
+                None,
+                "invalid units and non-positive limits must fail closed"
+            );
+        }
+    }
+
+    /// #261: the catalog's per-model list must survive through resolved
+    /// model metadata and ACP so the TUI does not offer the legacy full menu to
+    /// models that accept only a subset.
+    #[test]
+    fn codex_catalog_supported_reasoning_levels_drive_acp_effort_options() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-codex-a",
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [
+                        { "effort": "low", "description": "Fast" },
+                        { "effort": "high", "description": "Deep" }
+                    ]
+                },
+                {
+                    "slug": "gpt-codex-b",
+                    "default_reasoning_level": "xhigh",
+                    "supported_reasoning_levels": [
+                        { "effort": "medium", "description": "Balanced" },
+                        { "effort": "xhigh", "description": "Maximum" }
+                    ]
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let a = presets.get("gpt-codex-a").expect("model a");
+        let b = presets.get("gpt-codex-b").expect("model b");
+        assert_eq!(
+            a.reasoning_efforts
+                .iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>(),
+            vec![
+                xai_grok_sampling_types::ReasoningEffort::Low,
+                xai_grok_sampling_types::ReasoningEffort::High,
+            ]
+        );
+        assert_eq!(a.reasoning_efforts[0].description.as_deref(), Some("Fast"));
+        assert!(a.reasoning_efforts[0].default);
+        assert_eq!(
+            a.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Low)
+        );
+        assert!(!a.reasoning_efforts[1].default);
+        assert_eq!(
+            b.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Xhigh)
+        );
+        assert!(b.reasoning_efforts[1].default);
+
+        let cfg = Config::default();
+        let prefetched = presets
+            .into_iter()
+            .map(|(key, model)| {
+                let entry = model.apply(&key, None, &cfg.endpoints);
+                (key, entry)
+            })
+            .collect();
+        let resolved = resolve_model_list(&cfg, Some(prefetched));
+        let acp_models = crate::agent::config::to_acp_model_info(&resolved);
+        let a_meta = acp_models
+            .get(&acp::ModelId::new("gpt-codex-a"))
+            .and_then(|model| model.meta.as_ref())
+            .expect("model a ACP metadata");
+        let b_meta = acp_models
+            .get(&acp::ModelId::new("gpt-codex-b"))
+            .and_then(|model| model.meta.as_ref())
+            .expect("model b ACP metadata");
+        assert_eq!(a_meta["reasoningEfforts"][0]["value"], "low");
+        assert_eq!(a_meta["reasoningEfforts"][1]["value"], "high");
+        assert_eq!(a_meta["reasoningEffort"], "low");
+        assert_eq!(b_meta["reasoningEfforts"][0]["value"], "medium");
+        assert_eq!(b_meta["reasoningEfforts"][1]["value"], "xhigh");
+        assert_eq!(b_meta["reasoningEffort"], "xhigh");
+    }
+
+    /// #357: keep the shipped Codex picker aligned with the complete live
+    /// catalog snapshot. This is intentionally an exact matrix: accepting
+    /// Ultra on Luna (or omitting it from Terra) is a release-blocking
+    /// capability mismatch, not a harmless presentation difference.
+    #[test]
+    fn codex_live_catalog_reasoning_capability_matrix_is_exact() {
+        use xai_grok_sampling_types::ReasoningEffort;
+
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }, { "effort": "ultra" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.6-sol-wm",
+                    "display_name": "GPT-5.6-Sol-WM",
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }, { "effort": "ultra" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.6-terra",
+                    "display_name": "GPT-5.6-Terra",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }, { "effort": "ultra" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.6-luna",
+                    "display_name": "GPT-5.6-Luna",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.5",
+                    "display_name": "GPT-5.5",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.4",
+                    "display_name": "GPT-5.4",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.4-mini",
+                    "display_name": "GPT-5.4-Mini",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.3-codex-spark",
+                    "display_name": "GPT-5.3-Codex-Spark",
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" }
+                    ]
+                },
+                {
+                    "slug": "codex-auto-review",
+                    "display_name": "Codex Auto Review",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }
+                    ]
+                }
+            ]
+        });
+
+        let six = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+        ];
+        let five = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ];
+        let four = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+        ];
+        let expected = [
+            ("gpt-5.6-sol", ReasoningEffort::Low, six.as_slice()),
+            ("gpt-5.6-sol-wm", ReasoningEffort::Low, six.as_slice()),
+            ("gpt-5.6-terra", ReasoningEffort::Medium, six.as_slice()),
+            ("gpt-5.6-luna", ReasoningEffort::Medium, five.as_slice()),
+            ("gpt-5.5", ReasoningEffort::Medium, four.as_slice()),
+            ("gpt-5.4", ReasoningEffort::Medium, four.as_slice()),
+            ("gpt-5.4-mini", ReasoningEffort::Medium, four.as_slice()),
+            (
+                "gpt-5.3-codex-spark",
+                ReasoningEffort::High,
+                four.as_slice(),
+            ),
+            (
+                "codex-auto-review",
+                ReasoningEffort::Medium,
+                five.as_slice(),
+            ),
+        ];
+
+        let presets = parse_openai_codex_catalog_models(&payload);
+        assert_eq!(presets.len(), expected.len());
+        assert_eq!(
+            presets.keys().map(String::as_str).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(slug, _, _)| *slug)
+                .collect::<Vec<_>>()
+        );
+
+        for (slug, default, efforts) in expected {
+            let preset = presets
+                .get(slug)
+                .unwrap_or_else(|| panic!("missing {slug}"));
+            assert_eq!(
+                preset.supports_reasoning_effort,
+                Some(true),
+                "{slug} must advertise reasoning support"
+            );
+            assert_eq!(
+                preset
+                    .reasoning_efforts
+                    .iter()
+                    .map(|option| option.value)
+                    .collect::<Vec<_>>(),
+                efforts.to_vec(),
+                "{slug} effort menu drifted"
+            );
+            assert_eq!(preset.reasoning_effort, Some(default), "{slug} default");
+            let defaults = preset
+                .reasoning_efforts
+                .iter()
+                .filter(|option| option.default)
+                .collect::<Vec<_>>();
+            assert_eq!(defaults.len(), 1, "{slug} must have one default");
+            assert_eq!(defaults[0].value, default, "{slug} default marker");
+        }
+    }
+
+    #[test]
+    fn codex_catalog_preserves_ultra_as_an_authoritative_default() {
+        let payload = serde_json::json!({
+            "models": [{
+                "slug": "gpt-5.6-sol",
+                "default_reasoning_level": "ultra",
+                "supported_reasoning_levels": [
+                    { "effort": "max", "description": "Maximum reasoning" },
+                    {
+                        "effort": "ultra",
+                        "description": "Maximum reasoning with proactive multi-agent guidance"
+                    }
+                ]
+            }]
+        });
+
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let sol = presets.get("gpt-5.6-sol").expect("Sol catalog entry");
+        assert_eq!(
+            sol.reasoning_efforts
+                .iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>(),
+            vec![
+                xai_grok_sampling_types::ReasoningEffort::Max,
+                xai_grok_sampling_types::ReasoningEffort::Ultra,
+            ]
+        );
+        assert_eq!(
+            sol.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Ultra)
+        );
+        assert!(!sol.reasoning_efforts[0].default);
+        assert!(sol.reasoning_efforts[1].default);
+        assert_eq!(
+            sol.reasoning_efforts[1].description.as_deref(),
+            Some("Maximum reasoning with proactive multi-agent guidance")
+        );
+    }
+
+    #[test]
+    fn codex_catalog_default_reasoning_level_must_belong_to_supported_levels() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-codex-mismatch",
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": [
+                        { "effort": "low", "description": "Fast" },
+                        { "effort": "medium", "description": "Balanced" },
+                        { "effort": "future", "description": "Unknown to this client" },
+                        "not-an-object"
+                    ]
+                },
+                {
+                    "slug": "gpt-codex-no-efforts",
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": []
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let mismatch = presets.get("gpt-codex-mismatch").expect("mismatch model");
+        assert_eq!(mismatch.reasoning_efforts.len(), 2);
+        assert_eq!(
+            mismatch.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Low),
+            "an out-of-menu catalog default must not reach the wire"
+        );
+        assert!(mismatch.reasoning_efforts[0].default);
+        assert_eq!(mismatch.supports_reasoning_effort, Some(true));
+
+        let empty = presets.get("gpt-codex-no-efforts").expect("empty model");
+        assert!(empty.reasoning_efforts.is_empty());
+        assert_eq!(empty.reasoning_effort, None);
+        assert_eq!(empty.supports_reasoning_effort, Some(false));
+    }
+
+    #[test]
+    fn codex_catalog_metadata_override_can_disable_reasoning_effort() {
+        let key = "gpt-codex-disabled";
+        let mut models = IndexMap::from([(
+            key.to_owned(),
+            ConfigModelOverride {
+                supports_reasoning_effort: Some(false),
+                reasoning_effort: Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
+                reasoning_efforts: vec![xai_grok_sampling_types::ReasoningEffortOption {
+                    id: "xhigh".into(),
+                    value: xai_grok_sampling_types::ReasoningEffort::Xhigh,
+                    label: "X-High".into(),
+                    description: None,
+                    default: true,
+                }],
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        let presets = parse_openai_codex_catalog_models(&serde_json::json!({
+            "models": [{
+                "slug": key,
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [
+                    { "effort": "low" },
+                    { "effort": "high" }
+                ]
+            }]
+        }));
+        merge_openai_codex_preset_entries(&mut models, presets);
+
+        let merged = models.get(key).expect("merged metadata override");
+        assert_eq!(merged.supports_reasoning_effort, Some(false));
+        assert_eq!(merged.reasoning_effort, None);
+        assert!(
+            merged.reasoning_efforts.is_empty(),
+            "an explicitly disabled override must not inherit the catalog menu"
+        );
+
+        let cfg = Config::default();
+        let resolved = resolve_model_list(
+            &cfg,
+            Some(IndexMap::from([(
+                key.to_owned(),
+                merged.apply(key, None, &cfg.endpoints),
+            )])),
+        );
+        let info = &resolved[key].info;
+        assert!(!info.supports_reasoning_effort);
+        assert!(info.reasoning_efforts.is_empty());
+        assert_eq!(info.reasoning_effort, None);
+        let sampler = crate::agent::config::sampling_config_for_model(
+            &resolved[key],
+            crate::agent::config::resolve_credentials(&resolved[key], None),
+            None,
+            None,
+            None,
+            None,
+            &crate::agent::trusted_origins::TrustedXaiOrigins::default(),
+        );
+        assert_eq!(sampler.reasoning_effort, None);
+    }
+
+    #[test]
+    fn codex_catalog_explicit_empty_reasoning_menu_disables_unclaimed_scalar_end_to_end() {
+        use xai_grok_sampling_types::ReasoningEffort;
+
+        let evaluate = |key: &str, user: ConfigModelOverride, catalog: serde_json::Value| {
+            let mut models = IndexMap::from([(key.to_owned(), user)]);
+            merge_openai_codex_preset_entries(
+                &mut models,
+                parse_openai_codex_catalog_models(&catalog),
+            );
+            let merged = models.get(key).expect("merged metadata override");
+            let cfg = Config::default();
+            let resolved = resolve_model_list(
+                &cfg,
+                Some(IndexMap::from([(
+                    key.to_owned(),
+                    merged.apply(key, None, &cfg.endpoints),
+                )])),
+            );
+            let info = &resolved[key].info;
+            let sampler = crate::agent::config::sampling_config_for_model(
+                &resolved[key],
+                crate::agent::config::resolve_credentials(&resolved[key], None),
+                None,
+                None,
+                None,
+                None,
+                &crate::agent::trusted_origins::TrustedXaiOrigins::default(),
+            );
+            (
+                merged.supports_reasoning_effort,
+                merged.reasoning_effort,
+                merged.reasoning_efforts.len(),
+                info.supports_reasoning_effort,
+                info.reasoning_effort,
+                sampler.reasoning_effort,
+            )
+        };
+
+        let disabled = evaluate(
+            "gpt-codex-empty-menu",
+            ConfigModelOverride {
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..ConfigModelOverride::default()
+            },
+            serde_json::json!({
+                "models": [{
+                    "slug": "gpt-codex-empty-menu",
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": []
+                }]
+            }),
+        );
+        assert_eq!(disabled, (Some(false), None, 0, false, None, None));
+
+        let absent = evaluate(
+            "gpt-codex-legacy-absent-menu",
+            ConfigModelOverride {
+                reasoning_effort: Some(ReasoningEffort::Xhigh),
+                ..ConfigModelOverride::default()
+            },
+            serde_json::json!({
+                "models": [{ "slug": "gpt-codex-legacy-absent-menu" }]
+            }),
+        );
+        assert_eq!(
+            absent,
+            (
+                None,
+                Some(ReasoningEffort::Xhigh),
+                0,
+                false,
+                Some(ReasoningEffort::Xhigh),
+                Some(ReasoningEffort::Xhigh),
+            ),
+            "an absent catalog menu must retain the legacy scalar semantics"
+        );
+
+        let user_enabled = evaluate(
+            "gpt-codex-user-enabled-empty-menu",
+            ConfigModelOverride {
+                reasoning_effort: Some(ReasoningEffort::High),
+                supports_reasoning_effort: Some(true),
+                ..ConfigModelOverride::default()
+            },
+            serde_json::json!({
+                "models": [{
+                    "slug": "gpt-codex-user-enabled-empty-menu",
+                    "supported_reasoning_levels": []
+                }]
+            }),
+        );
+        assert_eq!(
+            user_enabled,
+            (
+                Some(true),
+                Some(ReasoningEffort::High),
+                0,
+                true,
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::High),
+            ),
+            "an explicit user support opt-in must retain its legacy scalar"
+        );
+    }
+
+    #[test]
+    fn codex_catalog_metadata_override_rejects_default_outside_inherited_menu() {
+        let key = "gpt-codex-limited";
+        let mut models = IndexMap::from([(
+            key.to_owned(),
+            ConfigModelOverride {
+                reasoning_effort: Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        let presets = parse_openai_codex_catalog_models(&serde_json::json!({
+            "models": [{
+                "slug": key,
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [
+                    { "effort": "low" },
+                    { "effort": "high" }
+                ]
+            }]
+        }));
+        merge_openai_codex_preset_entries(&mut models, presets);
+
+        let merged = models.get(key).expect("merged metadata override");
+        assert_eq!(
+            merged.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::High),
+            "a scalar outside the inherited menu must fall back to the catalog default"
+        );
+        assert!(
+            merged
+                .reasoning_efforts
+                .iter()
+                .all(|option| option.value != xai_grok_sampling_types::ReasoningEffort::Xhigh)
+        );
+    }
+
+    #[test]
+    fn codex_catalog_metadata_override_keeps_default_without_inherited_menu() {
+        let key = "gpt-codex-legacy";
+        let mut models = IndexMap::from([(
+            key.to_owned(),
+            ConfigModelOverride {
+                reasoning_effort: Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        let presets = IndexMap::from([(
+            key.to_owned(),
+            ConfigModelOverride {
+                model: Some(key.to_owned()),
+                supports_reasoning_effort: Some(true),
+                reasoning_effort: None,
+                reasoning_efforts: Vec::new(),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+
+        merge_openai_codex_preset_entries(&mut models, presets);
+
+        let merged = models.get(key).expect("merged metadata override");
+        assert_eq!(
+            merged.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
+            "without a restrictive catalog menu there is no evidence that the explicit tier is invalid"
+        );
+        assert!(merged.reasoning_efforts.is_empty());
+
+        let cfg = Config::default();
+        let resolved = resolve_model_list(
+            &cfg,
+            Some(IndexMap::from([(
+                key.to_owned(),
+                merged.apply(key, None, &cfg.endpoints),
+            )])),
+        );
+        let sampler = crate::agent::config::sampling_config_for_model(
+            &resolved[key],
+            crate::agent::config::resolve_credentials(&resolved[key], None),
+            None,
+            None,
+            None,
+            None,
+            &crate::agent::trusted_origins::TrustedXaiOrigins::default(),
+        );
+        assert_eq!(
+            sampler.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Xhigh)
+        );
+    }
+
+    #[test]
+    fn codex_catalog_metadata_narrower_menu_reconciles_scalar_end_to_end() {
+        use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+        for (suffix, reasoning_efforts, expected) in [
+            (
+                "first",
+                vec![ReasoningEffortOption {
+                    id: "low".into(),
+                    value: ReasoningEffort::Low,
+                    label: "Low".into(),
+                    description: None,
+                    default: false,
+                }],
+                ReasoningEffort::Low,
+            ),
+            (
+                "marked",
+                vec![
+                    ReasoningEffortOption {
+                        id: "low".into(),
+                        value: ReasoningEffort::Low,
+                        label: "Low".into(),
+                        description: None,
+                        default: false,
+                    },
+                    ReasoningEffortOption {
+                        id: "medium".into(),
+                        value: ReasoningEffort::Medium,
+                        label: "Medium".into(),
+                        description: None,
+                        default: true,
+                    },
+                ],
+                ReasoningEffort::Medium,
+            ),
+        ] {
+            let key = format!("gpt-codex-narrow-{suffix}");
+            let mut models = IndexMap::from([(
+                key.clone(),
+                ConfigModelOverride {
+                    reasoning_efforts,
+                    ..ConfigModelOverride::default()
+                },
+            )]);
+            let presets = parse_openai_codex_catalog_models(&serde_json::json!({
+                "models": [{
+                    "slug": key,
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" },
+                        { "effort": "medium" },
+                        { "effort": "high" }
+                    ]
+                }]
+            }));
+            merge_openai_codex_preset_entries(&mut models, presets);
+
+            let merged = models.get(&key).expect("merged metadata override");
+            assert_eq!(merged.reasoning_effort, Some(expected));
+            assert_eq!(
+                merged
+                    .reasoning_efforts
+                    .iter()
+                    .filter(|option| option.default)
+                    .map(|option| option.value)
+                    .collect::<Vec<_>>(),
+                vec![expected]
+            );
+
+            let cfg = Config::default();
+            let resolved = resolve_model_list(
+                &cfg,
+                Some(IndexMap::from([(
+                    key.clone(),
+                    merged.apply(&key, None, &cfg.endpoints),
+                )])),
+            );
+            let info = &resolved[&key].info;
+            assert_eq!(info.reasoning_effort, Some(expected));
+            assert_eq!(info.reasoning_efforts.len(), merged.reasoning_efforts.len());
+            let sampler = crate::agent::config::sampling_config_for_model(
+                &resolved[&key],
+                crate::agent::config::resolve_credentials(&resolved[&key], None),
+                None,
+                None,
+                None,
+                None,
+                &crate::agent::trusted_origins::TrustedXaiOrigins::default(),
+            );
+            assert_eq!(sampler.reasoning_effort, Some(expected));
+        }
+    }
+
+    /// `data` / `id` / `name` are tolerances for shapes this endpoint does not
+    /// currently return. They are kept so a server-side change does not break
+    /// the fetch, and pinned so nobody mistakes them for the observed shape.
+    ///
+    /// Mini reports both fields; the budget is `max_context_window` (operative
+    /// capacity), not `context_window` (pricing threshold). Small reports only
+    /// the pricing field, which remains the fallback.
+    #[test]
+    fn codex_catalog_parser_tolerates_other_shapes_and_budgets_the_operative_window() {
+        let payload = serde_json::json!({
+            "data": [
+                {
+                    "id": "codex-mini",
+                    "name": "Codex Mini",
+                    "context_window": 64000,
+                    "max_context_window": 256000
+                },
+                {
+                    "model": "codex-small",
+                    "context_window": 128000
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let mini = presets.get("codex-mini").expect("mini preset should parse");
+        assert_eq!(mini.model.as_deref(), Some("codex-mini"));
+        assert_eq!(
+            mini.model_provider.as_deref(),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+        // Operative capacity, not the 64k pricing threshold. `gpt-5.4` is the
+        // live split: 272000 pricing vs 1000000 capacity.
+        assert_eq!(mini.context_window, Some(256_000));
+        let small = presets
+            .get("codex-small")
+            .expect("fallback slug preset should parse");
+        assert_eq!(small.context_window, Some(128_000));
+    }
+
+    /// The live `gpt-5.4` shape (#266).
+    ///
+    /// Eight of nine models report `context_window` and `max_context_window`
+    /// equal, so preferring either one looked identical. `gpt-5.4` does not:
+    /// 272_000 is the billing/pricing threshold, 1_000_000 is operative token
+    /// capacity. Budgeting the pricing field (#258) fires auto-compact at ~27%
+    /// of the tokens the model accepts.
+    #[test]
+    fn codex_catalog_context_window_budgets_the_operative_window() {
+        let obj = serde_json::json!({
+            "context_window": 272_000,
+            "max_context_window": 1_000_000
+        });
+        assert_eq!(
+            codex_catalog_context_window(obj.as_object().expect("object")),
+            Some(1_000_000),
+            "gpt-5.4 is budgeted at max_context_window (operative capacity), not context_window (pricing threshold)"
+        );
+
+        let payload = serde_json::json!({
+            "models": [{
+                "slug": "gpt-5.4",
+                "display_name": "GPT-5.4",
+                "context_window": 272_000,
+                "max_context_window": 1_000_000
+            }]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let entry = presets.get("gpt-5.4").expect("slug is the catalog key");
+        assert_eq!(
+            entry.context_window,
+            Some(1_000_000),
+            "the session budget is the operative capacity"
+        );
+    }
+
+    /// Cheap inversion lock: this array *is* the lookup order. Putting
+    /// `context_window` first is how #258 budgeted gpt-5.4 at the 272k
+    /// pricing threshold.
+    #[test]
+    fn codex_catalog_context_window_keys_prefer_operative_capacity() {
+        assert_eq!(
+            CODEX_CATALOG_CONTEXT_WINDOW_KEYS,
+            &[
+                "max_context_window",
+                "maxContextWindow",
+                "context_window",
+                "contextWindow",
+            ]
+        );
+        let max_idx = CODEX_CATALOG_CONTEXT_WINDOW_KEYS
+            .iter()
+            .position(|key| *key == "max_context_window")
+            .expect("max_context_window must be a candidate");
+        let pricing_idx = CODEX_CATALOG_CONTEXT_WINDOW_KEYS
+            .iter()
+            .position(|key| *key == "context_window")
+            .expect("context_window must remain as the pricing-threshold fallback");
+        assert!(
+            max_idx < pricing_idx,
+            "inverting this order budgets gpt-5.4 at the 272k pricing threshold"
+        );
+    }
+
+    /// The query parameter is not decoration: without it the endpoint answers
+    /// HTTP 400 and the catalog silently stays at one hardcoded model.
+    #[test]
+    fn codex_catalog_url_carries_the_required_client_version() {
+        let url = format!(
+            "{}/models?client_version={}",
+            crate::auth::openai_codex::CODEX_API_BASE_URL,
+            OPENAI_CODEX_CATALOG_CLIENT_VERSION
+        );
+        assert!(
+            url.contains("?client_version="),
+            "GET /models without client_version is rejected: {url}"
+        );
+        assert!(!OPENAI_CODEX_CATALOG_CLIENT_VERSION.is_empty());
+    }
+
+    #[test]
+    fn codex_catalog_fallback_uses_builtin_preset_when_fetch_is_empty() {
+        let presets = effective_openai_codex_presets(Some(IndexMap::new()));
+        assert_eq!(presets.len(), 1);
+        let preset = presets
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("built-in fallback preset should exist");
+        assert_eq!(preset.model.as_deref(), Some(OPENAI_CODEX_PRESET_MODEL_ID));
+        assert_eq!(
+            preset.context_window,
+            Some(OPENAI_CODEX_PRESET_CONTEXT_WINDOW)
+        );
+    }
+
+    fn catalog_test_identity(account_id: &str) -> CodexCatalogCacheIdentity {
+        CodexCatalogCacheIdentity {
+            account_id: Some(account_id.to_owned()),
+            chatgpt_account_is_fedramp: false,
+        }
+    }
+
+    fn catalog_test_payload(model: &str) -> serde_json::Value {
+        serde_json::json!({
+            "models": [{
+                "slug": model,
+                "display_name": model,
+                "context_window": 123_456
+            }]
+        })
+    }
+
+    /// #262: the cache identity includes the verified account id. A cache hit
+    /// for account A must remain a miss for account B even though both use the
+    /// same endpoint and auth provider.
+    #[test]
+    fn codex_catalog_last_good_cache_is_account_keyed() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let account_a = catalog_test_identity("account-a");
+        let account_b = catalog_test_identity("account-b");
+        let path_a = codex_catalog_cache_path(home.path(), &account_a).expect("account A path");
+        let path_b = codex_catalog_cache_path(home.path(), &account_b).expect("account B path");
+
+        assert_ne!(path_a, path_b);
+        assert!(!path_a.to_string_lossy().contains("account-a"));
+        persist_codex_catalog_cache(&path_a, &catalog_test_payload("codex-a"));
+        assert!(load_codex_catalog_cache(&path_a).is_some());
+        assert!(
+            load_codex_catalog_cache(&path_b).is_none(),
+            "account B must not read account A's entitlements"
+        );
+
+        persist_codex_catalog_cache(&path_a, &catalog_test_payload("codex-a-new"));
+        let refreshed_a = load_codex_catalog_cache(&path_a).expect("refreshed account A cache");
+        assert!(refreshed_a.contains_key("codex-a-new"));
+        assert!(
+            !refreshed_a.contains_key("codex-a"),
+            "a later successful refresh must replace the account's last-good snapshot"
+        );
+
+        persist_codex_catalog_cache(&path_b, &catalog_test_payload("codex-b"));
+        assert!(
+            load_codex_catalog_cache(&path_a)
+                .unwrap()
+                .contains_key("codex-a-new")
+        );
+        assert!(
+            load_codex_catalog_cache(&path_b)
+                .unwrap()
+                .contains_key("codex-b")
+        );
+    }
+
+    /// A crash may leave the deterministic PID/sequence temp path behind.
+    /// The next refresh must clean that stale file and still persist bytes.
+    #[test]
+    fn codex_catalog_cache_temp_write_retries_stale_path() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let tmp = home.path().join("catalog.json.tmp.reused");
+        std::fs::write(&tmp, b"stale partial catalog").expect("seed stale temp file");
+
+        write_codex_catalog_cache_tmp(&tmp, b"fresh complete catalog")
+            .expect("replace stale temp file");
+        assert_eq!(
+            std::fs::read(&tmp).expect("read refreshed temp file"),
+            b"fresh complete catalog"
+        );
+    }
+
+    /// #262: an expired bearer is not eligible for the live request, but its
+    /// retained verified account id must still select that account's cache.
+    #[test]
+    fn codex_catalog_expired_credential_can_read_account_cache() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let manager = crate::auth::AuthManager::new_openai_codex(home.path());
+        manager.hot_swap(crate::auth::GrokAuth {
+            key: "expired-catalog-token".to_owned(),
+            auth_mode: crate::auth::AuthMode::Oidc,
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            refresh_token: Some("retained-refresh-token".to_owned()),
+            account_id: Some("account-expired".to_owned()),
+            ..crate::auth::GrokAuth::test_default()
+        });
+
+        let (identity, live) =
+            codex_catalog_access_from_manager(&manager).expect("retained account identity");
+        assert!(
+            live.is_none(),
+            "expired bearer must not reach the live request"
+        );
+        let path = codex_catalog_cache_path(home.path(), &identity).expect("account cache path");
+        persist_codex_catalog_cache(&path, &catalog_test_payload("codex-last-good"));
+
+        let fallback = codex_catalog_fallback_models(Some(&path));
+        assert!(fallback.contains_key("codex-last-good"));
+        assert_eq!(
+            fallback["codex-last-good"]
+                .catalog_degraded_reason
+                .as_deref(),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+    }
+
+    /// Disabling network discovery suppresses only the live request; it must
+    /// not discard the account's already persisted model menu.
+    #[test]
+    fn codex_catalog_remote_fetch_disabled_uses_account_cache() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let identity = catalog_test_identity("account-offline");
+        let path = codex_catalog_cache_path(home.path(), &identity).expect("account cache path");
+        persist_codex_catalog_cache(&path, &catalog_test_payload("codex-offline"));
+
+        let models = load_codex_catalog_when_remote_fetch_disabled(Some(&path))
+            .expect("saved offline catalog");
+        assert!(models.contains_key("codex-offline"));
+        assert!(
+            models["codex-offline"].catalog_degraded_reason.is_none(),
+            "an intentional network policy is not a failed live refresh"
+        );
+    }
+
+    /// #262: a failed live refresh keeps the account's last-good menu and
+    /// carries a structured reason through ACP instead of silently looking
+    /// identical to the old single-model preset.
+    #[test]
+    fn codex_catalog_saved_fallback_is_visible_in_acp_metadata() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let credential = catalog_test_identity("account-a");
+        let path = codex_catalog_cache_path(home.path(), &credential).expect("cache path");
+        persist_codex_catalog_cache(&path, &catalog_test_payload("codex-saved"));
+        let fallback = codex_catalog_fallback_models(Some(&path));
+        assert!(fallback.contains_key("codex-saved"));
+
+        let mut cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("empty config");
+        cfg.config_models = fallback;
+        let resolved = resolve_model_list(&cfg, None);
+        let meta = crate::agent::config::to_acp_model_info(&resolved)
+            .get(&acp::ModelId::new("codex-saved"))
+            .and_then(|model| model.meta.as_ref())
+            .cloned()
+            .expect("saved model ACP metadata");
+        assert_eq!(
+            meta.get("catalogDegradedReason")
+                .and_then(serde_json::Value::as_str),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+    }
+
+    /// A user's display-text override must not erase operational fallback
+    /// state while the built-in preset supplies the routing underneath it.
+    #[test]
+    fn codex_catalog_degraded_state_survives_description_override() {
+        let presets = mark_codex_catalog_degraded(
+            openai_codex_preset_models(),
+            OPENAI_CODEX_SAVED_CATALOG_REASON,
+        );
+        let mut models = IndexMap::from([(
+            OPENAI_CODEX_PRESET_MODEL_ID.to_owned(),
+            ConfigModelOverride {
+                description: Some("My Codex model".to_owned()),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        merge_openai_codex_preset_entries(&mut models, presets);
+        assert_eq!(
+            models[OPENAI_CODEX_PRESET_MODEL_ID]
+                .catalog_degraded_reason
+                .as_deref(),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+
+        let mut cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("empty config");
+        cfg.config_models = models;
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("merged Codex model");
+        assert_eq!(
+            model.info.catalog_degraded_reason.as_deref(),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+        assert!(
+            model
+                .info
+                .description
+                .as_deref()
+                .is_some_and(|description| description.starts_with("My Codex model — "))
+        );
+        let acp_models = crate::agent::config::to_acp_model_info(&resolved);
+        let meta = acp_models
+            .get(&acp::ModelId::new(OPENAI_CODEX_PRESET_MODEL_ID))
+            .and_then(|model| model.meta.as_ref())
+            .expect("Codex ACP metadata");
+        assert_eq!(
+            meta.get("catalogDegradedReason")
+                .and_then(serde_json::Value::as_str),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+
+        let healthy = ConfigModelOverride {
+            description: Some(format!(
+                "User-authored text containing {}but no runtime failure",
+                OPENAI_CODEX_CATALOG_DEGRADED_MARKER
+            )),
+            ..ConfigModelOverride::default()
+        }
+        .apply(
+            "healthy-custom",
+            None,
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        let healthy_models = IndexMap::from([("healthy-custom".to_owned(), healthy)]);
+        let healthy_acp = crate::agent::config::to_acp_model_info(&healthy_models);
+        assert!(
+            healthy_acp[&acp::ModelId::new("healthy-custom")]
+                .meta
+                .as_ref()
+                .is_none_or(|meta| !meta.contains_key("catalogDegradedReason")),
+            "display text alone must not synthesize operational degraded state"
+        );
+    }
+
+    /// #262's persisted-default criterion is already enforced by #131's
+    /// substitution wire field. Pin the interaction with the built-in fallback
+    /// so a missing saved/default model cannot become a silent model change.
+    #[test]
+    fn codex_catalog_builtin_fallback_reports_absent_persisted_default() {
+        let fallback = codex_catalog_fallback_models(None);
+        let mut cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("empty config");
+        cfg.config_models = fallback;
+        cfg.models.default = Some("gpt-5.4".to_owned());
+        let resolved = resolve_model_list(&cfg, None);
+        let (_key, _entry, source, _reason) =
+            crate::agent::models::resolve_default_model(&cfg, &resolved, true);
+        let substitution = crate::agent::models::substituted_preference(&cfg, source)
+            .expect("absent persisted default must be reported");
+        assert_eq!(
+            substitution.to_meta_value(),
+            serde_json::json!({
+                "configuredModelId": "gpt-5.4",
+                "source": "config"
+            })
+        );
+    }
+
+    #[test]
+    fn codex_catalog_credential_source_must_be_openai_codex_provider() {
+        assert!(codex_catalog_credential_source_is_valid(
+            &xai_grok_sampler::CredentialSource::AuthProvider {
+                name: OPENAI_CODEX_PROVIDER_ID.to_owned()
+            }
+        ));
+        assert!(!codex_catalog_credential_source_is_valid(
+            &xai_grok_sampler::CredentialSource::AuthProvider {
+                name: "other-provider".to_owned()
+            }
+        ));
+        assert!(!codex_catalog_credential_source_is_valid(
+            &xai_grok_sampler::CredentialSource::Missing
+        ));
     }
 }

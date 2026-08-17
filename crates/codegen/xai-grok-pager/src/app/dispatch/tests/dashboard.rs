@@ -876,6 +876,7 @@ fn dashboard_confirm_worktree_applies_pending_model_and_plan() {
             model_id,
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
             prev_model_id: None,
+            prev_model_id_captured: false,
         }),
         "effort must be stashed for the shell",
     );
@@ -1373,6 +1374,7 @@ fn dashboard_effort_stash_admitted_when_slot_free() {
             model_id: model_id.clone(),
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
             prev_model_id: None,
+            prev_model_id_captured: false,
         }),
         "an admitted pick is stashed for hydration"
     );
@@ -2537,6 +2539,7 @@ fn dashboard_dispatch_applies_pending_model_and_plan() {
             model_id,
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
             prev_model_id: None,
+            prev_model_id_captured: false,
         }),
         "effort must be stashed for the shell"
     );
@@ -2617,6 +2620,7 @@ fn dashboard_new_agent_button_applies_pending_model_and_plan() {
             model_id,
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
             prev_model_id: None,
+            prev_model_id_captured: false,
         }),
         "effort must be stashed for the shell"
     );
