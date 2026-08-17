@@ -686,9 +686,10 @@ jobs:
             fi
             rm -f "$output"
           }
-          run_nonzero -p xai-grok-update --lib dist_channel -- --nocapture
-          run_nonzero -p xai-grok-update --lib self_update -- --nocapture
+          run_nonzero -p xai-grok-update --lib '' -- --nocapture
           run_nonzero -p xai-grok-update --test test_dist_channel_gate -- --nocapture
+          run_nonzero -p xai-grok-update --test test_install_internal -- --nocapture
+          run_nonzero -p xai-grok-update --test test_install_sh -- --nocapture
 
       - name: Leader lock identity (Linux-only /proc probe)
         # The leader auto-kill path proves "is this OUR process" by checking
@@ -797,6 +798,12 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             issue14_spawn_refresh_parent_actor_unavailable_is_actionable_error -- --nocapture
           run_nonzero -p xai-chat-state --lib \
+            actor:: -- --nocapture
+          run_nonzero -p xai-chat-state --lib \
+            compaction_utils:: -- --nocapture
+          run_nonzero -p xai-chat-state --lib \
+            image_budget:: -- --nocapture
+          run_nonzero -p xai-chat-state --lib \
             prepared_model_state_never_tears_routing_from_credentials -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             keeps_endpoint_and_bound_secret_when_name_collides_with_an_external_model -- --nocapture
@@ -868,7 +875,17 @@ jobs:
           run_nonzero -p xai-sqlite-journal --lib \
             apply_with_retry -- --nocapture
           run_nonzero -p xai-tty-utils --lib \
-            git_command_locking -- --nocapture
+            '' -- --nocapture
+          run_nonzero -p xai-ratatui-textarea --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-computer-hub-core --test \
+            workspace_unavailable -- --nocapture
+          run_nonzero -p xai-interjection-core --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-tool-protocol --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-tool-protocol --test \
+            serde_roundtrip -- --nocapture
           run_nonzero -p xai-tool-types --lib \
             background_spawn_notice_keeps_poll_hint_and_open_parent_work -- --nocapture
           run_nonzero -p xai-tool-types --lib \
@@ -878,31 +895,19 @@ jobs:
           run_nonzero -p xai-computer-hub-sdk --lib \
             server:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
-            permission::auto_mode:: -- --nocapture
-          run_nonzero -p xai-grok-workspace --lib \
-            permission::manager:: -- --nocapture
-          run_nonzero -p xai-grok-workspace --lib \
-            permission::prompter:: -- --nocapture
-          run_nonzero -p xai-grok-workspace --lib \
-            permission::types:: -- --nocapture
-          # Upstream moved these tests into an external `restore_fetch_tests.rs`
-          # via `#[path = "restore_fetch_tests.rs"] mod tests;` — the *file* was
-          # renamed, the module path was not, and a filter naming the file
-          # matched nothing. `run_nonzero` is what noticed.
-          #
-          # It stops at `restore_fetch::` rather than `restore_fetch::tests::`
-          # so that both readers agree. Cargo selects the same tests either way,
-          # but the #171 guard approximates a module path by turning `::` into
-          # `/` and looking for it in the file path, which cannot see through
-          # `#[path]`: it would look for `restore_fetch/tests` in a file called
-          # `restore_fetch_tests.rs` and report every test here as running
-          # nowhere. `restore_fetch::` is a substring of both.
-          run_nonzero -p xai-grok-workspace --lib \
-            restore_fetch:: -- --nocapture
-          run_nonzero -p xai-grok-workspace --lib \
-            session::git:: -- --nocapture
-          run_nonzero -p xai-grok-workspace --lib \
-            workspace_ops:: -- --nocapture
+            '' -- --nocapture
+          run_nonzero -p xai-grok-workspace --bin \
+            xai-workspace-server -- --nocapture
+          run_nonzero -p xai-grok-workspace-client --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-grok-workspace-daemon --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-grok-workspace-types --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-hooks-plugins-types --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-ratatui-inline --lib \
+            '' -- --nocapture
           # Session publication is intentionally side-effect free until the
           # final gate opens. Keep every deferred subsystem on the hot-path
           # lane so a renamed filter cannot silently drop this contract.
@@ -941,6 +946,12 @@ jobs:
           # that contains none of the tests it names.
           run_nonzero -p xai-fast-worktree --features metadata --lib \
             db::tests:: -- --nocapture
+          run_nonzero -p xai-fast-worktree --lib \
+            copy::standalone:: -- --nocapture
+          run_nonzero -p xai-fast-worktree --lib \
+            worktree:: -- --nocapture
+          run_nonzero -p xai-file-utils --lib \
+            queue:: -- --nocapture
           run_nonzero -p xai-file-utils --lib \
             storage_client:: -- --nocapture
           run_nonzero -p xai-grok-shell-base --lib \
@@ -951,31 +962,62 @@ jobs:
             bearer_fragment:: -- --nocapture
           run_nonzero -p xai-grok-markdown --lib \
             render:: -- --nocapture
+          run_nonzero -p xai-grok-mcp --lib \
+            servers:: -- --nocapture
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             cache_ -- --nocapture
+          run_nonzero -p xai-grok-pager-bin --test \
+            update_never_blocked_by_config -- --nocapture
+          run_nonzero -p xai-grok-pager-pty-harness --test \
+            exit_timeout -- --nocapture
+          run_nonzero -p xai-grok-pager-render --lib \
+            appearance:: -- --nocapture
+          run_nonzero -p xai-grok-pager-render --lib \
+            clipboard:: -- --nocapture
+          run_nonzero -p xai-grok-pager-render --lib \
+            render:: -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             terminal::tmux:: -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             theme:: -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
+            actor:: -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            client:: -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            events:: -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
             retry:: -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            stream:: -- --nocapture
           # `--test <target>` is already the restriction. The positional that
           # used to follow named the *target* again, and an integration test's
           # target name is not a module inside it -- these seven live at the
           # binary's root, so `cf_edge_error_message::` selected none of them.
           run_nonzero -p xai-grok-sampler --test cf_edge_error_message -- --nocapture
+          run_nonzero -p xai-grok-sampler --test test_actor -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            conversation:: -- --nocapture
           run_nonzero -p xai-grok-sampling-types --lib \
             error:: -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            tool_overrides:: -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
-            deny::glob:: -- --nocapture
+            '' -- --nocapture
+          run_nonzero -p xai-grok-sandbox --test \
+            read_write_trailing_glob_e2e -- --nocapture
           run_nonzero -p xai-grok-shared --lib \
             ui_config:: -- --nocapture
+          run_nonzero -p xai-grok-telemetry --lib \
+            config:: -- --nocapture
           run_nonzero -p xai-grok-telemetry --lib \
             events:: -- --nocapture
           run_nonzero -p xai-grok-telemetry --lib \
             external:: -- --nocapture
           run_nonzero -p xai-grok-telemetry --lib \
             startup:: -- --nocapture
+          run_nonzero -p xai-grok-test-support --lib \
+            mock_server:: -- --nocapture
           run_nonzero -p xai-grok-test-support --lib \
             resources:: -- --nocapture
           # #296: loopback PTY model fixtures must explicitly opt out of auth;
@@ -987,9 +1029,15 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             unresolved_empty_current_model_uses_live_fail_closed_sampling_config -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
+            bridge:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            computer:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
             implementations:: -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             registry:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            reminders:: -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             types:: -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
@@ -1059,9 +1107,13 @@ jobs:
           # Keep this broad filter on the default parallel harness: serial-only
           # execution masks cross-module auth-store contamination (#343).
           run_nonzero -p xai-grok-shell --lib \
+            builtin:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             codex_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             config:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            extensions:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             inspect:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -1069,15 +1121,49 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             managed_config:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            relay:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            remote:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             sampling:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             session:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            terminal:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            tools:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            upload:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             util:: -- --nocapture
+          run_nonzero -p xai-grok-session-search --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-grok-shell --test \
+            session_delete_evicts_index -- --nocapture
+          run_nonzero -p xai-grok-shell --test \
+            session_search_off_builds_no_index -- --nocapture
+          run_nonzero -p xai-grok-shell --test \
+            test_image_strip_recovery -- --nocapture
+          run_nonzero -p xai-grok-shell --test \
+            test_mcp_doctor_isolation -- --nocapture
+          run_nonzero -p xai-grok-shell --test \
+            test_stop_cancelled_hook_e2e -- --nocapture
+          run_nonzero -p xai-grok-plugin-marketplace --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-grok-pager --test \
+            pty_e2e_scroll_selection -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             app:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             disk_usage_cmd:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            git_info:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            mcp_cmd:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            memory_trace:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            memory_trace_signal_topology:: -- --nocapture
           # `xai-grok-config` had no filter at all, so every test in it ran
           # nowhere. `display::` owns the state-directory label rules, which
           # is exactly the fork behaviour a sync is most likely to break --
@@ -1086,7 +1172,23 @@ jobs:
           run_nonzero -p xai-grok-config --lib \
             display:: -- --nocapture
           run_nonzero -p xai-grok-config --lib \
+            loader:: -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
+            paths:: -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
             validation:: -- --nocapture
+          run_nonzero -p xai-grok-bundle --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-grok-diag-server --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-grok-hooks --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-grok-active-sessions --lib \
+            '' -- --nocapture
+          run_nonzero -p xai-grok-active-sessions --test \
+            smoke -- --nocapture
+          run_nonzero -p xai-grok-agent --lib \
+            '' -- --nocapture
           # Same `#[path]` move as `restore_fetch::` above, and stopped one
           # segment short for the same reason: the file is `fs_size_tests.rs`,
           # the module is `fs_size::tests`, and only `fs_size::` is a substring
@@ -1384,6 +1486,8 @@ jobs:
           # was never executed anywhere except a developer's macOS machine.
           run_nonzero -p xai-fsnotify --lib \
             checkout:: -- --nocapture
+          run_nonzero -p xai-fsnotify --lib \
+            watcher:: -- --nocapture
 
       # #159: a runtime-only model was judged absent by a config-only lookup,
       # and the turn stripped its credentials. Filters written out rather than

@@ -3977,7 +3977,7 @@ mod tests {
 
     #[test]
     fn test_reinstall_hint_npm_mentions_npm_command() {
-        let hint = reinstall_hint_for("npm", false);
+        let hint = reinstall_hint_for("npm", "stable", false);
         assert!(hint.contains("npm i -g"), "should suggest npm i -g: {hint}");
         assert!(
             hint.contains("@xai-official/grok"),
@@ -3987,7 +3987,7 @@ mod tests {
 
     #[test]
     fn test_reinstall_hint_gh_release_mentions_gh_command() {
-        let hint = reinstall_hint_for("gh-release", false);
+        let hint = reinstall_hint_for("gh-release", "stable", false);
         assert!(
             hint.contains("gh release download"),
             "should suggest gh release download: {hint}"
@@ -4000,7 +4000,7 @@ mod tests {
 
     #[test]
     fn test_reinstall_hint_internal_mentions_platform_installer() {
-        let hint = reinstall_hint_for("internal", false);
+        let hint = reinstall_hint_for("internal", "stable", false);
         if cfg!(windows) {
             assert!(hint.contains("irm"), "should suggest irm install: {hint}");
             assert!(
@@ -4019,15 +4019,15 @@ mod tests {
     #[test]
     fn test_reinstall_hint_unknown_falls_back_to_internal() {
         // Unknown installer falls back to the same hint as "internal".
-        let unknown = reinstall_hint_for("homebrew", false);
-        let internal = reinstall_hint_for("internal", false);
+        let unknown = reinstall_hint_for("homebrew", "stable", false);
+        let internal = reinstall_hint_for("internal", "stable", false);
         assert_eq!(unknown, internal);
     }
 
     #[test]
     fn test_reinstall_hint_empty_falls_back_to_internal() {
-        let hint = reinstall_hint_for("", false);
-        assert_eq!(hint, reinstall_hint_for("internal", false));
+        let hint = reinstall_hint_for("", "stable", false);
+        assert_eq!(hint, reinstall_hint_for("internal", "stable", false));
     }
 
     /// A build that refuses to self-update must not hand the user an upstream
@@ -4035,9 +4035,9 @@ mod tests {
     /// with, the only correct recovery is the fork's own installer.
     #[test]
     fn reinstall_hint_is_installer_agnostic_when_self_update_is_disabled() {
-        let expected = reinstall_hint_for("internal", true);
+        let expected = reinstall_hint_for("internal", "stable", true);
         for installer in ["npm", "gh-release", "internal", "homebrew", ""] {
-            let hint = reinstall_hint_for(installer, true);
+            let hint = reinstall_hint_for(installer, "stable", true);
             assert_eq!(hint, expected, "installer {installer:?} changed the hint");
             assert!(
                 hint.contains(&dist_channel::medley_install_command()),
@@ -4061,7 +4061,7 @@ mod tests {
     #[test]
     fn reinstall_hint_follows_the_distribution_decision() {
         let disabled = dist_channel::self_update_refusal().is_some();
-        assert_eq!(reinstall_hint("npm"), reinstall_hint_for("npm", disabled));
+        assert_eq!(reinstall_hint("npm", "stable"), reinstall_hint_for("npm", "stable", disabled));
     }
 
     // ──────────────────────────────────────────────────────────────────────
