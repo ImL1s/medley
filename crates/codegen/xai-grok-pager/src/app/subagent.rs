@@ -200,9 +200,9 @@ pub(crate) fn replay_inherited_updates(
 pub(crate) fn replay_inherited_updates_with_fallback(
     child_view: &mut crate::app::agent_view::AgentView,
     child_session_id: &str,
-    parent_cwd: &std::path::Path,
-    child_cwd: Option<&std::path::Path>,
-    fallback: ReplayLookupFallback,
+    _parent_cwd: &std::path::Path,
+    _child_cwd: Option<&std::path::Path>,
+    _fallback: ReplayLookupFallback,
 ) {
     let home = effective_grok_home();
     let replay_meta = crate::acp::meta::NotificationMeta {

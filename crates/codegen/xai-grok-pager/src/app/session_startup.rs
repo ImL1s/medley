@@ -1122,6 +1122,7 @@ async fn restore_session_from_remote(
         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {}", e))?;
     use xai_grok_shell::agent::session_registry_client::SessionRegistryClient;
     use xai_grok_shell::auth::{AuthManager, ensure_authenticated_or_noninteractive};
+    #[allow(unused_imports)]
     use xai_grok_shell::foreign_sessions;
     use xai_grok_shell::session::restore::{RestoreSessionOpts, restore_session_with_storage};
     use xai_grok_shell::util::grok_home::grok_home;

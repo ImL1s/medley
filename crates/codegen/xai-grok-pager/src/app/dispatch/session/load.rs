@@ -1072,7 +1072,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
     // leave a notice (or a false one) in that staging for a later success to
     // merge — siblings (`SessionLoadFailed`, restore progress) refuse the same
     // push-into-staging.
-    let is_api_key_auth = app.is_api_key_auth;
+    let _is_api_key_auth = app.is_api_key_auth;
     tracing::info!(
         "Session loaded for agent {:?} session {:?}",
         agent_id,

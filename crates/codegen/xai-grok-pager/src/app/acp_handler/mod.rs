@@ -84,6 +84,7 @@ use workflow_ingest::ingest_workflow_update;
 /// through the same arm the removed `x.ai/session_notification` used. Re-exported
 /// narrowly (module stays private) so there is one renderer rather than a copy
 /// in dispatch that would drift out of sync with this one's coverage.
+#[allow(unused_imports)]
 pub(in crate::app) use session_notification::apply_session_event;
 #[cfg(test)]
 pub(crate) use session_notification::apply_session_event_for_test;

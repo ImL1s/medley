@@ -1379,7 +1379,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
     let agent_count = app.agents.len();
     let app_chat_mode = app.chat_mode;
     // Captured before the `agents` borrow below, like `app_chat_mode`.
-    let is_api_key_auth = app.is_api_key_auth;
+    let _is_api_key_auth = app.is_api_key_auth;
     let switch_hint =
         crate::views::dashboard::session_switch_hint_command(app.screen_mode.is_minimal());
     if let Some(agent) = app.agents.get_mut(&agent_id) {
@@ -1670,7 +1670,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
     scheduler_background_loops: Option<bool>,
 ) -> Vec<Effect> {
     // Captured before the `agents` borrow, as in `handle_session_created`.
-    let is_api_key_auth = app.is_api_key_auth;
+    let _is_api_key_auth = app.is_api_key_auth;
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         // #161: same treatment as the non-worktree path — a worktree session is
         // still a fresh session whose response carries the notice.

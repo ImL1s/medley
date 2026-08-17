@@ -249,6 +249,7 @@ pub(crate) fn parse_session_scheduler_background_loops(
 /// `model_id` and `reason` via `tracing::warn!` before pushing the block, and
 /// dropping them would leave the warning without the two fields that make it
 /// actionable.
+#[allow(dead_code)]
 pub(crate) fn parse_session_web_search_disabled(
     resp_meta: Option<&acp::Meta>,
 ) -> Option<xai_grok_shell::session::WebSearchDisabledNotice> {

@@ -130,9 +130,14 @@ async fn ambiguous_identity_refuses_every_update_entry_point() {
 
     // Launch-time auto-update.
     assert!(
-        !run_update_if_available(UpdateRunMode::NonBlocking, false, &config)
-            .await
-            .expect("refusing is not an error at launch"),
+        !run_update_if_available(
+            UpdateRunMode::NonBlocking,
+            false,
+            CliUpdateTrigger::AutoBackground,
+            &config
+        )
+        .await
+        .expect("refusing is not an error at launch"),
         "launch-time auto-update must not run"
     );
 
