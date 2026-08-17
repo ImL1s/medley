@@ -220,6 +220,7 @@ const PLAN_MODE_CHOICES: &[EnumChoice] = &[
 
 // Mid-turn follow-up routing. SHARED-owned, persisted to
 // `[ui].follow_up_behavior`. Canonicals match `FollowUpBehavior::as_canonical`.
+#[allow(dead_code)]
 const FOLLOW_UP_BEHAVIOR_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         canonical: "queue",

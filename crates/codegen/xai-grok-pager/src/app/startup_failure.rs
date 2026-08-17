@@ -1,6 +1,8 @@
 //! Startup failures as data. [`StartupFailure::user_report`] is the only place
 //! they become the text a reader sees.
 
+#![allow(dead_code)]
+
 mod render;
 
 use std::fmt;

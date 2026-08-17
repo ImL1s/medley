@@ -508,6 +508,7 @@ fn session_loaded_during_open_reload_window_defers_to_window() {
 /// a false notice) when the authoritative post-window load also carries one.
 #[test]
 fn stale_mid_window_load_does_not_push_web_search_notice() {
+    #[allow(dead_code)]
     const MSG: &str =
         "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)";
     let mut app = test_app();

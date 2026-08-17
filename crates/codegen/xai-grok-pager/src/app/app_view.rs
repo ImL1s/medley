@@ -6521,7 +6521,7 @@ pub(crate) mod tests {
             let agent = app.agents.get_mut(&id).unwrap();
             agent.session.prompt_history = vec!["first prompt".into(), "second prompt".into()];
             let history = agent.combined_prompt_history();
-            agent.prompt.history_search.activate(&history, "");
+            let _ = agent.prompt.history_search.activate(&history, "");
         }
         assert!(
             app.needs_animation(),
@@ -9502,7 +9502,7 @@ pub(crate) mod tests {
         assert!(agent.prompt.textarea.text().is_empty());
         let history = agent.combined_prompt_history();
         let current_text = agent.prompt.text().to_string();
-        agent
+        let _ = agent
             .prompt
             .history_search
             .activate(&history, &current_text);
@@ -11270,7 +11270,7 @@ pub(crate) mod tests {
         {
             let agent = app.agents.get_mut(&id).unwrap();
             agent.active_pane = crate::app::agent_view::AgentPane::Prompt;
-            agent.prompt.history_search.activate(&[], "");
+            let _ = agent.prompt.history_search.activate(&[], "");
             assert!(
                 agent.prompt.text().is_empty(),
                 "fixture draft must be empty"

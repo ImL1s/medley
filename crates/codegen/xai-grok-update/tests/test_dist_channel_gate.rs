@@ -23,10 +23,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{FakeBinGuard, make_update_config, reset_home, set_test_version, test_home};
 use xai_grok_update::auto_update::{
-    UpdateRunMode, apply_channel_switch, auto_update_target, check_update_background,
-    check_update_status, ensure_latest_on_disk, install_internal_from_base,
-    install_internal_from_bases, install_npm_for_test, run_install_script, run_update,
-    run_update_if_available,
+    CliUpdateTrigger, UpdateRunMode, apply_channel_switch, auto_update_target,
+    check_update_background, check_update_status, ensure_latest_on_disk,
+    install_internal_from_base, install_internal_from_bases, install_npm_for_test,
+    run_install_script, run_update, run_update_if_available,
 };
 use xai_grok_update::dist_channel;
 
@@ -138,25 +138,48 @@ async fn ambiguous_identity_refuses_every_update_entry_point() {
 
     // Explicit `grok update`, including the flags that force the issue.
     assert_eq!(
-        run_update(false, None, None, &mut config).await.unwrap(),
+        run_update(
+            false,
+            None,
+            None,
+            &mut config,
+            CliUpdateTrigger::UserCommand
+        )
+        .await
+        .unwrap(),
         None
     );
     assert_eq!(
-        run_update(true, None, None, &mut config).await.unwrap(),
+        run_update(true, None, None, &mut config, CliUpdateTrigger::UserCommand)
+            .await
+            .unwrap(),
         None,
         "--force must not bypass the refusal"
     );
     assert_eq!(
-        run_update(false, Some("9.9.9"), None, &mut config)
-            .await
-            .unwrap(),
+        run_update(
+            false,
+            Some("9.9.9"),
+            None,
+            &mut config,
+            CliUpdateTrigger::UserCommand
+        )
+        .await
+        .unwrap(),
         None,
         "--version must not bypass the refusal"
     );
 
     // The orchestrating install entry point refuses on its own authority.
     for installer in ["npm", "gh-release", "internal"] {
-        let Err(err) = run_install_script(installer, Some("9.9.9"), &config).await else {
+        let Err(err) = run_install_script(
+            installer,
+            Some("9.9.9"),
+            &config,
+            CliUpdateTrigger::UserCommand,
+        )
+        .await
+        else {
             panic!("install must be refused for {installer}");
         };
         assert!(
@@ -267,9 +290,15 @@ async fn refused_update_does_not_persist_a_channel_switch() {
     let mut config = make_update_config("stable");
 
     assert_eq!(
-        run_update(false, None, Some("alpha"), &mut config)
-            .await
-            .unwrap(),
+        run_update(
+            false,
+            None,
+            Some("alpha"),
+            &mut config,
+            CliUpdateTrigger::UserCommand
+        )
+        .await
+        .unwrap(),
         None
     );
 
@@ -305,7 +334,7 @@ async fn control_upstream_identity_still_reaches_the_installer() {
         fixture.npm.args_log()
     );
 
-    run_install_script("npm", Some("9.9.9"), &config)
+    run_install_script("npm", Some("9.9.9"), &config, CliUpdateTrigger::UserCommand)
         .await
         .expect("an upstream build must be allowed to install");
     assert!(
