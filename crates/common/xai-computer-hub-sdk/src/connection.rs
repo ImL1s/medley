@@ -1548,6 +1548,7 @@ async fn run_reader_actor(
             ConnectedExit::Stop => break,
             ConnectedExit::TerminalClose(code) => {
                 info!(code, "server sent terminal close; not reconnecting");
+                fire_on_terminal_close(inner.as_ref(), code);
                 fire_on_disconnect(inner.as_ref());
                 inner.demux.drain_waiters_with(|| {
                     ClientError::Closed(format!("server terminal close (code {code})"))
