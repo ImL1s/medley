@@ -543,6 +543,49 @@ async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
     assert!(child_compaction.join("INDEX.md").is_file());
 }
 
+/// Windows JSONL stores `C:\\…\\compaction` while `Path::to_string_lossy`
+/// is `C:\…\compaction`. Rewrite must run after deserialize (Codex P2 3793486694).
+#[test]
+fn issue345_updates_rewrite_runs_after_json_unescape() {
+    let from = r"C:\Users\iml1s\.grok\sessions\parent\compaction";
+    let to = r"C:\Users\iml1s\.grok\sessions\child\compaction";
+    let rewrite = super::CompactionHintRewrite {
+        from: from.to_string(),
+        to: to.to_string(),
+    };
+    let update = fork_agent_chunk("sid", &format!("history lives in {from}"));
+    let line = serde_json::to_string(
+        &crate::session::storage::SessionUpdateEnvelope::from_update(&update).expect("envelope"),
+    )
+    .expect("jsonl line");
+    assert!(
+        line.contains(r"C:\\Users") || line.contains(r"C:\\\\Users"),
+        "fixture line must JSON-escape backslashes: {line}"
+    );
+    assert_eq!(
+        rewrite.apply(&line).as_ref(),
+        line.as_str(),
+        "raw JSONL must not match the unescaped Windows prefix"
+    );
+
+    let mut parsed =
+        crate::session::storage::SessionUpdateEnvelope::from_str(&line).expect("parse");
+    super::rewrite_session_update_compaction_hint(&mut parsed, &rewrite);
+    let out = serde_json::to_string(
+        &crate::session::storage::SessionUpdateEnvelope::from_update(&parsed)
+            .expect("rewrite envelope"),
+    )
+    .expect("rewritten jsonl");
+    assert!(
+        out.contains("child"),
+        "parsed update must name the child compaction dir: {out}"
+    );
+    assert!(
+        !out.contains("parent"),
+        "parsed update must not keep the parent compaction dir: {out}"
+    );
+}
+
 /// A `compaction_checkpoint` record pointing at `compaction_checkpoints/{id}.json`.
 fn checkpoint_record(id: &str) -> SessionUpdate {
     checkpoint_record_with_path(id, &format!("compaction_checkpoints/{id}.json"))

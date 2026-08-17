@@ -249,6 +249,55 @@ fn rewrite_summary_compaction_hint(summary: &mut Summary, rewrite: &CompactionHi
     }
 }
 
+fn rewrite_json_strings(value: &mut serde_json::Value, rewrite: &CompactionHintRewrite) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Cow::Owned(replaced) = rewrite.apply(text) {
+                *text = replaced;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_json_strings(item, rewrite);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                rewrite_json_strings(item, rewrite);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite hint paths on the typed update (post-unescape), not the raw JSONL
+/// line. Chat/summary already do this; updates must match.
+fn rewrite_session_update_compaction_hint(
+    update: &mut SessionUpdate,
+    rewrite: &CompactionHintRewrite,
+) {
+    match update {
+        SessionUpdate::Acp(notification) => {
+            let Ok(mut value) = serde_json::to_value(&**notification) else {
+                return;
+            };
+            rewrite_json_strings(&mut value, rewrite);
+            if let Ok(rewritten) = serde_json::from_value(value) {
+                **notification = rewritten;
+            }
+        }
+        SessionUpdate::Xai(notification) => {
+            let Ok(mut value) = serde_json::to_value(&**notification) else {
+                return;
+            };
+            rewrite_json_strings(&mut value, rewrite);
+            if let Ok(rewritten) = serde_json::from_value(value) {
+                **notification = rewritten;
+            }
+        }
+    }
+}
+
 /// Indexes (in non-empty-line order) of the source lines that survive rewind
 /// filtering and the `target_prompt_index` cut, holding one classification per
 /// line instead of the lines. As in replay, an unparseable line classifies as
@@ -310,20 +359,19 @@ impl<'a> UpdateLineWriter<'a> {
                 return Ok(());
             }
         };
-        let rewritten;
-        let utf8 = if let Some(rewrite) = self.hint_rewrite {
-            rewritten = rewrite.apply(utf8);
-            rewritten.as_ref()
-        } else {
-            utf8
-        };
-        let update = match SessionUpdateEnvelope::from_str(utf8) {
+        let mut update = match SessionUpdateEnvelope::from_str(utf8) {
             Ok(update) => update,
             Err(error) => {
                 self.skip_torn_line(&error);
                 return Ok(());
             }
         };
+        // Rewrite after JSON unescape. On Windows the parent path uses `\`
+        // while the raw JSONL line stores `\\`, so a textual replace on the
+        // line never matches (Codex P2 3793486694).
+        if let Some(rewrite) = self.hint_rewrite {
+            rewrite_session_update_compaction_hint(&mut update, rewrite);
+        }
         if is_orchestration_projection_update(&update) {
             return Ok(());
         }
