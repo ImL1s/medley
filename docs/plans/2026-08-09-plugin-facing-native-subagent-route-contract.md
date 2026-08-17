@@ -1,8 +1,14 @@
 # Optional plugin-facing native subagent route contract
 
-**Status:** Shipped — the contract landed on `providers` via #386, #387 and #388.  
-This page is the 2026-08-09 design record, kept as written. For the surface that
-actually shipped — including what was deliberately left out — see
+**Status:** Partially shipped — the core contract landed on `providers` via
+[ImL1s/medley#385](https://github.com/ImL1s/medley/pull/385),
+[#386](https://github.com/ImL1s/medley/pull/386) and
+[#387](https://github.com/ImL1s/medley/pull/387); a further #290 slice landed via
+[#388](https://github.com/ImL1s/medley/pull/388).
+This page is the 2026-08-09 design record, kept as written — much of it is
+normative intent that was descoped or deferred, not a description of current
+behaviour. For the surface that actually shipped, including what was
+deliberately left out, see
 [`docs/architecture/native-subagent-route-contract.md`](../architecture/native-subagent-route-contract.md).  
 **Date:** 2026-08-09  
 **Target branch:** `providers`  
@@ -149,6 +155,10 @@ unknown
 ```
 
 Only `supported` authorizes use. Capability discovery performs no inference request and exposes no credential/account data.
+
+The Rust sketches below are the 2026-08-09 shape. The shipped types are in
+`xai-grok-subagent-resolution::native_route::types` and differ in several fields;
+read them there rather than copying from here.
 
 ## Request contract
 
