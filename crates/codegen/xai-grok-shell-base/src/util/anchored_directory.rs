@@ -679,15 +679,17 @@ mod platform {
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
     use windows::Win32::Security::GetTokenInformation;
     use windows::Win32::Security::{
         ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-        GetLengthSid, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
-        SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY,
-        TOKEN_USER, TokenUser,
+        EqualSid, GetLengthSid, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+        SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
@@ -1097,7 +1099,7 @@ mod platform {
         let current_user =
             OwnerOnlySecurity::new_with_inheritance(windows::Win32::Security::ACE_FLAGS(0))?;
         unsafe {
-            let mut dacl = std::ptr::null_mut();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
             let mut raw_descriptor = PSECURITY_DESCRIPTOR::default();
             let status = GetSecurityInfo(
                 HANDLE(file.as_raw_handle()),
@@ -1650,7 +1652,7 @@ mod platform {
         for attempt in 0..5_u32 {
             match rename_retained_handle_no_replace_once(source, target_parent, target_name) {
                 Ok(()) => return Ok(()),
-                Err(error) if destination_name_exists(target_parent, target_name) => {
+                Err(_error) if destination_name_exists(target_parent, target_name) => {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         "no-replace rename collided",
