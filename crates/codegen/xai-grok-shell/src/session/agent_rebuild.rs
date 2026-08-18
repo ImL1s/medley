@@ -127,6 +127,9 @@ pub(crate) struct AgentRebuildSpec {
     pub subagent_depth: u32,
     pub subagents_max_depth: u32,
     pub session_id_str: String,
+    /// Session ceiling applied to every rebuild so zero-turn harness switches
+    /// cannot widen a restricted session.
+    pub capability_mode_ceiling: Option<xai_tool_types::SubagentCapabilityMode>,
     pub blocking_wait_depth: Arc<crate::tools::tool_context::BlockingWaitState>,
     pub respect_gitignore: bool,
     pub path_not_found_hints: bool,
@@ -229,6 +232,7 @@ impl AgentRebuildSpec {
             subagent_depth,
             subagents_max_depth,
             session_id_str,
+            capability_mode_ceiling,
             blocking_wait_depth,
             respect_gitignore,
             path_not_found_hints,
@@ -241,10 +245,16 @@ impl AgentRebuildSpec {
             parent_scheduler_handle,
         } = self.as_ref();
         let _ = mcp_state;
+        let mut definition = definition;
+        definition.capability_mode =
+            xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
+                definition.capability_mode,
+                None,
+                *capability_mode_ceiling,
+            );
         #[allow(unused_variables)]
         let is_cursor_template =
             crate::session::is_cursor_system_template(&definition.system_prompt);
-        let mut definition = definition;
         if let Some(cfg_opts) = web_search_domains.clone() {
             definition
                 .tool_overrides
@@ -468,6 +478,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         subagent_depth: 0,
         subagents_max_depth: xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH,
         session_id_str: "test-session".to_string(),
+        capability_mode_ceiling: None,
         blocking_wait_depth: Arc::new(crate::tools::tool_context::BlockingWaitState::new()),
         respect_gitignore: false,
         scheduler_background_loops: true,
@@ -639,6 +650,43 @@ mod tests {
                          - beta-public\n\
                          - zeta-public"
                     )
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue39_rebuild_respects_capability_mode_ceiling() {
+        use xai_grok_tools::types::tool::ToolKind;
+        use xai_tool_types::SubagentCapabilityMode;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut spec = test_rebuild_spec_default();
+                let spec_mut =
+                    Arc::get_mut(&mut spec).expect("test rebuild spec should be uniquely owned");
+                spec_mut.capability_mode_ceiling = Some(SubagentCapabilityMode::ReadOnly);
+
+                let mut definition = AgentDefinition::default_grok_build();
+                definition.capability_mode = Some(SubagentCapabilityMode::All);
+
+                let agent = spec
+                    .build_agent(definition)
+                    .await
+                    .expect("agent rebuild with ceiling should succeed");
+
+                assert_eq!(
+                    agent.definition().capability_mode,
+                    Some(SubagentCapabilityMode::ReadOnly),
+                    "rebuild must clamp capability mode to the session ceiling"
+                );
+                let toolset = agent.tool_bridge().toolset();
+                assert!(
+                    toolset.tool_name_for_kind(ToolKind::Read).is_some(),
+                    "read tools remain available under ReadOnly"
+                );
+                assert!(
+                    toolset.tool_name_for_kind(ToolKind::Write).is_none(),
+                    "write tools must be removed by the rebuild capability ceiling"
                 );
             })
             .await;
