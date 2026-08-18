@@ -359,6 +359,7 @@ jobs:
   test:
     name: Tests (providers hot path)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -376,7 +377,9 @@ jobs:
       # developer machines have `rg`.
       - name: Install DotSlash and ripgrep
         run: |
-          sudo apt-get update && sudo apt-get install -y ripgrep
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=30 ripgrep
+          fi
           cargo install dotslash --version 0.5.7 --locked
           /usr/bin/env dotslash --help >/dev/null
           "$PROTOC" --version
