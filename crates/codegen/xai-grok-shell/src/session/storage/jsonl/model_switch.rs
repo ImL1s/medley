@@ -187,6 +187,7 @@ impl JsonlStorageAdapter {
                 cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
                 model: Some(super::super::summary_write::ModelPatch {
                     model_id: intent.model_id.clone(),
+                    catalog_identity: intent.catalog_identity.clone(),
                     agent_name: intent.agent_name.clone(),
                     reasoning_effort: Some(intent.reasoning_effort),
                 }),

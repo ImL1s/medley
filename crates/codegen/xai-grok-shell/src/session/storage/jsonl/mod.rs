@@ -1395,9 +1395,27 @@ impl StorageAdapter for JsonlStorageAdapter {
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<xai_grok_sampling_types::ReasoningEffort>>,
     ) -> io::Result<()> {
+        self.update_current_model_identity_and_agent(
+            info,
+            model_id,
+            None,
+            agent_name,
+            reasoning_effort,
+        )
+        .await
+    }
+    async fn update_current_model_identity_and_agent(
+        &self,
+        info: &Info,
+        model_id: &acp::ModelId,
+        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
+        agent_name: Option<&str>,
+        reasoning_effort: Option<Option<xai_grok_sampling_types::ReasoningEffort>>,
+    ) -> io::Result<()> {
         let adapter = self.clone();
         let info = info.clone();
         let model_id = model_id.clone();
+        let catalog_identity = catalog_identity.cloned();
         let agent_name = agent_name.map(String::from);
         tokio::task::spawn_blocking(move || {
             let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
@@ -1407,6 +1425,7 @@ impl StorageAdapter for JsonlStorageAdapter {
                 &super::summary_write::SummaryPatch {
                     model: Some(super::summary_write::ModelPatch {
                         model_id,
+                        catalog_identity,
                         agent_name,
                         reasoning_effort,
                     }),
@@ -1437,16 +1456,37 @@ impl StorageAdapter for JsonlStorageAdapter {
         agent_name: Option<&str>,
         reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     ) -> Result<(), super::ModelSwitchCommitError> {
+        self.commit_model_switch_with_identity(
+            info,
+            messages,
+            model_id,
+            None,
+            agent_name,
+            reasoning_effort,
+        )
+        .await
+    }
+    async fn commit_model_switch_with_identity(
+        &self,
+        info: &Info,
+        messages: &[ConversationItem],
+        model_id: &acp::ModelId,
+        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
+        agent_name: Option<&str>,
+        reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+    ) -> Result<(), super::ModelSwitchCommitError> {
         let adapter = self.clone();
         let info = info.clone();
         let messages = messages.to_vec();
         let model_id = model_id.clone();
+        let catalog_identity = catalog_identity.cloned();
         let agent_name = agent_name.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
-            adapter.commit_model_switch_sync(
+            adapter.commit_model_switch_with_identity_sync(
                 &info,
                 &messages,
                 &model_id,
+                catalog_identity.as_ref(),
                 agent_name.as_deref(),
                 reasoning_effort,
             )
