@@ -21,18 +21,29 @@
 #                                             archive cannot pass
 #   3. it can exec another program          — musl's process layer, from a
 #                                             statically linked caller
-#   4. it can resolve a name and complete   — the load-bearing one: a static
-#      a TLS handshake                        binary loads no NSS modules, so
-#                                             musl's own resolver is the only
-#                                             thing answering
+#   4. it can resolve a name and open a      — the load-bearing one: a static
+#      TLS connection                          binary loads no NSS modules, so
+#                                              musl's own resolver is the only
+#                                              thing answering
 #
 # (3) is `execve`, not `fork` — `wrap` replaces its own process on Unix. It
 # proves the binary can hand off to another program, which is the part a
 # static build could plausibly break; it is not a claim about `fork`.
 #
-# (4) asserts on what the harness observed, never on medley's wording. A line
-# in the TLS log can only exist if the name resolved *and* the handshake
-# completed, because the harness cannot see a request that got neither.
+# (4) asserts on what the harness observed, never on medley's wording. The
+# required observation is a TLS ClientHello, which the harness cannot see
+# unless the name resolved, TCP connected, and the client's TLS stack produced
+# a handshake message. A completed request is reported too when it happens,
+# but is not required: that additionally needs whichever subsystem made the
+# call to have wired GROK_EXTRA_CA_BUNDLE, which is a property of this
+# binary's plumbing rather than of musl.
+#
+# The driver is `setup`, which fetches managed configuration from
+# `[endpoints] managed_config_url` once a deployment key is present. It was
+# chosen by measurement, not by reading: `models` looks like the obvious
+# candidate and makes *no* network request at all — it answers from a local
+# catalogue, so a smoke test built on it would have asserted nothing and
+# failed at the first tag.
 set -eu
 
 ARCHIVE="${1:?usage: musl_smoke.sh <archive> <target> <version>}"
@@ -150,7 +161,7 @@ while [ ! -f "$READY" ]; do
   fi
   sleep 0.1
 done
-ok "harness listening on dns/53 and https/${HTTPS_PORT}"
+ok "harness listening on dns/53 and tls/${HTTPS_PORT}"
 
 # Point the container's resolver at the harness. musl reads this file on every
 # lookup, so no cache has to be invalidated.
@@ -164,42 +175,59 @@ else
   ok "TLS log empty before the run"
 fi
 
-# `models` is the lightest command that talks to the configured endpoint. Both
-# base URLs are overridden the same way this repository's own test support
-# overrides them. The key is a fixed placeholder: the harness answers 401 to
-# everything, and the assertion is on what the harness saw, not on the reply.
+# `setup` fetches managed configuration over HTTPS as soon as a deployment key
+# is present, from whatever `[endpoints] managed_config_url` names — so the
+# whole request is steered by config this script writes, with no credential
+# that has to be real. The key is a fixed placeholder; the harness answers
+# every request the same way, and the assertions are on what it observed.
 run_medley() {
-  HOME="${WORK}/home" \
-    MEDLEY_HOME="${WORK}/home/.medley" \
-    GROK_HOME="${WORK}/home/.medley" \
-    XAI_API_KEY=medley-musl-smoke-placeholder \
+  rm_home="${WORK}/home-${2}"
+  rm -rf "$rm_home"
+  mkdir -p "${rm_home}/.medley"
+  printf '[endpoints]\nmanaged_config_url = "https://%s:%s/deployment/config"\n' \
+    "$1" "$HTTPS_PORT" > "${rm_home}/.medley/config.toml"
+
+  HOME="$rm_home" \
+    MEDLEY_HOME="${rm_home}/.medley" \
+    GROK_HOME="${rm_home}/.medley" \
+    GROK_DEPLOYMENT_KEY=medley-musl-smoke-placeholder \
     GROK_EXTRA_CA_BUNDLE="${SMOKE_DIR}/ca.pem" \
-    GROK_XAI_API_BASE_URL="https://${1}:${HTTPS_PORT}/v1" \
-    GROK_MODELS_BASE_URL="https://${1}:${HTTPS_PORT}/v1" \
-    timeout 120 "$BIN" models > "${WORK}/models-${2}.log" 2>&1 || true
+    timeout 120 "$BIN" setup --json > "${WORK}/setup-${2}.log" 2>&1 || true
 }
 
-mkdir -p "${WORK}/home"
 run_medley "$RESOLVES" resolves
 
 if grep -q "^${RESOLVES} " "$DNS_LOG"; then
   ok "resolved ${RESOLVES} through musl's resolver"
 else
   bad "no DNS query for ${RESOLVES} reached the harness"
-  sed 's/^/       /' "${WORK}/models-resolves.log" | tail -15
+  sed 's/^/       /' "${WORK}/setup-resolves.log" | tail -15
 fi
 
-if [ -s "$TLS_LOG" ]; then
-  ok "completed a TLS handshake and sent a request: $(head -n 1 "$TLS_LOG")"
+# The required signal. A ClientHello means the name resolved, TCP connected,
+# and rustls came up far enough to speak — which is everything musl is
+# responsible for here.
+if grep -q '^CLIENTHELLO ' "$TLS_LOG"; then
+  ok "opened a TLS connection: $(grep -m 1 '^CLIENTHELLO ' "$TLS_LOG")"
 else
-  bad "no request survived the TLS handshake"
-  sed 's/^/       /' "${WORK}/models-resolves.log" | tail -15
+  bad "no TLS ClientHello reached the harness"
+  echo "       tls log:"
+  sed 's/^/       /' "$TLS_LOG"
+  sed 's/^/       /' "${WORK}/setup-resolves.log" | tail -15
+fi
+
+# Reported, not required — see the header. When it does appear, certificate
+# verification worked too, which is worth knowing but is not musl's doing.
+if grep -q '^REQUEST ' "$TLS_LOG"; then
+  ok "handshake completed and a request arrived: $(grep -m 1 '^REQUEST ' "$TLS_LOG")"
+else
+  printf '  info %s\n' "handshake did not complete; the caller did not trust the throwaway CA ($(grep -m 1 '^HANDSHAKE-FAILED ' "$TLS_LOG" || echo 'no handshake error logged'))"
 fi
 
 # Negative control. The same harness, the same binary, a name it will not
-# answer: the resolver must be asked and the TLS server must not be reached.
-# Without this, a TLS log that was somehow pre-populated would read as a pass.
-tls_before="$(wc -l < "$TLS_LOG" | tr -d ' ')"
+# answer: the resolver must be asked and no connection may arrive. Without
+# this, a TLS log that was somehow pre-populated would read as a pass.
+tls_before="$(grep -c '^CLIENTHELLO ' "$TLS_LOG" || true)"
 run_medley "$NXDOMAIN" nxdomain
 
 if grep -q "^${NXDOMAIN} " "$DNS_LOG"; then
@@ -208,11 +236,11 @@ else
   bad "control: ${NXDOMAIN} never reached the resolver, so the check above proves nothing about DNS"
 fi
 
-tls_after="$(wc -l < "$TLS_LOG" | tr -d ' ')"
+tls_after="$(grep -c '^CLIENTHELLO ' "$TLS_LOG" || true)"
 if [ "$tls_after" = "$tls_before" ]; then
-  ok "control: an unresolvable name reached no TLS request"
+  ok "control: an unresolvable name opened no TLS connection"
 else
-  bad "control: the TLS log grew from ${tls_before} to ${tls_after} for a name that does not resolve"
+  bad "control: ClientHellos grew from ${tls_before} to ${tls_after} for a name that does not resolve"
 fi
 
 echo

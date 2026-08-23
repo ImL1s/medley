@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A DNS resolver and an HTTPS origin, for the musl portability smoke test.
+"""A DNS resolver and a TLS origin, for the musl portability smoke test.
 
 The static musl archives exist so medley runs where there is no glibc, and the
 one behaviour a static binary genuinely loses is NSS: it cannot load
@@ -7,9 +7,9 @@ one behaviour a static binary genuinely loses is NSS: it cannot load
 musl resolves names itself instead, so the question is not academic and cannot
 be answered by `--version` succeeding.
 
-Answering it needs the shipped binary to resolve a name and complete a TLS
-handshake through its *own* stack. That is what this harness is for, and why it
-is a resolver as well as a server: pointing medley at `127.0.0.1` would skip
+Answering it needs the shipped binary to resolve a name and open a TLS
+connection through its *own* stack. That is what this harness is for, and why
+it is a resolver as well as a server: pointing medley at `127.0.0.1` would skip
 `getaddrinfo` altogether, and pointing it at a public host would make a release
 gate depend on somebody else's uptime and on the wording of an error message.
 
@@ -17,22 +17,34 @@ Both sides record what they saw, so the test asserts on this process's
 observations rather than on medley's prose:
 
 * every queried name is appended to ``--dns-log``
-* every request that survives the TLS handshake is appended to ``--tls-log``
+* every connection is appended to ``--tls-log``, tagged by how far it got
 
-A line in the TLS log therefore means DNS resolved *and* the handshake
-completed — the harness cannot see a request otherwise. A name that is not
-``--host`` gets NXDOMAIN, which is how the test gets a negative control out of
-the same running harness: the DNS log gains a line and the TLS log must not.
+The TLS side is deliberately a raw accept loop rather than a wrapped
+``HTTPServer``. Wrapping the listening socket makes a rejected handshake
+indistinguishable from a client that never connected — CPython swallows the
+error inside ``get_request`` — and those two are the readings that matter most
+to tell apart. Confusing them is how "this client does not trust our private
+CA" gets misdiagnosed as "musl cannot resolve names", which is the exact
+mistake this harness exists to prevent. So each connection is peeked at before
+the handshake:
+
+    CLIENTHELLO        a TLS record arrived — DNS resolved, TCP connected, and
+                       the client's TLS stack produced a handshake message.
+                       This is the load-bearing observation.
+    REQUEST <line>     the handshake also completed and a request arrived.
+                       Stronger, but it additionally requires the client to
+                       trust the throwaway CA, which not every subsystem in
+                       this binary wires up.
+    HANDSHAKE-FAILED   connected, and the handshake was refused.
+    NOTTLS             connected and sent something that is not TLS.
 
 Deliberately dependency-free and 3.9-compatible: it runs inside rockylinux:9
 and amazonlinux:2023, whose python3 is whatever `dnf` needs and nothing more.
 """
 
 import argparse
-import http.server
 import os
 import socket
-import socketserver
 import ssl
 import struct
 import sys
@@ -40,11 +52,16 @@ import threading
 
 # Query types this resolver distinguishes. musl asks for both, in parallel.
 QTYPE_A = 1
-QTYPE_AAAA = 28
 
 # Flags for a recursive-capable answer: QR=1, RD=1, RA=1, plus the RCODE.
 FLAGS_NOERROR = 0x8180
 FLAGS_NXDOMAIN = 0x8183
+
+# A TLS record header starts with the content type (0x16, handshake) followed
+# by the legacy protocol version, whose major byte is 0x03 for every version
+# still in use — TLS 1.3 included, which keeps 0x0303 on the wire.
+TLS_HANDSHAKE = 0x16
+TLS_VERSION_MAJOR = 0x03
 
 _LOG_LOCK = threading.Lock()
 
@@ -133,41 +150,63 @@ def _serve_dns(sock, host, address, dns_log):
             continue
 
 
-def _handler_class(tls_log):
-    class Handler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
+def _handle_connection(conn, peer, context, tls_log):
+    where = "%s:%d" % (peer[0], peer[1])
+    try:
+        conn.settimeout(15)
+        # Peeked, not consumed, so the handshake below still sees these bytes.
+        head = conn.recv(2, socket.MSG_PEEK)
+        if len(head) < 2 or head[0] != TLS_HANDSHAKE or head[1] != TLS_VERSION_MAJOR:
+            _append(tls_log, "NOTTLS %s %r" % (where, head))
+            return
+        _append(tls_log, "CLIENTHELLO %s" % where)
 
-        def _record(self):
-            _append(tls_log, "%s %s" % (self.command, self.path))
-            # Shape does not matter: the test asserts on the log line above,
+        try:
+            tls = context.wrap_socket(conn, server_side=True)
+        except (ssl.SSLError, OSError) as exc:
+            _append(tls_log, "HANDSHAKE-FAILED %s %s" % (where, exc))
+            return
+
+        with tls:
+            request = b""
+            while b"\r\n" not in request and len(request) < 8192:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            line = request.split(b"\r\n", 1)[0].decode("ascii", "replace")
+            _append(tls_log, "REQUEST %s" % line)
+            # Shape does not matter: the test asserts on the log lines above,
             # not on what medley makes of the reply. 401 is the least
-            # surprising thing to say to a request carrying a fake key.
+            # surprising thing to say to a request carrying a placeholder key.
             body = b'{"error":{"message":"medley musl smoke harness"}}'
-            self.send_response(401)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            tls.sendall(
+                b"HTTP/1.1 401 Unauthorized\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n"
+                b"Connection: close\r\n\r\n" % len(body)
+                + body
+            )
+    except OSError as exc:
+        _append(tls_log, "CONNECTION-ERROR %s %s" % (where, exc))
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
 
-        do_GET = _record
-        do_POST = _record
-        do_PUT = _record
-        do_DELETE = _record
 
-        def log_message(self, *args):
-            """Silence the default stderr access log; ``tls_log`` is the record."""
-
-    return Handler
-
-
-class _ThreadingHTTPSServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
-    # A refused handshake (medley rejecting our CA, say) must not take the
-    # harness down with it — the test needs an empty log, not a dead server.
-    allow_reuse_address = True
-
-    def handle_error(self, request, client_address):
-        sys.stderr.write("harness: connection from %s failed\n" % (client_address,))
+def _serve_tls(listener, context, tls_log):
+    while True:
+        try:
+            conn, peer = listener.accept()
+        except OSError:
+            return
+        threading.Thread(
+            target=_handle_connection,
+            args=(conn, peer, context, tls_log),
+            daemon=True,
+        ).start()
 
 
 def main():
@@ -197,22 +236,23 @@ def main():
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=args.cert, keyfile=args.key)
 
-    https = _ThreadingHTTPSServer(("0.0.0.0", args.https_port), _handler_class(args.tls_log))
-    https.socket = context.wrap_socket(https.socket, server_side=True)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", args.https_port))
+    listener.listen(16)
 
     threading.Thread(
         target=_serve_dns,
         args=(dns_socket, args.host, args.address, args.dns_log),
         daemon=True,
     ).start()
-    threading.Thread(target=https.serve_forever, daemon=True).start()
+    threading.Thread(target=_serve_tls, args=(listener, context, args.tls_log), daemon=True).start()
 
     with open(args.ready_file, "w", encoding="utf-8") as handle:
         handle.write("%d\n" % os.getpid())
 
     sys.stderr.write(
-        "harness: dns/%d and https/%d up for %s\n"
-        % (args.dns_port, args.https_port, args.host)
+        "harness: dns/%d and tls/%d up for %s\n" % (args.dns_port, args.https_port, args.host)
     )
     sys.stderr.flush()
     threading.Event().wait()
