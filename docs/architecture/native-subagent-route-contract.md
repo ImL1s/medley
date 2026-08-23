@@ -17,6 +17,14 @@ consumer [ImL1s/oh-my-grok#131](https://github.com/ImL1s/oh-my-grok/issues/131) 
 [#133](https://github.com/ImL1s/oh-my-grok/issues/133) /
 [#134](https://github.com/ImL1s/oh-my-grok/issues/134).
 
+Foundations: capability-aware eligibility
+[#19](https://github.com/ImL1s/medley/issues/19) · replay-safe failover
+[#18](https://github.com/ImL1s/medley/issues/18) · effective route and
+credential/origin binding [#110](https://github.com/ImL1s/medley/issues/110) ·
+access and usage-scope identity
+[#187](https://github.com/ImL1s/medley/issues/187) · usage attribution
+[#23](https://github.com/ImL1s/medley/issues/23).
+
 ## Implemented versus planned
 
 **Implemented in this slice** (`xai-grok-subagent-resolution::native_route`
@@ -35,7 +43,8 @@ plus live spawn in `xai-grok-shell`):
   (`routeReceiptDigest`), and optional ACP `SubagentSpawned` fields;
 - inspect/adapter usage facts helper from the canonical receipt (`catalogId` /
   `wireModel` / `accessProfile` / `routeDigest`); live `by_model` usage still
-  keys by catalog id on the existing #23 path;
+  keys by catalog id on the existing [#23](https://github.com/ImL1s/medley/issues/23)
+  path;
 - live exact `model:` fail-closed against the session catalog (unknown ids do
   **not** inherit);
 - generation-bound `/agents` enable/disable and default mutations (persisted

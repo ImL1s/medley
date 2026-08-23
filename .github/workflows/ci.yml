@@ -66,6 +66,12 @@ jobs:
       - name: Enforce SHA-pinned GitHub Actions
         run: python3 -B -m unittest tests.test_workflow_action_pins -v
 
+      # The user guide is extracted to <grok_home>/docs/user-guide/ at startup
+      # and docs/architecture/ is not, so a relative link out of the guide
+      # directory is broken for installed readers (#385 shipped one).
+      - name: Guard user-guide links against install extraction
+        run: python3 -B -m unittest tests.test_user_guide_link_guard -v
+
       # Direct-mention scan: EnvGuard / std::env::{set_var,remove_var} in
       # xai-grok-shell unit tests must carry unkeyed #[serial] (#319).
       # Known stragglers are allowlisted; new hits and stale entries fail.
