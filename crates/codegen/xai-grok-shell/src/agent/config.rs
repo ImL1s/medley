@@ -6805,6 +6805,27 @@ pub(crate) fn web_search_disable_details(
         endpoints,
     ) {
         Err(disabled) => Some(disabled),
+        // #178: `auth_scheme = "none"` is a deliberate absence, not a gap, and
+        // the recorded decision is that it stays disabled — the local
+        // `web_search` tool issues its own outbound request and cannot infer
+        // from the credential scheme that a keyless endpoint serves it. Only
+        // the wording changes: a user who declared the route keyless must not
+        // be told a credential is missing. The predicate is unchanged, and
+        // this arm carries it too, so the two arms can never disagree about
+        // which routes are disabled at all — only about how to say why.
+        Ok(cfg)
+            if !has_usable_credential(&cfg)
+                && matches!(
+                    cfg.credential_source,
+                    Some(xai_grok_sampler::CredentialSource::None)
+                ) =>
+        {
+            Some(WebSearchDisabled::new(
+                model_id,
+                "auth_scheme = \"none\" is a deliberately keyless route; \
+                 the local web_search tool needs a credentialed route",
+            ))
+        }
         // Mirror spawn.rs's enable condition, through the one shared
         // predicate, so this reason can never describe a state the spawn path
         // does not actually produce. Asking `api_key.is_none()` here reported
@@ -10596,8 +10617,15 @@ reasoning_effort = "low"
         );
     }
     /// #160 counterweight: the fix must not become "enable everything". A route
-    /// that genuinely has no credential stays disabled, and keeps #153's
-    /// reason — which is what makes the notice worth showing at all.
+    /// that genuinely has no credential stays disabled, and #153's notice is
+    /// still what says so — which is what makes it worth showing at all.
+    ///
+    /// #178 decided the *disable* stays and only the wording moves: the local
+    /// `web_search` tool cannot infer from `auth_scheme = "none"` that the
+    /// endpoint serves search, so a keyless route is still refused, but it no
+    /// longer borrows `Missing`'s "no API key" wording — a user who declared
+    /// the route keyless is not missing anything. Both halves are asserted:
+    /// still disabled, and no longer described as a missing credential.
     #[test]
     #[serial]
     fn credential_less_route_stays_disabled_with_the_153_reason() {
@@ -10641,8 +10669,12 @@ reasoning_effort = "low"
         .expect("a credential-less route must still produce a notice")
         .user_notice();
         assert!(
-            notice.contains("no API key or session credential available"),
-            "#153's reason must survive the #160 fix: {notice}"
+            notice.contains("auth_scheme = \"none\" is a deliberately keyless route"),
+            "#178: a keyless route must be refused in its own words: {notice}"
+        );
+        assert!(
+            !notice.contains("no API key or session credential available"),
+            "#178: a deliberately keyless route must not borrow Missing's wording: {notice}"
         );
     }
     /// #110 (Layer 0): a model that needs a bearer, declares no credential of
