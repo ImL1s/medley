@@ -2581,7 +2581,9 @@ impl AuthManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn last_rejected_scope_publication_phase(&self) -> Option<DurableAuthWritePhase> {
+    pub(in crate::auth) fn last_rejected_scope_publication_phase(
+        &self,
+    ) -> Option<DurableAuthWritePhase> {
         *self.last_rejected_scope_publication_phase.lock()
     }
 

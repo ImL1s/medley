@@ -28,8 +28,8 @@ fn remainder_after_http_400_prefix(message: &str) -> Option<&str> {
         let Some(rest) = message.strip_prefix(head) else {
             continue;
         };
-        let after_code = if rest.starts_with(')') {
-            &rest[1..]
+        let after_code = if let Some(stripped) = rest.strip_prefix(')') {
+            stripped
         } else if rest.starts_with(' ') {
             let close = rest.find(')')?;
             &rest[close + 1..]

@@ -5768,16 +5768,15 @@ pub(crate) fn resolve_credentials_with_origins(
     // origin. The sampling choke point still strips as defense in depth, but
     // callers of `resolve_credentials` must already see the refuse.
     let source = classify_credential_source(model, &resolved);
-    if source.is_ambient_xai() {
-        if !crate::util::is_xai_api_bearer_url(&resolved.base_url)
-            && !trusted_xai_origins.is_trusted(&resolved.base_url)
-        {
-            tracing::error!(
-                model = %info.model,
-                "resolve_credentials: refusing ambient xAI credential for non-first-party origin"
-            );
-            resolved.api_key = None;
-        }
+    if source.is_ambient_xai()
+        && !crate::util::is_xai_api_bearer_url(&resolved.base_url)
+        && !trusted_xai_origins.is_trusted(&resolved.base_url)
+    {
+        tracing::error!(
+            model = %info.model,
+            "resolve_credentials: refusing ambient xAI credential for non-first-party origin"
+        );
+        resolved.api_key = None;
     }
     resolved
 }

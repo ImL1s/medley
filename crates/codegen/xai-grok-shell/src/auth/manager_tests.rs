@@ -6898,7 +6898,7 @@ async fn permanent_codex_rejection_removes_only_codex_and_preserves_xai() {
 
     let store = read_auth_json(&path).unwrap();
     assert!(
-        store.get(crate::auth::openai_codex::AUTH_SCOPE).is_none(),
+        !store.contains_key(crate::auth::openai_codex::AUTH_SCOPE),
         "rejected Codex scope must be dropped from the durable file"
     );
     assert_xai_sibling_preserved(&path);
@@ -6986,7 +6986,7 @@ async fn permanent_codex_rejection_post_rename_reconciles_to_published_file() {
         .expect_err("classified post-rename failure still surfaces the rejection");
 
     let store = read_auth_json(&path).unwrap();
-    assert!(store.get(crate::auth::openai_codex::AUTH_SCOPE).is_none());
+    assert!(!store.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
     assert_xai_sibling_preserved(&path);
     assert!(
         manager.current_or_expired().is_none(),
@@ -7019,7 +7019,7 @@ async fn permanent_codex_rejection_parent_dir_sync_is_after_publication() {
         .expect_err("parent-directory sync failure is still a permanent rejection");
 
     let store = read_auth_json(&path).unwrap();
-    assert!(store.get(crate::auth::openai_codex::AUTH_SCOPE).is_none());
+    assert!(!store.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
     assert_xai_sibling_preserved(&path);
     assert!(manager.current_or_expired().is_none());
     assert_eq!(
@@ -7088,9 +7088,8 @@ async fn permanent_codex_rejection_never_exposes_torn_json_to_readers() {
     );
     assert_xai_sibling_preserved(&path);
     assert!(
-        read_auth_json(&path)
+        !read_auth_json(&path)
             .unwrap()
-            .get(crate::auth::openai_codex::AUTH_SCOPE)
-            .is_none()
+            .contains_key(crate::auth::openai_codex::AUTH_SCOPE)
     );
 }
