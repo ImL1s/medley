@@ -85,6 +85,7 @@ impl SlashCommand for EffortCommand {
             Ok(effort) => CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: Some(effort),
+                session_only: true,
             }),
             Err(err) => CommandResult::Error(err.message()),
         }
@@ -196,9 +197,14 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = EffortCommand.run(&mut ctx, "high");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::High));
+                assert!(session_only, "effort switch must be session-only");
             }
             other => panic!("expected SwitchModel with effort, got {other:?}"),
         }
@@ -214,7 +220,11 @@ mod tests {
         state.current = Some(id.clone());
         let mut ctx = dummy_exec_ctx(&state);
         match EffortCommand.run(&mut ctx, "minimal") {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Minimal));
             }
@@ -253,7 +263,11 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = EffortCommand.run(&mut ctx, "none");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::None));
             }
@@ -304,7 +318,11 @@ mod tests {
 
         let mut exec_ctx = dummy_exec_ctx(&state);
         match EffortCommand.run(&mut exec_ctx, "ultra") {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Ultra));
             }
@@ -329,7 +347,11 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         // The rendered row inserts the id; `/effort deep` must send `xhigh`.
         match EffortCommand.run(&mut ctx, "deep") {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Xhigh));
             }
@@ -478,7 +500,11 @@ mod tests {
         {
             let mut ctx = dummy_exec_ctx(&state);
             match EffortCommand.run(&mut ctx, "none") {
-                CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                CommandResult::Action(Action::SwitchModel {
+                    model_id,
+                    effort,
+                    session_only: _,
+                }) => {
                     assert_eq!(model_id, id_a);
                     assert_eq!(effort, Some(ReasoningEffort::None));
                 }
@@ -514,7 +540,11 @@ mod tests {
         {
             let mut ctx = dummy_exec_ctx(&state);
             match EffortCommand.run(&mut ctx, "minimal") {
-                CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                CommandResult::Action(Action::SwitchModel {
+                    model_id,
+                    effort,
+                    session_only: _,
+                }) => {
                     assert_eq!(model_id, id_b);
                     assert_eq!(effort, Some(ReasoningEffort::Minimal));
                 }

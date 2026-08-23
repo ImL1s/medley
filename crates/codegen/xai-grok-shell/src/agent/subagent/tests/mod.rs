@@ -2074,6 +2074,7 @@ async fn run_durable_legacy_resume_scenario(
             effective_model_id: Some(model_id.to_owned()),
             effective_model_route: complete_metadata.then(|| metadata_route.to_owned()),
             effective_model_agent_type: complete_metadata.then(|| "codex".to_owned()),
+            native_route_receipt: None,
         },
     );
 

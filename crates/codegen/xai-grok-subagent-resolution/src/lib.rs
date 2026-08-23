@@ -20,8 +20,9 @@
 //!
 //! [`native_route`] is the optional plugin-facing native subagent route
 //! contract (#287): capability negotiation, ordered catalog candidates, and
-//! secret-free receipts. Child-session construction still uses the existing
-//! exact/inherit spawn path until a later PR wires this resolver into spawn.
+//! secret-free receipts. Live child spawn maps the session catalog through
+//! this resolver when `AgentDefinition.models` is set or when exact `model:`
+//! is declared; unknown exact ids fail closed instead of inheriting.
 
 pub mod config;
 pub mod context;
@@ -42,9 +43,10 @@ pub use definition::{
 };
 pub use native_route::{
     AgentRouteUxSnapshot, CapabilityRequirements, CapabilityState, DeclarativeNativeRouteSpec,
-    NativeModelSelection, NativeRouteError, NativeSubagentRouteRequest, NativeSubagentRouteResult,
-    RejectionCode, RouteReceipt, SyntheticCatalog, WorkerRoute, discover_capabilities,
-    inspect_document, resolve_native_route,
+    FallbackAdmission, LifecyclePhase, NativeModelSelection, NativeRouteError,
+    NativeSubagentRouteRequest, NativeSubagentRouteResult, RejectionCode, RouteReceipt,
+    SyntheticCatalog, WorkerRoute, discover_capabilities, inspect_document, parse_declarative_spec,
+    request_from_agent_definition, resolve_native_route, usage_facts_from_receipt,
 };
 pub use overrides::{
     intersect_capability_mode_ceiling, intersect_capability_modes, resolve_effective_overrides,

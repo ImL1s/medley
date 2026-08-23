@@ -1550,7 +1550,11 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
         // Both the effort-bearing (`SwitchModel`) and bare
         // (`SetDefaultModel`) forms map to the same per-spawn staging — we
         // deliberately do NOT persist a global default here.
-        CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+        CommandResult::Action(Action::SwitchModel {
+            model_id,
+            effort,
+            session_only: _,
+        }) => {
             stage_dashboard_model(app, model_id, effort);
             vec![]
         }
@@ -1735,6 +1739,7 @@ pub(super) fn apply_pending_dispatch_config(
                         // Effort-only push; no display change to roll back.
                         prev_model_id: None,
                         prev_model_id_captured: false,
+                        session_only: false,
                     });
                 } else if let Some(agent) = app.agents.get_mut(&agent_id) {
                     // Refused at stash time: the request completes here, once,

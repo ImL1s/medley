@@ -700,6 +700,8 @@ pub struct DeferredModelSwitch {
     /// Distinguishes "no predecessor captured yet" from "captured that no
     /// model was displayed". The latter must survive rapid pre-session picks.
     pub prev_model_id_captured: bool,
+    /// Session-only switch: does not persist to the global preferred model
+    pub session_only: bool,
 }
 /// Per-agent business logic (ACP session, models, state).
 ///
@@ -915,6 +917,7 @@ impl AgentSession {
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
         prev_model_id: Option<acp::ModelId>,
+        session_only: bool,
     ) {
         let prior = self.deferred_model_switch.take();
         let rollback_prev = prior
@@ -927,6 +930,7 @@ impl AgentSession {
             effort,
             prev_model_id: rollback_prev,
             prev_model_id_captured: true,
+            session_only,
         });
     }
     /// Process an ACP session update. Returns true if scrollback was modified.

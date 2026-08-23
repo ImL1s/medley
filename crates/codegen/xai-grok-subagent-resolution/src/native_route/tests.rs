@@ -3,8 +3,8 @@ use crate::native_route::resolve::SyntheticCatalogEntry;
 use crate::native_route::types::{
     AttemptLifecycleFact, CAP_MODEL_FAMILY_METADATA, CAP_ORDERED_CANDIDATES,
     CAP_REPLAY_SAFE_FALLBACK, CAP_ROUTE_RECEIPT, CapabilityRequirements, CapabilityState,
-    NativeModelSelection, NativeRouteError, NativeSubagentRouteRequest, RECEIPT_SCHEMA,
-    RejectedCandidate, RejectionCode, ResumePin, SCHEMA_VERSION, WorkerRoute,
+    FallbackFailureClass, NativeModelSelection, NativeRouteError, NativeSubagentRouteRequest,
+    RECEIPT_SCHEMA, RejectedCandidate, RejectionCode, ResumePin, SCHEMA_VERSION, WorkerRoute,
 };
 use sha2::{Digest, Sha256};
 use xai_grok_agent::config::ModelOverride;
@@ -789,12 +789,447 @@ fn receipt_digest_binds_serialized_schema() {
     });
     let with_message = format!(
         "{:x}",
-        Sha256::digest(&serde_json::to_vec(&with_reject.canonical_payload()).unwrap())
+        Sha256::digest(serde_json::to_vec(&with_reject.canonical_payload()).unwrap())
     );
     with_reject.rejected_candidates[0].message = "forged explanation".into();
     let forged_message = format!(
         "{:x}",
-        Sha256::digest(&serde_json::to_vec(&with_reject.canonical_payload()).unwrap())
+        Sha256::digest(serde_json::to_vec(&with_reject.canonical_payload()).unwrap())
     );
     assert_ne!(with_message, forged_message);
+}
+
+#[test]
+fn agent_definition_parses_models_as_ordered_candidates() {
+    let def = crate::AgentDefinition::parse(
+        "---\nname: verifier\ndescription: dual review\nmodels:\n  - review-primary\n  - review-fallback\n---\n",
+    )
+    .unwrap();
+    assert_eq!(
+        def.models,
+        vec!["review-primary".to_string(), "review-fallback".to_string()]
+    );
+    let req = request_from_agent_definition(&def, None, None, None, None).unwrap();
+    assert_eq!(
+        req.selection,
+        NativeModelSelection::OrderedCandidates {
+            catalog_ids: vec!["review-primary".into(), "review-fallback".into()],
+        }
+    );
+}
+
+#[test]
+fn agent_definition_rejects_model_and_models_conflict() {
+    let err = crate::AgentDefinition::parse(
+        "---\nname: verifier\ndescription: dual review\nmodel: review-primary\nmodels:\n  - review-fallback\n---\n",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("model and models"));
+}
+
+#[test]
+fn usage_facts_from_receipt_are_secret_free() {
+    let result = resolve_native_route(
+        &request(NativeModelSelection::Exact {
+            catalog_id: "review-primary".into(),
+        }),
+        &catalog(),
+        1,
+        2,
+    )
+    .unwrap();
+    let facts = usage_facts_from_receipt(&result.receipt);
+    assert_eq!(facts["catalogId"], "review-primary");
+    assert_eq!(facts["wireModel"], "gpt-family-wire");
+    assert_eq!(facts["accessProfile"], "subscription");
+    assert_eq!(facts["attempt"], 2);
+    assert_eq!(facts["selectionMode"], "exact");
+    assert_eq!(facts["routeDigest"], result.receipt.route_digest);
+    let blob = facts.to_string().to_ascii_lowercase();
+    assert!(!blob.contains("sk-"));
+    assert!(!blob.contains("bearer"));
+    assert!(!blob.contains("api_key"));
+}
+
+#[test]
+fn inspect_document_includes_live_receipts() {
+    let result =
+        resolve_native_route(&request(NativeModelSelection::Inherit), &catalog(), 1, 1).unwrap();
+    let doc = inspect_document(vec![result.receipt.clone()]).expect("valid receipt");
+    assert_eq!(doc.receipts.len(), 1);
+    assert_eq!(doc.receipts[0].selected_catalog_id, "review-primary");
+}
+
+#[test]
+fn snapshot_from_agent_definition_uses_models_list() {
+    let mut def = crate::AgentDefinition::explore();
+    def.models = vec!["review-primary".into(), "review-fallback".into()];
+    let snap = snapshot_from_agent_definition(
+        "verifier",
+        "verifier",
+        "project",
+        true,
+        false,
+        false,
+        &def,
+        Some("read-only"),
+        1,
+    );
+    assert_eq!(snap.selection_mode, AgentSelectionMode::OrderedCandidates);
+    assert_eq!(
+        snap.requested_model_refs,
+        vec!["review-primary".to_string(), "review-fallback".to_string()]
+    );
+}
+
+fn fallback_plan<'a>(
+    selection: &'a NativeModelSelection,
+    remaining: &'a [String],
+    facts: &'a [AttemptLifecycleFact],
+    failure: FallbackFailureClass,
+    catalog: &'a SyntheticCatalog,
+    requirements: &'a CapabilityRequirements,
+) -> FallbackPlanRequest<'a> {
+    FallbackPlanRequest {
+        selection,
+        current_catalog_id: "review-primary",
+        current_access_profile: "subscription",
+        remaining_catalog_ids: remaining,
+        catalog,
+        requirements,
+        facts,
+        failure,
+    }
+}
+
+#[test]
+fn fallback_pre_output_429_admits_same_lane_next() {
+    let cat = catalog();
+    let mut same_lane = entry(
+        "review-same-lane",
+        "other-wire",
+        "route-same",
+        "subscription",
+        true,
+    );
+    same_lane.unknown_readiness = false;
+    let mut cat = cat;
+    cat.entries.push(same_lane);
+    let selection = NativeModelSelection::OrderedCandidates {
+        catalog_ids: vec!["review-primary".into(), "review-same-lane".into()],
+    };
+    let remaining = vec!["review-same-lane".to_string()];
+    let facts = [AttemptLifecycleFact::AttemptStarted];
+    let reqs = CapabilityRequirements::default();
+    let decision = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &facts,
+        FallbackFailureClass::RateLimited,
+        &cat,
+        &reqs,
+    ));
+    assert!(decision.admitted, "{decision:?}");
+    assert_eq!(
+        decision.next_catalog_id.as_deref(),
+        Some("review-same-lane")
+    );
+}
+
+#[test]
+fn fallback_skips_cross_billing_then_admits_same_lane() {
+    let mut cat = catalog();
+    cat.entries.push(entry(
+        "review-same-lane",
+        "other-wire",
+        "route-same",
+        "subscription",
+        true,
+    ));
+    let selection = NativeModelSelection::OrderedCandidates {
+        catalog_ids: vec![
+            "review-primary".into(),
+            "review-fallback".into(),
+            "review-same-lane".into(),
+        ],
+    };
+    let remaining = vec![
+        "review-fallback".to_string(),
+        "review-same-lane".to_string(),
+    ];
+    let facts = [AttemptLifecycleFact::AttemptStarted];
+    let reqs = CapabilityRequirements::default();
+    let decision = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &facts,
+        FallbackFailureClass::ConnectTimeout,
+        &cat,
+        &reqs,
+    ));
+    assert!(decision.admitted, "{decision:?}");
+    assert_eq!(
+        decision.next_catalog_id.as_deref(),
+        Some("review-same-lane")
+    );
+    assert!(
+        decision
+            .skipped_candidates
+            .iter()
+            .any(|row| row.reason_code == RejectionCode::CrossBillingBlocked),
+        "{decision:?}"
+    );
+}
+
+#[test]
+fn fallback_refuses_exact_mode_even_with_remaining() {
+    let cat = catalog();
+    let selection = NativeModelSelection::Exact {
+        catalog_id: "review-primary".into(),
+    };
+    let remaining = vec!["review-fallback".to_string()];
+    let facts = [AttemptLifecycleFact::AttemptStarted];
+    let reqs = CapabilityRequirements::default();
+    let decision = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &facts,
+        FallbackFailureClass::RetryableServer,
+        &cat,
+        &reqs,
+    ));
+    assert!(!decision.admitted);
+    assert_eq!(decision.reason_code, RejectionCode::FallbackReplayUnsafe);
+    assert!(decision.message.contains("exact"));
+}
+
+#[test]
+fn fallback_refuses_after_partial_output_and_tool() {
+    let cat = catalog();
+    let selection = NativeModelSelection::OrderedCandidates {
+        catalog_ids: vec!["review-primary".into(), "review-fallback".into()],
+    };
+    let remaining = vec!["review-same-lane".to_string()];
+    let reqs = CapabilityRequirements::default();
+    let after_output = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &[AttemptLifecycleFact::VisibleOutputCommitted],
+        FallbackFailureClass::RateLimited,
+        &cat,
+        &reqs,
+    ));
+    assert!(!after_output.admitted);
+    assert_eq!(
+        after_output.reason_code,
+        RejectionCode::FallbackReplayUnsafe
+    );
+    let after_tool = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &[AttemptLifecycleFact::ToolCallEmitted],
+        FallbackFailureClass::RateLimited,
+        &cat,
+        &reqs,
+    ));
+    assert!(!after_tool.admitted);
+    let partial = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &[AttemptLifecycleFact::AttemptStarted],
+        FallbackFailureClass::PartialOutput,
+        &cat,
+        &reqs,
+    ));
+    assert!(!partial.admitted);
+    assert_eq!(partial.reason_code, RejectionCode::FallbackReplayUnsafe);
+}
+
+#[test]
+fn fallback_refuses_401_and_policy() {
+    let cat = catalog();
+    let selection = NativeModelSelection::OrderedCandidates {
+        catalog_ids: vec!["review-primary".into(), "review-fallback".into()],
+    };
+    let remaining = vec!["review-fallback".to_string()];
+    let facts = [AttemptLifecycleFact::AttemptStarted];
+    let reqs = CapabilityRequirements::default();
+    let auth = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &facts,
+        FallbackFailureClass::AuthOrConfig,
+        &cat,
+        &reqs,
+    ));
+    assert!(!auth.admitted);
+    assert_eq!(auth.reason_code, RejectionCode::CredentialMissing);
+    let policy = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &facts,
+        FallbackFailureClass::SafetyPolicy,
+        &cat,
+        &reqs,
+    ));
+    assert!(!policy.admitted);
+}
+
+#[test]
+fn fallback_does_not_admit_unauthorized_remaining_ids() {
+    let mut cat = catalog();
+    cat.entries.push(entry(
+        "review-same-lane",
+        "other-wire",
+        "route-same",
+        "subscription",
+        true,
+    ));
+    let selection = NativeModelSelection::OrderedCandidates {
+        catalog_ids: vec!["review-primary".into()],
+    };
+    let remaining = vec!["review-same-lane".to_string()];
+    let facts = [AttemptLifecycleFact::AttemptStarted];
+    let reqs = CapabilityRequirements::default();
+    let decision = plan_replay_safe_fallback(&fallback_plan(
+        &selection,
+        &remaining,
+        &facts,
+        FallbackFailureClass::RateLimited,
+        &cat,
+        &reqs,
+    ));
+    assert!(!decision.admitted, "{decision:?}");
+    assert_eq!(decision.next_catalog_id, None);
+    assert!(
+        decision
+            .skipped_candidates
+            .iter()
+            .any(|row| row.catalog_id == "review-same-lane"
+                && row.reason_code == RejectionCode::UnsupportedContract),
+        "{decision:?}"
+    );
+}
+
+#[test]
+fn stale_generation_mutation_is_refused() {
+    let err = admit_generation_bound_mutation(1, 2).unwrap_err();
+    assert_eq!(err.code(), RejectionCode::StaleGeneration);
+    assert!(err.to_string().contains("stale generation"));
+    admit_generation_bound_mutation(7, 7).unwrap();
+}
+
+#[test]
+fn lifecycle_cards_keep_retry_fallback_and_refusal_distinct() {
+    let labels: Vec<_> = [
+        LifecyclePhase::SelectingRoute,
+        LifecyclePhase::RunningAttempt,
+        LifecyclePhase::RetryingSameRoute,
+        LifecyclePhase::FallingBack,
+        LifecyclePhase::FallbackRefused,
+        LifecyclePhase::ResumedFromPriorReceipt,
+        LifecyclePhase::Completed,
+        LifecyclePhase::Failed,
+        LifecyclePhase::Cancelled,
+    ]
+    .into_iter()
+    .map(|phase| format_lifecycle_line(phase, Some(2)))
+    .collect();
+    assert!(labels[0].contains("selecting route"));
+    assert!(labels[1].contains("running attempt 2"));
+    assert!(labels[2].contains("retrying same route"));
+    assert!(labels[3].contains("falling back to another route"));
+    assert!(labels[4].contains("fallback refused"));
+    assert!(labels[5].contains("resumed from prior receipt"));
+    assert!(labels.iter().all(|line| line.starts_with("  Lifecycle: ")));
+    let unique: std::collections::BTreeSet<_> = labels.iter().cloned().collect();
+    assert_eq!(unique.len(), labels.len(), "{labels:?}");
+}
+
+#[test]
+fn compact_row_a11y_matrix_preserves_identity_without_color() {
+    let mut snap = snapshot_from_model_override(
+        "verifier",
+        "审核员-verifier",
+        "project",
+        true,
+        false,
+        false,
+        &ModelOverride::Inherit,
+        Some("read-only"),
+        3,
+    );
+    snap.route_status = RouteStatus::Blocked;
+    for width in [20usize, 40, 80, 120] {
+        let row = format_compact_row(&snap, width);
+        assert!(
+            row.contains("审核") || row.contains("verifier") || row.starts_with("审"),
+            "width {width} lost identity: {row:?}"
+        );
+        assert!(!row.contains("\u{1b}"));
+        assert!(unicode_width::UnicodeWidthStr::width(row.as_str()) <= width);
+    }
+    let mut rows = Vec::new();
+    for i in 0..1000 {
+        let item = snapshot_from_model_override(
+            &format!("agent-{i:04}"),
+            &format!("agent-{i:04}"),
+            "user",
+            true,
+            false,
+            false,
+            &ModelOverride::Inherit,
+            Some("read-only"),
+            1,
+        );
+        rows.push(format_compact_row(&item, 40));
+    }
+    assert_eq!(rows.len(), 1000);
+    assert!(rows[0].contains("agent-0000"));
+    assert!(rows[999].contains("agent-0999") || rows[999].contains("agent-"));
+}
+
+#[test]
+fn format_route_detail_omits_lifecycle_card_when_idle() {
+    let snap = snapshot_from_model_override(
+        "verifier",
+        "verifier",
+        "project",
+        true,
+        false,
+        false,
+        &ModelOverride::Inherit,
+        Some("read-only"),
+        1,
+    );
+    let detail = format_route_detail(&snap);
+    assert!(
+        detail.iter().all(|line| !line.contains("Lifecycle:")),
+        "idle /agents details must not claim selecting route: {detail:?}"
+    );
+    assert_eq!(lifecycle_phase_for_snapshot(&snap), None);
+}
+
+#[test]
+fn format_route_detail_includes_lifecycle_card_when_attempt_attached() {
+    let mut snap = snapshot_from_model_override(
+        "verifier",
+        "verifier",
+        "project",
+        true,
+        false,
+        false,
+        &ModelOverride::Inherit,
+        Some("read-only"),
+        1,
+    );
+    snap.attempt = Some(2);
+    snap.last_fallback_admitted = Some(false);
+    let detail = format_route_detail(&snap);
+    assert!(
+        detail
+            .iter()
+            .any(|line| line.contains("Lifecycle: fallback refused")),
+        "{detail:?}"
+    );
 }

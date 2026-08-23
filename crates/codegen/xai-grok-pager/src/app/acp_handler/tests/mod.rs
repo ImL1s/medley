@@ -1334,6 +1334,8 @@ pub(super) fn test_subagent_spawned_for_workflow(
         context_normalized: false,
         capability_mode: None,
         workflow_run_id,
+        route_receipt_digest: None,
+        selected_catalog_id: None,
         persona: None,
         role: None,
         model: None,

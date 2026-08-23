@@ -589,6 +589,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             request_id,
             result,
             prev_model_id,
+            session_only,
         } => handle_switch_model_complete(
             app,
             agent_id,
@@ -597,6 +598,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             request_id,
             result,
             prev_model_id,
+            session_only,
         ),
         TaskResult::BgTaskKilled {
             session_id,

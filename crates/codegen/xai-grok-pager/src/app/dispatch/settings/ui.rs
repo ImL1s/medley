@@ -1169,6 +1169,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
                                     session_id: sid,
                                     model_id: id,
                                     effort: None,
+                                    session_only: false,
                                     request_id,
                                     prev_model_id: None,
                                 });

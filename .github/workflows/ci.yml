@@ -823,6 +823,8 @@ jobs:
           # drift still fails closed, and fresh overrides still preflight.
           run_nonzero -p xai-grok-subagent-resolution --lib \
             native_route:: -- --nocapture
+          run_nonzero -p xai-grok-agent --lib \
+            from_json_rejects_empty_models_entry -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             format_agent_detail -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

@@ -544,6 +544,8 @@ async fn test_subagent_notifications_round_trip() {
             model: None,
             resumed_from: None,
             workflow_run_id: None,
+            route_receipt_digest: None,
+            selected_catalog_id: None,
         },
         meta: None,
     };
@@ -662,6 +664,8 @@ async fn test_subagent_spawned_resumed_roundtrip() {
             model: None,
             resumed_from: Some("source-agent-id".to_string()),
             workflow_run_id: None,
+            route_receipt_digest: None,
+            selected_catalog_id: None,
         },
         meta: None,
     };

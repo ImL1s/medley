@@ -362,6 +362,7 @@ fn resumed_from_field_in_meta_roundtrips() {
         effective_model_id: Some("gpt-5.3-codex-spark".into()),
         effective_model_route: Some("gpt-5.3-codex-spark".into()),
         effective_model_agent_type: Some("grok-build-plan".into()),
+        native_route_receipt: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("resumed_from"));
@@ -426,6 +427,7 @@ fn resumed_from_none_not_serialized_in_meta() {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(
@@ -477,6 +479,7 @@ fn snapshot_ref_field_in_meta_roundtrips() {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("snapshot_ref"));
@@ -529,6 +532,7 @@ fn snapshot_test_meta(id: &str) -> SubagentMeta {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     }
 }
 /// The follow-up writer persists `snapshot_ref` into an already-finalized
@@ -726,6 +730,7 @@ fn subagent_session_metadata_roundtrip() {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -788,6 +793,7 @@ fn subagent_session_metadata_non_forked() {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -854,6 +860,7 @@ fn upload_lifecycle_spawn_then_completion_preserves_fields() {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     let spawn_gcs = SubagentSessionMetadata::from_meta(
         &spawn_meta,
@@ -939,6 +946,7 @@ fn upload_lifecycle_failure_preserves_error() {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -989,6 +997,7 @@ fn session_metadata_session_kind_for_resumed() {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -1292,6 +1301,7 @@ fn durable_fallback_roundtrips_child_cwd_and_worktree() {
         effective_model_id: Some("grok-3".into()),
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();
@@ -1333,6 +1343,7 @@ fn durable_fallback_rejects_running_status() {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     write_subagent_meta(&parent_dir, &meta);
     let data = std::fs::read_to_string(parent_dir.join("meta.json")).unwrap();
@@ -1417,6 +1428,7 @@ fn running_test_meta(id: &str, parent_session_id: &str) -> SubagentMeta {
         effective_model_id: None,
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     }
 }
 fn inspection(id: &str, status: SubagentSnapshotStatus) -> SubagentInspection {
@@ -1703,6 +1715,7 @@ fn durable_meta_roundtrips_effective_model_id() {
         effective_model_id: Some("grok-3".into()),
         effective_model_route: None,
         effective_model_agent_type: None,
+        native_route_receipt: None,
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();
@@ -1770,6 +1783,8 @@ fn notification_subagent_spawned_includes_resumed_from() {
         model: None,
         resumed_from: Some("prev-agent-id".into()),
         workflow_run_id: None,
+        route_receipt_digest: None,
+        selected_catalog_id: None,
     };
     let json = serde_json::to_value(&notification).unwrap();
     assert_eq!(json["resumed_from"], "prev-agent-id");
@@ -1791,6 +1806,8 @@ fn notification_subagent_spawned_includes_resumed_from() {
         model: None,
         resumed_from: None,
         workflow_run_id: None,
+        route_receipt_digest: None,
+        selected_catalog_id: None,
     };
     let json = serde_json::to_value(&fresh).unwrap();
     assert!(json.get("resumed_from").is_none());
@@ -4839,4 +4856,502 @@ async fn progress_publisher_delivers_ticks_to_parent_cmd_channel() {
             assert_eq!(tool_call_count, 1);
         })
         .await;
+}
+
+#[test]
+fn live_catalog_keeps_duplicate_wire_slugs_distinct() {
+    let mut models = indexmap::IndexMap::new();
+    let mut first = test_model_entry("shared-wire");
+    first.info.model = "shared-wire".into();
+    let mut second = test_model_entry("shared-wire");
+    second.info.model = "shared-wire".into();
+    models.insert("route-sub".into(), first);
+    models.insert("route-payg".into(), second);
+    let catalog = super::super::native_route_live::synthetic_catalog_from_available_models(&models);
+    assert_eq!(catalog.entries.len(), 2);
+    assert_eq!(catalog.entries[0].catalog_id, "route-sub");
+    assert_eq!(catalog.entries[1].catalog_id, "route-payg");
+    assert_eq!(catalog.entries[0].wire_model, "shared-wire");
+    assert_eq!(catalog.entries[1].wire_model, "shared-wire");
+    assert_ne!(catalog.entries[0].route_key, catalog.entries[1].route_key);
+}
+
+#[tokio::test]
+async fn native_ordered_models_select_first_eligible() {
+    let mut models = indexmap::IndexMap::new();
+    let mut unready = test_model_entry("review-unready");
+    unready.config_validation_errors.push("missing key".into());
+    models.insert("review-unready".into(), unready);
+    models.insert("review-ready".into(), test_model_entry("review-ready"));
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
+    definition.models = vec!["review-unready".into(), "review-ready".into()];
+    let resolved = resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    .expect("ordered models must resolve");
+    assert_eq!(resolved.prepared.model_id.0.as_ref(), "review-ready");
+    let receipt = resolved.receipt.expect("receipt");
+    assert_eq!(receipt.selection_mode, "ordered_candidates");
+    assert_eq!(receipt.selected_catalog_id, "review-ready");
+    assert_eq!(receipt.rejected_candidates.len(), 1);
+}
+
+#[tokio::test]
+async fn native_ordered_models_all_unready_fail_closed() {
+    let mut models = indexmap::IndexMap::new();
+    for id in ["review-a", "review-b", "review-parent"] {
+        let mut entry = test_model_entry(id);
+        if id != "review-parent" {
+            entry.config_validation_errors.push("missing key".into());
+        }
+        models.insert(id.to_string(), entry);
+    }
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
+    definition.models = vec!["review-a".into(), "review-b".into()];
+    let err = match resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(_) => panic!("all-unready models must not inherit"),
+        Err(err) => err,
+    };
+    assert!(err.contains("native route failed"), "{err}");
+}
+
+#[tokio::test]
+async fn config_pin_wins_over_native_ordered_models() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("review-ready".into(), test_model_entry("review-ready"));
+    models.insert("pinned-model".into(), test_model_entry("pinned-model"));
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.subagent_model_overrides
+        .insert("explore".into(), "pinned-model".into());
+    let mut definition = xai_grok_agent::AgentDefinition::explore();
+    definition.models = vec!["review-ready".into()];
+    let resolved = resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    .expect("pin must win");
+    assert_eq!(resolved.prepared.model_id.0.as_ref(), "pinned-model");
+}
+
+#[tokio::test]
+async fn inherit_stamps_native_route_receipt() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let definition = xai_grok_agent::AgentDefinition::explore();
+    let resolved = resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    .expect("inherit must resolve");
+    assert_eq!(resolved.prepared.model_id.0.as_ref(), "review-parent");
+    let receipt = resolved.receipt.expect("inherit receipt");
+    assert_eq!(receipt.selection_mode, "inherit");
+    assert_eq!(receipt.selected_catalog_id, "review-parent");
+}
+
+#[test]
+fn resume_stamp_pins_catalog_id_not_wire_slug() {
+    let mut models = indexmap::IndexMap::new();
+    let mut first = test_model_entry("shared-wire");
+    first.info.model = "shared-wire".into();
+    let mut second = test_model_entry("shared-wire");
+    second.info.model = "shared-wire".into();
+    models.insert("route-sub".into(), first);
+    models.insert("route-payg".into(), second);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models.clone();
+    ctx.model_id = acp::ModelId::new("route-sub");
+    ctx.sampling_config.model = "shared-wire".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("route-sub");
+    let catalog = super::super::native_route_live::synthetic_catalog_from_available_models(&models);
+    let definition = xai_grok_agent::AgentDefinition::explore();
+    let receipt = super::super::native_route_live::stamp_receipt_for_selection(
+        &definition,
+        &ctx,
+        &catalog,
+        "route-sub",
+        Some("child-1"),
+        Some(ResumePin {
+            source_catalog_id: "route-sub".into(),
+            source_receipt_digest: Some("deadbeef".into()),
+            source_route_key: Some("route-sub".into()),
+        }),
+        1,
+    )
+    .expect("resume receipt");
+    assert_eq!(receipt.selection_provenance, "resume");
+    assert_eq!(receipt.selected_catalog_id, "route-sub");
+    assert_eq!(receipt.selected_wire_model, "shared-wire");
+    assert_eq!(receipt.resume_source_receipt.as_deref(), Some("deadbeef"));
+
+    let fabricated = super::super::native_route_live::stamp_receipt_for_selection(
+        &definition,
+        &ctx,
+        &catalog,
+        "route-sub",
+        Some("child-1"),
+        Some(ResumePin {
+            source_catalog_id: "route-sub".into(),
+            source_receipt_digest: Some("deadbeef".into()),
+            source_route_key: Some("shared-wire".into()),
+        }),
+        1,
+    );
+    assert!(
+        fabricated.is_none(),
+        "wire slug must not restamp as a non-resume receipt"
+    );
+
+    let missing_key = super::super::native_route_live::stamp_receipt_for_selection(
+        &definition,
+        &ctx,
+        &catalog,
+        "route-sub",
+        Some("child-1"),
+        Some(ResumePin {
+            source_catalog_id: "route-sub".into(),
+            source_receipt_digest: Some("deadbeef".into()),
+            source_route_key: None,
+        }),
+        1,
+    );
+    assert!(
+        missing_key.is_none(),
+        "resume without route key must not fabricate a receipt"
+    );
+}
+
+#[test]
+fn live_catalog_local_only_uses_effective_credential_endpoint() {
+    let mut models = indexmap::IndexMap::new();
+    let mut split = test_model_entry("split-local-session");
+    split.info.base_url = "http://127.0.0.1:8080/v1".into();
+    split.api_base_url = Some("https://api.example.test/v1".into());
+    models.insert("split-local-session".into(), split);
+    let mut both_local = test_model_entry("both-local");
+    both_local.info.base_url = "http://127.0.0.1:8080/v1".into();
+    both_local.api_base_url = Some("http://localhost:9000/v1".into());
+    models.insert("both-local".into(), both_local);
+    let catalog = super::super::native_route_live::synthetic_catalog_from_available_models(&models);
+    let split_entry = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.catalog_id == "split-local-session")
+        .expect("split");
+    assert!(
+        !split_entry.local_only,
+        "loopback session URL plus remote api_base_url must not satisfy localOnly"
+    );
+    let local_entry = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.catalog_id == "both-local")
+        .expect("both-local");
+    assert!(local_entry.local_only);
+}
+
+#[tokio::test]
+async fn native_ordered_models_skip_incompatible_harness() {
+    let mut models = indexmap::IndexMap::new();
+    let mut codex = test_model_entry("review-codex");
+    codex.info.agent_type = "codex".into();
+    models.insert("review-codex".into(), codex);
+    models.insert("review-ready".into(), test_model_entry("review-ready"));
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
+    definition.models = vec!["review-codex".into(), "review-ready".into()];
+    let resolved = resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "grok-build-plan",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    .expect("compatible later candidate must spawn");
+    assert_eq!(resolved.prepared.model_id.0.as_ref(), "review-ready");
+    let receipt = resolved.receipt.expect("receipt");
+    assert_eq!(receipt.selected_catalog_id, "review-ready");
+}
+
+#[test]
+fn resume_digest_comes_from_source_meta_not_current_spawn() {
+    let mut source = snapshot_test_meta("source-child");
+    source.parent_session_id = "test-parent".into();
+    source.status = "completed".into();
+    source.native_route_receipt = Some(xai_grok_subagent_resolution::native_route::RouteReceipt {
+        schema: "medley.native-route-receipt.v1".into(),
+        schema_version: 1,
+        parent_session_id: Some("test-parent".into()),
+        child_session_id: Some("source-child".into()),
+        consumer_policy_id: None,
+        consumer_policy_digest: None,
+        selection_mode: "inherit".into(),
+        requested_catalog_ids: vec!["review-parent".into()],
+        selected_catalog_id: "review-parent".into(),
+        selected_wire_model: "review-parent".into(),
+        route_key: "review-parent".into(),
+        access_profile: "none".into(),
+        harness: None,
+        capability_ceiling: None,
+        required_capabilities: Default::default(),
+        selection_provenance: "inherit".into(),
+        rejected_candidates: Vec::new(),
+        route_digest: "source-digest".into(),
+        attempt: 1,
+        created_unix_ms: 1,
+        resume_source_receipt: None,
+    });
+    assert_eq!(
+        super::super::native_route_live::resume_source_receipt_digest(Some(&source)),
+        Some("source-digest".into())
+    );
+    assert_eq!(
+        super::super::native_route_live::resume_source_receipt_digest(None),
+        None,
+        "missing source meta must not invent a current-spawn digest"
+    );
+}
+
+#[tokio::test]
+async fn native_exact_unknown_model_fails_closed() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::explore();
+    definition.model = xai_grok_agent::config::ModelOverride::Override("does-not-exist".into());
+    let err = match resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(resolved) => panic!(
+            "unknown exact must not inherit parent ({})",
+            resolved.prepared.model_id.0
+        ),
+        Err(err) => err,
+    };
+    assert!(err.contains("native route failed"), "{err}");
+    assert!(
+        err.contains("exact_model_missing") || err.contains("does-not-exist"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn native_exact_known_model_selects_catalog() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("review-exact".into(), test_model_entry("review-exact"));
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
+    definition.model = xai_grok_agent::config::ModelOverride::Override("review-exact".into());
+    definition.models.clear();
+    let resolved = resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "grok-build-plan",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    .expect("known exact must resolve");
+    assert_eq!(resolved.prepared.model_id.0.as_ref(), "review-exact");
+    let receipt = resolved.receipt.expect("receipt");
+    assert_eq!(receipt.selection_mode, "exact");
+    assert_eq!(receipt.selected_catalog_id, "review-exact");
+}
+
+#[tokio::test]
+async fn native_exact_incompatible_harness_fails_closed() {
+    let mut models = indexmap::IndexMap::new();
+    let mut codex = test_model_entry("review-codex");
+    codex.info.agent_type = "codex".into();
+    models.insert("review-codex".into(), codex);
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::explore();
+    definition.model = xai_grok_agent::config::ModelOverride::Override("review-codex".into());
+    let err = match resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(resolved) => panic!(
+            "incompatible exact must not inherit parent ({})",
+            resolved.prepared.model_id.0
+        ),
+        Err(err) => err,
+    };
+    assert!(err.contains("native route failed"), "{err}");
+    assert!(err.contains("harness_incompatible"), "{err}");
+}
+
+#[tokio::test]
+async fn native_exact_unique_wire_slug_canonicalizes_to_catalog_id() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert(
+        "custom-local".into(),
+        test_model_entry("unique-wire-slug"),
+    );
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::grok_build_plan();
+    definition.model =
+        xai_grok_agent::config::ModelOverride::Override("unique-wire-slug".into());
+    definition.models.clear();
+    let resolved = resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "grok-build-plan",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    .expect("unique wire slug must canonicalize");
+    assert_eq!(resolved.prepared.model_id.0.as_ref(), "custom-local");
+    let receipt = resolved.receipt.expect("receipt");
+    assert_eq!(receipt.selection_mode, "exact");
+    assert_eq!(receipt.selected_catalog_id, "custom-local");
+}
+
+#[tokio::test]
+async fn native_exact_ambiguous_wire_slug_fails_closed() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("first-key".into(), test_model_entry("shared-wire"));
+    models.insert("second-key".into(), test_model_entry("shared-wire"));
+    models.insert("review-parent".into(), test_model_entry("review-parent"));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new("review-parent");
+    ctx.sampling_config.model = "review-parent".into();
+    ctx.sampling_config_model_id = acp::ModelId::new("review-parent");
+    let mut definition = xai_grok_agent::AgentDefinition::explore();
+    definition.model = xai_grok_agent::config::ModelOverride::Override("shared-wire".into());
+    let err = match resolve_request_prepared_model_with_native_route(
+        false,
+        None,
+        "explore",
+        &definition,
+        &definition,
+        &ctx,
+        Some("child-1"),
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(resolved) => panic!(
+            "ambiguous exact must not inherit parent ({})",
+            resolved.prepared.model_id.0
+        ),
+        Err(err) => err,
+    };
+    assert!(err.contains("native route failed"), "{err}");
+    assert!(err.contains("exact_model_missing"), "{err}");
 }

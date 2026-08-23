@@ -339,6 +339,7 @@ fn late_success_after_default_switch_owner_close_cannot_mutate_or_persist() {
             request_id,
             result: Ok(()),
             prev_model_id: Some(original.clone()),
+            session_only: false,
         }),
         &mut app,
     );

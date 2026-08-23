@@ -909,7 +909,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             }]
         }
         Action::NextModel => vec![],
-        Action::SwitchModel { model_id, effort } => {
+        Action::SwitchModel {
+            model_id,
+            effort,
+            session_only,
+        } => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
             };
@@ -995,9 +999,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 // leaves no preference behind.
                 let prev_model = agent.session.models.current.clone();
                 agent.session.models.set_current(model_id.clone(), effort);
-                agent
-                    .session
-                    .stash_deferred_model_switch(model_id, effort, prev_model);
+                agent.session.stash_deferred_model_switch(
+                    model_id,
+                    effort,
+                    prev_model,
+                    session_only,
+                );
                 return vec![];
             };
             let request_id = super::session::lifecycle::begin_model_switch_request(
@@ -1017,6 +1024,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 effort,
                 request_id,
                 prev_model_id: None,
+                session_only,
             }]
         }
         Action::AnnouncementsHide => {

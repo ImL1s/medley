@@ -17,29 +17,59 @@ consumer [ImL1s/oh-my-grok#131](https://github.com/ImL1s/oh-my-grok/issues/131) 
 [#133](https://github.com/ImL1s/oh-my-grok/issues/133) /
 [#134](https://github.com/ImL1s/oh-my-grok/issues/134).
 
+Foundations: capability-aware eligibility
+[#19](https://github.com/ImL1s/medley/issues/19) · replay-safe failover
+[#18](https://github.com/ImL1s/medley/issues/18) · effective route and
+credential/origin binding [#110](https://github.com/ImL1s/medley/issues/110) ·
+access and usage-scope identity
+[#187](https://github.com/ImL1s/medley/issues/187) · usage attribution
+[#23](https://github.com/ImL1s/medley/issues/23).
+
 ## Implemented versus planned
 
-**Implemented in this slice** (`xai-grok-subagent-resolution::native_route`):
+**Implemented in this slice** (`xai-grok-subagent-resolution::native_route`
+plus live spawn in `xai-grok-shell`):
 
 - versioned capability discovery (`supported` / `unsupported` / `unavailable` /
   `incompatible` / `unknown`);
 - exact / inherit / ordered-candidate request types;
-- deterministic offline resolver over a synthetic catalog;
+- deterministic resolver over a synthetic catalog and the live session catalog;
 - immutable secret-free route receipts and digests;
 - inspect JSON (`medley.native-subagent-route.inspect/v1`);
-- declarative `model` / `models` / `routingRequirements` parse;
-- typed `AgentRouteUxSnapshot` plus compact/detail formatters used by `/agents`.
+- declarative `model` / `models` / `routingRequirements` parse on real
+  `AgentDefinition` files;
+- typed `AgentRouteUxSnapshot` plus compact/detail formatters used by `/agents`;
+- spawn-time persistence of receipts on `SubagentMeta`, GCS `subagent.json`
+  (`routeReceiptDigest`), and optional ACP `SubagentSpawned` fields;
+- inspect/adapter usage facts helper from the canonical receipt (`catalogId` /
+  `wireModel` / `accessProfile` / `routeDigest`); live `by_model` usage still
+  keys by catalog id on the existing [#23](https://github.com/ImL1s/medley/issues/23)
+  path;
+- live exact `model:` fail-closed against the session catalog (unknown ids do
+  **not** inherit);
+- generation-bound `/agents` enable/disable and default mutations (persisted
+  to `config.toml`; this session is not silently rebound);
+- lifecycle card labels on `/agents` details (selecting / running / same-route
+  retry / fallback / refusal / resume / terminal);
+- compact-row a11y tests (narrow/normal/wide, CJK, 1,000 synthetic format
+  rows, no color-only status);
+- fail-closed replay-safe fallback *planner* (`plan_replay_safe_fallback`):
+  pre-output same-lane ordered candidates only.
 
 **Not implemented here (do not claim):**
 
-- wiring the resolver into live child-session spawn;
-- persisting receipts on real sessions / ACP / usage;
-- generation-bound `/agents` mutation;
-- replay-safe runtime fallback ([#18](https://github.com/ImL1s/medley/issues/18));
-- qualified model-family metadata.
+- picker / `/providers` / `/route` control plane ([#207](https://github.com/ImL1s/medley/issues/207));
+- live sampler auto-failover on a running child HTTP stream;
+- session-only vs persist *model policy* editing in `/agents`;
+- the full #290 interaction matrix (mouse/resize/suspend, 1,000-entry TUI
+  latency, NO_COLOR terminal snapshots);
+- qualified model-family metadata;
+- bounded live evidence at exact SHAs.
 
 `medley.native-model-family-metadata.v1` and
-`medley.native-replay-safe-fallback.v1` advertise `unsupported`.
+`medley.native-replay-safe-fallback.v1` advertise `unsupported` because live
+sampler auto-failover is not wired. The admission planner is tested and
+fail-closed.
 
 ## Ownership
 
@@ -48,8 +78,7 @@ consumer [ImL1s/oh-my-grok#131](https://github.com/ImL1s/oh-my-grok/issues/131) 
 Catalog-ID lookup and duplicate wire-slug disambiguation; readiness, harness,
 local-only, and capability eligibility; native child-session construction
 (existing spawn path); deterministic candidate resolution; immutable receipts;
-replay-safety *admission types* (cross-route fallback still refused in this
-slice).
+replay-safety admission planner (live sampler auto-failover is not wired).
 
 ### Orchestration consumers own
 
@@ -110,8 +139,11 @@ as a provider/access route. Worktree isolation is not an execution sandbox.
 ## Fallback
 
 Cross-route fallback after visible output, a tool call, or a side effect is
-refused (`fallback_replay_unsafe`). A `429` is not replay authorization.
-Runtime failover remains [#18](https://github.com/ImL1s/medley/issues/18).
+refused (`fallback_replay_unsafe`). Exact and inherit never fall over. A
+`429` is not replay authorization by itself. Same-lane ordered candidates may
+be *admitted* by `plan_replay_safe_fallback` before output; live sampler
+auto-failover is not wired. Runtime failover remains
+[#18](https://github.com/ImL1s/medley/issues/18).
 
 ## Inspect JSON
 
@@ -138,7 +170,10 @@ from an explicit inspect document (never inferred from PATH). Example
 
 ## TUI
 
-`/agents` compact rows append a non-color route status. Expanded details add
-selection, route status, and receipt fields from `AgentRouteUxSnapshot`.
-Generation-bound mutation, lifecycle cards, and stale-action gates remain
-[#290](https://github.com/ImL1s/medley/issues/290).
+`/agents` compact rows append non-color route status, selection intent, and
+capability floor. Expanded details add selection, route status, rejected
+candidates, receipt fields, and a lifecycle card from `AgentRouteUxSnapshot`.
+Enable/disable (`t`) and default (`s`) persist to `config.toml` and are
+generation-bound; stale actions refuse with `stale_generation`. This session
+is not silently rebound. Picker/#207 and the remaining a11y interaction
+matrix stay [#290](https://github.com/ImL1s/medley/issues/290).
