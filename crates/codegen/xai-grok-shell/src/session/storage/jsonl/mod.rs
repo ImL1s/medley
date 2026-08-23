@@ -275,10 +275,15 @@ impl JsonlStorageAdapter {
         accept_fresh_publication(publication.finalize()).map(|()| summary)
     }
 
-    fn delete_session_sync(&self, info: &Info) -> io::Result<()> {
+    /// `take_id_lease` is false only when the CALLER already holds the
+    /// session-id lease for `info.id`. `flock(2)` leases attach to the open
+    /// file description rather than the process, so a second acquisition
+    /// inside one process blocks against the first -- taking it again where
+    /// the caller owns it deadlocks rather than protecting anything.
+    fn delete_session_sync(&self, info: &Info, take_id_lease: bool) -> io::Result<()> {
         use xai_grok_workspace::session::id_lock::acquire_session_id_lock_sync;
         let session_id = info.id.to_string();
-        let _lease = match self.lock_root() {
+        let _lease = match self.lock_root().filter(|_| take_id_lease) {
             Some(root) => Some(acquire_session_id_lock_sync(root, &session_id)?),
             None => None,
         };
@@ -289,6 +294,24 @@ impl JsonlStorageAdapter {
             Err(error) => Err(error),
         }
     }
+    async fn delete_session_inner(&self, info: &Info, take_id_lease: bool) -> io::Result<()> {
+        let adapter = self.clone();
+        let info = info.clone();
+        tokio::task::spawn_blocking(move || adapter.delete_session_sync(&info, take_id_lease))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    /// Delete a session whose id lease the caller already holds -- currently
+    /// `session::persistence::delete_session_history`, which takes it at the
+    /// top so the resolve-then-delete window stays closed against a still
+    /// provisional creator. Going through [`StorageAdapter::delete_session`]
+    /// from there would re-acquire the same `flock(2)` lease on a second open
+    /// file description and block forever.
+    pub(crate) async fn delete_session_holding_id_lease(&self, info: &Info) -> io::Result<()> {
+        self.delete_session_inner(info, false).await
+    }
+
     pub(super) fn updates_file(&self, info: &Info) -> PathBuf {
         self.session_dir(info).join(super::UPDATES_FILE)
     }
@@ -1860,11 +1883,7 @@ impl StorageAdapter for JsonlStorageAdapter {
             .map_err(io::Error::other)?
     }
     async fn delete_session(&self, info: &Info) -> io::Result<()> {
-        let adapter = self.clone();
-        let info = info.clone();
-        tokio::task::spawn_blocking(move || adapter.delete_session_sync(&info))
-            .await
-            .map_err(io::Error::other)?
+        self.delete_session_inner(info, true).await
     }
     async fn append_rewind_point(&self, info: &Info, point: &RewindPoint) -> io::Result<()> {
         self.append_jsonl(self.rewind_points_file(info), point)
