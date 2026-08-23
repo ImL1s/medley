@@ -14,48 +14,34 @@ one at `16-subagents.md` pointing five levels up at
 it survived long enough to be copied into a second page before the Codex
 review on PR #402 found it. Both were changed to absolute URLs.
 
-Design: suppress nothing, parse as little as possible.
+Scope and deliberate omissions:
 
-For a guard, the two failure modes are not symmetric. A false positive is
-loud, immediate, and fixed in one line. A false negative is silent, and it
-is the exact failure this guard exists to prevent -- #385's broken link
-survived unnoticed long enough to be copied into a second page. So every
-choice here prefers a visible false positive over a silent miss.
+- Only `crates/codegen/xai-grok-pager/docs/user-guide/` is checked. The
+  `tutorial/` pages and the reference docs beside them are not extracted, so
+  the invariant does not apply to them.
+- Inline links, reference-style definitions, and HTML `href` attributes are
+  all scanned. Only inline links exist today; the other two are the obvious
+  ways the same mistake could return.
+- Fenced blocks are blanked before scanning, so a page that *documents* this
+  rule with a `](../` example does not trip it. Fence recognition follows
+  CommonMark indentation: at four spaces a line is an indented code block,
+  not a fence.
+- Nothing else is blanked, and link labels are not parsed -- detection is
+  anchored on `](` and `]:`. Inline code spans, indented code blocks and
+  HTML comments all stay visible. Suppressing text can only ever hide a real
+  link, and recognising labels can only ever lose one, so both are done as
+  little as possible. The cost is that an inline `](../x)` example is
+  reported; write it in a fence.
+- Destinations are taken as a reader's tool would follow them: character
+  references and backslash escapes are decoded, an angle-bracketed
+  destination may contain spaces, and a fragment or query is dropped before
+  the path is classified. Decoding can only reveal more parent components,
+  never fewer.
 
-That principle settled two questions that six Codex review rounds on #404
-kept reopening. Those rounds found eleven genuine false negatives, and not
-one was in the containment check -- every one lived in code that suppressed
-text before scanning or tried to parse link syntax precisely. Suppressing
-text can only ever hide a real link; parsing labels can only ever lose one.
-
-So neither is done:
-
-- Nothing is blanked. Not fenced blocks, not inline code spans, not
-  indented blocks, not HTML comments. Fence blanking was removed after
-  measuring it -- stubbing it to the identity function produced
-  byte-identical results across all 25 pages, and the guide contains no
-  literal `](..` at all. It was defending content that does not exist,
-  while a four-space-indented pseudo-fence could blank the rest of a page.
-  A future page documenting this rule with a literal `](../x)` example is
-  reported; it should describe the path in prose or use a placeholder.
-- Link labels are not parsed. Detection anchors on `](` and `]:`, so
-  escaped or nested brackets in a label cannot lose the destination. An
-  unrelated `](` in prose is flagged instead.
-
-What is scanned, and what is not:
-
-- Only `crates/codegen/xai-grok-pager/docs/user-guide/`. The `tutorial/`
-  pages and the reference docs beside them are not extracted, so the
-  invariant does not apply to them.
-- Inline destinations, reference-style definitions, and HTML `href`
-  attributes -- quoted, single-quoted, or bare. Only inline links exist
-  today; the others are the obvious ways the same mistake could return.
-- Destinations are read as a reader's tool would follow them: character
-  references and backslash escapes decoded, angle-bracketed destinations
-  may contain spaces, and a fragment or query dropped before the path is
-  classified. Decoding can only reveal more parent components, never fewer.
-- Targets are normalised lexically, never resolved on disk. This guard is
-  about escaping the directory, not about whether the target exists.
+Every choice above errs towards a visible false positive over a silent
+broken link, which is the safe direction for a guard.
+- Link targets are normalised lexically, never resolved on disk. This guard
+  is about escaping the directory, not about whether the target exists.
 """
 
 from __future__ import annotations
@@ -93,6 +79,45 @@ HTML_HREF = re.compile(
 
 # `scheme:` prefix -- https:, mailto:, file: and friends are not relative.
 HAS_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
+# A fence may be indented up to three spaces. At four it is an indented code
+# block, not a fence -- treating one as an opener would blank the rest of the
+# page and hide real links behind it.
+FENCE_LINE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _blank_code(text: str) -> str:
+    """Blank fenced blocks, preserving line numbering.
+
+    Only fences. Inline code spans are not blanked: recognising them means
+    tracking backtick-run lengths and backslash-escape parity, and every way
+    of getting that wrong hides a real link. Fences are line-oriented and
+    cannot swallow a link that way.
+    """
+    out: list[str] = []
+    fence: str | None = None
+    for line in text.split("\n"):
+        match = FENCE_LINE.match(line)
+        if fence is None:
+            # A backtick fence's info string may not contain a backtick.
+            if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+                fence = match.group(1)
+                out.append("")
+                continue
+            out.append(line)
+        else:
+            out.append("")
+            # A closer uses the same character, is at least as long, and
+            # carries nothing but trailing whitespace.
+            if (
+                match
+                and match.group(1)[0] == fence[0]
+                and len(match.group(1)) >= len(fence)
+                and not match.group(2).strip()
+            ):
+                fence = None
+    return "\n".join(out)
+
+
 def _target_of(match: re.Match[str]) -> str:
     """The destination a reader's tool would follow.
 
@@ -120,7 +145,7 @@ def _escapes(rel_dir: str, target: str) -> bool:
 def _offending_links() -> list[str]:
     findings: list[str] = []
     for path in sorted(GUIDE.rglob("*.md")):
-        text = path.read_text(encoding="utf-8")
+        text = _blank_code(path.read_text(encoding="utf-8"))
         rel_dir = posixpath.dirname(path.relative_to(GUIDE).as_posix()) or "."
         for pattern in (INLINE_LINK, REFERENCE_DEF, HTML_HREF):
             for match in pattern.finditer(text):
@@ -133,33 +158,6 @@ def _offending_links() -> list[str]:
                         f"{path.relative_to(REPO).as_posix()}:{line}: {target}"
                     )
     return findings
-
-
-REMEDIATION = """
-{listing}
-
-Each link above leaves {guide}/.
-That directory is extracted to <state-dir>/docs/user-guide/ when the pager
-starts; nothing above it is. So the link resolves in a repository checkout
-and is broken for everyone reading an installed copy.
-
-If it is a real link, use an absolute URL:
-    https://github.com/ImL1s/medley/blob/providers/<path-from-repo-root>
-
-If it is a deliberate example rather than a real link, it must not appear as
-a literal `](../...)`. Describe the path in prose, or use a placeholder such
-as `](<parent>/...)`. A fenced code block does NOT exempt it: this guard
-does no suppression at all, deliberately -- anything that can hide text from
-it can also hide a broken link, which is the failure this guard exists to
-prevent. See the module docstring.
-"""
-
-
-def _remediation(findings: list[str]) -> str:
-    listing = "\n".join(f"  {finding}" for finding in findings)
-    return REMEDIATION.format(
-        listing=listing, guide=GUIDE.relative_to(REPO).as_posix()
-    )
 
 
 class UserGuideLinkGuardTests(unittest.TestCase):
@@ -202,7 +200,13 @@ class UserGuideLinkGuardTests(unittest.TestCase):
 
     def test_no_relative_link_escapes_the_guide_directory(self) -> None:
         findings = _offending_links()
-        self.assertEqual(findings, [], _remediation(findings))
+        self.assertEqual(
+            findings,
+            [],
+            "user-guide pages are extracted to <state-dir>/docs/user-guide/, "
+            "where a relative link out of that directory does not resolve. "
+            "Use an absolute URL instead:\n  " + "\n  ".join(findings),
+        )
 
 
 class LinkDetectionTests(unittest.TestCase):
@@ -213,7 +217,7 @@ class LinkDetectionTests(unittest.TestCase):
     """
 
     def _flags(self, body: str) -> bool:
-        text = body
+        text = _blank_code(body)
         for pattern in (INLINE_LINK, REFERENCE_DEF, HTML_HREF):
             for match in pattern.finditer(text):
                 target = _target_of(match)
@@ -250,30 +254,37 @@ class LinkDetectionTests(unittest.TestCase):
             with self.subTest(form=label):
                 self.assertFalse(self._flags(body + "\n"), f"{label} wrongly flagged")
 
-    def test_fences_do_not_exempt_a_link(self) -> None:
-        """Nothing is suppressed, fenced code blocks included.
+    def test_fenced_examples_do_not_trip_the_rule(self) -> None:
+        """A page explaining the rule in a fenced block must not trip it."""
+        self.assertFalse(self._flags("```sh\ngrep '](../' *.md\n```\n"))
+        self.assertFalse(self._flags("~~~\n[x](../../escaped.md)\n~~~\n"))
 
-        Fence blanking was removed after measuring it: stubbing it to the
-        identity function produced byte-identical results across all 25
-        pages, and the guide contains no literal `](..` at all. It was
-        defending content that does not exist, and every one of the eleven
-        false negatives Codex found on #404 lived in that suppression and
-        parsing machinery -- including a four-space-indented pseudo-fence
-        that blanked the rest of a page.
+    def test_over_indented_backticks_are_not_a_fence(self) -> None:
+        """An indented example must not blank the rest of the page.
 
-        The trade is deliberate. A fenced example is now reported: loud,
-        immediate, one line to fix. A suppressed real link is silent, and
-        that is exactly how #385's broken link survived long enough to be
-        copied into a second page.
+        A four-space-indented line of backticks is an indented code block, not
+        a fence. Treating it as an unclosed opener would blank everything
+        after it and hide a real escaping link (Codex review, #404).
         """
-        for label, body in (
-            ("backtick fence", "```\n[x](../../escaped.md)\n```"),
-            ("tilde fence", "~~~\n[x](../../escaped.md)\n~~~"),
-            ("indented block", "    [x](../../escaped.md)"),
-            ("html comment", "<!-- [x](../../escaped.md) -->"),
-        ):
-            with self.subTest(form=label):
-                self.assertTrue(self._flags(body + "\n"), f"{label} was exempted")
+        body = (
+            "Example:\n"
+            "\n"
+            "    ```sh\n"
+            "    echo hi\n"
+            "\n"
+            "See [x](../../docs/architecture/foo.md).\n"
+        )
+        self.assertTrue(self._flags(body), "link after an indented example was hidden")
+
+    def test_fence_indented_up_to_three_spaces_still_fences(self) -> None:
+        self.assertFalse(self._flags("   ```\n   [x](../../escaped.md)\n   ```\n"))
+
+    def test_closing_fence_must_match_the_opener(self) -> None:
+        # A shorter run, or a different character, does not close the block.
+        self.assertFalse(self._flags("````\n```\n[x](../../escaped.md)\n````\n"))
+        self.assertFalse(self._flags("~~~\n```\n[x](../../escaped.md)\n~~~\n"))
+        # A longer run of the same character does close it.
+        self.assertTrue(self._flags("```\nhi\n````\n[x](../../escaped.md)\n"))
 
     def test_inline_backticks_never_hide_a_link(self) -> None:
         """Code spans are not blanked, so no backtick trick can hide a link.
@@ -329,21 +340,13 @@ class LinkDetectionTests(unittest.TestCase):
         self.assertTrue(self._flags("[x](..#top)\n"))
         self.assertFalse(self._flags("[x](11-custom-models.md?raw=1)\n"))
 
-    def test_reported_line_is_the_line_the_link_is_on(self) -> None:
-        """Failures cite a line an author can jump to."""
+    def test_blanking_preserves_line_numbers(self) -> None:
         body = "one\n```\nfenced\n```\nfour\n[x](../../escaped.md)\n"
-        match = INLINE_LINK.search(body)
+        blanked = _blank_code(body)
+        self.assertEqual(body.count("\n"), blanked.count("\n"))
+        match = INLINE_LINK.search(blanked)
         assert match is not None
-        self.assertEqual(body.count("\n", 0, match.start()) + 1, 6)
-
-    def test_failure_message_says_how_to_fix_it(self) -> None:
-        """A guard that flags without instructing gets deleted, not obeyed."""
-        message = _remediation(["some/page.md:12: ../../escaped.md"])
-        self.assertIn("some/page.md:12: ../../escaped.md", message)
-        self.assertIn("absolute URL", message)
-        self.assertIn("https://github.com/ImL1s/medley/blob/providers/", message)
-        self.assertIn("deliberate example", message)
-        self.assertIn("does NOT exempt", message)
+        self.assertEqual(blanked.count("\n", 0, match.start()) + 1, 6)
 
 
 if __name__ == "__main__":
