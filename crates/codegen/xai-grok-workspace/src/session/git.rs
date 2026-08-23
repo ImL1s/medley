@@ -245,12 +245,15 @@ pub(crate) fn strip_url_credentials(url_str: &str) -> String {
         return parsed.to_string();
     }
     if !url_str.contains("://")
-        && let Some((_, host_and_path)) = url_str.split_once('@')
+        && let Some((user, host_and_path)) = url_str.split_once('@')
         && host_and_path.contains(':')
     {
+        if user == "git" || user == "hg" || user == "svn" {
+            return url_str.to_string();
+        }
         return host_and_path.to_string();
     }
-    "<configured>".to_string()
+    url_str.to_string()
 }
 /// Scrub credentials from any URL embedded in free-form git output before it is
 /// returned to a caller or logged. A `github` remote may carry
@@ -935,14 +938,9 @@ pub async fn git_info(cwd: &Path) -> Result<GitInfoData> {
 /// Priority:
 /// 1. `refs/remotes/origin/HEAD` symbolic ref (set by `git clone` or
 ///    `git remote set-head origin --auto`).
-/// 2. A unique remote-tracking `origin/main` or `origin/master`
-///    (hand-added remotes never get `origin/HEAD`).
-/// 3. `init.defaultBranch` git config value (user/system preference).
+/// 2. `init.defaultBranch` git config value (user/system preference).
 fn detect_default_branch(repo: &Repository) -> Option<String> {
     if let Some(branch) = detect_remote_default_branch(repo) {
-        return Some(branch);
-    }
-    if let Some(branch) = guess_default_from_remote_tracking(repo) {
         return Some(branch);
     }
     if let Ok(config) = repo.config()
@@ -951,19 +949,6 @@ fn detect_default_branch(repo: &Repository) -> Option<String> {
         return Some(val);
     }
     None
-}
-/// `None` when both exist — a wrong guess would make clients treat the
-/// real default branch as a feature branch (and poll PR status on it).
-fn guess_default_from_remote_tracking(repo: &Repository) -> Option<String> {
-    let has = |name: &str| {
-        repo.find_branch(&format!("origin/{name}"), git2::BranchType::Remote)
-            .is_ok()
-    };
-    match (has("main"), has("master")) {
-        (true, false) => Some("main".to_string()),
-        (false, true) => Some("master".to_string()),
-        _ => None,
-    }
 }
 /// Resolve `refs/remotes/origin/HEAD` to the remote's default branch name.
 fn detect_remote_default_branch(repo: &Repository) -> Option<String> {

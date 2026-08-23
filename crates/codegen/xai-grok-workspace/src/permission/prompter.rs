@@ -1360,7 +1360,6 @@ mod tests {
             "cd /tmp && cargo test --workspace",
             "# build first\n# then test\ncargo test --workspace",
             "ps aux | grep process",
-            "ls /tmp && ./bazelw test //hw-tests/integration/...",
         ] {
             let access = AccessKind::Bash(script.to_owned());
             let opts = p.build_options(&access);
@@ -1410,8 +1409,12 @@ mod tests {
         }
     }
 
+    /// A dump script whose dangerous/floored siblings guarantee re-prompting
+    /// gets no allow row — its "Always allow: ls" could never stop this
+    /// script, which is exactly the "always allow keeps asking" complaint.
+    /// The deny row, selection meta, and the one-shot options all remain.
     #[test]
-    fn dump_script_with_redirects_still_offers_scoped_rows() {
+    fn dump_script_with_unhonorable_grant_keeps_only_the_deny_row() {
         let script = "# Probe the outputs dir\n\
                       ls /tmp/hw-test-outputs 2>/dev/null\n\
                       \n\
@@ -1421,7 +1424,7 @@ mod tests {
         let p = prompter(ClientType::GrokPager);
         let access = AccessKind::Bash(script.to_owned());
         let opts = p.build_options(&access);
-        assert!(has_option(&opts, "allow-always-command"));
+        assert!(!has_option(&opts, "allow-always-command"));
         assert!(has_option(&opts, "reject-always-command"));
         assert!(p.bash_selection_meta(&access).is_some());
         assert!(has_option(&opts, "allow-once"));

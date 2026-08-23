@@ -2429,9 +2429,12 @@ mod tests {
         t.tool_call_started("c1", "read_file", Some("unopened-sess"));
         t.tool_call_completed("c1", Some("unopened-sess"), ToolOutcome::Success);
 
-        // The "other" session's events.jsonl must stay empty.
-        let text = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
-        assert!(text.trim().is_empty(), "no event should be written");
+        // The "other" session's events.jsonl must stay empty (or not created).
+        let file = dir.path().join("events.jsonl");
+        if file.exists() {
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(text.trim().is_empty(), "no event should be written");
+        }
         // No start time was ever recorded: the insert is gated on this session's
         // writer being open, and "unopened-sess" has none — so the map is empty
         // (this is exactly the production flag-off shape: sink wired, map empty).

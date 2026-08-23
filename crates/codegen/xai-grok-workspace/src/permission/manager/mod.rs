@@ -1189,12 +1189,7 @@ fn bash_grant_pre_decision(
             }
         }
         SegmentEvaluation::NeedsPrompts { .. } => {
-            if !opts.allow_blanket
-                || (opts.conservative_blanket
-                    && evaluation
-                        .assessment
-                        .contains(ClassifierSecurityFinding::DangerousCommand))
-            {
+            if !opts.allow_blanket {
                 None
             } else if opts.conservative_blanket
                 && evaluation
@@ -1885,7 +1880,6 @@ fn spawn_permission_manager_with_pin_and_activation(
                         && !policy_forced_prompt
                         && !shell_forced_prompt
                         && protected_edit.is_none()
-                        && bash_assessment_is_clear(bash_evaluation.as_ref())
                         && matches!(policy_decision, Some(Decision::Allow))
                         && (bash_assessment_is_clear(bash_evaluation.as_ref())
                             || (!bash_request_floor_requires_prompt(bash_evaluation.as_ref())

@@ -4452,6 +4452,9 @@ fn bundled_allowlist_ignore_dirs(dir: &str, allowlist: Option<&str>) -> Vec<Stri
         .map(|s| s.strip_prefix("bundled__").unwrap_or(s))
         .filter(|s| !s.is_empty())
         .collect();
+    if allowed.is_empty() {
+        return vec![];
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) => {
