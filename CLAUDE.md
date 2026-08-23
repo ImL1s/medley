@@ -73,9 +73,13 @@ Deliberate exceptions: `.grok/config.toml` and `.grok/sandbox.toml` are **projec
 
 ## Releases
 
-Tags are `v<upstream>+providers.<N>`; the workflow rejects a bare upstream tag. Pushing the tag builds four targets, then creates a **draft** — the `### Changes` section is a placeholder someone must write before publishing. Publish with `--latest` explicitly; `+providers.N` build metadata is not something to trust GitHub to order.
+Tags are `v<upstream>+providers.<N>`; the workflow rejects a bare upstream tag. Pushing the tag builds five targets — two macOS, two Linux gnu, and `x86_64-unknown-linux-musl` — then creates a **draft** — the `### Changes` section is a placeholder someone must write before publishing. Publish with `--latest` explicitly; `+providers.N` build metadata is not something to trust GitHub to order.
 
 The pre-release gate accepts only a completed, successful run of *this* repo's `ci.yml`, `event=push`, `head_branch=providers`, at exactly the release SHA — matched on `.path`, so another workflow calling itself "CI" cannot satisfy it.
+
+**The glibc floor step forks by artifact kind, and must (#82).** gnu artifacts are proved correct by the *highest* versioned `GLIBC_` symbol in them; a static musl artifact has none, so that probe fails there for lack of the evidence it needs. The musl step asserts the opposite — no `PT_INTERP`, no `NEEDED`, no `GLIBC_` token — and pairs every one of those absence-assertions with a positive fact from the same tool (program-header count, string count), because a tool that read nothing would otherwise satisfy all of them. None of it reads the symbol table, which `strip` removes without changing whether a binary is static.
+
+**Adding `aarch64-unknown-linux-musl` needs a static arm64 ripgrep first (#424).** `xai-grok-tools/build.rs` embeds ripgrep into the executable on every `PROFILE=release` build and picks the asset by target: x86_64 already gets a musl one, aarch64 gets `aarch64-unknown-linux-gnu` because **upstream ripgrep publishes no aarch64 musl asset** (checked 15.0.0, 14.1.1, 14.1.0). So an arm64 musl archive would be a static binary with a glibc-linked `rg` inside it — the floor step catches it and blocks the release, which is the guard working. Do not relax the scan to get past it: that trades a loud release-time failure for a silent one where `medley` starts on Alpine and dies at the first grep.
 
 ## Upstream sync
 

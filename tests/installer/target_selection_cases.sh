@@ -137,10 +137,10 @@ run_case at-the-floor "$AT_FLOOR" '' 0 aarch64-unknown-linux-gnu
 BELOW="$(make_stubs below x86_64 'glibc 2.34' 'ldd (GNU libc) 2.34')"
 run_case below-floor "$BELOW" '' 0 x86_64-unknown-linux-musl
 
-# Debian 11. Older still, and the one a container-built glibc artifact would
-# not have recovered.
-OLD="$(make_stubs old aarch64 'glibc 2.31' 'ldd (Debian GLIBC 2.31-13+deb11u11) 2.31')"
-run_case debian-11 "$OLD" '' 0 aarch64-unknown-linux-musl
+# Debian 11 on x86_64. Older still, and the one a container-built glibc
+# artifact would not have recovered.
+OLD="$(make_stubs old x86_64 'glibc 2.31' 'ldd (Debian GLIBC 2.31-13+deb11u11) 2.31')"
+run_case debian-11 "$OLD" '' 0 x86_64-unknown-linux-musl
 
 # Alpine: getconf reports nothing usable and ldd names musl. This is the host
 # that gets the issue's worst failure today — checksum passes, installer says
@@ -150,8 +150,48 @@ run_case alpine "$ALPINE" '' 0 x86_64-unknown-linux-musl
 
 # Neither probe answers. Choosing gnu here would trade a working install for a
 # broken one on a host that cannot be asked, so the static build wins.
-UNKNOWN="$(make_stubs unknown aarch64 '' '')"
-run_case no-libc-probe "$UNKNOWN" '' 0 aarch64-unknown-linux-musl
+UNKNOWN="$(make_stubs unknown x86_64 '' '')"
+run_case no-libc-probe "$UNKNOWN" '' 0 x86_64-unknown-linux-musl
+
+# ---------------------------------------------------------------------------
+# aarch64 has no static build to fall back to (#424): upstream ripgrep, which
+# the binary embeds, publishes no aarch64 musl asset. A host that would have
+# been sent to musl must be told, before anything is downloaded, rather than
+# 404ing on an archive that does not exist or installing a gnu one that cannot
+# start. These are the cases that would silently regress if the arm64 lane were
+# ever half-added.
+ARM_BELOW="$(make_stubs arm-below aarch64 'glibc 2.34' 'ldd (GNU libc) 2.34')"
+run_case arm64-below-floor "$ARM_BELOW" '' 1 ''
+if grep -q 'no static (musl) build for aarch64' "${WORK}/err-arm64-below-floor.txt"; then
+  ok 'arm64-below-floor: refuses with a reason instead of downloading'
+else
+  bad 'arm64-below-floor: no usable message'
+  sed 's/^/       /' "${WORK}/err-arm64-below-floor.txt"
+fi
+if grep -q 'MEDLEY_LIBC=gnu' "${WORK}/err-arm64-below-floor.txt"; then
+  ok 'arm64-below-floor: offers the override as a way through'
+else
+  bad 'arm64-below-floor: dead end with no escape hatch'
+fi
+
+ARM_ALPINE="$(make_stubs arm-alpine aarch64 '' 'musl libc (aarch64) Version 1.2.5')"
+run_case arm64-alpine "$ARM_ALPINE" '' 1 ''
+
+# Asking for it explicitly must fail the same way, not 404 later.
+run_case arm64-override-musl "$ARM_BELOW" musl 1 ''
+if grep -q 'MEDLEY_LIBC=musl asked for one' "${WORK}/err-arm64-override-musl.txt"; then
+  ok 'arm64-override-musl: names the request as the reason'
+else
+  bad 'arm64-override-musl: no usable message'
+  sed 's/^/       /' "${WORK}/err-arm64-override-musl.txt"
+fi
+
+# The override still works in the direction that has an archive.
+run_case arm64-override-gnu "$ARM_ALPINE" gnu 0 aarch64-unknown-linux-gnu
+
+# An arm64 host at or above the floor is unaffected by any of this.
+ARM_MODERN="$(make_stubs arm-modern aarch64 'glibc 2.39' 'ldd (Ubuntu GLIBC 2.39-0ubuntu8.3) 2.39')"
+run_case arm64-modern "$ARM_MODERN" '' 0 aarch64-unknown-linux-gnu
 
 # The override wins in both directions, including against the detection that
 # would otherwise have chosen the other one.

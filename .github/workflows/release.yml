@@ -281,6 +281,25 @@ jobs:
           # Still native runners: a musl binary for the runner's own
           # architecture runs on that runner, so every archive is still
           # executed before it is packaged.
+          #
+          # x86_64 ONLY, and the aarch64 half is deferred to #424 rather than
+          # forgotten. The decision on #82 asked for both triples; arm64 turns
+          # out to need something that does not exist. `xai-grok-tools`
+          # embeds ripgrep into the executable on every release build, and
+          # picks the asset by target (build.rs:277-283): x86_64 already gets
+          # `x86_64-unknown-linux-musl`, but aarch64 gets
+          # `aarch64-unknown-linux-gnu`, because upstream ripgrep publishes no
+          # aarch64 musl asset at all — checked against 15.0.0, 14.1.1 and
+          # 14.1.0.
+          #
+          # An aarch64-musl archive would therefore be a static binary with a
+          # glibc-linked `rg` inside it. The step below catches that and
+          # blocks the release, which is the guard working; letting it through
+          # would ship a medley that starts on Alpine and dies at the first
+          # grep — the same silent failure #82 exists to end, moved one layer
+          # in. Fixing it means putting an unpinned, from-source ripgrep
+          # inside the shipped artifact, which is a supply-chain decision to
+          # take deliberately, not a side effect of adding libc lanes.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-22.04
             libc: musl
@@ -288,13 +307,6 @@ jobs:
             cargo_target: x86_64-unknown-linux-musl
             protoc_asset: linux-x86_64
             protoc_sha256: 3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-22.04-arm
-            libc: musl
-            host_triple: aarch64-unknown-linux-gnu
-            cargo_target: aarch64-unknown-linux-musl
-            protoc_asset: linux-aarch_64
-            protoc_sha256: 6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32
     steps:
       - name: Check out the release commit
         # Pinned to the resolved commit, never a moving branch: artifacts must
@@ -768,6 +780,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # x86_64 only, matching the build matrix — see #424 for the arm64
+          # rows, which arrive with the arm64 archive they would test.
           - arch: x86_64
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-musl
@@ -775,14 +789,6 @@ jobs:
           - arch: x86_64
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-musl
-            image: amazonlinux:2023
-          - arch: aarch64
-            runner: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
-            image: rockylinux:9
-          - arch: aarch64
-            runner: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
             image: amazonlinux:2023
     steps:
       - name: Check out the release commit
@@ -904,17 +910,18 @@ jobs:
           cat ./*.tar.gz.sha256 | LC_ALL=C sort -k2 > "$checksums"
           sha256sum --check --strict "$checksums"
           # The per-archive files are kept and published alongside the
-          # aggregate. Checking the aggregate requires all six archives
+          # aggregate. Checking the aggregate requires all five archives
           # present, so a user who downloaded only their own platform would see
-          # five "No such file" errors and a non-zero exit from a verification
+          # four "No such file" errors and a non-zero exit from a verification
           # that actually succeeded for the file they have.
 
-          # Two macOS, two Linux gnu, two Linux musl. This count is the only
-          # thing that notices a matrix lane that silently stopped uploading —
-          # `merge-multiple` is happy with however many artifacts arrive.
+          # Two macOS, two Linux gnu, one Linux musl (x86_64; arm64 musl is
+          # #424). This count is the only thing that notices a matrix lane that
+          # silently stopped uploading — `merge-multiple` is happy with
+          # however many artifacts arrive.
           found="$(find . -name '*.tar.gz' | wc -l | tr -d ' ')"
-          if [ "$found" != "6" ]; then
-            echo "::error::expected 6 archives, found ${found}"
+          if [ "$found" != "5" ]; then
+            echo "::error::expected 5 archives, found ${found}"
             exit 1
           fi
 
@@ -1056,32 +1063,37 @@ jobs:
             echo
             echo "macOS 15+ on Apple silicon or Intel."
             echo
-            echo "Linux ships two flavours per architecture, and the installer picks"
-            echo "between them for you:"
+            echo "On Linux the installer picks the archive your host can run:"
             echo
             echo "| Archive | Linking | Requires |"
             echo "| --- | --- | --- |"
-            echo "| \`*-unknown-linux-gnu\` | dynamic | glibc ${LINUX_GLIBC_FLOOR} or newer — Ubuntu 22.04+, Debian 12+, Fedora 36+ |"
-            echo "| \`*-unknown-linux-musl\` | static | nothing |"
+            echo "| \`x86_64-unknown-linux-gnu\` | dynamic | glibc ${LINUX_GLIBC_FLOOR}+ |"
+            echo "| \`aarch64-unknown-linux-gnu\` | dynamic | glibc ${LINUX_GLIBC_FLOOR}+ |"
+            echo "| \`x86_64-unknown-linux-musl\` | static | nothing |"
             echo
-            echo "The musl archives carry no libc requirement at all, which covers"
+            echo "glibc ${LINUX_GLIBC_FLOOR}+ means Ubuntu 22.04+, Debian 12+, Fedora 36+."
+            echo "The x86_64 musl archive has no libc requirement at all, which covers"
             echo "RHEL/Rocky 9 and Amazon Linux 2023 (glibc 2.34), Debian 11 (2.31),"
             echo "and Alpine, where there is no glibc to be below. \`install.sh\` reads"
-            echo "the host's glibc version and downloads the musl archive when it is"
-            echo "under ${LINUX_GLIBC_FLOOR} or absent; set \`MEDLEY_LIBC=gnu\` or"
+            echo "the host's glibc version and downloads it when that is under"
+            echo "${LINUX_GLIBC_FLOOR} or absent; set \`MEDLEY_LIBC=gnu\` or"
             echo "\`MEDLEY_LIBC=musl\` to choose yourself."
+            echo
+            echo "**There is no static aarch64 build yet.** An arm64 host below the"
+            echo "floor has no archive that runs, and the installer says so instead of"
+            echo "downloading one that will not start. Tracked in issue #424."
             echo
             echo "Prefer the gnu archives where they run: they use the system's NSS"
             echo "and locale support, which a static binary cannot load. The release"
-            echo "job measures the glibc floor out of each gnu binary, and proves each"
+            echo "job measures the glibc floor out of each gnu binary, and proves the"
             echo "musl binary needs no loader and names no glibc symbol, rather than"
             echo "shipping an archive that would not run."
             echo
             echo "### Verify"
             echo
             echo "Each archive ships its own \`.sha256\` next to it. Check that one —"
-            echo "the combined \`${DIST_NAME}-${VERSION}-checksums.txt\` lists all six"
-            echo "archives, so checking it reports the five you did not download as"
+            echo "the combined \`${DIST_NAME}-${VERSION}-checksums.txt\` lists all five"
+            echo "archives, so checking it reports the four you did not download as"
             echo "missing and exits non-zero."
             echo
             echo "On Linux:"

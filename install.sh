@@ -126,6 +126,23 @@ glibc_at_least() {
     }'
 }
 
+# Stop, with a reason, when this host needs a static build that is not published.
+#
+# The musl archives are x86_64 only. The binary embeds ripgrep, and upstream
+# ripgrep publishes no aarch64 musl asset, so an aarch64 static build would
+# carry a glibc-linked grep that dies the moment it runs — see issue #424.
+#
+# An aarch64 host below the floor therefore has no archive that works: the
+# static one does not exist and the dynamic one will not start. Saying so
+# before anything is downloaded is the whole point. Guessing gnu here would
+# reproduce exactly the failure this installer was changed to prevent — a
+# checksum that verifies, an install that reports success, and a binary that
+# does not run.
+assert_musl_published() {
+  [ "$1" = 'aarch64' ] || return 0
+  die "medley publishes no static (musl) build for aarch64 Linux, and ${2}, so the dynamically linked build would not start here either. Build from source, or set MEDLEY_LIBC=gnu to download the dynamically linked archive anyway — it needs glibc ${LINUX_GLIBC_FLOOR} or newer. x86_64 hosts do get a static build. Tracked in https://github.com/ImL1s/medley/issues/424"
+}
+
 # Which Linux archive this host can actually run: 'gnu' or 'musl'.
 #
 # The gnu archives are dynamically linked and serve the majority better — they
@@ -140,10 +157,16 @@ glibc_at_least() {
 # is deliberate — guessing gnu on an unreadable host trades a working install
 # for a broken one, and the musl archive runs in every case the gnu one does.
 detect_linux_libc() {
+  dll_arch="$1"
   dll_override="${MEDLEY_LIBC:-auto}"
   case "$dll_override" in
-  gnu | musl)
-    printf '%s\n' "$dll_override"
+  gnu)
+    printf 'gnu\n'
+    return 0
+    ;;
+  musl)
+    assert_musl_published "$dll_arch" 'MEDLEY_LIBC=musl asked for one'
+    printf 'musl\n'
     return 0
     ;;
   auto) ;;
@@ -154,6 +177,7 @@ detect_linux_libc() {
 
   dll_glibc="$(detect_glibc_version)"
   if [ -z "$dll_glibc" ]; then
+    assert_musl_published "$dll_arch" 'this host has no glibc'
     note 'no glibc found on this host; installing the static (musl) build.'
     printf 'musl\n'
     return 0
@@ -162,6 +186,7 @@ detect_linux_libc() {
   if glibc_at_least "$dll_glibc" "$LINUX_GLIBC_FLOOR"; then
     printf 'gnu\n'
   else
+    assert_musl_published "$dll_arch" "this host has glibc ${dll_glibc}"
     note "this host has glibc ${dll_glibc}, below the ${LINUX_GLIBC_FLOOR} the dynamically linked build needs; installing the static (musl) build instead."
     printf 'musl\n'
   fi
@@ -172,19 +197,21 @@ detect_target() {
   detect_os="$(uname -s)"
   detect_arch="$(uname -m)"
 
-  case "$detect_os" in
-  Darwin) detect_os_part='apple-darwin' ;;
-  Linux) detect_os_part="unknown-linux-$(detect_linux_libc)" ;;
-  *)
-    die "unsupported operating system '${detect_os}'. medley publishes macOS and Linux builds; build from source for anything else."
-    ;;
-  esac
-
+  # Architecture is resolved first because on Linux the libc choice depends on
+  # it: the static archives are published for x86_64 only (issue #424).
   case "$detect_arch" in
   arm64 | aarch64) detect_arch_part='aarch64' ;;
   x86_64 | amd64) detect_arch_part='x86_64' ;;
   *)
     die "unsupported architecture '${detect_arch}'. medley publishes x86_64 and aarch64 builds."
+    ;;
+  esac
+
+  case "$detect_os" in
+  Darwin) detect_os_part='apple-darwin' ;;
+  Linux) detect_os_part="unknown-linux-$(detect_linux_libc "$detect_arch_part")" ;;
+  *)
+    die "unsupported operating system '${detect_os}'. medley publishes macOS and Linux builds; build from source for anything else."
     ;;
   esac
 
