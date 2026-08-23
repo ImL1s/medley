@@ -161,7 +161,18 @@ cannot tell a dropped webhook from a run that has not started. The guard
 prints a `verdict:` line so those states stay distinct:
 
 - `success` — completed successful `ci.yml` run for this exact head
-- `absent` — zero runs for this head (dropped webhook / never created)
+- `absent` — zero runs for this head. Three causes, and they need opposite
+  responses: a dropped webhook, a run that was never created, or **the PR is
+  `CONFLICTING`**, in which case GitHub cannot compute `refs/pull/<n>/merge` and
+  never dispatches the `pull_request` run at all. Check `mergeable` before
+  assuming one of the first two — those you wait out, the third you fix by
+  merging the base in. Observed on #383 on 2026-08-23: merging #404 into
+  `providers` flipped it to `CONFLICTING`, and the next push produced zero check
+  runs while a PR opened minutes later ran normally. It reads exactly like a
+  slow queue. Corollary: **merging anything into `providers` can flip every
+  other open PR to `CONFLICTING` in the same instant**, so sweep
+  `gh pr list --json number,mergeable` after each merge rather than waiting to
+  notice that a PR's CI "stopped moving".
 - `in_progress` — a run exists and is queued / in progress / waiting
 - `skipped` — a run completed as skipped / cancelled, not success
 - `failed` / `identity_rejected` — finished unsuccessfully, or the path/event

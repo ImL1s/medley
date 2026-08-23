@@ -1435,9 +1435,35 @@ fn stale_settings_model_choice_reports_catalog_change() {
         .toast
         .as_ref()
         .map(|(message, _)| message.as_str());
+    // Assert against the constant, not a copy of its text: this test pinned a
+    // second, divergent literal until the providers merge routed this path
+    // through `CATALOG_CHANGED_TOAST`, and a copied string would drift again.
     assert_eq!(
         toast,
-        Some("The model catalog changed; choose an available model and try again")
+        Some(crate::slash::commands::model::CATALOG_CHANGED_TOAST)
+    );
+}
+
+/// The confirmed path is reached directly from `session::lifecycle`, not only
+/// through `set_default_model`, and it carried its own copy of this wording
+/// until the providers merge. An untested duplicate is what let the two
+/// diverge, so pin this one too.
+#[test]
+fn stale_confirmed_model_choice_reports_catalog_change() {
+    let mut app = test_app_with_agent();
+    let id = acp::ModelId::new(std::sync::Arc::from("removed-before-confirm"));
+
+    let effects =
+        crate::app::dispatch::settings::setters::set_default_model_confirmed(&mut app, id);
+
+    assert!(effects.is_empty());
+    let toast = app.agents[&AgentId(0)]
+        .toast
+        .as_ref()
+        .map(|(message, _)| message.as_str());
+    assert_eq!(
+        toast,
+        Some(crate::slash::commands::model::CATALOG_CHANGED_TOAST)
     );
 }
 

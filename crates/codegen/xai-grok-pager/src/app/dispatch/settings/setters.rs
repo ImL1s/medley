@@ -1785,7 +1785,12 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
     };
 
     if !available_has_new {
-        app.show_toast("The model catalog changed; choose an available model and try again");
+        // Same condition and the same user-visible outcome as `set_default_model`
+        // above, so it must read the same. This site carried its own literal
+        // until the two halves first coexisted at the providers merge: #332
+        // added this confirmed path with its own wording, while #335/#346/#358
+        // had already centralised the picker path on `CATALOG_CHANGED_TOAST`.
+        app.show_toast(crate::slash::commands::model::CATALOG_CHANGED_TOAST);
         return vec![];
     }
     if prev_id.as_ref() == Some(&new_id) {
