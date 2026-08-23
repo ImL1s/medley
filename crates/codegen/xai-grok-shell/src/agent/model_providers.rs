@@ -1006,9 +1006,18 @@ pub(crate) fn unknown_openai_codex_catalog_slug_reason(
 fn stamp_unknown_openai_codex_catalog_slugs(
     config_models: &mut IndexMap<String, ConfigModelOverride>,
     catalog_slugs: &std::collections::HashSet<String>,
+    catalog_is_authoritative: bool,
 ) {
     for (key, entry) in config_models.iter_mut() {
         if entry.model_provider.as_deref() != Some(OPENAI_CODEX_PROVIDER_ID) {
+            entry.unknown_codex_catalog_slug = None;
+            continue;
+        }
+        // #260: the gate is "the catalog said no", never "the catalog did not
+        // say yes". A degraded catalog is a saved cache or the single built-in
+        // preset, so it cannot speak for slugs it never listed, and a stamp
+        // left by an earlier authoritative refresh must not outlive it.
+        if !catalog_is_authoritative {
             entry.unknown_codex_catalog_slug = None;
             continue;
         }
@@ -1078,6 +1087,10 @@ fn merge_openai_codex_preset_entries(
     presets: IndexMap<String, ConfigModelOverride>,
 ) {
     let catalog_slugs = openai_codex_catalog_wire_slugs(&presets);
+    // Computed here, not after the loop: `presets` is moved below.
+    let catalog_is_authoritative = presets
+        .values()
+        .all(|preset| preset.catalog_degraded_reason.is_none());
     for (key, preset) in presets {
         let Some(user_entry) = config_models.get_mut(&key) else {
             config_models.insert(key, preset);
@@ -1172,7 +1185,11 @@ fn merge_openai_codex_preset_entries(
                 .get_or_insert(percent);
         }
     }
-    stamp_unknown_openai_codex_catalog_slugs(config_models, &catalog_slugs);
+    stamp_unknown_openai_codex_catalog_slugs(
+        config_models,
+        &catalog_slugs,
+        catalog_is_authoritative,
+    );
 }
 
 #[derive(Clone, Default, serde::Deserialize)]
@@ -2913,6 +2930,73 @@ mod tests {
             crate::agent::config::model_readiness(&model),
             (true, None),
             "a real Codex catalog slug must stay ready when credentials are present"
+        );
+    }
+
+    /// #260, second done-criterion: "an unavailable catalog does not make valid
+    /// entries unready". The check must be "the catalog said no", not "the
+    /// catalog did not say yes".
+    ///
+    /// `codex_catalog_fallback_models` stamps `catalog_degraded_reason` on
+    /// every entry it hands back, whether that is a saved cache or the single
+    /// built-in preset. Stamping unknown slugs off a degraded catalog therefore
+    /// marks a user's perfectly valid hand-written entry unready whenever the
+    /// live refresh fails — reachable through `resolve_remote_fetch_enabled`,
+    /// which is a supported setting, not an error path.
+    ///
+    /// This calls `merge_openai_codex_preset_entries` directly and hands it a
+    /// degraded preset set. Going through the normal path cannot reproduce it:
+    /// `fetch_openai_codex_catalog_models` returns `None` under `cfg!(test)`,
+    /// so the effective catalog in unit tests is always the one built-in slug,
+    /// and the two tests above happen to use exactly that slug. The bug is
+    /// structurally invisible to them.
+    #[test]
+    fn codex_wire_model_catalog_slug_stays_ready_when_catalog_is_degraded() {
+        let mut config_models = IndexMap::from([(
+            "gpt-5.3-codex-spark".to_owned(),
+            ConfigModelOverride {
+                model_provider: Some(OPENAI_CODEX_PROVIDER_ID.to_owned()),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        let degraded = mark_codex_catalog_degraded(
+            openai_codex_preset_models(),
+            OPENAI_CODEX_BUILTIN_FALLBACK_REASON,
+        );
+
+        merge_openai_codex_preset_entries(&mut config_models, degraded);
+
+        assert_eq!(
+            config_models["gpt-5.3-codex-spark"].unknown_codex_catalog_slug, None,
+            "a degraded catalog must not deny a slug it simply never listed"
+        );
+    }
+
+    /// The other half: a stamp left by an earlier authoritative refresh must
+    /// not survive into a degraded one. Skipping the stamping step alone would
+    /// leave the stale `Some(..)` in place and keep the row unready for the
+    /// rest of the session, which is the same user-visible bug arriving by a
+    /// slower route.
+    #[test]
+    fn codex_wire_model_catalog_slug_clears_stale_stamp_on_degraded_refresh() {
+        let mut config_models = IndexMap::from([(
+            "gpt-5.3-codex-spark".to_owned(),
+            ConfigModelOverride {
+                model_provider: Some(OPENAI_CODEX_PROVIDER_ID.to_owned()),
+                unknown_codex_catalog_slug: Some("gpt-5.3-codex-spark".to_owned()),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        let degraded = mark_codex_catalog_degraded(
+            openai_codex_preset_models(),
+            OPENAI_CODEX_BUILTIN_FALLBACK_REASON,
+        );
+
+        merge_openai_codex_preset_entries(&mut config_models, degraded);
+
+        assert_eq!(
+            config_models["gpt-5.3-codex-spark"].unknown_codex_catalog_slug, None,
+            "a degraded refresh must clear a stamp it can no longer justify"
         );
     }
 
