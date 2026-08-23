@@ -695,6 +695,13 @@ jobs:
           run_nonzero -p xai-grok-update --lib dist_channel -- --nocapture
           run_nonzero -p xai-grok-update --lib self_update -- --nocapture
           run_nonzero -p xai-grok-update --test test_dist_channel_gate -- --nocapture
+          # Same marker, one layer out: the release workflow greps
+          # `version --json` for `distChannel` to prove MEDLEY_CHANNEL reached
+          # the build, so a renamed or dropped key fails a release rather than
+          # a test. `channel`, `upstreamBase`, and `buildTarget` have no guard
+          # at all outside this filter (issue #29).
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            version_json_payload_ -- --nocapture
 
       - name: Leader lock identity (Linux-only /proc probe)
         # The leader auto-kill path proves "is this OUR process" by checking
