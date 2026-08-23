@@ -12129,10 +12129,7 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
         std::fs::create_dir_all(&xai_home).expect("create xAI home");
         let auth_manager =
             std::sync::Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
-        let _auth_path = EnvGuard::set(
-            "GROK_AUTH_PATH",
-            auth_path.to_str().expect("utf-8 auth path"),
-        );
+        let _auth_path = crate::auth::openai_codex::CodexAuthPathGuard::pin(auth_path);
 
         let empty = toml::Value::Table(toml::map::Map::new());
         let mut cfg = AgentConfig::new_from_toml_cfg(&empty).expect("production config");
