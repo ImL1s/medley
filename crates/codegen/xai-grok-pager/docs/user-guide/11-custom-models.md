@@ -152,6 +152,15 @@ web_search = "prod-grok-build"
 session_summary = "canary-grok-build"
 ```
 
+**Native subagent route contract.** The same catalog-key-versus-wire-slug
+identity governs Medley's optional native subagent route contract: route
+requests name catalog keys, never bare wire slugs, and each enhanced child
+session records a secret-free receipt naming the selected catalog key, wire
+model, and access route, so two entries sharing one slug stay distinct in
+receipts and diagnostics. The extension is capability-negotiated, and original
+Grok Build does not implement it. See
+[`docs/architecture/native-subagent-route-contract.md`](https://github.com/ImL1s/medley/blob/providers/docs/architecture/native-subagent-route-contract.md).
+
 **xAI identity headers.** On third-party endpoints or when `auth_scheme = "none"`, Grok omits `x-grok-user-id` and `x-grok-deployment-id` so account metadata is not sent to external hosts.
 
 ### Credential Resolution
