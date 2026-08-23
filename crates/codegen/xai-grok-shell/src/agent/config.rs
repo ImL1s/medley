@@ -12630,30 +12630,60 @@ reasoning_effort = "low"
     /// `session_key` is only meaningful when the stored credential really is a
     /// session token. `resolve_credentials`' third arm takes whatever it is
     /// handed and stamps it `AuthType::SessionToken`, so passing a BYOK key
-    /// there re-labels it — and passing a real session token carries it to a
-    /// model that may point anywhere.
+    /// there re-labels it.
     ///
     /// The function documents the guard as the caller's job; this pins what
     /// happens when a caller forgets, so the reason the guard exists survives
     /// in a test rather than only in a doc comment (#136).
+    ///
+    /// The label is no longer the whole story. #110 STOP-1 taught
+    /// `resolve_credentials` to drop the credential when the relabelled
+    /// `XaiSession` would reach a non-first-party origin, so the re-labelled
+    /// key now only survives on an origin allowed to see an xAI session. Both
+    /// halves are pinned below, and both go through
+    /// `resolve_credentials_with_origins` so the trusted-origin set is the
+    /// test's, not whatever the ambient config happens to declare.
     #[test]
     fn a_key_passed_as_session_key_is_relabelled_a_session_token() {
         let entry = test_model_entry("vendor", "https://vendor.example/v1", None, None, None);
 
         // No own credential, no provider: the `session_key` arm is what fires.
-        let with_key = resolve_credentials(&entry, Some("not-actually-a-session-token"));
+        let with_key = resolve_credentials_with_origins(
+            &entry,
+            Some("not-actually-a-session-token"),
+            &no_trusted_origins(),
+        );
         assert_eq!(
             with_key.auth_type,
             xai_chat_state::AuthType::SessionToken,
             "the arm stamps whatever it is handed, which is why the caller must guard"
         );
         assert_eq!(
-            with_key.api_key.as_deref(),
+            with_key.api_key, None,
+            "#110 STOP-1: the relabel makes it an ambient xAI session, and a \
+             non-first-party origin must not receive one"
+        );
+
+        // The gate does not fire on a first-party origin, so there the relabel
+        // still carries the key — the half of the #136 hazard that remains.
+        let first_party = test_model_entry("xai", "https://api.x.ai/v1", None, None, None);
+        let carried = resolve_credentials_with_origins(
+            &first_party,
+            Some("not-actually-a-session-token"),
+            &no_trusted_origins(),
+        );
+        assert_eq!(
+            carried.auth_type,
+            xai_chat_state::AuthType::SessionToken,
+            "the relabel itself does not depend on the origin"
+        );
+        assert_eq!(
+            carried.api_key.as_deref(),
             Some("not-actually-a-session-token")
         );
 
         // Guarded correctly, the same model resolves without inheriting it.
-        let without = resolve_credentials(&entry, None);
+        let without = resolve_credentials_with_origins(&entry, None, &no_trusted_origins());
         assert_ne!(
             without.auth_type,
             xai_chat_state::AuthType::SessionToken,

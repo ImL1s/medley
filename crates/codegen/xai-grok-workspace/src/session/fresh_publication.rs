@@ -312,12 +312,12 @@ impl FreshPublication {
         self.publish_attempts.fetch_add(1, Ordering::SeqCst);
         let published_session_anchor = match rename(
             stage_session_anchor,
-            &published_parent_anchor,
+            published_parent_anchor,
             &self.session_name,
         ) {
             Ok(child) => child,
             Err(failure) => {
-                return self.reconcile_or_abort(failure, &published_parent_anchor);
+                return self.reconcile_or_abort(failure, published_parent_anchor);
             }
         };
 
@@ -325,8 +325,8 @@ impl FreshPublication {
         self.drop_stage_container();
         self.finish_committed(
             published_session_anchor,
-            &published_parent_anchor,
-            &sessions_anchor,
+            published_parent_anchor,
+            sessions_anchor,
             sync_published,
         )
     }

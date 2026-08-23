@@ -534,9 +534,7 @@ impl WorkspaceLocalSessionReservation {
         // Finalizer runs without the session-map write lock so it can inspect
         // or re-enter the map (#348). Do not `take()` cleanup ownership first:
         // a panic here must still Drop-cancel the reservation (#349).
-        if let Err(error) = before_publish() {
-            return Err(error);
-        }
+        before_publish()?;
         before_lock();
         let mut sessions = shared.sessions.write();
         if shared.activity_tracker.is_draining() {
