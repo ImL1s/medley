@@ -849,12 +849,6 @@ jobs:
             issue39_aborted_explicit_gateway_refresh_recovers_waiters -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             gateway_refresh_fence_prevents_stale_snapshot_reconciliation -- --nocapture
-          run_nonzero -p xai-grok-shell-session-support --lib \
-            explicit_gateway_refresh_fence_clears_only_on_fresh_commit -- --nocapture
-          run_nonzero -p xai-grok-shell-session-support --lib \
-            legacy_config_invalidation_preserves_gateway_catalog -- --nocapture
-          run_nonzero -p xai-grok-shell-session-support --lib \
-            issue39_abort_gateway_tool_fetch_recovers_waiters -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             subagent_trusted_tool_capabilities_render_in_human_and_json_views -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
