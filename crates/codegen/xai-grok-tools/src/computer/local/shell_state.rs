@@ -442,7 +442,7 @@ impl ShellState {
                 // eval so it can never reach child processes or the state
                 // dump (`export -p`).
                 "{dump_script} \
-                 snap=$(command cat <&3) && builtin shopt -s extglob && builtin eval -- \"$snap\" && \
+                 snap=$(command cat <&3); builtin shopt -s extglob 2>/dev/null || true; builtin eval -- \"$snap\" 2>/dev/null || true; \
                  {{ builtin set +u 2>/dev/null || true; \
                  builtin export GROK_AGENT=1; \
                  builtin export PWD=\"$(builtin pwd)\"; \
@@ -461,7 +461,7 @@ impl ShellState {
                  snap=$(command cat <&3); \
                  builtin unsetopt aliases 2>/dev/null; \
                  builtin unalias -m '*' 2>/dev/null || true; \
-                 builtin eval \"$snap\" && \
+                 builtin eval \"$snap\" 2>/dev/null || true; \
                  {{ builtin unsetopt nounset 2>/dev/null || true; \
                  builtin setopt nonomatch 2>/dev/null || true; \
                  builtin export GROK_AGENT=1; \
