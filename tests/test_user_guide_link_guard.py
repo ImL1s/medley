@@ -160,6 +160,29 @@ def _offending_links() -> list[str]:
     return findings
 
 
+REMEDIATION = """
+{listing}
+
+Each link above leaves {guide}/.
+That directory is extracted to <state-dir>/docs/user-guide/ when the pager
+starts; nothing above it is. So the link resolves in a repository checkout
+and is broken for everyone reading an installed copy.
+
+If it is a real link, use an absolute URL:
+    https://github.com/ImL1s/medley/blob/providers/<path-from-repo-root>
+
+If it is a deliberate example rather than a real link, put it in a fenced
+code block. Fenced blocks are not scanned; nothing else is exempt.
+"""
+
+
+def _remediation(findings: list[str]) -> str:
+    listing = "\n".join(f"  {finding}" for finding in findings)
+    return REMEDIATION.format(
+        listing=listing, guide=GUIDE.relative_to(REPO).as_posix()
+    )
+
+
 class UserGuideLinkGuardTests(unittest.TestCase):
     def test_extraction_premise_still_holds(self) -> None:
         """The invariant only matters while the guide is extracted this way."""
@@ -200,13 +223,7 @@ class UserGuideLinkGuardTests(unittest.TestCase):
 
     def test_no_relative_link_escapes_the_guide_directory(self) -> None:
         findings = _offending_links()
-        self.assertEqual(
-            findings,
-            [],
-            "user-guide pages are extracted to <state-dir>/docs/user-guide/, "
-            "where a relative link out of that directory does not resolve. "
-            "Use an absolute URL instead:\n  " + "\n  ".join(findings),
-        )
+        self.assertEqual(findings, [], _remediation(findings))
 
 
 class LinkDetectionTests(unittest.TestCase):
@@ -339,6 +356,23 @@ class LinkDetectionTests(unittest.TestCase):
         self.assertTrue(self._flags("[x](../..?a=b)\n"))
         self.assertTrue(self._flags("[x](..#top)\n"))
         self.assertFalse(self._flags("[x](11-custom-models.md?raw=1)\n"))
+
+    def test_failure_message_says_how_to_fix_it(self) -> None:
+        """A guard that flags without instructing gets deleted, not obeyed.
+
+        Both branches must be present: an absolute URL for a real link, and
+        a fenced block for a deliberate example. The second only works while
+        fence blanking exists, so this test also pins that dependency -- if
+        fences ever stop being exempt, this message becomes false advice and
+        the test should fail with it.
+        """
+        message = _remediation(["some/page.md:12: ../../escaped.md"])
+        self.assertIn("some/page.md:12: ../../escaped.md", message)
+        self.assertIn("absolute URL", message)
+        self.assertIn("https://github.com/ImL1s/medley/blob/providers/", message)
+        self.assertIn("fenced\ncode block", message)
+        # The advice must stay true: fenced content is genuinely not scanned.
+        self.assertFalse(self._flags("```\n[x](../../escaped.md)\n```\n"))
 
     def test_blanking_preserves_line_numbers(self) -> None:
         body = "one\n```\nfenced\n```\nfour\n[x](../../escaped.md)\n"
