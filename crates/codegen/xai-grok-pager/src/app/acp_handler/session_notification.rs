@@ -1104,10 +1104,8 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     // Mirror the active agent's model state into app state *before* rebuilding
     // any surface, so the settings modal and the `/model` arg picker read the
     // reconciled catalog rather than the previous generation.
-    if active_model_state_changed {
-        if let Some(agent) = app.agents.get(&parent_id) {
-            app.models = agent.session.models.clone();
-        }
+    if active_model_state_changed && let Some(agent) = app.agents.get(&parent_id) {
+        app.models = agent.session.models.clone();
     }
     if refresh_model_ui || active_model_state_changed {
         // Superset of `refresh_open_settings_modals`: also rebuilds an open

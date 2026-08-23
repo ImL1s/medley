@@ -291,6 +291,7 @@ pub(crate) fn unready_reasons_from_catalog(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn is_unavailable_resident_meta(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> bool {

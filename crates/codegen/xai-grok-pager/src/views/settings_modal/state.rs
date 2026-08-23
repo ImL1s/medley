@@ -796,14 +796,14 @@ impl SettingsModalState {
         else {
             return None;
         };
-        match self.registry.find(*key).map(|m| &m.kind) {
+        match self.registry.find(key).map(|m| &m.kind) {
             Some(SettingKind::DynamicEnum { source, .. }) => {
                 dynamic_enum_choices(*source, &self.pager_snapshot)
                     .get(*choices_idx)
                     .map(|choice| choice.canonical.clone())
             }
             Some(SettingKind::Enum { choices, .. }) => {
-                effective_enum_choices(*key, choices, &self.pager_snapshot)
+                effective_enum_choices(key, choices, &self.pager_snapshot)
                     .get(*choices_idx)
                     .map(|choice| choice.canonical.to_string())
             }
@@ -822,7 +822,7 @@ impl SettingsModalState {
         else {
             return;
         };
-        let names: Vec<String> = match self.registry.find(*key).map(|m| &m.kind) {
+        let names: Vec<String> = match self.registry.find(key).map(|m| &m.kind) {
             Some(SettingKind::DynamicEnum { source, .. }) => {
                 dynamic_enum_choices(*source, &self.pager_snapshot)
                     .into_iter()
@@ -830,7 +830,7 @@ impl SettingsModalState {
                     .collect()
             }
             Some(SettingKind::Enum { choices, .. }) => {
-                effective_enum_choices(*key, choices, &self.pager_snapshot)
+                effective_enum_choices(key, choices, &self.pager_snapshot)
                     .into_iter()
                     .map(|choice| choice.canonical.to_string())
                     .collect()
