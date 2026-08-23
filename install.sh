@@ -16,6 +16,8 @@
 #   MEDLEY_INSTALL_DIR  where the `medley` symlink goes (default: ~/.medley/bin)
 #   MEDLEY_HOME         where unpacked versions live (default: ~/.medley)
 #   MEDLEY_TARGET       force a target triple instead of detecting one
+#   MEDLEY_LIBC         on Linux, 'gnu' or 'musl' instead of detecting which
+#                       one this host can run (default: auto)
 #   MEDLEY_REPO         source repository (default: ImL1s/medley)
 #   MEDLEY_DRYRUN       set to 1 to print the plan without downloading anything
 #   GITHUB_TOKEN / GH_TOKEN
@@ -33,8 +35,19 @@ DRYRUN="${MEDLEY_DRYRUN:-0}"
 # The official Grok Build state directory. medley must never write here.
 GROK_HOME="${HOME}/.grok"
 
+# The oldest glibc the dynamically linked Linux archives are built against.
+# Must match LINUX_GLIBC_FLOOR in .github/workflows/release.yml, which measures
+# this out of every gnu binary and fails the release rather than letting it
+# drift. Below this number the gnu archive downloads, verifies, installs, and
+# then dies — which is why the number lives here too.
+LINUX_GLIBC_FLOOR=2.35
+
 say() {
   printf '%s\n' "$*"
+}
+
+note() {
+  printf 'note: %s\n' "$*" >&2
 }
 
 warn() {
@@ -46,6 +59,114 @@ die() {
   exit 1
 }
 
+# The host's glibc version (e.g. 2.35), or nothing.
+#
+# Nothing is a real answer, not a failure: Alpine and other musl distributions
+# have no glibc to report, and that is exactly the case the static archives
+# exist for. It also covers a host too unusual to ask — see detect_linux_libc
+# for why both lead to the same choice.
+detect_glibc_version() {
+  # getconf is part of glibc itself, so a well-formed answer from it is
+  # evidence of glibc rather than an inference drawn from a version string.
+  if command -v getconf > /dev/null 2>&1; then
+    dgv_line="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+    case "$dgv_line" in
+    'glibc '[0-9]*)
+      printf '%s\n' "${dgv_line#glibc }"
+      return 0
+      ;;
+    esac
+  fi
+
+  # Busybox and musl both ship an `ldd`, and neither reports a glibc version —
+  # musl's writes to stderr and exits non-zero. So the version is taken only
+  # from a line that names GNU libc, and anything else is treated as "no
+  # glibc" rather than parsed hopefully.
+  if command -v ldd > /dev/null 2>&1; then
+    dgv_line="$(ldd --version 2>/dev/null | head -n 1 || true)"
+    case "$dgv_line" in
+    *musl* | *MUSL*) return 0 ;;
+    *GLIBC* | *'GNU libc'* | *'GNU C Library'*)
+      # The version is the last field, in both of the shapes seen in the wild:
+      #   ldd (GNU libc) 2.35
+      #   ldd (Ubuntu GLIBC 2.35-0ubuntu3.6) 2.35
+      dgv_field="${dgv_line##* }"
+      case "$dgv_field" in
+      [0-9]*.[0-9]*)
+        printf '%s\n' "$dgv_field"
+        return 0
+        ;;
+      esac
+      ;;
+    esac
+  fi
+
+  return 0
+}
+
+# Is dotted version $1 at least dotted version $2?
+#
+# Numeric, component by component. A string comparison puts 2.9 above 2.35,
+# and `sort -V` is neither POSIX nor present on every host this script runs on.
+# Reading each component through `+ 0` also makes a distribution suffix like
+# "35-0ubuntu3" read as 35 rather than derailing the comparison.
+glibc_at_least() {
+  awk -v have="$1" -v want="$2" '
+    BEGIN {
+      nh = split(have, h, ".")
+      nw = split(want, w, ".")
+      n = (nh > nw) ? nh : nw
+      for (i = 1; i <= n; i++) {
+        hv = (i <= nh) ? h[i] + 0 : 0
+        wv = (i <= nw) ? w[i] + 0 : 0
+        if (hv > wv) exit 0
+        if (hv < wv) exit 1
+      }
+      exit 0
+    }'
+}
+
+# Which Linux archive this host can actually run: 'gnu' or 'musl'.
+#
+# The gnu archives are dynamically linked and serve the majority better — they
+# use the system's NSS and locale support, which a static binary cannot load.
+# They also cannot run below glibc LINUX_GLIBC_FLOOR, and the way they fail is
+# the worst kind: the archive downloads, the checksum verifies, this script
+# reports success, and the binary then dies on a missing symbol. On Alpine
+# there is not even a loader to produce that message.
+#
+# So the static archive is chosen whenever the gnu one cannot be *shown* to
+# run: below the floor, no glibc at all, or no way to ask. The last of those
+# is deliberate — guessing gnu on an unreadable host trades a working install
+# for a broken one, and the musl archive runs in every case the gnu one does.
+detect_linux_libc() {
+  dll_override="${MEDLEY_LIBC:-auto}"
+  case "$dll_override" in
+  gnu | musl)
+    printf '%s\n' "$dll_override"
+    return 0
+    ;;
+  auto) ;;
+  *)
+    die "MEDLEY_LIBC must be 'gnu', 'musl', or 'auto' (got '${dll_override}')."
+    ;;
+  esac
+
+  dll_glibc="$(detect_glibc_version)"
+  if [ -z "$dll_glibc" ]; then
+    note 'no glibc found on this host; installing the static (musl) build.'
+    printf 'musl\n'
+    return 0
+  fi
+
+  if glibc_at_least "$dll_glibc" "$LINUX_GLIBC_FLOOR"; then
+    printf 'gnu\n'
+  else
+    note "this host has glibc ${dll_glibc}, below the ${LINUX_GLIBC_FLOOR} the dynamically linked build needs; installing the static (musl) build instead."
+    printf 'musl\n'
+  fi
+}
+
 # Resolve the archive triple from the running machine.
 detect_target() {
   detect_os="$(uname -s)"
@@ -53,7 +174,7 @@ detect_target() {
 
   case "$detect_os" in
   Darwin) detect_os_part='apple-darwin' ;;
-  Linux) detect_os_part='unknown-linux-gnu' ;;
+  Linux) detect_os_part="unknown-linux-$(detect_linux_libc)" ;;
   *)
     die "unsupported operating system '${detect_os}'. medley publishes macOS and Linux builds; build from source for anything else."
     ;;
