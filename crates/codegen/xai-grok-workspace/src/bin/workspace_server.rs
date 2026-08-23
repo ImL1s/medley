@@ -696,7 +696,7 @@ mod tests {
             .await
             .expect("bind");
         let port = bound.port.expect("tcp port");
-        let err = WorkspaceError::HubError("handshake auth failed: HTTP 401".into());
+        let err = WorkspaceError::HubError("hub authentication failed".into());
         let (elapsed, messages) = report_with_captured_messages(&handle, &err).await;
         assert_eq!(elapsed, HUB_CONNECT_FAILED_DWELL);
         assert!(
