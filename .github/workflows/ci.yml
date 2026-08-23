@@ -1574,7 +1574,9 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             issue345_fork_rewrites_parent_compaction_transcript_hint -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            issue345_updates_rewrite_runs_after_json_unescape -- --nocapture
+            issue345_checkpoint_rebind_runs_on_deserialized_items -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            fork_rebinds_checkpoint_hint_without_touching_quoted_transcript_paths -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             fork_and_import_reject_symlinked_encoded_cwd_parent -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
