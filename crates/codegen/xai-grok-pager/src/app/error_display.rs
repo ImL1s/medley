@@ -96,7 +96,7 @@ pub(crate) fn compose_typed_provider_failure(
         return Some(FormattedRequestFailure {
             status: status.or_else(|| parse_http_status(headline)),
             headline: headline.to_string(),
-            detail: detail.to_string(),
+            detail,
         });
     }
     if !looks_like_typed_provider_failure(status, error_type, raw) {
@@ -108,10 +108,40 @@ pub(crate) fn compose_typed_provider_failure(
 /// Our own banner shape: `Headline (NNN) — detail`. Used so PromptResponse
 /// (already formatted by `format_acp_error`) is not re-run through classify
 /// and does not lose a safe provider reason.
-fn split_existing_banner(raw: &str) -> Option<(&str, &str)> {
+///
+/// The headline must be one this module *can emit*, not merely one a status
+/// parses out of. A provider-controlled message can carry both features — an
+/// em dash and a parseable status — on its own
+/// (`Provider request failed (HTTP 400). Invalid parameter — {…}`), and was
+/// then copied through verbatim, bypassing the carrier strip, JSON extraction
+/// and detail cleanup that keep a raw provider payload out of the banner.
+/// Validation asks [`classify`] to rebuild the canonical headline for the
+/// parsed status and requires an exact, case-sensitive match: the accepted
+/// set is therefore *derived* from [`format_request_failure`] and cannot
+/// drift from it. Case matters because [`parse_http_status`] matches its
+/// markers case-insensitively, so `bad request (400)` parses but is not
+/// something this module ever wrote.
+///
+/// A canonical headline can still be forged exactly, and the detail half
+/// arrives verbatim from its producer either way, so it goes through the same
+/// two steps that end the normal path — [`resolve_embedded_json`] and
+/// [`clean_detail`]. Both are idempotent on genuine banner text, which has
+/// already been through them: a real detail cannot start with `{`
+/// ([`is_noise_detail`] rejects that at production) and cannot restate a
+/// reason phrase ([`is_headline_echo`] rejects that). An emptied detail
+/// leaves a headline-only banner, which [`banner_message`] already renders.
+fn split_existing_banner(raw: &str) -> Option<(&str, String)> {
     let (headline, detail) = raw.split_once(" \u{2014} ")?;
-    parse_http_status(headline)?;
-    Some((headline.trim(), detail.trim()))
+    let headline = headline.trim();
+    let status = parse_http_status(headline)?;
+    // `classify` ignores the wire type once the status is known, so `Other`
+    // reproduces exactly the headline any caller would have got.
+    if headline != classify(Some(status), WireErrorType::Other).headline {
+        return None;
+    }
+    let detail = detail.trim();
+    let detail = resolve_embedded_json(detail).unwrap_or_else(|| detail.to_string());
+    Some((headline, clean_detail(&detail).unwrap_or_default()))
 }
 
 fn looks_like_typed_provider_failure(
@@ -453,10 +483,8 @@ fn extract_error_detail(raw: &str) -> Option<String> {
     // JSON before carrier-prefix strips: an Internal-error envelope
     // (`{"message":"Provider request failed (HTTP 400).","http_status":400}`)
     // must not be sliced mid-object by the provider-prefix matcher.
-    if let Some(json_start) = s.find('{')
-        && let Some(extracted) = extract_from_json(&s[json_start..])
-    {
-        s = extracted;
+    if let Some(resolved) = resolve_embedded_json(&s) {
+        s = resolved;
     }
 
     if let Some(rest) = strip_provider_request_failed_prefix(&s) {
@@ -476,10 +504,8 @@ fn extract_error_detail(raw: &str) -> Option<String> {
     // A remaining JSON object after the prefix strips (API error + body), taken
     // before the URL-clause strip: a URL inside a JSON string would otherwise
     // split the body at its own ": " and leave garbage.
-    if let Some(json_start) = s.find('{')
-        && let Some(extracted) = extract_from_json(&s[json_start..])
-    {
-        s = extracted;
+    if let Some(resolved) = resolve_embedded_json(&s) {
+        s = resolved;
     }
 
     s = strip_from_url_clause(&s);
@@ -570,6 +596,36 @@ fn strip_from_url_clause(s: &str) -> String {
         return s[..from].trim().to_string();
     }
     s.to_string()
+}
+
+/// Resolve an embedded JSON object: the message it carries, or nothing.
+///
+/// [`extract_from_json`] answers only the first half. When the object parses
+/// but names no `error` / `message` the payload is a machine envelope the
+/// banner has no reading of (`Invalid parameter — {"key":"value"}`), and
+/// showing it raw is exactly the unprocessed-provider-output leak this module
+/// exists to prevent — so the object is *dropped* and only the prose before
+/// it is kept. Text that merely contains a brace is not valid JSON and is
+/// left untouched for the noise filter to judge.
+///
+/// Returns `None` when there is nothing to resolve, so the caller leaves `s`
+/// alone.
+fn resolve_embedded_json(s: &str) -> Option<String> {
+    let json_start = s.find('{')?;
+    let tail = s[json_start..].trim();
+    if let Some(extracted) = extract_from_json(tail) {
+        return Some(extracted);
+    }
+    serde_json::from_str::<serde_json::Value>(tail).ok()?;
+    // Drop the separator the object hung off (`… parameter — {…}`), not the
+    // sentence punctuation before it.
+    Some(
+        s[..json_start]
+            .trim_end()
+            .trim_end_matches(['\u{2014}', '-', ':', ','])
+            .trim_end()
+            .to_string(),
+    )
 }
 
 fn extract_from_json(s: &str) -> Option<String> {
@@ -1120,6 +1176,163 @@ mod tests {
         assert_eq!(
             parse_http_status(r#"{"http_status": 503, "message": "overloaded"}"#),
             Some(503)
+        );
+    }
+
+    /// #383: a raw provider message can contain both features
+    /// `split_existing_banner` used to accept on — an em dash and a parseable
+    /// status — without this module ever having written it. Accepting it
+    /// copied both halves verbatim, so the provider's own envelope became the
+    /// user-facing line.
+    #[test]
+    fn issue383_raw_provider_message_with_em_dash_is_not_treated_as_a_banner() {
+        let raw =
+            "Provider request failed (HTTP 400). Invalid parameter \u{2014} {\"key\":\"value\"}";
+        // Both rails: headless passes the wire status through, and the
+        // PromptResponse rail recovers it from the text.
+        for (status, error_type) in [(Some(400), Some("api")), (None, None)] {
+            let formatted = compose_typed_provider_failure(status, error_type, raw)
+                .expect("a provider 400 must still compose as a typed failure");
+            let msg = formatted.message();
+            assert_eq!(formatted.status, Some(400));
+            assert_eq!(
+                formatted.headline, "Bad request (400)",
+                "provider text must not be adopted as our headline: {msg}"
+            );
+            assert_ne!(msg, raw, "the raw message must not be copied verbatim");
+            assert!(
+                !msg.contains('{') && !msg.contains("key") && !msg.contains("value"),
+                "the unprocessed provider payload must not survive: {msg}"
+            );
+            assert!(
+                !msg.contains("Provider request failed"),
+                "the carrier prefix must be stripped: {msg}"
+            );
+            assert!(
+                formatted.detail.contains("Invalid parameter"),
+                "the safe provider reason must still survive: {}",
+                formatted.detail
+            );
+        }
+    }
+
+    /// `parse_http_status` matches its markers case-insensitively, so a
+    /// lowercased forgery parses. Only an exact match against what `classify`
+    /// would have written rejects it.
+    #[test]
+    fn issue383_case_forged_banner_headline_is_reformatted() {
+        let raw = "bad request (400) \u{2014} {\"secret\":\"payload\"}";
+        let formatted = compose_typed_provider_failure(Some(400), Some("api"), raw)
+            .expect("a 400 composes as a typed failure");
+        let msg = formatted.message();
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert!(
+            !msg.contains('{') && !msg.contains("secret"),
+            "forged-case headline must not carry its payload through: {msg}"
+        );
+    }
+
+    /// The set the fast path accepts, spelled out: `{prefix} ({code})` for
+    /// every prefix `classify` can write. This is what
+    /// `issue244_typed_provider_failure_does_not_reformat_existing_banner`
+    /// protects, widened to the whole set — a genuine banner is passed
+    /// through unmodified, never re-classified.
+    #[test]
+    fn issue383_every_formatter_produced_headline_still_takes_the_fast_path() {
+        // One code per `classify` arm, including the two ranged fallbacks.
+        const HEADLINES: &[(u16, &str)] = &[
+            (400, "Bad request (400)"),
+            (422, "Bad request (422)"),
+            (403, "Request denied (403)"),
+            (404, "Not found (404)"),
+            (408, "Request timed out (408)"),
+            (504, "Request timed out (504)"),
+            (409, "Conflict (409)"),
+            (413, "Request too large (413)"),
+            (429, "Rate limited (429)"),
+            (502, "Service unavailable (502)"),
+            (503, "Service unavailable (503)"),
+            (401, "Request failed (401)"),
+            (500, "Server error (500)"),
+        ];
+        for (code, headline) in HEADLINES {
+            // Exactly what `format_request_failure` would have written.
+            assert_eq!(
+                &classify(Some(*code), WireErrorType::Other).headline,
+                headline,
+                "the expectation itself must match the formatter"
+            );
+            let detail = "provider said no";
+            let raw = banner_message(headline, detail);
+            let formatted = compose_typed_provider_failure(Some(*code), None, &raw)
+                .expect("an already-formatted banner is typed");
+            assert_eq!(formatted.headline, *headline);
+            assert_eq!(
+                formatted.detail, detail,
+                "a genuine banner must pass through unmodified"
+            );
+        }
+    }
+
+    /// The fast path still receives the detail half verbatim from its
+    /// producer, so it re-runs the redaction `clean_detail` applies. Both
+    /// steps are idempotent on genuine banner text (asserted above).
+    #[test]
+    fn issue383_fast_path_detail_is_still_redacted() {
+        let raw = "Bad request (400) \u{2014} rejected by cli-chat-proxy at https://internal.example.com/v1";
+        let formatted = compose_typed_provider_failure(Some(400), None, raw)
+            .expect("an already-formatted banner is typed");
+        let msg = formatted.message();
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert!(
+            !msg.contains("cli-chat-proxy"),
+            "internal service names must not reach the banner: {msg}"
+        );
+        assert!(
+            !msg.contains("https://") && !msg.contains("internal.example.com"),
+            "endpoints must not reach the banner: {msg}"
+        );
+        assert!(msg.contains("rejected by server"), "{msg}");
+
+        // The headline can also be forged exactly. The detail half is still
+        // the producer's, so an unreadable payload is dropped there too and
+        // the banner degrades to the headline alone.
+        let forged = "Bad request (400) \u{2014} {\"key\":\"value\"}";
+        let formatted = compose_typed_provider_failure(Some(400), None, forged)
+            .expect("an already-formatted banner is typed");
+        let msg = formatted.message();
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert_eq!(formatted.detail, "");
+        assert!(
+            !msg.contains('{') && !msg.contains("key"),
+            "an exactly-forged headline must not carry its payload through: {msg}"
+        );
+    }
+
+    /// An embedded object the extractor cannot read is a machine payload, not
+    /// a reason: it is dropped rather than shown. Brace-prose is not valid
+    /// JSON and stays.
+    #[test]
+    fn issue383_unreadable_embedded_json_is_dropped_but_brace_prose_stays() {
+        let formatted = format_request_failure(
+            None,
+            Some("api"),
+            "API error (status 400 Bad Request): Invalid parameter {\"key\":\"value\"}",
+        );
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert_eq!(
+            formatted.detail, "Invalid parameter",
+            "the unreadable payload must be dropped, not shown"
+        );
+
+        let formatted = format_request_failure(
+            None,
+            Some("api"),
+            "API error (status 400 Bad Request): Supported values are: {'a','b'}",
+        );
+        assert_eq!(
+            formatted.detail, "Supported values are: {'a','b'}",
+            "prose containing a brace is not a payload and must survive"
         );
     }
 }
