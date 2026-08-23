@@ -117,8 +117,13 @@ callers, and they compile.
 
 In order, cheapest first:
 
-- `git log --merge -p -- <file>` shows nothing for conflicts of this shape, by
-  definition. Do not read that silence as safety.
+- `git log --merge` cannot answer this, and it is worth knowing why before you
+  reach for it. It requires an *unfinished* merge (`MERGE_HEAD`) and is scoped to
+  the files git recorded as **conflicted** — of which a semantic conflict has
+  none. Once the merge is committed it does not fall quiet, it fails:
+  `fatal: --merge requires one of the pseudorefs MERGE_HEAD, CHERRY_PICK_HEAD,
+  REVERT_HEAD or REBASE_HEAD`. Neither the empty listing nor the error is
+  evidence of safety.
 - After resolving, grep the whole tree for every env var, setter, or flag the
   incoming side removed or gated — including `#[cfg(test)]` code, which
   `cargo check --lib` and clippy on `--lib` never compile.
