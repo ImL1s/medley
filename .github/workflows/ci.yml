@@ -972,7 +972,7 @@ jobs:
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             cache_ -- --nocapture
           run_nonzero -p xai-grok-pager-pty-harness --test \
-            exit_timeout -- --nocapture
+            exit_timeout -- --ignored --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             appearance:: -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
