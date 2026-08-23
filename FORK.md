@@ -148,6 +148,33 @@ different: the first needs the grep above, the second needs a test to be
 *enrolled* (#408). Attributing an unenrolled-test blindspot to the merge would
 send the next reader looking for a conflict that was never there.
 
+### The third shape: two copies of one user-facing string
+
+The two above are about *plumbing*. The third is about *duplication*, and it is
+the one a merge is most likely to produce silently.
+
+`5f63802e` (#335/#346/#358/#359) centralised the changed-catalog toast on
+`CATALOG_CHANGED_TOAST` and left a comment above the call site saying so:
+"Single source of truth for the wording". `c113580a` (#332) independently added
+`set_default_model_confirmed`, a second live path for the same
+`!available_has_new` condition, carrying its own literal — and a test pinning
+that literal. Neither side touched the other's lines, so the merge produced one
+file with **two different messages for the same condition**, a comment claiming
+single-sourcing that was now false, and a test pinning whichever wording its own
+side had written.
+
+CI reported it as a plain assertion mismatch, which is the cheap outcome. The
+expensive part is that it survived at all: `set_default_model_confirmed` had **no
+test covering its toast**, so nothing pinned what it said. The tested half was
+tested; the untested half is the half that drifted.
+
+Generalisation, distinct from the plumbing one: **when one side introduces a
+constant for a literal, grep the other side for the literal's text, not for the
+constant's name.** A new duplicate cannot mention a constant it never knew about,
+so a name-based search finds nothing and reads as clean. And when a merge leaves
+two paths for one condition, ask which of them a test actually pins — the answer
+is usually "one".
+
 ## Tagging
 
 Release tags track upstream plus a fork counter:
