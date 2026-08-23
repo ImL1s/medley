@@ -201,6 +201,46 @@ fn mark_codex_catalog_degraded(
     models
 }
 
+/// A Codex preset map plus whether the *listing* it came from is one the
+/// server actually enumerated.
+///
+/// This deliberately does not read `catalog_degraded_reason`, because that
+/// field has two writers meaning two different things.
+/// [`mark_codex_catalog_degraded`] stamps **every** row because the listing
+/// itself is a stand-in; [`stamp_codex_catalog_client_version_floor`] stamps
+/// **one** row because that model wants a newer client. Only the first says
+/// anything about whether the listing enumerates every wire slug the account
+/// has, and deriving authority from the field conflated them: a single
+/// above-floor row made a successfully fetched catalog non-authoritative,
+/// which cleared every `unknown_codex_catalog_slug` marker and let a wire
+/// model the server does not serve pass readiness and 400 on every turn.
+struct CodexCatalogListing {
+    models: IndexMap<String, ConfigModelOverride>,
+    /// True only when the slug set here is the account's real slug set, so an
+    /// absent slug means the server does not serve it.
+    enumerates_account_slugs: bool,
+}
+
+impl CodexCatalogListing {
+    /// A listing the server enumerated — live, or a saved one standing in for
+    /// a live fetch that was never attempted because remote fetch is off.
+    fn served(models: IndexMap<String, ConfigModelOverride>) -> Self {
+        Self {
+            models,
+            enumerates_account_slugs: true,
+        }
+    }
+
+    /// A stand-in listing. Its slug set is not the account's, so an absent
+    /// slug proves nothing and no entry may be rejected for missing from it.
+    fn stand_in(models: IndexMap<String, ConfigModelOverride>) -> Self {
+        Self {
+            models,
+            enumerates_account_slugs: false,
+        }
+    }
+}
+
 fn codex_catalog_fallback_models(
     cache_path: Option<&std::path::Path>,
 ) -> IndexMap<String, ConfigModelOverride> {
@@ -218,15 +258,20 @@ fn codex_catalog_fallback_models(
     )
 }
 
+/// `served`, not `stand_in`: this is a catalog the server did enumerate, kept
+/// because remote fetch is switched off rather than because a fetch failed.
+/// It is also what the previous `catalog_degraded_reason`-derived authority
+/// treated it as — these models are returned unmarked — so keeping it served
+/// leaves that path's behaviour unchanged.
 fn load_codex_catalog_when_remote_fetch_disabled(
     cache_path: Option<&std::path::Path>,
-) -> Option<IndexMap<String, ConfigModelOverride>> {
+) -> Option<CodexCatalogListing> {
     let models = cache_path.and_then(load_codex_catalog_cache)?;
     tracing::info!(
         count = models.len(),
         "Codex catalog live refresh skipped; using account-scoped saved catalog"
     );
-    Some(models)
+    Some(CodexCatalogListing::served(models))
 }
 
 impl std::fmt::Debug for CodexCatalogCredential {
@@ -880,7 +925,7 @@ pub(crate) fn reset_live_codex_catalog_fetch_attempts() {
     LIVE_CODEX_CATALOG_FETCH_ATTEMPTS.with(|count| count.set(0));
 }
 
-fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOverride>> {
+fn fetch_openai_codex_catalog_models() -> Option<CodexCatalogListing> {
     record_live_codex_catalog_fetch_attempt();
     if cfg!(test) {
         return None;
@@ -892,7 +937,9 @@ fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOve
         return load_codex_catalog_when_remote_fetch_disabled(cache_path.as_deref());
     }
     let Some(credential) = credential else {
-        return Some(codex_catalog_fallback_models(cache_path.as_deref()));
+        return Some(CodexCatalogListing::stand_in(
+            codex_catalog_fallback_models(cache_path.as_deref()),
+        ));
     };
     let url = format!(
         "{}/models?client_version={}",
@@ -908,18 +955,27 @@ fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOve
                     "Codex catalog has no verified account id; not persisting account-scoped cache"
                 );
             }
-            Some(models)
+            // A live listing stays served even when rows carry a version
+            // floor: the account's slug set is exactly what came back.
+            Some(CodexCatalogListing::served(models))
         }
-        None => Some(codex_catalog_fallback_models(cache_path.as_deref())),
+        None => Some(CodexCatalogListing::stand_in(
+            codex_catalog_fallback_models(cache_path.as_deref()),
+        )),
     }
 }
 
-fn effective_openai_codex_presets(
-    fetched: Option<IndexMap<String, ConfigModelOverride>>,
-) -> IndexMap<String, ConfigModelOverride> {
+/// The built-in list is returned `served`, which is what the previous
+/// `catalog_degraded_reason`-derived authority made it — those entries are
+/// unmarked, so `all(..is_none())` was true. Whether built-ins should really
+/// be treated as enumerating an account's slugs is a separate question from
+/// this fix, and answering it here would change which entries are rejected;
+/// `served` is also the stricter of the two, so preserving it cannot widen the
+/// defect this change closes.
+fn effective_openai_codex_presets(fetched: Option<CodexCatalogListing>) -> CodexCatalogListing {
     fetched
-        .filter(|models| !models.is_empty())
-        .unwrap_or_else(openai_codex_preset_models)
+        .filter(|listing| !listing.models.is_empty())
+        .unwrap_or_else(|| CodexCatalogListing::served(openai_codex_preset_models()))
 }
 
 fn openai_codex_provider() -> ModelProviderConfig {
@@ -1069,28 +1125,35 @@ pub(crate) fn merge_openai_codex_presets_offline(
     );
 }
 
-fn offline_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOverride>> {
+fn offline_openai_codex_catalog_models() -> Option<CodexCatalogListing> {
     if cfg!(test) {
         return None;
     }
     let home = crate::util::grok_home::grok_home();
     let Some((cache_identity, _)) = codex_catalog_access(&home) else {
-        return Some(codex_catalog_fallback_models(None));
+        return Some(CodexCatalogListing::stand_in(
+            codex_catalog_fallback_models(None),
+        ));
     };
     let cache_path = codex_catalog_cache_path(&home, &cache_identity);
-    load_codex_catalog_when_remote_fetch_disabled(cache_path.as_deref())
-        .or_else(|| Some(codex_catalog_fallback_models(cache_path.as_deref())))
+    load_codex_catalog_when_remote_fetch_disabled(cache_path.as_deref()).or_else(|| {
+        Some(CodexCatalogListing::stand_in(
+            codex_catalog_fallback_models(cache_path.as_deref()),
+        ))
+    })
 }
 
 fn merge_openai_codex_preset_entries(
     config_models: &mut IndexMap<String, ConfigModelOverride>,
-    presets: IndexMap<String, ConfigModelOverride>,
+    listing: CodexCatalogListing,
 ) {
+    // Authority comes from where the listing came from, never from the rows'
+    // `catalog_degraded_reason` — see `CodexCatalogListing`.
+    let CodexCatalogListing {
+        models: presets,
+        enumerates_account_slugs: catalog_is_authoritative,
+    } = listing;
     let catalog_slugs = openai_codex_catalog_wire_slugs(&presets);
-    // Computed here, not after the loop: `presets` is moved below.
-    let catalog_is_authoritative = presets
-        .values()
-        .all(|preset| preset.catalog_degraded_reason.is_none());
     for (key, preset) in presets {
         let Some(user_entry) = config_models.get_mut(&key) else {
             config_models.insert(key, preset);
@@ -2964,11 +3027,61 @@ mod tests {
             OPENAI_CODEX_BUILTIN_FALLBACK_REASON,
         );
 
-        merge_openai_codex_preset_entries(&mut config_models, degraded);
+        merge_openai_codex_preset_entries(
+            &mut config_models,
+            CodexCatalogListing::stand_in(degraded),
+        );
 
         assert_eq!(
             config_models["gpt-5.3-codex-spark"].unknown_codex_catalog_slug, None,
             "a degraded catalog must not deny a slug it simply never listed"
+        );
+    }
+
+    /// The counterweight the pair above was missing: "the catalog did not say
+    /// yes" must not be reached by a route other than degradation. A catalog
+    /// the server *did* serve keeps speaking for every slug even when one of
+    /// its rows wants a newer client.
+    ///
+    /// Deriving authority from `catalog_degraded_reason` conflated the two
+    /// writers of that field — a per-model version floor and a stand-in
+    /// listing — so a single above-floor row cleared every
+    /// `unknown_codex_catalog_slug` marker and let a wire model the account
+    /// cannot use pass readiness and 400 on every turn.
+    #[test]
+    fn codex_wire_model_catalog_slug_is_rejected_when_a_served_catalog_has_a_version_floor() {
+        let served = parse_openai_codex_catalog_models(&serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6 Sol",
+                    "minimal_client_version": "0.100.0",
+                    "context_window": 272000
+                }
+            ]
+        }));
+        assert!(
+            served["gpt-5.6-sol"].catalog_degraded_reason.is_some(),
+            "the floor must stamp the row, or this test proves nothing"
+        );
+
+        let mut config_models = IndexMap::from([(
+            "gpt-5.3-codex-spark".to_owned(),
+            ConfigModelOverride {
+                model_provider: Some(OPENAI_CODEX_PROVIDER_ID.to_owned()),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+
+        merge_openai_codex_preset_entries(&mut config_models, CodexCatalogListing::served(served));
+
+        assert_eq!(
+            config_models["gpt-5.3-codex-spark"]
+                .unknown_codex_catalog_slug
+                .as_deref(),
+            Some("gpt-5.3-codex-spark"),
+            "a served catalog enumerates every slug; one row wanting a newer \
+             client says nothing about the others"
         );
     }
 
@@ -2992,7 +3105,10 @@ mod tests {
             OPENAI_CODEX_BUILTIN_FALLBACK_REASON,
         );
 
-        merge_openai_codex_preset_entries(&mut config_models, degraded);
+        merge_openai_codex_preset_entries(
+            &mut config_models,
+            CodexCatalogListing::stand_in(degraded),
+        );
 
         assert_eq!(
             config_models["gpt-5.3-codex-spark"].unknown_codex_catalog_slug, None,
@@ -3216,7 +3332,10 @@ mod tests {
                 ..ConfigModelOverride::default()
             },
         )]);
-        merge_openai_codex_preset_entries(&mut user_models, presets.clone());
+        merge_openai_codex_preset_entries(
+            &mut user_models,
+            CodexCatalogListing::served(presets.clone()),
+        );
         assert_eq!(
             user_models["gpt-5.4"].model.as_deref(),
             Some("gpt-5.4"),
@@ -3972,7 +4091,7 @@ mod tests {
                 ]
             }]
         }));
-        merge_openai_codex_preset_entries(&mut models, presets);
+        merge_openai_codex_preset_entries(&mut models, CodexCatalogListing::served(presets));
 
         let merged = models.get(key).expect("merged metadata override");
         assert_eq!(merged.supports_reasoning_effort, Some(false));
@@ -4014,7 +4133,7 @@ mod tests {
             let mut models = IndexMap::from([(key.to_owned(), user)]);
             merge_openai_codex_preset_entries(
                 &mut models,
-                parse_openai_codex_catalog_models(&catalog),
+                CodexCatalogListing::served(parse_openai_codex_catalog_models(&catalog)),
             );
             let merged = models.get(key).expect("merged metadata override");
             let cfg = Config::default();
@@ -4132,7 +4251,7 @@ mod tests {
                 ]
             }]
         }));
-        merge_openai_codex_preset_entries(&mut models, presets);
+        merge_openai_codex_preset_entries(&mut models, CodexCatalogListing::served(presets));
 
         let merged = models.get(key).expect("merged metadata override");
         assert_eq!(
@@ -4169,7 +4288,7 @@ mod tests {
             },
         )]);
 
-        merge_openai_codex_preset_entries(&mut models, presets);
+        merge_openai_codex_preset_entries(&mut models, CodexCatalogListing::served(presets));
 
         let merged = models.get(key).expect("merged metadata override");
         assert_eq!(
@@ -4258,7 +4377,7 @@ mod tests {
                     ]
                 }]
             }));
-            merge_openai_codex_preset_entries(&mut models, presets);
+            merge_openai_codex_preset_entries(&mut models, CodexCatalogListing::served(presets));
 
             let merged = models.get(&key).expect("merged metadata override");
             assert_eq!(merged.reasoning_effort, Some(expected));
@@ -4417,7 +4536,9 @@ mod tests {
 
     #[test]
     fn codex_catalog_fallback_uses_builtin_preset_when_fetch_is_empty() {
-        let presets = effective_openai_codex_presets(Some(IndexMap::new()));
+        let presets =
+            effective_openai_codex_presets(Some(CodexCatalogListing::served(IndexMap::new())))
+                .models;
         assert_eq!(presets.len(), 1);
         let preset = presets
             .get(OPENAI_CODEX_PRESET_MODEL_ID)
@@ -4550,8 +4671,13 @@ mod tests {
         let path = codex_catalog_cache_path(home.path(), &identity).expect("account cache path");
         persist_codex_catalog_cache(&path, &catalog_test_payload("codex-offline"));
 
-        let models = load_codex_catalog_when_remote_fetch_disabled(Some(&path))
+        let listing = load_codex_catalog_when_remote_fetch_disabled(Some(&path))
             .expect("saved offline catalog");
+        assert!(
+            listing.enumerates_account_slugs,
+            "a catalog the server did serve, kept because remote fetch is off, still enumerates the account's slugs"
+        );
+        let models = listing.models;
         assert!(models.contains_key("codex-offline"));
         assert!(
             models["codex-offline"].catalog_degraded_reason.is_none(),
@@ -4602,7 +4728,7 @@ mod tests {
                 ..ConfigModelOverride::default()
             },
         )]);
-        merge_openai_codex_preset_entries(&mut models, presets);
+        merge_openai_codex_preset_entries(&mut models, CodexCatalogListing::stand_in(presets));
         assert_eq!(
             models[OPENAI_CODEX_PRESET_MODEL_ID]
                 .catalog_degraded_reason
