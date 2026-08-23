@@ -22,14 +22,17 @@ Scope and deliberate omissions:
 - Inline links, reference-style definitions, and HTML `href` attributes are
   all scanned. Only inline links exist today; the other two are the obvious
   ways the same mistake could return.
-- Fenced blocks and inline code spans are blanked before scanning, so a page
-  that *documents* this rule with a `](../` example does not trip it. Fence
-  recognition follows CommonMark indentation: at four spaces a line is an
-  indented code block, not a fence, and code spans require backtick runs of
-  equal length. Indented code blocks and HTML comments are deliberately
-  *not* blanked -- a link inside one is reported rather than ignored. Every
-  such choice errs towards a visible false positive instead of a silent
-  broken link, which is the safe direction for a guard.
+- Fenced blocks are blanked before scanning, so a page that *documents* this
+  rule with a `](../` example does not trip it. Fence recognition follows
+  CommonMark indentation: at four spaces a line is an indented code block,
+  not a fence.
+- Nothing else is blanked, and link labels are not parsed -- detection is
+  anchored on `](`. Inline code spans, indented code blocks and HTML
+  comments all stay visible. Suppressing text can only ever hide a real
+  link, and recognising labels can only ever lose one, so both are done as
+  little as possible. The cost is that an inline `](../x)` example is
+  reported; write it in a fence. Every choice here errs towards a visible
+  false positive over a silent broken link.
 - Link targets are normalised lexically, never resolved on disk. This guard
   is about escaping the directory, not about whether the target exists.
 """
@@ -46,8 +49,11 @@ REPO = Path(__file__).resolve().parent.parent
 GUIDE = REPO / "crates" / "codegen" / "xai-grok-pager" / "docs" / "user-guide"
 DOCS_RS = REPO / "crates" / "codegen" / "xai-grok-pager" / "src" / "docs.rs"
 
-# Inline `[text](target)`, image `![alt](target)`, and a trailing "title".
-INLINE_LINK = re.compile(r"!?\[[^\]]*\]\(\s*<?([^)>\s]+)>?(?:\s+[\"'(][^)]*)?\)")
+# Inline and image destinations. Anchored on `](` rather than on the label:
+# labels may contain escaped or nested brackets, and any attempt to match them
+# can only lose links. An unrelated `](` in prose is flagged instead, which is
+# the safe direction.
+INLINE_LINK = re.compile(r"\]\(\s*<?([^)>\s]+)>?(?:\s+[\"'(][^)]*)?\)")
 # Reference-style definition: `[label]: target`.
 REFERENCE_DEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*<?([^\s>]+)>?", re.MULTILINE)
 # HTML anchors, which markdown renderers pass through. The attribute value
@@ -59,10 +65,6 @@ HTML_HREF = re.compile(
 
 # `scheme:` prefix -- https:, mailto:, file: and friends are not relative.
 HAS_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
-# A code span is delimited by backtick runs of *equal* length. Allowing
-# mismatched runs would let a stray backtick pair with a later, longer run
-# and blank a real link between them.
-INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)([^\n]*?)(?<!`)\1(?!`)")
 # A fence may be indented up to three spaces. At four it is an indented code
 # block, not a fence -- treating one as an opener would blank the rest of the
 # page and hide real links behind it.
@@ -70,7 +72,13 @@ FENCE_LINE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def _blank_code(text: str) -> str:
-    """Blank fenced blocks and inline code, preserving line numbering."""
+    """Blank fenced blocks, preserving line numbering.
+
+    Only fences. Inline code spans are not blanked: recognising them means
+    tracking backtick-run lengths and backslash-escape parity, and every way
+    of getting that wrong hides a real link. Fences are line-oriented and
+    cannot swallow a link that way.
+    """
     out: list[str] = []
     fence: str | None = None
     for line in text.split("\n"):
@@ -93,8 +101,7 @@ def _blank_code(text: str) -> str:
                 and not match.group(2).strip()
             ):
                 fence = None
-    # Inline spans cannot contain a newline, so this keeps the line count.
-    return INLINE_CODE.sub("", "\n".join(out))
+    return "\n".join(out)
 
 
 def _target_of(match: re.Match[str]) -> str:
@@ -102,8 +109,13 @@ def _target_of(match: re.Match[str]) -> str:
     return next(group for group in match.groups() if group is not None)
 
 
+BACKSLASH_ESCAPE = re.compile(r"\\(.)")
+
+
 def _escapes(rel_dir: str, target: str) -> bool:
     """True when `target`, read from a file in `rel_dir`, leaves the guide."""
+    # `..\/..\/x.md` renders as `../../x.md`; classify what Markdown produces.
+    target = BACKSLASH_ESCAPE.sub(r"\1", target)
     if target.startswith("/"):
         return True
     normalised = posixpath.normpath(posixpath.join(rel_dir, target))
@@ -222,11 +234,10 @@ class LinkDetectionTests(unittest.TestCase):
             with self.subTest(form=label):
                 self.assertFalse(self._flags(body + "\n"), f"{label} wrongly flagged")
 
-    def test_ignores_code_that_documents_this_rule(self) -> None:
-        """A page explaining the rule must not trip it."""
+    def test_fenced_examples_do_not_trip_the_rule(self) -> None:
+        """A page explaining the rule in a fenced block must not trip it."""
         self.assertFalse(self._flags("```sh\ngrep '](../' *.md\n```\n"))
         self.assertFalse(self._flags("~~~\n[x](../../escaped.md)\n~~~\n"))
-        self.assertFalse(self._flags("Run `grep -n '](../' *.md` here.\n"))
 
     def test_over_indented_backticks_are_not_a_fence(self) -> None:
         """An indented example must not blank the rest of the page.
@@ -255,18 +266,37 @@ class LinkDetectionTests(unittest.TestCase):
         # A longer run of the same character does close it.
         self.assertTrue(self._flags("```\nhi\n````\n[x](../../escaped.md)\n"))
 
-    def test_unmatched_backtick_does_not_blank_a_real_link(self) -> None:
-        """A stray backtick must not pair with a longer run (Codex, #404)."""
-        self.assertTrue(
-            self._flags("`oops [x](../../escaped.md) ``code``\n"),
-            "link between mismatched backtick runs was hidden",
-        )
+    def test_inline_backticks_never_hide_a_link(self) -> None:
+        """Code spans are not blanked, so no backtick trick can hide a link.
 
-    def test_code_spans_still_blank_with_matching_runs(self) -> None:
-        self.assertFalse(self._flags("`[x](../../escaped.md)`\n"))
-        self.assertFalse(self._flags("``[x](../../escaped.md)``\n"))
-        # A double-run span may contain a single backtick.
-        self.assertFalse(self._flags("``a ` [x](../../escaped.md)``\n"))
+        Successive Codex rounds on #404 found three ways to make span
+        blanking swallow a live link -- mismatched run lengths, and a
+        backslash-escaped opener. Not blanking spans removes the class
+        instead of patching each corner, at the cost of flagging an inline
+        example. That is the safe direction, and no page has one.
+        """
+        for label, body in (
+            ("mismatched runs", "`oops [x](../../escaped.md) ``code``"),
+            ("escaped opener", "\\` `oops [x](../../escaped.md) `"),
+            ("matched span", "`[x](../../escaped.md)`"),
+        ):
+            with self.subTest(form=label):
+                self.assertTrue(self._flags(body + "\n"), f"{label} hid the link")
+
+    def test_escaped_destinations_are_resolved_before_classifying(self) -> None:
+        """`..\\/..\\/x.md` renders as `../../x.md` (Codex, #404)."""
+        self.assertTrue(self._flags("[x](..\\/..\\/escaped.md)\n"))
+
+    def test_awkward_link_labels_still_yield_their_destination(self) -> None:
+        """Labels are not parsed, so brackets in them cannot lose a link."""
+        for label, body in (
+            ("escaped bracket", "[a \\] b](../../escaped.md)"),
+            ("nested brackets", "[a [b] c](../../escaped.md)"),
+            ("image", "![a](../../escaped.png)"),
+            ("empty label", "[](../../escaped.md)"),
+        ):
+            with self.subTest(form=label):
+                self.assertTrue(self._flags(body + "\n"), f"{label} was skipped")
 
     def test_blanking_preserves_line_numbers(self) -> None:
         body = "one\n```\nfenced\n```\nfour\n[x](../../escaped.md)\n"
