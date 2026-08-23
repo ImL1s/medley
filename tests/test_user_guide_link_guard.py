@@ -23,7 +23,11 @@ Scope and deliberate omissions:
   all scanned. Only inline links exist today; the other two are the obvious
   ways the same mistake could return.
 - Fenced blocks and inline code spans are blanked before scanning, so a page
-  that *documents* this rule with a `](../` example does not trip it.
+  that *documents* this rule with a `](../` example does not trip it. Fence
+  recognition follows CommonMark indentation: at four spaces a line is an
+  indented code block, not a fence. Indented code blocks are deliberately
+  *not* blanked -- a link inside one is reported rather than ignored, which
+  errs towards a visible false positive instead of a silent broken link.
 - Link targets are normalised lexically, never resolved on disk. This guard
   is about escaping the directory, not about whether the target exists.
 """
@@ -54,7 +58,10 @@ HTML_HREF = re.compile(
 # `scheme:` prefix -- https:, mailto:, file: and friends are not relative.
 HAS_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
 INLINE_CODE = re.compile(r"`+[^`\n]*`+")
-FENCE_OPEN = re.compile(r"(```+|~~~+)")
+# A fence may be indented up to three spaces. At four it is an indented code
+# block, not a fence -- treating one as an opener would blank the rest of the
+# page and hide real links behind it.
+FENCE_LINE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def _blank_code(text: str) -> str:
@@ -62,17 +69,24 @@ def _blank_code(text: str) -> str:
     out: list[str] = []
     fence: str | None = None
     for line in text.split("\n"):
-        stripped = line.lstrip()
+        match = FENCE_LINE.match(line)
         if fence is None:
-            match = FENCE_OPEN.match(stripped)
-            if match:
-                fence = match.group(1)[:3]
+            # A backtick fence's info string may not contain a backtick.
+            if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+                fence = match.group(1)
                 out.append("")
                 continue
             out.append(line)
         else:
             out.append("")
-            if stripped.startswith(fence):
+            # A closer uses the same character, is at least as long, and
+            # carries nothing but trailing whitespace.
+            if (
+                match
+                and match.group(1)[0] == fence[0]
+                and len(match.group(1)) >= len(fence)
+                and not match.group(2).strip()
+            ):
                 fence = None
     # Inline spans cannot contain a newline, so this keeps the line count.
     return INLINE_CODE.sub("", "\n".join(out))
@@ -208,6 +222,33 @@ class LinkDetectionTests(unittest.TestCase):
         self.assertFalse(self._flags("```sh\ngrep '](../' *.md\n```\n"))
         self.assertFalse(self._flags("~~~\n[x](../../escaped.md)\n~~~\n"))
         self.assertFalse(self._flags("Run `grep -n '](../' *.md` here.\n"))
+
+    def test_over_indented_backticks_are_not_a_fence(self) -> None:
+        """An indented example must not blank the rest of the page.
+
+        A four-space-indented line of backticks is an indented code block, not
+        a fence. Treating it as an unclosed opener would blank everything
+        after it and hide a real escaping link (Codex review, #404).
+        """
+        body = (
+            "Example:\n"
+            "\n"
+            "    ```sh\n"
+            "    echo hi\n"
+            "\n"
+            "See [x](../../docs/architecture/foo.md).\n"
+        )
+        self.assertTrue(self._flags(body), "link after an indented example was hidden")
+
+    def test_fence_indented_up_to_three_spaces_still_fences(self) -> None:
+        self.assertFalse(self._flags("   ```\n   [x](../../escaped.md)\n   ```\n"))
+
+    def test_closing_fence_must_match_the_opener(self) -> None:
+        # A shorter run, or a different character, does not close the block.
+        self.assertFalse(self._flags("````\n```\n[x](../../escaped.md)\n````\n"))
+        self.assertFalse(self._flags("~~~\n```\n[x](../../escaped.md)\n~~~\n"))
+        # A longer run of the same character does close it.
+        self.assertTrue(self._flags("```\nhi\n````\n[x](../../escaped.md)\n"))
 
     def test_blanking_preserves_line_numbers(self) -> None:
         body = "one\n```\nfenced\n```\nfour\n[x](../../escaped.md)\n"
