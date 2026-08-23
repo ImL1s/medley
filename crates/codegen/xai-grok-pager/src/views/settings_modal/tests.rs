@@ -493,16 +493,35 @@ fn action_for_string_commits_catalog_model_id_not_display_name() {
         }
         other => panic!("fork picker must persist the focused ModelId, got {other:?}"),
     }
-    match action_for_string("default_model", "GPT-5.6 Sol".to_string(), &snapshot) {
-        Some(Action::SetDefaultModel(id)) => {
-            assert_eq!(
-                id.0.as_ref(),
-                "gpt-5.6-sol",
-                "typed display text still resolves to the first catalog row"
-            );
-        }
-        other => panic!("typed display name must still resolve, got {other:?}"),
-    }
+    // A typed colliding display name is refused, not silently resolved.
+    //
+    // This block previously demanded the FIRST catalog row (`gpt-5.6-sol`).
+    // That expectation predates `06208096` (#388), which made an ambiguous
+    // name an error; the two halves first coexist at the providers merge on
+    // this branch. It also contradicted this test's own header, which says a
+    // display-only resolver "would pick the wrong sibling when two rows share
+    // a display name" -- and then asked for exactly that sibling. `fb41b34a`
+    // kept the refusal for the same collision on the `/model` path, and
+    // `active_model_choices_use_ids_and_duplicate_names_are_ambiguous`
+    // (registry.rs) already pinned `ModelResolution::Ambiguous` for this shape.
+    //
+    // `action_for_string` folds Ambiguous and Unknown into the same `None`, so
+    // a bare `is_none()` would not prove WHICH refusal fired. Pin the
+    // resolution alongside it: this must be the ambiguity refusal, not a name
+    // the catalog never carried.
+    assert_eq!(
+        snapshot.resolve_model_name("GPT-5.6 Sol"),
+        crate::settings::ModelResolution::Ambiguous,
+        "the collision must resolve as ambiguous, not merely unresolvable",
+    );
+    assert!(
+        action_for_string("default_model", "GPT-5.6 Sol".to_string(), &snapshot).is_none(),
+        "a typed colliding display name must not commit either sibling",
+    );
+    assert!(
+        action_for_string("fork_secondary_model", "GPT-5.6 Sol".to_string(), &snapshot).is_none(),
+        "the fork picker must refuse the same collision, not just the default picker",
+    );
 }
 
 /// Mirror of `every_setting_has_action_for_bool_arm` for
@@ -3285,7 +3304,25 @@ fn unavailable_model_keyboard_enter_does_not_commit_or_close_picker() {
         &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     );
 
-    assert!(matches!(outcome, SettingsKeyOutcome::Unchanged));
+    // `5f63802e` (#335, #346) changed this refusal from silent to explained:
+    // Enter on a disabled row now returns the readiness reason as a toast
+    // instead of `Unchanged`. The contract this test actually guards is
+    // unchanged -- no commit, picker stays open -- and both halves are still
+    // pinned below: `Toast` carries no `Action`, and its consumer
+    // (`app/agent_view`) shows the message without touching `active_modal`.
+    //
+    // Pinning the reason is strictly stronger than the old
+    // `matches!(.., Unchanged)`: it also proves the explanation reaches the
+    // user, which is the point of the feature. A revert to `Unchanged` fails
+    // here AND at
+    // `settings_model_picker_enter_on_disabled_row_toasts_and_does_not_commit`,
+    // which demands `Toast` from this same call.
+    match outcome {
+        SettingsKeyOutcome::Toast(msg) => {
+            assert_eq!(msg, "Codex authentication required");
+        }
+        other => panic!("Enter on an unavailable row must toast the reason, not commit: {other:?}"),
+    }
     assert!(matches!(
         state.mode(),
         SettingsModalMode::PickingEnum { choices_idx: 2, .. }
@@ -8503,11 +8540,35 @@ fn dynamic_enum_choices_disables_by_model_id_not_display_name() {
         crate::settings::DynamicEnumSource::ActiveModelCatalog,
         &snapshot,
     );
+    // Rows that share a display name are disambiguated by catalog id when the
+    // choice list is built, so NO row's display is ever the bare shared name --
+    // `active_model_choices_use_ids_and_duplicate_names_are_ambiguous`
+    // (registry.rs) has pinned that format since before this branch. Selecting
+    // on `display == "Shared Name"` therefore matched zero rows.
+    //
+    // The `assert_eq!(shared.len(), 2)` below is what caught that (`left: 0,
+    // right: 2`), and it is deliberately kept AHEAD of the `any()` assertions:
+    // `any()` over an empty vec is `false` and `all()` would be vacuously
+    // true, so the length pin is what stops an empty selection from being
+    // reported as agreement. This test never passed vacuously -- it had simply
+    // never run, because its lane sat behind an earlier failure.
+    //
+    // Select by ModelId instead, which is the identity this test's own title
+    // says the disabling must key on, and pin the disambiguated displays so the
+    // selector cannot go stale unnoticed.
     let shared: Vec<_> = choices
         .iter()
-        .filter(|c| c.display == "Shared Name")
+        .filter(|c| c.canonical == "ready-id" || c.canonical == "unready-id")
         .collect();
     assert_eq!(shared.len(), 2);
+    assert_eq!(
+        shared[0].display, "Shared Name (ready-id)",
+        "the ready sibling must be disambiguated by its catalog id",
+    );
+    assert_eq!(
+        shared[1].display, "Shared Name (unready-id) [unavailable]",
+        "the unready sibling must be disambiguated by id and marked unavailable",
+    );
     assert!(
         shared.iter().any(|c| !c.disabled),
         "the ready ID that shares a display name must stay selectable"
