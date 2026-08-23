@@ -69,8 +69,8 @@ pub use managed_cache::{
 pub use paths::{
     claude_managed_settings_path, claude_managed_settings_probe_path, create_dir_all_owner_only,
     decode_cwd_from_dirname, default_grok_home, encode_cwd_dirname, ensure_sessions_cwd_dir,
-    ensure_sessions_cwd_dir_in, grok_application, grok_application_in, grok_home,
-    sessions_cwd_dir, sessions_cwd_dir_in, set_dir_owner_only, system_config_dir, user_grok_home,
+    ensure_sessions_cwd_dir_in, grok_application, grok_application_in, grok_home, sessions_cwd_dir,
+    sessions_cwd_dir_in, set_dir_owner_only, system_config_dir, user_grok_home,
 };
 // `pin_grok_home` is fork-only and deliberately re-exported on its own line rather than
 // folded into the alphabetised block above (#405). That block must stay byte-identical to
