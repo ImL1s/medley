@@ -69,9 +69,13 @@ pub use managed_cache::{
 pub use paths::{
     claude_managed_settings_path, claude_managed_settings_probe_path, decode_cwd_from_dirname,
     default_grok_home, encode_cwd_dirname, ensure_sessions_cwd_dir, grok_application,
-    grok_application_in, grok_home, pin_grok_home, sessions_cwd_dir, system_config_dir,
-    user_grok_home,
+    grok_application_in, grok_home, sessions_cwd_dir, system_config_dir, user_grok_home,
 };
+// `pin_grok_home` is fork-only and deliberately re-exported on its own line rather than
+// folded into the alphabetised block above (#405). That block must stay byte-identical to
+// the upstream merge base: an inserted name reflows it, so every upstream addition to the
+// same block then conflicts on sync. Keep this separate.
+pub use paths::pin_grok_home;
 pub use validation::{
     RequirementsError, RequirementsLayer, RequirementsLayerLoad, RequirementsSource,
     load_merged_requirements, requirements_layers, try_requirements_layers, validate_requirements,
