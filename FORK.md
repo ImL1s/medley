@@ -89,8 +89,75 @@ On every sync PR, review upstream diffs that touch:
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/` — #271: nested spawns flatten lifecycle ownership to the root, but `spawn_parent_session_id` must be captured before reparenting and carried through `QueuedSpawn`; otherwise a dequeued grandchild inherits the root session's capabilities instead of its immediate spawner's ceiling.
 - `crates/codegen/xai-grok-pager/` — `/model` slash command, model picker (`Ctrl+M`), `available_models` rendering
 - Custom models docs: `crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md`
+- `crates/codegen/xai-fast-worktree/src/db/mod.rs` — #405: the fork owns the **body** of `resolve_grok_home()`, routing it through `xai_grok_config::state_dir::resolve_user()` so worktree checkouts and `worktrees.db` land in the same state directory as trust, hooks and everything else — including which of `~/.medley` and `~/.grok` is live. Keeping upstream's definition and adding a fork wrapper alongside it does **not** work, because upstream calls the function itself: in `eb267fef`, at `auto_gc.rs:592`, `auto_gc.rs:640` and `db/mod.rs:240`, and it is re-exported from `lib.rs:60`. Those internal call sites would keep resolving upstream's path no matter what a wrapper did. So this conflict is **irreducible** — a known, recurring cost, not a mistake to be fixed. `git config rerere.enabled true` (above) earns its keep here: the resolution is identical every sync — keep *ours* for the definition, then re-apply upstream's non-state-dir changes on top.
+- `crates/codegen/xai-grok-update/src/auto_update.rs` — #405: conflicts every sync, and its hunks resolve **in three different directions**, so read each one before reaching for *ours*. Against `eb267fef` the file has five conflict hunks:
+
+  **Three are keep-ours.** The fork's `dist_channel::self_update_refusal()` guards, inserted into upstream functions — `run_update_if_available`, `run_install_script`, `install_internal_from_bases` — so a medley build never runs the inherited updater. **Irreducible**: they live inside code upstream owns and keeps editing. Keep *ours*, re-apply upstream's changes on top. This is the resolution that is identical every sync, and the reason `rerere` (above) is worth enabling on this file.
+
+  **One is take-upstream** — `reinstall_hint()`, below.
+
+  **One is neither, and blindly keeping *ours* on it would be a real loss:** upstream has extracted the whole inline `mod tests { .. }` into `auto_update_tests.rs` (`#[path = "auto_update_tests.rs"] mod tests;`, two lines) while the fork still has ~2500 lines of tests inline. Git reports that as one enormous hunk. Take upstream's declaration and move the fork's own tests into the new file; keeping *ours* silently discards upstream's refactor **and** every upstream test that now lives in `auto_update_tests.rs`, which is a new file and so never appears as a conflict to warn you. Measured against `eb267fef`: 7 upstream-only tests would be lost that way, and 4 fork-only tests need porting the other way. Tracked with the name lists in #425. One-time, not recurring — and not a rebrand conflict at all, which is why it is worth naming here.
+
+  The fifth hunk is `reinstall_hint()`, and there the rule is **take upstream**. The fork's override reads as load-bearing and is not. `reinstall_hint` has exactly one non-test caller, inside `run_install_script`, and an unconditional `self_update_refusal()` `bail!` returns before it; `decide()` yields `Allowed` only for `DistIdentity::Upstream`, which a stamped medley binary can never resolve to (*any stamp at all wins*). So the fork's medley branch is unreachable in production, and accepting upstream's definition — including its `(installer, channel)` signature change — cannot tell a fork user to install Grok. What actually shows a fork user the medley installer is `dist_channel::refusal_message()`, in a **fork-only file upstream does not have**, so that guarantee costs nothing at sync time. Two consequences worth knowing before you take it: the fork's `reinstall_hint_for` unit tests go with it (they exercise a state that call site cannot reach), and the check that could invalidate this rule is a grep — confirm every `reinstall_hint` call site is still dominated by a `self_update_refusal()` guard. If upstream ever adds one that is not, add the guard at that call site rather than re-forking the hint.
+
+#405 measured three rebrand-caused conflicts against upstream `eb267fef`, and calling them all irreducible would have been wrong. One is gone: the alphabetised `pub use paths::{ .. }` block in `crates/codegen/xai-grok-config/src/lib.rs` conflicted only because the fork inserted `pin_grok_home` into it, so `pin_grok_home` now sits on its own re-export line and the block stays byte-identical to the merge base. A comment in that file says so; do not fold it back in. One is irreducible: `resolve_grok_home()`. The third is mixed, as the entry above sets out — the file keeps conflicting on the update guards no matter what is done with the hint.
 
 Prefer keeping fork intent on auth hotspots (`AuthScheme::None`, `local.none`, no ambient xAI credential leak) rather than blindly taking upstream.
+
+## Conflicts git does not report
+
+A textual conflict is not the only kind, and it is not the expensive kind. On
+PR #383 a merge produced a tree where **both halves were individually correct
+and jointly wrong**, with no conflict markers, because the halves lived in
+*different files*.
+
+`d6d096ce` (#343, on the feature branch) stopped `resolved_auth_path` reading
+`GROK_AUTH_PATH` under `cfg!(test)`, so in-process tests could not clobber each
+other through a process-global, and moved its own copy of the fresh-process
+regression onto the new `CodexAuthPathGuard`. Production still honours the env.
+`providers` meanwhile carried a version of that same test which still did
+`EnvGuard::set("GROK_AUTH_PATH", ..)` — the channel the other side had just
+closed. The merge kept both (renaming one to avoid a name collision) and
+reported no conflict. The `providers` variant then read `state_home/auth.json`,
+which nothing wrote, and failed an hour into CI.
+
+The generalisation, and the thing to check on every merge into `providers`:
+**when one side changes how a value is *plumbed*, grep the other side for the
+old channel by name.** Merge-base reasoning answers *who deleted this?*; it does
+not answer *who is still calling it?* A closed channel usually has surviving
+callers, and they compile.
+
+In order, cheapest first:
+
+- `git log --merge` cannot answer this, and it is worth knowing why before you
+  reach for it. It requires an *unfinished* merge (`MERGE_HEAD`) and is scoped to
+  the files git recorded as **conflicted** — of which a semantic conflict has
+  none. Once the merge is committed it does not fall quiet, it fails:
+  `fatal: --merge requires one of the pseudorefs MERGE_HEAD, CHERRY_PICK_HEAD,
+  REVERT_HEAD or REBASE_HEAD`. Neither the empty listing nor the error is
+  evidence of safety.
+- After resolving, grep the whole tree for every env var, setter, or flag the
+  incoming side removed or gated — including `#[cfg(test)]` code, which
+  `cargo check --lib` and clippy on `--lib` never compile.
+- `cargo test --workspace --no-run` compiles those targets without running them.
+  That catches callers which stopped *compiling*. It cannot catch the ones that
+  still compile and now read the wrong thing — only the grep does.
+
+### The neighbouring failure that is *not* this
+
+PR #383's other late CI failure looks identical from the outside and is not.
+`d6d096ce` also taught `resolve_credentials` to drop an ambient xAI credential
+bound for a non-first-party origin and migrated three sibling call sites,
+missing a fourth — but that fourth site was in **its own branch**, broken from
+the moment that commit landed. It stayed invisible because
+`a_key_passed_as_session_key_is_relabelled_a_session_token` is named in no
+filter in `ci.yml`, so the hot path never ran it; only a fuller run surfaced it.
+
+Both failures cost an hour of CI and both were found late, so it is tempting to
+file them together. Keep them apart, because the check that catches each one is
+different: the first needs the grep above, the second needs a test to be
+*enrolled* (#408). Attributing an unenrolled-test blindspot to the merge would
+send the next reader looking for a conflict that was never there.
 
 ## Tagging
 
