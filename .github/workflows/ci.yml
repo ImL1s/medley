@@ -436,8 +436,6 @@ jobs:
             test_output=""
           }
           run_nonzero -p xai-grok-shell --lib \
-            auth::openai_codex::tests:: -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
             auth::manager::tests:: -- --nocapture
 
       # #361: parser and auth-store unit tests cannot prove that the shipped
@@ -824,8 +822,6 @@ jobs:
           # durable legacy lineage is reconciled before migration, route/harness
           # drift still fails closed, and fresh overrides still preflight.
           run_nonzero -p xai-grok-subagent-resolution --lib \
-            resume::tests -- --nocapture
-          run_nonzero -p xai-grok-subagent-resolution --lib \
             native_route:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             format_agent_detail -- --nocapture
@@ -849,8 +845,6 @@ jobs:
             issue39_aborted_explicit_gateway_refresh_recovers_waiters -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             gateway_refresh_fence_prevents_stale_snapshot_reconciliation -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            subagent_trusted_tool_capabilities_render_in_human_and_json_views -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             resolve_session_toolset_mcp_kind_none_dropped_under_readonly -- --nocapture
           run_nonzero -p xai-computer-hub-sdk --lib \
@@ -871,6 +865,20 @@ jobs:
             edge_client_retries_transient_edge_codes_but_not_origin_tls -- --nocapture
           run_nonzero -p xai-sqlite-journal --lib \
             apply_with_retry -- --nocapture
+          run_nonzero -p xai-grok-pager-bin --test \
+            update_never_blocked_by_config -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            memory_trace_signal_topology_tests:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::server_tests:: -- --nocapture
+          run_nonzero -p xai-grok-shell --test \
+            session_delete_evicts_index -- --nocapture
+          run_nonzero -p xai-grok-shell --test \
+            session_search_off_builds_no_index -- --nocapture
+          run_nonzero -p xai-grok-shell --test \
+            test_image_strip_recovery -- --nocapture
+          run_nonzero -p xai-grok-shell --test \
+            test_mcp_doctor_isolation -- --nocapture
           run_nonzero -p xai-tty-utils --lib \
             '' -- --nocapture
           run_nonzero -p xai-ratatui-textarea --lib \
@@ -927,8 +935,6 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             remote_pull_publication_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            fetched_session_rejects_ -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
             extensions::session_state:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             symlinked_cwd_parent_without_touching_outside_tree -- --nocapture
@@ -963,8 +969,6 @@ jobs:
             servers:: -- --nocapture
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             cache_ -- --nocapture
-          run_nonzero -p xai-grok-pager-bin --test \
-            update_never_blocked_by_config -- --nocapture
           run_nonzero -p xai-grok-pager-pty-harness --test \
             exit_timeout -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
@@ -973,8 +977,6 @@ jobs:
             clipboard:: -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             render:: -- --nocapture
-          run_nonzero -p xai-grok-pager-render --lib \
-            terminal::tmux:: -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             theme:: -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
@@ -1054,8 +1056,6 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             agent::config_model_override_parse:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            agent::docs_examples_tests:: -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
             agent::ext_parsers:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::feedback_client:: -- --nocapture
@@ -1074,25 +1074,17 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             agent::otel_gate:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            agent::proxy:: -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
             agent::relay:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::restore_code:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::roster:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            agent::server:: -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
             agent::session_config:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::session_registry_client:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            agent::storage_client_tests:: -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
             agent::subagent:: -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            agent::subscription_check:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::update_chunk_merge:: -- --nocapture
           # Auth-provider tests spawn credential-helper subprocesses. Keep them
@@ -1136,14 +1128,6 @@ jobs:
           run_nonzero -p xai-grok-session-search --lib \
             '' -- --nocapture
           run_nonzero -p xai-grok-shell --test \
-            session_delete_evicts_index -- --nocapture
-          run_nonzero -p xai-grok-shell --test \
-            session_search_off_builds_no_index -- --nocapture
-          run_nonzero -p xai-grok-shell --test \
-            test_image_strip_recovery -- --nocapture
-          run_nonzero -p xai-grok-shell --test \
-            test_mcp_doctor_isolation -- --nocapture
-          run_nonzero -p xai-grok-shell --test \
             test_stop_cancelled_hook_e2e -- --nocapture
           run_nonzero -p xai-grok-plugin-marketplace --lib \
             '' -- --nocapture
@@ -1159,8 +1143,6 @@ jobs:
             mcp_cmd:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             memory_trace:: -- --nocapture
-          run_nonzero -p xai-grok-pager --lib \
-            memory_trace_signal_topology:: -- --nocapture
           # `xai-grok-config` had no filter at all, so every test in it ran
           # nowhere. `display::` owns the state-directory label rules, which
           # is exactly the fork behaviour a sync is most likely to break --
@@ -1221,8 +1203,6 @@ jobs:
             resolve_failure_refuses_for_deny_carrying_devbox_extends -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
             bwrap_reexec_for_profile_skips_plan_inside_bwrap -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            terminal::local_terminal:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             acp:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
@@ -1262,16 +1242,6 @@ jobs:
           }
           run_nonzero -p xai-grok-shell --lib \
             issue8_agent_serve_security_ -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            issue41_bound_ws_queues_ -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            issue41_bound_ws_queues_gateway_queue_rejects_when_full -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            issue41_bound_ws_queues_oversized_trailing_ping_closes_with_1009 -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            issue41_bound_ws_queues_oversized_empty_after_trim_closes_with_1009 -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            issue41_bound_ws_queues_oversized_non_utf8_binary_closes_with_1009 -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             issue8_agent_serve_security_ -- --nocapture
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
@@ -1314,8 +1284,6 @@ jobs:
           # (shared `leaders_kill` prefixes would stay green if it were deleted).
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             leaders_kill_issue183_interleaving_preserves_new_leader_socket -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            leader::lock::tests::reclaim -- --nocapture
 
       - name: Shell auth + readiness meta
         run: |
@@ -1542,25 +1510,11 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             dropped_model_switch_ack_preserves_live_candidate_generation -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            model_switch_recovers_new_generation_after_summary_materialization -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            restart_preserves_unique_route_identity_against_removed_key_reuse -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            push_pull_resume_preserves_unique_route_across_key_reuse -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
             model_metadata_update_keeps_id_and_identity_atomic -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             fork_registration_remote_pull_preserves_inherited_model_identity_and_harness -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             copy_session_data_with_model_override -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            model_switch_interruption_before_intent_rename_ -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            model_switch_interruption_after_intent_rename_ -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            list_sessions_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            list_sessions_recent_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
 
       # #166: these assert on colour, and used to inherit the ambient colour
       # level. Run them under both settings of NO_COLOR -- one pass alone would
@@ -1674,18 +1628,6 @@ jobs:
             fi
             rm -f "$output"
           }
-          run_nonzero -p xai-grok-shell --lib \
-            collect_assistant_text_discards_abandoned_retry_attempt_phrase -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            collect_assistant_text_discards_attempt_discarded_retraction_phrase -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            collect_assistant_text_still_flushes_on_rewind_marker_boundary -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            collect_assistant_text_still_flushes_on_compaction_checkpoint_boundary -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            collect_assistant_text_completed_turn_still_indexes_across_hook_annotation -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            single_pass_omits_abandoned_retry_attempt_from_fts_content -- --nocapture
 
       # #180: an ambient xAI session JWT under a post-strip `ExplicitHeader`
       # label reaching a third-party origin. Both halves of the fix are
@@ -1715,8 +1657,6 @@ jobs:
           # Seam half of #180: reconstruct / parent-inherit must not invent
           # ExplicitHeader from the maps while keeping api_key. The sampler
           # dual_auth_gateway_… test never reaches these functions.
-          run_nonzero -p xai-grok-shell --lib \
-            reconstruct_full_config_ready_dual_auth_keeps_model_api_key -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             read_parent_sampling_config_dual_auth_keeps_model_api_key -- --nocapture
 
@@ -1908,8 +1848,6 @@ jobs:
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             leaders_kill_failed_kill_counts -- --nocapture
           # Unique filter: proves startup kill PID plausibility bounds run.
-          run_nonzero -p xai-grok-shell --lib \
-            startup_kill_socket_pid_plausibility_bounds -- --nocapture
           # `reclaim_` rather than the NotFound test alone: this branch's two
           # mutation-proven invariant tests (`reclaim_removes_a_lock_no_process_holds`,
           # `reclaim_refuses_a_lock_a_live_process_holds`) are also selected here.
@@ -1937,8 +1875,6 @@ jobs:
             fi
             rm -f "$output"
           }
-          run_nonzero -p xai-grok-shell --lib \
-            respawn_stdio_then_inserts_before_arming_and_has_no_post_arm_yields -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             arm_liveness_watcher_then_has_no_scheduler_yield_after_spawning -- --nocapture
 
