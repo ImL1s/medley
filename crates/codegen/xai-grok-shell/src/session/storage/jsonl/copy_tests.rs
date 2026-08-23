@@ -1373,7 +1373,9 @@ async fn copy_session_data_copies_compaction_segments_when_enabled() {
 
 /// Inherited `transcript_hint` text names the parent `session_dir/compaction`.
 /// After a production-style fork copy the child must point at its own copied
-/// archive so deleting the parent cannot break history (issue #345).
+/// archive so deleting the parent cannot break history (issue #345) — while
+/// the transcript, which is words a user or the model wrote, copies through
+/// untouched even when it quotes that same path.
 #[tokio::test]
 async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
     use crate::extensions::notification::CompactionSegmentFile;
@@ -1418,6 +1420,8 @@ async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
         .append_chat_message(&source_info, &ConversationItem::user_meta(inherited))
         .await
         .unwrap();
+    // The agent quoted the generated hint in its own reply. That is content,
+    // not metadata: the fork must leave it alone.
     adapter
         .append_update(&source_info, &fork_agent_chunk(sid, &hint))
         .await
@@ -1489,12 +1493,12 @@ async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
 
     let updates_blob = std::fs::read_to_string(adapter.updates_file(&target_info)).unwrap();
     assert!(
-        updates_blob.contains(&child_loc),
-        "copied updates must name the child compaction dir"
+        updates_blob.contains(&parent_loc),
+        "agent message content must survive the fork verbatim, got {updates_blob}"
     );
     assert!(
-        !updates_blob.contains(&parent_loc),
-        "copied updates must not keep the parent compaction dir"
+        !updates_blob.contains(&child_loc),
+        "fork must not rewrite transcript content, got {updates_blob}"
     );
 
     std::fs::remove_dir_all(adapter.session_dir(&source_info)).unwrap();
@@ -1506,47 +1510,57 @@ async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
     assert!(child_compaction.join("INDEX.md").is_file());
 }
 
-/// Windows JSONL stores `C:\\…\\compaction` while `Path::to_string_lossy`
-/// is `C:\…\compaction`. Rewrite must run after deserialize (Codex P2 3793486694).
+/// Successor to `issue345_updates_rewrite_runs_after_json_unescape`, which
+/// pinned the deleted `updates.jsonl` walk. Windows checkpoints store
+/// `C:\\…\\compaction` where `Path::to_string_lossy` yields `C:\…\compaction`,
+/// so a textual replace on the file bytes never matches (Codex P2 3793486694).
+/// The rebind runs on the deserialized items, so the escaping never enters —
+/// this pins that it stays that way.
 #[test]
-fn issue345_updates_rewrite_runs_after_json_unescape() {
-    let from = r"C:\Users\iml1s\.grok\sessions\parent\compaction";
-    let to = r"C:\Users\iml1s\.grok\sessions\child\compaction";
-    let rewrite = super::CompactionHintRewrite {
-        from: from.to_string(),
-        to: to.to_string(),
+fn issue345_checkpoint_rebind_runs_on_deserialized_items() {
+    use crate::extensions::notification::CompactionCheckpointFile;
+    use xai_chat_state::{CompactionDetail, CompactionMode};
+
+    let source = std::path::PathBuf::from(r"C:\Users\iml1s\.grok\sessions\parent\compaction");
+    let target = std::path::PathBuf::from(r"C:\Users\iml1s\.grok\sessions\child\compaction");
+    let hint = CompactionMode::Segments(CompactionDetail::default())
+        .transcript_hint(Some(source.to_string_lossy().as_ref()))
+        .expect("segments hint needs a location");
+    let file = CompactionCheckpointFile {
+        checkpoint_id: "win".to_string(),
+        prompt_index_at_compaction: 1,
+        compacted_history: vec![ConversationItem::user_meta(format!("summary body{hint}"))],
+        schema_version: 1,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        original_user_info: None,
+        reread_file_paths: vec![],
     };
-    let update = fork_agent_chunk("sid", &format!("history lives in {from}"));
-    let line = serde_json::to_string(
-        &crate::session::storage::SessionUpdateEnvelope::from_update(&update).expect("envelope"),
-    )
-    .expect("jsonl line");
+    let bytes = serde_json::to_vec_pretty(&file).expect("checkpoint bytes");
     assert!(
-        line.contains(r"C:\\Users") || line.contains(r"C:\\\\Users"),
-        "fixture line must JSON-escape backslashes: {line}"
-    );
-    assert_eq!(
-        rewrite.apply(&line).as_ref(),
-        line.as_str(),
-        "raw JSONL must not match the unescaped Windows prefix"
+        String::from_utf8_lossy(&bytes).contains(r"C:\\Users"),
+        "fixture must JSON-escape backslashes"
     );
 
-    let mut parsed =
-        crate::session::storage::SessionUpdateEnvelope::from_str(&line).expect("parse");
-    super::rewrite_session_update_compaction_hint(&mut parsed, &rewrite);
-    let out = serde_json::to_string(
-        &crate::session::storage::SessionUpdateEnvelope::from_update(&parsed)
-            .expect("rewrite envelope"),
+    let rebinds = super::CheckpointRebinds {
+        segments: Some((source, target)),
+        // Not under test: a pair pointing at itself rebinds nothing.
+        transcript: (
+            std::path::PathBuf::from(r"C:\same\updates.jsonl"),
+            std::path::PathBuf::from(r"C:\same\updates.jsonl"),
+        ),
+    };
+    let rebound = super::rebound_checkpoint_bytes(
+        &bytes,
+        &rebinds,
+        std::path::Path::new("checkpoint.json"),
+        &acp::SessionId::new("win-src"),
     )
-    .expect("rewritten jsonl");
-    assert!(
-        out.contains("child"),
-        "parsed update must name the child compaction dir: {out}"
-    );
-    assert!(
-        !out.contains("parent"),
-        "parsed update must not keep the parent compaction dir: {out}"
-    );
+    .expect("rebind")
+    .expect("segments hint must rebind");
+    let out: CompactionCheckpointFile = serde_json::from_slice(&rebound).expect("reparse");
+    let text = out.compacted_history[0].text_content();
+    assert!(text.contains(r"\child\compaction"), "got {text}");
+    assert!(!text.contains(r"\parent\compaction"), "got {text}");
 }
 
 #[tokio::test]
@@ -1785,6 +1799,153 @@ async fn write_checkpoint_file(adapter: &JsonlStorageAdapter, info: &Info, id: &
         )
         .await
         .unwrap();
+}
+
+/// #345 with the case Codex flagged on PR #383: the fork must rebind the
+/// checkpoint's generated hint — the copy a cross-compaction rewind replays —
+/// while leaving a transcript that quotes the very same path byte-identical.
+/// Transcript records are words a user and the model wrote; rewriting them
+/// would hand the model back a prompt nobody typed.
+#[tokio::test]
+async fn fork_rebinds_checkpoint_hint_without_touching_quoted_transcript_paths() {
+    use crate::extensions::notification::{CompactionCheckpointFile, CompactionSegmentFile};
+    use xai_chat_state::{CompactionDetail, CompactionMode};
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source_info = Info {
+        id: acp::SessionId::new("ckpt-rebind-src"),
+        cwd: "/shared/workspace".to_string(),
+    };
+    let target_info = Info {
+        id: acp::SessionId::new("ckpt-rebind-dst"),
+        cwd: "/shared/workspace".to_string(),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+    adapter
+        .write_compaction_segment(
+            &source_info,
+            &CompactionSegmentFile {
+                items: vec![ConversationItem::user("pre-compact turn")],
+                summary: "segment summary".to_string(),
+                detail: CompactionDetail::Verbose,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let parent_archive = adapter
+        .session_dir(&source_info)
+        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+    let parent_loc = parent_archive.to_string_lossy().into_owned();
+    let hint = CompactionMode::Segments(CompactionDetail::Verbose)
+        .transcript_hint(Some(parent_loc.as_str()))
+        .expect("segments hint needs a location");
+
+    // The user asked about the archive by name, and the agent answered naming
+    // a file inside it. Both are content; neither is a generated hint. The
+    // trailing `/` matters: the deleted rewrite's component boundary let it
+    // through, so these are exactly the bytes it corrupted.
+    let quoted_prompt = format!("what is in {parent_loc}/segment_000.md?");
+    adapter
+        .append_update(&source_info, &prompt_user_chunk(&quoted_prompt, 0))
+        .await
+        .unwrap();
+    let quoted_reply = format!("I read {parent_loc}/INDEX.md for you.");
+    adapter
+        .append_update(
+            &source_info,
+            &fork_agent_chunk("ckpt-rebind-src", &quoted_reply),
+        )
+        .await
+        .unwrap();
+
+    // The generated hint's replay home: the checkpoint the fork must rebind.
+    adapter
+        .append_update(&source_info, &checkpoint_record("ckpt-rebind"))
+        .await
+        .unwrap();
+    adapter
+        .write_compaction_checkpoint(
+            &source_info,
+            &CompactionCheckpointFile {
+                checkpoint_id: "ckpt-rebind".to_string(),
+                prompt_index_at_compaction: 1,
+                compacted_history: vec![ConversationItem::user_meta(format!("summary body{hint}"))],
+                schema_version: 1,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                original_user_info: None,
+                reread_file_paths: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    adapter
+        .copy_session_data(
+            &source_info,
+            &target_info,
+            CopySessionOptions {
+                copy_compaction_segments: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let child_archive = adapter
+        .session_dir(&target_info)
+        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+    let child_loc = child_archive.to_string_lossy().into_owned();
+    assert_ne!(parent_loc, child_loc, "fork must land in a new session dir");
+
+    // Transcript: unchanged. Compare JSON-escaped forms so this also holds on
+    // Windows, where the path's `\` is stored as `\\`.
+    let child_updates = std::fs::read_to_string(adapter.updates_file(&target_info)).unwrap();
+    let escaped = |text: &str| {
+        serde_json::to_string(text)
+            .expect("escape")
+            .trim_matches('"')
+            .to_string()
+    };
+    assert!(
+        child_updates.contains(&escaped(&quoted_prompt)),
+        "user prompt must survive the fork verbatim, got {child_updates}"
+    );
+    assert!(
+        child_updates.contains(&escaped(&quoted_reply)),
+        "agent reply must survive the fork verbatim, got {child_updates}"
+    );
+    assert!(
+        !child_updates.contains(&escaped(&child_loc)),
+        "no transcript record may name the child archive, got {child_updates}"
+    );
+
+    // Checkpoint: rebound, and readable once the parent is gone.
+    std::fs::remove_dir_all(adapter.session_dir(&source_info)).unwrap();
+    let copied: CompactionCheckpointFile = serde_json::from_slice(
+        &std::fs::read(
+            adapter
+                .session_dir(&target_info)
+                .join("compaction_checkpoints/ckpt-rebind.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let restored = copied.compacted_history[0].text_content();
+    assert!(
+        restored.contains(&child_loc),
+        "replayed compacted history must name the child archive, got {restored}"
+    );
+    assert!(
+        !restored.contains(&parent_loc),
+        "replayed compacted history must not keep the parent archive, got {restored}"
+    );
+    assert!(child_archive.join("segment_000.md").is_file());
 }
 
 #[tokio::test]
