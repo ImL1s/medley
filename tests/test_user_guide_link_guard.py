@@ -25,9 +25,11 @@ Scope and deliberate omissions:
 - Fenced blocks and inline code spans are blanked before scanning, so a page
   that *documents* this rule with a `](../` example does not trip it. Fence
   recognition follows CommonMark indentation: at four spaces a line is an
-  indented code block, not a fence. Indented code blocks are deliberately
-  *not* blanked -- a link inside one is reported rather than ignored, which
-  errs towards a visible false positive instead of a silent broken link.
+  indented code block, not a fence, and code spans require backtick runs of
+  equal length. Indented code blocks and HTML comments are deliberately
+  *not* blanked -- a link inside one is reported rather than ignored. Every
+  such choice errs towards a visible false positive instead of a silent
+  broken link, which is the safe direction for a guard.
 - Link targets are normalised lexically, never resolved on disk. This guard
   is about escaping the directory, not about whether the target exists.
 """
@@ -57,7 +59,10 @@ HTML_HREF = re.compile(
 
 # `scheme:` prefix -- https:, mailto:, file: and friends are not relative.
 HAS_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
-INLINE_CODE = re.compile(r"`+[^`\n]*`+")
+# A code span is delimited by backtick runs of *equal* length. Allowing
+# mismatched runs would let a stray backtick pair with a later, longer run
+# and blank a real link between them.
+INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)([^\n]*?)(?<!`)\1(?!`)")
 # A fence may be indented up to three spaces. At four it is an indented code
 # block, not a fence -- treating one as an opener would blank the rest of the
 # page and hide real links behind it.
@@ -249,6 +254,19 @@ class LinkDetectionTests(unittest.TestCase):
         self.assertFalse(self._flags("~~~\n```\n[x](../../escaped.md)\n~~~\n"))
         # A longer run of the same character does close it.
         self.assertTrue(self._flags("```\nhi\n````\n[x](../../escaped.md)\n"))
+
+    def test_unmatched_backtick_does_not_blank_a_real_link(self) -> None:
+        """A stray backtick must not pair with a longer run (Codex, #404)."""
+        self.assertTrue(
+            self._flags("`oops [x](../../escaped.md) ``code``\n"),
+            "link between mismatched backtick runs was hidden",
+        )
+
+    def test_code_spans_still_blank_with_matching_runs(self) -> None:
+        self.assertFalse(self._flags("`[x](../../escaped.md)`\n"))
+        self.assertFalse(self._flags("``[x](../../escaped.md)``\n"))
+        # A double-run span may contain a single backtick.
+        self.assertFalse(self._flags("``a ` [x](../../escaped.md)``\n"))
 
     def test_blanking_preserves_line_numbers(self) -> None:
         body = "one\n```\nfenced\n```\nfour\n[x](../../escaped.md)\n"
