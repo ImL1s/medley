@@ -106,6 +106,8 @@ fn poisoned_image_session_recovers_within_the_failing_turn() {
         prompt_turn(&conn, &info.id, "hi").await;
 
         let bodies = chat_completion_bodies(&server);
+        eprintln!("BODIES: {:#?}", bodies);
+        eprintln!("IMAGE_MARKER: {}", image_marker);
         assert!(
             bodies.len() >= 2,
             "expected the rejected attempt plus a strip-retry, saw {} request(s)",
@@ -113,7 +115,8 @@ fn poisoned_image_session_recovers_within_the_failing_turn() {
         );
         assert!(
             bodies[0].contains(image_marker),
-            "first attempt must carry the poisoned image"
+            "first attempt must carry the poisoned image; body[0]={}",
+            bodies[0]
         );
         let retry = &bodies[bodies.len() - 1];
         assert!(
