@@ -44,8 +44,12 @@ DOCS_RS = REPO / "crates" / "codegen" / "xai-grok-pager" / "src" / "docs.rs"
 INLINE_LINK = re.compile(r"!?\[[^\]]*\]\(\s*<?([^)>\s]+)>?(?:\s+[\"'(][^)]*)?\)")
 # Reference-style definition: `[label]: target`.
 REFERENCE_DEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*<?([^\s>]+)>?", re.MULTILINE)
-# HTML anchors, which markdown renderers pass through.
-HTML_HREF = re.compile(r"""<a\s[^>]*href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+# HTML anchors, which markdown renderers pass through. The attribute value
+# may be double-quoted, single-quoted, or bare -- all three are valid HTML.
+HTML_HREF = re.compile(
+    r"""<a\s[^>]*href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"'`]+))""",
+    re.IGNORECASE,
+)
 
 # `scheme:` prefix -- https:, mailto:, file: and friends are not relative.
 HAS_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
@@ -74,6 +78,11 @@ def _blank_code(text: str) -> str:
     return INLINE_CODE.sub("", "\n".join(out))
 
 
+def _target_of(match: re.Match[str]) -> str:
+    """The first group that matched; href alternation yields three."""
+    return next(group for group in match.groups() if group is not None)
+
+
 def _escapes(rel_dir: str, target: str) -> bool:
     """True when `target`, read from a file in `rel_dir`, leaves the guide."""
     if target.startswith("/"):
@@ -89,13 +98,13 @@ def _offending_links() -> list[str]:
         rel_dir = posixpath.dirname(path.relative_to(GUIDE).as_posix()) or "."
         for pattern in (INLINE_LINK, REFERENCE_DEF, HTML_HREF):
             for match in pattern.finditer(text):
-                target = match.group(1).split("#", 1)[0].strip()
+                target = _target_of(match).split("#", 1)[0].strip()
                 if not target or target.startswith("//") or HAS_SCHEME.match(target):
                     continue
                 if _escapes(rel_dir, target):
                     line = text.count("\n", 0, match.start()) + 1
                     findings.append(
-                        f"{path.relative_to(REPO).as_posix()}:{line}: {match.group(1)}"
+                        f"{path.relative_to(REPO).as_posix()}:{line}: {target}"
                     )
     return findings
 
@@ -160,7 +169,7 @@ class LinkDetectionTests(unittest.TestCase):
         text = _blank_code(body)
         for pattern in (INLINE_LINK, REFERENCE_DEF, HTML_HREF):
             for match in pattern.finditer(text):
-                target = match.group(1).split("#", 1)[0].strip()
+                target = _target_of(match).split("#", 1)[0].strip()
                 if not target or target.startswith("//") or HAS_SCHEME.match(target):
                     continue
                 if _escapes(".", target):
@@ -175,6 +184,8 @@ class LinkDetectionTests(unittest.TestCase):
             ("image", "![d](../../assets/logo.png)"),
             ("reference definition", "[spec]: ../../../docs/architecture/foo.md"),
             ("html href", '<a href="../../docs/architecture/foo.md">x</a>'),
+            ("html href, single-quoted", "<a href='../../docs/architecture/foo.md'>x</a>"),
+            ("html href, unquoted", "<a href=../../docs/architecture/foo.md>x</a>"),
         ):
             with self.subTest(form=label):
                 self.assertTrue(self._flags(body + "\n"), f"{label} not flagged")
@@ -186,6 +197,8 @@ class LinkDetectionTests(unittest.TestCase):
             ("bare anchor", "See [x](#credential-resolution)."),
             ("absolute url", "See [x](https://github.com/ImL1s/medley)."),
             ("mailto", "Mail [x](mailto:someone@example.com)."),
+            ("html href, sibling", '<a href="11-custom-models.md">x</a>'),
+            ("html href, unquoted sibling", "<a href=11-custom-models.md>x</a>"),
         ):
             with self.subTest(form=label):
                 self.assertFalse(self._flags(body + "\n"), f"{label} wrongly flagged")
