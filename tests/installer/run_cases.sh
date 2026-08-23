@@ -38,19 +38,27 @@ bad() {
   printf '  FAIL %s\n' "$1"
 }
 
-# The triple install.sh will detect on this machine, derived the same way.
+# The triple install.sh will detect on this machine.
+#
+# Asked of the script under test rather than reimplemented here. This used to
+# be a copy of the detection, which was fine while a Linux host always meant
+# `unknown-linux-gnu`; now that the Linux branch reads the host's glibc version
+# and can choose musl (issue #82), a mirror that drifts would build a fixture
+# archive under a triple the installer never asks for — and every case below
+# would fail for a reason that has nothing to do with what it tests.
+#
+# `main` is disarmed so sourcing defines the functions without installing
+# anything. This runs inside a command substitution, so nothing it defines
+# escapes into this shell.
 target_triple() {
-  case "$(uname -s)" in
-  Darwin) os_part='apple-darwin' ;;
-  Linux) os_part='unknown-linux-gnu' ;;
-  *) echo "unsupported test host" >&2; exit 1 ;;
-  esac
-  case "$(uname -m)" in
-  arm64 | aarch64) arch_part='aarch64' ;;
-  x86_64 | amd64) arch_part='x86_64' ;;
-  *) echo "unsupported test host" >&2; exit 1 ;;
-  esac
-  printf '%s-%s\n' "$arch_part" "$os_part"
+  sed 's/^main "$@"$/:/' "${REPO_ROOT}/install.sh" > "${WORK}/install-functions.sh"
+  if grep -q '^main "\$@"$' "${WORK}/install-functions.sh"; then
+    echo 'error: main() is still armed in the copy of install.sh' >&2
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  . "${WORK}/install-functions.sh"
+  detect_target
 }
 
 TARGET="$(target_triple)"

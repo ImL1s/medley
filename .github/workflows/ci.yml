@@ -87,11 +87,28 @@ jobs:
       - name: Lint for POSIX sh
         run: |
           shellcheck -s sh install.sh
+          shellcheck -s sh tests/installer/target_selection_cases.sh
+          shellcheck -s sh tests/release/musl_smoke.sh
           dash -n install.sh
           dash -n tests/installer/run_cases.sh
+          dash -n tests/installer/target_selection_cases.sh
+          dash -n tests/release/musl_smoke.sh
 
       - name: Behaviour, with curl
         run: sh tests/installer/run_cases.sh
+
+      # Which Linux archive to download is decided before any of the above
+      # runs, from the host's glibc version (#82). The interesting hosts are
+      # ones this runner is not — below the floor, or with no glibc at all —
+      # so the probes are stubbed rather than the case going untested.
+      - name: Target selection across libc flavours
+        run: sh tests/installer/target_selection_cases.sh
+
+      # The musl smoke harness runs inside a release container, where a
+      # syntax error would surface only at tag time. Importing it here is the
+      # cheapest thing that keeps it honest between releases.
+      - name: The musl smoke harness imports
+        run: python3 -B -m py_compile tests/release/musl_smoke_server.py
 
       # `select_downloader` prefers curl whenever it is present, so on any
       # normal machine the wget branch never runs. That is how it stayed
@@ -697,6 +714,13 @@ jobs:
           run_nonzero -p xai-grok-update --test test_dist_channel_gate -- --nocapture
           run_nonzero -p xai-grok-update --test test_install_internal -- --nocapture
           run_nonzero -p xai-grok-update --test test_install_sh -- --nocapture
+          # Same marker, one layer out: the release workflow greps
+          # `version --json` for `distChannel` to prove MEDLEY_CHANNEL reached
+          # the build, so a renamed or dropped key fails a release rather than
+          # a test. `channel`, `upstreamBase`, and `buildTarget` have no guard
+          # at all outside this filter (issue #29).
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            version_json_payload_ -- --nocapture
 
       - name: Leader lock identity (Linux-only /proc probe)
         # The leader auto-kill path proves "is this OUR process" by checking

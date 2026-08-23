@@ -2221,6 +2221,53 @@ fn version_text_for(name: &str, channel_label: &str) -> String {
 fn write_version(writer: &mut impl std::io::Write, channel_label: &str) -> std::io::Result<()> {
     writer.write_all(version_text(channel_label).as_bytes())
 }
+
+/// The `version --json` payload: the five facts a build must be able to state
+/// about itself with no repository beside it (issue #29).
+///
+/// Split out of `main` so the contract — these key names, each carrying the
+/// value from that one source — is reachable from a test. Very little else
+/// guards it: release packaging greps this output for `distChannel`, and
+/// `--version` covers `currentVersion`, so dropping `channel`, `upstreamBase`,
+/// or `buildTarget` would break no build and no test at all.
+///
+/// Takes its stamps as arguments rather than reading them, so a test can prove
+/// each key is wired to its own source using values that differ. Read live,
+/// `channel` and `distChannel` both say "unknown" on any unstamped build,
+/// which is exactly where a transposition would hide.
+fn version_json_payload_from(
+    current_version: &str,
+    channel: &str,
+    dist_channel: &str,
+    upstream_base: Option<&str>,
+    build_target: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "currentVersion": current_version,
+        "channel": channel,
+        // Which distribution built this binary, baked in at
+        // compile time. "unknown" means it carries no marker
+        // and will refuse to self-update. Release packaging
+        // asserts on this field.
+        "distChannel": dist_channel,
+        // Which upstream this fork was built on, and for what
+        // machine. Both baked in at compile time: a binary has
+        // to answer these without the repository beside it.
+        "upstreamBase": upstream_base,
+        "buildTarget": build_target,
+    })
+}
+
+/// [`version_json_payload_from`] wired to the stamps of the running build.
+fn version_json_payload() -> serde_json::Value {
+    version_json_payload_from(
+        env!("VERSION_WITH_COMMIT"),
+        xai_grok_update::channel_name().unwrap_or("unknown"),
+        xai_grok_update::dist_channel::identity().name(),
+        xai_grok_version::UPSTREAM_BASE,
+        xai_grok_version::BUILD_TARGET,
+    )
+}
 fn dispatch_version_if_requested(args: &PagerArgs) -> bool {
     if !args.version {
         return false;
@@ -2534,21 +2581,7 @@ async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> R
         match command {
             Command::Version { json } => {
                 if json {
-                    let payload = serde_json::json!({
-                        "currentVersion": env!("VERSION_WITH_COMMIT"),
-                        "channel": xai_grok_update::channel_name().unwrap_or("unknown"),
-                        // Which distribution built this binary, baked in at
-                        // compile time. "unknown" means it carries no marker
-                        // and will refuse to self-update. Release packaging
-                        // asserts on this field.
-                        "distChannel": xai_grok_update::dist_channel::identity().name(),
-                        // Which upstream this fork was built on, and for what
-                        // machine. Both baked in at compile time: a binary has
-                        // to answer these without the repository beside it.
-                        "upstreamBase": xai_grok_version::UPSTREAM_BASE,
-                        "buildTarget": xai_grok_version::BUILD_TARGET,
-                    });
-                    println!("{}", serde_json::to_string(&payload)?);
+                    println!("{}", serde_json::to_string(&version_json_payload())?);
                 } else {
                     write_version(
                         &mut std::io::stdout().lock(),
@@ -4869,5 +4902,168 @@ mod auth_instruction_guard_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src"
         ));
+    }
+}
+
+#[cfg(test)]
+mod version_json_payload_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Every key `version --json` publishes, and nothing else.
+    ///
+    /// Issue #29 requires the payload to identify the fork version and commit
+    /// (`currentVersion`), the release channel (`channel`), the distribution
+    /// that built it (`distChannel`), the upstream base (`upstreamBase`), and
+    /// the build target (`buildTarget`).
+    ///
+    /// Pinned as an exact set, in both directions. A dropped key is the
+    /// failure this exists to catch: release packaging greps this output for
+    /// `distChannel`, so losing it fails a release rather than a test, and
+    /// losing any of the other three fails nothing at all until someone tries
+    /// to answer "which upstream is this built on" from a shipped binary. An
+    /// *added* key matters too — this is user-facing diagnostic output, so a
+    /// new field belongs in a diff somebody reads, not arriving unannounced.
+    const EXPECTED_KEYS: [&str; 5] = [
+        "buildTarget",
+        "channel",
+        "currentVersion",
+        "distChannel",
+        "upstreamBase",
+    ];
+
+    /// Sorted so the comparison reports a missing or surplus key rather than a
+    /// reordering, which the wire format does not promise anyway.
+    fn sorted_keys(payload: &serde_json::Value) -> Vec<&str> {
+        let mut names: Vec<&str> = payload
+            .as_object()
+            .expect("the payload is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Each key carries the value from its own source, not a neighbour's.
+    ///
+    /// Distinct sentinels rather than live stamps: on an unstamped build
+    /// `channel` and `distChannel` both read "unknown", so a transposition
+    /// between exactly those two is invisible to any assertion made against
+    /// real values.
+    #[test]
+    fn version_json_payload_carries_each_value_from_its_own_source() {
+        let payload = version_json_payload_from(
+            "current-version-sentinel",
+            "channel-sentinel",
+            "dist-channel-sentinel",
+            Some("upstream-base-sentinel"),
+            Some("build-target-sentinel"),
+        );
+
+        assert_eq!(
+            sorted_keys(&payload),
+            EXPECTED_KEYS,
+            "the set of keys in `version --json` is a published contract",
+        );
+        assert_eq!(
+            payload["currentVersion"],
+            serde_json::json!("current-version-sentinel"),
+        );
+        assert_eq!(payload["channel"], serde_json::json!("channel-sentinel"));
+        assert_eq!(
+            payload["distChannel"],
+            serde_json::json!("dist-channel-sentinel"),
+        );
+        assert_eq!(
+            payload["upstreamBase"],
+            serde_json::json!("upstream-base-sentinel"),
+        );
+        assert_eq!(
+            payload["buildTarget"],
+            serde_json::json!("build-target-sentinel"),
+        );
+    }
+
+    /// An absent stamp reaches the wire as JSON `null`, keeping its key.
+    ///
+    /// A vendored crate has no `SOURCE_REV` and a build with no build script
+    /// has no `TARGET`; "this build cannot say" is an answer a consumer parses,
+    /// and it must not arrive as the string "null" or as a missing key.
+    #[test]
+    fn version_json_payload_reports_absent_build_stamps_as_null() {
+        let payload =
+            version_json_payload_from("0.0.0 (0000000)", "unknown", "unknown", None, None);
+
+        assert_eq!(
+            sorted_keys(&payload),
+            EXPECTED_KEYS,
+            "an unstamped build publishes the same keys as a stamped one",
+        );
+        assert_eq!(payload["upstreamBase"], serde_json::Value::Null);
+        assert_eq!(payload["buildTarget"], serde_json::Value::Null);
+    }
+
+    /// The wiring `main` actually calls: every key reads the source documented
+    /// for it, on this build.
+    ///
+    /// `channel` and `distChannel` are the pair worth separating. They are
+    /// both "unknown" on an unstamped build, so the distribution identity is
+    /// pinned to `medley` for the length of this test — two keys that agree
+    /// cannot demonstrate that they are wired to different sources. The
+    /// override is honoured only because a test build carries no
+    /// `MEDLEY_CHANNEL` stamp; a published build ignores it.
+    #[test]
+    #[serial]
+    fn version_json_payload_is_wired_to_the_stamps_of_this_build() {
+        unsafe {
+            std::env::set_var(
+                xai_grok_version::TEST_DIST_CHANNEL_ENV,
+                xai_grok_update::dist_channel::MEDLEY_CHANNEL,
+            )
+        };
+        let payload = version_json_payload();
+        unsafe { std::env::remove_var(xai_grok_version::TEST_DIST_CHANNEL_ENV) };
+
+        assert_eq!(
+            sorted_keys(&payload),
+            EXPECTED_KEYS,
+            "the set of keys in `version --json` is a published contract",
+        );
+        assert_eq!(
+            payload["distChannel"],
+            serde_json::json!(xai_grok_update::dist_channel::MEDLEY_CHANNEL),
+            "distChannel must report the distribution identity — release \
+             packaging greps this exact field to prove MEDLEY_CHANNEL reached \
+             the build",
+        );
+        assert_eq!(
+            payload["channel"],
+            serde_json::json!(xai_grok_update::channel_name().unwrap_or("unknown")),
+            "channel must report the update channel, falling back to \
+             \"unknown\" rather than being omitted",
+        );
+        assert_eq!(
+            payload["currentVersion"],
+            serde_json::json!(env!("VERSION_WITH_COMMIT")),
+        );
+        let current = payload["currentVersion"]
+            .as_str()
+            .expect("currentVersion is a string");
+        assert!(
+            current.contains(xai_grok_version::VERSION),
+            "currentVersion must carry the compiled version {:?}, got {current:?}",
+            xai_grok_version::VERSION,
+        );
+        assert_eq!(
+            payload["upstreamBase"],
+            serde_json::json!(xai_grok_version::UPSTREAM_BASE),
+            "upstreamBase must report the synced upstream commit, not the target",
+        );
+        assert_eq!(
+            payload["buildTarget"],
+            serde_json::json!(xai_grok_version::BUILD_TARGET),
+            "buildTarget must report the target triple, not the upstream commit",
+        );
     }
 }
