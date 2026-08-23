@@ -868,9 +868,9 @@ jobs:
           run_nonzero -p xai-grok-pager-bin --test \
             update_never_blocked_by_config -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
-            memory_trace_signal_topology_tests:: -- --nocapture
+            memtrace_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            agent::server_tests:: -- --nocapture
+            agent::server:: -- --nocapture
           run_nonzero -p xai-grok-shell --test \
             session_delete_evicts_index -- --nocapture
           run_nonzero -p xai-grok-shell --test \
