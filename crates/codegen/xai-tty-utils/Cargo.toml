@@ -15,5 +15,8 @@ libc = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
 
+[dev-dependencies]
+serial_test = { workspace = true }
+
 [lints]
 workspace = true

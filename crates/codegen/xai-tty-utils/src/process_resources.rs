@@ -232,12 +232,13 @@ mod tests {
     /// few tries.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
+    #[serial_test::serial]
     fn thread_gauge_tracks_spawned_threads() {
         use std::sync::mpsc::channel;
 
         const SPAWNED: u64 = 4;
         let mut deltas = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..10 {
             let before = sample_process_memory().threads.expect("threads");
 
             let (stop_tx, stop_rx) = channel::<()>();

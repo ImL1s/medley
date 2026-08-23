@@ -1876,7 +1876,8 @@ mod tests {
 
     fn team_jwt(principal_id: &str) -> String {
         use base64::Engine;
-        let header = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"HS256"}"#);
+        let header =
+            base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"HS256"}"#);
         let payload = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(
             serde_json::json!({
                 "sub": "user-1",
