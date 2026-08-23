@@ -133,6 +133,10 @@ impl xai_grok_auth::HttpAuth for GrokAuthCredentials {
     fn apply(&self, builder: RequestBuilder, base_url: &str) -> RequestBuilder {
         GrokAuthCredentials::apply(self, builder, base_url)
     }
+
+    fn needs_token_auth_header(&self) -> bool {
+        self.deployment_key.is_none()
+    }
 }
 #[cfg(test)]
 mod tests {

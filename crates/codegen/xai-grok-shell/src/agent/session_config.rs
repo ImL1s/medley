@@ -120,12 +120,18 @@ pub(crate) fn build_session_config_options(
 
     if let Some(effort) = current_effort
         && !current_effort_included
+        && (effort != ReasoningEffort::None || effort_options.is_empty())
     {
+        let description = if effort == ReasoningEffort::None {
+            Some("This reasoning effort is no longer offered for this model.".to_string())
+        } else {
+            None
+        };
         options.push(SessionConfigOption {
             id: effort.as_str().to_string(),
             category: "mode".to_string(),
             label: effort_label(effort),
-            description: None,
+            description,
             selected: true,
         });
     }
