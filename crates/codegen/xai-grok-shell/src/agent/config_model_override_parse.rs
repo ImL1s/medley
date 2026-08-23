@@ -287,15 +287,22 @@ fn parse_model_override_table(
 
     // Unknown-field warnings come from whichever parse produces the returned
     // entry, so both paths report them identically.
-    let (entry, mut warnings) = match deserialize_with_unknown_fields(table.clone()) {
+    let (mut entry, mut warnings) = match deserialize_with_unknown_fields(table.clone()) {
         Ok((entry, unknown)) => {
             warnings.extend(unknown_field_warnings(model_key, unknown));
             (entry, warnings)
         }
         Err(_) => {
+            let invalid_auth_scheme = table
+                .get("auth_scheme")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
             prune_invalid_fields(model_key, &mut table, &mut warnings);
             match deserialize_with_unknown_fields(table) {
-                Ok((entry, unknown)) => {
+                Ok((mut entry, unknown)) => {
+                    if entry.auth_scheme.is_none() && invalid_auth_scheme.is_some() {
+                        entry.invalid_auth_scheme = invalid_auth_scheme;
+                    }
                     warnings.extend(unknown_field_warnings(model_key, unknown));
                     (entry, warnings)
                 }

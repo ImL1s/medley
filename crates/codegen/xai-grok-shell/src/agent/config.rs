@@ -13680,7 +13680,7 @@ reasoning_effort = "low"
         let p = default_cfg
             .resolve_doom_loop_recovery()
             .expect("default is ON");
-        assert_eq!(p.max_threshold, 8, "default tunables unchanged");
+        assert_eq!(p.max_threshold, 32, "default tunables unchanged");
         assert_eq!(p.max_retries, 2, "default tunables unchanged");
         let toml_off = Config {
             doom_loop_recovery: DoomLoopRecoverySettings {
