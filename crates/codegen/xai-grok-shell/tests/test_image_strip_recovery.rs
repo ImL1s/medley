@@ -55,10 +55,14 @@ async fn seed_poisoned_session(cwd: &std::path::Path, image_url: &str) -> Info {
         .append_chat_message(&info, &ConversationItem::assistant("A test pattern."))
         .await
         .expect("append assistant message");
+    storage
+        .update_session_title(&info, "Poisoned Image Test".to_owned())
+        .await
+        .expect("set title");
     info
 }
 
-/// Main-turn `/v1/chat/completions` bodies, excluding turn-summary side-calls.
+/// Main-turn `/v1/chat/completions` bodies, excluding turn-summary and session-title side-calls.
 fn chat_completion_bodies(server: &xai_grok_test_support::MockInferenceServer) -> Vec<String> {
     server
         .requests()
@@ -69,6 +73,7 @@ fn chat_completion_bodies(server: &xai_grok_test_support::MockInferenceServer) -
                 .is_some_and(|id| id.starts_with("xai-turn-summary-"))
         })
         .map(|r| r.body.map(|b| b.to_string()).unwrap_or_default())
+        .filter(|b| !b.contains("session_title"))
         .collect()
 }
 
@@ -106,8 +111,6 @@ fn poisoned_image_session_recovers_within_the_failing_turn() {
         prompt_turn(&conn, &info.id, "hi").await;
 
         let bodies = chat_completion_bodies(&server);
-        eprintln!("BODIES: {:#?}", bodies);
-        eprintln!("IMAGE_MARKER: {}", image_marker);
         assert!(
             bodies.len() >= 2,
             "expected the rejected attempt plus a strip-retry, saw {} request(s)",
@@ -115,8 +118,7 @@ fn poisoned_image_session_recovers_within_the_failing_turn() {
         );
         assert!(
             bodies[0].contains(image_marker),
-            "first attempt must carry the poisoned image; body[0]={}",
-            bodies[0]
+            "first attempt must carry the poisoned image"
         );
         let retry = &bodies[bodies.len() - 1];
         assert!(
