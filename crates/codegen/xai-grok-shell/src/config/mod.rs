@@ -1485,6 +1485,7 @@ fn apply_requirements_inner(
     pin_feature!(video_gen);
     pin_feature!(write_file);
     pin_feature!(voice_mode);
+    pin_feature!(session_search);
     pin_requirement_only!(remote_fetch);
     if let Some(val) = req_bool(req, "telemetry", "trace_upload") {
         config.requirements.trace_upload.pin(val, source.clone());

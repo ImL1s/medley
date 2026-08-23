@@ -200,8 +200,10 @@ pub async fn prompt_turn(
 }
 
 fn set_test_env(grok_home: &std::path::Path, server_url: &str) {
+    let _ = xai_grok_config::pin_grok_home(grok_home.to_path_buf());
     // SAFETY: the only live threads are the mock's HTTP workers, which never read env.
     unsafe {
+        std::env::set_var("MEDLEY_HOME", grok_home);
         std::env::set_var("GROK_HOME", grok_home);
         std::env::set_var("GROK_CLI_CHAT_PROXY_BASE_URL", server_url);
         std::env::set_var("GROK_XAI_API_BASE_URL", server_url);
@@ -234,7 +236,7 @@ where
         .expect("mock runtime");
     let server = std::rc::Rc::new(
         mock_rt
-            .block_on(xai_grok_test_support::MockInferenceServer::start())
+            .block_on(xai_grok_test_support::MockInferenceServer::start_keyless_local())
             .expect("mock server"),
     );
     let grok_home = tempfile::TempDir::new().expect("grok home");

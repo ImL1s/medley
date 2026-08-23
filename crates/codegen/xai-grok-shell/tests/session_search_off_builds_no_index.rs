@@ -15,6 +15,8 @@ use xai_grok_test_support::EnvGuard;
 async fn a_saved_session_is_neither_indexed_nor_found_with_search_off() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
+    let _ = xai_grok_config::pin_grok_home(root.to_path_buf());
+    let _medley_home = EnvGuard::set("MEDLEY_HOME", root);
     let _home = EnvGuard::set("GROK_HOME", root);
     let _off = EnvGuard::set("GROK_SESSION_SEARCH", "0");
 

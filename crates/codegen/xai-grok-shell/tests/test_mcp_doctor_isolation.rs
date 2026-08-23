@@ -13,9 +13,11 @@ fn isolate_home() -> &'static PathBuf {
         std::fs::create_dir_all(&grok).unwrap();
         std::fs::write(grok.join("config.toml"), "").unwrap();
         // SAFETY: this binary's only test; set before any grok_home() call.
+        let _ = xai_grok_config::pin_grok_home(grok.clone());
         unsafe {
             std::env::set_var("HOME", &dir);
             std::env::set_var("USERPROFILE", &dir);
+            std::env::set_var("MEDLEY_HOME", &grok);
             std::env::set_var("GROK_HOME", &grok);
         }
         dir
