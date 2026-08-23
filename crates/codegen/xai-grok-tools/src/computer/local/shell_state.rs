@@ -74,6 +74,9 @@ fn sudo_alias_injection() -> String {
 /// functions, and aliases as base64-encoded replayable shell snippets.
 const DUMP_BASH_STATE_SCRIPT: &str = r##"
 dump_bash_state() {
+  local __grok_allexport=0
+  case "$-" in *a*) __grok_allexport=1 ;; esac
+  builtin set +a 2>/dev/null || true
   set -euo pipefail
   if ! command -v base64 >/dev/null 2>&1; then
     echo "Error: base64 command is required" >&2
@@ -108,6 +111,9 @@ dump_bash_state() {
   # shell-global in bash); replaying them would abort later user commands.
   local posix_opts
   posix_opts=$(builtin shopt -po 2>/dev/null | command grep -vE '^set [-+]o (nounset|errexit|pipefail)$' || true)
+  if [[ "$__grok_allexport" -eq 1 ]]; then
+    posix_opts=$(builtin printf '%s\nset -o allexport' "$posix_opts")
+  fi
   _emit_encoded "$posix_opts" "POSIX_OPTS_B64"
 
   local bash_opts
