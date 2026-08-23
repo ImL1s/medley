@@ -5057,42 +5057,36 @@ async fn enrich_auth_inline_unreachable_server_leaves_auth_unchanged() {
 // token the manager hands out (startup, sync reads, `auth()`), not just fresh
 // login. Each test fails on the pre-fix tree.
 
-/// `jsonwebtoken` needs a process-level CryptoProvider; tests that encode
-/// JWTs can't rely on another test having installed it first.
-fn ensure_crypto_provider() {
-    let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
-}
-
 /// A signed (HS256) access token carrying a `Team` principal, matching the
 /// shape `peek_access_token_principal` extracts in production.
 fn team_jwt(principal_id: &str) -> String {
-    ensure_crypto_provider();
-    jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-        &serde_json::json!({
+    use base64::Engine;
+    let header = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"HS256"}"#);
+    let payload = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(
+        serde_json::json!({
             "sub": "user-1",
             "principal_type": "Team",
             "principal_id": principal_id,
             "exp": 9999999999u64,
-        }),
-        &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
-    )
-    .unwrap()
+        })
+        .to_string(),
+    );
+    format!("{header}.{payload}.mock-signature")
 }
 
 /// An access token carrying `principal_id` but NO `principal_type`.
 fn principal_id_only_jwt(principal_id: &str) -> String {
-    ensure_crypto_provider();
-    jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-        &serde_json::json!({
+    use base64::Engine;
+    let header = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"HS256"}"#);
+    let payload = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(
+        serde_json::json!({
             "sub": "user-1",
             "principal_id": principal_id,
             "exp": 9999999999u64,
-        }),
-        &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
-    )
-    .unwrap()
+        })
+        .to_string(),
+    );
+    format!("{header}.{payload}.mock-signature")
 }
 
 fn pinned_cfg(team: &str) -> GrokComConfig {
