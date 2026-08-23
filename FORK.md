@@ -92,6 +92,40 @@ On every sync PR, review upstream diffs that touch:
 
 Prefer keeping fork intent on auth hotspots (`AuthScheme::None`, `local.none`, no ambient xAI credential leak) rather than blindly taking upstream.
 
+## Conflicts git does not report
+
+A textual conflict is not the only kind, and it is not the expensive kind. Twice
+on PR #383 a merge produced a tree where **both halves were individually correct
+and jointly wrong**, with no conflict markers, because the halves lived in
+*different files*. Both trace to the same commit, `d6d096ce`:
+
+- It stopped `resolved_auth_path` reading `GROK_AUTH_PATH` under `cfg!(test)`, so
+  in-process tests could not clobber each other through a process-global
+  (production still honours the env). A test on the other side pointed its
+  fixture at an auth.json with `EnvGuard::set("GROK_AUTH_PATH", ...)` — the
+  channel that had just been closed. It read `state_home/auth.json`, which
+  nothing wrote, and failed an hour into CI.
+- It taught `resolve_credentials` to drop an ambient xAI credential bound for a
+  non-first-party origin and migrated three sibling call sites, missing a
+  fourth. The mismatch surfaced only once the merge put the two sides together.
+
+The generalisation, and the thing to check on every merge into `providers`:
+**when one side changes how a value is *plumbed*, grep the other side for the
+old channel by name.** Merge-base reasoning answers *who deleted this?*; it does
+not answer *who is still calling it?* A closed channel usually has surviving
+callers, and they compile.
+
+In order, cheapest first:
+
+- `git log --merge -p -- <file>` shows nothing for conflicts of this shape, by
+  definition. Do not read that silence as safety.
+- After resolving, grep the whole tree for every env var, setter, or flag the
+  incoming side removed or gated — including `#[cfg(test)]` code, which
+  `cargo check --lib` and clippy on `--lib` never compile.
+- `cargo test --workspace --no-run` compiles those targets without running them.
+  That catches callers which stopped *compiling*. It cannot catch the ones that
+  still compile and now read the wrong thing — only the grep does.
+
 ## Tagging
 
 Release tags track upstream plus a fork counter:
