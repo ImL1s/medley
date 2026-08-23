@@ -8678,6 +8678,7 @@ reasoning_effort = "low"
     /// The session bearer resolver must never cross a provider boundary or
     /// replace a resolver already owned by the auxiliary model.
     #[test]
+    #[serial_test::serial]
     fn session_resolver_is_only_stamped_between_xai_samplers() {
         #[derive(Debug)]
         struct SessionResolver;
@@ -11376,6 +11377,7 @@ reasoning_effort = "low"
     }
 
     #[test]
+    #[serial_test::serial]
     fn user_override_adds_api_key_to_default_model() {
         let dm = crate::models::default_model();
         let raw_config: toml::Value = toml::from_str(&format!(
@@ -17635,7 +17637,7 @@ default = "grok-4.5"
         assert_eq!(r.source, ConfigSource::Remote);
     }
     #[test]
-    #[serial_test::serial(remote_sig_disarm)]
+    #[serial_test::serial]
     fn remote_settings_disarm_managed_config_signatures() {
         xai_grok_config::signed_policy::apply_remote_managed_config_signature_verification(
             Some(true),
@@ -17670,6 +17672,20 @@ default = "grok-4.5"
     #[test]
     #[serial_test::serial]
     fn remote_settings_disarm_requires_prod_proxy_when_keys_embedded() {
+        struct EnvCleanup;
+        impl Drop for EnvCleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("GROK_CLI_CHAT_PROXY_BASE_URL");
+                }
+                xai_grok_config::signed_policy::apply_remote_managed_config_signature_verification(
+                    Some(true),
+                    true,
+                );
+            }
+        }
+        let _cleanup = EnvCleanup;
+
         xai_grok_config::signed_policy::apply_remote_managed_config_signature_verification(
             Some(true),
             true,
@@ -17702,13 +17718,6 @@ default = "grok-4.5"
         assert!(
             xai_grok_config::signed_policy::verification_active(),
             "env-overridden proxy must not be able to disarm keyed verification"
-        );
-        unsafe {
-            std::env::remove_var("GROK_CLI_CHAT_PROXY_BASE_URL");
-        }
-        xai_grok_config::signed_policy::apply_remote_managed_config_signature_verification(
-            Some(true),
-            true,
         );
     }
 }
