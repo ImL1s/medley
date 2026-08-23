@@ -95,7 +95,9 @@ dump_bash_state() {
       command base64 <<<"$content" | command tr -d '\n'
       builtin printf '\nGROK_SNAP_EOF_%s\n' "$var_name"
       builtin printf ')\n'
+      builtin printf 'builtin declare +x grok_snap_%s 2>/dev/null || true\n' "$var_name"
       builtin printf 'eval "$grok_snap_%s"\n' "$var_name"
+      builtin printf 'builtin unset grok_snap_%s 2>/dev/null || true\n' "$var_name"
     fi
   }
 
@@ -154,7 +156,9 @@ function dump_zsh_state() {
       command base64 <<<"$content" | command tr -d '\n'
       builtin printf '\nGROK_SNAP_EOF_%s\n' "$var_name"
       builtin printf ')\n'
+      builtin printf 'builtin typeset +x grok_snap_%s 2>/dev/null || true\n' "$var_name"
       builtin printf 'eval "$grok_snap_%s"\n' "$var_name"
+      builtin printf 'builtin unset grok_snap_%s 2>/dev/null || true\n' "$var_name"
     fi
   }
 
@@ -448,7 +452,7 @@ impl ShellState {
                 // eval so it can never reach child processes or the state
                 // dump (`export -p`).
                 "{dump_script} \
-                 snap=$(command cat <&3); builtin shopt -s extglob 2>/dev/null || true; builtin eval -- \"$snap\" 2>/dev/null || true; \
+                 snap=$(command cat <&3); builtin declare +x snap 2>/dev/null || true; builtin shopt -s extglob 2>/dev/null || true; builtin eval -- \"$snap\" 2>/dev/null || true; builtin unset snap 2>/dev/null || true; \
                  {{ builtin set +u 2>/dev/null || true; \
                  builtin export GROK_AGENT=1; \
                  builtin export PWD=\"$(builtin pwd)\"; \
@@ -464,10 +468,10 @@ impl ShellState {
             // them identically).
             ShellKind::Zsh => format!(
                 "{dump_script} \
-                 snap=$(command cat <&3); \
+                 snap=$(command cat <&3); builtin typeset +x snap 2>/dev/null || true; \
                  builtin unsetopt aliases 2>/dev/null; \
                  builtin unalias -m '*' 2>/dev/null || true; \
-                 builtin eval \"$snap\" 2>/dev/null || true; \
+                 builtin eval \"$snap\" 2>/dev/null || true; builtin unset snap 2>/dev/null || true; \
                  {{ builtin unsetopt nounset 2>/dev/null || true; \
                  builtin setopt nonomatch 2>/dev/null || true; \
                  builtin export GROK_AGENT=1; \
