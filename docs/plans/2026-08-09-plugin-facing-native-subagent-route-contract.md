@@ -68,7 +68,7 @@ Medley already has:
 - capability ceilings, tool filtering, background execution, worktree isolation, persistence, and resume;
 - declarative plugin agents;
 - typed credential/effective-route/access foundations in related work;
-- a native `/agents` modal listing built-in, user, project, bundled, and plugin definitions.
+- a native `/agents` modal listing built-in, user, project, and bundled definitions.
 
 The missing seam is a consumer-facing request/receipt contract and route-aware agent UX that do not rebuild provider or credential logic.
 
@@ -157,7 +157,8 @@ unknown
 Only `supported` authorizes use. Capability discovery performs no inference request and exposes no credential/account data.
 
 The Rust sketches below are the 2026-08-09 shape. The shipped types are in
-`xai-grok-subagent-resolution::native_route::types` and differ in several fields;
+`xai_grok_subagent_resolution::native_route` (the `types` module is private and
+re-exported there) and differ in several fields;
 read them there rather than copying from here.
 
 ## Request contract
@@ -275,8 +276,8 @@ Every candidate independently resolves credential/access identity. No credential
 
 ```rust
 enum WorkerRoute {
-    Native(NativeSubagentRouteRequest),
-    ExternalExecutor(ExternalExecutorDescriptor),
+    Native(Box<NativeSubagentRouteRequest>),
+    ExternalExecutor { descriptor: String },
 }
 ```
 
