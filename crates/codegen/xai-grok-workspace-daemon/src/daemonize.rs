@@ -888,13 +888,21 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[allow(clippy::disallowed_methods)] // test fixture; the test kills it
     fn spawn_predecessor() -> Child {
-        Command::new("sleep")
+        let child = Command::new("sleep")
             .arg("300")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn sleep")
+            .expect("spawn sleep");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if process_name_matches(child.id(), "sleep") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        child
     }
 
     /// Wait (bounded) for a child to exit; returns true if it did.
