@@ -1412,13 +1412,28 @@ mod tests {
             other => panic!("expected SetDefaultModel(issue17-catalog-b), got {other:?}"),
         }
 
-        // Typed display name still resolves, but must not be the picker path.
+        // A typed colliding display name is refused, not silently resolved.
+        //
+        // This assertion previously expected the first match (`id_a`). That was
+        // written before `06208096` (#388) made an ambiguous name an error, and
+        // the two halves first coexisted at the providers merge on this branch.
+        // Refusing is the behaviour to keep: picking one of two rows the user
+        // cannot tell apart is the same defect this test's own header describes
+        // for the picker, one input away. It is also what #260's third
+        // criterion was closed on, and `run_model_session_flag_rejects_ambiguous`
+        // already pins the same refusal on the `--session` path -- so the old
+        // expectation contradicted a sibling in this same file.
         let mut ctx = dummy_exec_ctx(&state);
         match ModelCommand.run(&mut ctx, display) {
-            CommandResult::Action(Action::SetDefaultModel(resolved)) => {
-                assert_eq!(resolved, id_a);
+            CommandResult::Error(msg) => {
+                assert!(
+                    msg.contains("Ambiguous model name") && msg.contains("model id"),
+                    "the refusal must name the way out, not just say no: {msg}"
+                );
             }
-            other => panic!("expected first-name match for typed display, got {other:?}"),
+            other => {
+                panic!("expected an ambiguity refusal for a typed display name, got {other:?}")
+            }
         }
     }
 
