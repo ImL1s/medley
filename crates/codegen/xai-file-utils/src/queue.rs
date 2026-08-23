@@ -2396,6 +2396,14 @@ fn cleanup_queue_dir(queue_dir: &Path, max_age: Duration, stats: Option<&UploadQ
         } else if std::fs::remove_file(&path).is_ok() {
             cleaned += 1;
             cleaned_bytes += metadata.len();
+            let name_str = name.to_string_lossy();
+            if let Some(stem) = name_str.strip_suffix(SIDECAR_SUFFIX) {
+                let companion_path = path.with_file_name(stem);
+                let _ = std::fs::remove_file(companion_path);
+            } else {
+                let companion_path = sidecar_path_for(&path);
+                let _ = std::fs::remove_file(companion_path);
+            }
             if let Some(stats) = stats
                 && is_mismatched_queue_file(&name, &all_names)
             {
