@@ -62,7 +62,7 @@ Consumers negotiate versioned capabilities rather than guessing from the
 executable name.
 
 The canonical page is
-[`docs/architecture/native-subagent-route-contract.md`](../../../../../docs/architecture/native-subagent-route-contract.md).
+[`docs/architecture/native-subagent-route-contract.md`](https://github.com/ImL1s/medley/blob/providers/docs/architecture/native-subagent-route-contract.md).
 `/agents` compact rows include a non-color route status, selection intent, and
 capability floor; expanded details show `models:` candidates, receipt fields,
 and a lifecycle card when present. Live spawn resolves ordered `models:` and

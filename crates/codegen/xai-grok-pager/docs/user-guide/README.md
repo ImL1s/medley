@@ -65,7 +65,7 @@ Automate, script, and integrate Medley with other systems.
 |---|----------|-------------|
 | 14 | [Headless Mode and Scripting](14-headless-mode.md) | `grok -p`, output formats, CI/CD integration, and piping |
 | 15 | [Agent Mode and IDE Integration](15-agent-mode.md) | ACP stdio transport, WebSocket relay, and SDK integration |
-| 16 | [Subagents and Personas](16-subagents.md) | Parallel child sessions, agent types, personas, capability modes, and the optional native route contract |
+| 16 | [Subagents and Personas](16-subagents.md) | Parallel child sessions, agent types, personas, capability modes, and the [optional native route contract](https://github.com/ImL1s/medley/blob/providers/docs/architecture/native-subagent-route-contract.md) |
 | 17 | [Session Management](17-sessions.md) | Save, load, resume, rewind, compact, and the session persistence format |
 | 18 | [Sandbox Mode](18-sandbox.md) | OS-level filesystem and network isolation profiles |
 | 19 | [Plan Mode](19-plan-mode.md) | Structured planning, plan-file edits, and approval before coding |
