@@ -33,9 +33,10 @@ Scope and deliberate omissions:
   little as possible. The cost is that an inline `](../x)` example is
   reported; write it in a fence.
 - Destinations are taken as a reader's tool would follow them: character
-  references and backslash escapes are decoded, and an angle-bracketed
-  destination may contain spaces. Decoding can only reveal more parent
-  components, never fewer.
+  references and backslash escapes are decoded, an angle-bracketed
+  destination may contain spaces, and a fragment or query is dropped before
+  the path is classified. Decoding can only reveal more parent components,
+  never fewer.
 
 Every choice above errs towards a visible false positive over a silent
 broken link, which is the safe direction for a guard.
@@ -127,7 +128,10 @@ def _target_of(match: re.Match[str]) -> str:
     parent components, never fewer, so it cannot mask an escape.
     """
     raw = next(group for group in match.groups() if group is not None)
-    return BACKSLASH_ESCAPE.sub(r"\1", html.unescape(raw))
+    decoded = BACKSLASH_ESCAPE.sub(r"\1", html.unescape(raw))
+    # A fragment or query is not part of the path: `..?download` and `..#top`
+    # both address the parent directory.
+    return re.split(r"[#?]", decoded, maxsplit=1)[0].strip()
 
 
 def _escapes(rel_dir: str, target: str) -> bool:
@@ -145,7 +149,7 @@ def _offending_links() -> list[str]:
         rel_dir = posixpath.dirname(path.relative_to(GUIDE).as_posix()) or "."
         for pattern in (INLINE_LINK, REFERENCE_DEF, HTML_HREF):
             for match in pattern.finditer(text):
-                target = _target_of(match).split("#", 1)[0].strip()
+                target = _target_of(match)
                 if not target or target.startswith("//") or HAS_SCHEME.match(target):
                     continue
                 if _escapes(rel_dir, target):
@@ -216,7 +220,7 @@ class LinkDetectionTests(unittest.TestCase):
         text = _blank_code(body)
         for pattern in (INLINE_LINK, REFERENCE_DEF, HTML_HREF):
             for match in pattern.finditer(text):
-                target = _target_of(match).split("#", 1)[0].strip()
+                target = _target_of(match)
                 if not target or target.startswith("//") or HAS_SCHEME.match(target):
                     continue
                 if _escapes(".", target):
@@ -328,6 +332,13 @@ class LinkDetectionTests(unittest.TestCase):
         """A browser follows `..&#47;..&#47;x.md` as `../../x.md`."""
         self.assertTrue(self._flags('<a href="..&#47;..&#47;escaped.md">x</a>\n'))
         self.assertFalse(self._flags('<a href="11-custom&#45;models.md">x</a>\n'))
+
+    def test_query_and_fragment_are_not_path_components(self) -> None:
+        """`..?download` addresses the parent directory (Codex, #404)."""
+        self.assertTrue(self._flags("[x](..?download)\n"))
+        self.assertTrue(self._flags("[x](../..?a=b)\n"))
+        self.assertTrue(self._flags("[x](..#top)\n"))
+        self.assertFalse(self._flags("[x](11-custom-models.md?raw=1)\n"))
 
     def test_blanking_preserves_line_numbers(self) -> None:
         body = "one\n```\nfenced\n```\nfour\n[x](../../escaped.md)\n"
