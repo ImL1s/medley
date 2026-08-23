@@ -333,6 +333,32 @@
     }
 
     #[test]
+    fn apply_retry_state_disk_full_pushes_session_event() {
+        use xai_grok_shell::extensions::notification::{
+            DISK_FULL_ERROR_TYPE, DISK_FULL_USER_MESSAGE,
+        };
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+    http_status: None,
+                error_type: DISK_FULL_ERROR_TYPE.into(),
+                message: DISK_FULL_USER_MESSAGE.into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        match scrollback.last().map(|e| &e.block) {
+            Some(RenderBlock::SessionEvent(ev)) => {
+                assert!(matches!(ev.event, SessionEvent::DiskFull));
+                assert_eq!(ev.event.message(), DISK_FULL_USER_MESSAGE);
+            }
+            other => panic!("expected DiskFull session event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_retry_state_credit_limit_exhausted_preserves_in_flight_prompt() {
         let mut session = make_session(Some("s1"));
         let mut scrollback = ScrollbackState::new();
@@ -375,7 +401,8 @@
         });
         apply_retry_state(
             &RetryState::Failed {
-                error_type: "proxy_error".into(),
+    http_status: None,
+                error_type: "api".into(),
                 message: "status 403: run out of credits".into(),
             },
             &mut session,
@@ -404,7 +431,8 @@
         });
         apply_retry_state(
             &RetryState::Failed {
-                error_type: "proxy_error".into(),
+    http_status: None,
+                error_type: "api".into(),
                 message:
                     "API error (status 402 Payment Required): Grok Build usage balance exhausted"
                         .into(),
@@ -431,7 +459,8 @@
         });
         apply_retry_state(
             &RetryState::Failed {
-                error_type: "server_error".into(),
+    http_status: None,
+                error_type: "api".into(),
                 message: "internal server error".into(),
             },
             &mut session,
@@ -468,7 +497,7 @@
         ));
         // Unrelated failures must not be treated as re-authable.
         assert!(!is_reauthable_failure(
-            Some("server_error"),
+            Some("api"),
             "internal server error"
         ));
         assert!(!is_reauthable_failure(Some("api"), "model not found"));
@@ -482,6 +511,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "auth".into(),
                 message: "Unauthorized (401) from https://cli-chat-proxy.grok.com/v1/messages: \
                           no auth context"
@@ -514,6 +544,7 @@
         });
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "auth".into(),
                 message: "Unauthorized (401) from https://proxy/v1/messages".into(),
             },
@@ -534,6 +565,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api".into(),
                 message: "Unauthorized (401) from https://proxy/v1/responses: invalid credentials"
                     .into(),
@@ -554,6 +586,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "legacy_auth".into(),
                 message: format!(
                     "Unauthorized (401) ... deprecated authentication method (WebLogin) ... \
@@ -569,22 +602,93 @@
         ));
     }
 
-    /// Non-auth terminal failures still render the standard RetryFailed.
+    /// Non-auth terminal failures render the formatted RequestFailed banner
+    /// (same visual treatment as 401 re-auth), not a raw RetryFailed dump.
     #[test]
-    fn apply_retry_state_generic_failure_still_shows_retry_failed() {
+    fn apply_retry_state_generic_failure_shows_request_failed_banner() {
         let mut session = make_session(Some("s1"));
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
-                error_type: "server_error".into(),
-                message: "internal server error".into(),
+    http_status: None,
+                error_type: "api".into(),
+                message: r#"API error (status 500 Internal Server Error): {"error":"upstream exploded"}"#.into(),
             },
             &mut session,
             &mut scrollback, false);
-        assert!(matches!(
-            last_session_event(&scrollback),
-            Some(SessionEvent::RetryFailed { .. })
-        ));
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::RequestFailed {
+                status,
+                headline,
+                detail,
+            }) => {
+                assert_eq!(status, Some(500));
+                assert_eq!(headline, "Server error (500)");
+                assert_eq!(
+                    detail,
+                    "Something went wrong on our side. Wait a minute and send again."
+                );
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_retry_state_typed_400_preserves_safe_detail() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: "api".into(),
+                http_status: Some(400),
+                message: "Provider request failed (HTTP 400). invalid field `reasoning.effort`"
+                    .into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::RequestFailed {
+                status,
+                headline,
+                detail,
+            }) => {
+                assert_eq!(status, Some(400));
+                assert_eq!(headline, "Bad request (400)");
+                assert_eq!(detail, "invalid field `reasoning.effort`");
+            }
+            other => panic!("expected typed RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_retry_state_403_shows_clean_denied_banner() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+    http_status: None,
+                error_type: "api".into(),
+                message: "API error (status 403 Forbidden): Access to the chat endpoint is denied"
+                    .into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::RequestFailed {
+                status,
+                headline,
+                detail,
+            }) => {
+                assert_eq!(status, Some(403));
+                assert_eq!(headline, "Request denied (403)");
+                assert_eq!(detail, "Access to the chat endpoint is denied");
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
     }
 
     /// A context overflow surfaces the actionable `ContextTooLarge` prompt (not the
@@ -595,6 +699,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "context_length".into(),
                 message: "API error (status 500): the prompt is too long for this model's \
                           context window"
@@ -611,6 +716,33 @@
         );
     }
 
+    /// Overflow-shaped copy without `error_type=context_length` must not take
+    /// the ContextTooLarge path — the shell is what tags overflow.
+    #[test]
+    fn apply_retry_state_overflow_copy_without_type_is_not_context_too_large() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+    http_status: None,
+                error_type: "api".into(),
+                message: "API error (status 500): the prompt is too long for this model's \
+                          context window"
+                    .into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        assert!(
+            matches!(
+                last_session_event(&scrollback),
+                Some(SessionEvent::RequestFailed { .. })
+            ),
+            "without error_type=context_length this is a generic banner, not overflow UX"
+        );
+    }
+
     /// When the compaction handler already showed its "too large to compact" message,
     /// the overflow path does NOT stack a second `ContextTooLarge` prompt on top.
     #[test]
@@ -622,6 +754,7 @@
         }));
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "context_length".into(),
                 message: "the prompt is too long for this model's context window".into(),
             },
@@ -672,6 +805,104 @@
             }
             other => panic!("expected deferred CompactionCompleted, got {other:?}"),
         }
+    }
+
+    /// Gate 6: auto-compaction activity + deferred completion (distinct from
+    /// manual `/compact` Gate 5).
+    ///
+    /// ACTIVE: `AutoCompactStarted` → `TurnActivity::AutoCompacting` +
+    /// `SessionEvent::CompactionStarted` user text containing "Compacting…".
+    /// COMPLETE: `AutoCompactCompleted` deferred until `finish_turn`, then
+    /// `SessionEvent::CompactionCompleted` message contains "Context compacted".
+    #[test]
+    fn auto_compaction_renders_activity_and_completion() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+
+        // ACTIVE half — auto-compact start sets activity and user-facing start line.
+        let started = XaiSessionUpdate::AutoCompactStarted {
+            tokens_used: 90_000,
+            context_window: 131_072,
+            percentage: 85,
+            reason: "threshold".into(),
+        };
+        assert!(apply_session_event(
+            &started,
+            &mut session,
+            &mut scrollback,
+            false
+        ));
+        assert_eq!(
+            session.tracker.activity(),
+            Some(TurnActivity::AutoCompacting),
+            "AutoCompactStarted must set AutoCompacting activity"
+        );
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::CompactionStarted { percentage }) => {
+                assert_eq!(percentage, 85);
+                let msg = SessionEvent::CompactionStarted { percentage: 85 }.message();
+                assert!(
+                    msg.contains("Compacting…"),
+                    "CompactionStarted user text must include Compacting…, got: {msg}"
+                );
+            }
+            other => panic!("expected CompactionStarted, got {other:?}"),
+        }
+
+        // COMPLETE half — live completion is deferred; activity clears immediately.
+        let completed = XaiSessionUpdate::AutoCompactCompleted {
+            tokens_before: Some(90_000),
+            tokens_after: 20_000,
+            elapsed_ms: Some(500),
+            summary_preview: None,
+        };
+        assert!(apply_session_event(
+            &completed,
+            &mut session,
+            &mut scrollback,
+            false
+        ));
+        assert_eq!(
+            session.tracker.activity(),
+            None,
+            "AutoCompactCompleted clears compaction activity"
+        );
+        assert!(
+            !matches!(
+                last_session_event(&scrollback),
+                Some(SessionEvent::CompactionCompleted { .. })
+            ),
+            "live AutoCompactCompleted must not push CompactionCompleted immediately"
+        );
+        assert!(
+            matches!(
+                last_session_event(&scrollback),
+                Some(SessionEvent::CompactionStarted { .. })
+            ),
+            "scrollback still ends on CompactionStarted until finish_turn"
+        );
+
+        session.finish_turn(&mut scrollback);
+        match last_session_event(&scrollback) {
+            Some(event @ SessionEvent::CompactionCompleted { .. }) => {
+                let msg = event.message();
+                assert!(
+                    msg.contains("Context compacted"),
+                    "auto complete message must contain Context compacted, got: {msg}"
+                );
+                // Distinct from manual CompactCompleted wording (Gate 5).
+                assert!(
+                    !msg.contains("Compaction completed in"),
+                    "auto path must not use manual CompactCompleted wording: {msg}"
+                );
+            }
+            other => panic!("expected deferred CompactionCompleted after finish_turn, got {other:?}"),
+        }
+        assert_eq!(
+            session.tracker.activity(),
+            None,
+            "activity remains cleared after finish_turn flushes deferred completion"
+        );
     }
 
     #[test]
@@ -895,6 +1126,7 @@
         assert!(!session.model_incompatible);
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "encrypted_content_mismatch".into(),
                 message: "incompatible history".into(),
             },
@@ -914,6 +1146,7 @@
 
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api_400".into(),
                 message: "bad request".into(),
             },
@@ -924,4 +1157,3 @@
             "non-encrypted_content error types must not set model_incompatible"
         );
     }
-

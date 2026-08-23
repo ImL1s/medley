@@ -498,6 +498,7 @@ fn write_summary(
         num_messages: 8 + ordinal % 24,
         num_chat_messages: 8 + ordinal % 24,
         current_model_id: acp::ModelId::new("benchmark-model"),
+        catalog_identity: None,
         parent_session_id: None,
         forked_at: None,
         collection_id: None,
@@ -523,6 +524,8 @@ fn write_summary(
         agent_name: Some("benchmark-agent".to_owned()),
         sandbox_profile: Some("workspace".to_owned()),
         reasoning_effort: None,
+        last_turn_summary: None,
+        last_turn_summary_prompt_id: None,
     };
     let summary_path = session_dir.join("summary.json");
     let bytes = serde_json::to_vec_pretty(&summary).expect("serialize summary");

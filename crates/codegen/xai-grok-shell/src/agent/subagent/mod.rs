@@ -36,16 +36,19 @@ use xai_file_utils::events::types::CancellationCategory;
 use xai_grok_agent::config::{McpInheritance, ModelOverride, PermissionMode};
 use xai_grok_sampling_types::conversation::ConversationItem;
 use xai_grok_subagent_resolution::ResumeSourceData;
+use xai_grok_subagent_resolution::native_route::{
+    ResumePin, RouteReceipt, request_from_agent_definition, resolve_native_route,
+};
 use xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer;
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
-    ChildCompletion, ChildControl, ChildReporter, ChildRunOutput, LocalBoxFuture, StartedChild,
-    SubagentProgress,
+    ChildCompletion, ChildControl, ChildRunOutput, LocalBoxFuture, StartedChild, SubagentProgress,
 };
 use xai_grok_tools::implementations::grok_build::task::types::*;
 use xai_grok_tools::types::tool::ToolKind;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod handle_request;
+mod native_route_live;
 pub(crate) use handle_request::run_shell_child;
 /// Command channels for live child sessions that participate in managed-gateway
 /// admission and refresh barriers.
@@ -88,7 +91,7 @@ impl AutoCompactThresholdTiers {
     /// Slice the parent's `Config` into the four tier inputs we'll resolve
     /// against later. Only fields relevant to the auto-compact threshold
     /// are captured; the parent's `Config` is not held by reference.
-    pub fn capture(cfg: &crate::agent::config::Config) -> Self {
+    pub(crate) fn capture(cfg: &crate::agent::config::Config) -> Self {
         let user_per_model = cfg
             .config_models
             .iter()
@@ -122,6 +125,9 @@ pub(crate) struct SubagentSpawnContext {
     /// context is built (an async snapshot from the parent session actor).
     pub client_hooks: crate::extensions::hooks::ClientHooks,
     pub sampling_config: xai_grok_sampler::SamplerConfig,
+    /// Catalog identity that owns the process-level `sampling_config`
+    /// baseline. It stays fixed when a session switches models.
+    pub sampling_config_model_id: acp::ModelId,
     pub managed_mcp_proxy_base_url: String,
     /// The staging auth header value propagated from the parent. Used
     /// when materialising subagent `SamplerConfig`s for auth-flow tracking
@@ -141,6 +147,7 @@ pub(crate) struct SubagentSpawnContext {
     pub subagent_event_tx: mpsc::UnboundedSender<SubagentEvent>,
     pub parent_depth: u32,
     pub subagents_max_depth: u32,
+    pub workflow_max_concurrent_agents: usize,
     /// Inference idle timeout (secs), resolved from the parent's model config at spawn-context creation time.
     pub inference_idle_timeout_secs: u64,
     /// Tier inputs for resolving `auto_compact_threshold_percent` at
@@ -187,6 +194,9 @@ pub(crate) struct SubagentSpawnContext {
     pub memory_config: Option<crate::config::MemoryConfig>,
     /// Resolved sampling config for web_search.
     pub web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    /// Parent session's configured web-search model at spawn time.
+    pub web_search_model: String,
+    pub web_search_follows_default: bool,
     /// Resolved config for web fetch.
     pub web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     /// Image generation config (parent-inherited).
@@ -270,6 +280,7 @@ pub(crate) struct SubagentSpawnContext {
     pub worktree_type: crate::util::config::WorktreeType,
     pub api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     pub image_description_model: String,
+    pub image_description_follows_default: bool,
     /// Dual-mode workspace operations handle.
     pub workspace_ops: xai_grok_workspace::WorkspaceOps,
     pub auth_manager: std::sync::Arc<crate::auth::AuthManager>,
@@ -347,14 +358,14 @@ impl SubagentSpawnContext {
     /// resolver: env > user [model.<id>] > user [session] > GB per-model
     /// > GB global > 85.
     ///
-    /// The GB per-model tier is read from `available_models` (the same
-    /// catalog used to pick the subagent's `SamplerConfig`); user TOML and
-    /// GB global tiers are sourced from the parent's snapshot captured at
-    /// spawn-context build time.
-    pub(crate) fn resolve_auto_compact_threshold_percent(&self, subagent_model_id: &str) -> u8 {
-        let gb_per_model =
-            crate::agent::config::find_model_by_id(&self.available_models, subagent_model_id)
-                .and_then(|e| e.info.auto_compact_threshold_percent);
+    /// The caller supplies the GB per-model tier from the same prepared
+    /// catalog snapshot as the subagent's `SamplerConfig`; user TOML and GB
+    /// global tiers remain sourced from the parent's spawn-context snapshot.
+    pub(crate) fn resolve_auto_compact_threshold_percent(
+        &self,
+        subagent_model_id: &str,
+        gb_per_model: Option<u8>,
+    ) -> u8 {
         crate::util::config::resolve_auto_compact_threshold_percent_from_tiers(
             self.auto_compact_threshold_tiers
                 .user_per_model
@@ -467,13 +478,17 @@ impl ChildControl for ShellChildRuntime {
         })
     }
     fn cancel(&self) {
-        let _ = self.child_handle.cmd_tx.send(SessionCommand::Cancel {
-            cancel_subagents: true,
-            kill_background_tasks: true,
-            rewind_if_pristine: false,
-            trigger: None,
-        });
-        let _ = self.child_handle.cmd_tx.send(SessionCommand::Shutdown);
+        let _ =
+            self.child_handle
+                .cmd_tx
+                .send(SessionCommand::Cancel(crate::session::CancelOptions {
+                    cancel_subagents: true,
+                    kill_background_tasks: true,
+                    ..Default::default()
+                }));
+        let _ = self.child_handle.cmd_tx.send(SessionCommand::Shutdown(
+            crate::session::ShutdownKind::Graceful,
+        ));
     }
 }
 #[derive(Default)]
@@ -610,23 +625,25 @@ pub(crate) fn present_child_completion(
 /// intentionally ignored. Subagent prompt/toolset is always determined by
 /// the `AgentDefinition`, not the model. See design spec
 /// "Behavioral Rules section 3".
-async fn resolve_subagent_sampling_config(
+async fn resolve_subagent_prepared_model(
     agent_name: &str,
     agent_model: &xai_grok_agent::config::ModelOverride,
     ctx: &SubagentSpawnContext,
-) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
-    let (parent_config, parent_mid) = read_parent_sampling_config(ctx).await;
+) -> PreparedSubagentModel {
+    let parent = read_parent_prepared_model(ctx).await;
+    let parent_config = &parent.sampling_config;
+    let parent_mid = &parent.model_id;
     let try_pin = |model_id: &str, source: &'static str, unknown_msg: &'static str| {
-        match resolve_model_override_to_config(model_id, ctx) {
-            Some((config, canonical_id)) => {
+        match resolve_model_override_to_prepared(model_id, ctx) {
+            Some(prepared) => {
                 log_subagent_model_resolution(
                     agent_name,
                     source,
-                    &config,
-                    &canonical_id,
-                    &parent_config,
+                    &prepared.sampling_config,
+                    &prepared.model_id,
+                    parent_config,
                 );
-                Some((config, canonical_id))
+                Some(prepared)
             }
             None => {
                 tracing::warn!(agent = agent_name, model_id, "{unknown_msg}");
@@ -655,11 +672,20 @@ async fn resolve_subagent_sampling_config(
     log_subagent_model_resolution(
         agent_name,
         "inherit_parent",
-        &parent_config,
-        &parent_mid,
-        &parent_config,
+        parent_config,
+        parent_mid,
+        parent_config,
     );
-    (parent_config, parent_mid)
+    parent
+}
+
+async fn resolve_subagent_sampling_config(
+    agent_name: &str,
+    agent_model: &xai_grok_agent::config::ModelOverride,
+    ctx: &SubagentSpawnContext,
+) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+    let prepared = resolve_subagent_prepared_model(agent_name, agent_model, ctx).await;
+    (prepared.sampling_config, prepared.model_id)
 }
 /// Resolve a subagent's effective sampling config + model id, honoring the
 /// model-resolution precedence (Key Decision #16).
@@ -674,14 +700,14 @@ async fn resolve_subagent_sampling_config(
 ///
 /// Extracted from `run_shell_child` so the precedence is unit-testable
 /// without spawning a child session.
-async fn resolve_effective_model_config(
+async fn resolve_effective_prepared_model(
     runtime_override_model: Option<&str>,
     subagent_type: &str,
     definition_model: &xai_grok_agent::config::ModelOverride,
     ctx: &SubagentSpawnContext,
-) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+) -> PreparedSubagentModel {
     if let Some(model_id) = runtime_override_model {
-        if let Some(resolved) = resolve_model_override_to_config(model_id, ctx) {
+        if let Some(resolved) = resolve_model_override_to_prepared(model_id, ctx) {
             return resolved;
         }
         tracing::warn!(
@@ -689,7 +715,191 @@ async fn resolve_effective_model_config(
             "Runtime model override references unknown model, falling through"
         );
     }
-    resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
+    resolve_subagent_prepared_model(subagent_type, definition_model, ctx).await
+}
+
+async fn resolve_request_prepared_model(
+    fork_context: bool,
+    runtime_override_model: Option<&str>,
+    subagent_type: &str,
+    definition_model: &xai_grok_agent::config::ModelOverride,
+    ctx: &SubagentSpawnContext,
+) -> PreparedSubagentModel {
+    if fork_context {
+        // Forked history is model-bound. Keep the committed parent tuple even
+        // when its exact catalog key disappears; the caller can then fail
+        // closed on missing harness facts instead of falling through to a
+        // lower-priority model pin.
+        read_parent_prepared_model(ctx).await
+    } else {
+        resolve_effective_prepared_model(
+            runtime_override_model,
+            subagent_type,
+            definition_model,
+            ctx,
+        )
+        .await
+    }
+}
+
+struct NativeRoutePrepared {
+    prepared: PreparedSubagentModel,
+    receipt: Option<RouteReceipt>,
+}
+
+fn native_route_now_ms() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+fn runtime_or_config_pin_resolves(
+    runtime_override_model: Option<&str>,
+    subagent_type: &str,
+    ctx: &SubagentSpawnContext,
+) -> bool {
+    if runtime_override_model
+        .is_some_and(|model_id| resolve_model_override_to_prepared(model_id, ctx).is_some())
+    {
+        return true;
+    }
+    ctx.subagent_model_overrides
+        .get(subagent_type)
+        .is_some_and(|model_id| resolve_model_override_to_prepared(model_id, ctx).is_some())
+}
+
+/// Live native-route resolution for spawn. Ordered `models:` and exact
+/// `model:` are fail-closed. Runtime / `[subagents.models]` pins still win
+/// when they resolve. Unknown exact ids never inherit.
+///
+/// `harness_definition` is the pre-CLI-overlay spawn definition used by
+/// model-harness preflight. Incompatible catalog harnesses are skipped so
+/// ordered fallback can select a later candidate that can actually spawn.
+async fn resolve_request_prepared_model_with_native_route(
+    fork_context: bool,
+    runtime_override_model: Option<&str>,
+    subagent_type: &str,
+    definition: &xai_grok_agent::AgentDefinition,
+    harness_definition: &xai_grok_agent::AgentDefinition,
+    ctx: &SubagentSpawnContext,
+    child_session_id: Option<&str>,
+    resume: Option<ResumePin>,
+    allow_native_ordered: bool,
+) -> Result<NativeRoutePrepared, String> {
+    let catalog = native_route_live::synthetic_catalog_from_available_models(&ctx.available_models);
+    let now = native_route_now_ms();
+    let exact_or_ordered = !definition.models.is_empty()
+        || matches!(
+            definition.model,
+            xai_grok_agent::config::ModelOverride::Override(_)
+        );
+    if !fork_context
+        && allow_native_ordered
+        && exact_or_ordered
+        && !runtime_or_config_pin_resolves(runtime_override_model, subagent_type, ctx)
+    {
+        let mut route_definition = definition.clone();
+        if !route_definition.models.is_empty() {
+            route_definition.models.retain(|catalog_id| {
+                ctx.available_models.get(catalog_id).is_some_and(|entry| {
+                    live_catalog_harness_can_spawn(harness_definition, entry, ctx)
+                })
+            });
+            if route_definition.models.is_empty() {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
+                ));
+            }
+        } else if let xai_grok_agent::config::ModelOverride::Override(requested_id) =
+            &definition.model
+        {
+            let Some(identity) = crate::agent::models::resolve_catalog_identity(
+                &ctx.available_models,
+                &acp::ModelId::new(requested_id.clone()),
+            ) else {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (exact_model_missing)"
+                ));
+            };
+            let catalog_id = identity.model_id;
+            let Some(entry) = ctx.available_models.get(catalog_id.as_str()) else {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (exact_model_missing)"
+                ));
+            };
+            if !live_catalog_harness_can_spawn(harness_definition, entry, ctx) {
+                return Err(format!(
+                    "Cannot spawn subagent '{subagent_type}': native route failed (harness_incompatible)"
+                ));
+            }
+            route_definition.model = xai_grok_agent::config::ModelOverride::Override(catalog_id);
+        }
+        let request = request_from_agent_definition(
+            &route_definition,
+            Some(ctx.model_id.0.to_string()),
+            Some(ctx.parent_session_id.clone()),
+            child_session_id.map(str::to_string),
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+        let result = resolve_native_route(&request, &catalog, now, 1).map_err(|err| {
+            format!("Cannot spawn subagent '{subagent_type}': native route failed ({err})")
+        })?;
+        let prepared = resolve_model_override_to_prepared(&result.selected_catalog_id, ctx)
+            .ok_or_else(|| {
+                format!(
+                    "Cannot spawn subagent '{subagent_type}': selected catalog '{}' is not a ready model",
+                    result.selected_catalog_id
+                )
+            })?;
+        log_subagent_model_resolution(
+            subagent_type,
+            if definition.models.is_empty() {
+                "native_exact"
+            } else {
+                "native_ordered"
+            },
+            &prepared.sampling_config,
+            &prepared.model_id,
+            &ctx.sampling_config,
+        );
+        return Ok(NativeRoutePrepared {
+            prepared,
+            receipt: Some(result.receipt),
+        });
+    }
+    let prepared = resolve_request_prepared_model(
+        fork_context,
+        runtime_override_model,
+        subagent_type,
+        &definition.model,
+        ctx,
+    )
+    .await;
+    let receipt = native_route_live::stamp_receipt_for_selection(
+        definition,
+        ctx,
+        &catalog,
+        prepared.model_id.0.as_ref(),
+        child_session_id,
+        resume,
+        now,
+    );
+    Ok(NativeRoutePrepared { prepared, receipt })
+}
+
+async fn resolve_effective_model_config(
+    runtime_override_model: Option<&str>,
+    subagent_type: &str,
+    definition_model: &xai_grok_agent::config::ModelOverride,
+    ctx: &SubagentSpawnContext,
+) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+    let prepared = resolve_effective_prepared_model(
+        runtime_override_model,
+        subagent_type,
+        definition_model,
+        ctx,
+    )
+    .await;
+    (prepared.sampling_config, prepared.model_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,6 +933,41 @@ fn resolve_and_validate_subagent_model_harness(
         plugin_registry,
     );
     validate_subagent_model_harness(active, required_agent_type, required.as_ref())
+}
+
+fn live_catalog_harness_can_spawn(
+    active: &xai_grok_agent::AgentDefinition,
+    entry: &crate::agent::config::ModelEntry,
+    ctx: &SubagentSpawnContext,
+) -> bool {
+    if entry.info.agent_type.is_empty() {
+        return false;
+    }
+    resolve_and_validate_subagent_model_harness(
+        active,
+        &entry.info.agent_type,
+        &ctx.parent_cwd,
+        ctx.plugin_registry.as_deref(),
+    )
+    .is_ok()
+}
+
+fn load_subagent_meta(
+    id: &str,
+    parent_session_id: &str,
+    parent_cwd: &Path,
+) -> Option<SubagentMeta> {
+    let parent_info = SessionInfo {
+        id: acp::SessionId::new(parent_session_id),
+        cwd: parent_cwd.to_string_lossy().into_owned(),
+    };
+    let meta_path = session::persistence::session_dir(&parent_info)
+        .join("subagents")
+        .join(id)
+        .join("meta.json");
+    let data = std::fs::read_to_string(meta_path).ok()?;
+    let meta: SubagentMeta = serde_json::from_str(&data).ok()?;
+    (meta.parent_session_id == parent_session_id).then_some(meta)
 }
 /// Emit a unified log entry recording which model and credentials a subagent
 /// resolved to, and how they compare to the parent's.
@@ -775,14 +1020,22 @@ fn session_bearer_resolver(
     credential_source: Option<&xai_grok_sampler::CredentialSource>,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
     use crate::agent::auth_method;
-    // #110: a credential header the user declared is terminal. Attaching a
-    // session resolver on top of one makes `SamplingClient::post` strip the
-    // header and send under the xAI session instead. The check lives here, in
-    // the one function every attach path goes through, rather than at each
-    // call site -- three of them had to be found one at a time by review.
+    // #110 / #136: a credential the user or model declared is terminal.
+    // Attaching a session resolver on top of one makes `SamplingClient::post`
+    // strip the retained key and send under the xAI session instead. The check
+    // lives here, in the one function every attach path goes through, rather
+    // than at each call site -- three of them had to be found one at a time by
+    // review. In particular, the bound `ModelApiKey` provenance remains
+    // authoritative if a catalog refresh removes the committed model and its
+    // BYOK classification can no longer be looked up.
     if matches!(
         credential_source,
-        Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+        Some(
+            xai_grok_sampler::CredentialSource::ExplicitHeader { .. }
+                | xai_grok_sampler::CredentialSource::ModelApiKey
+                | xai_grok_sampler::CredentialSource::EnvKey { .. }
+                | xai_grok_sampler::CredentialSource::AuthProvider { .. }
+        )
     ) {
         return None;
     }
@@ -796,53 +1049,167 @@ fn session_bearer_resolver(
         crate::auth::credential_provider::WireValidBearerResolver::shared(ctx.auth_manager.clone())
     })
 }
-/// [`session_bearer_resolver`] for an inherited config, where only the model
-/// string is known: BYOK comes from the catalog memo.
-fn inherited_bearer_resolver(
-    ctx: &SubagentSpawnContext,
-    model: &str,
-    base_url: &str,
-    credential_source: Option<&xai_grok_sampler::CredentialSource>,
-) -> Option<xai_grok_sampler::SharedBearerResolver> {
-    let byok = crate::agent::config::resolve_model_auth_facts_and_provider(
-        model,
-        Some(&ctx.available_models),
-    )
-    .0
-    .byok;
-    session_bearer_resolver(ctx, byok, base_url, credential_source)
-}
 /// Read the parent session's actual current sampling config.
 ///
 /// Prefers the live state from `ChatStateHandle` (authoritative). Falls back
 /// to the baseline on `SubagentSpawnContext` if the actor is unavailable.
 /// The returned [`acp::ModelId`] is the parent session catalog id (`ctx.model_id`),
 /// not the process-global default or chat-state routing slug.
-async fn read_parent_sampling_config(
-    ctx: &SubagentSpawnContext,
-) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+#[derive(Clone)]
+struct PreparedSubagentModel {
+    sampling_config: xai_grok_sampler::SamplerConfig,
+    model_id: acp::ModelId,
+    catalog_identity: xai_chat_state::CatalogIdentity,
+    supports_reasoning_effort: bool,
+    reasoning_efforts: Vec<xai_grok_sampling_types::ReasoningEffortOption>,
+    model_has_own_credentials: bool,
+    auth_type: xai_chat_state::AuthType,
+    agent_type: String,
+    auto_compact_threshold_percent: Option<u8>,
+}
+
+fn resolve_subagent_reasoning_effort_override(
+    supports_reasoning_effort: bool,
+    reasoning_efforts: &[xai_grok_sampling_types::ReasoningEffortOption],
+    raw: &str,
+) -> Option<xai_grok_sampling_types::ReasoningEffort> {
+    let effort = raw.parse().ok()?;
+    crate::agent::models::reasoning_effort_is_offered(
+        supports_reasoning_effort,
+        reasoning_efforts,
+        effort,
+    )
+    .then_some(effort)
+}
+
+fn reconcile_inherited_subagent_reasoning_effort(
+    sampling_config: &mut xai_grok_sampler::SamplerConfig,
+    supports_reasoning_effort: bool,
+    reasoning_efforts: &[xai_grok_sampling_types::ReasoningEffortOption],
+) {
+    let Some(inherited) = sampling_config.reasoning_effort else {
+        return;
+    };
+    if crate::agent::models::reasoning_effort_is_offered(
+        supports_reasoning_effort,
+        reasoning_efforts,
+        inherited,
+    ) {
+        return;
+    }
+    sampling_config.reasoning_effort = if supports_reasoning_effort {
+        reasoning_efforts
+            .iter()
+            .find(|option| option.default)
+            .or_else(|| reasoning_efforts.first())
+            .map(|option| option.value)
+    } else {
+        None
+    };
+}
+
+fn catalog_auth_scheme(
+    auth_scheme: xai_grok_sampler::AuthScheme,
+) -> xai_chat_state::CatalogAuthScheme {
+    match auth_scheme {
+        xai_grok_sampler::AuthScheme::Bearer => xai_chat_state::CatalogAuthScheme::Bearer,
+        xai_grok_sampler::AuthScheme::XApiKey => xai_chat_state::CatalogAuthScheme::XApiKey,
+        xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+    }
+}
+
+fn sampler_auth_scheme(
+    auth_scheme: xai_chat_state::CatalogAuthScheme,
+) -> xai_grok_sampler::AuthScheme {
+    match auth_scheme {
+        xai_chat_state::CatalogAuthScheme::Bearer => xai_grok_sampler::AuthScheme::Bearer,
+        xai_chat_state::CatalogAuthScheme::XApiKey => xai_grok_sampler::AuthScheme::XApiKey,
+        xai_chat_state::CatalogAuthScheme::None => xai_grok_sampler::AuthScheme::None,
+    }
+}
+
+async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubagentModel {
     if let Some(ref chat_state) = ctx.parent_chat_state {
-        if let Some(cfg) = chat_state.get_sampling_config().await {
-            let creds = chat_state.get_credentials().await;
+        if let Some((cfg, catalog_identity, creds)) = chat_state.get_prepared_model_state().await {
+            // Copy identity, routing config, and credentials in one actor
+            // query. A concurrent model switch must not pair one model's
+            // endpoint/wire facts with another model's credential.
+            let preferred_model_id = catalog_identity
+                .as_ref()
+                .map(|identity| identity.model_id.as_str())
+                .unwrap_or(ctx.model_id.0.as_ref());
+            let retained_catalog_route = catalog_identity
+                .as_ref()
+                .map(|identity| identity.route.as_str())
+                .or_else(|| {
+                    (catalog_identity.is_none()
+                        && preferred_model_id == ctx.sampling_config_model_id.0.as_ref())
+                    .then_some(ctx.sampling_config.model.as_str())
+                })
+                .or_else(|| {
+                    crate::agent::models::resolve_catalog_key(
+                        &ctx.available_models,
+                        &acp::ModelId::new(preferred_model_id),
+                    )
+                    .and_then(|key| ctx.available_models.get(key.0.as_ref()))
+                    .map(|entry| entry.info().model.as_str())
+                });
+            let opaque_model_name_override =
+                retained_catalog_route.is_some_and(|route| route != cfg.model);
+            let allow_missing_preferred_remap = catalog_identity
+                .as_ref()
+                .is_some_and(|identity| identity.allows_route_remap());
+            let capability_route = catalog_identity
+                .as_ref()
+                .filter(|_| allow_missing_preferred_remap && opaque_model_name_override)
+                .map(|identity| identity.route.as_str())
+                .unwrap_or(&cfg.model);
+            let capabilities = ctx.models_manager.capabilities_for_route(
+                Some(preferred_model_id),
+                capability_route,
+                catalog_identity.is_some() && !allow_missing_preferred_remap,
+                opaque_model_name_override
+                    .then_some(retained_catalog_route)
+                    .flatten(),
+            );
+            let model_id = capabilities
+                .as_ref()
+                .map(|facts| facts.model_id.clone())
+                .unwrap_or_else(|| acp::ModelId::new(preferred_model_id));
+            let baseline_matches_live = preferred_model_id
+                == ctx.sampling_config_model_id.0.as_ref()
+                && retained_catalog_route.is_some_and(|route| route == ctx.sampling_config.model);
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
                 &mut extra_headers,
                 creds.alpha_test_key(),
                 &cfg.base_url,
             );
-            // Prefer the spawn-time in-memory catalog (session-selected models),
-            // then disk effective config, then parent spawn baseline. Never
-            // silent-default to Bearer on miss when the parent baseline is None.
-            let auth_scheme = crate::agent::config::find_model_by_id(
-                &ctx.available_models,
-                ctx.model_id.0.as_ref(),
-            )
-            .map(|e| e.info.auth_scheme)
-            .or_else(|| {
-                crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
-                    .map(|r| r.auth_scheme)
-            })
-            .unwrap_or(ctx.sampling_config.auth_scheme);
+            // Auth belongs to the same locked catalog entry as the other
+            // request-shaping facts. On a miss, retain the parent baseline;
+            // never perform a second routing-slug lookup that a shadow entry
+            // could satisfy.
+            let auth_scheme = capabilities
+                .as_ref()
+                .map(|facts| facts.auth_scheme)
+                .or_else(|| {
+                    catalog_identity
+                        .as_ref()
+                        .and_then(|identity| identity.auth_scheme)
+                        .map(sampler_auth_scheme)
+                })
+                .unwrap_or_else(|| {
+                    if catalog_identity.is_some() {
+                        // A legacy persisted identity predates the committed
+                        // auth field. It still identifies a model switch, so
+                        // borrowing the process-startup model's auth would
+                        // cross model boundaries. Fail closed until the exact
+                        // entry is available again.
+                        xai_grok_sampler::AuthScheme::None
+                    } else {
+                        ctx.sampling_config.auth_scheme
+                    }
+                });
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key());
             // #110 / #136 / #180: provenance comes from parent `Credentials`
@@ -904,28 +1271,61 @@ async fn read_parent_sampling_config(
                 {
                     None
                 } else {
-                    inherited_bearer_resolver(
+                    session_bearer_resolver(
                         ctx,
-                        &cfg.model,
+                        capabilities
+                            .as_ref()
+                            .map(|facts| facts.byok)
+                            .unwrap_or(crate::agent::auth_method::ModelByok::Unknown),
                         &inherited_base_url,
                         credential_source.as_ref(),
                     )
                 },
-                supports_backend_search: ctx
-                    .models_manager
-                    .model_supports_backend_search(ctx.model_id.0.as_ref()),
-                compactions_remaining: ctx
-                    .models_manager
-                    .model_compactions_remaining(ctx.model_id.0.as_ref()),
-                compaction_at_tokens: ctx
-                    .models_manager
-                    .model_compaction_at_tokens(ctx.model_id.0.as_ref()),
+                supports_backend_search: capabilities
+                    .as_ref()
+                    .map(|facts| facts.supports_backend_search)
+                    .unwrap_or_else(|| {
+                        baseline_matches_live && ctx.sampling_config.supports_backend_search
+                    }),
+                compactions_remaining: capabilities
+                    .as_ref()
+                    .map(|facts| facts.compactions_remaining)
+                    .unwrap_or_else(|| {
+                        baseline_matches_live
+                            .then_some(ctx.sampling_config.compactions_remaining)
+                            .flatten()
+                    }),
+                compaction_at_tokens: capabilities
+                    .as_ref()
+                    .map(|facts| facts.compaction_at_tokens)
+                    .unwrap_or_else(|| {
+                        baseline_matches_live
+                            .then_some(ctx.sampling_config.compaction_at_tokens)
+                            .flatten()
+                    }),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 header_injector: ctx.sampling_config.header_injector.clone(),
-                codex_wire: ctx.sampling_config.codex_wire.clone(),
+                // Resolved from the subagent's own model, like the three
+                // catalog lookups above — not copied from the parent's
+                // config, whose `codex_wire` belongs to whatever model the
+                // parent is running (#277).
+                //
+                // `model_codex_wire` is `None` only on a catalog miss.
+                // `Some(None)` is authoritative empty metadata and must
+                // not inherit a stale same-model baseline (#282). A
+                // route-rejected identity (`capabilities` is `None`) is
+                // treated as a miss so a reused catalog key cannot
+                // supply another model's flags.
+                codex_wire: match capabilities.as_ref() {
+                    Some(facts) => ctx
+                        .models_manager
+                        .model_codex_wire(facts.model_id.0.as_ref())
+                        .unwrap_or_else(|| facts.codex_wire.clone()),
+                    None => baseline_matches_live
+                        .then(|| ctx.sampling_config.codex_wire.clone())
+                        .flatten(),
+                },
             };
-            let model_id = ctx.model_id.clone();
-            let global_model_id = ctx.models_manager.current_model_id();
             xai_grok_telemetry::unified_log::debug(
                 "subagent read parent config (live)",
                 None,
@@ -934,11 +1334,49 @@ async fn read_parent_sampling_config(
                     "parent_endpoint_is_first_party": crate::util::is_xai_api_bearer_url(&inherited.base_url),
                     "parent_credential_present": inherited.api_key.is_some(),
                     "session_model_id": model_id.0.as_ref(),
-                    "global_model_id": global_model_id.0.as_ref(),
                     "source": "chat_state",
                 })),
             );
-            return (inherited, model_id);
+            let mut resolved_identity =
+                catalog_identity.unwrap_or_else(|| xai_chat_state::CatalogIdentity {
+                    model_id: model_id.0.to_string(),
+                    route: inherited.model.clone(),
+                    lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                    auth_scheme: Some(catalog_auth_scheme(auth_scheme)),
+                });
+            if capabilities.is_some() {
+                // The resolved entry is authoritative for every catalog fact,
+                // including auth. This also upgrades a legacy identity whose
+                // persisted auth field was absent so a later descendant can
+                // retain the recovered scheme across another catalog miss.
+                resolved_identity.auth_scheme = Some(catalog_auth_scheme(auth_scheme));
+            }
+            if allow_missing_preferred_remap {
+                resolved_identity.model_id = model_id.0.to_string();
+            }
+            return PreparedSubagentModel {
+                sampling_config: inherited,
+                model_id,
+                catalog_identity: resolved_identity,
+                supports_reasoning_effort: capabilities
+                    .as_ref()
+                    .is_some_and(|facts| facts.supports_reasoning_effort),
+                reasoning_efforts: capabilities
+                    .as_ref()
+                    .map(|facts| facts.reasoning_efforts.clone())
+                    .unwrap_or_default(),
+                model_has_own_credentials: capabilities
+                    .as_ref()
+                    .is_some_and(|facts| facts.byok == crate::agent::auth_method::ModelByok::Byok),
+                auth_type: creds.auth_type(),
+                agent_type: capabilities
+                    .as_ref()
+                    .map(|facts| facts.agent_type.clone())
+                    .unwrap_or_default(),
+                auto_compact_threshold_percent: capabilities
+                    .as_ref()
+                    .and_then(|facts| facts.auto_compact_threshold_percent),
+            };
         }
         tracing::warn!(
             "Parent chat state actor returned None for sampling config, \
@@ -957,6 +1395,31 @@ async fn read_parent_sampling_config(
         })),
     );
     let mut fallback = ctx.sampling_config.clone();
+    let capabilities = crate::agent::models::capabilities_for_route_in(
+        &ctx.available_models,
+        Some(ctx.sampling_config_model_id.0.as_ref()),
+        &fallback.model,
+        true,
+        None,
+    );
+    let fallback_model_id = capabilities
+        .as_ref()
+        .map(|facts| facts.model_id.clone())
+        .unwrap_or_else(|| ctx.sampling_config_model_id.clone());
+    if let Some(capabilities) = capabilities.as_ref() {
+        fallback.auth_scheme = capabilities.auth_scheme;
+        fallback.supports_backend_search = capabilities.supports_backend_search;
+        fallback.compactions_remaining = capabilities.compactions_remaining;
+        fallback.compaction_at_tokens = capabilities.compaction_at_tokens;
+        // Prefer the live manager lookup so a present entry with
+        // `codex_wire: None` stays `None` instead of the cloned
+        // spawn-baseline `Some` (#282). A miss here keeps the
+        // already-cloned parent value (#159).
+        fallback.codex_wire = ctx
+            .models_manager
+            .model_codex_wire(capabilities.model_id.0.as_ref())
+            .unwrap_or_else(|| capabilities.codex_wire.clone());
+    }
     if fallback.auth_scheme == xai_grok_sampler::AuthScheme::None {
         fallback.api_key = None;
         fallback.bearer_resolver = None;
@@ -964,25 +1427,65 @@ async fn read_parent_sampling_config(
         fallback.bearer_resolver = if ctx.would_strip_fallback_key(fallback.api_key.as_deref()) {
             None
         } else {
-            inherited_bearer_resolver(
+            session_bearer_resolver(
                 ctx,
-                &fallback.model,
+                capabilities
+                    .as_ref()
+                    .map(|facts| facts.byok)
+                    .unwrap_or(crate::agent::auth_method::ModelByok::Unknown),
                 &fallback.base_url,
                 fallback.credential_source.as_ref(),
             )
         };
     }
-    fallback.supports_backend_search = ctx
-        .models_manager
-        .model_supports_backend_search(ctx.model_id.0.as_ref());
-    fallback.compactions_remaining = ctx
-        .models_manager
-        .model_compactions_remaining(ctx.model_id.0.as_ref());
-    fallback.compaction_at_tokens = ctx
-        .models_manager
-        .model_compaction_at_tokens(ctx.model_id.0.as_ref());
-    (fallback, ctx.model_id.clone())
+    // The block above already re-resolves catalog facts here; `codex_wire` is
+    // one too, and cloning the parent's would reintroduce
+    // #277 on the path taken whenever the parent's chat-state actor is
+    // unavailable — which `try_build_subagent_spawn_context` does not bail
+    // on, so a nested child outliving its parent lands here for real.
+    let catalog_identity = xai_chat_state::CatalogIdentity {
+        model_id: ctx.sampling_config_model_id.0.to_string(),
+        route: fallback.model.clone(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: Some(catalog_auth_scheme(fallback.auth_scheme)),
+    };
+    PreparedSubagentModel {
+        catalog_identity,
+        sampling_config: fallback,
+        model_id: fallback_model_id,
+        supports_reasoning_effort: capabilities
+            .as_ref()
+            .is_some_and(|facts| facts.supports_reasoning_effort),
+        reasoning_efforts: capabilities
+            .as_ref()
+            .map(|facts| facts.reasoning_efforts.clone())
+            .unwrap_or_default(),
+        model_has_own_credentials: capabilities
+            .as_ref()
+            .is_some_and(|facts| facts.byok == crate::agent::auth_method::ModelByok::Byok),
+        auth_type: subagent_auth_type(
+            capabilities
+                .as_ref()
+                .and_then(|facts| ctx.available_models.get(facts.model_id.0.as_ref())),
+            &ctx.auth_method_id,
+        ),
+        agent_type: capabilities
+            .as_ref()
+            .map(|facts| facts.agent_type.clone())
+            .unwrap_or_default(),
+        auto_compact_threshold_percent: capabilities
+            .as_ref()
+            .and_then(|facts| facts.auto_compact_threshold_percent),
+    }
 }
+
+async fn read_parent_sampling_config(
+    ctx: &SubagentSpawnContext,
+) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+    let prepared = read_parent_prepared_model(ctx).await;
+    (prepared.sampling_config, prepared.model_id)
+}
+
 /// `AuthType` for a subagent: BYOK ⇒ `ApiKey` (don't overwrite the BYOK
 /// key); session-based ACP method ⇒ `SessionToken` (keep refresh wired);
 /// otherwise `ApiKey`.
@@ -1000,21 +1503,24 @@ fn subagent_auth_type(
 }
 /// Resolve a model override string (config key or model ID) to a
 /// `(SamplerConfig, ModelId)` pair.
-fn resolve_model_override_to_config(
+fn resolve_model_override_to_prepared(
     model_id: &str,
     ctx: &SubagentSpawnContext,
-) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
+) -> Option<PreparedSubagentModel> {
     use crate::agent::config::{model_readiness, resolve_credentials, sampling_config_for_model};
-    let entry = crate::agent::config::find_model_by_id(&ctx.available_models, model_id).cloned()?;
+    let catalog_identity = crate::agent::models::resolve_catalog_identity(
+        &ctx.available_models,
+        &acp::ModelId::new(model_id),
+    )?;
+    let entry = ctx
+        .available_models
+        .get(catalog_identity.model_id.as_str())
+        .cloned()?;
     if !model_readiness(&entry).0 {
         tracing::warn!(model_id, "subagent model override skipped: model not ready");
         return None;
     }
-    let canonical_model_id = if ctx.available_models.contains_key(model_id) {
-        acp::ModelId::new(model_id)
-    } else {
-        acp::ModelId::new(entry.info().model.clone())
-    };
+    let canonical_model_id = acp::ModelId::new(catalog_identity.model_id.clone());
     let session_key = ctx.auth.as_ref().map(|a| a.key.as_str());
     let has_session_key = session_key.is_some();
     let mut credentials = resolve_credentials(&entry, session_key);
@@ -1061,7 +1567,25 @@ fn resolve_model_override_to_config(
             "auth_method_id": ctx.auth_method_id.0.as_ref(),
         })),
     );
-    Some((config, canonical_model_id))
+    Some(PreparedSubagentModel {
+        sampling_config: config,
+        model_id: canonical_model_id,
+        catalog_identity,
+        supports_reasoning_effort: entry.info().supports_reasoning_effort,
+        reasoning_efforts: entry.info().reasoning_efforts.clone(),
+        model_has_own_credentials: entry.has_own_credentials(),
+        auth_type: resolved_auth_type,
+        agent_type: entry.info().agent_type.clone(),
+        auto_compact_threshold_percent: entry.info().auto_compact_threshold_percent,
+    })
+}
+
+fn resolve_model_override_to_config(
+    model_id: &str,
+    ctx: &SubagentSpawnContext,
+) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
+    resolve_model_override_to_prepared(model_id, ctx)
+        .map(|prepared| (prepared.sampling_config, prepared.model_id))
 }
 /// Leading items to preserve across compaction on resume: the System head only, so the
 /// resumed body (the child's own work) stays compactable. Returns 0 when there's no
@@ -1102,7 +1626,7 @@ fn resume_initial_context(
 fn forked_initial_context(
     mut items: Vec<xai_grok_sampling_types::conversation::ConversationItem>,
 ) -> InitialContext {
-    crate::session::storage::jsonl::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     if items.is_empty() {
         return InitialContext {
             source: InitialContextSource::New,
@@ -1193,7 +1717,7 @@ fn verbatim_or_normalize_fork(
         };
     }
     let mut filtered = items;
-    crate::session::storage::jsonl::fork_filter_chat(&mut filtered);
+    crate::sampling::fork_filter_chat(&mut filtered);
     if !filtered
         .iter()
         .any(|i| !matches!(i, ConversationItem::System(_)))
@@ -1303,11 +1827,11 @@ async fn bootstrap_initial_context(
             fork_filter: false,
             ..Default::default()
         };
-        return match storage.copy_session_data_sync(
-            &source_session_info,
-            child_session_info,
-            copy_options,
-        ) {
+        use crate::session::storage::StorageAdapter as _;
+        return match storage
+            .copy_session_data(&source_session_info, child_session_info, copy_options)
+            .await
+        {
             Ok(result) => {
                 let conversation = match storage.load_chat_history_from_dir(child_session_dir) {
                     Ok(items) if !items.is_empty() => items,
@@ -1414,7 +1938,11 @@ async fn bootstrap_initial_context(
             fork_filter: true,
             ..Default::default()
         };
-        return match storage.copy_session_data_sync(parent_info, child_session_info, copy_options) {
+        use crate::session::storage::StorageAdapter as _;
+        return match storage
+            .copy_session_data(parent_info, child_session_info, copy_options)
+            .await
+        {
             Ok(result) => {
                 tracing::info!(
                     subagent_id = %request.id,
@@ -1519,19 +2047,8 @@ fn durable_resume_source_for(
     parent_session_id: &str,
     parent_cwd: &Path,
 ) -> Option<ResumeSourceData> {
-    let parent_info = SessionInfo {
-        id: acp::SessionId::new(parent_session_id),
-        cwd: parent_cwd.to_string_lossy().into_owned(),
-    };
-    let meta_path = session::persistence::session_dir(&parent_info)
-        .join("subagents")
-        .join(id)
-        .join("meta.json");
-    let data = std::fs::read_to_string(meta_path).ok()?;
-    let meta: SubagentMeta = serde_json::from_str(&data).ok()?;
-    if meta.parent_session_id != parent_session_id
-        || !matches!(meta.status.as_str(), "completed" | "failed" | "cancelled")
-    {
+    let meta = load_subagent_meta(id, parent_session_id, parent_cwd)?;
+    if !matches!(meta.status.as_str(), "completed" | "failed" | "cancelled") {
         return None;
     }
     Some(ResumeSourceData {
@@ -1543,6 +2060,8 @@ fn durable_resume_source_for(
         subagent_type: meta.subagent_type,
         persona: meta.persona,
         model_id: meta.effective_model_id,
+        model_route: meta.effective_model_route,
+        model_agent_type: meta.effective_model_agent_type,
     })
 }
 /// Resolve the MCP pool a child subagent should import from its parent.
@@ -2104,6 +2623,17 @@ fn inject_subagent_completed_prompt(
         });
     }
 }
+fn telemetry_owner_kind(
+    request: &SubagentRequest,
+) -> xai_grok_telemetry::events::SubagentOwnerKind {
+    if request.owner.is_workflow() {
+        xai_grok_telemetry::events::SubagentOwnerKind::Workflow
+    } else if request.from_scheduler_loop() {
+        xai_grok_telemetry::events::SubagentOwnerKind::SchedulerLoop
+    } else {
+        xai_grok_telemetry::events::SubagentOwnerKind::Task
+    }
+}
 fn failure_result(request: &SubagentRequest, error: &str) -> SubagentResult {
     SubagentResult {
         success: false,
@@ -2184,7 +2714,9 @@ async fn cancel_pending_shell_child(
     duration_ms: u64,
     gcs_ctx: &GcsUploadContext,
 ) -> SubagentResult {
-    let _ = child_cmd_tx.send(SessionCommand::Shutdown);
+    let _ = child_cmd_tx.send(SessionCommand::Shutdown(
+        crate::session::ShutdownKind::Graceful,
+    ));
     if worktree_freshly_created
         && let Some(wt_path) = worktree_path
         && let Err(e) = crate::session::worktree::remove_subagent_worktree(wt_path).await
@@ -2432,6 +2964,19 @@ pub(crate) struct SubagentMeta {
     /// durable `resume_from` identity validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_model_id: Option<String>,
+    /// Routing model committed with `effective_model_id`. This is model
+    /// lineage, not the subagent role stored in `subagent_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model_route: Option<String>,
+    /// Catalog harness committed with `effective_model_id`. This is kept
+    /// separate from the selected subagent role so resume compares harness
+    /// identity with harness identity instead of treating `general-purpose`
+    /// as a model harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model_agent_type: Option<String>,
+    /// Secret-free native route receipt for this spawn, when resolution ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_route_receipt: Option<RouteReceipt>,
 }
 /// Canonical subagent metadata for GCS persistence (`subagent.json`).
 ///
@@ -2469,6 +3014,13 @@ pub(crate) struct SubagentSessionMetadata {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Routing model committed with `model_id` for durable resume identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_route: Option<String>,
+    /// Catalog sampling harness committed with `model_id`. This is distinct
+    /// from the selected subagent role stored in `subagent_type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_agent_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2494,10 +3046,13 @@ pub(crate) struct SubagentSessionMetadata {
     /// ID of the source subagent this session was resumed from (`resume_from`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<String>,
+    /// Digest of the native route receipt when spawn resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_receipt_digest: Option<String>,
 }
 impl SubagentSessionMetadata {
     /// Current schema version.
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub(crate) const SCHEMA_VERSION: u32 = 1;
     /// Build from a `SubagentMeta` + additional runtime context.
     pub(crate) fn from_meta(
         meta: &SubagentMeta,
@@ -2532,6 +3087,8 @@ impl SubagentSessionMetadata {
             capability_mode: capability_mode.map(str::to_string),
             reasoning_effort: reasoning_effort.map(str::to_string),
             model_id: model_id.map(str::to_string),
+            model_route: meta.effective_model_route.clone(),
+            model_agent_type: meta.effective_model_agent_type.clone(),
             cwd: cwd.map(str::to_string),
             worktree_path: worktree_path.map(str::to_string),
             isolation_mode: isolation_mode.map(str::to_string),
@@ -2545,6 +3102,10 @@ impl SubagentSessionMetadata {
             error: meta.error.clone(),
             fork_copy_error: meta.fork_copy_error.clone(),
             resumed_from: meta.resumed_from.clone(),
+            route_receipt_digest: meta
+                .native_route_receipt
+                .as_ref()
+                .map(|receipt| receipt.route_digest.clone()),
         }
     }
 }

@@ -1177,6 +1177,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
                 session_id: hydrate_sid.clone(),
                 model_id: switch.model_id,
                 effort: switch.effort,
+                session_only: switch.session_only,
                 request_id,
                 prev_model_id: switch.prev_model_id,
             });
@@ -1185,10 +1186,11 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         let page_flip_entry = drain.page_flip_entry;
         effects.extend(drain.effects);
         let cwd = agent.session.cwd.clone();
-        effects.push(Effect::HydrateSessionTitleFromDisk {
+        effects.push(Effect::HydrateSessionMetaFromDisk {
             agent_id,
             session_id: hydrate_sid.clone(),
             cwd: cwd.clone(),
+            last_turn_summary_gen: agent.last_turn_summary_gen,
         });
         agent.session.prompt_history_loading = true;
         effects.push(Effect::FetchPromptHistory {

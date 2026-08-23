@@ -80,6 +80,7 @@ Relative to upstream Grok Build, the `providers` branch adds:
 | **Keyless local models** | `auth_scheme = "none"` sends no `Authorization` / `x-api-key` at all, which is what Ollama, LM Studio, llama.cpp, and vLLM expect. Without it a local server can receive an ambient xAI Bearer token it never asked for. |
 | **Strict credential isolation** | An unknown or malformed `auth_scheme` marks the model **unready** and fails closed rather than silently falling back to Bearer; unready models are rejected by the picker, `/model`, new sessions, session restore, and ACP model switches. On third-party endpoints and `auth_scheme = "none"`, the `x-grok-user-id` / `x-grok-deployment-id` identity headers are omitted. Custom model-catalog discovery uses an explicit key rather than your signed-in session. |
 | **Readiness surfaced in the TUI** | `/model` and `Ctrl+M` show `ready` / `missing` / `none` badges, hard-block unready models, and ask for confirmation when a switch crosses auth classes. |
+| **Optional native subagent route contract** | Plugin-facing exact / ordered-candidate / receipt types for orchestration consumers. Optional and capability-negotiated; original Grok Build is not claimed to implement it. See [native-subagent-route-contract.md](docs/architecture/native-subagent-route-contract.md). Live spawn wiring and replay-safe fallback are still incomplete. |
 
 Details and copy-pasteable configuration live in
 [Custom Models](crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md)
@@ -228,10 +229,12 @@ medley version --json
 
 `medley version --json` includes the build identity fields used by this fork:
 
-- `distChannel` (fork packaging marker; expected `providers` for fork releases)
+- `distChannel` (packaged product/channel; expected `medley` for fork releases)
 - `channel` (configured update channel name)
 - `upstreamBase` (upstream commit this build is based on)
 - `buildTarget` (target triple baked into the binary)
+
+The packaged product/channel is `medley`; the git branch and tag suffix remain `providers`.
 
 Releases are published for `aarch64`/`x86_64` macOS and Linux. The installer
 refuses to install into `~/.grok`, never touches an existing `grok` binary, and
@@ -318,6 +321,10 @@ support instructions in it as describing the **official** build.
 xAI's online documentation for the upstream product is at
 [docs.x.ai/build/overview](https://docs.x.ai/build/overview). It does not cover
 this fork.
+
+The optional native subagent route contract is
+[`docs/architecture/native-subagent-route-contract.md`](docs/architecture/native-subagent-route-contract.md)
+(#287 / #289). It is a Medley extension, not an upstream Grok Build claim.
 
 ## Repository layout
 

@@ -768,6 +768,19 @@ impl<T: Clone> Constrained<T> {
     pub fn source(&self) -> Option<&crate::config::RequirementSource> {
         self.source.as_ref()
     }
+
+    fn clear(&mut self) {
+        self.pin = None;
+        self.source = None;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuxiliaryModelPins {
+    pub source: crate::config::RequirementSource,
+    pub web_search: Option<String>,
+    pub session_summary: Option<String>,
+    pub image_description: Option<String>,
 }
 /// Enforced requirements from `requirements.toml`. Pinned values win over all other sources.
 #[derive(Debug, Clone, Default)]
@@ -788,6 +801,17 @@ pub struct Requirements {
     pub sandbox_profile: Constrained<String>,
     pub respect_gitignore: Constrained<bool>,
     pub remote_fetch: Constrained<bool>,
+    pub web_search_model: Constrained<String>,
+    pub session_summary_model: Constrained<String>,
+    pub image_description_model: Constrained<String>,
+    pub(crate) auxiliary_model_layers: Vec<AuxiliaryModelPins>,
+}
+impl Requirements {
+    pub(crate) fn clear_auxiliary_model_pins(&mut self) {
+        self.web_search_model.clear();
+        self.session_summary_model.clear();
+        self.image_description_model.clear();
+    }
 }
 /// Inputs for resolving `#[serde(skip)]` runtime fields after `new_from_toml_cfg()`.
 ///
@@ -1860,6 +1884,13 @@ pub struct Config {
     /// [`crate::config::SubagentsConfig::resolve_max_depth`]).
     #[serde(skip)]
     pub subagents_max_depth: u32,
+    #[serde(skip)]
+    pub subagents_max_concurrent: usize,
+    #[serde(skip)]
+    pub subagents_limit_behavior:
+        xai_grok_tools::implementations::grok_build::task::admission::LimitBehavior,
+    #[serde(skip)]
+    pub workflow_max_concurrent_agents: usize,
     /// Per-subagent model ID overrides from `[subagents.models]` in config.toml.
     /// Keys are agent names, values are model IDs. Set alongside `subagents_enabled`
     /// from `SubagentsConfig::resolve()`.
@@ -1949,13 +1980,25 @@ pub struct Config {
     /// Model ID for web_search.
     #[serde(skip)]
     pub web_search_model: String,
+    #[serde(skip)]
+    pub web_search_model_explicit: bool,
+    #[serde(skip)]
+    pub web_search_follows_default: bool,
     /// Session title model. Resolved to the compiled default
     /// (`default_session_summary_model`) when unset; see `ModelOverrideConfig::resolve`.
     #[serde(skip)]
     pub session_summary_model: Option<String>,
+    #[serde(skip)]
+    pub session_summary_model_explicit: bool,
+    #[serde(skip)]
+    pub session_summary_follows_default: bool,
     /// Image describe model (`grok-build` default via `ModelOverrideConfig::resolve`).
     #[serde(skip)]
     pub image_description_model: Option<String>,
+    #[serde(skip)]
+    pub image_description_model_explicit: bool,
+    #[serde(skip)]
+    pub image_description_follows_default: bool,
     /// Next-prompt suggestion model pin (`env > [models] prompt_suggestion >
     /// remote`), consumed catalog-guarded by `handle_suggest_prompt`; see
     /// `ModelOverrideConfig::resolve`.
@@ -2182,6 +2225,11 @@ impl Default for Config {
             cli_agent_overrides: CliAgentOverrides::default(),
             subagents_enabled: true,
             subagents_max_depth: crate::config::SubagentsConfig::DEFAULT_MAX_DEPTH,
+            subagents_max_concurrent:
+                xai_grok_tools::implementations::grok_build::task::admission::DEFAULT_MAX_CONCURRENT,
+            subagents_limit_behavior: Default::default(),
+            workflow_max_concurrent_agents:
+                crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
             subagent_model_overrides: std::collections::HashMap::new(),
             subagent_toggle: std::collections::HashMap::new(),
             subagent_roles: std::collections::HashMap::new(),
@@ -2203,8 +2251,14 @@ impl Default for Config {
             compat_resolved: CompatConfig::default(),
             requirements: Requirements::default(),
             web_search_model: crate::models::default_web_search_model().to_owned(),
+            web_search_model_explicit: false,
+            web_search_follows_default: false,
             session_summary_model: None,
+            session_summary_model_explicit: false,
+            session_summary_follows_default: false,
             image_description_model: None,
+            image_description_model_explicit: false,
+            image_description_follows_default: false,
             prompt_suggest_model_pin: crate::config::PromptSuggestModelPin::Unpinned,
         };
         cfg.apply_env_overrides();
@@ -2487,8 +2541,15 @@ impl Config {
         let model_overrides =
             crate::config::ModelOverrideConfig::resolve(None, None, raw_config, None);
         config.web_search_model = model_overrides.web_search;
+        config.web_search_model_explicit = model_overrides.web_search_explicit;
+        config.web_search_follows_default = model_overrides.web_search_follows_default;
         config.session_summary_model = model_overrides.session_summary;
+        config.session_summary_model_explicit = model_overrides.session_summary_explicit;
+        config.session_summary_follows_default = model_overrides.session_summary_follows_default;
         config.image_description_model = model_overrides.image_description;
+        config.image_description_model_explicit = model_overrides.image_description_explicit;
+        config.image_description_follows_default =
+            model_overrides.image_description_follows_default;
         config.prompt_suggest_model_pin = model_overrides.prompt_suggestion;
         config.apply_env_overrides();
         Ok(config)
@@ -2514,6 +2575,8 @@ impl Config {
     /// per cwd after that cwd's authoritative folder-trust resolve.
     pub(crate) fn resolve_subagents(&mut self, cli_flag: bool, raw_config: &toml::Value) {
         let sa = crate::config::SubagentsConfig::resolve(cli_flag, raw_config);
+        let remote_settings = self.remote_settings.clone();
+        self.resolve_subagent_limits(&sa, remote_settings.as_ref());
         self.subagents_enabled = sa.enabled;
         self.subagent_model_overrides = sa.models;
         self.subagent_toggle = sa.toggle;
@@ -2526,6 +2589,29 @@ impl Config {
             .and_then(|r| r.subagents_max_depth);
         self.subagents_max_depth =
             crate::config::SubagentsConfig::resolve_max_depth(env.as_deref(), sa.max_depth, remote);
+    }
+    fn resolve_subagent_limits(
+        &mut self,
+        sa: &crate::config::SubagentsConfig,
+        remote: Option<&crate::util::config::RemoteSettings>,
+    ) {
+        use crate::config::SubagentsConfig;
+        let env = |name: &str| std::env::var(name).ok();
+        self.subagents_max_concurrent = SubagentsConfig::resolve_max_concurrent(
+            env(SubagentsConfig::ENV_MAX_CONCURRENT).as_deref(),
+            sa.max_concurrent,
+            remote.and_then(|r| r.subagents_max_concurrent),
+        );
+        self.subagents_limit_behavior = SubagentsConfig::resolve_limit_behavior(
+            env(SubagentsConfig::ENV_LIMIT_BEHAVIOR).as_deref(),
+            sa.limit_behavior.as_deref(),
+            remote.and_then(|r| r.subagents_limit_behavior.as_deref()),
+        );
+        self.workflow_max_concurrent_agents = SubagentsConfig::resolve_workflow_max_concurrent(
+            env(SubagentsConfig::ENV_WORKFLOW_MAX_CONCURRENT).as_deref(),
+            sa.workflow_max_concurrent,
+            remote.and_then(|r| r.workflow_max_concurrent_agents),
+        );
     }
     /// Resolve all `#[serde(skip)]` runtime fields that have resolver functions.
     ///
@@ -2558,6 +2644,26 @@ impl Config {
         let remote = ctx.remote_settings.and_then(|r| r.subagents_max_depth);
         self.subagents_max_depth =
             crate::config::SubagentsConfig::resolve_max_depth(env.as_deref(), toml_max, remote);
+        let subagents_toml = crate::config::SubagentsConfig {
+            max_concurrent: ctx
+                .raw_config
+                .get("subagents")
+                .and_then(|s| s.get("max_concurrent"))
+                .and_then(|v| v.as_integer()),
+            limit_behavior: ctx
+                .raw_config
+                .get("subagents")
+                .and_then(|s| s.get("limit_behavior"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            workflow_max_concurrent: ctx
+                .raw_config
+                .get("subagents")
+                .and_then(|s| s.get("workflow_max_concurrent"))
+                .and_then(|v| v.as_integer()),
+            ..Default::default()
+        };
+        self.resolve_subagent_limits(&subagents_toml, ctx.remote_settings);
         let tools = crate::config::ToolsConfig::resolve(ctx.raw_config);
         self.respect_gitignore = match self.requirements.respect_gitignore.pinned() {
             Some(pinned) => pinned,
@@ -2572,15 +2678,22 @@ impl Config {
         );
         self.managed_mcps_enabled = mcps.enabled;
         self.managed_mcp_gateway_tools_enabled = mcps.gateway_tools_enabled;
-        let models = crate::config::ModelOverrideConfig::resolve(
+        let models = crate::config::ModelOverrideConfig::resolve_with_default_model(
+            self.default_model_override.as_deref(),
             ctx.cli_web_search_model,
             ctx.cli_session_summary_model,
             ctx.raw_config,
             ctx.remote_settings,
         );
         self.web_search_model = models.web_search;
+        self.web_search_model_explicit = models.web_search_explicit;
+        self.web_search_follows_default = models.web_search_follows_default;
         self.session_summary_model = models.session_summary;
+        self.session_summary_model_explicit = models.session_summary_explicit;
+        self.session_summary_follows_default = models.session_summary_follows_default;
         self.image_description_model = models.image_description;
+        self.image_description_model_explicit = models.image_description_explicit;
+        self.image_description_follows_default = models.image_description_follows_default;
         self.prompt_suggest_model_pin = models.prompt_suggestion;
         self.cli_experimental_memory = ctx.cli_experimental_memory;
         self.cli_no_memory = ctx.cli_no_memory;
@@ -2607,12 +2720,66 @@ impl Config {
             .value;
         self.compat_resolved = resolve_compat_config(&self.compat, ctx.remote_settings);
     }
+
+    pub(crate) fn rebind_unset_auxiliary_models_to_default(
+        &mut self,
+        effective_default: Option<&str>,
+    ) {
+        fn non_empty(value: Option<&str>) -> Option<&str> {
+            value.map(str::trim).filter(|value| !value.is_empty())
+        }
+        if let Some(policy_model) = self.requirements.web_search_model.pinned() {
+            self.web_search_model = policy_model;
+            self.web_search_model_explicit = true;
+            self.web_search_follows_default = false;
+        } else if !self.web_search_model_explicit
+            && let Some(model) = non_empty(self.models.web_search.as_deref()).or(effective_default)
+        {
+            self.web_search_model = model.to_owned();
+            self.web_search_follows_default =
+                non_empty(self.models.web_search.as_deref()).is_none();
+        }
+        if let Some(policy_model) = self.requirements.session_summary_model.pinned() {
+            self.session_summary_model = Some(policy_model);
+            self.session_summary_model_explicit = true;
+            self.session_summary_follows_default = false;
+        } else if !self.session_summary_model_explicit
+            && let Some(model) =
+                non_empty(self.models.session_summary.as_deref()).or(effective_default)
+        {
+            self.session_summary_model = Some(model.to_owned());
+            self.session_summary_follows_default =
+                non_empty(self.models.session_summary.as_deref()).is_none();
+        }
+        if let Some(policy_model) = self.requirements.image_description_model.pinned() {
+            self.image_description_model = Some(policy_model);
+            self.image_description_model_explicit = true;
+            self.image_description_follows_default = false;
+        } else if !self.image_description_model_explicit
+            && let Some(model) =
+                non_empty(self.models.image_description.as_deref()).or(effective_default)
+        {
+            self.image_description_model = Some(model.to_owned());
+            self.image_description_follows_default =
+                non_empty(self.models.image_description.as_deref()).is_none();
+        }
+    }
     /// Re-resolve eagerly-resolved runtime fields using the current `Config`
     /// state and fresh `raw_config`. Builds a [`RuntimeResolutionContext`] from
     /// the CLI flags already stored on this `Config`.
     ///
     /// Integration test coverage: `tests/test_settings_refresh.rs`.
     pub(crate) fn re_resolve_runtime_fields(&mut self, raw_config: &toml::Value) {
+        let configured_model = |key: &str| {
+            raw_config
+                .get("models")
+                .and_then(|models| models.get(key))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
+        self.models.web_search = configured_model("web_search");
+        self.models.session_summary = configured_model("session_summary");
+        self.models.image_description = configured_model("image_description");
         let remote_settings = self.remote_settings.clone();
         let cli_web_search_model = self.web_search_model_override.clone();
         let cli_session_summary_model = self.session_summary_model_override.clone();
@@ -2632,6 +2799,9 @@ impl Config {
             storage_mode: None,
         };
         self.resolve_runtime_fields(&ctx);
+        let effective_default =
+            crate::agent::models::configured_preference(self).map(|preference| preference.value);
+        self.rebind_unset_auxiliary_models_to_default(effective_default.as_deref());
         crate::util::config::set_remote_campaigns_from_settings(self.remote_settings.as_ref());
     }
     /// If the TOML contains `[auth]`, copy its contents under `[grok_com_config]`.
@@ -2674,6 +2844,9 @@ impl Config {
     }
     pub(crate) fn is_session_recap_enabled(&self) -> bool {
         self.resolve_session_recap().value
+    }
+    pub(crate) fn is_turn_summary_enabled(&self) -> bool {
+        self.resolve_turn_summary().value
     }
     pub(crate) fn is_voice_mode_enabled(&self) -> bool {
         self.resolve_voice_mode().value
@@ -2910,6 +3083,17 @@ impl Config {
         let ff = self.remote_settings.as_ref().and_then(|s| s.session_recap);
         BoolFlag::env("GROK_SESSION_RECAP")
             .config(self.features.session_recap)
+            .feature_flag(ff)
+            .default(true)
+            .resolve()
+    }
+    /// Per-turn dashboard summary gate. Default ON — disable via remote
+    /// settings `turn_summary`, the `[features] turn_summary` config.toml key,
+    /// or `GROK_TURN_SUMMARY` env.
+    pub(crate) fn resolve_turn_summary(&self) -> Resolved<bool> {
+        let ff = self.remote_settings.as_ref().and_then(|s| s.turn_summary);
+        BoolFlag::env("GROK_TURN_SUMMARY")
+            .config(self.features.turn_summary)
             .feature_flag(ff)
             .default(true)
             .resolve()
@@ -3510,7 +3694,7 @@ pub(crate) struct SyncBoolFlag {
     default: bool,
 }
 impl SyncBoolFlag {
-    pub const fn new(extract_toml: fn(&toml::Value) -> Option<bool>) -> Self {
+    pub(crate) const fn new(extract_toml: fn(&toml::Value) -> Option<bool>) -> Self {
         Self {
             extract_toml,
             disable_env: None,
@@ -3532,15 +3716,15 @@ impl SyncBoolFlag {
         self
     }
     /// Fallback when no source above fires.
-    pub const fn inherit(mut self, resolver: fn() -> bool) -> Self {
+    pub(crate) const fn inherit(mut self, resolver: fn() -> bool) -> Self {
         self.inherit = Some(resolver);
         self
     }
-    pub const fn default(mut self, val: bool) -> Self {
+    pub(crate) const fn default(mut self, val: bool) -> Self {
         self.default = val;
         self
     }
-    pub fn resolve(&self) -> bool {
+    pub(crate) fn resolve(&self) -> bool {
         if let Some(enabled) = read_requirements_toml()
             .as_ref()
             .and_then(|r| (self.extract_toml)(r))
@@ -4257,9 +4441,13 @@ pub struct ModelEntryConfig {
     /// Example: { "x-anthropic-api-key" = "sk-ant-..." }
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub extra_headers: IndexMap<String, String>,
-    /// The total context window size in tokens for this model.
-    /// Used for auto-compact threshold calculations.
-    /// Required — BYOK users must explicitly set this in config.toml.
+    /// Session token budget (context bar + auto-compact), i.e. operative
+    /// capacity. Required — BYOK users must set this in config.toml.
+    ///
+    /// This is not the Codex catalog field of the same name. Catalog
+    /// `context_window` is a billing/pricing threshold (272_000 on gpt-5.4);
+    /// catalog `max_context_window` is the operative capacity (1_000_000 on
+    /// gpt-5.4) and is what `codex_catalog_context_window` writes here.
     pub context_window: NonZeroU64,
     /// Per-model auto-compact threshold (0-100). When the session's token
     /// usage exceeds this percentage of `context_window`, the conversation
@@ -4421,6 +4609,14 @@ pub struct ConfigModelOverride {
     pub query_params: IndexMap<String, String>,
     #[serde(default)]
     pub env_http_headers: IndexMap<String, String>,
+    /// Session token budget (context bar + auto-compact).
+    ///
+    /// When filled from the Codex catalog this is the operative token
+    /// capacity: `max_context_window` first, then `context_window` as
+    /// fallback. On `gpt-5.4` those differ — catalog `context_window` is the
+    /// 272_000 billing/pricing threshold, not capacity; catalog
+    /// `max_context_window` is the 1_000_000 operative capacity. Do not call
+    /// the catalog `context_window` field "capacity".
     pub context_window: Option<u64>,
     /// Per-model auto-compact threshold override (0-100) from `[model.<id>]`.
     /// Read directly by `resolve_auto_compact_threshold_percent`; intentionally
@@ -4450,6 +4646,10 @@ pub struct ConfigModelOverride {
     /// parse fills it. Skipped in serde so unknown user keys stay ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
+    /// Runtime-only state from the Codex catalog refresh. Kept separate from
+    /// `description` so a metadata-only user override cannot erase it.
+    #[serde(skip)]
+    pub(crate) catalog_degraded_reason: Option<String>,
     /// Raw `auth_scheme` string when TOML parsing failed. Not persisted; used to
     /// fail-closed at resolve time instead of defaulting to Bearer.
     #[serde(skip)]
@@ -4506,6 +4706,10 @@ impl std::fmt::Debug for ConfigModelOverride {
             .field("show_model_fingerprint", &self.show_model_fingerprint)
             .field("stream_tool_calls", &self.stream_tool_calls)
             .field("codex_wire", &self.codex_wire)
+            .field(
+                "catalog_degraded_reason_present",
+                &self.catalog_degraded_reason.is_some(),
+            )
             .field(
                 "invalid_auth_scheme_present",
                 &self.invalid_auth_scheme.is_some(),
@@ -4612,6 +4816,21 @@ impl ConfigModelOverride {
         if self.codex_wire.is_some() {
             entry.info.codex_wire.clone_from(&self.codex_wire);
         }
+        entry
+            .info
+            .catalog_degraded_reason
+            .clone_from(&self.catalog_degraded_reason);
+        if let Some(reason) = self.catalog_degraded_reason.as_deref() {
+            let description = entry
+                .info
+                .description
+                .take()
+                .unwrap_or_else(|| "OpenAI Codex via a ChatGPT subscription".to_owned());
+            entry.info.description = Some(format!(
+                "{description} — {}{reason}",
+                super::model_providers::OPENAI_CODEX_CATALOG_DEGRADED_MARKER
+            ));
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -4663,6 +4882,10 @@ pub struct ModelInfo {
     pub query_params: IndexMap<String, String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub env_http_headers: IndexMap<String, String>,
+    /// Session token budget (operative capacity). See
+    /// [`ConfigModelOverride::context_window`] for the Codex catalog split
+    /// between the `context_window` pricing threshold and
+    /// `max_context_window` capacity.
     pub context_window: NonZeroU64,
     /// Per-model auto-compact threshold (0-100). `None` defers to the
     /// global / default tiers in `resolve_auto_compact_threshold_percent`.
@@ -4715,6 +4938,10 @@ pub struct ModelInfo {
     /// not each tax SamplingConfig.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
+    /// Runtime-only operational state for an account-scoped Codex catalog.
+    /// Never infer this from user-controlled display text.
+    #[serde(skip)]
+    pub(crate) catalog_degraded_reason: Option<String>,
 }
 
 impl std::fmt::Debug for ModelInfo {
@@ -4762,6 +4989,10 @@ impl std::fmt::Debug for ModelInfo {
             .field("stream_tool_calls", &self.stream_tool_calls)
             .field("laziness_detector", &self.laziness_detector)
             .field("codex_wire", &self.codex_wire)
+            .field(
+                "catalog_degraded_reason_present",
+                &self.catalog_degraded_reason.is_some(),
+            )
             .finish()
     }
 }
@@ -4803,6 +5034,7 @@ impl ModelInfo {
             stream_tool_calls: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
+            catalog_degraded_reason: None,
         }
     }
     /// Extract shared model metadata from a flat config entry.
@@ -4841,6 +5073,7 @@ impl ModelInfo {
             stream_tool_calls: entry.stream_tool_calls,
             laziness_detector: entry.laziness_detector.clone(),
             codex_wire: None,
+            catalog_degraded_reason: None,
         }
     }
     /// Derive the legacy effort gate/default from `reasoning_efforts` so the
@@ -5188,6 +5421,10 @@ pub struct Features {
     /// `None` = defer to remote settings / env / default (`true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_recap: Option<bool>,
+    /// Per-turn dashboard summary generated at turn end.
+    /// `None` = defer to remote settings / env / default (`true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_summary: Option<bool>,
     /// Voice dictation (STT). `None` = env / remote / default on.
     /// Set `false` in requirements or managed config to force off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5787,6 +6024,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 stream_tool_calls: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 codex_wire: None,
+                catalog_degraded_reason: None,
             },
             api_key: Some(bearer),
             env_key: None,
@@ -6416,6 +6654,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             stream_tool_calls: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
+            catalog_degraded_reason: None,
         },
         api_key: None,
         env_key: None,
@@ -6470,7 +6709,7 @@ impl WebSearchDisabled {
     }
 
     /// One-line notice naming the model and why it was rejected.
-    pub fn user_notice(&self) -> String {
+    pub(crate) fn user_notice(&self) -> String {
         format!(
             "web_search is unavailable: model \"{}\" could not be used ({})",
             self.model_id, self.reason
@@ -6698,7 +6937,7 @@ fn invalid_auth_scheme_validation_error(raw: &str) -> String {
 }
 
 /// Credential class for picker UX: keyless, env/BYOK, or xAI session/login.
-fn auth_class_for_entry(model: &ModelEntry) -> &'static str {
+pub(crate) fn auth_class_for_entry(model: &ModelEntry) -> &'static str {
     if model.info.auth_scheme == AuthScheme::None {
         "none"
     } else if model.has_own_credentials()
@@ -6712,17 +6951,8 @@ fn auth_class_for_entry(model: &ModelEntry) -> &'static str {
 
 /// Short provider label for picker rows (`providerHint`).
 fn provider_hint_for_url(base_url: &str) -> String {
-    // Check loopback before `is_xai_api_url` — that helper treats localhost as
-    // cli-chat-proxy for credential refusal, which is not a useful picker label.
-    if let Ok(parsed) = reqwest::Url::parse(base_url) {
-        match parsed.host() {
-            Some(url::Host::Domain("localhost")) => {
-                return "local".to_string();
-            }
-            Some(url::Host::Ipv4(ip)) if ip.is_loopback() => return "local".to_string(),
-            Some(url::Host::Ipv6(ip)) if ip.is_loopback() => return "local".to_string(),
-            _ => {}
-        }
+    if catalog_endpoint_is_local(base_url) {
+        return "local".to_string();
     }
     if crate::util::is_xai_api_url(base_url) {
         return "xAI".to_string();
@@ -6736,6 +6966,33 @@ fn provider_hint_for_url(base_url: &str) -> String {
         Some(url::Host::Ipv6(ip)) => ip.to_string(),
         None => base_url.to_string(),
     }
+}
+
+/// Loopback catalog endpoints are `local_only` for native route eligibility.
+pub(crate) fn catalog_endpoint_is_local(base_url: &str) -> bool {
+    // Check loopback before `is_xai_api_url` — that helper treats localhost as
+    // cli-chat-proxy for credential refusal, which is not a useful picker label.
+    let Ok(parsed) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => true,
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => true,
+        _ => false,
+    }
+}
+
+/// `local_only` eligibility for one catalog entry.
+///
+/// Session auth uses `base_url`; the `XAI_API_KEY` arm uses `api_base_url`
+/// when set (`resolve_credentials`). This function cannot see which credential
+/// is live, so every arm that spawn might send must be loopback. A loopback
+/// `base_url` with a remote `api_base_url` is not local.
+pub(crate) fn catalog_entry_is_local(model: &ModelEntry) -> bool {
+    let session_url = model.info.base_url.as_str();
+    let api_url = model.api_base_url.as_deref().unwrap_or(session_url);
+    catalog_endpoint_is_local(session_url) && catalog_endpoint_is_local(api_url)
 }
 
 /// #135 origin binding for the built-in OpenAI Codex provider: its bearer is
@@ -6997,6 +7254,12 @@ pub(crate) fn to_acp_model_info(
                     map.insert(
                         "readinessReason".to_string(),
                         serde_json::Value::String(reason),
+                    );
+                }
+                if let Some(reason) = info.catalog_degraded_reason.as_deref() {
+                    map.insert(
+                        "catalogDegradedReason".to_string(),
+                        serde_json::Value::String(reason.to_owned()),
                     );
                 }
                 map.insert(
@@ -9050,6 +9313,7 @@ reasoning_effort = "low"
                 stream_tool_calls: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 codex_wire: None,
+                catalog_degraded_reason: None,
             },
             api_key: api_key.map(|s| s.to_string()),
             env_key: env_key.map(EnvKeys::single),
@@ -10473,6 +10737,49 @@ reasoning_effort = "low"
             Some("https://api.x.ai/v1"),
         );
         assert_eq!(model_readiness(&m), (true, None));
+    }
+
+    /// #329: the named keyless-local mock catalog (`authScheme: none`) is ready
+    /// on loopback. The shared `start()` Bearer default stays unready so we do
+    /// not weaken the origin gate or reuse ambient xAI session credentials.
+    #[test]
+    fn keyless_local_mock_catalog_entry_is_ready_on_loopback() {
+        let loopback = "http://127.0.0.1:9/v1";
+        let parsed = crate::remote::client::parse_remote_model_value(
+            &serde_json::json!({
+                "id": "test-model",
+                "object": "model",
+                "created": 1234567890,
+                "owned_by": "test",
+                "authScheme": "none",
+            }),
+            loopback,
+        )
+        .expect("parse keyless local catalog entry");
+        let entry = ModelEntry::from_config_entry(&parsed);
+        assert_eq!(entry.info.auth_scheme, AuthScheme::None);
+        assert_eq!(
+            model_readiness(&entry),
+            (true, None),
+            "auth_scheme=none local fixtures must be ready"
+        );
+
+        let parsed = crate::remote::client::parse_remote_model_value(
+            &serde_json::json!({
+                "id": "test-model",
+                "object": "model",
+                "created": 1234567890,
+                "owned_by": "test",
+            }),
+            loopback,
+        )
+        .expect("parse default catalog entry");
+        let entry = ModelEntry::from_config_entry(&parsed);
+        assert_eq!(entry.info.auth_scheme, AuthScheme::Bearer);
+        assert!(
+            !model_readiness(&entry).0,
+            "Bearer-default loopback catalog must stay unready"
+        );
     }
 
     /// #123 option 3: when an ambient credential is present but the model's
@@ -13256,6 +13563,41 @@ reasoning_effort = "low"
         );
         assert_eq!(r.source, ConfigSource::Remote);
     }
+    /// Precedence: env > config.toml > remote settings > default(true). One
+    /// test covers the full ladder (the `resolve_two_pass_compaction` pattern).
+    #[test]
+    #[serial]
+    fn resolve_turn_summary_precedence() {
+        unsafe { std::env::remove_var("GROK_TURN_SUMMARY") };
+        let r = Config::default().resolve_turn_summary();
+        assert!(r.value, "turn_summary defaults on");
+        assert_eq!(r.source, ConfigSource::Default);
+        let remote_off = Config {
+            remote_settings: Some(crate::util::config::RemoteSettings {
+                turn_summary: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = remote_off.resolve_turn_summary();
+        assert!(!r.value, "remote false must kill-switch default on");
+        assert_eq!(r.source, ConfigSource::Remote);
+        let config_over_remote = Config {
+            features: Features {
+                turn_summary: Some(true),
+                ..Default::default()
+            },
+            ..remote_off
+        };
+        let r = config_over_remote.resolve_turn_summary();
+        assert!(r.value, "config.toml beats remote kill-switch");
+        assert_eq!(r.source, ConfigSource::Config);
+        unsafe { std::env::set_var("GROK_TURN_SUMMARY", "0") };
+        let r = config_over_remote.resolve_turn_summary();
+        assert!(!r.value, "env wins over config + remote");
+        assert_eq!(r.source, ConfigSource::Env);
+        unsafe { std::env::remove_var("GROK_TURN_SUMMARY") };
+    }
     /// Precedence: env > config.toml > remote settings > default(false). One test
     /// covers the full ladder so we do not maintain a matrix of flag cases.
     #[test]
@@ -15451,6 +15793,7 @@ agent_type = "cursor"
             std::env::remove_var("GROK_RESPECT_GITIGNORE");
             std::env::remove_var("GROK_WEB_SEARCH_MODEL");
             std::env::remove_var("GROK_SESSION_SUMMARY_MODEL");
+            std::env::remove_var("GROK_IMAGE_DESCRIPTION_MODEL");
             std::env::remove_var("GROK_CURSOR_SKILLS_ENABLED");
             std::env::remove_var("GROK_CURSOR_RULES_ENABLED");
             std::env::remove_var("GROK_CURSOR_AGENTS_ENABLED");
@@ -15929,6 +16272,340 @@ hooks = true
     }
     #[test]
     #[serial]
+    fn resolve_runtime_fields_model_overrides_follow_cli_default() {
+        clear_runtime_env_vars();
+        let raw = empty_config();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.default_model_override = Some("custom-default".to_owned());
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        assert_eq!(cfg.web_search_model, "custom-default");
+        assert!(cfg.web_search_follows_default);
+        assert_eq!(cfg.session_summary_model.as_deref(), Some("custom-default"));
+        assert!(cfg.session_summary_follows_default);
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("custom-default")
+        );
+        assert!(cfg.image_description_follows_default);
+    }
+    #[test]
+    #[serial]
+    fn model_overrides_policy_default_rebinds_only_unset_auxiliary_lanes() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+web_search = "explicit-search"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        cfg.models.session_summary = Some("required-summary".to_owned());
+
+        cfg.rebind_unset_auxiliary_models_to_default(Some("required-default"));
+
+        assert_eq!(cfg.web_search_model, "explicit-search");
+        assert!(!cfg.web_search_follows_default);
+        assert_eq!(
+            cfg.session_summary_model.as_deref(),
+            Some("required-summary")
+        );
+        assert!(!cfg.session_summary_follows_default);
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("required-default")
+        );
+        assert!(cfg.image_description_follows_default);
+    }
+
+    #[test]
+    #[serial]
+    fn managed_auxiliary_pins_override_explicit_user_provenance() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+web_search = "user-search"
+session_summary = "user-summary"
+image_description = "user-image"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        assert!(cfg.web_search_model_explicit);
+        assert_eq!(cfg.web_search_model, "user-search");
+        assert!(cfg.session_summary_model_explicit);
+        assert_eq!(cfg.session_summary_model.as_deref(), Some("user-summary"));
+        assert!(cfg.image_description_model_explicit);
+        assert_eq!(cfg.image_description_model.as_deref(), Some("user-image"));
+
+        // A managed policy merge records enforcement after runtime provenance
+        // has already recorded the user's explicit pins.
+        let source = crate::config::RequirementSource::Requirements {
+            path: PathBuf::from("/test/requirements.toml"),
+        };
+        cfg.models.web_search = Some("required-search".to_owned());
+        cfg.models.session_summary = Some("required-summary".to_owned());
+        cfg.models.image_description = Some("required-image".to_owned());
+        cfg.requirements
+            .web_search_model
+            .pin("required-search".to_owned(), source.clone());
+        cfg.requirements
+            .session_summary_model
+            .pin("required-summary".to_owned(), source.clone());
+        cfg.requirements
+            .image_description_model
+            .pin("required-image".to_owned(), source);
+        cfg.rebind_unset_auxiliary_models_to_default(Some("required-default"));
+
+        assert_eq!(cfg.web_search_model, "required-search");
+        assert!(cfg.web_search_model_explicit);
+        assert!(!cfg.web_search_follows_default);
+        assert_eq!(
+            cfg.session_summary_model.as_deref(),
+            Some("required-summary")
+        );
+        assert!(cfg.session_summary_model_explicit);
+        assert!(!cfg.session_summary_follows_default);
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("required-image")
+        );
+        assert!(cfg.image_description_model_explicit);
+        assert!(!cfg.image_description_follows_default);
+    }
+
+    #[test]
+    #[serial]
+    fn removed_auxiliary_requirement_pins_do_not_survive_runtime_refresh() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+default = "fresh-default"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        let source = crate::config::RequirementSource::Requirements {
+            path: PathBuf::from("/test/requirements.toml"),
+        };
+        for (model, requirement) in [
+            (
+                &mut cfg.models.web_search,
+                &mut cfg.requirements.web_search_model,
+            ),
+            (
+                &mut cfg.models.session_summary,
+                &mut cfg.requirements.session_summary_model,
+            ),
+            (
+                &mut cfg.models.image_description,
+                &mut cfg.requirements.image_description_model,
+            ),
+        ] {
+            *model = Some("removed-policy-model".to_owned());
+            requirement.pin("removed-policy-model".to_owned(), source.clone());
+        }
+        cfg.rebind_unset_auxiliary_models_to_default(Some("fresh-default"));
+        assert_eq!(cfg.web_search_model, "removed-policy-model");
+
+        cfg.requirements.clear_auxiliary_model_pins();
+        cfg.re_resolve_runtime_fields(&raw);
+
+        assert_eq!(cfg.web_search_model, "fresh-default");
+        assert_eq!(cfg.session_summary_model.as_deref(), Some("fresh-default"));
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("fresh-default")
+        );
+        assert!(cfg.web_search_follows_default);
+        assert!(cfg.session_summary_follows_default);
+        assert!(cfg.image_description_follows_default);
+        assert!(!cfg.web_search_model_explicit);
+        assert!(!cfg.session_summary_model_explicit);
+        assert!(!cfg.image_description_model_explicit);
+        assert!(cfg.models.web_search.is_none());
+        assert!(cfg.models.session_summary.is_none());
+        assert!(cfg.models.image_description.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn cli_auxiliary_pins_survive_default_rebind() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+web_search = "config-search"
+session_summary = "config-summary"
+image_description = "config-image"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: Some("cli-search"),
+            cli_session_summary_model: Some("cli-summary"),
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+
+        cfg.rebind_unset_auxiliary_models_to_default(Some("required-default"));
+
+        assert_eq!(cfg.web_search_model, "cli-search");
+        assert_eq!(cfg.session_summary_model.as_deref(), Some("cli-summary"));
+        assert_eq!(cfg.image_description_model.as_deref(), Some("config-image"));
+    }
+
+    #[test]
+    #[serial]
+    fn env_auxiliary_pins_survive_default_rebind() {
+        clear_runtime_env_vars();
+        let _web_search = EnvGuard::set("GROK_WEB_SEARCH_MODEL", "env-search");
+        let _session_summary = EnvGuard::set("GROK_SESSION_SUMMARY_MODEL", "env-summary");
+        let _image_description = EnvGuard::set("GROK_IMAGE_DESCRIPTION_MODEL", "env-image");
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+web_search = "config-search"
+session_summary = "config-summary"
+image_description = "config-image"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+
+        cfg.rebind_unset_auxiliary_models_to_default(Some("required-default"));
+
+        assert_eq!(cfg.web_search_model, "env-search");
+        assert_eq!(cfg.session_summary_model.as_deref(), Some("env-summary"));
+        assert_eq!(cfg.image_description_model.as_deref(), Some("env-image"));
+    }
+
+    #[test]
+    #[serial]
+    fn blank_auxiliary_values_remain_unset_during_default_rebind() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+web_search = "  "
+session_summary = "\t"
+image_description = "\n"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+
+        cfg.rebind_unset_auxiliary_models_to_default(Some("required-default"));
+
+        assert_eq!(cfg.web_search_model, "required-default");
+        assert!(cfg.web_search_follows_default);
+        assert_eq!(
+            cfg.session_summary_model.as_deref(),
+            Some("required-default")
+        );
+        assert!(cfg.session_summary_follows_default);
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("required-default")
+        );
+        assert!(cfg.image_description_follows_default);
+    }
+    #[test]
+    #[serial]
     fn resolve_runtime_fields_path_hints_from_remote() {
         clear_runtime_env_vars();
         let raw = empty_config();
@@ -16223,6 +16900,7 @@ default = "grok-4.5"
                 auto_compact_threshold_percent: None,
                 system_prompt_label: None,
                 codex_wire: None,
+                catalog_degraded_reason: None,
             },
             api_key: None,
             env_key: None,

@@ -658,6 +658,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // both the pager drain and the shell promote. Registered before
             // multiline_mode, so it renders first).
             "combine_queued_prompts",
+            "confirm_before_rewind",
             // PAGER-owned multiline (Editor category).
             "multiline_mode",
             // SHELL-owned prompt_suggestions (Editor; tab autocomplete
@@ -1584,6 +1585,30 @@ fn editor_render_fixture(buffer: &str, cursor_byte: usize) -> SettingsModalState
         validation_error,
     );
     s
+}
+
+#[test]
+fn known_model_validator_rejects_duplicate_display_name_but_accepts_id() {
+    use agent_client_protocol as acp;
+
+    let models = vec![
+        (
+            "Shared Model".to_string(),
+            acp::ModelId::new(Arc::from("provider-a/shared")),
+        ),
+        (
+            "Shared Model".to_string(),
+            acp::ModelId::new(Arc::from("provider-b/shared")),
+        ),
+    ];
+    assert_eq!(
+        validate_string(StringValidator::KnownModel, "Shared Model", &models),
+        Some("Ambiguous model name: \"Shared Model\" — enter the model id".to_string()),
+    );
+    assert_eq!(
+        validate_string(StringValidator::KnownModel, "provider-a/shared", &models),
+        None,
+    );
 }
 
 /// Cursor lands at the visual column matching `cursor_byte` for
@@ -3101,6 +3126,208 @@ fn try_enter_picking_enum_returns_false_for_non_enum_row() {
     assert!(
         matches!(s.mode(), SettingsModalMode::Browse),
         "mode must not change on non-Enum row"
+    );
+}
+
+/// A persisted `fork_secondary_model` id seeds the picker on that model's row
+/// rather than the stale-value
+/// fallback (index 1). The catalog carries two models so a fallback seed
+/// and a genuine match land on different indices.
+#[test]
+fn fork_secondary_model_picker_opens_on_persisted_model() {
+    use agent_client_protocol as acp;
+    // Must differ from the baseline slug or the empty-fold arm hides the lookup.
+    let slug = "grok-4.5-fast";
+    assert_ne!(slug, xai_grok_shell::models::default_model());
+    let snapshot = PagerLocalSnapshot {
+        available_models: vec![
+            ("Grok 3".to_string(), acp::ModelId::new(Arc::from("grok-3"))),
+            (
+                "Grok 4.5 Fast".to_string(),
+                acp::ModelId::new(Arc::from(slug)),
+            ),
+        ],
+        ..PagerLocalSnapshot::default()
+    };
+    let ui = UiConfig {
+        fork_secondary_model: slug.to_string(),
+        ..UiConfig::default()
+    };
+    let mut s = SettingsModalState::new(Arc::new(SettingsRegistry::defaults()), ui, snapshot);
+
+    // Row value retains the stable id; the picker still renders readable names.
+    assert_eq!(
+        s.value_for("fork_secondary_model"),
+        Some(SettingValue::String(slug.to_string())),
+    );
+
+    assert!(s.focus_key("fork_secondary_model"));
+    assert!(s.try_enter_picking_enum());
+    match s.mode() {
+        SettingsModalMode::PickingEnum {
+            key,
+            choices_idx,
+            ref original_value,
+            ..
+        } => {
+            assert_eq!(key, "fork_secondary_model");
+            // Choices: [(no override), Grok 3, Grok 4.5 Fast] → idx 2.
+            assert_eq!(
+                choices_idx, 2,
+                "picker must open on the persisted model, not the stale fallback",
+            );
+            assert_eq!(
+                original_value,
+                &SettingValue::String(slug.to_string()),
+                "original_value must carry the model id so Esc-revert round-trips",
+            );
+        }
+        ref other => panic!("expected PickingEnum mode, got {other:?}"),
+    }
+}
+
+fn model_picker_with_unavailable_choice() -> SettingsModalState {
+    use agent_client_protocol as acp;
+
+    let ready = acp::ModelId::new(Arc::from("provider/ready"));
+    let unavailable = acp::ModelId::new(Arc::from("provider/unavailable"));
+    let snapshot = PagerLocalSnapshot {
+        available_models: vec![
+            ("Ready Model".to_string(), ready),
+            ("Unavailable Model".to_string(), unavailable.clone()),
+        ],
+        model_unready_reasons: std::collections::HashMap::from([(
+            unavailable.0.to_string(),
+            "Codex authentication required".to_string(),
+        )]),
+        ..PagerLocalSnapshot::default()
+    };
+    let mut state = SettingsModalState::new(
+        Arc::new(SettingsRegistry::defaults()),
+        UiConfig::default(),
+        snapshot,
+    );
+    assert!(state.focus_key("fork_secondary_model"));
+    assert!(state.try_enter_picking_enum());
+    state
+}
+
+#[test]
+fn unavailable_model_keyboard_enter_does_not_commit_or_close_picker() {
+    let mut state = model_picker_with_unavailable_choice();
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    assert!(matches!(
+        handle_settings_key(&mut state, &down),
+        SettingsKeyOutcome::Changed
+    ));
+    assert!(matches!(
+        handle_settings_key(&mut state, &down),
+        SettingsKeyOutcome::Changed
+    ));
+
+    let outcome = handle_settings_key(
+        &mut state,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(outcome, SettingsKeyOutcome::Unchanged));
+    assert!(matches!(
+        state.mode(),
+        SettingsModalMode::PickingEnum { choices_idx: 2, .. }
+    ));
+}
+
+#[test]
+fn unavailable_model_mouse_click_focuses_without_commit_or_preview() {
+    let mut state = model_picker_with_unavailable_choice();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 20,
+    };
+    let mut buf = Buffer::empty(area);
+    render_picking_enum(&mut buf, area, &state, &Theme::current());
+    state.picker_choice_rects = take_picker_choice_rects();
+    let target = state.picker_choice_rects[2];
+
+    let outcome = handle_settings_mouse(
+        &mut state,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        target.x + target.width / 2,
+        target.y,
+    );
+
+    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert!(matches!(
+        state.mode(),
+        SettingsModalMode::PickingEnum { choices_idx: 2, .. }
+    ));
+}
+
+#[test]
+fn fork_secondary_model_browse_row_projects_catalog_label_and_unavailable_state() {
+    use agent_client_protocol as acp;
+    let slug = "provider/retired";
+    let snapshot = PagerLocalSnapshot {
+        available_models: vec![(
+            "Retired Friendly Name".to_string(),
+            acp::ModelId::new(Arc::from(slug)),
+        )],
+        model_unready_reasons: std::collections::HashMap::from([(
+            slug.to_string(),
+            "authentication expired".to_string(),
+        )]),
+        ..PagerLocalSnapshot::default()
+    };
+    let ui = UiConfig {
+        fork_secondary_model: slug.to_string(),
+        ..UiConfig::default()
+    };
+    let state = SettingsModalState::new(Arc::new(SettingsRegistry::defaults()), ui, snapshot);
+
+    assert_eq!(
+        state.value_for("fork_secondary_model"),
+        Some(SettingValue::String(slug.to_string())),
+        "the persisted value remains the stable model id"
+    );
+    assert_eq!(
+        state.display_value_for("fork_secondary_model"),
+        Some(SettingValue::String(
+            "Retired Friendly Name [unavailable]".to_string()
+        )),
+        "the browse row uses the catalog label and readiness annotation"
+    );
+}
+
+#[test]
+fn unavailable_resident_default_model_browse_row_keeps_friendly_label() {
+    use agent_client_protocol as acp;
+
+    let slug = "provider/retired-resident";
+    let snapshot = PagerLocalSnapshot {
+        current_model_id: Some(acp::ModelId::new(Arc::from(slug))),
+        current_model_name: Some("Retired Resident".to_string()),
+        available_models: vec![],
+        ..PagerLocalSnapshot::default()
+    };
+    let state = SettingsModalState::new(
+        Arc::new(SettingsRegistry::defaults()),
+        UiConfig::default(),
+        snapshot,
+    );
+
+    assert_eq!(
+        state.value_for("default_model"),
+        Some(SettingValue::String(slug.to_string())),
+        "the stable resident model id remains the action value"
+    );
+    assert_eq!(
+        state.display_value_for("default_model"),
+        Some(SettingValue::String(
+            "Retired Resident [unavailable]".to_string()
+        )),
+        "the browse row must not expose a raw id for a removed resident"
     );
 }
 

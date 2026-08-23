@@ -77,10 +77,41 @@ impl ChatStateActor {
         event_tx: mpsc::UnboundedSender<ChatStateEvent>,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> ChatStateHandle {
+        Self::spawn_with_pruning_and_catalog_identity(
+            initial_conversation,
+            sampling_config,
+            None,
+            pruning_config,
+            persistence,
+            event_tx,
+            cancellation_token,
+        )
+    }
+
+    /// Spawn with an initial catalog identity committed atomically with the
+    /// sampling config.
+    pub fn spawn_with_pruning_and_catalog_identity(
+        initial_conversation: Vec<ConversationItem>,
+        sampling_config: SamplingConfig,
+        catalog_identity: Option<crate::types::CatalogIdentity>,
+        pruning_config: PruningConfig,
+        persistence: Box<dyn ChatPersistence>,
+        event_tx: mpsc::UnboundedSender<ChatStateEvent>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> ChatStateHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
+        let state = match catalog_identity {
+            Some(catalog_identity) => ChatState::new_with_catalog_identity(
+                initial_conversation,
+                sampling_config,
+                Some(catalog_identity),
+            ),
+            None => ChatState::new(initial_conversation, sampling_config),
+        };
+
         let actor = ChatStateActor {
-            state: ChatState::new(initial_conversation, sampling_config),
+            state,
             pruning_config,
             persistence,
             cmd_rx,
@@ -166,8 +197,12 @@ impl ChatStateActor {
             ChatStateCommand::PushAssistantResponse { item } => {
                 self.push_message(item);
             }
-            ChatStateCommand::PushToolResult { item } => {
-                self.push_message(item);
+            ChatStateCommand::PushToolResult {
+                item,
+                truncation_policy,
+                trusted_suffix,
+            } => {
+                self.push_tool_result(item, truncation_policy, trusted_suffix);
             }
             ChatStateCommand::RecordTokenUsage { total_tokens } => {
                 self.record_token_usage(total_tokens);
@@ -205,6 +240,13 @@ impl ChatStateActor {
             }
             ChatStateCommand::UpdateSamplingConfig { config } => {
                 self.state.sampling_config = config;
+            }
+            ChatStateCommand::UpdateSamplingConfigAndCredentials {
+                config,
+                credentials,
+            } => {
+                self.state.sampling_config = config;
+                self.state.credentials = credentials;
             }
             ChatStateCommand::RecordAgentEditedPath { path } => {
                 self.state.agent_edited_paths.insert(path);
@@ -333,6 +375,19 @@ impl ChatStateActor {
             }
             ChatStateCommand::GetSamplingConfig { reply } => {
                 let _ = reply.send(self.state.sampling_config.clone());
+            }
+            ChatStateCommand::GetSamplingConfigWithModelId { reply } => {
+                let _ = reply.send((
+                    self.state.sampling_config.clone(),
+                    self.state.catalog_identity.clone(),
+                ));
+            }
+            ChatStateCommand::GetPreparedModelState { reply } => {
+                let _ = reply.send((
+                    self.state.sampling_config.clone(),
+                    self.state.catalog_identity.clone(),
+                    self.state.credentials.clone(),
+                ));
             }
             ChatStateCommand::GetAgentEditedPaths { reply } => {
                 let _ = reply.send(self.state.agent_edited_paths.clone());

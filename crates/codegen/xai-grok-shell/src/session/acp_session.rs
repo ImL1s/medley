@@ -91,14 +91,17 @@ mod compaction_segments;
 mod types;
 pub(crate) use types::*;
 pub use types::{TodoGateDecision, TodoGateReason};
-#[path = "acp_session_impl/auth_retry.rs"]
-mod auth_retry;
 #[path = "acp_session_impl/goal.rs"]
 mod goal;
+#[path = "acp_session_impl/tool_layer_images.rs"]
+mod tool_layer_images;
 #[path = "acp_session_impl/turn.rs"]
 mod turn;
 #[path = "acp_session_impl/workflow.rs"]
 mod workflow_run;
+use tool_layer_images::*;
+#[path = "acp_session_impl/auth_retry.rs"]
+mod auth_retry;
 pub(crate) use auth_retry::{
     AuthRetryDecision, AuthRetrySchedule, Codex401RetryBudget, Provider401RecoveryAction,
     human_duration, pace_uncharged_resubmit, provider_401_recovery_action,
@@ -112,14 +115,15 @@ pub(crate) use interjection::*;
 mod laziness;
 #[cfg(test)]
 pub(crate) use laziness::*;
+#[path = "acp_session_impl/prompt_queue.rs"]
+mod prompt_queue;
+pub(super) use prompt_queue::QueueInputRequest;
 #[path = "acp_session_impl/hooks_plugins.rs"]
 mod hooks_plugins;
 #[path = "acp_session_impl/mcp.rs"]
 mod mcp;
 #[path = "acp_session_impl/model_switch.rs"]
 mod model_switch;
-#[path = "acp_session_impl/prompt_queue.rs"]
-mod prompt_queue;
 #[path = "acp_session_impl/slash_exec.rs"]
 mod slash_exec;
 use super::PromptOrigin;
@@ -180,8 +184,12 @@ mod rewind;
 mod run_loop;
 #[path = "acp_session_impl/session_setup.rs"]
 mod session_setup;
+#[path = "acp_session_impl/side_call.rs"]
+mod side_call;
 #[path = "acp_session_impl/turn_end.rs"]
 mod turn_end;
+#[path = "acp_session_impl/turn_summary.rs"]
+mod turn_summary;
 #[path = "acp_session_impl/updates.rs"]
 mod updates;
 use run_loop::*;
@@ -208,7 +216,8 @@ pub(crate) struct InputItem {
     /// Who originated this prompt — user or auto-wake system.
     pub(crate) origin: super::PromptOrigin,
     /// Typed deferred completion retained while an admitted task wake is queued.
-    /// Consumed by Ctrl+C if it removes the wake before the turn starts.
+    /// Consumed by an interactive stop if it removes the wake before the
+    /// turn starts.
     pub(crate) task_wake_fallback: Option<TaskWakeFallback>,
     pub(crate) tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
     pub(crate) respond_to: oneshot::Sender<PromptTurnResult>,
@@ -292,11 +301,16 @@ pub(crate) struct State {
     /// Prompt ids held out of combine-on-promote (composer edit in progress).
     pub(crate) combine_edit_holds: std::collections::HashSet<String>,
     /// When true, notifications are buffered but not drained until genuine
-    /// user re-engagement. Set by interactive Ctrl+C, cleared by a user prompt.
+    /// user re-engagement. Set by an interactive stop, cleared by a user
+    /// prompt.
     pub(crate) notifications_suppressed: bool,
-    /// Active prompt is still rewindable until the first outbound prompt-scoped
-    /// event is emitted.
+    /// Active prompt is still rewindable until the first outbound
+    /// prompt-scoped event is emitted; armed at promote, cleared at first
+    /// output or by the rewind pop itself.
     pub(crate) rewindable: bool,
+    /// Whether the running front's user message is recorded where the model
+    /// will see it; lifecycle on `mark_front_message_committed`.
+    pub(crate) front_message_committed: bool,
     /// Layer-3 LazinessDetector: number of `<system-reminder>` nudges
     /// injected so far in this (session, model) pair. Reset to 0 by
     /// the actor's main `select!` loop when its `model_switch_rx`
@@ -363,7 +377,7 @@ impl State {
 /// so they share one definition of idleness, with no drift between them.
 ///
 /// Returns `true` exactly when: no turn is running, no user prompt is
-/// queued, and interactive Ctrl+C has not suppressed notifications pending
+/// queued, and an interactive stop has not suppressed notifications pending
 /// genuine user re-engagement.
 pub(crate) fn is_session_idle_for_injection(state: &State) -> bool {
     state.running_task.is_none()
@@ -799,6 +813,13 @@ pub(crate) struct SessionActor {
     /// Authoritative catalog model id for auth/readiness lookups. Distinct from
     /// the wire routing slug stored in `chat_state_handle` sampling config.
     pub(crate) catalog_model_id: std::cell::Cell<String>,
+    /// Tool-result truncation policy committed with the active model's
+    /// sampling configuration. Keep this paired with `catalog_model_id`: a
+    /// background catalog refresh must not replace one capability underneath
+    /// an already-running session, while a successful model switch updates
+    /// both together.
+    pub(crate) committed_tool_result_truncation_policy:
+        std::cell::Cell<Option<xai_grok_sampling_types::TruncationPolicyConfig>>,
     /// Per-turn override, set at promotion. Not persisted; a reload reverts to the definition seed.
     pub(crate) tool_overrides: std::cell::RefCell<Option<xai_grok_sampling_types::ToolOverrides>>,
     /// Configured cutoff a subagent inherits, read off the `SessionHandle` without an actor round-trip.
@@ -1112,6 +1133,18 @@ pub(crate) struct SessionActor {
     /// Bumped on each real user prompt (queue accept + turn start); in-flight
     /// recap suppresses emit if this changes before commit.
     pub(crate) recap_epoch: std::cell::Cell<u64>,
+    /// The in-flight turn-summary side-call, if any. A newer completion (or a
+    /// real prompt / rewind / cancel / shutdown) aborts it — its result would
+    /// describe an older turn — and a completion respawns; see
+    /// `restart_turn_summary`. Cleared when the task finishes so `Some` means
+    /// "still running".
+    pub(crate) turn_summary_task: std::cell::RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Generation of the currently registered turn-summary task. Bumped on
+    /// each spawn so a finishing older task cannot clear a newer slot.
+    pub(crate) turn_summary_generation: std::cell::Cell<u64>,
+    /// Turn-summary gate, resolved once at spawn (env / config / remote
+    /// settings — see `Config::resolve_turn_summary`).
+    pub(crate) turn_summary_enabled: bool,
     /// True while THIS session has a prompt turn in flight (RAII-guarded in
     /// `handle_prompt`, like `tool_context.is_turn_active` — which is the
     /// agent-wide coordinator flag shared by all sessions and so unusable
@@ -1184,7 +1217,7 @@ pub(crate) struct SessionActor {
     pub(crate) rebuild_spec: Arc<crate::session::agent_rebuild::AgentRebuildSpec>,
     /// Resolved vision model ID for auxiliary image processing.
     /// Populated from `Config.image_description_model` at spawn.
-    pub(crate) image_description_model: String,
+    pub(crate) image_description_model: std::cell::RefCell<String>,
     /// Cache auxiliary image outputs by content and prompt fingerprint.
     pub(crate) image_describe_cache: Arc<crate::session::image_describe::ImageDescribeCache>,
     /// Per-subagent token state keyed by `subagent_id`; sums into
@@ -1278,6 +1311,15 @@ impl SessionActor {
         let out = id.clone();
         self.catalog_model_id.set(id);
         out
+    }
+    /// Return the client-side tool-result truncation policy committed with the
+    /// active model. Model switches replace this value only after the new
+    /// chat generation has been persisted; catalog refreshes do not mutate it
+    /// underneath the session (#245, #263, #277).
+    fn tool_result_truncation_policy(
+        &self,
+    ) -> Option<xai_grok_sampling_types::TruncationPolicyConfig> {
+        self.committed_tool_result_truncation_policy.get()
     }
     /// Build a hook run context for dispatching hook events.
     fn session_id_string(&self) -> String {
@@ -1439,7 +1481,11 @@ const PROMPT_CONTEXT_FILENAME: &str = "prompt_context.json";
 /// inspection, and post-hoc debugging of what went into a session's system prompt.
 fn save_prompt_context(session_info: &SessionInfo, prompt_context: &xai_grok_agent::PromptContext) {
     let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    save_prompt_context_in_dir(&dir, prompt_context);
+}
+
+fn save_prompt_context_in_dir(dir: &Path, prompt_context: &xai_grok_agent::PromptContext) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(?e, "failed to create session dir for prompt_context.json");
         return;
     }
@@ -1471,7 +1517,15 @@ const SYSTEM_PROMPT_FILENAME: &str = "system_prompt.txt";
 /// the content is identical, so the two writers can never produce a torn file.
 fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[ConversationItem]) {
     let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    persist_chat_history_jsonl_sync_in_dir(session_info, &dir, conversation);
+}
+
+fn persist_chat_history_jsonl_sync_in_dir(
+    session_info: &SessionInfo,
+    dir: &Path,
+    conversation: &[ConversationItem],
+) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(session_id = %session_info.id.0, ?e,
             "persist_chat_history_jsonl_sync: failed to create session dir");
         return;
@@ -1503,7 +1557,11 @@ fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[C
 /// (the conversation head is).
 fn save_system_prompt(session_info: &SessionInfo, system_prompt: &str) {
     let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    save_system_prompt_in_dir(&dir, system_prompt);
+}
+
+fn save_system_prompt_in_dir(dir: &Path, system_prompt: &str) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(?e, "failed to create session dir for system_prompt.txt");
         return;
     }
@@ -1914,7 +1972,12 @@ mod tool_meta_stamp_tests {
                         } = cmd
                         {
                             *captured_in_task.lock().await = Some(tool_call_update);
-                            let _ = respond_to.send(Decision::Allow);
+                            let _ = respond_to.send(
+                                xai_grok_workspace::permission::PermissionResolution {
+                                    decision: Decision::Allow,
+                                    event: None,
+                                },
+                            );
                         }
                     }
                 });
@@ -1992,6 +2055,9 @@ mod cancel_running_task_tests;
 #[path = "acp_session_tests/turn/chat_history_integrity_tests.rs"]
 mod chat_history_integrity_tests;
 #[cfg(test)]
+#[path = "acp_session_tests/turn/disk_full_tests.rs"]
+mod disk_full_tests;
+#[cfg(test)]
 #[path = "acp_session_tests/feedback_turn_lookup_tests.rs"]
 mod feedback_turn_lookup_tests;
 #[cfg(test)]
@@ -2033,6 +2099,9 @@ mod reactive_managed_reauth_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/session_thread_tests.rs"]
 mod session_thread_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/tool_layer_images_bridge_tests.rs"]
+mod tool_layer_images_bridge_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/turn/turn_end_guard_tests.rs"]
 mod turn_end_guard_tests;

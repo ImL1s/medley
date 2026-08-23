@@ -1521,22 +1521,9 @@ impl BlockViewerPane {
         }
     }
 
-    /// Advance a display-column past the grapheme that occupies it.
-    /// Returns the exclusive end column for `slice_display_cols`.
-    fn col_past_char(text: &str, col: u16) -> u16 {
-        use unicode_segmentation::UnicodeSegmentation;
-        use unicode_width::UnicodeWidthStr;
-        let mut c = 0u16;
-        for g in text.graphemes(true) {
-            let w = (g.width() as u16).max(1);
-            let next = c.saturating_add(w);
-            if next > col {
-                return next;
-            }
-            c = next;
-        }
-        // Past last character — return total width.
-        c
+    /// First cell of the grapheme occupying `col`, or `col` itself past the text.
+    fn col_at_char_start(text: &str, col: u16) -> u16 {
+        crate::scrollback::types::grapheme_cells_at(text, col).map_or(col, |cells| cells.start)
     }
 
     /// Extract the selected text from the unified items list.
@@ -1553,14 +1540,16 @@ impl BlockViewerPane {
             let text = item.copy_text();
             let slice = if start.item_idx == end.item_idx {
                 // Single-item: slice [start .. end_inclusive]
-                let hi = Self::col_past_char(&text, end.col);
-                crate::scrollback::types::slice_display_cols(&text, start.col, hi)
+                let lo = Self::col_at_char_start(&text, start.col);
+                let hi = crate::scrollback::types::col_past_grapheme(&text, end.col);
+                crate::scrollback::types::slice_display_cols(&text, lo, hi)
             } else if idx == start.item_idx {
                 // First item: from start to end of line
-                crate::scrollback::types::slice_display_cols(&text, start.col, u16::MAX)
+                let lo = Self::col_at_char_start(&text, start.col);
+                crate::scrollback::types::slice_display_cols(&text, lo, u16::MAX)
             } else if idx == end.item_idx {
                 // Last item: from beginning to end_inclusive
-                let hi = Self::col_past_char(&text, end.col);
+                let hi = crate::scrollback::types::col_past_grapheme(&text, end.col);
                 crate::scrollback::types::slice_display_cols(&text, 0, hi)
             } else {
                 // Middle items: full line
@@ -1594,17 +1583,30 @@ impl BlockViewerPane {
             return;
         }
         let (start, end) = drag.ordered();
+
         // Advance end past the character under the cursor so the
         // highlight includes the pointed-at character (matches copy).
         let end_col_hi = self
             .cached_unified
             .get(end.item_idx)
-            .map(|item| Self::col_past_char(&item.copy_text(), end.col))
+            .map(|item| crate::scrollback::types::col_past_grapheme(&item.copy_text(), end.col))
             .unwrap_or(end.col);
         let end = TextEndpoint {
             item_idx: end.item_idx,
             col: end_col_hi,
         };
+
+        // Floor the start onto its grapheme so the overlay matches the copy.
+        let start_col_lo = self
+            .cached_unified
+            .get(start.item_idx)
+            .map(|item| Self::col_at_char_start(&item.copy_text(), start.col))
+            .unwrap_or(start.col);
+        let start = TextEndpoint {
+            item_idx: start.item_idx,
+            col: start_col_lo,
+        };
+
         let scroll = self.list_state.scroll_offset();
         let pane_top = pane.y;
         let pane_bottom = pane.y + pane.height;
@@ -1798,6 +1800,43 @@ impl BlockViewerPane {
                 .focused(focused)
                 .style(self.list_style)
                 .render(render_area, buf, &mut self.list_state);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scrollback::block::RenderBlock;
+    use crate::scrollback::blocks::tool::{ToolCallBlock, WebSearchToolCallBlock};
+    use crate::scrollback::entry::ScrollbackEntry;
+
+    /// #306 gate 7 (**component presentation** — block already holds URLs, not
+    /// Codex SSE decode; #306 live TUI still open): fullscreen web-search
+    /// viewer shows Sources (N) + full citation URLs.
+    #[test]
+    fn codex_web_search_viewer_renders_citations() {
+        let mut ws = WebSearchToolCallBlock::new("codex web search");
+        ws.content = Some("result body".into());
+        let urls = ["https://example.com/a", "https://docs.openai.com/b"];
+        ws.citations = urls.iter().map(|s| s.to_string()).collect();
+        let entry = ScrollbackEntry::new(RenderBlock::ToolCall(ToolCallBlock::WebSearch(ws)));
+        let viewer = BlockViewerPane::for_web_search(entry.id, &entry).expect("web search viewer");
+        let plain: String = viewer
+            .items
+            .iter()
+            .map(|c| c.plain_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plain.contains("Sources (2)"),
+            "must show Sources (2), got:\n{plain}"
+        );
+        for url in urls {
+            assert!(
+                plain.contains(url),
+                "must include full URL {url}, got:\n{plain}"
+            );
         }
     }
 }

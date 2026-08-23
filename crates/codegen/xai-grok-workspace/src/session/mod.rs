@@ -461,6 +461,105 @@ impl WorkspaceSession {
 /// params JSON) to the client. The shell installs the concrete delivery:
 /// the agent gateway in local mode, the server transport in proxy mode.
 pub type ClientExtSink = std::sync::Arc<dyn Fn(String, serde_json::Value) + Send + Sync>;
+
+/// Workspace session identities, split between externally visible sessions and
+/// unpublished claims held by two-phase local binds.
+///
+/// The map-like methods intentionally expose only `live`. `contains_key` is the
+/// exception used by creation paths: it treats a reservation as occupied so no
+/// other creator can steal a claimed identity before publication.
+pub(crate) struct WorkspaceSessionRegistry {
+    live: HashMap<String, Arc<WorkspaceSession>>,
+    reservations: HashMap<String, Arc<()>>,
+}
+
+impl WorkspaceSessionRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            live: HashMap::new(),
+            reservations: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn contains_key(&self, session_id: &str) -> bool {
+        self.live.contains_key(session_id) || self.reservations.contains_key(session_id)
+    }
+
+    pub(crate) fn get(&self, session_id: &str) -> Option<&Arc<WorkspaceSession>> {
+        self.live.get(session_id)
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.live.keys()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Arc<WorkspaceSession>)> {
+        self.live.iter()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.live.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        session_id: String,
+        session: Arc<WorkspaceSession>,
+    ) -> Option<Arc<WorkspaceSession>> {
+        debug_assert!(
+            !self.reservations.contains_key(&session_id),
+            "ordinary session insertion must not replace a reservation"
+        );
+        if self.reservations.contains_key(&session_id) {
+            return None;
+        }
+        self.live.insert(session_id, session)
+    }
+
+    pub(crate) fn remove(&mut self, session_id: &str) -> Option<Arc<WorkspaceSession>> {
+        self.live.remove(session_id)
+    }
+
+    pub(crate) fn reserve(&mut self, session_id: String) -> Option<Arc<()>> {
+        if self.contains_key(&session_id) {
+            return None;
+        }
+        let claim = Arc::new(());
+        self.reservations.insert(session_id, claim.clone());
+        Some(claim)
+    }
+
+    pub(crate) fn cancel_reservation(&mut self, session_id: &str, claim: &Arc<()>) {
+        if self
+            .reservations
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, claim))
+        {
+            self.reservations.remove(session_id);
+        }
+    }
+
+    pub(crate) fn promote(
+        &mut self,
+        session_id: String,
+        claim: &Arc<()>,
+        session: Arc<WorkspaceSession>,
+    ) {
+        let owns_claim = self
+            .reservations
+            .get(&session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, claim));
+        assert!(owns_claim, "session reservation lost before promotion");
+        self.reservations.remove(&session_id);
+        let previous = self.live.insert(session_id, session);
+        assert!(previous.is_none(), "reserved session already became live");
+    }
+}
+
 /// Workspace-wide shared state.
 pub struct WorkspaceShared {
     pub(crate) default_tool_config: ToolServerConfig,
@@ -473,7 +572,7 @@ pub struct WorkspaceShared {
     /// Workspace root directory. Independent of any session — stored
     /// here so it survives session creation/deletion.
     pub(crate) root_cwd: std::path::PathBuf,
-    pub(crate) sessions: RwLock<HashMap<String, Arc<WorkspaceSession>>>,
+    pub(crate) sessions: RwLock<WorkspaceSessionRegistry>,
     pub(crate) session_factory: Arc<dyn SessionContextFactory>,
     pub(crate) mcp_tools_snapshot: arc_swap::ArcSwap<Vec<ToolConfig>>,
     pub(crate) events: tokio::sync::broadcast::Sender<xai_grok_workspace_types::WorkspaceEvent>,

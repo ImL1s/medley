@@ -821,9 +821,11 @@ mod factory_tests {
             watcher: watcher.map(std::sync::Arc::new),
             ..make_params_fts_only("test-watcher-runtime")
         };
-        // watcher.is_some() reflects whether startup succeeded.
-        // (On environments without inotify/FSEvents this may be None; skip rather than fail.)
-        let _ = params_with_watcher.watcher.is_some(); // just verify it compiles
+        let watcher = params_with_watcher
+            .watcher
+            .as_ref()
+            .expect("a supported release environment must create an OS file watcher");
+        assert!(watcher.is_started());
 
         // Failure path: non-existent directory → watcher must return None.
         let missing = tmp.path().join("does_not_exist");
@@ -1109,24 +1111,22 @@ mod factory_tests {
             idx.reindex_file(&file, "workspace").unwrap();
         }
 
-        // Step 2: Start watcher AFTER indexing so the Remove event for the
-        // upcoming deletion is the first event the watcher ever sees.
+        // Step 2: Build the backend with a dormant watcher, matching provisional
+        // session construction. Activate it only after the backend exists so
+        // this covers the publication-time late-binding path.
         let watch_dir = dunce::canonicalize(&global).unwrap_or(global.clone());
-        let watcher = match crate::watcher::MemoryFileWatcher::start(&watch_dir) {
-            Some(w) => w,
-            None => {
-                // File-watching not supported in this environment (e.g., some CI
-                // containers without inotify/FSEvents).  Skip rather than fail.
-                return;
-            }
-        };
-        let watcher_arc = std::sync::Arc::new(watcher);
+        let watcher_arc = std::sync::Arc::new(crate::watcher::MemoryFileWatcher::deferred());
 
         let params = MemoryBackendParams {
             watcher: Some(watcher_arc.clone()),
             ..make_params_fts_only("test-watcher-delete")
         };
         let backend = MemoryBackendImpl::from_session_params(storage, &params);
+        if !watcher_arc.activate(&watch_dir) {
+            // File-watching not supported in this environment (e.g., some CI
+            // containers without inotify/FSEvents). Skip rather than fail.
+            return;
+        }
 
         // Step 3: Confirm content is found before deletion.
         let before = backend

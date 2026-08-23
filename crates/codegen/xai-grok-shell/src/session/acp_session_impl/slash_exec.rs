@@ -6,6 +6,8 @@ impl SessionActor {
         self: &Arc<Self>,
         action: BuiltinAction,
     ) -> PromptTurnResult {
+        // Builtin turns carry no user message, so a send-now may cancel from the start.
+        self.mark_front_message_committed().await;
         xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SlashCommandUsed {
             command: action.command_name().to_string(),
             args_provided: action.args_provided(),
@@ -677,7 +679,7 @@ impl SessionActor {
             }
             BuiltinAction::Feedback { text } => self.execute_feedback_command(text).await,
             BuiltinAction::MemoryBrowse => {
-                let file_infos = if let Some(ref storage) = *self.memory.storage.borrow() {
+                let file_infos = if let Some(storage) = self.memory.storage() {
                     match storage.list_memory_files() {
                         Ok(files) => files
                             .into_iter()
@@ -741,10 +743,13 @@ impl SessionActor {
                 );
                 let msg = if enabled && !self.memory.is_enabled() {
                     if let Some(ref params) = self.memory.backend_params {
-                        let storage = crate::session::memory::MemoryStorage::new(
-                            std::path::Path::new(&self.session_info.cwd),
-                            None,
-                        );
+                        let Some(storage) = self.memory.configured_storage() else {
+                            self.send_host_turn_slash_command_output(
+                                "Memory cannot be enabled (storage is not configured for this session).",
+                            )
+                            .await;
+                            return ok_end_turn(0, None);
+                        };
                         if let Err(e) = storage.ensure_initialized() {
                             tracing::warn!(error = %e, "failed to initialize memory storage on re-enable");
                             format!("Memory could not be enabled: {e}")
@@ -754,18 +759,22 @@ impl SessionActor {
                                     storage.clone(),
                                     params,
                                 );
-                            *self.memory.search_counter.borrow_mut() =
-                                Some(backend.search_counter.clone());
+                            let search_counter = backend.search_counter.clone();
                             let backend: std::sync::Arc<
                                 dyn xai_grok_tools::types::memory_backend::MemoryBackend,
                             > = std::sync::Arc::new(backend);
                             let bridge = self.agent.borrow().tool_bridge().clone();
                             bridge.update_resource(backend.clone()).await;
-                            if let Err(e) = self.register_memory_tools(&bridge).await {
-                                tracing::warn!(error = %e, "memory tool registration failed during toggle");
+                            match self.register_memory_tools(&bridge).await {
+                                Ok(()) => {
+                                    self.memory.enable(search_counter);
+                                    "Memory enabled for this session.".to_owned()
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "memory tool registration failed during toggle");
+                                    format!("Memory could not be enabled: {e}")
+                                }
                             }
-                            *self.memory.storage.borrow_mut() = Some(storage);
-                            "Memory enabled for this session.".to_owned()
                         }
                     } else {
                         "Memory cannot be enabled (not configured for this session).".to_owned()
@@ -782,8 +791,7 @@ impl SessionActor {
                     ) {
                         tracing::debug!("memory_get tool was not registered during unregister");
                     }
-                    *self.memory.storage.borrow_mut() = None;
-                    *self.memory.search_counter.borrow_mut() = None;
+                    self.memory.disable();
                     "Memory disabled for this session.".to_owned()
                 } else {
                     let state = if enabled { "enabled" } else { "disabled" };

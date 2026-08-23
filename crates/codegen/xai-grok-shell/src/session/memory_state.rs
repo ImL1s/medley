@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 /// Memory subsystem state for a session.
 pub(crate) struct SessionMemory {
-    /// Memory storage handle for writing flush output (None when memory disabled).
+    /// Canonical configured memory storage handle retained across toggles.
+    pub configured_storage: Option<crate::session::memory::MemoryStorage>,
+    /// Canonical configured memory storage handle.
     /// Wrapped in `RefCell` to allow `/memory on|off` toggle from `&Arc<SessionActor>`.
     pub storage: RefCell<Option<crate::session::memory::MemoryStorage>>,
     /// Whether to write a session summary to memory on session end.
@@ -59,13 +61,34 @@ pub(crate) struct SessionMemory {
 
 impl SessionMemory {
     /// Whether memory is enabled for this session.
-    pub fn is_enabled(&self) -> bool {
+    pub(crate) fn is_enabled(&self) -> bool {
         self.storage.borrow().is_some()
     }
 
-    /// Clone the storage out of the `RefCell`, dropping the borrow immediately.
-    pub fn storage(&self) -> Option<crate::session::memory::MemoryStorage> {
-        self.storage.borrow().clone()
+    /// Clone the active storage out of the `RefCell`, dropping the borrow immediately.
+    pub(crate) fn storage(&self) -> Option<crate::session::memory::MemoryStorage> {
+        if self.is_enabled() {
+            self.configured_storage()
+        } else {
+            None
+        }
+    }
+
+    /// Clone the canonical configured storage, including while memory is off.
+    pub(crate) fn configured_storage(&self) -> Option<crate::session::memory::MemoryStorage> {
+        self.configured_storage.clone()
+    }
+
+    /// Mark the configured memory backend active with its search counter.
+    pub(crate) fn enable(&self, search_counter: Arc<AtomicU64>) {
+        *self.storage.borrow_mut() = self.configured_storage();
+        *self.search_counter.borrow_mut() = Some(search_counter);
+    }
+
+    /// Mark memory inactive without discarding its configured storage.
+    pub(crate) fn disable(&self) {
+        *self.storage.borrow_mut() = None;
+        *self.search_counter.borrow_mut() = None;
     }
 
     /// Attempt to acquire the flush lock. Returns `true` if acquired,
@@ -150,7 +173,7 @@ impl SessionMemory {
 
     /// Reindex a file and embed new chunks when embedding is configured.
     pub(crate) async fn reindex_and_embed(&self, path: &std::path::Path, source: &str) {
-        let Some(storage) = self.storage.borrow().clone() else {
+        let Some(storage) = self.storage() else {
             return;
         };
         if let Some(mut index) = self.open_index(&storage) {
@@ -172,7 +195,7 @@ impl SessionMemory {
         if paths.is_empty() {
             return;
         }
-        let Some(storage) = self.storage.borrow().clone() else {
+        let Some(storage) = self.storage() else {
             return;
         };
         if let Some(mut index) = self.open_index(&storage) {
@@ -202,7 +225,7 @@ impl SessionMemory {
     }
 
     /// Collect telemetry counters for session-end summary.
-    pub fn telemetry_snapshot(&self) -> MemoryTelemetry {
+    pub(crate) fn telemetry_snapshot(&self) -> MemoryTelemetry {
         use std::sync::atomic::Ordering::Relaxed;
         MemoryTelemetry {
             flush_count: self.flush_count.load(Relaxed),
@@ -235,4 +258,59 @@ pub(crate) struct MemoryTelemetry {
     pub dream_count: u64,
     pub dream_success_count: u64,
     pub dream_error_count: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toggle_retains_canonical_configured_storage() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let global_dir = temp.path().join("flat-memory-root");
+        let workspace_dir = global_dir.join("workspace");
+        let storage = crate::session::memory::MemoryStorage::with_paths(
+            global_dir.clone(),
+            workspace_dir.clone(),
+        );
+        let memory = SessionMemory {
+            configured_storage: Some(storage.clone()),
+            storage: RefCell::new(Some(storage)),
+            save_on_end: true,
+            backend_params: None,
+            initial_injection_config: Default::default(),
+            context_injected: AtomicBool::new(false),
+            flush_config: Default::default(),
+            is_flushing: AtomicBool::new(false),
+            last_flush_compaction: AtomicU64::new(0),
+            flush_count: AtomicU64::new(0),
+            last_flush_content: RefCell::new(None),
+            flush_success_count: AtomicU64::new(0),
+            flush_error_count: AtomicU64::new(0),
+            search_counter: RefCell::new(Some(Arc::new(AtomicU64::new(0)))),
+            injection_count: AtomicU64::new(0),
+            compaction_recovery_count: AtomicU64::new(0),
+            chunks_added: Arc::new(AtomicU64::new(0)),
+            dream_config: Default::default(),
+            dream_count: AtomicU64::new(0),
+            dream_success_count: AtomicU64::new(0),
+            dream_error_count: AtomicU64::new(0),
+        };
+
+        memory.disable();
+        assert!(!memory.is_enabled());
+        assert!(memory.storage().is_none());
+        let configured = memory
+            .configured_storage()
+            .expect("toggle-off must retain configured storage");
+        assert_eq!(configured.global_dir(), global_dir);
+        assert_eq!(configured.workspace_dir(), workspace_dir);
+
+        memory.enable(Arc::new(AtomicU64::new(0)));
+        let active = memory
+            .storage()
+            .expect("toggle-on must reactivate configured storage");
+        assert_eq!(active.global_dir(), global_dir);
+        assert_eq!(active.workspace_dir(), workspace_dir);
+    }
 }

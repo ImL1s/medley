@@ -46,6 +46,7 @@ impl CounterOp {
 #[derive(Debug, Clone)]
 pub(crate) struct ModelPatch {
     pub model_id: acp::ModelId,
+    pub catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     pub agent_name: Option<String>,
     pub reasoning_effort: Option<Option<ReasoningEffort>>,
 }
@@ -92,6 +93,10 @@ pub(crate) struct SummaryPatch {
     /// set via `/rename`. Ignored when `generated_title` is also set.
     pub generated_title_if_absent: Option<String>,
     pub cwd_switch_bookkeeping_generation: Option<u64>,
+    /// Per-turn dashboard summary as `(text, prompt_id)`. Outer `Some`
+    /// applies (last-writer-wins); `Some(None)` clears it (conversation
+    /// rewind removed the described work).
+    pub last_turn_summary: Option<Option<(String, String)>>,
 }
 
 impl Summary {
@@ -143,6 +148,7 @@ impl Summary {
         }
         if let Some(model) = &patch.model {
             self.current_model_id = model.model_id.clone();
+            self.catalog_identity = model.catalog_identity.clone();
             if let Some(agent_name) = &model.agent_name {
                 self.agent_name = Some(agent_name.clone());
             }
@@ -156,6 +162,11 @@ impl Summary {
         }
         if let Some(collection_id) = &patch.collection_id {
             self.collection_id = Some(collection_id.clone());
+        }
+        if let Some(last_turn_summary) = &patch.last_turn_summary {
+            let (text, prompt_id) = last_turn_summary.clone().unzip();
+            self.last_turn_summary = text;
+            self.last_turn_summary_prompt_id = prompt_id;
         }
         let mut absent_title_applied = false;
         if let Some(title) = &patch.generated_title {

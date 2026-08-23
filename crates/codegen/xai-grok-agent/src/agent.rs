@@ -190,6 +190,31 @@ impl Agent {
         self.backend_search_enabled
     }
 
+    /// Keep the local function definition and hosted Responses tool aligned
+    /// with live web-search availability for this resident session.
+    pub fn can_set_web_search_enabled(&self, enabled: bool) -> bool {
+        self.tool_bridge.can_set_web_search_enabled(enabled)
+    }
+
+    pub fn set_web_search_enabled(&mut self, enabled: bool) -> bool {
+        let local_enabled = self.tool_bridge.set_web_search_enabled(enabled);
+        self.hosted_tools
+            .retain(|tool| !matches!(tool, HostedTool::WebSearch { .. }));
+        if enabled
+            && local_enabled
+            && self.backend_search_enabled
+            && self.definition.hosted_tool_allowed("web_search")
+        {
+            let mut web_search = vec![HostedTool::WebSearch { options: None }];
+            xai_grok_sampling_types::apply_tool_overrides(
+                &mut web_search,
+                self.definition.tool_overrides.as_ref(),
+            );
+            self.hosted_tools.extend(web_search);
+        }
+        local_enabled
+    }
+
     /// Built-in tool definitions only (excludes MCP tools).
     pub async fn tool_definitions_builtins_only(&self) -> Vec<ToolDefinition> {
         self.tool_bridge.tool_definitions_builtins_only().await

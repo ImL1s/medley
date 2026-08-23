@@ -33,6 +33,8 @@ pub(crate) enum SessionLiveState {
     /// marker. Harmless to reap — the conversation persists and demotes to
     /// `Dormant` on the next disk scan.
     DeadFailed,
+    /// A load or resume is building the actor.
+    Attaching,
 }
 /// `_meta` key carrying [`SessionHandle::scheduler_background_loops`] on the
 /// `session/new` and `session/load` responses. Defined here so the shell that
@@ -61,6 +63,20 @@ pub struct WebSearchDisabledNotice {
     /// One-line user-facing notice naming the model and the reason.
     pub message: String,
 }
+/// Spawn-time provenance for auxiliary model lanes.
+///
+/// Config reloads update the process-wide defaults, but an already-resident
+/// session must keep the inheritance policy with which its resources were
+/// created. Model switches consult this snapshot instead of the latest global
+/// config.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct AuxiliaryModelProvenance {
+    pub session_summary_follows_default: bool,
+    pub web_search_follows_default: bool,
+    pub web_search_model: String,
+    pub image_description_follows_default: bool,
+    pub image_description_model: String,
+}
 /// Handle for interacting with a session actor.
 /// Note: Permission event receivers are returned separately from `spawn_session_actor`
 /// and should be stored/managed by the caller.
@@ -69,6 +85,9 @@ pub struct SessionHandle {
     pub cmd_tx: mpsc::UnboundedSender<SessionCommand>,
     /// Persistence channel shared with the actor (used by extension handlers).
     pub(crate) persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
+    /// Private-to-public filesystem publication plan for a fresh session.
+    /// `None` for loaded, resumed, and subagent sessions.
+    pub(crate) fresh_publication: Option<super::persistence::FreshPublication>,
     /// Current running prompt/turn id, if any.
     ///
     /// Shared with the session actor so external cancellation paths can target
@@ -93,6 +112,10 @@ pub struct SessionHandle {
         std::sync::Arc<arc_swap::ArcSwapOption<xai_grok_sampling_types::ToolOverrides>>,
     /// Handle to the hunk tracker for this session
     pub hunk_tracker_handle: HunkTrackerHandle,
+    /// Finalized actor toolset captured at initialization. Fresh sessions use
+    /// this during their final synchronous publication commit so workspace
+    /// binding is already complete when the ACP response becomes observable.
+    pub(crate) workspace_toolset: std::sync::Arc<xai_grok_tools::registry::types::FinalizedToolset>,
     /// Actor-based chat state handle — lets callers inspect final conversation state.
     pub chat_state_handle: xai_chat_state::ChatStateHandle,
     /// Handle to session signals (used for completion tracking)
@@ -140,6 +163,9 @@ pub struct SessionHandle {
     /// Per-session tracking prevents cross-client contamination in leader mode
     /// where `MvpAgent.current_model_id` is shared mutable state.
     pub model_id: acp::ModelId,
+    /// Spawn-time auxiliary lane inheritance policy and explicit web-search
+    /// pin. This remains stable across process-wide config reloads.
+    pub(crate) auxiliary_model_provenance: AuxiliaryModelProvenance,
     /// Whether this session's scheduled fires run as detached background
     /// subagents. Copied from the value the spawn resolved for the session's
     /// [`AgentRebuildSpec`](crate::session::agent_rebuild::AgentRebuildSpec), so

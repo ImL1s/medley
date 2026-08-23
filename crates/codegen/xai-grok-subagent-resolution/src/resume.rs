@@ -85,6 +85,8 @@ mod tests {
             subagent_type: subagent_type.into(),
             persona: persona.map(String::from),
             model_id: model_id.map(String::from),
+            model_route: None,
+            model_agent_type: None,
             child_cwd: "/workspace".into(),
             worktree_path: None,
             snapshot_ref: None,

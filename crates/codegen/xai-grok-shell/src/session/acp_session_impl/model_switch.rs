@@ -2,8 +2,63 @@ use super::*;
 use crate::agent::config;
 use crate::agent::mvp_agent::harnesses_are_compatible;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
-use crate::session::{AppliedModelSwitch, PreparedModelSwitch};
+use crate::session::{AppliedModelSwitch, AppliedWebSearchState, PreparedModelSwitch};
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
+
+fn prepare_web_search_client(
+    sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    alpha_test_key: Option<String>,
+    default_api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
+    attribution_callback: Option<xai_grok_tools::SharedAttributionCallback>,
+) -> Result<Option<xai_grok_tools::implementations::web_search::client::WebSearchClient>, acp::Error>
+{
+    let Some(cfg) = sampling_config else {
+        return Ok(None);
+    };
+    if !config::has_usable_credential(&cfg) {
+        return Ok(None);
+    }
+    let transport_profile = match cfg.api_backend {
+        xai_grok_sampling_types::ApiBackend::CodexResponses => {
+            xai_grok_tools::types::ApiTransportProfile::CodexResponses
+        }
+        _ => xai_grok_tools::types::ApiTransportProfile::GenericResponses,
+    };
+    let provider_scoped = cfg.bearer_resolver.clone().map(|resolver| {
+        crate::auth::credential_provider::ProviderScopedToolKeyProvider::shared(
+            resolver,
+            transport_profile,
+        )
+    });
+    let tool_config = xai_grok_tools::implementations::WebSearchConfig::Enabled {
+        api_key: cfg.api_key,
+        base_url: cfg.base_url,
+        model: cfg.model,
+        extra_headers: cfg.extra_headers,
+        env_http_headers: cfg.env_http_headers,
+        alpha_test_key,
+        api_key_provider: provider_scoped,
+    };
+    xai_grok_tools::implementations::web_search::client::WebSearchClient::new(
+        &tool_config,
+        default_api_key_provider,
+    )
+    .map(|client| Some(client.with_attribution_callback(attribution_callback)))
+    .map_err(|error| {
+        acp::Error::invalid_params().data(format!(
+            "model switch web-search configuration is invalid: {error}"
+        ))
+    })
+}
+
+fn save_live_prompt_context(
+    session_info: &SessionInfo,
+    prompt_context: &xai_grok_agent::PromptContext,
+) {
+    let mut prompt_context = prompt_context.clone();
+    prompt_context.normalize_for_persistence();
+    save_prompt_context(session_info, &prompt_context);
+}
 
 #[derive(Clone)]
 struct ModelSwitchRollbackState {
@@ -50,14 +105,31 @@ impl SessionActor {
         prepared: PreparedModelSwitch,
     ) -> Result<AppliedModelSwitch, acp::Error> {
         let PreparedModelSwitch {
-            catalog_model_id,
+            catalog_identity,
             resolved_model,
             sampling_config,
             use_concise,
             auto_compact_threshold_percent,
             required_agent_type,
             required_definition,
+            summary_sampling_config,
+            replace_inherited_web_search,
+            web_search_sampling_config,
+            web_search_disable_notice,
+            web_search_alpha_test_key,
+            image_description_model,
         } = prepared;
+        let catalog_model_id = acp::ModelId::new(catalog_identity.model_id.clone());
+        let web_search_client = if replace_inherited_web_search {
+            Some(prepare_web_search_client(
+                web_search_sampling_config,
+                web_search_alpha_test_key,
+                self.rebuild_spec.api_key_provider.clone(),
+                self.rebuild_spec.attribution_callback.clone(),
+            )?)
+        } else {
+            None
+        };
         let resolved_model_slug = resolved_model.info().model.clone();
         if resolved_model_slug != sampling_config.model {
             tracing::warn!(
@@ -222,22 +294,97 @@ impl SessionActor {
             None
         };
         let did_rebuild = installed_rebuild.is_some();
+        // Eligibility belongs to the harness that will own the committed
+        // session. A zero-turn rebuild may replace a policy-filtered old
+        // harness with one that permits web search (or vice versa).
+        let web_search_client = match web_search_client {
+            Some(Some(client)) if self.agent.borrow().can_set_web_search_enabled(true) => {
+                Some(Some(client))
+            }
+            Some(Some(_)) => {
+                tracing::debug!(
+                    session_id = %self.session_info.id.0,
+                    "model switch left web search disabled because the candidate agent policy has no eligible built-in topology"
+                );
+                // This is still an applied web-search outcome: clear any
+                // source client and stale availability notice, while the
+                // policy-filtered topology remains disabled as a safe no-op.
+                Some(None)
+            }
+            other => other,
+        };
+
+        let applied_web_search = web_search_client
+            .as_ref()
+            .map(|client| AppliedWebSearchState {
+                enabled: client.is_some(),
+                disable_notice: if client.is_none() {
+                    web_search_disable_notice
+                } else {
+                    None
+                },
+            });
+        let mut previous_web_search_client = None;
+        let mut topology_updated = false;
+        if let Some(web_search_client) = web_search_client {
+            let web_search_enabled = web_search_client.is_some();
+            let bridge = self.agent.borrow().tool_bridge().clone();
+            let resources = bridge.shared_resources().await;
+            let mut resources = resources.lock().await;
+            previous_web_search_client = Some(
+                resources
+                    .remove::<xai_grok_tools::implementations::web_search::client::WebSearchClient>(
+                    ),
+            );
+            if let Some(client) = web_search_client {
+                resources.insert(client);
+            }
+            drop(resources);
+            topology_updated = self
+                .agent
+                .borrow_mut()
+                .set_web_search_enabled(web_search_enabled);
+            debug_assert!(topology_updated, "web-search topology was preflighted");
+            if topology_updated {
+                self.agent.borrow_mut().finalize_prompt().await;
+            }
+        }
 
         let updated_model = match self
             .handle_set_session_model_with_rollback(
                 catalog_model_id.clone(),
+                catalog_identity,
                 sampling_config,
                 use_concise,
                 !self.startup_hints.preserve_inherited_system,
-                did_rebuild || model_unchanged,
+                (did_rebuild || model_unchanged) && !topology_updated,
                 auto_compact_threshold_percent,
                 &required_agent_type,
                 Some(rollback.clone()),
+                summary_sampling_config,
             )
             .await
         {
             Ok(model) => model,
             Err(error) => {
+                if !did_rebuild && let Some(previous_client) = previous_web_search_client.take() {
+                    let bridge = self.agent.borrow().tool_bridge().clone();
+                    let resources = bridge.shared_resources().await;
+                    let mut resources = resources.lock().await;
+                    resources.remove::<
+                        xai_grok_tools::implementations::web_search::client::WebSearchClient,
+                    >();
+                    let was_enabled = previous_client.is_some();
+                    if let Some(client) = previous_client {
+                        resources.insert(client);
+                    }
+                    drop(resources);
+                    let restored = self.agent.borrow_mut().set_web_search_enabled(was_enabled);
+                    debug_assert!(restored, "prior web-search topology must remain restorable");
+                    if restored {
+                        self.agent.borrow_mut().finalize_prompt().await;
+                    }
+                }
                 if let Some(rebuild) = installed_rebuild.take() {
                     *self.agent.borrow_mut() = rebuild.previous_agent;
                     *self.active_agent_type.lock() = Some(previous_active_agent_type.clone());
@@ -270,12 +417,20 @@ impl SessionActor {
             }
         };
         self.invalidate_prefire_after_model_switch().await;
-        if let Some(rebuild) = installed_rebuild {
+        if let Some(image_description_model) = image_description_model {
+            self.image_description_model
+                .replace(image_description_model);
+        }
+        if topology_updated && !use_concise && !self.startup_hints.preserve_inherited_system {
+            let agent = self.agent.borrow();
+            save_live_prompt_context(&self.session_info, agent.prompt_context());
+            save_system_prompt(&self.session_info, agent.system_prompt());
+        }
+        if installed_rebuild.is_some() {
             self.commit_rebuilt_harness_side_effects().await;
-            save_prompt_context(&self.session_info, &rebuild.prompt_context);
-            save_system_prompt(&self.session_info, &rebuild.system_prompt);
-            let snapshot = self.chat_state_handle.get_conversation().await;
-            persist_chat_history_jsonl_sync(&self.session_info, &snapshot);
+            let agent = self.agent.borrow();
+            save_live_prompt_context(&self.session_info, agent.prompt_context());
+            save_system_prompt(&self.session_info, agent.system_prompt());
             self.mcp_reminder_dirty
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self.send_available_commands_update().await;
@@ -285,6 +440,7 @@ impl SessionActor {
             catalog_model_id: updated_model,
             did_rebuild,
             active_agent_type: self.active_agent_type.lock().clone(),
+            web_search: applied_web_search,
         })
     }
 
@@ -299,13 +455,28 @@ impl SessionActor {
         required_agent_type: &str,
     ) -> Result<acp::ModelId, acp::Error> {
         self.handle_set_session_model_with_rollback(
-            catalog_model_id,
+            catalog_model_id.clone(),
+            xai_chat_state::CatalogIdentity {
+                model_id: catalog_model_id.0.to_string(),
+                route: sampling_config.model.clone(),
+                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                auth_scheme: Some(match sampling_config.auth_scheme {
+                    xai_grok_sampler::AuthScheme::Bearer => {
+                        xai_chat_state::CatalogAuthScheme::Bearer
+                    }
+                    xai_grok_sampler::AuthScheme::XApiKey => {
+                        xai_chat_state::CatalogAuthScheme::XApiKey
+                    }
+                    xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+                }),
+            },
             sampling_config,
             use_concise,
             apply_prompt_override,
             skip_prompt_rewrite,
             auto_compact_threshold_percent,
             required_agent_type,
+            None,
             None,
         )
         .await
@@ -314,6 +485,7 @@ impl SessionActor {
     async fn handle_set_session_model_with_rollback(
         &self,
         catalog_model_id: acp::ModelId,
+        catalog_identity: xai_chat_state::CatalogIdentity,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
         apply_prompt_override: bool,
@@ -321,6 +493,7 @@ impl SessionActor {
         auto_compact_threshold_percent: u8,
         required_agent_type: &str,
         rollback: Option<ModelSwitchRollbackState>,
+        summary_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
     ) -> Result<acp::ModelId, acp::Error> {
         let active_agent_type = self
             .active_agent_type
@@ -356,6 +529,7 @@ impl SessionActor {
                     .expect("DEFAULT_CONTEXT_WINDOW is non-zero")
             });
         let mut committed_chat = current_chat.clone();
+        committed_chat.catalog_identity = Some(catalog_identity);
         committed_chat.sampling_config = xai_grok_sampling_types::SamplingConfig {
             base_url: sampling_config.base_url.clone(),
             model: sampling_config.model.clone(),
@@ -404,19 +578,12 @@ impl SessionActor {
             .rebind(api_key, auth_type, source)
             .with_client_version(sampling_config.client_version.clone());
         if apply_prompt_override && !skip_prompt_rewrite {
-            for item in &mut committed_chat.conversation {
-                if let ConversationItem::System(sys) = item {
-                    if use_concise {
-                        sys.content = std::sync::Arc::<str>::from(
-                            xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT,
-                        );
-                    } else {
-                        sys.content =
-                            std::sync::Arc::<str>::from(self.agent.borrow().system_prompt());
-                    }
-                    break;
-                }
-            }
+            let prompt = if use_concise {
+                xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT.to_owned()
+            } else {
+                self.agent.borrow().system_prompt().to_owned()
+            };
+            let _ = replace_or_insert_system_head(&mut committed_chat.conversation, &prompt);
         } else if !apply_prompt_override {
             tracing::info!(
                 session_id = %self.session_info.id.0,
@@ -446,8 +613,10 @@ impl SessionActor {
             .persist_model_switch_transaction(
                 committed_chat.conversation,
                 &catalog_model_id,
+                committed_chat.catalog_identity.as_ref(),
                 &active_agent_type,
                 sampling_config.reasoning_effort,
+                summary_sampling_config,
             )
             .await
         {
@@ -464,6 +633,12 @@ impl SessionActor {
 
         let prev_threshold = self.compaction.threshold_percent.get();
         self.catalog_model_id.set(catalog_model_id.0.to_string());
+        self.committed_tool_result_truncation_policy.set(
+            sampling_config
+                .codex_wire
+                .as_ref()
+                .and_then(|capabilities| capabilities.truncation_policy),
+        );
         self.compaction
             .threshold_percent
             .set(auto_compact_threshold_percent);
@@ -503,8 +678,10 @@ impl SessionActor {
         &self,
         conversation: Vec<ConversationItem>,
         model_id: &acp::ModelId,
+        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
         agent_type: &str,
         reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+        summary_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
     ) -> Result<(), &'static str> {
         if self.notifications.persistence_is_noop {
             return Ok(());
@@ -515,8 +692,10 @@ impl SessionActor {
             .send(PersistenceMsg::ModelSwitchAndAck {
                 messages: conversation,
                 model_id: model_id.clone(),
+                catalog_identity: catalog_identity.cloned(),
                 agent_name: Some(agent_type.to_owned()),
                 reasoning_effort,
+                summary_sampling_config,
                 respond_to,
             })
             .map_err(|_| "persistence_channel_closed")?;
@@ -915,13 +1094,24 @@ mod model_switch_transaction_tests {
         );
         resolved_model.info.model = "target-wire-model".to_owned();
         PreparedModelSwitch {
-            catalog_model_id: acp::ModelId::new("target-model"),
+            catalog_identity: xai_chat_state::CatalogIdentity {
+                model_id: "target-model".to_string(),
+                route: "target-wire-model".to_string(),
+                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+            },
             resolved_model,
             sampling_config: switch_sampling_config("target-wire-model"),
             use_concise: false,
             auto_compact_threshold_percent: 73,
             required_agent_type: required_agent_type.to_owned(),
             required_definition: definition,
+            summary_sampling_config: None,
+            replace_inherited_web_search: false,
+            web_search_sampling_config: None,
+            web_search_disable_notice: None,
+            web_search_alpha_test_key: None,
+            image_description_model: None,
         }
     }
 
@@ -929,6 +1119,13 @@ mod model_switch_transaction_tests {
         let value = actor.catalog_model_id.take();
         actor.catalog_model_id.set(value.clone());
         value
+    }
+
+    fn byte_truncation_policy(limit: i64) -> xai_grok_sampling_types::TruncationPolicyConfig {
+        xai_grok_sampling_types::TruncationPolicyConfig {
+            mode: xai_grok_sampling_types::TruncationMode::Bytes,
+            limit,
+        }
     }
 
     fn assert_model_switch_phase(error: &acp::Error, code: &'static str, reason: &str) {
@@ -1261,6 +1458,21 @@ mod model_switch_transaction_tests {
                 assert_eq!(receipt.catalog_model_id.0.as_ref(), "target-model");
                 assert_eq!(receipt.active_agent_type.as_deref(), Some("grok-build"));
                 assert_eq!(catalog_model_id(&actor), "target-model");
+                let snapshot = actor
+                    .chat_state_handle
+                    .snapshot()
+                    .await
+                    .expect("chat state");
+                assert_eq!(
+                    snapshot.catalog_identity,
+                    Some(xai_chat_state::CatalogIdentity {
+                        model_id: "target-model".to_string(),
+                        route: "target-wire-model".to_string(),
+                        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+                    }),
+                    "the actor must commit the identity prepared with the sampler"
+                );
                 assert_eq!(
                     actor.active_agent_type.lock().as_deref(),
                     Some("grok-build")
@@ -1279,6 +1491,419 @@ mod model_switch_transaction_tests {
                     !actor.compaction.prefire.has_cache(),
                     "a successful model switch must invalidate the old-model prefire cache"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_overrides_successful_switch_commits_inherited_auxiliary_lanes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = persistence_rx.recv().await {
+                        if let PersistenceMsg::ModelSwitchAndAck {
+                            summary_sampling_config,
+                            respond_to,
+                            ..
+                        } = message
+                        {
+                            assert_eq!(
+                                summary_sampling_config
+                                    .as_ref()
+                                    .map(|config| config.model.as_str()),
+                                Some("target-wire-model")
+                            );
+                            let _ = respond_to.send(Ok(()));
+                        }
+                    }
+                });
+                let (mut actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                std::sync::Arc::get_mut(&mut actor.rebuild_spec)
+                    .expect("test actor owns rebuild spec")
+                    .backend_search = true;
+                let mut old_definition = xai_grok_agent::AgentDefinition::default_grok_build();
+                old_definition.name = "old-policy-filtered".to_owned();
+                old_definition.disallowed_tools = vec!["web_search".to_owned()];
+                let dynamic_agent = xai_grok_agent::AgentBuilder::new(
+                    std::env::temp_dir(),
+                    std::sync::Arc::new(
+                        xai_grok_tools::computer::local::LocalTerminalBackend::new(),
+                    ),
+                    xai_grok_tools::notification::ToolNotificationHandle::noop(),
+                )
+                .from_definition(old_definition)
+                .with_web_search_config(xai_grok_tools::implementations::WebSearchConfig::Disabled)
+                .with_backend_search(true)
+                .build()
+                .await
+                .expect("dynamic web-search test agent");
+                *actor.agent.borrow_mut() = dynamic_agent;
+                actor.supports_backend_search.set(true);
+                *actor.active_agent_type.lock() = Some("codex".to_owned());
+                assert!(
+                    actor
+                        .agent
+                        .borrow()
+                        .tool_bridge()
+                        .read_resource::<
+                            xai_grok_tools::implementations::web_search::client::WebSearchClient,
+                        >()
+                        .await
+                        .is_none()
+                );
+                assert!(
+                    actor
+                        .agent
+                        .borrow()
+                        .tool_definitions()
+                        .await
+                        .iter()
+                        .all(|definition| definition.function.name != "web_search")
+                );
+                assert!(actor.hosted_tools_for_turn().iter().all(|tool| !matches!(
+                    tool,
+                    xai_grok_sampling_types::HostedTool::WebSearch { .. }
+                )));
+                let mut prepared = prepared_switch(
+                    "grok-build",
+                    Some(xai_grok_agent::AgentDefinition::default_grok_build()),
+                );
+                prepared.summary_sampling_config = Some(prepared.sampling_config.clone());
+                prepared.replace_inherited_web_search = true;
+                let mut web_search_sampling = prepared.sampling_config.clone();
+                web_search_sampling.api_key = Some("target-test-key".to_owned());
+                prepared.web_search_sampling_config = Some(web_search_sampling);
+                prepared.image_description_model = Some("target-provider".to_owned());
+
+                let enabled_receipt = actor
+                    .handle_apply_model_switch(prepared)
+                    .await
+                    .expect("inherited auxiliary lanes must commit with the model switch");
+                assert!(matches!(
+                    enabled_receipt.web_search,
+                    Some(AppliedWebSearchState {
+                        enabled: true,
+                        disable_notice: None,
+                    })
+                ));
+
+                assert_eq!(
+                    actor.image_description_model.borrow().as_str(),
+                    "target-provider"
+                );
+                let bridge = actor.agent.borrow().tool_bridge().clone();
+                assert!(
+                    bridge
+                        .read_resource::<
+                            xai_grok_tools::implementations::web_search::client::WebSearchClient,
+                        >()
+                        .await
+                        .is_some()
+                );
+                assert!(
+                    actor
+                        .agent
+                        .borrow()
+                        .tool_definitions()
+                        .await
+                        .iter()
+                        .any(|definition| definition.function.name == "web_search")
+                );
+                assert!(actor.hosted_tools_for_turn().iter().any(|tool| matches!(
+                    tool,
+                    xai_grok_sampling_types::HostedTool::WebSearch { .. }
+                )));
+
+                let mut filtered_definition = xai_grok_agent::AgentDefinition::default_grok_build();
+                filtered_definition.name = "target-policy-filtered".to_owned();
+                filtered_definition.disallowed_tools = vec!["web_search".to_owned()];
+                *actor.active_agent_type.lock() = Some("codex".to_owned());
+                let mut prepared =
+                    prepared_switch("target-policy-filtered", Some(filtered_definition));
+                prepared.summary_sampling_config = Some(prepared.sampling_config.clone());
+                prepared.replace_inherited_web_search = true;
+                let mut web_search_sampling = prepared.sampling_config.clone();
+                web_search_sampling.api_key = Some("target-filtered-key".to_owned());
+                prepared.web_search_sampling_config = Some(web_search_sampling);
+                prepared.web_search_disable_notice = None;
+                let disabled_receipt = actor
+                    .handle_apply_model_switch(prepared)
+                    .await
+                    .expect("policy-filtered inherited web search must commit as disabled");
+                assert!(matches!(
+                    disabled_receipt.web_search,
+                    Some(AppliedWebSearchState {
+                        enabled: false,
+                        disable_notice: None,
+                    })
+                ));
+                let bridge = actor.agent.borrow().tool_bridge().clone();
+                assert!(
+                    bridge
+                        .read_resource::<
+                            xai_grok_tools::implementations::web_search::client::WebSearchClient,
+                        >()
+                        .await
+                        .is_none()
+                );
+                assert!(
+                    actor
+                        .agent
+                        .borrow()
+                        .tool_definitions()
+                        .await
+                        .iter()
+                        .all(|definition| definition.function.name != "web_search")
+                );
+                assert!(actor.hosted_tools_for_turn().iter().all(|tool| !matches!(
+                    tool,
+                    xai_grok_sampling_types::HostedTool::WebSearch { .. }
+                )));
+                assert!(actor.hosted_tools_for_turn().iter().any(|tool| matches!(
+                    tool,
+                    xai_grok_sampling_types::HostedTool::XSearch { .. }
+                )));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_harness_web_search_switch_reconciles_rendered_system_prompt() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let committed_messages = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let receiver_messages = committed_messages.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = persistence_rx.recv().await {
+                        if let PersistenceMsg::ModelSwitchAndAck {
+                            messages,
+                            respond_to,
+                            ..
+                        } = message
+                        {
+                            *receiver_messages.lock().unwrap() = Some(messages);
+                            let _ = respond_to.send(Ok(()));
+                        }
+                    }
+                });
+                let (mut actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                std::sync::Arc::get_mut(&mut actor.rebuild_spec)
+                    .expect("test actor owns rebuild spec")
+                    .backend_search = true;
+                actor.session_info.id = acp::SessionId::new(format!(
+                    "web-search-prompt-commit-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+                definition.prompt_body = Some(
+                    "${% if tools.by_kind.web_search %}Web search: ${{ tools.by_kind.web_search }}${% else %}Web search disabled${% endif %}"
+                        .to_owned(),
+                );
+                let dynamic_agent = xai_grok_agent::AgentBuilder::new(
+                    std::env::temp_dir(),
+                    std::sync::Arc::new(
+                        xai_grok_tools::computer::local::LocalTerminalBackend::new(),
+                    ),
+                    xai_grok_tools::notification::ToolNotificationHandle::noop(),
+                )
+                .from_definition(definition.clone())
+                .with_web_search_config(xai_grok_tools::implementations::WebSearchConfig::Disabled)
+                .with_backend_search(true)
+                .build()
+                .await
+                .expect("dynamic web-search test agent");
+                *actor.agent.borrow_mut() = dynamic_agent;
+                actor.supports_backend_search.set(true);
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                let previous_prompt = actor.agent.borrow().system_prompt().to_owned();
+                assert!(previous_prompt.contains("Web search disabled"));
+
+                let mut prepared = prepared_switch("grok-build", Some(definition));
+                prepared.replace_inherited_web_search = true;
+                let mut web_search_sampling = prepared.sampling_config.clone();
+                web_search_sampling.api_key = Some("target-test-key".to_owned());
+                prepared.web_search_sampling_config = Some(web_search_sampling);
+
+                let receipt = actor
+                    .handle_apply_model_switch(prepared)
+                    .await
+                    .expect("same-harness web-search switch must succeed");
+                assert!(!receipt.did_rebuild);
+                let rendered_prompt = actor.agent.borrow().system_prompt().to_owned();
+                assert_ne!(rendered_prompt, previous_prompt);
+                assert!(rendered_prompt.contains("Web search: web_search"));
+
+                let conversation = actor.chat_state_handle.get_conversation().await;
+                let system_head = conversation
+                    .iter()
+                    .find_map(|item| match item {
+                        ConversationItem::System(system) => Some(system.content.as_ref()),
+                        _ => None,
+                    })
+                    .expect("system head");
+                assert_eq!(system_head, rendered_prompt);
+
+                let session_dir = crate::session::persistence::session_dir(&actor.session_info);
+                assert_eq!(
+                    std::fs::read_to_string(session_dir.join(SYSTEM_PROMPT_FILENAME))
+                        .expect("persisted system prompt"),
+                    rendered_prompt
+                );
+                let committed = committed_messages
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one committed transaction");
+                let committed_head = committed
+                    .iter()
+                    .find_map(|item| match item {
+                        ConversationItem::System(system) => Some(system.content.as_ref()),
+                        _ => None,
+                    })
+                    .expect("committed system head");
+                assert_eq!(committed_head, rendered_prompt);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_search_prompt_commit_failure_rolls_back_without_clobbering_artifacts() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let attempted_messages = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let receiver_messages = attempted_messages.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = persistence_rx.recv().await {
+                        if let PersistenceMsg::ModelSwitchAndAck {
+                            messages,
+                            respond_to,
+                            ..
+                        } = message
+                        {
+                            *receiver_messages.lock().unwrap() = Some(messages);
+                            let _ = respond_to.send(Err(
+                                crate::session::storage::ModelSwitchCommitError::NotCommitted(
+                                    std::io::Error::other("injected failure"),
+                                ),
+                            ));
+                            break;
+                        }
+                    }
+                });
+                let (mut actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                std::sync::Arc::get_mut(&mut actor.rebuild_spec)
+                    .expect("test actor owns rebuild spec")
+                    .backend_search = true;
+                actor.session_info.id = acp::SessionId::new(format!(
+                    "web-search-prompt-rollback-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+                definition.prompt_body = Some(
+                    "${% if tools.by_kind.web_search %}Web search: ${{ tools.by_kind.web_search }}${% else %}Web search disabled${% endif %}"
+                        .to_owned(),
+                );
+                let dynamic_agent = xai_grok_agent::AgentBuilder::new(
+                    std::env::temp_dir(),
+                    std::sync::Arc::new(
+                        xai_grok_tools::computer::local::LocalTerminalBackend::new(),
+                    ),
+                    xai_grok_tools::notification::ToolNotificationHandle::noop(),
+                )
+                .from_definition(definition.clone())
+                .with_web_search_config(xai_grok_tools::implementations::WebSearchConfig::Disabled)
+                .with_backend_search(true)
+                .build()
+                .await
+                .expect("dynamic web-search test agent");
+                *actor.agent.borrow_mut() = dynamic_agent;
+                actor.supports_backend_search.set(true);
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                let previous_prompt = actor.agent.borrow().system_prompt().to_owned();
+                assert!(previous_prompt.contains("Web search disabled"));
+
+                let session_dir = crate::session::persistence::session_dir(&actor.session_info);
+                std::fs::create_dir_all(&session_dir).expect("session directory");
+                let chat_sentinel = "existing chat history\n";
+                let prompt_sentinel = "existing prompt context\n";
+                let system_sentinel = "existing system prompt\n";
+                std::fs::write(session_dir.join("chat_history.jsonl"), chat_sentinel)
+                    .expect("chat sentinel");
+                std::fs::write(session_dir.join(PROMPT_CONTEXT_FILENAME), prompt_sentinel)
+                    .expect("prompt-context sentinel");
+                std::fs::write(session_dir.join(SYSTEM_PROMPT_FILENAME), system_sentinel)
+                    .expect("system-prompt sentinel");
+
+                let mut prepared = prepared_switch("grok-build", Some(definition));
+                prepared.replace_inherited_web_search = true;
+                let mut web_search_sampling = prepared.sampling_config.clone();
+                web_search_sampling.api_key = Some("target-test-key".to_owned());
+                prepared.web_search_sampling_config = Some(web_search_sampling);
+
+                let error = actor
+                    .handle_apply_model_switch(prepared)
+                    .await
+                    .expect_err("failed durable commit must reject prompt topology switch");
+                assert_model_switch_phase(
+                    &error,
+                    config::MODEL_SWITCH_COMMIT_FAILED,
+                    "persistence_write_failed",
+                );
+                assert_eq!(catalog_model_id(&actor), "test");
+                assert_eq!(actor.agent.borrow().system_prompt(), previous_prompt);
+                assert!(
+                    actor
+                        .agent
+                        .borrow()
+                        .tool_bridge()
+                        .tool_for_kind(xai_grok_tools::types::tool::ToolKind::WebSearch)
+                        .await
+                        .is_none()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(session_dir.join("chat_history.jsonl")).unwrap(),
+                    chat_sentinel
+                );
+                assert_eq!(
+                    std::fs::read_to_string(session_dir.join(PROMPT_CONTEXT_FILENAME)).unwrap(),
+                    prompt_sentinel
+                );
+                assert_eq!(
+                    std::fs::read_to_string(session_dir.join(SYSTEM_PROMPT_FILENAME)).unwrap(),
+                    system_sentinel
+                );
+
+                let attempted = attempted_messages
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one attempted transaction");
+                let attempted_prompt = attempted
+                    .iter()
+                    .find_map(|item| match item {
+                        ConversationItem::System(system) => Some(system.content.as_ref()),
+                        _ => None,
+                    })
+                    .expect("attempted system head");
+                assert!(attempted_prompt.contains("Web search: web_search"));
             })
             .await;
     }
@@ -1317,6 +1942,82 @@ mod model_switch_transaction_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn tool_result_truncation_policy_catalog_refresh_cannot_replace_committed_tuple() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let persistence = crate::session::persistence::PersistenceHandle::noop();
+                let (mut actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence.tx.clone()).await;
+                actor.notifications.persistence_is_noop = persistence.is_noop();
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+
+                let frozen = byte_truncation_policy(111);
+                actor
+                    .committed_tool_result_truncation_policy
+                    .set(Some(frozen));
+
+                let refreshed = byte_truncation_policy(222);
+                let mut refreshed_entry = crate::agent::config::ModelEntry::fallback(
+                    "test",
+                    &crate::agent::config::EndpointsConfig::default(),
+                );
+                refreshed_entry.info.codex_wire =
+                    Some(xai_grok_sampling_types::CodexWireCapabilities {
+                        truncation_policy: Some(refreshed),
+                        ..Default::default()
+                    });
+                actor
+                    .models_manager
+                    .insert_test_entry("test", refreshed_entry);
+
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    Some(frozen),
+                    "same-key catalog churn must not replace the session's committed capability"
+                );
+                actor
+                    .models_manager
+                    .apply_catalog_for_test(indexmap::IndexMap::new());
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    Some(frozen),
+                    "catalog removal must not erase the session's committed capability"
+                );
+
+                let switched = byte_truncation_policy(333);
+                let mut prepared = prepared_switch("grok-build", None);
+                prepared.sampling_config.codex_wire =
+                    Some(xai_grok_sampling_types::CodexWireCapabilities {
+                        truncation_policy: Some(switched),
+                        ..Default::default()
+                    });
+                actor
+                    .handle_apply_model_switch(prepared)
+                    .await
+                    .expect("successful model switch");
+
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    Some(switched),
+                    "a committed model switch must replace the policy with the new model's tuple"
+                );
+
+                actor
+                    .handle_apply_model_switch(prepared_switch("grok-build", None))
+                    .await
+                    .expect("successful switch to a model without a policy");
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    None,
+                    "a committed model switch must clear a policy absent from the new tuple"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn closed_real_persistence_channel_still_rejects_live_model_switch() {
         let local = tokio::task::LocalSet::new();
         local
@@ -1327,6 +2028,10 @@ mod model_switch_transaction_tests {
                 let (actor, _event_rx) =
                     create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
                 *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                let previous_policy = byte_truncation_policy(444);
+                actor
+                    .committed_tool_result_truncation_policy
+                    .set(Some(previous_policy));
                 let previous_chat = actor.chat_state_handle.snapshot().await.expect("snapshot");
 
                 assert_eq!(
@@ -1334,8 +2039,10 @@ mod model_switch_transaction_tests {
                         .persist_model_switch_transaction(
                             previous_chat.conversation.clone(),
                             &acp::ModelId::new("test"),
+                            None,
                             "grok-build",
                             previous_chat.sampling_config.reasoning_effort,
+                            None,
                         )
                         .await,
                     Err("persistence_channel_closed"),
@@ -1356,6 +2063,11 @@ mod model_switch_transaction_tests {
                 assert_eq!(payload.reason, "persistence_channel_closed");
                 assert!(config::ModelSwitchHarnessError::from_acp_error(&error).is_none());
                 assert_eq!(catalog_model_id(&actor), "test");
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    Some(previous_policy),
+                    "a failed commit must retain the previous model's policy"
+                );
                 assert_eq!(
                     actor
                         .chat_state_handle

@@ -1,17 +1,30 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
 use super::handle_request::{
-    canonical_total_tokens, record_subagent_usage, usage_is_incomplete,
+    canonical_total_tokens, inherited_web_search_model_id, record_subagent_usage,
+    usage_is_incomplete,
 };
 use crate::test_support::lsp_runtime::{
     DummyLspDispatch, ctx_with_toggle, test_gateway, test_gateway_with_receiver,
 };
+use crate::session::storage::{StorageAdapter, jsonl::JsonlStorageAdapter};
 use xai_grok_subagent_resolution::resolve_effective_overrides;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
     ChildCompletion, ChildRunOutput, ChildRunRequest, ChildRunner, CompletionDisposition,
     CoordinatorConfig, LocalBoxFuture, SubagentCoordinator,
 };
+#[test]
+fn model_overrides_inherited_subagent_web_search_uses_child_operative_model() {
+    assert_eq!(
+        inherited_web_search_model_id(true, "child-operative-model"),
+        Some("child-operative-model")
+    );
+    assert_eq!(
+        inherited_web_search_model_id(false, "child-operative-model"),
+        None
+    );
+}
 #[test]
 fn canonical_total_tokens_does_not_double_count_reasoning() {
     let totals = xai_chat_state::UsageTotals {
@@ -1794,7 +1807,7 @@ async fn cancel_pending_shell_child_presents_one_cancelled_finish() {
         .await;
     assert!(matches!(
             child_cmd_rx.try_recv(),
-            Ok(SessionCommand::Shutdown)
+            Ok(SessionCommand::Shutdown(_))
         ));
     assert!(result.cancelled);
     assert!(!result.success);
@@ -1862,7 +1875,7 @@ async fn run_promote_cancel_with_worktree(
         .await;
     assert!(matches!(
             child_cmd_rx.try_recv(),
-            Ok(SessionCommand::Shutdown)
+            Ok(SessionCommand::Shutdown(_))
         ));
     assert!(result.cancelled);
 }
@@ -1884,13 +1897,7 @@ impl ChildRunner for Issue39ShellChildRunner {
             .expect("runner context should be consumed once");
         let gateway = self.gateway.clone();
         Box::pin(async move {
-            let ChildRunRequest {
-                request,
-                cancellation,
-                reporter,
-                ..
-            } = run;
-            super::run_shell_child(request, ctx, cancellation, reporter, &gateway).await
+            super::run_shell_child(run, ctx, &gateway).await
         })
     }
     fn validate_type(
@@ -1931,6 +1938,258 @@ async fn run_issue39_spawn(request: SubagentRequest, ctx: SubagentSpawnContext) 
     actor.abort();
     result
 }
+
+#[derive(Clone, Copy)]
+enum DurableLegacyResumeScenario {
+    Unchanged,
+    MissingCatalogIdentity,
+    ModelConflict,
+    RouteDrift,
+    CompleteMetadataModelConflict,
+    CompleteMetadataRouteConflict,
+}
+
+async fn run_durable_legacy_resume_scenario(
+    scenario: DurableLegacyResumeScenario,
+) -> SubagentResult {
+    let temp = tempfile::tempdir().expect("temp workspace");
+    let parent_id = format!("legacy-resume-parent-{}", uuid::Uuid::now_v7());
+    let source_id = format!("legacy-resume-source-{}", uuid::Uuid::now_v7());
+    let model_id = "legacy-codex-key";
+    let current_route = "current-codex-route";
+    let mut model_entry = test_model_entry(current_route);
+    model_entry.info.agent_type = "codex".to_owned();
+    let models = indexmap::IndexMap::from([(model_id.to_owned(), model_entry)]);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_session_id = parent_id.clone();
+    ctx.parent_cwd = temp.path().to_path_buf();
+    ctx.parent_session_info = Some(SessionInfo {
+        id: acp::SessionId::new(parent_id.clone()),
+        cwd: temp.path().to_string_lossy().into_owned(),
+    });
+    ctx.model_id = acp::ModelId::new(model_id);
+    ctx.sampling_config.model = current_route.to_owned();
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new(model_id),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+
+    let parent_info = ctx.parent_session_info.clone().expect("parent info");
+    let durable_dir = crate::session::persistence::session_dir(&parent_info)
+        .join("subagents")
+        .join(&source_id);
+    let child_session_id = format!("child-{source_id}");
+    let child_info = SessionInfo {
+        id: acp::SessionId::new(child_session_id.clone()),
+        cwd: temp.path().to_string_lossy().into_owned(),
+    };
+    let child_session_dir = crate::session::persistence::session_dir(&child_info);
+    let child_storage = JsonlStorageAdapter::with_explicit_session_dir(child_session_dir.clone());
+    let summary_model_id = if matches!(
+        scenario,
+        DurableLegacyResumeScenario::ModelConflict
+            | DurableLegacyResumeScenario::CompleteMetadataModelConflict
+    ) {
+        "conflicting-codex-key"
+    } else {
+        model_id
+    };
+    child_storage
+        .init_session(&child_info, acp::ModelId::new(summary_model_id))
+        .await
+        .expect("initialize durable source child JSONL");
+    child_storage
+        .append_chat_message(
+            &child_info,
+            &xai_grok_sampling_types::conversation::ConversationItem::user(
+                "persisted source turn",
+            ),
+        )
+        .await
+        .expect("persist source child transcript");
+    if !matches!(scenario, DurableLegacyResumeScenario::MissingCatalogIdentity) {
+        let summary_route = if matches!(scenario, DurableLegacyResumeScenario::RouteDrift) {
+            "historical-codex-route"
+        } else {
+            current_route
+        };
+        let identity = xai_chat_state::CatalogIdentity {
+            model_id: summary_model_id.to_owned(),
+            route: summary_route.to_owned(),
+            lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        };
+        child_storage
+            .update_current_model_identity_and_agent(
+                &child_info,
+                &acp::ModelId::new(summary_model_id),
+                Some(&identity),
+                Some("general-purpose"),
+                None,
+            )
+            .await
+            .expect("persist durable source catalog identity");
+    }
+    let complete_metadata = matches!(
+        scenario,
+        DurableLegacyResumeScenario::CompleteMetadataModelConflict
+            | DurableLegacyResumeScenario::CompleteMetadataRouteConflict
+    );
+    let metadata_route = if matches!(
+        scenario,
+        DurableLegacyResumeScenario::CompleteMetadataRouteConflict
+    ) {
+        "metadata-conflicting-route"
+    } else {
+        current_route
+    };
+    write_subagent_meta(
+        &durable_dir,
+        &SubagentMeta {
+            subagent_id: source_id.clone(),
+            parent_session_id: parent_id.clone(),
+            child_session_id,
+            subagent_type: "general-purpose".to_owned(),
+            description: "legacy source".to_owned(),
+            prompt: "source prompt".to_owned(),
+            status: "completed".to_owned(),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            duration_ms: Some(1),
+            tool_calls: Some(0),
+            turns: Some(1),
+            error: None,
+            effective_context_source: Some("new".to_owned()),
+            context_normalized: false,
+            fork_copy_error: None,
+            persona: None,
+            resumed_from: None,
+            child_cwd: Some(temp.path().to_string_lossy().into_owned()),
+            worktree_path: None,
+            snapshot_ref: None,
+            effective_model_id: Some(model_id.to_owned()),
+            effective_model_route: complete_metadata.then(|| metadata_route.to_owned()),
+            effective_model_agent_type: complete_metadata.then(|| "codex".to_owned()),
+            native_route_receipt: None,
+        },
+    );
+
+    let mut request = auto_wake_test_request(&format!("resume-{source_id}"));
+    request.parent_session_id = parent_id;
+    request.resume_from = Some(source_id);
+    request.run_in_background = false;
+    request.surface_completion = false;
+    if matches!(scenario, DurableLegacyResumeScenario::Unchanged) {
+        request.cancel_token.cancel();
+    }
+    let result = run_issue39_spawn(request, ctx).await;
+    let _ = std::fs::remove_dir_all(
+        crate::session::persistence::session_dir(&parent_info),
+    );
+    let _ = std::fs::remove_dir_all(child_session_dir);
+    result
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_with_reconciled_jsonl_reaches_child_runtime() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result =
+                run_durable_legacy_resume_scenario(DurableLegacyResumeScenario::Unchanged).await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                result.cancelled && !error.contains("Cannot resume from subagent"),
+                "unchanged pre-patch Codex lineage must pass resume validation and reach the cancelled child runtime: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_missing_catalog_identity_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result = run_durable_legacy_resume_scenario(
+                DurableLegacyResumeScenario::MissingCatalogIdentity,
+            )
+            .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("source model route evidence is missing"),
+                "pre-patch metadata without durable catalog identity must fail closed: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_model_conflict_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result =
+                run_durable_legacy_resume_scenario(DurableLegacyResumeScenario::ModelConflict)
+                    .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("metadata conflicts with the durable child session model identity"),
+                "legacy metadata/JSONL model conflict must fail closed: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_route_drift_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result =
+                run_durable_legacy_resume_scenario(DurableLegacyResumeScenario::RouteDrift).await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("persisted source model lineage no longer matches the current catalog"),
+                "durable route drift must fail closed before child spawn: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_complete_metadata_conflicting_jsonl_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result = run_durable_legacy_resume_scenario(
+                DurableLegacyResumeScenario::CompleteMetadataModelConflict,
+            )
+            .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("metadata conflicts with the durable child session model identity"),
+                "complete metadata must not bypass conflicting durable JSONL: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_complete_metadata_route_conflict_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result = run_durable_legacy_resume_scenario(
+                DurableLegacyResumeScenario::CompleteMetadataRouteConflict,
+            )
+            .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("metadata conflicts with the durable child session route identity"),
+                "complete metadata/JSONL route conflict must fail closed: {error}"
+            );
+        })
+        .await;
+}
 #[tokio::test(flavor = "current_thread")]
 async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {
     xai_test_utils::require_git!();
@@ -1943,8 +2202,9 @@ async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {
             init_git_repo(&repo);
             std::fs::write(repo.join("tracked.txt"), "original").unwrap();
             git_commit_all(&repo, "initial");
-            let model_id = "issue39-codex-model";
-            let mut model_entry = test_model_entry(model_id);
+            let model_id = "issue39-codex-catalog-key";
+            let routing_model = "issue39-codex-routing-model";
+            let mut model_entry = test_model_entry(routing_model);
             model_entry.info.agent_type = "codex".to_string();
             let mut models = indexmap::IndexMap::new();
             models.insert(model_id.to_string(), model_entry.clone());
@@ -1956,7 +2216,7 @@ async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {
             });
             ctx.fs = Arc::new(xai_grok_workspace::file_system::LocalFs::new(repo.clone()));
             ctx.model_id = acp::ModelId::new(model_id);
-            ctx.sampling_config.model = model_id.to_string();
+            ctx.sampling_config.model = routing_model.to_string();
             ctx.available_models = models.clone();
             ctx.models_manager = crate::agent::models::ModelsManager::new(
                 None,
@@ -1969,7 +2229,7 @@ async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {
             let mut request = auto_wake_test_request(&request_id);
             request.run_in_background = false;
             request.surface_completion = false;
-            request.runtime_overrides.model = Some(model_id.to_string());
+            request.runtime_overrides.model = Some(routing_model.to_string());
             request.runtime_overrides.model_override_provenance = ModelOverrideProvenance::Tool;
             request.runtime_overrides.isolation = Some(xai_tool_types::SubagentIsolationMode::Worktree);
             let expected_worktree = crate::session::worktree::worktree_base_dir_for_source(&repo)
@@ -2143,6 +2403,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             stream_tool_calls: None,
             laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
+            catalog_degraded_reason: None,
         },
         api_key: None,
         env_key: None,
@@ -2150,6 +2411,199 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
         api_base_url: None,
         config_validation_errors: Vec::new(),
     }
+}
+
+#[test]
+fn subagent_reasoning_override_obeys_authoritative_model_menu() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    let options = [ReasoningEffortOption {
+        id: "deep".into(),
+        value: ReasoningEffort::High,
+        label: "Deep".into(),
+        description: None,
+        default: true,
+    }];
+    assert_eq!(
+        resolve_subagent_reasoning_effort_override(true, &options, "high"),
+        Some(ReasoningEffort::High)
+    );
+    for rejected in ["low", "none", "max"] {
+        assert_eq!(
+            resolve_subagent_reasoning_effort_override(true, &options, rejected),
+            None,
+            "explicit model menu must reject {rejected}"
+        );
+    }
+}
+
+#[test]
+fn subagent_reasoning_override_accepts_catalog_advertised_ultra() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    let options = [ReasoningEffortOption {
+        id: "ultra".into(),
+        value: ReasoningEffort::Ultra,
+        label: "Ultra".into(),
+        description: Some("Maximum reasoning with proactive multi-agent guidance".into()),
+        default: true,
+    }];
+    assert_eq!(
+        resolve_subagent_reasoning_effort_override(true, &options, "ultra"),
+        Some(ReasoningEffort::Ultra)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_ultra_rejected_for_child_model_without_ultra_before_inference() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+    use xai_grok_test_support::MockInferenceServer;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let server = MockInferenceServer::start().await.unwrap();
+            let model_id = "codex-luna-like";
+            let mut entry = test_model_entry(model_id);
+            entry.info.base_url = server.url();
+            entry.info.supports_reasoning_effort = true;
+            entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+                id: "max".into(),
+                value: ReasoningEffort::Max,
+                label: "Max".into(),
+                description: None,
+                default: true,
+            }];
+            let mut models = indexmap::IndexMap::new();
+            models.insert(model_id.to_owned(), entry);
+            let mut ctx = ctx_with_toggle(HashMap::new());
+            ctx.model_id = acp::ModelId::new(model_id);
+            ctx.sampling_config_model_id = acp::ModelId::new(model_id);
+            ctx.sampling_config.model = model_id.to_owned();
+            ctx.sampling_config.base_url = server.url();
+            ctx.available_models = models.clone();
+            ctx.models_manager = crate::agent::models::ModelsManager::new(
+                None,
+                models,
+                acp::ModelId::new(model_id),
+                ctx.auth_manager.clone(),
+                crate::agent::config::Config::default(),
+            );
+            let mut request = auto_wake_test_request("reject-child-ultra");
+            request.run_in_background = false;
+            request.surface_completion = false;
+            request.runtime_overrides.reasoning_effort = Some("ultra".into());
+
+            let result = run_issue39_spawn(request, ctx).await;
+
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("reasoning_effort 'ultra' is not offered")),
+                "explicit unavailable effort must return a failure_result: {:?}",
+                result.error
+            );
+            assert_eq!(
+                server.request_count(),
+                0,
+                "rejected explicit effort must not reach inference"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_ultra_advertised_by_child_model_reaches_responses_as_max() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+    use xai_grok_test_support::MockInferenceServer;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let server = MockInferenceServer::start().await.unwrap();
+            let model_id = "codex-sol-like";
+            let mut entry = test_model_entry(model_id);
+            entry.info.base_url = server.url();
+            entry.info.api_backend = xai_grok_sampler::ApiBackend::Responses;
+            entry.info.auth_scheme = xai_grok_sampler::AuthScheme::None;
+            entry.info.supports_reasoning_effort = true;
+            entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+                id: "ultra".into(),
+                value: ReasoningEffort::Ultra,
+                label: "Ultra".into(),
+                description: None,
+                default: true,
+            }];
+            let mut models = indexmap::IndexMap::new();
+            models.insert(model_id.to_owned(), entry);
+            let mut ctx = ctx_with_toggle(HashMap::new());
+            ctx.model_id = acp::ModelId::new(model_id);
+            ctx.sampling_config_model_id = acp::ModelId::new(model_id);
+            ctx.sampling_config.model = model_id.to_owned();
+            ctx.sampling_config.base_url = server.url();
+            ctx.sampling_config.api_backend = xai_grok_sampler::ApiBackend::Responses;
+            ctx.sampling_config.auth_scheme = xai_grok_sampler::AuthScheme::None;
+            ctx.available_models = models.clone();
+            ctx.models_manager = crate::agent::models::ModelsManager::new(
+                None,
+                models,
+                acp::ModelId::new(model_id),
+                ctx.auth_manager.clone(),
+                crate::agent::config::Config::default(),
+            );
+            let mut request = auto_wake_test_request("accept-child-ultra");
+            request.prompt = "answer briefly".into();
+            request.run_in_background = false;
+            request.surface_completion = false;
+            request.runtime_overrides.reasoning_effort = Some("ultra".into());
+
+            let result = run_issue39_spawn(request, ctx).await;
+
+            assert!(result.success, "child run failed: {:?}", result.error);
+            let bodies = server.request_bodies();
+            assert!(!bodies.is_empty(), "accepted effort must reach inference");
+            assert!(
+                bodies.iter().any(|body| {
+                    body.pointer("/reasoning/effort")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("max")
+                }),
+                "no Responses request carried Ultra's typed max wire effort: {bodies:?}"
+            );
+            assert!(
+                bodies.iter().all(|body| !body.to_string().contains("<multi_agent_mode>")),
+                "generic Responses must not receive Codex-only proactive guidance: {bodies:?}"
+            );
+        })
+        .await;
+}
+
+#[test]
+fn subagent_reasoning_override_uses_legacy_menu_when_catalog_menu_is_absent() {
+    use xai_grok_sampling_types::ReasoningEffort;
+
+    for (raw, expected) in [
+        ("minimal", ReasoningEffort::Minimal),
+        ("low", ReasoningEffort::Low),
+        ("high", ReasoningEffort::High),
+        ("xhigh", ReasoningEffort::Xhigh),
+    ] {
+        assert_eq!(
+            resolve_subagent_reasoning_effort_override(true, &[], raw),
+            Some(expected)
+        );
+    }
+    for rejected in ["none", "max"] {
+        assert_eq!(
+            resolve_subagent_reasoning_effort_override(true, &[], rejected),
+            None,
+            "menu-less legacy policy must reject {rejected}"
+        );
+    }
+    assert_eq!(
+        resolve_subagent_reasoning_effort_override(false, &[], "high"),
+        None
+    );
 }
 fn byok_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
     crate::agent::config::ModelEntry {
@@ -2254,10 +2708,33 @@ fn fresh_tool_model_rejects_unavailable_first_slug_collision() {
             )
             .as_deref(),
             Some(
-                "Unknown Task.model slug 'shared-routing-slug'. Valid model slugs: \
-                 visible-second. Omit `model` to inherit the parent model."
+                "Ambiguous Task.model slug 'shared-routing-slug'. Use an exact catalog key. \
+                 Valid model slugs: visible-second. Omit `model` to inherit the parent model."
             ),
-            "validation must inspect the first routing-slug entry selected by execution"
+            "validation must reject an ambiguous route instead of selecting either entry"
+        );
+}
+
+#[test]
+fn fresh_tool_model_rejects_ambiguous_visible_slug() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("first-key".to_string(), test_model_entry("shared-routing-slug"));
+    models.insert("second-key".to_string(), test_model_entry("shared-routing-slug"));
+
+    assert_eq!(
+            super::handle_request::task_model_override_error(
+                Some("shared-routing-slug"),
+                ModelOverrideProvenance::Tool,
+                false,
+                &models,
+                false,
+            )
+            .as_deref(),
+            Some(
+                "Ambiguous Task.model slug 'shared-routing-slug'. Use an exact catalog key. \
+                 Valid model slugs: first-key, second-key. Omit `model` to inherit the parent model."
+            ),
+            "an explicit Task.model must not silently inherit when its route is ambiguous"
         );
 }
 #[test]
@@ -2437,6 +2914,28 @@ fn spawn_test_parent_chat_state(model_slug: &str) -> xai_chat_state::ChatStateHa
     xai_chat_state::ChatStateActor::spawn(
         vec![],
         test_sampling_config(model_slug),
+        Box::new(mock),
+        event_tx,
+        token,
+    )
+}
+fn spawn_test_parent_chat_state_with_catalog_identity(
+    catalog_model_id: &str,
+    model_slug: &str,
+) -> xai_chat_state::ChatStateHandle {
+    let (mock, _persistence_rx) = xai_chat_state::MockChatPersistence::new();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let token = tokio_util::sync::CancellationToken::new();
+    xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
+        vec![],
+        test_sampling_config(model_slug),
+        Some(xai_chat_state::CatalogIdentity {
+            model_id: catalog_model_id.to_string(),
+            route: model_slug.to_string(),
+            lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        }),
+        xai_chat_state::PruningConfig::default(),
         Box::new(mock),
         event_tx,
         token,

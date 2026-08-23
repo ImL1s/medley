@@ -16,6 +16,10 @@ pub(crate) use self::journal::{RelocationJournal, RelocationLease, RelocationPha
 pub(crate) use self::view::RelocationView;
 use crate::session::persistence::{PendingCwdSwitchReminder, Summary};
 
+pub(crate) fn publish_directory_no_replace(source: &Path, target: &Path) -> Result<()> {
+    fs::rename_no_replace(source, target)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RelocationError {
     #[error("invalid relocation {field}: {value:?}")]

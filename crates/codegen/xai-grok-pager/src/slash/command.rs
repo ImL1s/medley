@@ -152,6 +152,31 @@ pub struct CommandExecCtx<'a> {
     pub(crate) pager_state: crate::settings::PagerLocalSnapshot,
 }
 
+/// Origin of a slash command. The dropdown renderer turns this into badge
+/// text via [`CommandProvenance::badge`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandProvenance {
+    Builtin,
+    /// Non-skill ACP command (e.g. `/flush`).
+    Shell,
+    /// Skill; `source` is the plugin install name or scope.
+    Skill {
+        source: String,
+    },
+}
+
+impl CommandProvenance {
+    /// Right-aligned slash-menu badge. Shell commands render as `built-in`
+    /// too — the badge only has to separate a skill from whoever kept the
+    /// bare name.
+    pub fn badge(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Builtin | Self::Shell => std::borrow::Cow::Borrowed("built-in"),
+            Self::Skill { source } => std::borrow::Cow::Owned(format!("skill · {source}")),
+        }
+    }
+}
+
 /// A slash command.
 ///
 /// Implementors define command metadata (name, description, args) and
@@ -169,6 +194,11 @@ pub trait SlashCommand: Send + Sync {
 
     /// Short human-readable description shown in the dropdown.
     fn description(&self) -> &str;
+
+    /// Origin for the slash-menu provenance badge. Defaults to builtin.
+    fn provenance(&self) -> CommandProvenance {
+        CommandProvenance::Builtin
+    }
 
     /// Usage string shown in help. E.g., `"/model <name>"`.
     fn usage(&self) -> &str;
@@ -206,6 +236,16 @@ pub trait SlashCommand: Send + Sync {
     #[allow(unused_variables)]
     fn suggest_args(&self, ctx: &AppCtx, args_query: &str) -> Option<Vec<ArgItem>> {
         None
+    }
+
+    /// Whether an argument row should be selected when its picker first opens.
+    ///
+    /// The controller only honors a single preferred row in a fresh, empty
+    /// argument context. Typed queries still select the fuzzy-ranked first row,
+    /// and an existing user selection is carried across refreshes.
+    #[allow(unused_variables)]
+    fn initially_preferred_arg(&self, ctx: &AppCtx, item: &ArgItem) -> bool {
+        false
     }
 
     /// Whether this command is currently visible / executable.

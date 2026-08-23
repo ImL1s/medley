@@ -41,6 +41,7 @@ async fn create_test_actor(
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
+        front_message_committed: false,
         nudges_used_this_session: 0,
     });
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -84,6 +85,7 @@ async fn create_test_actor(
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
             persistence_is_noop: false,
+            disk_full: crate::session::notifications::idle_disk_full_rx(),
         },
         permissions: PermissionHandle::allow_all(),
         tool_context,
@@ -102,6 +104,7 @@ async fn create_test_actor(
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
         catalog_model_id: std::cell::Cell::new("test".to_string()),
+        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -130,6 +133,7 @@ async fn create_test_actor(
             flush_config: crate::config::MemoryFlushConfig::default(),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+            configured_storage: None,
             storage: std::cell::RefCell::new(None),
             save_on_end: true,
             backend_params: None,
@@ -238,11 +242,16 @@ async fn create_test_actor(
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
+        turn_summary_task: std::cell::RefCell::new(None),
+        turn_summary_generation: std::cell::Cell::new(0),
+        turn_summary_enabled: false,
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
-        image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+        image_description_model: std::cell::RefCell::new(
+            crate::test_support::TEST_MODEL.to_owned(),
+        ),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
@@ -485,6 +494,7 @@ async fn create_test_actor_with_memory(
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
+        front_message_committed: false,
         nudges_used_this_session: 0,
     });
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -532,6 +542,7 @@ async fn create_test_actor_with_memory(
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
             persistence_is_noop: false,
+            disk_full: crate::session::notifications::idle_disk_full_rx(),
         },
         permissions: PermissionHandle::allow_all(),
         tool_context,
@@ -547,6 +558,7 @@ async fn create_test_actor_with_memory(
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
         catalog_model_id: std::cell::Cell::new("test".to_string()),
+        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -577,6 +589,7 @@ async fn create_test_actor_with_memory(
                 .map_or_else(Default::default, |mc| mc.flush.clone()),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+            configured_storage: memory_storage.clone(),
             storage: std::cell::RefCell::new(memory_storage),
             save_on_end: true,
             backend_params: None,
@@ -696,11 +709,16 @@ async fn create_test_actor_with_memory(
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
+        turn_summary_task: std::cell::RefCell::new(None),
+        turn_summary_generation: std::cell::Cell::new(0),
+        turn_summary_enabled: false,
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
-        image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+        image_description_model: std::cell::RefCell::new(
+            crate::test_support::TEST_MODEL.to_owned(),
+        ),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
@@ -1200,11 +1218,6 @@ async fn test_compact_on_error_no_trigger_when_tokens_within_new_window() {
             assert!(!actor.should_compact_on_error(&err).await);
         })
         .await;
-}
-/// Verify `maybe_refresh_model_metadata_on_resume` is a no-op when idle < 10 min.
-#[tokio::test(flavor = "current_thread")]
-async fn test_idle_resume_noop_when_not_idle_enough() {
-    let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (gateway_tx, _) = mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();

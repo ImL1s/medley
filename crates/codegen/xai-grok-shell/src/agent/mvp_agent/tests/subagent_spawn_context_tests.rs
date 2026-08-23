@@ -43,7 +43,7 @@ async fn subagent_spawn_context_inherits_parent_permission_handle() {
 
             let mut handle = make_test_handle("test-model", false, None);
             handle.permission_handle = permission_handle;
-            agent.sessions.borrow_mut().insert(sid.clone(), handle);
+            agent.insert_resident(&sid, handle);
 
             let ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
             let inherited = ctx
@@ -87,7 +87,7 @@ async fn subagent_spawn_context_shares_parent_goal_loop_gate() {
     let handle = make_test_handle("test-model", false, None);
     // Clone the parent's live gate before the handle moves into `sessions`.
     let parent_gate = handle.tool_context.goal_loop_active_gate.clone();
-    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+    agent.insert_resident(&sid, handle);
 
     let ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
 
@@ -110,10 +110,7 @@ async fn subagent_spawn_context_inherits_parent_ask_user_question_gate() {
     let sid_off = acp::SessionId::new("parent-no-ask");
     let mut handle_off = make_test_handle("test-model", false, None);
     handle_off.ask_user_question_enabled = false;
-    agent
-        .sessions
-        .borrow_mut()
-        .insert(sid_off.clone(), handle_off);
+    agent.insert_resident(&sid_off, handle_off);
     let ctx_off = agent.build_subagent_spawn_context(sid_off.0.as_ref());
     assert!(
         !ctx_off.ask_user_question_enabled,
@@ -123,10 +120,7 @@ async fn subagent_spawn_context_inherits_parent_ask_user_question_gate() {
     // Parent with the tool enabled (the default) → child on.
     let sid_on = acp::SessionId::new("parent-ask");
     let handle_on = make_test_handle("test-model", false, None);
-    agent
-        .sessions
-        .borrow_mut()
-        .insert(sid_on.clone(), handle_on);
+    agent.insert_resident(&sid_on, handle_on);
     let ctx_on = agent.build_subagent_spawn_context(sid_on.0.as_ref());
     assert!(
         ctx_on.ask_user_question_enabled,
@@ -153,7 +147,7 @@ async fn subagent_spawn_context_inherits_parent_configured_cutoff() {
     handle
         .resolved_tool_overrides
         .store(Some(std::sync::Arc::new(cutoff.clone())));
-    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+    agent.insert_resident(&sid, handle);
     let ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
     assert_eq!(
         ctx.inherited_tool_overrides,
@@ -163,10 +157,7 @@ async fn subagent_spawn_context_inherits_parent_configured_cutoff() {
 
     // A parent with no configured cutoff must not fabricate one for the child.
     let sid_none = acp::SessionId::new("parent-unbounded");
-    agent.sessions.borrow_mut().insert(
-        sid_none.clone(),
-        make_test_handle("test-model", false, None),
-    );
+    agent.insert_resident(&sid_none, make_test_handle("test-model", false, None));
     let ctx_none = agent.build_subagent_spawn_context(sid_none.0.as_ref());
     assert!(
         ctx_none.inherited_tool_overrides.is_none(),
@@ -188,9 +179,8 @@ async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting
     lifecycle_scope.register(&lifecycle_owner);
     lifecycle.tool_context.process_scope = Some(lifecycle_scope);
     agent
-        .sessions
-        .borrow_mut()
-        .insert(lifecycle_sid.clone(), lifecycle);
+        .session_registry
+        .put_resident(&lifecycle_sid, lifecycle);
 
     let immediate_sid = acp::SessionId::new("execute-immediate-parent");
     let mut immediate = make_test_handle("immediate-model", false, None);
@@ -219,9 +209,8 @@ async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting
         .resolved_tool_overrides
         .store(Some(std::sync::Arc::new(cutoff.clone())));
     agent
-        .sessions
-        .borrow_mut()
-        .insert(immediate_sid.clone(), immediate);
+        .session_registry
+        .put_resident(&immediate_sid, immediate);
 
     let (ctx, _) = agent
         .try_build_subagent_spawn_context_for_run(
@@ -234,7 +223,9 @@ async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting
     assert_eq!(ctx.model_id.0.as_ref(), "immediate-model");
     assert_eq!(ctx.parent_cwd, immediate_cwd);
     assert_eq!(
-        ctx.parent_session_info.as_ref().map(|info| info.cwd.as_str()),
+        ctx.parent_session_info
+            .as_ref()
+            .map(|info| info.cwd.as_str()),
         Some("/isolated-worktree")
     );
     assert_eq!(ctx.fs.root(), std::path::Path::new("/isolated-worktree"));
@@ -254,7 +245,10 @@ async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting
             .live_count(),
         1
     );
-    assert_eq!(ctx.parent_capability_mode, Some(SubagentCapabilityMode::Execute));
+    assert_eq!(
+        ctx.parent_capability_mode,
+        Some(SubagentCapabilityMode::Execute)
+    );
     assert_eq!(ctx.parent_depth, 1);
     assert_eq!(ctx.inherited_tool_overrides, Some(cutoff));
     assert_eq!(
@@ -277,7 +271,7 @@ async fn subagent_spawn_context_inherits_parent_process_scope() {
     let mut handle = make_test_handle("test-model", false, None);
     let parent_scope = xai_tty_utils::ProcessScope::new();
     handle.tool_context.process_scope = Some(parent_scope.clone());
-    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+    agent.insert_resident(&sid, handle);
 
     // Hold an owner Arc in the parent scope so live_count == 1.
     let owner = std::sync::Arc::new(xai_tty_utils::ProcessGroup::new().expect("process group"));
@@ -310,31 +304,40 @@ async fn issue14_spawn_refresh_replaces_stale_parent_capabilities() {
     let sid = acp::SessionId::new("issue14-refresh-parent");
     let (mut handle, _cmd_tx, mut cmd_rx) = super::make_live_session_handle(&sid, None);
     handle.mcp_servers = vec![issue14_stdio_server("stale-bootstrap-mcp")];
-    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+    agent.session_registry.put_resident(&sid, handle);
 
-    tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            if let SessionCommand::SnapshotSubagentCapabilities { respond_to } = cmd {
-                let _ = respond_to.send(Ok(SubagentCapabilitySnapshot {
-                    mcp_configs: vec![issue14_stdio_server("fresh-live-mcp")],
-                    mcp_pool: None,
-                    client_hooks: Default::default(),
-                    tool_definitions: vec![xai_grok_sampling_types::ToolSpec {
-                        name: "issue14_fresh_tool".to_string(),
-                        description: Some("spawn-refresh tool".to_string()),
-                        parameters: serde_json::json!({
-                            "type": "object",
-                            "properties": {}
-                        }),
-                    }],
-                    skills: vec![xai_grok_tools::implementations::skills::types::SkillInfo {
-                        name: "issue14-fresh-skill".to_string(),
-                        description: "spawn-refresh skill".to_string(),
-                        ..Default::default()
-                    }],
-                    mcp_generation: 41,
-                }));
-                break;
+    let responder = tokio::spawn(async move {
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                Some(cmd) = cmd_rx.recv() => {
+                    if let SessionCommand::SnapshotSubagentCapabilities { respond_to } = cmd {
+                        let _ = respond_to.send(Ok(SubagentCapabilitySnapshot {
+                            mcp_configs: vec![issue14_stdio_server("fresh-live-mcp")],
+                            mcp_pool: None,
+                            client_hooks: Default::default(),
+                            tool_definitions: vec![xai_grok_sampling_types::ToolSpec {
+                                name: "issue14_fresh_tool".to_string(),
+                                description: Some("spawn-refresh tool".to_string()),
+                                parameters: serde_json::json!({
+                                    "type": "object",
+                                    "properties": {}
+                                }),
+                            }],
+                            skills: vec![xai_grok_tools::implementations::skills::types::SkillInfo {
+                                name: "issue14-fresh-skill".to_string(),
+                                description: "spawn-refresh skill".to_string(),
+                                ..Default::default()
+                            }],
+                            mcp_generation: 41,
+                        }));
+                        break;
+                    }
+                }
+                () = &mut timeout => {
+                    panic!("timeout waiting for SnapshotSubagentCapabilities command");
+                }
             }
         }
     });
@@ -352,15 +355,18 @@ async fn issue14_spawn_refresh_replaces_stale_parent_capabilities() {
     assert!(ctx.parent_tool_definitions.is_none());
 
     let handle = agent
-        .sessions
-        .borrow()
-        .get(&sid)
-        .cloned()
+        .session_registry
+        .resident_handle(&sid)
         .expect("parent handle should exist");
-    let refreshed = agent
-        .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
-        .await
-        .expect("capability refresh should succeed");
+    let refreshed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent.refresh_subagent_capabilities_for_spawn(&mut ctx, &handle),
+    )
+    .await
+    .expect("refresh_subagent_capabilities_for_spawn must complete within 5s")
+    .expect("capability refresh should succeed");
+    
+    responder.await.expect("responder task must complete");
 
     assert_eq!(refreshed.mcp_generation, 41);
     assert_eq!(
@@ -405,7 +411,7 @@ async fn issue14_spawn_refresh_parent_actor_unavailable_is_actionable_error() {
         cwd: "/tmp".to_string(),
     };
     handle.mcp_servers = vec![issue14_stdio_server("stale-bootstrap-mcp")];
-    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+    agent.session_registry.put_resident(&sid, handle);
 
     let mut ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
     let original = ctx
@@ -416,10 +422,8 @@ async fn issue14_spawn_refresh_parent_actor_unavailable_is_actionable_error() {
     assert_eq!(original, vec!["stale-bootstrap-mcp".to_string()]);
 
     let handle = agent
-        .sessions
-        .borrow()
-        .get(&sid)
-        .cloned()
+        .session_registry
+        .resident_handle(&sid)
         .expect("parent handle should exist");
     let err = agent
         .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)

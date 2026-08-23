@@ -2,15 +2,18 @@ use super::types::WebSearchConfig;
 use crate::attribution::{SharedAttributionCallback, ToolConsumer};
 use crate::types::{ApiCredential, ApiTransportProfile, SharedApiKeyProvider};
 use async_openai::types::responses as rs;
+use futures_util::StreamExt as _;
 use indexmap::IndexMap;
 use reqwest::header::{
-    AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 
 const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-id");
 const OPENAI_FEDRAMP: HeaderName = HeaderName::from_static("x-openai-fedramp");
 const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const MAX_CODEX_SSE_BYTES: usize = 16 * 1024 * 1024;
+const CODEX_SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Session-wide auth belongs only to xAI-operated endpoints. A custom model's
 /// static key is scoped to its configured endpoint and must never be replaced
@@ -47,29 +50,71 @@ fn accepts_xai_session_provider(base_url: &str) -> bool {
                 .is_some_and(|suffix| suffix.starts_with('/')))
 }
 
-fn has_declared_credential_header(
-    extra_headers: &IndexMap<String, String>,
-    env_http_headers: &IndexMap<String, String>,
-) -> bool {
-    fn is_credential_header(name: &str) -> bool {
-        name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
-    }
+fn is_credential_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
+}
 
+fn has_declared_credential_header(extra_headers: &IndexMap<String, String>) -> bool {
     extra_headers
         .iter()
         .any(|(name, value)| is_credential_header(name) && !value.trim().is_empty())
-        || env_http_headers.iter().any(|(name, env_var)| {
-            is_credential_header(name)
-                && std::env::var(env_var)
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty())
-        })
 }
 
 fn strip_codex_routing_headers(headers: &mut HeaderMap) {
     headers.remove(CHATGPT_ACCOUNT_ID);
     headers.remove(OPENAI_FEDRAMP);
     headers.remove(ORIGINATOR);
+}
+
+/// Codex account/routing metadata is trusted only at the canonical ChatGPT
+/// origin.  Keep this decision separate from the wire-format profile so a
+/// future Codex-compatible transport cannot inherit first-party identity
+/// headers merely by selecting `CodexResponses`.
+fn accepts_codex_internal_metadata(base_url: &str) -> bool {
+    if base_url == CODEX_BASE_URL {
+        return true;
+    }
+
+    // Codex request tests use a loopback receiver. Production builds have no
+    // equivalent exception because `normalize_codex_base_url` rejects it.
+    #[cfg(test)]
+    {
+        normalize_codex_base_url(base_url).is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// First-party metadata must never cross an untrusted web-search transport,
+/// regardless of whether it came from static model config, an environment
+/// mapping, or a later per-request merge. Keep this list aligned with the
+/// sampler's final request boundary.
+fn is_internal_metadata_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    name.starts_with("x-grok-")
+        || name.starts_with("x-xai-")
+        || name == CHATGPT_ACCOUNT_ID.as_str()
+        || name == OPENAI_FEDRAMP.as_str()
+        || name == ORIGINATOR.as_str()
+        || name == "x-compactions-remaining"
+        || name == "x-compaction-at"
+        || name == "x-authenticateresponse"
+        || name == "traceparent"
+        || name == "tracestate"
+        || name == "baggage"
+}
+
+fn strip_internal_metadata_headers(headers: &mut HeaderMap) {
+    let internal = headers
+        .keys()
+        .filter(|name| is_internal_metadata_header(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in internal {
+        headers.remove(name);
+    }
 }
 
 fn should_follow_redirect_with_dynamic_credential(
@@ -134,6 +179,7 @@ fn retain_codex_headers(
         headers.insert(CONTENT_TYPE, value);
     }
     headers.insert(USER_AGENT, grok_build_user_agent()?);
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert(AUTHORIZATION, authorization);
     if let Some(account_id) = account_id {
         let value = HeaderValue::from_str(account_id)
@@ -156,6 +202,7 @@ pub struct WebSearchClient {
     api_key_provider: Option<SharedApiKeyProvider>,
     provider_scoped: bool,
     transport_profile: ApiTransportProfile,
+    sends_internal_metadata: bool,
     /// Optional 401-attribution hook. Callers can wire this so a 401
     /// from the Responses API emits an `auth_401_attribution` event
     /// with `consumer == "WebSearch"`.
@@ -168,6 +215,16 @@ impl WebSearchClient {
     pub fn new(
         config: &WebSearchConfig,
         default_api_key_provider: Option<SharedApiKeyProvider>,
+    ) -> Result<Self, xai_tool_runtime::ToolError> {
+        Self::new_with_env_resolver(config, default_api_key_provider, |name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    fn new_with_env_resolver(
+        config: &WebSearchConfig,
+        default_api_key_provider: Option<SharedApiKeyProvider>,
+        get_env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, xai_tool_runtime::ToolError> {
         let WebSearchConfig::Enabled {
             api_key,
@@ -227,8 +284,9 @@ impl WebSearchClient {
         // and unrepresentable entries are skipped rather than failing the
         // build: a mapping to a variable the user has not exported is a
         // configuration the sampler already tolerates (#160).
+        let mut route_declares_credential_header = has_declared_credential_header(extra_headers);
         for (key, env_var) in env_http_headers {
-            let Ok(value) = std::env::var(env_var) else {
+            let Some(value) = get_env(env_var) else {
                 continue;
             };
             let value = value.trim();
@@ -247,6 +305,7 @@ impl WebSearchClient {
                 continue;
             };
             headers.insert(header_name, header_value);
+            route_declares_credential_header |= is_credential_header(key);
         }
         let _ = alpha_test_key;
         let provider_scoped = api_key_provider.is_some();
@@ -264,6 +323,9 @@ impl WebSearchClient {
         } else {
             base_url.clone()
         };
+        let sends_internal_metadata = (transport_profile == ApiTransportProfile::CodexResponses
+            && accepts_codex_internal_metadata(&base_url))
+            || accepts_xai_session_provider(&base_url);
         if transport_profile == ApiTransportProfile::CodexResponses {
             let content_type = headers.get(CONTENT_TYPE).cloned();
             headers.clear();
@@ -282,8 +344,12 @@ impl WebSearchClient {
         } else {
             strip_codex_routing_headers(&mut headers);
         }
-        let route_declares_credential_header =
-            has_declared_credential_header(extra_headers, env_http_headers);
+        if !sends_internal_metadata {
+            // Apply once after all static and environment-backed merges. The
+            // same policy is applied again to the final request below so a
+            // future dynamic merge cannot reopen this boundary.
+            strip_internal_metadata_headers(&mut headers);
+        }
         let request_api_key_provider = api_key_provider.clone().or_else(|| {
             if accepts_xai_session_provider(&base_url) && !route_declares_credential_header {
                 default_api_key_provider
@@ -327,6 +393,7 @@ impl WebSearchClient {
             api_key_provider: request_api_key_provider,
             provider_scoped,
             transport_profile,
+            sends_internal_metadata,
             attribution_callback: None,
         })
     }
@@ -467,42 +534,69 @@ impl WebSearchClient {
         } else {
             strip_codex_routing_headers(request.headers_mut());
         }
+        if !self.sends_internal_metadata {
+            // This is the authoritative wire boundary. It deliberately runs
+            // after dynamic credentials and routing cleanup, matching the
+            // sampler's post-injector enforcement point.
+            strip_internal_metadata_headers(request.headers_mut());
+        }
         Ok(request)
     }
-    /// Perform a web search query using the Responses API.
-    ///
-    /// Returns `(content, citations)` where content is the assistant's text
-    /// and citations are unique URLs found in the response annotations.
-    pub async fn search(
+
+    fn build_search_request(
         &self,
         query: &str,
         allowed_domains: Option<Vec<String>>,
-    ) -> Result<(String, Vec<String>), xai_tool_runtime::ToolError> {
-        let web_search = rs::WebSearchToolArgs::default()
-            .filters(rs::WebSearchToolFilters { allowed_domains })
-            .build()
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Failed to build web search tool: {e}"),
-                )
-            })?;
+    ) -> Result<rs::CreateResponse, xai_tool_runtime::ToolError> {
+        let mut web_search_builder = rs::WebSearchToolArgs::default();
+        if let Some(allowed_domains) = allowed_domains {
+            web_search_builder.filters(rs::WebSearchToolFilters {
+                allowed_domains: Some(allowed_domains),
+            });
+        }
+        let web_search = web_search_builder.build().map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                format!("Failed to build web search tool: {e}"),
+            )
+        })?;
+
+        let codex_transport = self.transport_profile == ApiTransportProfile::CodexResponses;
+        let input = if codex_transport {
+            rs::InputParam::Items(vec![rs::EasyInputMessage::from(query).into()])
+        } else {
+            rs::InputParam::Text(query.to_owned())
+        };
         let mut request_builder = rs::CreateResponseArgs::default();
         request_builder
             .model(self.model.clone())
-            .input(query.to_string())
+            .input(input)
             .tools(vec![rs::Tool::WebSearch(web_search)])
-            .store(false)
-            .max_output_tokens(8192u32);
-        if self.transport_profile != ApiTransportProfile::CodexResponses {
-            request_builder.temperature(0.1).top_p(0.95);
+            .store(false);
+        if codex_transport {
+            request_builder
+                .include(vec![rs::IncludeEnum::WebSearchCallActionSources])
+                .stream(true);
+        } else {
+            request_builder
+                .max_output_tokens(8192u32)
+                .temperature(0.1)
+                .top_p(0.95);
         }
-        let request = request_builder.build().map_err(|e| {
+        request_builder.build().map_err(|e| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
                 format!("Failed to build request: {e}"),
             )
-        })?;
+        })
+    }
+
+    async fn execute_search(
+        &self,
+        query: &str,
+        allowed_domains: Option<Vec<String>>,
+    ) -> Result<rs::Response, xai_tool_runtime::ToolError> {
+        let request = self.build_search_request(query, allowed_domains)?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let response = self.execute_authenticated(&url, &request).await?;
         let status = response.status();
@@ -512,18 +606,35 @@ impl WebSearchClient {
                 format!("Responses API request failed (HTTP {status})."),
             ));
         }
-        let bytes = response.bytes().await.map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Failed to read Responses API response.".to_string(),
-            )
-        })?;
-        let response_obj: rs::Response = serde_json::from_slice(&bytes).map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Responses API returned an invalid response.".to_string(),
-            )
-        })?;
+
+        if self.transport_profile == ApiTransportProfile::CodexResponses {
+            read_codex_sse_response(response).await
+        } else {
+            let bytes = response.bytes().await.map_err(|_| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                    "Failed to read Responses API response.".to_string(),
+                )
+            })?;
+            serde_json::from_slice(&bytes).map_err(|_| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                    "Responses API returned an invalid response.".to_string(),
+                )
+            })
+        }
+    }
+
+    /// Perform a web search query using the Responses API.
+    ///
+    /// Returns `(content, citations)` where content is the assistant's text
+    /// and citations are unique URLs found in the response provenance fields.
+    pub async fn search(
+        &self,
+        query: &str,
+        allowed_domains: Option<Vec<String>>,
+    ) -> Result<(String, Vec<String>), xai_tool_runtime::ToolError> {
+        let response_obj = self.execute_search(query, allowed_domains).await?;
         let content = response_obj
             .output_text()
             .unwrap_or_else(|| "No search results found.".to_string());
@@ -542,52 +653,7 @@ impl WebSearchClient {
         query: &str,
         allowed_domains: Option<Vec<String>>,
     ) -> Result<(String, Vec<(String, String)>), xai_tool_runtime::ToolError> {
-        let web_search = rs::WebSearchToolArgs::default()
-            .filters(rs::WebSearchToolFilters { allowed_domains })
-            .build()
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Failed to build web search tool: {e}"),
-                )
-            })?;
-        let mut request_builder = rs::CreateResponseArgs::default();
-        request_builder
-            .model(self.model.clone())
-            .input(query.to_string())
-            .tools(vec![rs::Tool::WebSearch(web_search)])
-            .store(false)
-            .max_output_tokens(8192u32);
-        if self.transport_profile != ApiTransportProfile::CodexResponses {
-            request_builder.temperature(0.1).top_p(0.95);
-        }
-        let request = request_builder.build().map_err(|e| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Failed to build request: {e}"),
-            )
-        })?;
-        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let response = self.execute_authenticated(&url, &request).await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Responses API request failed (HTTP {status})."),
-            ));
-        }
-        let bytes = response.bytes().await.map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Failed to read Responses API response.".to_string(),
-            )
-        })?;
-        let response_obj: rs::Response = serde_json::from_slice(&bytes).map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Responses API returned an invalid response.".to_string(),
-            )
-        })?;
+        let response_obj = self.execute_search(query, allowed_domains).await?;
         let content = response_obj
             .output_text()
             .unwrap_or_else(|| "No search results found.".to_string());
@@ -595,11 +661,164 @@ impl WebSearchClient {
         Ok((content, pairs))
     }
 }
-/// Extract citation URLs from the Response output items.
-/// The async-openai crate doesn't provide a helper for this, and the `url` field
-/// in `UrlCitationBody` is private, so we serialize to JSON to extract it.
-fn extract_citations(response: &rs::Response) -> Vec<String> {
-    let mut citations = Vec::new();
+
+async fn read_codex_sse_response(
+    response: reqwest::Response,
+) -> Result<rs::Response, xai_tool_runtime::ToolError> {
+    let mut stream = response.bytes_stream();
+    let mut decoder = CodexSseDecoder::default();
+    loop {
+        let chunk = tokio::time::timeout(CODEX_SSE_IDLE_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| codex_stream_error("Responses API stream timed out."))?;
+        match chunk {
+            Some(Ok(chunk)) => {
+                if let Some(response) = decoder.push(&chunk)? {
+                    return Ok(response);
+                }
+            }
+            Some(Err(_)) => {
+                return Err(codex_stream_error("Failed to read Responses API stream."));
+            }
+            None => return Err(invalid_codex_stream()),
+        }
+    }
+}
+
+fn codex_stream_error(message: &str) -> xai_tool_runtime::ToolError {
+    xai_tool_runtime::ToolError::execution(
+        xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+        message.to_string(),
+    )
+}
+
+fn invalid_codex_stream() -> xai_tool_runtime::ToolError {
+    codex_stream_error("Responses API returned an invalid stream.")
+}
+
+fn sse_line_ending_len(bytes: &[u8], index: usize) -> Option<usize> {
+    match bytes.get(index) {
+        Some(b'\n') => Some(1),
+        Some(b'\r') if bytes.get(index + 1) == Some(&b'\n') => Some(2),
+        Some(b'\r') => Some(1),
+        _ => None,
+    }
+}
+
+fn next_sse_frame(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(first_len) = sse_line_ending_len(bytes, index) {
+            let next = index + first_len;
+            if let Some(second_len) = sse_line_ending_len(bytes, next) {
+                return Some((index, next + second_len));
+            }
+            index = next;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct CodexSseDecoder {
+    buffer: Vec<u8>,
+    received_bytes: usize,
+    done_output_items: std::collections::BTreeMap<u32, rs::OutputItem>,
+}
+
+impl CodexSseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Option<rs::Response>, xai_tool_runtime::ToolError> {
+        self.received_bytes = self.received_bytes.saturating_add(chunk.len());
+        if self.received_bytes > MAX_CODEX_SSE_BYTES {
+            return Err(codex_stream_error(
+                "Responses API stream exceeded the safe size limit.",
+            ));
+        }
+        self.buffer.extend_from_slice(chunk);
+
+        while let Some((frame_end, consumed_end)) = next_sse_frame(&self.buffer) {
+            let frame = self.buffer[..frame_end].to_vec();
+            self.buffer.drain(..consumed_end);
+            if let Some(response) = self.decode_frame(&frame)? {
+                return Ok(Some(response));
+            }
+        }
+        Ok(None)
+    }
+
+    fn decode_frame(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Option<rs::Response>, xai_tool_runtime::ToolError> {
+        let text = std::str::from_utf8(frame).map_err(|_| invalid_codex_stream())?;
+        let data = text
+            .split(['\r', '\n'])
+            .filter_map(|line| line.strip_prefix("data:").map(|data| data.trim_start()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() {
+            return Ok(None);
+        }
+        if data == "[DONE]" {
+            return Err(invalid_codex_stream());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&data).map_err(|_| invalid_codex_stream())?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("response.output_item.done") => {
+                let event: rs::ResponseOutputItemDoneEvent =
+                    serde_json::from_value(value).map_err(|_| invalid_codex_stream())?;
+                self.done_output_items
+                    .insert(event.output_index, event.item);
+                Ok(None)
+            }
+            Some("response.completed") => {
+                let event: rs::ResponseCompletedEvent =
+                    serde_json::from_value(value).map_err(|_| invalid_codex_stream())?;
+                let mut response = event.response;
+                if response.status != rs::Status::Completed {
+                    return Err(invalid_codex_stream());
+                }
+                let mut output_items = response
+                    .output
+                    .drain(..)
+                    .enumerate()
+                    .map(|(index, item)| (index as u32, item))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                output_items.append(&mut self.done_output_items);
+                response.output = output_items.into_values().collect();
+                Ok(Some(response))
+            }
+            Some("response.failed") => {
+                Err(codex_stream_error("Responses API stream reported failure."))
+            }
+            Some("response.incomplete") => {
+                Err(codex_stream_error("Responses API stream ended incomplete."))
+            }
+            Some("error") => Err(codex_stream_error(
+                "Responses API stream reported an error.",
+            )),
+            Some(_) => Ok(None),
+            None => Err(invalid_codex_stream()),
+        }
+    }
+}
+
+#[cfg(test)]
+fn decode_codex_sse_response(body: &[u8]) -> Result<rs::Response, xai_tool_runtime::ToolError> {
+    CodexSseDecoder::default()
+        .push(body)?
+        .ok_or_else(invalid_codex_stream)
+}
+
+/// Extract `(title, url)` pairs from output-text annotations.
+///
+/// The `url` and `title` fields in `UrlCitationBody` are private, so serialize
+/// the body to access them without duplicating the upstream response types.
+fn extract_annotation_pairs(response: &rs::Response) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
     for output_item in &response.output {
         if let rs::OutputItem::Message(output_message) = output_item {
             for message_content in &output_message.content {
@@ -608,41 +827,12 @@ fn extract_citations(response: &rs::Response) -> Vec<String> {
                         if let rs::Annotation::UrlCitation(url_citation) = annotation
                             && let Ok(json) = serde_json::to_value(url_citation)
                             && let Some(url) = json.get("url").and_then(|v| v.as_str())
+                            && !url.is_empty()
                         {
-                            citations.push(url.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    citations.retain(|url| seen.insert(url.clone()));
-    citations
-}
-/// Extract `(title, url)` pairs from the Responses API annotations.
-///
-/// `title` may be an empty string when upstream doesn't supply one. URLs
-/// are deduplicated while preserving the first-seen order so the rendered
-/// `Links:` list is stable and free of duplicates.
-fn extract_citation_pairs(response: &rs::Response) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    for output_item in &response.output {
-        if let rs::OutputItem::Message(output_message) = output_item {
-            for message_content in &output_message.content {
-                if let rs::OutputMessageContent::OutputText(text_content) = message_content {
-                    for annotation in &text_content.annotations {
-                        if let rs::Annotation::UrlCitation(url_citation) = annotation
-                            && let Ok(json) = serde_json::to_value(url_citation)
-                        {
-                            let url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                            if url.is_empty() {
-                                continue;
-                            }
                             let title = json
                                 .get("title")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
                                 .to_string();
                             pairs.push((title, url.to_string()));
                         }
@@ -651,9 +841,93 @@ fn extract_citation_pairs(response: &rs::Response) -> Vec<(String, String)> {
             }
         }
     }
+    deduplicate_citation_pairs(pairs)
+}
+
+/// Extract source URLs requested through `web_search_call.action.sources`.
+///
+/// ChatGPT Codex does not emit output-text URL annotations on every successful
+/// web search. The structured action sources are the provenance-preserving
+/// fallback for those responses; unlike URLs in assistant text, these URLs are
+/// supplied by the web-search tool call itself.
+fn extract_web_search_source_pairs(response: &rs::Response) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for output_item in &response.output {
+        let rs::OutputItem::WebSearchCall(call) = output_item else {
+            continue;
+        };
+        if call.status == rs::WebSearchToolCallStatus::Completed
+            && let rs::WebSearchToolCallAction::Search(search) = &call.action
+            && let Some(sources) = &search.sources
+        {
+            pairs.extend(
+                sources
+                    .iter()
+                    .filter(|source| {
+                        url::Url::parse(&source.url).is_ok_and(|url| {
+                            matches!(url.scheme(), "http" | "https") && url.host().is_some()
+                        })
+                    })
+                    .map(|source| (String::new(), source.url.clone())),
+            );
+        }
+    }
+    let pairs = deduplicate_citation_pairs(pairs);
+    let content = response.output_text().unwrap_or_default();
+    let mentioned = pairs
+        .iter()
+        .filter(|(_title, url)| text_mentions_url(&content, url))
+        .cloned()
+        .collect::<Vec<_>>();
+    let relevant = if mentioned.is_empty() {
+        pairs
+    } else {
+        mentioned
+    };
+    relevant.into_iter().take(8).collect()
+}
+
+fn text_mentions_url(text: &str, url: &str) -> bool {
+    text.match_indices(url).any(|(index, _)| {
+        text[index + url.len()..].chars().next().is_none_or(|next| {
+            next.is_ascii_whitespace()
+                || matches!(
+                    next,
+                    ')' | ']' | '}' | '>' | ',' | '.' | ';' | ':' | '!' | '\'' | '"'
+                )
+        })
+    })
+}
+
+fn deduplicate_citation_pairs(mut pairs: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
-    pairs.retain(|(_t, url)| seen.insert(url.clone()));
+    pairs.retain(|(_title, url)| seen.insert(url.clone()));
     pairs
+}
+
+/// Extract citation URLs from the Response output items.
+///
+/// Prefer answer-span annotations. When the backend omits them, fall back to
+/// the explicitly requested web-search action sources.
+fn extract_citations(response: &rs::Response) -> Vec<String> {
+    extract_citation_pairs(response)
+        .into_iter()
+        .map(|(_title, url)| url)
+        .collect()
+}
+
+/// Extract `(title, url)` pairs from the Responses API provenance fields.
+///
+/// `title` may be an empty string when upstream doesn't supply one. URLs
+/// are deduplicated while preserving the first-seen order so the rendered
+/// `Links:` list is stable and free of duplicates.
+fn extract_citation_pairs(response: &rs::Response) -> Vec<(String, String)> {
+    let annotations = extract_annotation_pairs(response);
+    if annotations.is_empty() {
+        extract_web_search_source_pairs(response)
+    } else {
+        annotations
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1036,6 +1310,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn codex_internal_metadata_trust_is_origin_scoped_not_profile_scoped() {
+        assert!(accepts_codex_internal_metadata(CODEX_BASE_URL));
+        for base_url in [
+            "https://api.openai.com/v1",
+            "https://chatgpt.com.evil.example/backend-api/codex",
+            "https://evil.example/backend-api/codex",
+        ] {
+            assert!(
+                !accepts_codex_internal_metadata(base_url),
+                "untrusted Codex-compatible origin accepted identity metadata: {base_url}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn codex_web_search_uses_canonical_responses_endpoint_before_auth() {
         let client = WebSearchClient::new(
@@ -1151,8 +1440,142 @@ mod tests {
         })
     }
 
+    fn search_sse_from_response(mut terminal: serde_json::Value) -> String {
+        let items = terminal["output"]
+            .as_array()
+            .expect("test response output must be an array")
+            .clone();
+        let sequence_number = items.len() + 1;
+        terminal["output"] = serde_json::json!([]);
+        let item_done = items
+            .into_iter()
+            .enumerate()
+            .map(|(output_index, item)| {
+                let event = serde_json::json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": output_index + 1,
+                    "output_index": output_index,
+                    "item": item,
+                });
+                format!("event: response.output_item.done\r\ndata: {event}\r\n\r\n")
+            })
+            .collect::<String>();
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": sequence_number,
+            "response": terminal,
+        });
+        format!(
+            "{item_done}event: response.completed\r\ndata: {completed}\r\n\r\n\
+             data: [DONE]\r\n\r\n"
+        )
+    }
+
+    fn successful_search_sse(text: &str) -> String {
+        search_sse_from_response(successful_search_response(text))
+    }
+
+    fn partial_terminal_search_sse() -> String {
+        let terminal_item =
+            successful_search_response("stale terminal result")["output"][0].clone();
+        let completed_item =
+            successful_search_response("authoritative streamed result")["output"][0].clone();
+        let search_item = serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_reconciled",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "query",
+                "sources": [{"type": "url", "url": "https://example.com/reconciled"}]
+            }
+        });
+        let terminal = serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [terminal_item]
+        });
+        let done_one = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 1,
+            "output_index": 1,
+            "item": completed_item,
+        });
+        let done_zero = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": search_item,
+        });
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": terminal,
+        });
+        format!("data: {done_one}\r\n\r\ndata: {done_zero}\r\n\r\ndata: {completed}\r\n\r\n")
+    }
+
+    #[test]
+    fn codex_sse_backfills_done_items_from_empty_completed_terminal() {
+        let response =
+            decode_codex_sse_response(successful_search_sse("streamed result").as_bytes())
+                .expect("valid Codex SSE should decode");
+        assert_eq!(response.output_text().as_deref(), Some("streamed result"));
+        assert_eq!(response.output.len(), 1);
+    }
+
+    #[test]
+    fn codex_sse_reconciliation_retains_terminal_only_indices() {
+        let item = |text| successful_search_response(text)["output"][0].clone();
+        let terminal = serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [item("stale zero"), item("terminal-only one"), item("stale two")]
+        });
+        let done_two = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 1,
+            "output_index": 2,
+            "item": item("done two"),
+        });
+        let done_zero = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": item("done zero"),
+        });
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": terminal,
+        });
+        let body = format!("data: {done_two}\n\ndata: {done_zero}\n\ndata: {completed}\n\n");
+
+        let response = decode_codex_sse_response(body.as_bytes()).unwrap();
+        let texts = response
+            .output
+            .iter()
+            .map(|item| {
+                let rs::OutputItem::Message(message) = item else {
+                    panic!("expected output message");
+                };
+                let rs::OutputMessageContent::OutputText(text) = &message.content[0] else {
+                    panic!("expected output text");
+                };
+                text.text.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["done zero", "terminal-only one", "done two"]);
+    }
+
     #[tokio::test]
-    async fn codex_web_search_omits_unsupported_sampling_parameters() {
+    async fn codex_web_search_reconciles_partial_terminal_output_for_both_entry_points() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1161,7 +1584,130 @@ mod tests {
             .and(path("/responses"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(successful_search_response("codex result")),
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(partial_terminal_search_sse()),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&codex_config(&server.uri()), None).unwrap();
+
+        let (content, citations) = client.search("query", None).await.unwrap();
+        assert_eq!(content, "authoritative streamed result");
+        assert_eq!(citations, vec!["https://example.com/reconciled"]);
+
+        let (content, citation_pairs) = client.search_with_titles("query", None).await.unwrap();
+        assert_eq!(content, "authoritative streamed result");
+        assert_eq!(
+            citation_pairs,
+            vec![(String::new(), "https://example.com/reconciled".to_string())]
+        );
+    }
+
+    #[test]
+    fn codex_sse_decoder_returns_on_terminal_before_done_or_eof() {
+        let body = successful_search_sse("incremental result");
+        let mut decoder = CodexSseDecoder::default();
+        let mut terminal = None;
+        let mut consumed = 0;
+        for byte in body.as_bytes().chunks(1) {
+            consumed += byte.len();
+            if let Some(response) = decoder.push(byte).unwrap() {
+                terminal = Some(response);
+                break;
+            }
+        }
+        let response = terminal.expect("completed event should terminate the decoder");
+        assert_eq!(
+            response.output_text().as_deref(),
+            Some("incremental result")
+        );
+        assert!(
+            consumed < body.len(),
+            "decoder waited for the trailing [DONE] frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_returns_when_terminal_arrives_before_http_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = successful_search_sse("early terminal result");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket
+                .write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            let _ = release_rx.await;
+        });
+
+        let client =
+            WebSearchClient::new(&codex_config(&format!("http://{address}")), None).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.search("query", None),
+        )
+        .await
+        .expect("completed SSE must not wait for HTTP EOF")
+        .unwrap();
+        assert_eq!(result.0, "early terminal result");
+        let _ = release_tx.send(());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn codex_sse_terminal_failures_and_malformed_payloads_are_secret_safe() {
+        let secret = "provider-secret-payload-0123456789";
+        for body in [
+            format!("data: {{\"type\":\"response.failed\",\"message\":\"{secret}\"}}\n\n"),
+            format!("data: {{\"type\":\"response.incomplete\",\"message\":\"{secret}\"}}\n\n"),
+            format!("data: {{\"type\":\"error\",\"message\":\"{secret}\"}}\n\n"),
+            format!("data: {{\"type\":\"response.completed\",\"secret\":\"{secret}\"}}\n\n"),
+            format!("data: {secret}\n\n"),
+        ] {
+            let error = decode_codex_sse_response(body.as_bytes())
+                .expect_err("terminal failure or malformed SSE must fail")
+                .to_string();
+            assert_secret_absent(&error, secret);
+        }
+    }
+
+    #[test]
+    fn codex_sse_rejects_missing_terminal_and_oversized_body() {
+        let missing_terminal = b"data: {\"type\":\"response.queued\"}\n\n";
+        assert!(decode_codex_sse_response(missing_terminal).is_err());
+
+        let oversized = vec![b'x'; MAX_CODEX_SSE_BYTES + 1];
+        let error = decode_codex_sse_response(&oversized).unwrap_err();
+        assert!(error.to_string().contains("safe size limit"));
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_uses_streaming_chatgpt_request_shape_for_both_entry_points() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(successful_search_sse("codex result")),
             )
             .expect(2)
             .mount(&server)
@@ -1188,6 +1734,21 @@ mod tests {
         assert_eq!(requests.len(), 2);
         for request in requests {
             let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request.headers.get("accept").unwrap(), "text/event-stream");
+            assert!(
+                body["input"].is_array(),
+                "Codex input must be a list: {body}"
+            );
+            assert_eq!(body.get("stream"), Some(&serde_json::json!(true)));
+            assert_eq!(
+                body.get("include"),
+                Some(&serde_json::json!(["web_search_call.action.sources"])),
+                "Codex web search must request structured source provenance: {body}"
+            );
+            assert!(
+                body.get("max_output_tokens").is_none(),
+                "Codex request must omit max_output_tokens: {body}"
+            );
             assert!(
                 body.get("temperature").is_none(),
                 "Codex request must omit temperature: {body}"
@@ -1196,7 +1757,231 @@ mod tests {
                 body.get("top_p").is_none(),
                 "Codex request must omit top_p: {body}"
             );
+            assert!(
+                body["tools"][0].get("filters").is_none(),
+                "absent domain filters must be omitted: {body}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_preserves_explicit_domain_filter_intent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(successful_search_sse("codex result")),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&codex_config(&server.uri()), None).unwrap();
+        client.search("empty", Some(Vec::new())).await.unwrap();
+        client
+            .search("restricted", Some(vec!["example.com".to_string()]))
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let empty: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let restricted: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            empty["tools"][0]["filters"]["allowed_domains"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            restricted["tools"][0]["filters"]["allowed_domains"],
+            serde_json::json!(["example.com"])
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_extracts_streamed_citations_for_both_entry_points() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut response = successful_search_response("cited result");
+        response["output"][0]["content"][0]["annotations"] = serde_json::json!([{
+            "type": "url_citation",
+            "url": "https://example.com/source",
+            "title": "Example source",
+            "start_index": 0,
+            "end_index": 5
+        }]);
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(search_sse_from_response(response)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&codex_config(&server.uri()), None).unwrap();
+
+        let (content, citations) = client.search("query", None).await.unwrap();
+        assert_eq!(content, "cited result");
+        assert_eq!(citations, vec!["https://example.com/source"]);
+        let (content, citation_pairs) = client.search_with_titles("query", None).await.unwrap();
+        assert_eq!(content, "cited result");
+        assert_eq!(
+            citation_pairs,
+            vec![(
+                "Example source".to_string(),
+                "https://example.com/source".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_source_fallback_without_output_text_annotations() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut response = successful_search_response(
+            "sourced result https://example.com/source without annotations",
+        );
+        response["output"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "query",
+                    "sources": [
+                        {"type": "url", "url": "https://example.com/source"},
+                        {"type": "url", "url": "https://example.com/source"},
+                        {"type": "url", "url": "https://example.com/source/longer"},
+                        {"type": "url", "url": "https://example.com/unused"},
+                        {"type": "url", "url": "ftp://example.com/not-http"}
+                    ]
+                }
+            }),
+        );
+        response["output"][1]["content"][0]["annotations"] = serde_json::json!([{
+            "type": "url_citation",
+            "url": "",
+            "title": "Empty annotation must not suppress fallback",
+            "start_index": 0,
+            "end_index": 0
+        }]);
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(search_sse_from_response(response)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&codex_config(&server.uri()), None).unwrap();
+
+        let (content, citations) = client.search("query", None).await.unwrap();
+        assert_eq!(
+            content,
+            "sourced result https://example.com/source without annotations"
+        );
+        assert_eq!(citations, vec!["https://example.com/source"]);
+
+        let (content, citation_pairs) = client.search_with_titles("query", None).await.unwrap();
+        assert_eq!(
+            content,
+            "sourced result https://example.com/source without annotations"
+        );
+        assert_eq!(
+            citation_pairs,
+            vec![(String::new(), "https://example.com/source".to_string())]
+        );
+
+        let source_urls = (0..10)
+            .map(|index| format!("https://example.com/source-{index}"))
+            .collect::<Vec<_>>();
+        let mut bounded_response = successful_search_response(&source_urls.join(" "));
+        bounded_response["output"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_bounded",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "query",
+                    "sources": source_urls
+                        .iter()
+                        .map(|url| serde_json::json!({
+                            "type": "url",
+                            "url": url
+                        }))
+                        .collect::<Vec<_>>()
+                }
+            }),
+        );
+        let bounded_response = response_from_json(bounded_response);
+        let citations = extract_citations(&bounded_response);
+        assert_eq!(citations.len(), 8);
+        assert_eq!(citations.first().unwrap(), "https://example.com/source-0");
+        assert_eq!(citations.last().unwrap(), "https://example.com/source-7");
+    }
+
+    #[test]
+    fn codex_web_search_source_fallback_requires_completed_search_and_valid_http_url() {
+        let mut response = successful_search_response("structured fallback");
+        let output = response["output"].as_array_mut().unwrap();
+        for (id, status, url) in [
+            ("completed_https", "completed", "https://example.com/https"),
+            ("completed_http", "completed", "http://example.com/http"),
+            ("searching", "searching", "https://example.com/searching"),
+            ("failed", "failed", "https://example.com/failed"),
+            ("missing_host", "completed", "https://"),
+            ("malformed", "completed", "http://[invalid"),
+            ("non_http", "completed", "ftp://example.com/file"),
+        ] {
+            output.insert(
+                0,
+                serde_json::json!({
+                    "type": "web_search_call",
+                    "id": id,
+                    "status": status,
+                    "action": {
+                        "type": "search",
+                        "query": "query",
+                        "sources": [{"type": "url", "url": url}]
+                    }
+                }),
+            );
+        }
+        output.insert(
+            0,
+            serde_json::json!({
+                "type": "web_search_call",
+                "id": "completed_open_page",
+                "status": "completed",
+                "action": {
+                    "type": "open_page",
+                    "url": "https://example.com/opened"
+                }
+            }),
+        );
+
+        let citations = extract_citations(&response_from_json(response));
+        assert_eq!(
+            citations,
+            vec![
+                "http://example.com/http".to_string(),
+                "https://example.com/https".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1220,7 +2005,8 @@ mod tests {
                 .and(header("chatgpt-account-id", "fresh-codex-account"))
                 .respond_with(
                     ResponseTemplate::new(200)
-                        .set_body_json(successful_search_response("recovered result")),
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(successful_search_sse("recovered result")),
                 )
                 .expect(1)
                 .mount(&server)
@@ -1355,6 +2141,10 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("include").is_none(),
+            "generic Responses endpoints must not receive Codex-only include values: {body}"
+        );
         assert_eq!(body.get("temperature"), Some(&serde_json::json!(0.1)));
         assert_eq!(body.get("top_p"), Some(&serde_json::json!(0.95)));
         for name in ["chatgpt-account-id", "x-openai-fedramp", "originator"] {
@@ -1363,6 +2153,160 @@ mod tests {
                 "Codex-only routing header leaked to generic Responses: {name}"
             );
         }
+    }
+
+    const INTERNAL_WEB_SEARCH_METADATA: [&str; 14] = [
+        "chatgpt-account-id",
+        "x-openai-fedramp",
+        "originator",
+        "traceparent",
+        "tracestate",
+        "baggage",
+        "x-grok-conv-id",
+        "x-grok-client-identifier",
+        "x-grok-client-version",
+        "x-compactions-remaining",
+        "x-compaction-at",
+        "x-authenticateresponse",
+        "x-xai-token-auth",
+        "x-grok-user-id",
+    ];
+
+    /// Model switching and subagents both construct this same client from the
+    /// selected model's `WebSearchConfig`; prove the shared wire boundary strips
+    /// internal metadata after static, environment-backed, and dynamic auth
+    /// sources have all been applied.
+    #[tokio::test]
+    async fn external_web_search_strips_internal_metadata_at_final_wire_boundary() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer generic-key",
+            ))
+            .and(wiremock::matchers::header("x-provider-static", "kept"))
+            .and(wiremock::matchers::header("x-provider-env", "also-kept"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(successful_search_response("external result")),
+            )
+            .mount(&server)
+            .await;
+
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("stale-static-key".to_string()),
+            base_url: server.uri(),
+            model: "external-model".to_string(),
+            extra_headers: IndexMap::from([
+                ("x-provider-static".to_string(), "kept".to_string()),
+                (
+                    "chatgpt-account-id".to_string(),
+                    "static-account".to_string(),
+                ),
+                ("x-openai-fedramp".to_string(), "true".to_string()),
+                ("originator".to_string(), "codex_cli_rs".to_string()),
+                ("x-grok-conv-id".to_string(), "static-conv".to_string()),
+                ("x-xai-token-auth".to_string(), "static-auth".to_string()),
+                ("traceparent".to_string(), "static-trace".to_string()),
+                (
+                    "x-compactions-remaining".to_string(),
+                    "static-budget".to_string(),
+                ),
+            ]),
+            env_http_headers: IndexMap::from([
+                ("x-provider-env".to_string(), "PROVIDER_ENV".to_string()),
+                ("x-grok-client-version".to_string(), "GROK_ENV".to_string()),
+                ("tracestate".to_string(), "TRACE_ENV".to_string()),
+                ("baggage".to_string(), "BAGGAGE_ENV".to_string()),
+                ("x-compaction-at".to_string(), "COMPACTION_ENV".to_string()),
+                (
+                    "x-authenticateresponse".to_string(),
+                    "AUTH_RESPONSE_ENV".to_string(),
+                ),
+            ]),
+            alpha_test_key: None,
+            api_key_provider: Some(std::sync::Arc::new(GenericScopedProvider)),
+        };
+        let client = WebSearchClient::new_with_env_resolver(&config, None, |name| {
+            Some(
+                match name {
+                    "PROVIDER_ENV" => "also-kept",
+                    "GROK_ENV" => "env-version",
+                    "TRACE_ENV" => "env-trace",
+                    "BAGGAGE_ENV" => "env-baggage",
+                    "COMPACTION_ENV" => "env-compaction",
+                    "AUTH_RESPONSE_ENV" => "env-auth-response",
+                    unexpected => panic!("unexpected environment lookup: {unexpected}"),
+                }
+                .to_string(),
+            )
+        })
+        .expect("external client should build");
+
+        let (content, _) = client.search("query", None).await.expect("search succeeds");
+        assert_eq!(content, "external result");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        for name in INTERNAL_WEB_SEARCH_METADATA {
+            assert!(
+                requests[0].headers.get(name).is_none(),
+                "external web search received internal metadata: {name}={:?}",
+                requests[0].headers.get(name)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_xai_web_search_preserves_required_internal_headers() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .and(wiremock::matchers::header(
+                "x-grok-client-identifier",
+                "grok-shell",
+            ))
+            .and(wiremock::matchers::header(
+                "x-grok-client-version",
+                "trusted-version",
+            ))
+            .and(wiremock::matchers::header("traceparent", "trusted-trace"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(successful_search_response("trusted result")),
+            )
+            .mount(&server)
+            .await;
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("xai-key".to_string()),
+            base_url: "https://api.x.ai/v1".to_string(),
+            model: "grok-model".to_string(),
+            extra_headers: IndexMap::from([
+                (
+                    "x-grok-client-identifier".to_string(),
+                    "grok-shell".to_string(),
+                ),
+                (
+                    "x-grok-client-version".to_string(),
+                    "trusted-version".to_string(),
+                ),
+                ("traceparent".to_string(), "trusted-trace".to_string()),
+            ]),
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let mut client = WebSearchClient::new(&config, None).expect("xAI client should build");
+        assert!(client.sends_internal_metadata);
+        // Preserve the trust decision made from the production xAI endpoint,
+        // but route through the in-process receiver for a wire assertion.
+        client.base_url = server.uri();
+        let (content, _) = client
+            .search("query", None)
+            .await
+            .expect("trusted request should succeed");
+        assert_eq!(content, "trusted result");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
     /// When the dynamic provider returns `None`, the static `api_key`
     /// from config must still be sent as the Authorization header.
@@ -1738,24 +2682,12 @@ mod tests {
                 "user-agent",
                 format!("xai-grok-build/{}", xai_grok_version::VERSION),
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "resp_test",
-                "object": "response",
-                "created_at": 1234567890,
-                "status": "completed",
-                "model": "test-model",
-                "output": [{
-                    "type": "message",
-                    "id": "msg_1",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "provider scoped result",
-                        "annotations": []
-                    }]
-                }]
-            })))
+            .and(header("accept", "text/event-stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(successful_search_sse("provider scoped result")),
+            )
             .mount(&server)
             .await;
 

@@ -150,6 +150,52 @@ restricted_path() {
     IFS=:
   done
   IFS="$saved_ifs"
+  if [ "$exclude" = "curl" ] && ! command -v wget >/dev/null 2>&1; then
+    curl_bin=""
+    IFS=:
+    for entry in $PATH; do
+      IFS="$saved_ifs"
+      if [ -x "${entry}/curl" ]; then
+        curl_bin="${entry}/curl"
+        break
+      fi
+      IFS=:
+    done
+    IFS="$saved_ifs"
+    if [ -n "$curl_bin" ]; then
+      cat > "${dir}/wget" <<MOCKWGET
+#!/bin/sh
+out=""
+url=""
+server_resp=0
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -q|--quiet) shift ;;
+    -O|--output-document) out="\$2"; shift 2 ;;
+    --output-document=*) out="\${1#--output-document=}"; shift ;;
+    -O*) out="\${1#-O}"; shift ;;
+    --server-response) server_resp=1; shift ;;
+    --tries=*) shift ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+if [ "\$server_resp" = 1 ]; then
+  status_code="\$( "$curl_bin" --silent --location --output "\$out" --write-out '%{http_code}' "\$url" 2>/dev/null )" || exit 1
+  printf '  HTTP/1.1 %s OK\n' "\$status_code" >&2
+  if [ "\$status_code" -ge 400 ] || [ "\$status_code" -eq 0 ]; then
+    exit 1
+  fi
+else
+  if [ -n "\$out" ]; then
+    exec "$curl_bin" --fail --silent --show-error --location -o "\$out" "\$url"
+  else
+    exec "$curl_bin" --fail --silent --show-error --location "\$url"
+  fi
+fi
+MOCKWGET
+      chmod 755 "${dir}/wget"
+    fi
+  fi
   printf '%s\n' "$dir"
 }
 
@@ -208,6 +254,9 @@ DOWNLOADER_LABEL="${EXCLUDE_DOWNLOADER:+wget-only (curl hidden)}"
 echo "== installer cases (${TARGET}) ${DOWNLOADER_LABEL:-curl} =="
 
 # A release that exists installs, and the result is usable.
+# This is also the deterministic `/releases/latest` resolution case (#256):
+# the fixture answers 200 + tag_name, and the installer must pick that tag
+# without a live GitHub quota.
 run_case ok ok clean 0 'Checksum verified'
 if [ -x "${CASE_HOME}/.medley/bin/medley" ]; then
   ok "ok: the command is executable"

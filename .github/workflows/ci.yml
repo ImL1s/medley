@@ -22,6 +22,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Keep every Rust lane on the repository-pinned protobuf toolchain. Ubuntu
+  # ships protoc 21.12, which predates FieldOptions.debug_redact and cannot
+  # compile the upstream debug-redaction fixtures.
+  PROTOC: ${{ github.workspace }}/bin/protoc
 
 jobs:
   audit-publisher:
@@ -45,10 +49,25 @@ jobs:
       - name: Test the new-test filter guard
         run: python3 -B -m unittest tests.test_new_test_filter_guard -v
 
+      - name: Test the uncovered-crate ratchet
+        run: python3 -B -m unittest tests.test_uncovered_crates_guard -v
+
       - name: Test the PR-head CI receipt guard
         # This guard is a pre-merge local/orchestrator check; it does not run
         # as part of CI itself. CI only executes its Python unit tests.
         run: python3 -B -m unittest tests.test_pr_head_ci_run_guard -v
+
+      - name: Guard distChannel docs against the release stamp
+        run: python3 -B -m unittest tests.test_dist_channel_docs_guard -v
+
+      # Direct-mention scan: EnvGuard / std::env::{set_var,remove_var} in
+      # xai-grok-shell unit tests must carry unkeyed #[serial] (#319).
+      # Known stragglers are allowlisted; new hits and stale entries fail.
+      - name: Test the EnvGuard serial guard
+        run: python3 -B -m unittest tests.test_envguard_serial_guard -v
+
+      - name: Enforce EnvGuard tests are unkeyed #[serial]
+        run: python3 -B scripts/check_envguard_serial.py
 
   installer:
     name: Installer
@@ -79,11 +98,20 @@ jobs:
       # The fixture rewrites the GitHub hosts, so it cannot catch a mistake in
       # the real URLs — percent-encoding of `+` in a tag, say. One live install
       # covers exactly that, and nothing else does.
+      #
+      # Resolve the published tag with the job token. Anonymous
+      # /releases/latest shares a 60 req/h/IP budget across runners (#256).
+      # Pinning MEDLEY_VERSION still exercises download, checksums, extract,
+      # launcher, --version, and the ~/.grok assertion. Latest-lookup itself
+      # is covered by tests/installer/run_cases.sh `ok` / `no-release`.
       - name: Install the published release for real
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eux
           home="$(mktemp -d)"
-          HOME="$home" sh install.sh
+          MEDLEY_VERSION="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          HOME="$home" MEDLEY_VERSION="$MEDLEY_VERSION" sh install.sh
           HOME="$home" "$home/.medley/bin/medley" --version
           test ! -e "$home/.grok"
 
@@ -112,7 +140,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.93.0"
+          toolchain: "1.94.0"
           components: rustfmt
 
       - name: cargo fmt --check
@@ -137,6 +165,156 @@ jobs:
             --workflow .github/workflows/ci.yml \
             --base "origin/${{ github.base_ref || 'providers' }}"
 
+      # Crate-level complement of the diff-scoped guard above (issue #280).
+      # A crate with src/ tests that no `-p` names runs nowhere forever;
+      # #171 only sees newly added tests. No Rust toolchain: this reads
+      # Cargo.toml + src/**/*.rs + ci.yml against a checked-in allowlist.
+      - name: Every crate with tests is named or allowlisted
+        run: |
+          python3 scripts/check_uncovered_crates.py \
+            --workflow .github/workflows/ci.yml \
+            --allowlist tests/ci/uncovered-crates.allowlist
+
+  windows-session-publication:
+    name: Windows session publication
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+
+      - name: Install pinned protoc
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "protoc-29.3-win64.zip"
+          $protocRoot = Join-Path $env:RUNNER_TEMP "protoc"
+          $protoc = Join-Path $protocRoot "bin\protoc.exe"
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $expected = "57ea59e9f551ad8d71ffaa9b5cfbe0ca1f4e720972a1db7ec2d12ab44bff9383"
+          if ($actual -ne $expected) {
+            throw "protoc archive SHA-256 $actual did not match $expected"
+          }
+          Expand-Archive -Path $archive -DestinationPath $protocRoot
+          "PROTOC=$protoc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $protoc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: providers-windows-session-publication
+          cache-targets: true
+
+      - name: Native ACL and no-replace publication contracts
+        shell: pwsh
+        run: |
+          function Run-Nonzero {
+            param([string[]] $CargoArgs)
+            $log = New-TemporaryFile
+            & cargo test @CargoArgs 2>&1 | Tee-Object -FilePath $log
+            if ($LASTEXITCODE -ne 0) {
+              throw "cargo test failed: cargo test $($CargoArgs -join ' ')"
+            }
+            if ((Get-Content -Raw $log) -match 'test result: ok\. 0 passed') {
+              throw "filter matched zero tests: cargo test $($CargoArgs -join ' ')"
+            }
+          }
+          Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'ensure_owner_only_directory_', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'windows_retained_handle_survives_root_rename_and_replacement_by_identity', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'windows_child_creation_and_no_replace_are_handle_relative', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'windows_retained_tree_removal_does_not_follow_junctions', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'windows_open_root_and_child_reject_reparse_points', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'windows_owner_only_lock_file_', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'failed_retained_rename_returns_the_live_source_anchor', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'codex_windows_last_scope_clear_replaces_with_empty_store', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'fresh_claim_does_not_follow_staging_junctions', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'relative_auth_path_parent_sync_uses_current_directory', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'nested_relative_auth_parent_creation_is_durable_and_isolated', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'no_replace_', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'final_publication_moves_private_stage_and_rebinds_storage_path', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'final_publication_collision_is_not_committed', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'stale_public_marker_is_preserved_', '--', '--nocapture')
+
+  macos-session-publication:
+    name: macOS session publication
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+
+      - name: Install DotSlash and verify pinned protoc
+        run: |
+          cargo install dotslash --version 0.5.7 --locked
+          /usr/bin/env dotslash --help >/dev/null
+          "$PROTOC" --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: providers-macos-session-publication
+          cache-targets: true
+
+      - name: Anchored publication contracts
+        run: |
+          set -o pipefail
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell-base --lib anchored_directory:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib no_replace_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib final_publication_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            symlinked_cwd_parent_without_touching_outside_tree -- --nocapture
+
+  compile-tests:
+    name: Compile every test target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+
+      - name: Install DotSlash and verify pinned protoc
+        run: |
+          cargo install dotslash --version 0.5.7 --locked
+          /usr/bin/env dotslash --help >/dev/null
+          "$PROTOC" --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: providers-compile-tests
+          cache-targets: true
+
+      # #254: thirteen pager integration targets (and any other crate's tests)
+      # are never named by a hot-path filter. Compiling them without running
+      # is what catches a renamed type after an upstream sync.
+      - name: cargo test --workspace --no-run
+        run: cargo test --workspace --no-run
+
   lint:
     name: Clippy (hot path)
     runs-on: ubuntu-latest
@@ -146,11 +324,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.93.0"
+          toolchain: "1.94.0"
           components: clippy
 
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install DotSlash and verify pinned protoc
+        run: |
+          cargo install dotslash --version 0.5.7 --locked
+          /usr/bin/env dotslash --help >/dev/null
+          "$PROTOC" --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -158,12 +339,10 @@ jobs:
           shared-key: providers-lint
           cache-targets: true
 
-      - name: Clippy sampler / shell / pager / pager-bin (all targets)
-        env:
-          PROTOC: protoc
+      - name: Clippy sampler / shell / tools / pager / pager-bin (all targets)
         run: |
-          # Measured 2026-08-07 on providers (#194): `--all-targets` on these
-          # four crates is clean after fixing the handful of test/bench lints
+          # Measured 2026-08-09 on providers (#275): `--all-targets` on these
+          # five crates is clean after fixing the handful of test/bench lints
           # (see the PR). No `-A` allow-list — that would re-open the blind
           # spot this job is meant to close. Full-workspace clippy remains
           # too slow; we stay on the hot-path crates only.
@@ -172,6 +351,8 @@ jobs:
           # that is how `.err().expect()` lived green in CI since 5c8144e.
           cargo clippy --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --all-targets -- -D warnings
+          # Include the opt-in PI backend so its test-only environment lock is linted too.
+          cargo clippy --manifest-path crates/codegen/xai-grok-tools/Cargo.toml --all-targets --features pi -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-pager-bin/Cargo.toml --all-targets -- -D warnings
 
@@ -184,10 +365,21 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.93.0"
+          toolchain: "1.94.0"
 
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # `ripgrep` is a runtime dependency of the grep tool, not a convenience:
+      # `rg_path()` falls back to a bare `rg` on PATH when the crate is built
+      # without `bundle_rg`, and a failed spawn surfaces as exit code -1 with
+      # empty output. This job never needed it until the upstream sync brought
+      # the `implementations::` filter that runs those tests, at which point 44
+      # of them failed here and passed on a developer machine — because
+      # developer machines have `rg`.
+      - name: Install DotSlash and ripgrep
+        run: |
+          sudo apt-get update && sudo apt-get install -y ripgrep
+          cargo install dotslash --version 0.5.7 --locked
+          /usr/bin/env dotslash --help >/dev/null
+          "$PROTOC" --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -195,32 +387,147 @@ jobs:
           shared-key: providers-test
           cache-targets: true
 
-      - name: Sampler auth / wire tests
-        env:
-          PROTOC: protoc
+      # #343: temp-store fixtures must bind to their requested path even when
+      # the caller already has an ambient auth override. Run both fixture-heavy
+      # modules with the normal libtest parallelism so process-wide env leakage
+      # cannot hide behind a serial harness.
+      - name: Codex auth fixtures ignore hostile ambient auth path
         run: |
-          cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \
-            --test shared_http_wire none_auth_scheme_ -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \
-            none_scheme_ -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \
-            hostile_injector -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \
-            omits_xai_identity -- --nocapture
+          set -o pipefail
+          umask 077
+          hostile_auth_dir="$(mktemp -d "${TMPDIR:-/tmp}/medley-hostile-auth.XXXXXX")"
+          hostile_auth="$hostile_auth_dir/auth.json"
+          test_output=""
+          cleanup() {
+            if [ -n "$test_output" ]; then
+              rm -f "$test_output" 2>/dev/null || true
+            fi
+            rm -f "$hostile_auth" 2>/dev/null || true
+            rmdir "$hostile_auth_dir" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          chmod 700 "$hostile_auth_dir"
+          printf '%s\n' '{}' >"$hostile_auth"
+          chmod 600 "$hostile_auth"
+          export GROK_AUTH_PATH="$hostile_auth"
+
+          run_nonzero() {
+            test_output="$(mktemp "$hostile_auth_dir/test-output.XXXXXX")"
+            cargo test "$@" 2>&1 | tee "$test_output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then
+              rm -f "$test_output"
+              test_output=""
+              return "$status"
+            fi
+            if grep -qE '^test result: ok\. 0 passed' "$test_output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$test_output"
+              test_output=""
+              return 1
+            fi
+            rm -f "$test_output"
+            test_output=""
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            auth::openai_codex::tests:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            auth::manager::tests:: -- --nocapture
+
+      # #361: parser and auth-store unit tests cannot prove that the shipped
+      # composition root dispatches the selected provider to Codex logout.
+      - name: Provider-scoped Codex logout dispatch
+        run: |
+          set -o pipefail
+          output="$(mktemp)"
+          cargo test --locked -p xai-grok-pager-bin \
+            --test auth_logout_dispatch \
+            openai_codex_logout_dispatch_removes_only_medleys_provider_scope_without_network \
+            -- --exact --nocapture 2>&1 | tee "$output"
+          status="${PIPESTATUS[0]}"
+          if [ "$status" -ne 0 ]; then rm -f "$output"; exit "$status"; fi
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' "$output"; then
+            echo "::error::Codex logout dispatch must run exactly one passing test"
+            rm -f "$output"; exit 1
+          fi
+          rm -f "$output"
+
+      # #363: the PKCE/callback/exchange/storage pieces are individually tested,
+      # but the release gate must keep the complete Codex login flow selected.
+      - name: Codex OAuth login persistence
+        run: |
+          set -o pipefail
+          output="$(mktemp)"
+          cargo test --locked -p xai-grok-shell --lib \
+            auth::openai_codex::tests::full_login_flow_persists_provider_scoped_codex_credential \
+            -- --exact --nocapture 2>&1 | tee "$output"
+          status="${PIPESTATUS[0]}"
+          if [ "$status" -ne 0 ]; then rm -f "$output"; exit "$status"; fi
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' "$output"; then
+            echo "::error::Codex OAuth login filter did not match exactly one passing test"
+            rm -f "$output"; exit 1
+          fi
+          rm -f "$output"
+
+      # #356: the unit fixtures prove private staging in-process, but only the
+      # production binary crosses config loading, auth-provider minting,
+      # session publication, and the first authenticated Responses request.
+      # Keep this exact ignored test in CI so a broad lib filter cannot report
+      # green while never executing the binary-level contract.
+      - name: Codex provider prompt publishes one complete session tree
+        env:
+          GROK_BINARY: ${{ github.workspace }}/target/debug/xai-grok-pager
+        run: |
+          set -o pipefail
+          cargo build --locked -p xai-grok-pager-bin
+          output="$(mktemp)"
+          cargo test --locked -p xai-grok-shell --test test_auth_provider_e2e \
+            codex_provider_prompt_publishes_one_complete_session_tree \
+            -- --ignored --nocapture 2>&1 | tee "$output"
+          status="${PIPESTATUS[0]}"
+          if [ "$status" -ne 0 ]; then rm -f "$output"; exit "$status"; fi
+          if grep -qE '^test result: ok\. 0 passed' "$output"; then
+            echo "::error::Codex publication E2E filter matched zero tests"
+            rm -f "$output"; exit 1
+          fi
+          rm -f "$output"
+
+      - name: Sampler auth / wire tests
+        run: |
+          set -o pipefail
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-sampler --test shared_http_wire \
+            none_auth_scheme_ -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib none_scheme_ -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib hostile_injector -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib omits_xai_identity -- --nocapture
 
       - name: Credential relation and telemetry export guards
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture
@@ -242,6 +549,16 @@ jobs:
             codex_wire_capabilities_omit_reasoning_summary_when_unsupported -- --nocapture
           run_nonzero -p xai-grok-sampling-types --lib \
             codex_wire_capabilities_keep_summary_when_catalog_allows_or_is_silent -- --nocapture
+          # #263: the catalog parser and the single chat-state mutation must
+          # both run; xai-chat-state previously had no CI filter (#280).
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_reads_and_validates_truncation_policy -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            tool_result_truncation_policy_catalog_refresh_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            trusted_reminder_suffix_ -- --nocapture
+          run_nonzero -p xai-chat-state --lib \
+            tool_result_truncation_policy -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
             final_relation_observes_hostile_injector_replacement_and_removal -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
@@ -252,6 +569,26 @@ jobs:
             transport_failure_never_emits_query_credential_bytes -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
             provider_controlled_stream_error_is_secret_free_for_all_stream_apis -- --nocapture
+          # Codex Responses wire invariants are release gates, not incidental
+          # coverage. Keep exact filters so removal or renaming fails closed.
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_transport_normalizes_endpoint_and_isolates_live_headers -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_defaults_enable_parallel_tools_without_overriding_explicit_choice -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_transport_rejects_non_allowlisted_origins_and_query_params -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_mock_request_has_exact_path_and_no_xai_extensions -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_sends_the_prompt_cache_key_the_predicate_promises -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_401_reports_actual_live_request_credential_relation_without_secrets -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_empty_terminal_output_backfills_from_item_done -- --nocapture
+          # #304: Codex sometimes omits answer-span annotations. This proves
+          # authoritative streamed items survive partial terminal output.
+          run_nonzero -p xai-grok-tools --lib \
+            codex_web_search_reconciles_partial_terminal_output_for_both_entry_points -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_errors_never_echo_provider_controlled_credentials -- --nocapture
           # #151: an unlabelled chat-state credential reaching an external origin
@@ -266,6 +603,11 @@ jobs:
           # tells them apart.
           run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
           run_nonzero -p xai-grok-shell --lib test_catalog_auth_schemes_and_override -- --nocapture
+          # #329: keyless local mock fixtures stay ready; start() stays Bearer.
+          run_nonzero -p xai-grok-test-support --lib \
+            keyless_local_server_catalog_emits_auth_scheme_none -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            keyless_local_mock_catalog_entry_is_ready_on_loopback -- --nocapture
           # #132: the reader's dup must not be inherited by children. Named
           # explicitly rather than by a `pty_session` prefix: the rest of that
           # module is the hang this change fixes, and this one is the fd leak
@@ -297,20 +639,21 @@ jobs:
             final_401_relation_uses_final_wire_credential_and_post_response_snapshot -- --nocapture
           run_nonzero -p xai-file-utils --lib \
             upload_config_debug_redacts_all_secret_carriers -- --nocapture
+          run_nonzero -p xai-file-utils --lib \
+            git_ancestor_does_not_override_excluded_component -- --nocapture
 
       - name: Provider docs examples and fixtures
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           # #31: validate executable provider docs. Unique filters so
@@ -330,18 +673,17 @@ jobs:
         # (issue #71). The release workflow trusts this job, and it only checks
         # that the distribution marker is present in the shipped binary — these
         # are what prove the marker actually stops an update.
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-update --lib dist_channel -- --nocapture
@@ -361,35 +703,65 @@ jobs:
         # run_nonzero fails on a zero-match filter, so this also catches the
         # test later being renamed, moved, or cfg'd out — the exact way it
         # silently stopped being covered before.
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib holder_has_lock_file_open -- --nocapture
 
-      - name: Restricted subagent capability boundaries
-        env:
-          PROTOC: protoc
+      - name: Codex Ultra client and wire contracts
+        # #357: Ultra is a client orchestration tier that must lower to the
+        # provider-supported `max` wire value. Keep each boundary named in full
+        # so an unrelated Codex or Responses test cannot make this lane green.
         run: |
           run_nonzero() {
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_ultra_preparation_preserves_max_wire_effort_and_injects_marker_once -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_non_ultra_preparation_does_not_inject_proactive_marker -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            generic_responses_never_receive_codex_ultra_proactive_marker -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            test_typed_response_max_reasoning_effort_stamped_on_assistant_as_max -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            test_response_wrapper_keeps_client_ultra_separate_from_typed_max -- --nocapture
+          # #360: `/new` must use the same implicit built-in effort menu as
+          # model switching when support is explicit but the catalog list is empty.
+          run_nonzero -p xai-grok-shell --lib \
+            prepared_new_session_plan_preserves_selected_effort_with_implicit_menu -- --nocapture
+
+      - name: Restricted subagent capability boundaries
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-tools --lib \
@@ -404,6 +776,12 @@ jobs:
           # matched the steady-state cases would go green on those alone.
           run_nonzero -p xai-grok-tools --lib \
             first_party_declared_authorization_header_survives_mid_session_login -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            tool_result_truncation_policy_runner_records_trusted_suffix_provenance -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            structured_completion_reminders_carry_every_producer_id -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            tool_result_truncation_policy_proxy_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             restricted_gateway_snapshot_exposes_only_trusted_permitted_tools_per_session -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -418,6 +796,39 @@ jobs:
             issue14_spawn_refresh_replaces_stale_parent_capabilities -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue14_spawn_refresh_parent_actor_unavailable_is_actionable_error -- --nocapture
+          run_nonzero -p xai-chat-state --lib \
+            prepared_model_state_never_tears_routing_from_credentials -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            keeps_endpoint_and_bound_secret_when_name_collides_with_an_external_model -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            empty_catalog_keeps_persisted_identity_pending_instead_of_rejecting_load -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            prompt_recovery_rejects_a_remapped_model_with_an_incompatible_harness -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            identity_backed_prompt_recovery_requires_persisted_harness_evidence -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            cold_spawn_reconciled_route_rejects_incompatible_harness -- --nocapture
+          # #300: an inherited Codex child resumes the already-admitted tuple;
+          # durable legacy lineage is reconciled before migration, route/harness
+          # drift still fails closed, and fresh overrides still preflight.
+          run_nonzero -p xai-grok-subagent-resolution --lib \
+            resume::tests -- --nocapture
+          run_nonzero -p xai-grok-subagent-resolution --lib \
+            native_route:: -- --nocapture
+          run_nonzero -p xai-grok-agent --lib \
+            from_json_rejects_empty_models_entry -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            format_agent_detail -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            resume_model_lineage_tests -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            durable_legacy_resume_ -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            completed_resume_source_carries_committed_model_lineage -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            pre_promotion_failure_does_not_mask_durable_resume_fallback -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -454,21 +865,302 @@ jobs:
             unrestricted_generation_guard_rejects_reused_session_id -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             drop_cleanup_clears_old_generation_resources_written_in_flight -- --nocapture
+          run_nonzero -p xai-circuit-breaker --lib \
+            edge_client_retries_transient_edge_codes_but_not_origin_tls -- --nocapture
+          run_nonzero -p xai-sqlite-journal --lib \
+            apply_with_retry -- --nocapture
+          run_nonzero -p xai-tty-utils --lib \
+            git_command_locking -- --nocapture
+          run_nonzero -p xai-tool-types --lib \
+            background_spawn_notice_keeps_poll_hint_and_open_parent_work -- --nocapture
+          run_nonzero -p xai-tool-types --lib \
+            continue_parent_work_detects_prior_exec_and_skips_review_only -- --nocapture
+          run_nonzero -p xai-computer-hub-sdk --lib \
+            connection:: -- --nocapture
+          run_nonzero -p xai-computer-hub-sdk --lib \
+            server:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::auto_mode:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::manager:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::prompter:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::types:: -- --nocapture
+          # Upstream moved these tests into an external `restore_fetch_tests.rs`
+          # via `#[path = "restore_fetch_tests.rs"] mod tests;` — the *file* was
+          # renamed, the module path was not, and a filter naming the file
+          # matched nothing. `run_nonzero` is what noticed.
+          #
+          # It stops at `restore_fetch::` rather than `restore_fetch::tests::`
+          # so that both readers agree. Cargo selects the same tests either way,
+          # but the #171 guard approximates a module path by turning `::` into
+          # `/` and looking for it in the file path, which cannot see through
+          # `#[path]`: it would look for `restore_fetch/tests` in a file called
+          # `restore_fetch_tests.rs` and report every test here as running
+          # nowhere. `restore_fetch::` is a substring of both.
+          run_nonzero -p xai-grok-workspace --lib \
+            restore_fetch:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            session::git:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            workspace_ops:: -- --nocapture
+          # Session publication is intentionally side-effect free until the
+          # final gate opens. Keep every deferred subsystem on the hot-path
+          # lane so a renamed filter cannot silently drop this contract.
+          run_nonzero -p xai-grok-memory --lib \
+            deferred_watcher_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            deferred_relay_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            dropping_pending_relay_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            notification_bridge_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            acknowledged_removal_queued_before_abort_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            published_write_post_commit_sync_failure_preserves_visible_directory -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            published_copy_post_commit_sync_failure_preserves_visible_target -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            aborted_fresh_publication_drops_queued_mutations_and_sync_side_effects -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            remote_pull_publication_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            fetched_session_rejects_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            extensions::session_state:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            symlinked_cwd_parent_without_touching_outside_tree -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            stale_public_marker_is_preserved_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            no_replace_ -- --nocapture
+          run_nonzero -p xai-hunk-tracker --lib \
+            gated_spawn_cancelled_before_readiness_ -- --nocapture
+          # `xai-fast-worktree` has no default features and its `db` module is
+          # gated on `metadata`, so without this the filter compiles a crate
+          # that contains none of the tests it names.
+          run_nonzero -p xai-fast-worktree --features metadata --lib \
+            db::tests:: -- --nocapture
+          run_nonzero -p xai-file-utils --lib \
+            storage_client:: -- --nocapture
+          run_nonzero -p xai-grok-shell-base --lib \
+            ensure_owner_only_directory_ -- --nocapture
+          run_nonzero -p xai-grok-shell-base --lib \
+            anchored_directory:: -- --nocapture
+          run_nonzero -p xai-grok-auth --lib \
+            bearer_fragment:: -- --nocapture
+          run_nonzero -p xai-grok-markdown --lib \
+            render:: -- --nocapture
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            cache_ -- --nocapture
+          run_nonzero -p xai-grok-pager-render --lib \
+            terminal::tmux:: -- --nocapture
+          run_nonzero -p xai-grok-pager-render --lib \
+            theme:: -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            retry:: -- --nocapture
+          # `--test <target>` is already the restriction. The positional that
+          # used to follow named the *target* again, and an integration test's
+          # target name is not a module inside it -- these seven live at the
+          # binary's root, so `cf_edge_error_message::` selected none of them.
+          run_nonzero -p xai-grok-sampler --test cf_edge_error_message -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            error:: -- --nocapture
+          run_nonzero -p xai-grok-sandbox --lib \
+            deny::glob:: -- --nocapture
+          run_nonzero -p xai-grok-shared --lib \
+            ui_config:: -- --nocapture
+          run_nonzero -p xai-grok-telemetry --lib \
+            events:: -- --nocapture
+          run_nonzero -p xai-grok-telemetry --lib \
+            external:: -- --nocapture
+          run_nonzero -p xai-grok-telemetry --lib \
+            startup:: -- --nocapture
+          run_nonzero -p xai-grok-test-support --lib \
+            resources:: -- --nocapture
+          # #296: loopback PTY model fixtures must explicitly opt out of auth;
+          # otherwise credential-origin hardening correctly makes them unready.
+          run_nonzero -p xai-grok-test-support --lib \
+            mock_model_emits_explicit_auth_scheme -- --nocapture
+          run_nonzero -p xai-grok-pager-pty-harness --lib \
+            replacement_models_keep_keyless_loopback_default -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            unresolved_empty_current_model_uses_live_fail_closed_sampling_config -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            implementations:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            registry:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            types:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            util:: -- --nocapture
+          run_nonzero -p xai-grok-workspace-types --lib \
+            rpc::repos:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::activity:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::app:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::auth_method:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::chat_modes:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::config:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::config_model_override_parse:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::docs_examples_tests:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::ext_parsers:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::feedback_client:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::folder_trust:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::handlers:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::model_providers:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::models:: -- --nocapture
+          # EnvGuard tests in this module are #[serial], but sibling tests still
+          # mutate GROK_HOME / XAI_API_KEY in parallel and steal their isolation.
+          run_nonzero -p xai-grok-shell --lib \
+            agent::mvp_agent:: -- --nocapture --test-threads=1
+          run_nonzero -p xai-grok-shell --lib \
+            agent::otel_gate:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::proxy:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::relay:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::restore_code:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::roster:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::server:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::session_config:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::session_registry_client:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::storage_client_tests:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::subagent:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::subscription_check:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::update_chunk_merge:: -- --nocapture
+          # Auth-provider tests spawn credential-helper subprocesses. Keep them
+          # parallel, but bound libtest fan-out so host pressure cannot turn an
+          # unrelated helper's first mint into a resource-exhaustion flake.
+          run_nonzero -p xai-grok-shell --lib \
+            auth:: -- --nocapture --test-threads=4
+          # Codex fixtures previously changed GROK_AUTH_PATH process-wide.
+          # Keep this broad filter on the default parallel harness: serial-only
+          # execution masks cross-module auth-store contamination (#343).
+          run_nonzero -p xai-grok-shell --lib \
+            codex_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            config:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            inspect:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            leader:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            managed_config:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            sampling:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            util:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            app:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            disk_usage_cmd:: -- --nocapture
+          # `xai-grok-config` had no filter at all, so every test in it ran
+          # nowhere. `display::` owns the state-directory label rules, which
+          # is exactly the fork behaviour a sync is most likely to break --
+          # `disk_usage_cmd::` above is one of its callers, and it caught a
+          # regression here that this crate's own tests could not report.
+          run_nonzero -p xai-grok-config --lib \
+            display:: -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
+            validation:: -- --nocapture
+          # Same `#[path]` move as `restore_fetch::` above, and stopped one
+          # segment short for the same reason: the file is `fs_size_tests.rs`,
+          # the module is `fs_size::tests`, and only `fs_size::` is a substring
+          # of both. This filter named the file and matched zero tests — which
+          # `run_nonzero` catches, while the #171 guard called the same line
+          # covered. Wrong in both directions at once.
+          run_nonzero -p xai-grok-pager --lib \
+            fs_size:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            headless:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            input:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            notifications:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            pty_wrap:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            scrollback:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            settings:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            slash:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            views:: -- --nocapture
+          # Same shape as `cf_edge_error_message` above: the positional repeated
+          # the target name, which is not a module path inside the binary.
+          run_nonzero -p xai-grok-pager --test grok_home_paths -- --nocapture
+          run_nonzero -p xai-grok-pager --test signal_errno_preservation -- --nocapture
+          run_nonzero -p xai-grok-pager --test settings_e2e -- --nocapture
+          run_nonzero -p xai-grok-shell --test acp_session_setup_wire \
+            acp_session_setup_conformance -- --nocapture
+          run_nonzero -p xai-grok-sandbox --lib \
+            resolve_failure_refuses_for_deny_carrying_devbox_extends -- --nocapture
+          run_nonzero -p xai-grok-sandbox --lib \
+            bwrap_reexec_for_profile_skips_plan_inside_bwrap -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            terminal::local_terminal:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            acp:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            actions:: -- --nocapture
+          # This one was wrong twice. `--test pty_e2e` names a target that does
+          # not exist -- upstream splits the PTY suites into `pty_e2e_smoke`,
+          # `_queue`, `_minimal`, `_config_ui` and so on, each an explicit
+          # `[[test]]` entry, and `tests/pty_e2e/` has no `main.rs` to make the
+          # directory one. `cargo test` errors out rather than reporting a
+          # count, so this never even reached the zero-match check. And the
+          # positional selected nothing in the target that *does* exist: those
+          # cases sit under `minimal::`, not `pty_e2e::`.
+          #
+          # 30 of the 31 are `#[ignore]`d without `PAGER_BINARY`, so what this
+          # buys is the target compiling plus its one runnable case -- which is
+          # the whole value, since a broken PTY harness fails to build.
+          run_nonzero -p xai-grok-pager --test pty_e2e_minimal -- --nocapture
+          # `pty_e2e_queue` was named by nothing. It only became visible once
+          # the #171 guard stopped agreeing with `--test pty_e2e` -- the two
+          # readers were wrong together, so neither reported it.
+          run_nonzero -p xai-grok-pager --test pty_e2e_queue -- --nocapture
 
       - name: Agent serve exposure and authentication
-        env:
-          PROTOC: protoc
         run: |
           set -o pipefail
           run_nonzero() {
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib \
@@ -505,19 +1197,18 @@ jobs:
         # so without this step these tests would run nowhere. `run_nonzero`
         # fails on a zero-match filter, so renaming them breaks CI loudly
         # instead of silently dropping the coverage.
-        env:
-          PROTOC: protoc
         run: |
           set -o pipefail
           run_nonzero() {
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
@@ -530,23 +1221,12 @@ jobs:
             leader::lock::tests::reclaim -- --nocapture
 
       - name: Shell auth + readiness meta
-        env:
-          PROTOC: protoc
         run: |
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            none_auth_scheme -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            acp_model_meta_ -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            agent::auth_method -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            config_model_override_parse -- --nocapture
-          # #13: env_key trim/validate/dedupe + path-specific invalid-name warnings.
-          # Unique prefixes so run_nonzero proves the new tests are selected.
+          set -o pipefail
           run_nonzero() {
             local output
             output="$(mktemp)"
-            cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml "$@" 2>&1 | tee "$output"
+            cargo test "$@" 2>&1 | tee "$output"
             local status="${PIPESTATUS[0]}"
             if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
             if grep -qE '^test result: ok\. 0 passed' "$output"; then
@@ -555,47 +1235,43 @@ jobs:
             fi
             rm -f "$output"
           }
-          run_nonzero --lib env_keys_normalize_ -- --nocapture
-          run_nonzero --lib env_keys_diagnostics_show_normalized_names_only -- --nocapture
-          run_nonzero --lib env_keys_invalid_entry_emits_path_specific_config_warning -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            read_parent_sampling_config_ -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            handle_set_session_model_clears_credentials_for_none -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            catalog_key -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            auth_scheme -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            sampling_config_for_unready -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            credential_header -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            invalid_auth_scheme -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            relation_matrix_is_secret_free -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            callback_errors_never_echo_provider_controlled_values -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
-            snapshot_never_derives_stable_ids_from_credentials -- --nocapture
+          run_nonzero -p xai-grok-shell --lib none_auth_scheme -- --nocapture
+          run_nonzero -p xai-grok-shell --lib acp_model_meta_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib agent::auth_method -- --nocapture
+          run_nonzero -p xai-grok-shell --lib config_model_override_parse -- --nocapture
+          run_nonzero -p xai-grok-shell --lib model_overrides_ -- --nocapture
+          # #13: env_key trim/validate/dedupe + path-specific invalid-name warnings.
+          # Unique prefixes so run_nonzero proves the new tests are selected.
+          run_nonzero -p xai-grok-shell --lib env_keys_normalize_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib env_keys_diagnostics_show_normalized_names_only -- --nocapture
+          run_nonzero -p xai-grok-shell --lib env_keys_invalid_entry_emits_path_specific_config_warning -- --nocapture
+          run_nonzero -p xai-grok-shell --lib read_parent_sampling_config_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib handle_set_session_model_clears_credentials_for_none -- --nocapture
+          run_nonzero -p xai-grok-shell --lib catalog_key -- --nocapture
+          run_nonzero -p xai-grok-shell --lib auth_scheme -- --nocapture
+          run_nonzero -p xai-grok-shell --lib sampling_config_for_unready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib credential_header -- --nocapture
+          run_nonzero -p xai-grok-shell --lib invalid_auth_scheme -- --nocapture
+          run_nonzero -p xai-grok-shell --lib relation_matrix_is_secret_free -- --nocapture
+          run_nonzero -p xai-grok-shell --lib callback_errors_never_echo_provider_controlled_values -- --nocapture
+          run_nonzero -p xai-grok-shell --lib snapshot_never_derives_stable_ids_from_credentials -- --nocapture
           # #132: CLOEXEC regression guard; full test path keeps the filter
           # unique so #171 can prove this exact test is selected.
-          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+          run_nonzero -p xai-grok-shell --lib \
             terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child -- --nocapture
 
       - name: "Substituted default model meta (#131)"
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib \
@@ -622,33 +1298,40 @@ jobs:
             warm_cache_refresh_does_not_reseat_over_user_model_pick -- --nocapture
 
       - name: Pager model picker / readiness
-        env:
-          PROTOC: protoc
         run: |
-          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
-            slash::commands::model:: -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
-            hard_blocks_ -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
-            catalog_miss -- --nocapture
-          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
-            toctou -- --nocapture
+          set -o pipefail
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-pager --lib slash::commands::model:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib hard_blocks_ -- --nocapture
+          run_nonzero -p xai-grok-pager --lib catalog_miss -- --nocapture
+          run_nonzero -p xai-grok-pager --lib toctou -- --nocapture
           # The three tests this change fixes matched none of the filters
           # above, so registering their models bought nothing: they ran in no
           # job at all (#171). This selects them and the six sibling
           # deferred-switch tests, which belong to this step by subject and
           # were equally unrun.
-          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+          run_nonzero -p xai-grok-pager --lib \
             deferred_switch_ -- --nocapture
           # #11: the two persist-failure mirrors. These live in the pager's
           # dispatch, not the shell -- the issue is about model persistence and
           # the tests are about what the pager mirrors after a failed write.
-          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+          run_nonzero -p xai-grok-pager --lib \
             preferred_model_persist_failure -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            refresh_open_settings_modals_exits_dynamic_picker_when_highlighted_model_disappears -- --nocapture
 
       - name: 'Orphaned switch transaction via synthesized switch (issue #239)'
-        env:
-          PROTOC: protoc
         run: |
           # The stricter of the two `run_nonzero` shapes in this file: it reads
           # cargo's own status out of PIPESTATUS before looking at the output.
@@ -678,8 +1361,6 @@ jobs:
       # new button-path test pins why THAT path may discard the refusal
       # signal. Full unique names so run_nonzero proves each one still runs.
       - name: 'Dashboard refused-pick mirror obligations (issue #170)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -711,8 +1392,6 @@ jobs:
       # looped, so the #171 check can see them. Quoted name: an unquoted `#159`
       # truncates at the comment marker.
       - name: 'Runtime-catalog lookup and memo generation (issue #159)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -746,8 +1425,6 @@ jobs:
       # and `dropped_model_switch_ack_...` appears once rather than twice.
       # Filters are unique names, so run_nonzero proves each is selected.
       - name: 'Model-switch persistence boundaries and narrow windows (issues #50, #54)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -768,6 +1445,16 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             model_switch_recovers_new_generation_after_summary_materialization -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            restart_preserves_unique_route_identity_against_removed_key_reuse -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            push_pull_resume_preserves_unique_route_across_key_reuse -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_metadata_update_keeps_id_and_identity_atomic -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            fork_registration_remote_pull_preserves_inherited_model_identity_and_harness -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            copy_session_data_with_model_override -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             model_switch_interruption_before_intent_rename_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_switch_interruption_after_intent_rename_ -- --nocapture
@@ -782,8 +1469,6 @@ jobs:
       # CI never varied. Quoted name: an unquoted `#166` truncates at the
       # comment marker.
       - name: 'Colour-asserting pager tests, both NO_COLOR settings (issue #166)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -834,8 +1519,6 @@ jobs:
       # covers all three and the two new ones carry the protection. Quoted
       # name: an unquoted `#162` truncates at the comment marker.
       - name: 'Workflow restore ordering and scan budget (issue #162)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -855,8 +1538,6 @@ jobs:
       # must be unique so run_nonzero proves each guard test still executes.
       # Quoted name: an unquoted `#10` truncates at the comment marker.
       - name: 'Catalog ID vs wire slug restore/switch guards (issue #10)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -881,8 +1562,6 @@ jobs:
       # Unique filters so run_nonzero proves each new test is selected.
       # Quoted name: an unquoted `#165` truncates at the comment marker.
       - name: 'Abandoned attempt text omitted from search index (issue #165)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -915,8 +1594,6 @@ jobs:
       # either one reddens only its own test. Quoted name: an unquoted `#180`
       # truncates at the comment marker.
       - name: 'Ambient credential label coupling (issue #180)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -948,8 +1625,6 @@ jobs:
       # material itself, not from a self-reported ambient label alone. Unique
       # filters so run_nonzero proves each new test is selected (#171).
       - name: 'L3 provenance-required and inconsistency (issue #136 step 4)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -978,8 +1653,6 @@ jobs:
       # check can see them. Quoted name: an unquoted `#123` truncates at the
       # comment marker.
       - name: 'User-declared trusted xAI origins (issue #123)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1022,14 +1695,32 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             a_trusted_repo_still_cannot_declare_trusted_xai_origins -- --nocapture
 
+      # #291: the first Codex catalog load can happen after the pager enters
+      # Tokio. The parent test launches a fresh copy of the test binary so both
+      # the blocking client and its first authenticated request run cold.
+      - name: 'Codex catalog first use under Tokio (issue #291)'
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_runtime_first_fetch_ -- --nocapture
+
       # #160: six of the seven tests this branch originally added matched no
       # filter. The seventh, `web_search_resolves_an_env_backed_credential_header`,
       # is already selected by the existing `credential_header` filter. Written
       # out rather than looped so the #171 check can see them. Quoted name: an
       # unquoted `#160` truncates at the comment marker.
       - name: 'web_search env header forwarding (issue #160)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1065,8 +1756,6 @@ jobs:
       # `web_search_disable` also matches preexisting #57 config/renderer tests,
       # so `run_nonzero` would stay green if the new tests were deleted (#171).
       - name: 'web_search disable notice (issue #161)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1096,8 +1785,6 @@ jobs:
       # three helpers plus the failed-signal counter contract. Quoted name: an
       # unquoted `#167` truncates the YAML value at the comment marker.
       - name: 'leaders kill summary and PID guard (issue #167)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1138,8 +1825,6 @@ jobs:
       # its test uniquely. Quoted name: an unquoted `#173` truncates at the
       # comment marker.
       - name: 'MCP respawn arm/insert ordering guards (issue #173)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1162,8 +1847,6 @@ jobs:
       # client still sends `x.ai/local_workspace`; silent ignore would read as
       # supported and then degrade to NotAttached behavior.
       - name: 'Removed local-workspace meta guard (issue #35)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1186,8 +1869,6 @@ jobs:
       # query parameter both need a test that fails loudly when they drift.
       # Full unique names so run_nonzero proves each one still runs.
       - name: 'Codex account model catalog (issue #188)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1206,24 +1887,142 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_tolerates_other_shapes_and_budgets_the_operative_window -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            codex_catalog_uses_context_window_not_the_ceiling_for_gpt_5_4 -- --nocapture
+            codex_catalog_context_window_budgets_the_operative_window -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_context_window_keys_prefer_operative_capacity -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_url_carries_the_required_client_version -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_fallback_uses_builtin_preset_when_fetch_is_empty -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_credential_source_must_be_openai_codex_provider -- --nocapture
+          # #262: last-good catalogs are account-isolated and degraded state is visible.
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_last_good_cache_is_account_keyed -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_saved_fallback_is_visible_in_acp_metadata -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_degraded_state_survives_description_override -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_builtin_fallback_reports_absent_persisted_default -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_catalog_degraded_state_is_visible_in_model_picker -- --nocapture
+          # #306 C-min: Codex-only boot footer + picker readiness presentation
+          # (presentation unit tests; fail closed if the exact names vanish).
+          run_nonzero -p xai-grok-pager --lib \
+            codex_only_boot_footer_uses_authoritative_default_never_unknown -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_model_picker_lists_live_codex_ready_and_grok_unready -- --nocapture
+          # #306 remaining gates 3–8 (presentation; fail closed if names vanish)
+          run_nonzero -p xai-grok-pager --lib \
+            codex_model_picker_selects_every_live_catalog_model -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_effort_picker_obeys_each_model_menu_including_minimal_and_none -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            manual_compaction_renders_activity_and_completion -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            auto_compaction_renders_activity_and_completion -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_web_search_viewer_renders_citations -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            resumed_subagent_badge_and_transcript_are_visible -- --nocapture
+          # #303: Codex-only implicit default + reseat (selection policy).
+          run_nonzero -p xai-grok-shell --lib \
+            codex_only_cold_start_defaults_to_ready_codex -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_only_default_not_bundled_grok_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            xai_ambient_still_prefers_first_party_grok -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_ready_reseats_ambient_grok_without_xai_auth -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            byok_unchanged_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            auth_scheme_none_unchanged_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            deployment_key_keeps_first_party_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            third_party_codex_responses_does_not_steal_default -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            blank_xai_env_does_not_pin_grok_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            preferred_method_api_key_pin_keeps_first_party_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            has_usable_first_party_session_single_snapshot -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            first_party_session_eligibility_refreshable_vs_malformed -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            refreshable_expired_oidc_session_keeps_first_party_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            refreshable_expired_external_session_keeps_first_party_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            hard_expired_nonrefreshable_session_seats_codex -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_only_from_config_seats_codex_and_sampling_stack -- --nocapture
           # #245: catalog wire flags that differ from the Sol preset must parse.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture
+          # #261: catalog reasoning menus must reach ACP and remain model-specific in the TUI.
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_supported_reasoning_levels_drive_acp_effort_options -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_default_reasoning_level_must_belong_to_supported_levels -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            current_reasoning_effort_rejects_persisted_value_outside_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_override_can_disable_reasoning_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_override_rejects_default_outside_inherited_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            catalog_refresh_clears_current_effort_removed_from_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            config_refresh_clears_current_effort_removed_from_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_returns_structured_invalid_params_for_effort_outside_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_accepts_catalog_advertised_ultra_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            unconditional_default_reselection_revalidates_current_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session_model_effort_validation_uses_requested_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            menu_less_reasoning_model_accepts_legacy_minimal_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            rebuild_revalidates_current_reasoning_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_override_keeps_default_without_inherited_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_narrower_menu_reconciles_scalar_end_to_end -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_explicit_empty_reasoning_menu_disables_unclaimed_scalar_end_to_end -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_state_prefers_session_reasoning_effort_over_global -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            active_none_effort_is_preserved_as_stale_session_mode -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            stale_effort_revalidation_does_not_clear_newer_selection -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            subagent_reasoning_override_obeys_authoritative_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            subagent_reasoning_override_uses_legacy_menu_when_catalog_menu_is_absent -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            inherited_subagent_effort_reconciles_after_catalog_refresh -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            resolve_model_override_prepared_carries_authoritative_reasoning_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session_config_preserves_resident_effort_after_catalog_disables_reasoning -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            menu_less_reasoning_model_accepts_minimal_but_rejects_none_in_effort_command -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            deferred_cli_accepts_minimal_for_menu_less_reasoning_model -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_catalog_effort_options_are_model_specific -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release
       # auto-download bundle. Filters are written explicitly so #171 can prove
       # each new test runs somewhere.
       - name: 'PI fd glob contract and bundling (issue #36)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1258,8 +2057,6 @@ jobs:
       # that reaches it. Quoted name: an unquoted `#88` truncates at the comment
       # marker.
       - name: 'Build-script protoc discovery and rerun-if-changed emission (issue #88)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output

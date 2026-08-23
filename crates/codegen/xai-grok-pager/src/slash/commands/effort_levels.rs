@@ -4,13 +4,14 @@ use xai_grok_shell::sampling::types::{ReasoningEffort, ReasoningEffortOption};
 
 use crate::slash::command::ArgItem;
 
-/// Effort levels in the built-in fallback menu (strongest first). `none`/`minimal`
-/// are still accepted by `ReasoningEffort::from_str` for power users.
+/// Effort levels in the built-in fallback menu (strongest first). `none` is
+/// still accepted by `ReasoningEffort::from_str` only when a server menu offers it.
 pub(crate) const EFFORT_LEVELS: &[ReasoningEffort] = &[
     ReasoningEffort::Xhigh,
     ReasoningEffort::High,
     ReasoningEffort::Medium,
     ReasoningEffort::Low,
+    ReasoningEffort::Minimal,
 ];
 
 pub(crate) fn effort_description(level: ReasoningEffort) -> &'static str {
@@ -22,6 +23,7 @@ pub(crate) fn effort_description(level: ReasoningEffort) -> &'static str {
         ReasoningEffort::High => "Heavy reasoning",
         ReasoningEffort::Xhigh => "Extended reasoning",
         ReasoningEffort::Max => "Maximum reasoning",
+        ReasoningEffort::Ultra => "Maximum reasoning with proactive multi-agent guidance",
     }
 }
 

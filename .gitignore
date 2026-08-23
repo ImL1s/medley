@@ -6,3 +6,15 @@ __pycache__/
 
 # OMC operational state — never commit
 .omc/
+
+# oh-my-grok
+.omg/
+.omg/state/
+.omg/artifacts/
+.omg/handoffs/
+.omg/ultragoal/
+.omg/wiki/
+*.pid
+.env
+.env.*
+!.env.example

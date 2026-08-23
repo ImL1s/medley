@@ -100,6 +100,18 @@ pub struct SubagentRequest {
     pub cancel_token: CancellationToken,
 }
 
+impl SubagentRequest {
+    pub fn from_scheduler_loop(&self) -> bool {
+        self.runtime_overrides.loop_task_id.is_some()
+    }
+
+    /// The caller blocks on the foreground await budget (neither backgrounded
+    /// nor awaiting to completion).
+    pub fn awaits_in_foreground(&self) -> bool {
+        !self.run_in_background && !self.await_to_completion
+    }
+}
+
 /// Spawn command envelope owned by the coordinator mailbox.
 #[derive(Educe)]
 #[educe(Debug)]
@@ -673,6 +685,8 @@ pub struct SubagentRegistryCounts {
     pub pending: usize,
     pub active: usize,
     pub completed: usize,
+    /// Spawns parked at the session's concurrent limit, not yet started.
+    pub queued: usize,
 }
 
 #[derive(Educe)]
@@ -740,13 +754,15 @@ pub struct SubagentResumeSource {
     pub subagent_type: String,
     pub persona: Option<String>,
     pub model_id: Option<String>,
+    pub model_route: Option<String>,
+    pub model_agent_type: Option<String>,
 }
 
 /// Result of a resume-source lookup.
 #[derive(Debug, Clone)]
 pub enum SubagentResumeLookup {
     Active,
-    Completed(SubagentResumeSource),
+    Completed(Box<SubagentResumeSource>),
     Missing,
 }
 

@@ -25,17 +25,40 @@ pub fn bootstrap(
 ) -> Result<(AgentConfig, ModelsManager), String> {
     // Remote kill-switch before the gate (settings-only prefetch — no managed-config
     // sync, so a live server cannot heal a tampered policy before fail-closed).
+    xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::Bootstrap);
     let mut cfg = cfg.clone();
-    ensure_remote_settings_side_effects(&mut cfg, false);
+    {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.remote_settings");
+        ensure_remote_settings_side_effects(&mut cfg, false);
+    }
     crate::managed_config::managed_policy_gate()?;
-    let cfg = resolve_config(&cfg, auth_manager);
-    cfg.validate_model_filters()?;
-    init_process(&cfg, auth_manager);
-    let models_manager = ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?;
+    let cfg = {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.resolve_config");
+        let cfg = resolve_config(&cfg, auth_manager);
+        cfg.validate_model_filters()?;
+        cfg
+    };
+    {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.init_process");
+        init_process(&cfg, auth_manager);
+    }
+    xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::ModelCatalog);
+    // Arm the first auth-refresh waiter before model construction. Successful
+    // proactive refreshes use `notify_waiters`, which is intentionally not a
+    // stored permit; creating this future first makes a refresh that lands
+    // between the final construction generation check and watcher startup
+    // observable instead of permanently losing catalog reconciliation.
+    let auth_refresh_notify = auth_manager.refresh_notifier();
+    let mut first_auth_refresh = Box::pin(auth_refresh_notify.clone().notified_owned());
+    first_auth_refresh.as_mut().enable();
+    let models_manager = {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.models_manager");
+        ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?
+    };
 
     // Refresh on every auth refresh — the FSEvents watcher can silently die after
     // macOS sleep, stranding the catalog on bundled defaults.
-    models_manager.start_auth_refresh_watcher(auth_manager.refresh_notifier());
+    models_manager.start_auth_refresh_watcher_with_first(auth_refresh_notify, first_auth_refresh);
 
     Ok((cfg, models_manager))
 }
@@ -117,6 +140,9 @@ fn resolve_config(cfg: &AgentConfig, auth_manager: &AuthManager) -> AgentConfig 
     // Full prefetch (with managed-config sync when stale) is allowed after the gate.
     ensure_remote_settings_side_effects(&mut cfg, true);
     crate::util::config::sync_campaign_fields(&mut cfg);
+    let effective_default =
+        crate::agent::models::configured_preference(&cfg).map(|value| value.value);
+    cfg.rebind_unset_auxiliary_models_to_default(effective_default.as_deref());
 
     // env var > remote settings > Local. Skip remote settings for Generic (grok -p, subagents).
     let has_xai_auth = auth_manager.current().is_some_and(|a| a.is_xai_auth());

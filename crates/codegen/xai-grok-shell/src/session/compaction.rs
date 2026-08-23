@@ -776,6 +776,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: "auth".to_string(),
+                http_status: crate::sampling::error::http_status_from_error(&err),
                 message: message.clone(),
             },
         ))
@@ -1501,8 +1502,9 @@ impl SessionActor {
                 }
             };
         let memory_backend_impl = {
-            let g = self.memory.storage.borrow();
-            g.as_ref()
+            self.memory
+                .storage()
+                .as_ref()
                 .zip(self.memory.backend_params.as_ref())
                 .map(|(storage, params)| {
                     crate::session::memory::MemoryBackendImpl::from_session_params(
@@ -2282,6 +2284,7 @@ mod inline_auto_compact_flow_tests {
             pending_notifications: Vec::new(),
             notifications_suppressed: false,
             rewindable: false,
+            front_message_committed: false,
             nudges_used_this_session: 0,
         });
         let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2327,6 +2330,7 @@ mod inline_auto_compact_flow_tests {
                 gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 persistence_tx,
                 persistence_is_noop: false,
+                disk_full: crate::session::notifications::idle_disk_full_rx(),
             },
             permissions: PermissionHandle::allow_all(),
             tool_context,
@@ -2341,6 +2345,7 @@ mod inline_auto_compact_flow_tests {
             telemetry_enabled: false,
             supports_backend_search: std::cell::Cell::new(false),
             catalog_model_id: std::cell::Cell::new("test".to_string()),
+            committed_tool_result_truncation_policy: std::cell::Cell::new(None),
             tool_overrides: std::cell::RefCell::new(None),
             resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             compactions_remaining: std::cell::Cell::new(None),
@@ -2369,6 +2374,7 @@ mod inline_auto_compact_flow_tests {
                 flush_config: crate::config::MemoryFlushConfig::default(),
                 is_flushing: std::sync::atomic::AtomicBool::new(false),
                 last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+                configured_storage: None,
                 storage: std::cell::RefCell::new(None),
                 save_on_end: true,
                 backend_params: None,
@@ -2482,6 +2488,9 @@ mod inline_auto_compact_flow_tests {
             last_recap_main_turn: std::cell::Cell::new(0),
             recap_in_flight: std::cell::Cell::new(false),
             recap_epoch: std::cell::Cell::new(0),
+            turn_summary_task: std::cell::RefCell::new(None),
+            turn_summary_generation: std::cell::Cell::new(0),
+            turn_summary_enabled: false,
             session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             streaming_turn_capture: parking_lot::Mutex::new(
                 crate::session::acp_session::StreamingTurnCapture::default(),
@@ -2489,7 +2498,9 @@ mod inline_auto_compact_flow_tests {
             turn_stream_drained: parking_lot::Mutex::new(None),
             sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
             rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-            image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+            image_description_model: std::cell::RefCell::new(
+                crate::test_support::TEST_MODEL.to_owned(),
+            ),
             image_describe_cache: Arc::new(
                 crate::session::image_describe::ImageDescribeCache::new(),
             ),
@@ -2855,6 +2866,7 @@ mod inline_auto_compact_flow_tests {
                             crate::extensions::notification::RetryState::Failed {
                                 error_type,
                                 message,
+                                ..
                             },
                         ) = &notif.update
                     {
@@ -3014,6 +3026,7 @@ mod inline_auto_compact_flow_tests {
                                 crate::extensions::notification::RetryState::Failed {
                                     error_type,
                                     message,
+                                    ..
                                 },
                             ) => {
                                 assert_eq!(error_type, "auth");
@@ -3100,6 +3113,7 @@ mod inline_auto_compact_flow_tests {
                             crate::extensions::notification::RetryState::Failed {
                                 error_type,
                                 message,
+                                ..
                             },
                         ) = &notif.update
                     {
@@ -3603,6 +3617,7 @@ mod inline_auto_compact_flow_tests {
                 .map_or_else(Default::default, |mc| mc.flush.clone()),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+            configured_storage: memory_storage.clone(),
             storage: std::cell::RefCell::new(memory_storage),
             save_on_end: true,
             backend_params: None,

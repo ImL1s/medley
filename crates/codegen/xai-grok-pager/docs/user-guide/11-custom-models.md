@@ -316,9 +316,13 @@ For models that support reasoning effort levels, you can configure per-model par
   * For models using the **Messages (Anthropic-style)** backend, this is automatically enabled (`true`) and does not need to be declared.
   * For **OpenAI-compatible** endpoints (e.g. Chat Completions or Responses backends), you must explicitly set `supports_reasoning_effort = true`.
   * If a non-empty `reasoning_efforts` list is defined, support is automatically implied — this derive runs after per-model overrides merge, so the list turns support on even when `supports_reasoning_effort = false` was set explicitly.
-* `reasoning_effort` (string): The default reasoning effort level to send on the wire.
-  * Valid effort levels (lowercase) are: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
-  * **On the Messages backend, `none` and `minimal` are not sent at all.** Both map to an omitted effort, so the request carries no `output_config.effort` and no adaptive thinking — the same wire shape as leaving `reasoning_effort` unset. Selecting `minimal` on an Anthropic-style model therefore does not pick a lower reasoning tier; it turns the field off. The remaining five behave as named.
+* `reasoning_effort` (string): The default client/session reasoning tier. Backend-specific wire conversion happens when Grok builds a request.
+  * Valid effort levels (lowercase) are: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
+  * `ultra` is distinct from `max` in model selection, ACP state, and persisted sessions. It is selectable only when the model's catalog entry or custom `reasoning_efforts` menu advertises it; accepting the canonical string does not add it to a model's menu.
+  * **Responses and Codex Responses:** `ultra` is encoded as `max`, the highest value supported by the typed Responses request. A response that reports `max` remains `max`; Grok does not infer that the server used the client-side `ultra` tier.
+  * **Chat Completions:** `ultra` is sent literally. Only advertise it when the endpoint accepts that value.
+  * **Messages (Anthropic-style):** `none` and `minimal` are not sent at all. Both map to an omitted effort, so the request carries no `output_config.effort` and no adaptive thinking — the same wire shape as leaving `reasoning_effort` unset. Selecting `minimal` therefore turns the field off. The other levels, including `ultra`, are sent literally, so only advertise values the endpoint accepts.
+  * For an authenticated Codex session using `ultra`, Grok adds proactive multi-agent guidance. This guidance tells the model to consider subagents when the available tools and task make delegation useful; the model still decides whether to spawn, and may complete a turn without spawning. Tool filtering, permissions, and agent-profile capabilities still apply.
   * If this is omitted but `reasoning_efforts` is provided, Grok will automatically derive a default reasoning effort (preferring the option flagged as `default = true`, or falling back to the first defined option).
 * `reasoning_efforts` (array of strings or tables): Declares the list of reasoning effort levels selectable in the UI. Each entry can be:
   * A bare string corresponding to the effort level, e.g. `"high"`.

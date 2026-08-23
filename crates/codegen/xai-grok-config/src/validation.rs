@@ -60,39 +60,96 @@ pub struct RequirementsLayer {
     pub is_system: bool,
 }
 
+/// Result of loading one configured requirements layer. Absent layers are
+/// omitted; rejected layers remain in the ordered stream so reload consumers
+/// can preserve prior state without blocking higher-priority layers.
+#[derive(Debug, Clone)]
+pub enum RequirementsLayerLoad {
+    Absent(RequirementsSource),
+    Loaded(RequirementsLayer),
+    Rejected(RequirementsSource),
+}
+
 /// All loaded requirements layers in apply order (user first, system last).
 /// Use when you need per-layer source attribution; otherwise use
 /// [`load_merged_requirements`].
 pub fn requirements_layers() -> Vec<RequirementsLayer> {
+    let loads = try_requirements_layers();
+    let last_rejection = loads
+        .iter()
+        .rposition(|load| matches!(load, RequirementsLayerLoad::Rejected(_)));
+    loads
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, load)| match load {
+            RequirementsLayerLoad::Loaded(layer)
+                if last_rejection.is_none_or(|rejected| index > rejected) =>
+            {
+                Some(layer)
+            }
+            RequirementsLayerLoad::Absent(_)
+            | RequirementsLayerLoad::Loaded(_)
+            | RequirementsLayerLoad::Rejected(_) => None,
+        })
+        .collect()
+}
+
+/// Checked requirements layers in apply order, including rejected sources.
+///
+/// Callers that replace live policy state use the rejection entries to keep
+/// last-known-good constraints while continuing with higher-priority layers.
+pub fn try_requirements_layers() -> Vec<RequirementsLayerLoad> {
     let mut out = Vec::new();
-    if let Some(user_path) = user_grok_home().map(|g| g.join("requirements.toml"))
-        && let Some(value) = load_requirements_layer(&user_path)
-    {
-        out.push(RequirementsLayer {
-            value,
-            source: RequirementsSource::File(user_path),
-            is_system: false,
-        });
+    if let Some(user_path) = user_grok_home().map(|g| g.join("requirements.toml")) {
+        match load_requirements_layer_status(&user_path) {
+            RequirementsLayerStatus::Loaded(value) => {
+                out.push(RequirementsLayerLoad::Loaded(RequirementsLayer {
+                    value,
+                    source: RequirementsSource::File(user_path),
+                    is_system: false,
+                }))
+            }
+            RequirementsLayerStatus::Absent => out.push(RequirementsLayerLoad::Absent(
+                RequirementsSource::File(user_path),
+            )),
+            RequirementsLayerStatus::Rejected => out.push(RequirementsLayerLoad::Rejected(
+                RequirementsSource::File(user_path),
+            )),
+        }
     }
     if let Some(dir) = system_config_dir() {
         let sys_path = dir.join("requirements.toml");
-        if let Some(value) = load_requirements_layer(&sys_path) {
-            out.push(RequirementsLayer {
-                value,
-                source: RequirementsSource::File(sys_path),
-                is_system: true,
-            });
+        match load_requirements_layer_status(&sys_path) {
+            RequirementsLayerStatus::Loaded(value) => {
+                out.push(RequirementsLayerLoad::Loaded(RequirementsLayer {
+                    value,
+                    source: RequirementsSource::File(sys_path),
+                    is_system: true,
+                }))
+            }
+            RequirementsLayerStatus::Absent => out.push(RequirementsLayerLoad::Absent(
+                RequirementsSource::File(sys_path),
+            )),
+            RequirementsLayerStatus::Rejected => out.push(RequirementsLayerLoad::Rejected(
+                RequirementsSource::File(sys_path),
+            )),
         }
     }
     // macOS MDM: OS-protected admin layer (forced values only). Pushed last so it
     // wins the deep-merge over the system file and cloud cache; `is_system` so
     // security decisions trust it like the root-owned layer.
-    if let Some(value) = mdm_requirements_value() {
-        out.push(RequirementsLayer {
-            value,
-            source: RequirementsSource::Mdm,
-            is_system: true,
-        });
+    match crate::macos_managed::managed_preferences_requirements() {
+        Some(raw) => {
+            match normalize_requirements_value(raw, crate::macos_managed::MDM_REQUIREMENTS_SOURCE) {
+                Some(value) => out.push(RequirementsLayerLoad::Loaded(RequirementsLayer {
+                    value,
+                    source: RequirementsSource::Mdm,
+                    is_system: true,
+                })),
+                None => out.push(RequirementsLayerLoad::Rejected(RequirementsSource::Mdm)),
+            }
+        }
+        None => out.push(RequirementsLayerLoad::Absent(RequirementsSource::Mdm)),
     }
     out
 }
@@ -126,11 +183,28 @@ pub(crate) fn load_system_requirements() -> Option<toml::Value> {
 /// Soft-fails on errors; fail-closed enforcement lives in
 /// [`validate_requirements`].
 pub(crate) fn load_requirements_layer(path: &Path) -> Option<toml::Value> {
-    let v = match load_toml_file(path) {
-        Ok(v) if v.as_table().is_some_and(|t| !t.is_empty()) => v,
-        _ => return None,
+    match load_requirements_layer_status(path) {
+        RequirementsLayerStatus::Loaded(value) => Some(value),
+        RequirementsLayerStatus::Absent | RequirementsLayerStatus::Rejected => None,
+    }
+}
+
+enum RequirementsLayerStatus {
+    Absent,
+    Loaded(toml::Value),
+    Rejected,
+}
+
+fn load_requirements_layer_status(path: &Path) -> RequirementsLayerStatus {
+    let value = match load_toml_file(path) {
+        Ok(value) if value.as_table().is_some_and(|table| !table.is_empty()) => value,
+        Ok(_) => return RequirementsLayerStatus::Absent,
+        Err(_) => return RequirementsLayerStatus::Rejected,
     };
-    normalize_requirements_value(v, &path.display().to_string())
+    match normalize_requirements_value(value, &path.display().to_string()) {
+        Some(value) => RequirementsLayerStatus::Loaded(value),
+        None => RequirementsLayerStatus::Rejected,
+    }
 }
 
 /// Strip `fail_closed` and apply `[[version_overrides]]` for a parsed
@@ -247,6 +321,31 @@ fn resolve_fail_closed_mode(requirements: &toml::Value) -> bool {
 mod tests {
     use super::*;
 
+    static FAIL_CLOSED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct FailClosedEnvGuard(Option<std::ffi::OsString>);
+
+    impl FailClosedEnvGuard {
+        fn unset() -> Self {
+            let prior = std::env::var_os(FAIL_CLOSED_ENV);
+            // SAFETY: tests that access this variable hold FAIL_CLOSED_ENV_LOCK.
+            unsafe { std::env::remove_var(FAIL_CLOSED_ENV) };
+            Self(prior)
+        }
+    }
+
+    impl Drop for FailClosedEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests that access this variable hold FAIL_CLOSED_ENV_LOCK.
+            unsafe {
+                match self.0.take() {
+                    Some(prior) => std::env::set_var(FAIL_CLOSED_ENV, prior),
+                    None => std::env::remove_var(FAIL_CLOSED_ENV),
+                }
+            }
+        }
+    }
+
     /// Even with `fail_closed = true` in the file -- enforcement is
     /// `validate_requirements`, not the loader.
     #[test]
@@ -271,6 +370,22 @@ telemetry = true
 
         assert!(load_requirements_layer(&path).is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn checked_requirements_layer_distinguishes_rejection_from_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("requirements.toml");
+        assert!(matches!(
+            load_requirements_layer_status(&path),
+            RequirementsLayerStatus::Absent
+        ));
+
+        std::fs::write(&path, "[models\ndefault = \"broken\"").unwrap();
+        assert!(matches!(
+            load_requirements_layer_status(&path),
+            RequirementsLayerStatus::Rejected
+        ));
     }
 
     #[test]
@@ -303,6 +418,9 @@ minimum_version = "not-a-version"
     fn validate_requirements_layer_ok_without_fail_closed() {
         use std::io::Write;
 
+        let _lock = FAIL_CLOSED_ENV_LOCK.lock().unwrap();
+        let _env = FailClosedEnvGuard::unset();
+
         let dir = std::env::temp_dir().join(format!("grok-vo-soft2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("requirements.toml");
@@ -322,6 +440,7 @@ minimum_version = "not-a-version"
 
     #[test]
     fn fail_closed_env_can_tighten_but_not_loosen() {
+        let _lock = FAIL_CLOSED_ENV_LOCK.lock().unwrap();
         // SAFETY: process-global env mutation, restored before return.
         let off: toml::Value = toml::from_str("fail_closed = false\n").unwrap();
         let on: toml::Value = toml::from_str("fail_closed = true\n").unwrap();
@@ -441,6 +560,8 @@ minimum_version = "not-a-version"
     /// hold with no file in the loop.
     #[test]
     fn mdm_value_normalizes_and_enforces_like_a_file() {
+        let _lock = FAIL_CLOSED_ENV_LOCK.lock().unwrap();
+        let _env = FailClosedEnvGuard::unset();
         let source = crate::macos_managed::MDM_REQUIREMENTS_SOURCE;
 
         // Effective view: fail_closed stripped, the forced clamp kept.

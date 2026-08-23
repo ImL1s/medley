@@ -2,57 +2,99 @@
 
 use crate::remote::client::{BackendClient, BackendError};
 
+#[derive(Debug, Clone)]
+pub(crate) struct FetchedSession {
+    requested_session_id: String,
+    loaded: crate::remote::client::LoadDataResponse,
+    info: crate::session::info::Info,
+}
+
+impl FetchedSession {
+    pub(crate) fn info(&self) -> &crate::session::info::Info {
+        &self.info
+    }
+
+    fn validate(
+        session_id: &str,
+        loaded: crate::remote::client::LoadDataResponse,
+    ) -> Result<Self, PullError> {
+        let Some(remote) = loaded.session.as_ref() else {
+            return Err(PullError::MalformedSession {
+                requested: session_id.to_owned(),
+                missing_field: "session",
+            });
+        };
+        if remote.session_id != session_id {
+            return Err(PullError::SessionIdMismatch {
+                requested: session_id.to_owned(),
+                returned: remote.session_id.clone(),
+            });
+        }
+        let Some(cwd) = remote.cwd.clone() else {
+            return Err(PullError::MalformedSession {
+                requested: session_id.to_owned(),
+                missing_field: "session.cwd",
+            });
+        };
+        Ok(Self {
+            requested_session_id: session_id.to_owned(),
+            info: crate::session::info::Info {
+                id: agent_client_protocol::SessionId::new(std::sync::Arc::from(session_id)),
+                cwd,
+            },
+            loaded,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_loaded_for_test(
+        session_id: &str,
+        loaded: crate::remote::client::LoadDataResponse,
+    ) -> Result<Option<Self>, PullError> {
+        Self::validate(session_id, loaded).map(Some)
+    }
+}
+
 #[derive(Debug)]
-pub enum PullResult {
-    /// Written to local storage. The [`Info`] cwd comes from the backend (may differ from caller's).
-    Hydrated(crate::session::info::Info),
-    /// Not found on the backend.
+pub(crate) enum FetchResult {
+    Fetched(Box<FetchedSession>),
     NotFound,
 }
 
-/// Fetch a session from the backend and hydrate local JSONL storage.
-pub async fn pull_session_to_local(
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PullError {
+    #[error(transparent)]
+    Backend(#[from] BackendError),
+    #[error("backend returned session id {returned} for requested session {requested}")]
+    SessionIdMismatch { requested: String, returned: String },
+    #[error("backend returned malformed session {requested}: missing {missing_field}")]
+    MalformedSession {
+        requested: String,
+        missing_field: &'static str,
+    },
+}
+
+/// Fetch and validate backend data without touching the local filesystem.
+pub(crate) async fn fetch_session(
     session_id: &str,
     client: &BackendClient,
-) -> Result<PullResult, BackendError> {
+) -> Result<FetchResult, PullError> {
     let loaded = match client.load_session_data(session_id).await {
-        Ok(resp) => resp,
-        Err(BackendError::SessionNotFound { .. }) => return Ok(PullResult::NotFound),
-        Err(e) => return Err(e),
+        Ok(response) => response,
+        Err(BackendError::SessionNotFound { .. }) => return Ok(FetchResult::NotFound),
+        Err(error) => return Err(error.into()),
     };
-
-    let remote = match loaded.session.as_ref() {
-        Some(s) => s,
-        None => return Ok(PullResult::NotFound),
-    };
-
-    // cwd required for local dir placement; null means pre-writeback session.
-    let cwd = match remote.cwd.as_ref() {
-        Some(cwd) => cwd,
-        None => {
-            tracing::warn!(session_id, "Cannot pull session: backend has cwd=null");
-            return Ok(PullResult::NotFound);
-        }
-    };
-
-    let info = crate::session::info::Info {
-        id: agent_client_protocol::SessionId::new(std::sync::Arc::from(session_id)),
-        cwd: cwd.clone(),
-    };
-    let dir = crate::session::persistence::session_dir(&info);
-
-    let num_messages = hydrate::write_to_dir(&dir, &loaded)?;
-
-    tracing::info!(session_id, %cwd, num_messages, "Pulled session from backend");
-
-    Ok(PullResult::Hydrated(info))
+    Ok(FetchResult::Fetched(Box::new(FetchedSession::validate(
+        session_id, loaded,
+    )?)))
 }
 
 pub(crate) mod hydrate {
     use std::path::Path;
     use std::sync::Arc;
 
-    use crate::remote::client::{BackendError, LoadDataResponse, LoadedMessage, SessionInfo};
+    use crate::remote::client::{BackendError, LoadedMessage, SessionInfo};
+    use crate::remote::pull::FetchedSession;
     use crate::session::info::Info;
     use crate::session::persistence::{CHAT_FORMAT_VERSION, Summary, default_model_id};
     use crate::session::storage::{SUMMARY_FILE, UPDATES_FILE};
@@ -65,17 +107,20 @@ pub(crate) mod hydrate {
     }
 
     /// Write all session files to `dir`.
-    pub(super) fn write_to_dir(
+    pub(crate) fn write_to_dir(
         dir: &Path,
-        loaded: &LoadDataResponse,
+        fetched: &FetchedSession,
     ) -> Result<usize, BackendError> {
+        let loaded = &fetched.loaded;
         let remote = loaded
             .session
             .as_ref()
             .expect("caller checked session.is_some()");
 
         let info = Info {
-            id: agent_client_protocol::SessionId::new(Arc::from(remote.session_id.as_str())),
+            id: agent_client_protocol::SessionId::new(Arc::from(
+                fetched.requested_session_id.as_str(),
+            )),
             cwd: remote.cwd.clone().expect("caller verified cwd is Some"),
         };
 
@@ -96,6 +141,50 @@ pub(crate) mod hydrate {
         Ok(num_messages)
     }
 
+    /// Flush hydrated files and directory entries before the visibility marker
+    /// is removed. `.remote_origin` is advisory metadata, but when present it
+    /// participates in the same pre-publication durability pass.
+    pub(crate) fn sync_tree_durable(session_dir: &Path) -> Result<(), BackendError> {
+        fn visit(dir: &Path, directories: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+            directories.push(dir.to_path_buf());
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("hydrated session contains symlink: {}", path.display()),
+                    ));
+                }
+                if file_type.is_dir() {
+                    visit(&path, directories)?;
+                } else if file_type.is_file() {
+                    std::fs::File::open(&path)?.sync_all()?;
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "hydrated session contains unsupported entry: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        let mut directories = Vec::new();
+        visit(session_dir, &mut directories).map_err(|error| io_err(session_dir, error))?;
+        #[cfg(unix)]
+        for directory in directories.into_iter().rev() {
+            std::fs::File::open(&directory)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| io_err(&directory, error))?;
+        }
+        Ok(())
+    }
+
     fn write_summary(
         dir: &Path,
         info: &Info,
@@ -106,10 +195,26 @@ pub(crate) mod hydrate {
         let meta = remote.metadata.as_ref();
 
         let model_id = meta
-            .and_then(|m| m.get("modelId"))
+            .and_then(|m| m.get("modelId").or_else(|| m.get("model_id")))
             .and_then(|v| v.as_str())
             .map(agent_client_protocol::ModelId::new)
             .unwrap_or_else(default_model_id);
+        let catalog_identity = meta
+            .and_then(|m| {
+                m.get("catalogIdentity")
+                    .or_else(|| m.get("catalog_identity"))
+            })
+            .cloned()
+            .and_then(|value| serde_json::from_value::<xai_chat_state::CatalogIdentity>(value).ok())
+            .filter(|identity| {
+                identity.model_id == model_id.0.as_ref() && !identity.route.trim().is_empty()
+            });
+        let agent_name = meta
+            .and_then(|m| m.get("agentName").or_else(|| m.get("agent_name")))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
 
         let parent_session_id = meta
             .and_then(|m| m.get("parentSessionId"))
@@ -128,6 +233,7 @@ pub(crate) mod hydrate {
             num_messages,
             num_chat_messages,
             current_model_id: model_id,
+            catalog_identity,
             parent_session_id,
             forked_at: None,
             collection_id: None,
@@ -152,10 +258,12 @@ pub(crate) mod hydrate {
             generated_title: None,
             title_is_manual: false,
             worktree_label: None,
-            agent_name: None,
+            agent_name,
             // Hydrated locally — record the profile this process runs under.
             sandbox_profile: xai_grok_sandbox::configured_profile_name().map(String::from),
             reasoning_effort: None,
+            last_turn_summary: None,
+            last_turn_summary_prompt_id: None,
         };
 
         let json = serde_json::to_string_pretty(&summary)?;
@@ -182,8 +290,8 @@ pub(crate) mod hydrate {
                 continue;
             }
             if let Some(line) = to_envelope_line(&parsed) {
-                let _ = w.write_all(line.as_bytes());
-                let _ = w.write_all(b"\n");
+                w.write_all(line.as_bytes()).map_err(|e| io_err(&path, e))?;
+                w.write_all(b"\n").map_err(|e| io_err(&path, e))?;
             }
         }
 
@@ -191,6 +299,9 @@ pub(crate) mod hydrate {
     }
 
     fn write_remote_origin_marker(dir: &Path) {
+        // Advisory provenance only: failure must not invalidate otherwise
+        // complete backend data. If written, the caller's durability pass
+        // flushes it before publication.
         let _ = std::fs::write(
             dir.join(".remote_origin"),
             format!("pulled_at={}\n", chrono::Utc::now().to_rfc3339()),
@@ -233,6 +344,195 @@ pub(crate) mod hydrate {
 #[cfg(test)]
 mod tests {
     use crate::remote::client::LoadedMessage;
+
+    fn validated(data: crate::remote::client::LoadDataResponse) -> super::FetchedSession {
+        let session_id = data.session.as_ref().unwrap().session_id.clone();
+        super::FetchedSession::validate(&session_id, data).unwrap()
+    }
+
+    #[test]
+    fn fetched_session_rejects_backend_id_mismatch() {
+        let data = crate::remote::client::LoadDataResponse {
+            messages: None,
+            session: Some(crate::remote::client::SessionInfo {
+                session_id: "returned-id".to_owned(),
+                title: None,
+                cwd: Some("/tmp".to_owned()),
+                status: None,
+                created_at: None,
+                updated_at: None,
+                metadata: None,
+            }),
+        };
+        assert!(matches!(
+            super::FetchedSession::validate("requested-id", data),
+            Err(super::PullError::SessionIdMismatch { requested, returned })
+                if requested == "requested-id" && returned == "returned-id"
+        ));
+    }
+
+    #[test]
+    fn fetched_session_rejects_missing_cwd_as_malformed_payload() {
+        let data = crate::remote::client::LoadDataResponse {
+            messages: None,
+            session: Some(crate::remote::client::SessionInfo {
+                session_id: "requested-id".to_owned(),
+                title: None,
+                cwd: None,
+                status: None,
+                created_at: None,
+                updated_at: None,
+                metadata: None,
+            }),
+        };
+
+        assert!(matches!(
+            super::FetchedSession::validate("requested-id", data),
+            Err(super::PullError::MalformedSession {
+                requested,
+                missing_field: "session.cwd",
+            }) if requested == "requested-id"
+        ));
+    }
+
+    #[test]
+    fn fetched_session_rejects_missing_session_as_malformed_payload() {
+        let data = crate::remote::client::LoadDataResponse {
+            messages: None,
+            session: None,
+        };
+
+        assert!(matches!(
+            super::FetchedSession::validate("requested-id", data),
+            Err(super::PullError::MalformedSession {
+                requested,
+                missing_field: "session",
+            }) if requested == "requested-id"
+        ));
+    }
+
+    #[test]
+    fn push_pull_resume_preserves_unique_route_across_key_reuse() {
+        let info = crate::session::info::Info {
+            id: agent_client_protocol::SessionId::new("remote-lineage"),
+            cwd: "/tmp/remote-lineage".to_owned(),
+        };
+        let mut source = crate::session::persistence::Summary::new(
+            &info,
+            agent_client_protocol::ModelId::new("removed-key"),
+        )
+        .unwrap();
+        source.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+            model_id: "removed-key".to_owned(),
+            route: "retained-route".to_owned(),
+            lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        });
+        source.agent_name = Some("codex".to_owned());
+        let pushed = crate::session::export::ExportedMetadata::from_summary(&source);
+        let data = crate::remote::client::LoadDataResponse {
+            messages: None,
+            session: Some(crate::remote::client::SessionInfo {
+                session_id: "remote-lineage".to_owned(),
+                title: None,
+                cwd: Some("/tmp/remote-lineage".to_owned()),
+                status: None,
+                created_at: None,
+                updated_at: None,
+                metadata: Some(serde_json::to_value(pushed).unwrap()),
+            }),
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        super::hydrate::write_to_dir(tmp.path(), &validated(data)).unwrap();
+        let pulled: crate::session::persistence::Summary =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("summary.json")).unwrap())
+                .unwrap();
+        let restored = pulled
+            .catalog_identity
+            .expect("remote lineage must round-trip");
+        assert_eq!(pulled.agent_name.as_deref(), Some("codex"));
+
+        let mut invalid_metadata = serde_json::to_value(
+            crate::session::export::ExportedMetadata::from_summary(&source),
+        )
+        .unwrap();
+        invalid_metadata["catalog_identity"]["model_id"] = serde_json::json!("other-key");
+        let invalid = crate::remote::client::LoadDataResponse {
+            messages: None,
+            session: Some(crate::remote::client::SessionInfo {
+                session_id: "remote-lineage-invalid".to_owned(),
+                title: None,
+                cwd: Some("/tmp/remote-lineage".to_owned()),
+                status: None,
+                created_at: None,
+                updated_at: None,
+                metadata: Some(invalid_metadata),
+            }),
+        };
+        let invalid_tmp = tempfile::TempDir::new().unwrap();
+        super::hydrate::write_to_dir(invalid_tmp.path(), &validated(invalid)).unwrap();
+        let invalid_pulled: crate::session::persistence::Summary = serde_json::from_slice(
+            &std::fs::read(invalid_tmp.path().join("summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            invalid_pulled.catalog_identity.is_none(),
+            "pull must reject identity metadata that disagrees with model_id"
+        );
+
+        let endpoints = crate::agent::config::EndpointsConfig::default();
+        let mut reused = crate::agent::config::ModelEntry::fallback("foreign-route", &endpoints);
+        reused.info.base_url = "https://foreign.example/v1".to_owned();
+        reused.api_key = Some("foreign-secret".to_owned());
+        reused.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+        let mut replacement =
+            crate::agent::config::ModelEntry::fallback("retained-route", &endpoints);
+        replacement.info.base_url = "https://retained.example/v1".to_owned();
+        replacement.api_key = Some("retained-secret".to_owned());
+        replacement.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+        let catalog = indexmap::IndexMap::from([
+            ("removed-key".to_owned(), reused),
+            ("replacement-key".to_owned(), replacement),
+        ]);
+        let resolved =
+            crate::agent::models::reconcile_persisted_catalog_identity(&catalog, &restored)
+                .expect("retained route should resolve uniquely after pull");
+        let entry = &catalog[resolved.model_id.as_str()];
+        let credentials = crate::agent::config::resolve_credentials(entry, None);
+        assert_eq!(resolved.model_id, "replacement-key");
+        assert_eq!(credentials.base_url, "https://retained.example/v1");
+        assert_eq!(credentials.api_key.as_deref(), Some("retained-secret"));
+        assert_ne!(credentials.api_key.as_deref(), Some("foreign-secret"));
+
+        let mut incompatible = catalog["replacement-key"].clone();
+        incompatible.info.agent_type = "cursor".to_owned();
+        let incompatible_catalog =
+            indexmap::IndexMap::from([("replacement-key".to_owned(), incompatible)]);
+        let incompatible_resolved = crate::agent::models::reconcile_persisted_catalog_identity(
+            &incompatible_catalog,
+            &restored,
+        )
+        .expect("the retained route still resolves by wire identity");
+        let active = xai_grok_agent::discovery::by_name_in_cwd(
+            pulled.agent_name.as_deref().unwrap(),
+            std::path::Path::new("."),
+        )
+        .expect("persisted codex harness");
+        let compatible = crate::agent::mvp_agent::first_ready_compatible_model(
+            [agent_client_protocol::ModelId::new(
+                incompatible_resolved.model_id,
+            )],
+            &active,
+            |id| incompatible_catalog.get(id.0.as_ref()).cloned(),
+            |agent_type| {
+                xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
+            },
+        );
+        assert!(
+            compatible.is_none(),
+            "remote resume must validate a remap against the persisted harness"
+        );
+    }
 
     #[test]
     fn hydrate_writes_valid_updates_jsonl() {
@@ -319,7 +619,7 @@ mod tests {
             }),
         };
         let tmp = tempfile::TempDir::new().unwrap();
-        super::hydrate::write_to_dir(tmp.path(), &data).unwrap();
+        super::hydrate::write_to_dir(tmp.path(), &validated(data)).unwrap();
 
         let chat = std::fs::read_to_string(tmp.path().join("chat_history.jsonl")).unwrap();
         let items: Vec<crate::sampling::ConversationItem> = chat
@@ -403,7 +703,7 @@ mod tests {
             }),
         };
         let tmp = tempfile::TempDir::new().unwrap();
-        super::hydrate::write_to_dir(tmp.path(), &data).unwrap();
+        super::hydrate::write_to_dir(tmp.path(), &validated(data)).unwrap();
 
         let chat = std::fs::read_to_string(tmp.path().join("chat_history.jsonl")).unwrap();
         let items: Vec<crate::sampling::ConversationItem> = chat

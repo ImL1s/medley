@@ -598,6 +598,23 @@ pub enum SessionUpdate {
     /// forever; on receipt the pager clears it. Never emitted for an automatic
     /// recap (those show no spinner).
     SessionRecapUnavailable,
+    /// Ultra-short summary of the just-finished successful turn, generated at
+    /// turn end for the dashboard row's secondary line. Rows show it until
+    /// the next successful turn's summary replaces it.
+    ///
+    /// Transient (never persisted to `updates.jsonl`): the durable copy lives
+    /// in `summary.json` and reaches non-attached clients via the roster.
+    /// Clients may apply deliveries directly — generation is serialized
+    /// shell-side (one in-flight call, aborted by newer turns) and gateway
+    /// delivery is ordered, so the latest delivery is the latest summary.
+    LastTurnSummary {
+        /// One-line fragment (~5–12 words, capped at a safety limit).
+        summary: String,
+        /// Prompt id of the turn this summary describes (provenance; also
+        /// persisted as `Summary::last_turn_summary_prompt_id`).
+        #[serde(default)]
+        prompt_id: Option<String>,
+    },
     /// A compaction checkpoint marker written to `updates.jsonl`.
     ///
     /// This is **persist-only** — it is never sent to the gateway/UI. It records
@@ -673,6 +690,12 @@ pub enum SessionUpdate {
         resumed_from: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_run_id: Option<String>,
+        /// Digest of the native route receipt when spawn resolved one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route_receipt_digest: Option<String>,
+        /// Catalog id selected by native route resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_catalog_id: Option<String>,
     },
     /// Periodic progress update for a running subagent.
     ///
@@ -1139,6 +1162,9 @@ impl From<&crate::session::image_normalize::ImageCompressionInfo> for ImageCompr
     }
 }
 
+pub const DISK_FULL_ERROR_TYPE: &str = "disk_full";
+pub const DISK_FULL_USER_MESSAGE: &str = "Out of disk space. Free some space and try again.";
+
 /// State of a retry operation or error for visual feedback in the TUI
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "type")]
@@ -1168,6 +1194,10 @@ pub enum RetryState {
     Failed {
         /// Category of the error (e.g., "auth", "invalid_params", "server")
         error_type: String,
+        /// Parsed HTTP status when the failure originated from a provider
+        /// response. Older persisted notifications omit this field.
+        #[serde(default)]
+        http_status: Option<u16>,
         /// Human-readable error message
         message: String,
     },
@@ -1178,8 +1208,8 @@ pub enum RetryState {
 /// again. Drives the actionable re-auth banner.
 ///
 /// `legacy_auth` is intentionally excluded: those failures carry their own
-/// detailed migration guidance (`grok logout` / `grok login`) in the
-/// message, so we surface that verbatim instead of the generic prompt.
+/// detailed migration guidance (`grok update` / `grok logout` / `grok login`)
+/// in the message, so we surface that verbatim instead of the generic prompt.
 ///
 /// `auth_transient` is excluded for the opposite reason: the shell emits it
 /// only when the failure self-heals (see `AuthManager::requires_manual_reauth`)
@@ -1621,6 +1651,8 @@ mod tests {
             model: None,
             resumed_from: None,
             workflow_run_id: None,
+            route_receipt_digest: None,
+            selected_catalog_id: None,
         })
         .unwrap();
         let progress = serde_json::to_value(SessionUpdate::SubagentProgress {
@@ -1787,7 +1819,20 @@ mod tests {
         let update: SessionUpdate = serde_json::from_str(json).unwrap();
         assert!(matches!(
             update,
-            SessionUpdate::RetryState(RetryState::Failed { .. })
+            SessionUpdate::RetryState(RetryState::Failed {
+                http_status: None,
+                ..
+            })
+        ));
+
+        let json = r#"{"sessionUpdate":"retry_state","type":"failed","error_type":"api","http_status":400,"message":"bad request"}"#;
+        let update: SessionUpdate = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            update,
+            SessionUpdate::RetryState(RetryState::Failed {
+                http_status: Some(400),
+                ..
+            })
         ));
     }
 

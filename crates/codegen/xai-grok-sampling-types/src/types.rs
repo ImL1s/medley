@@ -771,6 +771,7 @@ pub enum ReasoningEffort {
     High,
     Xhigh,
     Max,
+    Ultra,
 }
 
 impl ReasoningEffort {
@@ -783,11 +784,19 @@ impl ReasoningEffort {
             Self::High => crate::rs::ReasoningEffort::High,
             Self::Xhigh => crate::rs::ReasoningEffort::Xhigh,
             Self::Max => crate::rs::ReasoningEffort::Max,
+            // The app keeps Ultra as a distinct catalog/session tier, while
+            // the canonical async-openai client currently tops out at Max.
+            // The wrapper retains the app value for transports that need to
+            // apply an Ultra-specific wire policy after typed serialization.
+            Self::Ultra => crate::rs::ReasoningEffort::Max,
         }
     }
 
-    /// Inverse of [`to_responses_api`](Self::to_responses_api): the effort the
-    /// Responses API echoes back on `response.reasoning.effort`.
+    /// Convert the effort echoed by the typed Responses API into the app tier.
+    ///
+    /// This is intentionally not a strict inverse of
+    /// [`to_responses_api`](Self::to_responses_api): app-level Ultra is encoded
+    /// as typed Max and therefore a server response containing Max remains Max.
     pub fn from_responses_api(effort: crate::rs::ReasoningEffort) -> Self {
         match effort {
             crate::rs::ReasoningEffort::None => Self::None,
@@ -809,6 +818,7 @@ impl ReasoningEffort {
             Self::High => "high",
             Self::Xhigh => "xhigh",
             Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 
@@ -838,8 +848,9 @@ impl std::str::FromStr for ReasoningEffort {
             "high" => Ok(Self::High),
             "xhigh" => Ok(Self::Xhigh),
             "max" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
             _ => Err(format!(
-                "invalid reasoning effort: {s:?} (expected one of: none, minimal, low, medium, high, xhigh, max)"
+                "invalid reasoning effort: {s:?} (expected one of: none, minimal, low, medium, high, xhigh, max, ultra)"
             )),
         }
     }
@@ -1037,6 +1048,11 @@ pub struct CodexWireCapabilities {
     /// session has not set an effort override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_level: Option<String>,
+    /// Client-side limit applied to text tool results before they enter
+    /// conversation history. This is catalog metadata, not a Responses API
+    /// request field (#263).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_policy: Option<TruncationPolicyConfig>,
 }
 
 impl CodexWireCapabilities {
@@ -1055,6 +1071,21 @@ impl CodexWireCapabilities {
     pub fn include_reasoning_summary(&self) -> bool {
         self.supports_reasoning_summary_parameter != Some(false)
     }
+}
+
+/// Unit used by a Codex catalog tool-output truncation policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncationMode {
+    Bytes,
+    Tokens,
+}
+
+/// Client-side tool-output truncation policy advertised by the Codex catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncationPolicyConfig {
+    pub mode: TruncationMode,
+    pub limit: i64,
 }
 
 /// Which API backend to use for model inference.
@@ -1320,6 +1351,11 @@ pub struct CreateResponseWrapper {
     /// The inner Responses API request.
     pub inner: crate::rs::CreateResponse,
 
+    /// App-level effort before conversion into the typed Responses request.
+    /// This preserves tiers such as Ultra that intentionally share a typed
+    /// representation with Max.
+    pub client_reasoning_effort: Option<ReasoningEffort>,
+
     /// Custom header: conversation ID for tracking.
     pub x_grok_conv_id: Option<String>,
 
@@ -1346,6 +1382,7 @@ impl CreateResponseWrapper {
     pub fn new(inner: crate::rs::CreateResponse) -> Self {
         Self {
             inner,
+            client_reasoning_effort: None,
             x_grok_conv_id: None,
             x_grok_req_id: None,
             x_grok_session_id: None,
@@ -1528,6 +1565,7 @@ mod tests {
             ReasoningEffort::High,
             ReasoningEffort::Xhigh,
             ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
         ] {
             let json = serde_json::to_string(&v).unwrap();
             assert_eq!(json, format!("\"{}\"", v.as_str()), "serialize {v:?}");
@@ -1538,7 +1576,11 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_from_str_parses_max_and_xhigh_as_distinct_tiers() {
+    fn reasoning_effort_from_str_parses_ultra_max_and_xhigh_as_distinct_tiers() {
+        assert_eq!(
+            "ultra".parse::<ReasoningEffort>().unwrap(),
+            ReasoningEffort::Ultra
+        );
         assert_eq!(
             "max".parse::<ReasoningEffort>().unwrap(),
             ReasoningEffort::Max
@@ -1551,6 +1593,10 @@ mod tests {
 
     #[test]
     fn parse_canonical_effort_token_helper() {
+        assert_eq!(
+            parse_canonical_effort_token("ultra"),
+            Some(ReasoningEffort::Ultra)
+        );
         assert_eq!(
             parse_canonical_effort_token("max"),
             Some(ReasoningEffort::Max)
@@ -1713,7 +1759,12 @@ mod tests {
         );
         let bad_type = as_map(serde_json::json!({"reasoningEffort": 3}));
         assert_eq!(parse_reasoning_effort_meta(Some(&bad_type)), None);
-        let unknown = as_map(serde_json::json!({"reasoningEffort": "ULTRA"}));
+        let ultra = as_map(serde_json::json!({"reasoningEffort": "ULTRA"}));
+        assert_eq!(
+            parse_reasoning_effort_meta(Some(&ultra)),
+            Some(ReasoningEffort::Ultra)
+        );
+        let unknown = as_map(serde_json::json!({"reasoningEffort": "FUTURE"}));
         assert_eq!(parse_reasoning_effort_meta(Some(&unknown)), None);
     }
 

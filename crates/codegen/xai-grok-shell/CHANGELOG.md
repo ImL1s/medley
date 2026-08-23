@@ -1,5 +1,89 @@
 # Changelog
 
+# 0.2.121 — 2026-08-05
+
+## Features
+
+- Codex model catalogs can now expose the distinct `ultra` client/session tier
+  through model selection, TUI and ACP menus, and persisted sessions. Only
+  models that advertise the tier can select it. Responses requests encode it
+  as `max`; authenticated Codex sessions also receive proactive multi-agent
+  guidance, while the model still decides whether a task warrants a subagent.
+- Dashboard rows now show a short summary of what the agent did in the previous turn.
+- The Extensions modal now shows items grouped and sorted alphabetically with collapsible sections for Skills.
+- When a subagent runs in the background the parent agent is now reminded to keep working on the original task.
+- Clients can now reattach to a running session without replaying the transcript and explicitly close sessions.
+- Grok no longer asks which project directory to use when launched from your home folder or other non-project directories.
+- **/feedback** now opens a dedicated report box instead of entering prompt mode.
+- **Auto theme detection** now works over SSH and inside tmux sessions.
+- **Voice and Finance tool cards** are now rendered with icons and localized labels.
+- **Markdown tables** now reflow inside cells on narrow panes instead of clipping the right border.
+- **Permission prompts** now show the complete script clearly instead of dimmed fragments.
+- **Long bash commands** in permission prompts can now be expanded with Ctrl-F.
+
+## Bug Fixes
+
+- Provider credentials rejected by the identity provider are now removed with
+  an atomic, durable scoped-store update instead of a truncate fallback, while
+  preserving credentials for sibling providers.
+- New sessions now publish their summary, prompt context, system prompt, and
+  initial chat history as one complete tree instead of colliding with their own
+  eager artifact writes.
+- Per-session publication and mutation locks now live in an owner-only,
+  path-anchored namespace that rejects link indirection. Stop every older
+  Medley process before upgrading so old and new lock protocols never overlap.
+- Third-party web-search endpoints no longer receive xAI identity, compaction,
+  or tracing metadata; trusted xAI and Codex transports retain the headers they
+  require.
+- MCP tools that return images no longer drop or corrupt screenshots when output is large.
+- Resuming a restored child session after a remote parent restore no longer fails with 404.
+- The default branch is now correctly detected for hand-initialized repos that lack origin/HEAD.
+- Disabled MCP servers that can still be re-enabled now remain visible in the list instead of disappearing.
+- Rapid send-now presses or messages sent while waiting on subagents no longer lose earlier queued messages.
+- Pressing Esc or the stop button now reliably prevents background tasks from restarting the model after a cancel.
+- **Login** no longer skips when an invalid first-party API key is present in the environment.
+- **Model picker** and command palette now work while reviewing a plan before approving.
+- **Workflow parallel()** panels no longer launch hundreds of children at once and stall.
+- **Dashboard overlay** no longer shows useless prev/next shortcuts when only one agent is present.
+- **Pinned prompt headers** can now be selected and copied with the mouse.
+- **Tab** and **Esc** now behave consistently on every blocking card (question, permission, cancel-turn).
+- **Dashboard navigation** after /new now correctly exits back to the dashboard from an empty prompt.
+- **Codebase restore** no longer hangs on large or shallow git repositories.
+- **Remote session resume** restores conversation only unless --restore-code is explicitly used.
+- **Copying CJK text** with the mouse now includes every character at the selection edges.
+- **Resume search** now finds sessions by UUID even when they live in other directories.
+- **API errors** now appear as clean banners instead of raw JSON dumps in the TUI.
+- **Typing exit or quit** in the dashboard now exits the CLI instead of starting a new session.
+- **Mode indicator** (plan/agent/ask) now correctly reflects the session's actual mode after resume and transitions.
+- **`/delete`** now returns to the dashboard when you delete a session you opened from it.
+- **Enter in the slash command menu** now runs the highlighted command.
+- **Grok** now retries more server errors during outages for better reliability.
+- **Syntax highlighting** in long diff lines now stays correct when wrapped.
+- **Slash commands** that require a session now show a helpful message when used from the dashboard.
+- **Exiting the CLI** now properly resets terminal modes even in minimal mode.
+- **Queued prompts** now stay visible and reachable while waiting on subagents.
+- **Auto recaps** no longer appear in the middle of new turns or while busy.
+- **Error messages** in /btw side questions now show fully wrapped.
+- **Queued slash commands** and images can now be reordered in the queue pane.
+- **Error messages** in /btw side questions now show fully wrapped.
+- **/feedback** no longer resets the composer input mode after the pane closes.
+
+## Performance
+
+- Forking very large sessions no longer uses many times the session file size in memory.
+- **Exiting** an empty session is now instant even on slow networks.
+
+
+# 0.2.120 — 2026-08-03
+
+## Bug Fixes
+
+- **Model picker** now updates the status bar and /model menu immediately, even before the first prompt creates a session.
+- **Changes panel** now refreshes after the agent commits on the current branch instead of showing stale unstaged files.
+- **Background task** completions now report the full log size and read hint even when only a short prefix was captured.
+- **GitHub export** on old hibernated sessions now shows a clear message to start a new chat instead of a generic error.
+
+
 # 0.2.119 — 2026-08-02
 
 ## Features
@@ -1950,5 +2034,3 @@
 ## Performance
 
 - **Large chat sessions** now use substantially less memory and run faster during forks, rewinds, and compaction.
-
-

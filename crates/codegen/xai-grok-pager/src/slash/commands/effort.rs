@@ -85,6 +85,7 @@ impl SlashCommand for EffortCommand {
             Ok(effort) => CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: Some(effort),
+                session_only: true,
             }),
             Err(err) => CommandResult::Error(err.message()),
         }
@@ -157,11 +158,11 @@ mod tests {
         match result {
             CommandResult::Error(msg) => {
                 assert!(msg.contains("Usage: /effort"));
-                // Legacy menu option ids only — not none/minimal.
-                assert!(msg.contains("xhigh|high|medium|low"), "msg={msg}");
+                // Legacy menu option ids only — `none` still requires an
+                // explicit server menu, while Minimal is a legacy level.
+                assert!(msg.contains("xhigh|high|medium|low|minimal"), "msg={msg}");
                 assert!(msg.contains("current: medium"));
                 assert!(!msg.contains("none"));
-                assert!(!msg.contains("minimal"));
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -181,7 +182,7 @@ mod tests {
                 assert!(msg.contains("use one of:"), "msg={msg}");
                 assert!(msg.contains("xhigh"), "msg={msg}");
                 assert!(!msg.contains("none"), "msg={msg}");
-                assert!(!msg.contains("minimal"), "msg={msg}");
+                assert!(msg.contains("minimal"), "msg={msg}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -196,46 +197,50 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = EffortCommand.run(&mut ctx, "high");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::High));
+                assert!(session_only, "effort switch must be session-only");
             }
             other => panic!("expected SwitchModel with effort, got {other:?}"),
         }
     }
 
     #[test]
-    fn none_and_minimal_rejected_when_model_menu_omits_them() {
-        // Legacy fallback menu is low..xhigh — `none`/`minimal` used to pass
-        // through and 400 on grok-4.5; reject at the TUI instead.
+    fn menu_less_reasoning_model_accepts_minimal_but_rejects_none_in_effort_command() {
+        // The menu-less fallback preserves legacy Minimal. `none` remains
+        // server-advertised only, so it is still rejected here.
         let mut state = ModelState::default();
         let (id, info) = model_with_reasoning("reasoning-x", "Reasoning X");
         state.available.insert(id.clone(), info);
-        state.current = Some(id);
+        state.current = Some(id.clone());
         let mut ctx = dummy_exec_ctx(&state);
-        for token in ["none", "minimal"] {
-            let result = EffortCommand.run(&mut ctx, token);
-            match result {
-                CommandResult::Error(ref msg) => {
-                    assert!(
-                        msg.contains(&format!("unknown effort level '{token}'")),
-                        "expected Error for {token}, got {msg}"
-                    );
-                    // Must not re-advertise the rejected token as a valid choice
-                    // (aside from quoting it in "unknown effort level '…'").
-                    let after_prefix = msg
-                        .split_once("; ")
-                        .map(|(_, rest)| rest)
-                        .unwrap_or(msg.as_str());
-                    assert!(
-                        !after_prefix.contains(token),
-                        "error must not list {token} as offered: {msg}"
-                    );
-                    assert!(!msg.contains("unset"), "msg={msg}");
-                }
-                other => panic!("expected Error for {token}, got {other:?}"),
+        match EffortCommand.run(&mut ctx, "minimal") {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
+                assert_eq!(model_id, id);
+                assert_eq!(effort, Some(ReasoningEffort::Minimal));
             }
+            other => panic!("expected SwitchModel with minimal, got {other:?}"),
         }
+
+        let CommandResult::Error(msg) = EffortCommand.run(&mut ctx, "none") else {
+            panic!("expected Error for none");
+        };
+        assert!(msg.contains("unknown effort level 'none'"), "msg={msg}");
+        let after_prefix = msg
+            .split_once("; ")
+            .map(|(_, rest)| rest)
+            .unwrap_or(msg.as_str());
+        assert!(!after_prefix.contains("none"), "msg={msg}");
+        assert!(!msg.contains("unset"), "msg={msg}");
     }
 
     #[test]
@@ -258,11 +263,69 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = EffortCommand.run(&mut ctx, "none");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::None));
             }
             other => panic!("expected SwitchModel with none, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ultra_is_rendered_and_dispatched_when_model_menu_offers_it() {
+        let mut state = ModelState::default();
+        let id = acp::ModelId::new(Arc::from("gpt-5.6-sol"));
+        let info = acp::ModelInfo::new(id.clone(), "GPT-5.6 Sol".to_string()).meta(
+            serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEfforts": [{
+                    "value": "ultra",
+                    "label": "Ultra",
+                    "description": "Maximum reasoning with proactive multi-agent guidance",
+                    "default": true
+                }],
+            })
+            .as_object()
+            .cloned(),
+        );
+        state.available.insert(id.clone(), info);
+        state.current = Some(id.clone());
+
+        let app_ctx = AppCtx {
+            models: &state,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+        };
+        let items = EffortCommand
+            .suggest_args(&app_ctx, "")
+            .expect("Ultra model has a menu");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert_text, "ultra");
+        assert_eq!(items[0].display, "Ultra");
+        assert_eq!(
+            items[0].description,
+            "Maximum reasoning with proactive multi-agent guidance"
+        );
+
+        let mut exec_ctx = dummy_exec_ctx(&state);
+        match EffortCommand.run(&mut exec_ctx, "ultra") {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
+                assert_eq!(model_id, id);
+                assert_eq!(effort, Some(ReasoningEffort::Ultra));
+            }
+            other => panic!("expected SwitchModel Ultra, got {other:?}"),
         }
     }
 
@@ -283,7 +346,11 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         // The rendered row inserts the id; `/effort deep` must send `xhigh`.
         match EffortCommand.run(&mut ctx, "deep") {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id,
+                effort,
+                session_only: _,
+            }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Xhigh));
             }
@@ -373,5 +440,114 @@ mod tests {
         assert_eq!(items[3].insert_text, "low");
         assert!(items[0].match_text.starts_with("a "));
         assert!(items[3].match_text.starts_with("d "));
+    }
+
+    /// #306 gate 4 (**component presentation** — fabricated metadata, not shell
+    /// dispatch; #306 live TUI still open): effort menu is model-specific; none
+    /// only when advertised;
+    /// menu-less models still accept minimal and reject none.
+    #[test]
+    fn codex_effort_picker_obeys_each_model_menu_including_minimal_and_none() {
+        let mut state = ModelState::default();
+        // Model A: catalog menu with none
+        let id_a = acp::ModelId::new(Arc::from("codex-with-none"));
+        let info_a = acp::ModelInfo::new(id_a.clone(), "Codex With None".to_string()).meta(
+            serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEfforts": [
+                    { "value": "none", "label": "None", "default": true },
+                    { "value": "high", "label": "High" },
+                ],
+            })
+            .as_object()
+            .cloned(),
+        );
+        // Model B: menu-less reasoning
+        let (id_b, info_b) = model_with_reasoning("reasoning-menu-less", "Reasoning Menu Less");
+        state.available.insert(id_a.clone(), info_a);
+        state.available.insert(id_b.clone(), info_b);
+
+        let cmd = EffortCommand;
+
+        // Seat A
+        state.current = Some(id_a.clone());
+        let suggest_a = {
+            let ctx = AppCtx {
+                models: &state,
+                cwd: std::path::Path::new("."),
+                has_session_announcements: false,
+                billing_surface_visible: true,
+                usage_command_visible: true,
+                workflows_available: true,
+                screen_mode: crate::app::ScreenMode::Fullscreen,
+            };
+            cmd.suggest_args(&ctx, "").expect("A has menu")
+        };
+        let ids_a: Vec<String> = suggest_a.iter().map(|i| i.insert_text.clone()).collect();
+        assert!(
+            ids_a.iter().any(|s| s == "none"),
+            "A must offer none: {ids_a:?}"
+        );
+        assert!(
+            ids_a.iter().any(|s| s == "high"),
+            "A must offer high: {ids_a:?}"
+        );
+        {
+            let mut ctx = dummy_exec_ctx(&state);
+            match EffortCommand.run(&mut ctx, "none") {
+                CommandResult::Action(Action::SwitchModel {
+                    model_id,
+                    effort,
+                    session_only: _,
+                }) => {
+                    assert_eq!(model_id, id_a);
+                    assert_eq!(effort, Some(ReasoningEffort::None));
+                }
+                other => panic!("expected SwitchModel none, got {other:?}"),
+            }
+        }
+
+        // Seat B
+        state.current = Some(id_b.clone());
+        let suggest_b = {
+            let ctx = AppCtx {
+                models: &state,
+                cwd: std::path::Path::new("."),
+                has_session_announcements: false,
+                billing_surface_visible: true,
+                usage_command_visible: true,
+                workflows_available: true,
+                screen_mode: crate::app::ScreenMode::Fullscreen,
+            };
+            cmd.suggest_args(&ctx, "").expect("B has legacy menu")
+        };
+        let ids_b: Vec<String> = suggest_b.iter().map(|i| i.insert_text.clone()).collect();
+        assert_ne!(ids_a, ids_b, "suggest lists must differ between A and B");
+        assert!(
+            !ids_b.iter().any(|s| s == "none"),
+            "B must not offer none: {ids_b:?}"
+        );
+        assert!(
+            ids_b.iter().any(|s| s == "minimal"),
+            "B must offer minimal: {ids_b:?}"
+        );
+        {
+            let mut ctx = dummy_exec_ctx(&state);
+            match EffortCommand.run(&mut ctx, "minimal") {
+                CommandResult::Action(Action::SwitchModel {
+                    model_id,
+                    effort,
+                    session_only: _,
+                }) => {
+                    assert_eq!(model_id, id_b);
+                    assert_eq!(effort, Some(ReasoningEffort::Minimal));
+                }
+                other => panic!("expected minimal, got {other:?}"),
+            }
+            let CommandResult::Error(msg) = EffortCommand.run(&mut ctx, "none") else {
+                panic!("expected Error for none on B");
+            };
+            assert!(msg.contains("unknown effort level 'none'"), "msg={msg}");
+        }
     }
 }

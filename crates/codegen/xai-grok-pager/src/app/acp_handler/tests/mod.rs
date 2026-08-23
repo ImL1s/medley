@@ -183,6 +183,7 @@ pub(super) fn last_session_event(sb: &ScrollbackState) -> Option<SessionEvent> {
 pub(super) fn make_app_with_agent(session_id: &str) -> AppView {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = AppView::new(tx.clone(), ModelState::default(), Vec::new());
+    app.leader_mode = true;
     let id = AgentId(0);
     let agent = make_agent(Some(session_id));
     app.agents.insert(id, agent);
@@ -1312,6 +1313,8 @@ pub(super) fn test_subagent_spawned(
         context_normalized: false,
         capability_mode: None,
         workflow_run_id: None,
+        route_receipt_digest: None,
+        selected_catalog_id: None,
         persona: None,
         role: None,
         model: None,
@@ -2144,3 +2147,4 @@ mod background_tasks;
 mod models;
 mod mcp;
 mod git_head;
+mod version_mismatch;

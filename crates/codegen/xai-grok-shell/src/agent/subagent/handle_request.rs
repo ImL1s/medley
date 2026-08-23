@@ -1,6 +1,13 @@
 use super::*;
+use crate::session::storage::{StorageAdapter, jsonl::JsonlStorageAdapter};
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_tools::implementations::{grok_build, opencode};
+pub(super) fn inherited_web_search_model_id(
+    follows_default: bool,
+    effective_model_id: &str,
+) -> Option<&str> {
+    follows_default.then_some(effective_model_id)
+}
 pub(super) fn canonical_total_tokens(totals: &xai_chat_state::UsageTotals) -> u64 {
     totals.total_tokens()
 }
@@ -53,6 +60,140 @@ pub(super) fn task_model_override_error(
     }
     let requested = requested?;
     crate::agent::models::task_model_error_for_catalog(requested, available, is_session_auth)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResumeModelLineage {
+    route: Option<String>,
+    agent_type: Option<String>,
+    catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeModelLineageError {
+    MissingRoute,
+    MissingDurableIdentity,
+    RouteChanged,
+    HarnessChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeModelLineageRecoveryError {
+    ModelConflict,
+    RouteConflict,
+}
+
+fn validate_resume_model_lineage(
+    source: &ResumeModelLineage,
+    current_route: &str,
+    current_agent_type: &str,
+) -> Result<(), ResumeModelLineageError> {
+    let Some(source_route) = source.route.as_deref() else {
+        return Err(ResumeModelLineageError::MissingRoute);
+    };
+    if source_route != current_route {
+        return Err(ResumeModelLineageError::RouteChanged);
+    }
+    if source.agent_type.is_none() && source.catalog_identity.is_none() {
+        return Err(ResumeModelLineageError::MissingDurableIdentity);
+    }
+    if source
+        .agent_type
+        .as_deref()
+        .is_some_and(|agent_type| agent_type != current_agent_type)
+    {
+        return Err(ResumeModelLineageError::HarnessChanged);
+    }
+    Ok(())
+}
+
+async fn recover_resume_model_lineage(
+    source: &ResumeSourceData,
+) -> Result<ResumeModelLineage, ResumeModelLineageRecoveryError> {
+    let child_info = SessionInfo {
+        id: acp::SessionId::new(source.child_session_id.clone()),
+        cwd: source.child_cwd.clone(),
+    };
+    let child_dir = session::persistence::session_dir(&child_info);
+    recover_resume_model_lineage_at(source, child_dir).await
+}
+
+async fn recover_resume_model_lineage_at(
+    source: &ResumeSourceData,
+    child_dir: PathBuf,
+) -> Result<ResumeModelLineage, ResumeModelLineageRecoveryError> {
+    let mut lineage = ResumeModelLineage {
+        route: source.model_route.clone(),
+        agent_type: source.model_agent_type.clone(),
+        catalog_identity: None,
+    };
+    if source.model_id.is_none() {
+        return Ok(lineage);
+    }
+    let metadata_is_incomplete = lineage.route.is_none() || lineage.agent_type.is_none();
+
+    let child_info = SessionInfo {
+        id: acp::SessionId::new(source.child_session_id.clone()),
+        cwd: source.child_cwd.clone(),
+    };
+    let storage = JsonlStorageAdapter::with_explicit_session_dir(child_dir);
+    let Ok(summary) = storage.load_summary(&child_info).await else {
+        if metadata_is_incomplete {
+            tracing::warn!(
+                source_subagent_id = %source.subagent_id,
+                "Legacy resume metadata lacks complete model lineage and the child session summary could not be loaded"
+            );
+        }
+        return Ok(lineage);
+    };
+    let Some(identity) = summary.catalog_identity else {
+        if metadata_is_incomplete {
+            tracing::warn!(
+                source_subagent_id = %source.subagent_id,
+                "Legacy resume metadata lacks complete model lineage and the child session summary has no catalog identity"
+            );
+        }
+        return Ok(lineage);
+    };
+    if source.model_id.as_deref() != Some(identity.model_id.as_str())
+        || summary.current_model_id.0.as_ref() != identity.model_id
+    {
+        tracing::error!(
+            source_subagent_id = %source.subagent_id,
+            metadata_model_id = ?source.model_id,
+            summary_model_id = %summary.current_model_id.0,
+            catalog_model_id = %identity.model_id,
+            "Refusing inconsistent legacy resume model lineage"
+        );
+        return Err(ResumeModelLineageRecoveryError::ModelConflict);
+    }
+    if lineage
+        .route
+        .as_deref()
+        .is_some_and(|route| route != identity.route)
+    {
+        tracing::error!(
+            source_subagent_id = %source.subagent_id,
+            metadata_route = ?lineage.route,
+            summary_route = %identity.route,
+            "Refusing conflicting durable resume route lineage"
+        );
+        return Err(ResumeModelLineageRecoveryError::RouteConflict);
+    }
+
+    if lineage.route.is_none() {
+        lineage.route = Some(identity.route.clone());
+    }
+    lineage.catalog_identity = Some(identity);
+    Ok(lineage)
+}
+
+fn should_preflight_model_harness(
+    is_resume: bool,
+    has_committed_resume_model: bool,
+    has_fresh_model_selection: bool,
+) -> bool {
+    !(is_resume && has_committed_resume_model) && has_fresh_model_selection
 }
 /// Lifecycle guard that keeps managed-gateway refresh barriers aware of live
 /// child sessions until this spawn path exits.
@@ -137,18 +278,24 @@ impl Drop for PreHandoffWorktreeCleanupGuard {
     name = "subagent.handle_request",
     skip_all,
     fields(
-        subagent_id = %request.id,
+        subagent_id = %run.request.id,
         parent_session_id = %ctx.parent_session_id,
-        subagent_type = %request.subagent_type,
+        subagent_type = %run.request.subagent_type,
     )
 )]
 pub(crate) async fn run_shell_child(
-    mut request: SubagentRequest,
+    run: grok_build::task::coordinator::ChildRunRequest<ShellChildRuntime>,
     mut ctx: SubagentSpawnContext,
-    cancel_token: CancellationToken,
-    reporter: ChildReporter<ShellChildRuntime>,
     gateway: &GatewaySender,
 ) -> ChildRunOutput<ShellCompletionData> {
+    let grok_build::task::coordinator::ChildRunRequest {
+        mut request,
+        spawn_parent_session_id: _,
+        cancellation: cancel_token,
+        reporter,
+        queued_for,
+        session_running,
+    } = run;
     let start = std::time::Instant::now();
     let mut completion_data = ShellCompletionData::from_context(&ctx);
     if request.owner.is_workflow() && cancel_token.is_cancelled() {
@@ -206,6 +353,7 @@ pub(crate) async fn run_shell_child(
         .parent_session_info
         .as_ref()
         .map(|i| std::path::Path::new(&i.cwd));
+    let has_explicit_reasoning_effort = request.runtime_overrides.reasoning_effort.is_some();
     let mut effective_runtime = xai_grok_subagent_resolution::resolve_runtime_config(
         &request.subagent_type,
         &request.runtime_overrides,
@@ -255,6 +403,8 @@ pub(crate) async fn run_shell_child(
                 subagent_type: info.subagent_type,
                 persona: info.persona,
                 model_id: info.model_id,
+                model_route: info.model_route,
+                model_agent_type: info.model_agent_type,
             }),
             SubagentResumeLookup::Missing => {
                 match durable_resume_source_for(resume_id, &ctx.parent_session_id, &ctx.parent_cwd)
@@ -276,6 +426,27 @@ pub(crate) async fn run_shell_child(
         }
     } else {
         None
+    };
+    let mut resume_model_lineage = match resume_source.as_ref() {
+        Some(source) => match recover_resume_model_lineage(source).await {
+            Ok(lineage) => Some(lineage),
+            Err(conflict) => {
+                let detail = match conflict {
+                    ResumeModelLineageRecoveryError::ModelConflict => {
+                        "subagent metadata conflicts with the durable child session model identity"
+                    }
+                    ResumeModelLineageRecoveryError::RouteConflict => {
+                        "subagent metadata conflicts with the durable child session route identity"
+                    }
+                };
+                let msg = format!(
+                    "Cannot resume from subagent '{}': {detail}.",
+                    source.subagent_id,
+                );
+                return child_run_output(failure_result(&request, &msg), completion_data, None);
+            }
+        },
+        None => None,
     };
     if let Some(ref source) = resume_source {
         if request.runtime_overrides.model.is_some() {
@@ -512,82 +683,119 @@ pub(crate) async fn run_shell_child(
             )
         });
     }
-    if request.fork_context {
-        effective_runtime.model = Some(ctx.model_id.0.to_string());
-    }
-    let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
+    let mut prepared_model = match resolve_request_prepared_model_with_native_route(
+        request.fork_context,
         effective_runtime.model.as_deref(),
         &request.subagent_type,
-        &definition.model,
+        &definition,
+        &selected_harness_definition,
         &ctx,
+        Some(request.id.as_str()),
+        None,
+        resume_source.is_none(),
     )
-    .await;
-    let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
+    .await
     {
-        let model_str = &effective_sampling_config.model;
-        let model_unknown = !model_str.is_empty()
-            && !ctx.available_models.is_empty()
-            && !ctx.available_models.contains_key(model_str)
-            && !ctx
-                .available_models
-                .values()
-                .any(|e| e.info().model == *model_str);
-        if model_unknown {
-            let (parent_config, parent_mid) = read_parent_sampling_config(&ctx).await;
-            tracing::warn!(
-                subagent_id = %request.id,
-                resolved_model = %model_str,
-                parent_model = %parent_config.model,
-                "Resolved subagent model not found in available models — \
-                 falling back to parent model"
-            );
-            effective_sampling_config = parent_config;
-            effective_model_id = parent_mid;
+        Ok(resolved) => resolved,
+        Err(msg) => {
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
-    }
+    };
+    let mut native_route_receipt = prepared_model.receipt.take();
+    let mut prepared_model = prepared_model.prepared;
+    let mut effective_sampling_config = prepared_model.sampling_config.clone();
+    let mut effective_model_id = prepared_model.model_id.clone();
+    let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
     if let Some(ref source) = resume_source
         && let Some(ref source_model) = source.model_id
-        && effective_model_id.0.as_ref() != source_model.as_str()
     {
-        if let Some(resolved) = resolve_model_override_to_config(source_model, &ctx) {
-            tracing::info!(
-                subagent_id = %request.id,
-                resolved_model = %effective_model_id.0,
-                source_model = source_model,
-                "Pinning resumed child to source model"
-            );
-            effective_sampling_config = resolved.0;
-            effective_model_id = resolved.1;
-        } else {
+        let persisted_identity = resume_model_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.catalog_identity.clone());
+        let reconciled_identity = persisted_identity.as_ref().and_then(|identity| {
+            crate::agent::models::reconcile_persisted_catalog_identity(
+                &ctx.available_models,
+                identity,
+            )
+        });
+        if persisted_identity.is_some() && reconciled_identity.is_none() {
             let msg = format!(
-                "Cannot resume from subagent '{}': source model '{source_model}' \
-                 is no longer available in the model catalogue.",
+                "Cannot resume from subagent '{}': persisted source model lineage no longer matches the current catalog.",
                 source.subagent_id,
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
+        if let Some(identity) = reconciled_identity.as_ref()
+            && let Some(lineage) = resume_model_lineage.as_mut()
+        {
+            lineage.catalog_identity = Some(identity.clone());
+        }
+        let resume_model_id = reconciled_identity
+            .as_ref()
+            .map_or(source_model.as_str(), |identity| identity.model_id.as_str());
+        if effective_model_id.0.as_ref() != resume_model_id {
+            if let Some(resolved) = resolve_model_override_to_prepared(resume_model_id, &ctx) {
+                tracing::info!(
+                    subagent_id = %request.id,
+                    resolved_model = %effective_model_id.0,
+                    source_model = resume_model_id,
+                    "Pinning resumed child to source model"
+                );
+                effective_sampling_config = resolved.sampling_config.clone();
+                effective_model_id = resolved.model_id.clone();
+                prepared_model = resolved;
+            } else {
+                let msg = format!(
+                    "Cannot resume from subagent '{}': source model '{resume_model_id}' \
+                     is no longer available in the model catalogue.",
+                    source.subagent_id,
+                );
+                return child_run_output(failure_result(&request, &msg), completion_data, None);
+            }
+        }
+        native_route_receipt = native_route_live::stamp_receipt_for_selection(
+            &definition,
+            &ctx,
+            &native_route_live::synthetic_catalog_from_available_models(&ctx.available_models),
+            effective_model_id.0.as_ref(),
+            Some(request.id.as_str()),
+            Some(ResumePin {
+                source_catalog_id: resume_model_id.to_string(),
+                source_receipt_digest: native_route_live::resume_source_receipt_digest(
+                    load_subagent_meta(
+                        &source.subagent_id,
+                        &ctx.parent_session_id,
+                        &ctx.parent_cwd,
+                    )
+                    .as_ref(),
+                ),
+                // Live catalog `route_key` is the catalog id, not the wire slug
+                // stored on `CatalogIdentity.route`.
+                source_route_key: Some(resume_model_id.to_string()),
+            }),
+            native_route_now_ms(),
+        );
     }
+    // A resident parent keeps its immutable sampling config across catalog
+    // refreshes. A new child must instead honor the fresh prepared menu, or a
+    // narrowed model can inherit a now-invalid effort and send it on the wire.
+    reconcile_inherited_subagent_reasoning_effort(
+        &mut effective_sampling_config,
+        prepared_model.supports_reasoning_effort,
+        &prepared_model.reasoning_efforts,
+    );
     let requested_model_matches_effective = |requested: &str| {
-        crate::agent::config::find_model_by_id(&ctx.available_models, requested).is_some_and(
-            |entry| {
-                let resolved_id = if ctx.available_models.contains_key(requested) {
-                    requested
-                } else {
-                    entry.info().model.as_str()
-                };
-                effective_model_id.0.as_ref() == resolved_id
-            },
+        crate::agent::models::resolve_catalog_identity(
+            &ctx.available_models,
+            &acp::ModelId::new(requested),
         )
+        .is_some_and(|identity| identity.model_id == effective_model_id.0.as_ref())
     };
-    let explicit_model_selection = resume_source
-        .as_ref()
-        .and_then(|source| source.model_id.as_deref())
-        .is_some_and(&requested_model_matches_effective)
-        || (!request.fork_context
-            && effective_runtime
-                .model
-                .as_deref()
-                .is_some_and(&requested_model_matches_effective))
+    let explicit_model_selection = request.fork_context
+        || effective_runtime
+            .model
+            .as_deref()
+            .is_some_and(&requested_model_matches_effective)
         || ctx
             .subagent_model_overrides
             .get(&request.subagent_type)
@@ -597,19 +805,74 @@ pub(crate) async fn run_shell_child(
                 requested_model_matches_effective(model)
             }
             xai_grok_agent::config::ModelOverride::Inherit => false,
-        };
-    if explicit_model_selection {
-        let Some(effective_model_entry) = crate::agent::config::find_model_by_id(
-            &ctx.available_models,
-            effective_model_id.0.as_ref(),
-        ) else {
+        }
+        || native_route_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.selection_mode != "inherit")
+        || definition
+            .models
+            .iter()
+            .any(|model| requested_model_matches_effective(model));
+    let is_resume = resume_source.is_some();
+    let has_committed_resume_model = resume_source
+        .as_ref()
+        .and_then(|source| source.model_id.as_deref())
+        .is_some();
+    if is_resume && has_committed_resume_model {
+        if let Some(source_lineage) = resume_model_lineage.as_ref()
+            && let Err(lineage_error) = validate_resume_model_lineage(
+                source_lineage,
+                &prepared_model.catalog_identity.route,
+                &prepared_model.agent_type,
+            )
+        {
+            let detail = match lineage_error {
+                ResumeModelLineageError::MissingRoute => {
+                    "source model route evidence is missing; resume requires persisted route lineage"
+                }
+                ResumeModelLineageError::MissingDurableIdentity => {
+                    "legacy metadata has no harness lineage and no reconciled durable catalog identity"
+                }
+                ResumeModelLineageError::RouteChanged => {
+                    "source model route no longer matches the current catalog"
+                }
+                ResumeModelLineageError::HarnessChanged => {
+                    "source model harness no longer matches the current catalog"
+                }
+            };
+            let msg = format!(
+                "Cannot resume from subagent '{}': {detail}.",
+                resume_source
+                    .as_ref()
+                    .map_or("unknown", |source| source.subagent_id.as_str()),
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+        if resume_model_lineage
+            .as_ref()
+            .is_some_and(|lineage| lineage.agent_type.is_none())
+        {
+            tracing::warn!(
+                source_subagent_id = %resume_source
+                    .as_ref()
+                    .map_or("unknown", |source| source.subagent_id.as_str()),
+                model_route = %prepared_model.catalog_identity.route,
+                "Migrating legacy resume without historical harness lineage after durable catalog identity reconciliation"
+            );
+        }
+    } else if should_preflight_model_harness(
+        is_resume,
+        has_committed_resume_model,
+        explicit_model_selection,
+    ) {
+        if prepared_model.agent_type.is_empty() {
             let msg = format!(
                 "Cannot spawn subagent '{}': resolved model '{}' is no longer in the model catalog.",
                 request.subagent_type, effective_model_id.0,
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
-        };
-        let required_agent_type = effective_model_entry.info().agent_type.as_str();
+        }
+        let required_agent_type = prepared_model.agent_type.as_str();
         if let Err(harness_error) = resolve_and_validate_subagent_model_harness(
             &selected_harness_definition,
             required_agent_type,
@@ -637,20 +900,30 @@ pub(crate) async fn run_shell_child(
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
     }
-    if let Some(raw) = effective_runtime.reasoning_effort.as_deref()
-        && ctx
-            .models_manager
-            .model_supports_reasoning_effort(effective_model_id.0.as_ref())
-    {
-        match raw.parse::<ReasoningEffort>() {
-            Ok(eff) => effective_sampling_config.reasoning_effort = Some(eff),
-            Err(err) => {
-                tracing::warn!(
-                    value = raw,
-                    error = %err,
-                    "subagent reasoning_effort: parse failed, ignoring override"
-                )
-            }
+    if let Some(raw) = effective_runtime.reasoning_effort.as_deref() {
+        if let Some(effort) = resolve_subagent_reasoning_effort_override(
+            prepared_model.supports_reasoning_effort,
+            &prepared_model.reasoning_efforts,
+            raw,
+        ) {
+            effective_sampling_config.reasoning_effort = Some(effort);
+        } else if has_explicit_reasoning_effort {
+            let msg = format!(
+                "Cannot spawn subagent '{}' with model '{}': reasoning_effort '{}' is not offered by that model.",
+                request.subagent_type, prepared_model.model_id.0, raw,
+            );
+            tracing::warn!(
+                value = raw,
+                model_id = %prepared_model.model_id.0,
+                "subagent reasoning_effort rejected because the selected model does not offer it"
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
+        } else {
+            tracing::warn!(
+                value = raw,
+                model_id = %prepared_model.model_id.0,
+                "subagent reasoning_effort is invalid or unavailable for model; ignoring inherited default"
+            );
         }
     }
     let subagent_id = request.id.clone();
@@ -742,6 +1015,10 @@ pub(crate) async fn run_shell_child(
             .map(|p| p.to_string_lossy().to_string()),
         snapshot_ref: None,
         effective_model_id: Some(effective_model_id.0.to_string()),
+        effective_model_route: Some(prepared_model.catalog_identity.route.clone()),
+        effective_model_agent_type: (!prepared_model.agent_type.is_empty())
+            .then(|| prepared_model.agent_type.clone()),
+        native_route_receipt: native_route_receipt.clone(),
     };
     write_subagent_meta(&subagent_meta_dir, &subagent_meta);
     if let (Some(bucket_url), Some(upload_method)) = (&ctx.gcs_bucket_url, &ctx.gcs_upload_method) {
@@ -801,6 +1078,12 @@ pub(crate) async fn run_shell_child(
             model: Some(effective_model_id.0.to_string()),
             resumed_from: request.resume_from.clone(),
             workflow_run_id: request.owner.workflow_run_id().map(str::to_string),
+            route_receipt_digest: native_route_receipt
+                .as_ref()
+                .map(|receipt| receipt.route_digest.clone()),
+            selected_catalog_id: native_route_receipt
+                .as_ref()
+                .map(|receipt| receipt.selected_catalog_id.clone()),
         },
         ctx.parent_cmd_tx.as_ref(),
     );
@@ -890,13 +1173,12 @@ pub(crate) async fn run_shell_child(
     let parent_traceparent = xai_file_utils::trace_context::current_traceparent();
     let tracker_child_cwd = child_session_info.cwd.clone();
     let tracker_model_id = effective_model_id.0.to_string();
+    let tracker_model_route = prepared_model.catalog_identity.route.clone();
+    let tracker_model_agent_type =
+        (!prepared_model.agent_type.is_empty()).then(|| prepared_model.agent_type.clone());
     let initial_child_tokens = xai_chat_state::estimate_conversation_tokens(&forked_conversation);
-    let model_entry = crate::agent::config::find_model_by_id(
-        &ctx.available_models,
-        effective_model_id.0.as_ref(),
-    );
-    let model_has_own_creds = model_entry.is_some_and(|entry| entry.has_own_credentials());
-    let inherited_auth_type = subagent_auth_type(model_entry, &ctx.auth_method_id);
+    let model_has_own_creds = prepared_model.model_has_own_credentials;
+    let inherited_auth_type = prepared_model.auth_type;
     // `read_parent_sampling_config` sets `credential_source` only when the
     // parent declared a credential header, so it is `None` for the ordinary
     // case -- while `api_key` here is the parent's live session token. Falling
@@ -1170,6 +1452,10 @@ pub(crate) async fn run_shell_child(
         subagent_id: request.id.clone(),
         parent_session_id: request.parent_session_id.clone(),
         subagent_type: request.subagent_type.clone(),
+        owner: telemetry_owner_kind(&request),
+        workflow_run_id: request.owner.workflow_run_id().map(str::to_string),
+        queued_ms: queued_for.map(|queued| u64::try_from(queued.as_millis()).unwrap_or(u64::MAX)),
+        session_running: u32::try_from(session_running).unwrap_or(u32::MAX),
         persona: request.runtime_overrides.persona.clone(),
         fork_context: matches!(context_source, InitialContextSource::Forked),
         resume_from: request.resume_from.clone(),
@@ -1180,10 +1466,51 @@ pub(crate) async fn run_shell_child(
     });
     let subagent_session_default_agent_profile = Some(definition.name.clone());
     let subagent_model_id = effective_sampling_config.model.clone();
+    let effective_catalog_identity = prepared_model.catalog_identity;
+    effective_model_id = acp::ModelId::new(effective_catalog_identity.model_id.clone());
+    let image_description_model = crate::config::auxiliary_model_or_operative(
+        &ctx.image_description_model,
+        effective_model_id.0.as_ref(),
+        ctx.image_description_follows_default,
+    );
+    let web_search_sampling_config = if let Some(web_search_model_id) =
+        inherited_web_search_model_id(
+            ctx.web_search_follows_default,
+            effective_model_id.0.as_ref(),
+        ) {
+        if let Some(cfg) = ctx.agent_config.as_ref() {
+            let mut resolved =
+                crate::agent::config::resolve_web_search_sampling_config_preflight_result(
+                    web_search_model_id,
+                    &ctx.available_models,
+                    ctx.auth.as_ref().map(|auth| auth.key.as_str()),
+                    cfg.grok_com_config.api_key_auth_disabled(),
+                    cfg.endpoints.alpha_test_key.clone(),
+                    cfg.client_version.clone(),
+                    &cfg.endpoints,
+                )
+                .await
+                .ok();
+            if let Some(config) = resolved.as_mut() {
+                crate::agent::mvp_agent::inject_proxy_headers(
+                    &mut config.extra_headers,
+                    config.client_version.as_deref(),
+                    cfg.endpoints.alpha_test_key.as_deref(),
+                    &config.base_url,
+                );
+            }
+            resolved
+        } else {
+            ctx.web_search_sampling_config.clone()
+        }
+    } else {
+        ctx.web_search_sampling_config.clone()
+    };
     let _ = persistence
         .tx
         .send(crate::session::persistence::PersistenceMsg::CurrentModel {
             model_id: effective_model_id.clone(),
+            catalog_identity: Some(effective_catalog_identity.clone()),
             agent_name: Some(definition.name.clone()),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
         });
@@ -1191,6 +1518,7 @@ pub(crate) async fn run_shell_child(
         child_session_info,
         gateway.clone(),
         effective_sampling_config,
+        effective_catalog_identity,
         credentials,
         crate::agent::auth_method::new_shared_auth_method_id(Some(ctx.auth_method_id.clone())),
         Some(ctx.auth_manager.clone()),
@@ -1218,7 +1546,10 @@ pub(crate) async fn run_shell_child(
             ..Default::default()
         },
         xai_grok_workspace::permission::ClientType::Generic,
-        ctx.resolve_auto_compact_threshold_percent(&subagent_model_id),
+        ctx.resolve_auto_compact_threshold_percent(
+            &subagent_model_id,
+            prepared_model.auto_compact_threshold_percent,
+        ),
         xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
         xai_chat_state::CompactionMode::Summary,
         ctx.resolve_compaction_verbatim_input(),
@@ -1238,6 +1569,8 @@ pub(crate) async fn run_shell_child(
         false,
         false,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        crate::session::SessionPublicationGate::published(),
+        crate::agent::folder_trust::project_scope_allowed(&ctx.parent_cwd),
         definition,
         subagent_session_default_agent_profile,
         if inherit_skills {
@@ -1286,7 +1619,7 @@ pub(crate) async fn run_shell_child(
         None,
         ctx.inference_idle_timeout_secs,
         None,
-        ctx.web_search_sampling_config.clone(),
+        web_search_sampling_config,
         ctx.web_fetch_config.clone(),
         ctx.image_gen_config.clone(),
         ctx.video_gen_config.clone(),
@@ -1296,6 +1629,7 @@ pub(crate) async fn run_shell_child(
         ctx.background_workflows_enabled,
         true,
         ctx.subagents_max_depth,
+        ctx.workflow_max_concurrent_agents,
         ctx.ask_user_question_enabled,
         ctx.client_hooks.clone(),
         None,
@@ -1315,7 +1649,7 @@ pub(crate) async fn run_shell_child(
         parent_traceparent,
         ctx.permission_handle.clone(),
         ctx.api_key_provider.clone(),
-        ctx.image_description_model.clone(),
+        image_description_model,
         ctx.hook_registry.clone(),
         ctx.workspace_ops.clone(),
         vec![],
@@ -1371,6 +1705,8 @@ pub(crate) async fn run_shell_child(
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
             effective_model_id: tracker_model_id.clone(),
+            effective_model_route: Some(tracker_model_route),
+            effective_model_agent_type: tracker_model_agent_type,
             definition_background,
             control: ShellChildRuntime {
                 child_handle: child_handle.clone(),
@@ -1927,6 +2263,8 @@ pub(crate) async fn run_shell_child(
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentCompleted {
         subagent_id: request.id.clone(),
         parent_session_id: request.parent_session_id.clone(),
+        owner: telemetry_owner_kind(&request),
+        workflow_run_id: request.owner.workflow_run_id().map(str::to_string),
         outcome,
         duration_ms: result.duration_ms,
         tool_calls: result.tool_calls,
@@ -1981,7 +2319,9 @@ pub(crate) async fn run_shell_child(
         }
         (None, None) => {}
     }
-    let _ = child_handle.cmd_tx.send(SessionCommand::Shutdown);
+    let _ = child_handle.cmd_tx.send(SessionCommand::Shutdown(
+        crate::session::ShutdownKind::Graceful,
+    ));
     ctx.workspace_ops
         .end_local_session(child_session_id.0.as_ref());
     let mut disposed_snapshot_ref: Option<String> = None;
@@ -2087,4 +2427,137 @@ pub(crate) async fn run_shell_child(
         })),
     );
     child_run_output(result, completion_data, disposed_snapshot_ref)
+}
+
+#[cfg(test)]
+mod resume_model_lineage_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_resume_recovers_committed_route_from_child_summary() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let child_dir = temp.path().join("persisted-child");
+        let child_info = SessionInfo {
+            id: acp::SessionId::new("child-session"),
+            cwd: "/workspace".to_owned(),
+        };
+        let storage = JsonlStorageAdapter::with_explicit_session_dir(child_dir.clone());
+        storage
+            .init_session(&child_info, acp::ModelId::new("codex-key"))
+            .await
+            .expect("initialize persisted child session");
+        let identity = xai_chat_state::CatalogIdentity {
+            model_id: "codex-key".to_owned(),
+            route: "gpt-5.3-codex-spark".to_owned(),
+            lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        };
+        storage
+            .update_current_model_identity_and_agent(
+                &child_info,
+                &acp::ModelId::new("codex-key"),
+                Some(&identity),
+                Some("codex"),
+                None,
+            )
+            .await
+            .expect("persist child model lineage");
+        let source = ResumeSourceData {
+            subagent_id: "legacy-source".to_owned(),
+            subagent_type: "general-purpose".to_owned(),
+            persona: None,
+            model_id: Some("codex-key".to_owned()),
+            model_route: None,
+            model_agent_type: None,
+            child_cwd: child_info.cwd.clone(),
+            worktree_path: None,
+            snapshot_ref: None,
+            child_session_id: child_info.id.0.to_string(),
+        };
+
+        let recovered = recover_resume_model_lineage_at(&source, child_dir)
+            .await
+            .expect("durable lineage should be consistent");
+
+        assert_eq!(recovered.route.as_deref(), Some("gpt-5.3-codex-spark"));
+        assert!(
+            recovered.agent_type.is_none(),
+            "summary.agent_name is the selected child role, not catalog harness lineage"
+        );
+        assert_eq!(recovered.catalog_identity.as_ref(), Some(&identity));
+    }
+
+    #[test]
+    fn inherited_codex_subagent_resume_preserves_accepted_model_harness_tuple() {
+        let selected_role = xai_grok_agent::AgentDefinition::general_purpose();
+        let catalog_harness = xai_grok_agent::AgentDefinition::grok_build_plan();
+        assert_eq!(
+            super::super::validate_subagent_model_harness(
+                &selected_role,
+                "grok-build-plan",
+                Some(&catalog_harness),
+            ),
+            Err(super::super::SubagentModelHarnessError::Incompatible),
+            "the regression requires role and catalog harness to differ",
+        );
+        assert!(
+            !should_preflight_model_harness(false, false, false),
+            "a fresh inherited model is not a model override",
+        );
+        assert!(
+            !should_preflight_model_harness(true, true, true),
+            "resume continues an accepted tuple instead of selecting a new model",
+        );
+        assert_eq!(
+            validate_resume_model_lineage(
+                &ResumeModelLineage {
+                    route: Some("gpt-5.3-codex-spark".to_owned()),
+                    agent_type: Some("grok-build-plan".to_owned()),
+                    catalog_identity: None,
+                },
+                "gpt-5.3-codex-spark",
+                "grok-build-plan",
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn fresh_explicit_incompatible_model_still_requires_harness_preflight() {
+        assert!(should_preflight_model_harness(false, false, true));
+    }
+
+    #[test]
+    fn legacy_resume_without_committed_model_still_preflights_fresh_selection() {
+        assert!(should_preflight_model_harness(true, false, true));
+    }
+
+    #[test]
+    fn resume_model_lineage_fails_closed_when_route_or_harness_changes() {
+        let source = ResumeModelLineage {
+            route: Some("gpt-5.3-codex-spark".to_owned()),
+            agent_type: Some("grok-build-plan".to_owned()),
+            catalog_identity: None,
+        };
+        assert_eq!(
+            validate_resume_model_lineage(&source, "reused-route", "grok-build-plan"),
+            Err(ResumeModelLineageError::RouteChanged),
+        );
+        assert_eq!(
+            validate_resume_model_lineage(&source, "gpt-5.3-codex-spark", "codex"),
+            Err(ResumeModelLineageError::HarnessChanged),
+        );
+    }
+
+    #[test]
+    fn legacy_resume_without_route_lineage_fails_closed() {
+        assert_eq!(
+            validate_resume_model_lineage(
+                &ResumeModelLineage::default(),
+                "gpt-5.3-codex-spark",
+                "grok-build-plan",
+            ),
+            Err(ResumeModelLineageError::MissingRoute),
+        );
+    }
 }

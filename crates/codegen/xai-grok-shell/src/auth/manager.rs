@@ -7,7 +7,9 @@ use parking_lot::RwLock;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
+use xai_grok_auth::bearer_suffix;
 
 use tokio_util::sync::CancellationToken;
 
@@ -39,9 +41,10 @@ use super::model::{
 };
 use super::refresh::{RefreshOutcome, TokenRefresher, resolve_refresh_credential};
 use super::storage::{
-    AuthFileLock, ensure_auth_json_owner_only, read_auth_json,
+    AuthFileLock, AuthWriteFailure, ensure_auth_json_owner_only, read_auth_json,
     read_auth_json_or_empty_recovering_corrupt, read_auth_json_owner_only,
-    read_auth_json_owner_only_or_empty_recovering_corrupt, write_auth_json, write_auth_json_strict,
+    read_auth_json_owner_only_or_empty_recovering_corrupt, sync_auth_parent_directory,
+    write_auth_json, write_auth_json_strict, write_auth_json_strict_classified,
 };
 
 use super::storage::read_auth_json_or_empty;
@@ -59,6 +62,141 @@ pub(crate) enum RefreshReason {
     PreRequest,
     /// Server returned 401/403. Must obtain a different token.
     ServerRejected,
+}
+
+/// First-party session half of ambient xAI eligibility for #303 (Pro P1).
+///
+/// Classified from **one** memory-or-disk observation — never split
+/// `has_usable_token()` vs `current()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstPartySessionEligibility {
+    /// No first-party session, or hard-expired without complete refresh surface.
+    None,
+    /// Hard-valid (incl. soft early-invalidation buffer) session auth.
+    WireUsable,
+    /// Hard-expired session that still has complete mode-specific refresh
+    /// authority and can self-heal without re-login.
+    Refreshable,
+}
+
+/// Stable auth authority inputs used by implicit model selection.
+///
+/// The generation is even only while no auth selection mutation is in
+/// progress. Callers must validate it again at their model commit boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthSelectionSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) has_auth: bool,
+    pub(crate) session_eligibility: FirstPartySessionEligibility,
+    pub(crate) is_session_auth: bool,
+    pub(crate) first_party_env_api_key_ok: bool,
+}
+
+struct AuthSelectionMutationGuard<'a> {
+    generation: &'a AtomicU64,
+    wait_lock: &'a parking_lot::Mutex<()>,
+    changed: &'a parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct AuthSelectionBackoff {
+    attempts: u32,
+}
+
+impl AuthSelectionBackoff {
+    /// Auth publication can include an `auth.json` sync + rename. Keep the
+    /// short uncontended path as a spin, yield briefly, then tell the caller
+    /// to park instead of burning a core through a slow filesystem operation.
+    fn should_park(&mut self) -> bool {
+        const SPIN_ATTEMPTS: u32 = 64;
+        const YIELD_ATTEMPTS: u32 = 96;
+        if self.attempts < SPIN_ATTEMPTS {
+            std::hint::spin_loop();
+        } else if self.attempts < YIELD_ATTEMPTS {
+            std::thread::yield_now();
+        } else {
+            return true;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        false
+    }
+}
+
+/// Short synchronous pin for an auth-dependent decision that has already
+/// captured a stable generation. Writers observe the temporary odd value and
+/// wait; dropping the seal restores the same even generation because no auth
+/// mutation occurred.
+pub(crate) struct AuthSelectionSeal {
+    manager: Arc<AuthManager>,
+    stable_generation: u64,
+}
+
+impl Drop for AuthSelectionMutationGuard<'_> {
+    fn drop(&mut self) {
+        let _wait_guard = self.wait_lock.lock();
+        let previous = self.generation.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(previous % 2, 1, "auth selection mutation must end odd");
+        self.changed.notify_all();
+    }
+}
+
+impl Drop for AuthSelectionSeal {
+    fn drop(&mut self) {
+        let _wait_guard = self.manager.selection_wait_lock.lock();
+        let sealed_generation = self.stable_generation.wrapping_add(1);
+        let observed = self.manager.selection_generation.load(Ordering::Relaxed);
+        debug_assert_eq!(
+            observed, sealed_generation,
+            "auth selection seal must restore its unchanged even generation"
+        );
+        self.manager
+            .selection_generation
+            .store(self.stable_generation, Ordering::Release);
+        self.manager.selection_changed.notify_all();
+    }
+}
+
+impl FirstPartySessionEligibility {
+    /// Whether this session classification alone should keep first-party Grok
+    /// precedence over an implicit Codex default.
+    pub(crate) fn preserves_ambient_precedence(self) -> bool {
+        matches!(self, Self::WireUsable | Self::Refreshable)
+    }
+}
+
+/// Complete refresh surface for ambient "self-healing" classification.
+///
+/// Requires the mode's complete refresh authority. A bare
+/// `refresh_token.is_some()` (empty string / missing IdP fields) is **not**
+/// enough — those must not pin Grok over ready Codex (Pro P1).
+///
+/// External auth refreshes by re-running its configured provider command, so
+/// it requires a nonblank command instead of OIDC metadata (#316).
+fn session_has_complete_refresh_surface(
+    auth: &GrokAuth,
+    auth_provider_command: Option<&str>,
+) -> bool {
+    if !auth.is_session_auth() {
+        return false;
+    }
+    match auth.auth_mode {
+        AuthMode::Oidc => {
+            auth.refresh_token
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+                && auth
+                    .oidc_issuer
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                && auth
+                    .oidc_client_id
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+        }
+        AuthMode::External => super::has_nonblank_auth_provider_command(auth_provider_command),
+        // WebLogin has no silent refresh authority for ambient classification.
+        AuthMode::WebLogin | AuthMode::ApiKey | AuthMode::OpenAiCodex => false,
+    }
 }
 
 /// Timeout for acquiring the advisory `auth.json.lock` file lock.
@@ -103,6 +241,11 @@ const RELOAD_RETRY_BACKOFF: StdDuration = StdDuration::from_millis(50);
 struct ScopedRefreshFailure {
     token_key: String,
     error: crate::auth::error::RefreshTokenFailedError,
+    /// The provider rejected this access token on the request path that
+    /// triggered refresh. A still-unexpired copy may remain in memory when a
+    /// strict disk removal fails before publication, but it must never be
+    /// exported again while this key-scoped verdict is active.
+    suppress_wire_bearer: bool,
     /// Two-clock timestamp (see [`DualClock`]): the TTL below is *real* time,
     /// so it must keep counting across a system sleep. The monotonic clock
     /// pauses during suspend — with it alone, a failure cached just before
@@ -123,12 +266,13 @@ const PERMANENT_FAILURE_TTL: StdDuration = StdDuration::from_secs(300);
 
 /// Single source of truth for `auth.json` + the in-memory bearer.
 ///
-/// Lock order: `refresh_lock` (async) -> the sync locks (`inner` / `refresher`
-/// / `permanent_failure` / `manual_auth`), never co-held; `permanent_failure()`
-/// reads `permanent_failure` first and only then `inner` (via
-/// `attempted_verdict_key`, when a verdict is stored), never co-held. Never hold
-/// a `parking_lot` guard across `.await`. Refreshers return [`RefreshOutcome`]
-/// for `refresh_chain` to apply.
+/// Lock order: `refresh_lock` (async) -> `inner` -> `permanent_failure`; the
+/// remaining sync locks (`refresher` / `manual_auth`) are never co-held with
+/// auth-state locks. Bearer-export readers keep the `inner` read guard while
+/// inspecting `permanent_failure`, and paired publications keep the `inner`
+/// write guard while updating the verdict. Never hold a `parking_lot` guard
+/// across `.await`. Refreshers return [`RefreshOutcome`] for `refresh_chain` to
+/// apply.
 /// Redacted `Debug` so `AuthManager` (held via `Arc` inside `Debug`-derived
 /// types like `PersistenceMsg`) never leaks credentials into logs or panics.
 impl std::fmt::Debug for AuthManager {
@@ -143,6 +287,28 @@ pub struct AuthManager {
     /// enforces "no `.await` while holding the lock". `Arc`
     /// so the spawned `/user` enrichment task can write back.
     inner: Arc<RwLock<Option<GrokAuth>>>,
+    /// Seqlock generation for the auth inputs consumed by implicit model
+    /// selection. Even = stable; odd = a writer is active.
+    selection_generation: AtomicU64,
+    /// Parking path after bounded spin/yield retries. Generation transitions
+    /// to stable state and notifications occur while `selection_wait_lock` is
+    /// held, preventing a waiter from missing the wake-up.
+    selection_wait_lock: parking_lot::Mutex<()>,
+    selection_changed: parking_lot::Condvar,
+    /// Deterministic seam for proving that disk -> memory credential
+    /// publication remains inside one selection-generation transaction.
+    #[cfg(test)]
+    selection_after_disk_before_memory_hook:
+        parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Deterministic seam for proving a selection reader actually observed an
+    /// in-flight (odd) publication generation rather than merely being
+    /// scheduled near it.
+    #[cfg(test)]
+    selection_snapshot_observed_odd_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Deterministic seam for pinning a bearer reader after it acquires
+    /// `inner` but before it reads `permanent_failure`.
+    #[cfg(test)]
+    auth_state_after_inner_read_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     path: PathBuf,
     scope: String,
     /// xAI-only policy and `/user` enrichment are forbidden for provider
@@ -209,6 +375,9 @@ pub struct AuthManager {
     /// Per-process `manual_auth` KPI debounce, shared by all recoveries on this
     /// manager so repeated 401s on the most-recent dead credential emit once.
     manual_auth: crate::auth::recovery::ManualAuthTracker,
+    /// First-party env key may advertise after initialize probe (default true).
+    /// Lives here (not on `MvpAgent`) so the probe verdict is auth-owned.
+    first_party_env_api_key_ok: std::sync::atomic::AtomicBool,
     /// When the current unbroken run of dark-wake refresh deferrals began, on
     /// two clocks (see [`DualClock`]); `None` outside such a run. Bounds the
     /// deferral to [`sleep_gate::DARK_WAKE_DEFER_MAX`] so a machine stuck
@@ -253,10 +422,33 @@ enum ScopeRemoval {
     EntryRemoved,
     /// Last scope dropped; auth.json deleted.
     FileDeleted,
+    /// Last scope was visibly unlinked, but the containing directory barrier
+    /// failed. Memory must still reconcile to logged-out while success is not
+    /// reported to the caller.
+    FileDeletedSyncFailed,
+    /// Windows durable provider logout replaced the last credential with an
+    /// empty owner-only store through `MOVEFILE_WRITE_THROUGH`.
+    #[cfg(windows)]
+    FileCleared,
+    /// The empty-store replacement is visible, but a final durability or
+    /// permission proof failed.
+    #[cfg(windows)]
+    FileClearedDurabilityFailed,
+    /// Scope removal is visible in a remaining multi-scope store, but a final
+    /// durability or permission proof failed.
+    EntryRemovedDurabilityFailed,
     /// Lock unavailable (held by another process); disk left untouched.
     SkippedLockUnavailable,
     /// Lock held but auth.json was unreadable; disk left untouched.
     SkippedUnreadable,
+}
+
+/// A durable removal may become visible before its final directory barrier
+/// fails. Callers must then reconcile memory to the visible removal while
+/// still returning the durability error to the user.
+struct DurableScopeRemoval {
+    mutation: ScopeRemoval,
+    durability_error: Option<std::io::Error>,
 }
 
 impl ScopeRemoval {
@@ -265,6 +457,12 @@ impl ScopeRemoval {
         match self {
             Self::EntryRemoved => "entry removed",
             Self::FileDeleted => "file deleted (no scopes left)",
+            Self::FileDeletedSyncFailed => "file deleted but directory sync failed",
+            #[cfg(windows)]
+            Self::FileCleared => "file replaced with empty credential store",
+            #[cfg(windows)]
+            Self::FileClearedDurabilityFailed => "file cleared but final durability proof failed",
+            Self::EntryRemovedDurabilityFailed => "entry removed but final durability proof failed",
             Self::SkippedLockUnavailable => "skipped (lock unavailable)",
             Self::SkippedUnreadable => "skipped (auth.json unreadable)",
         }
@@ -312,8 +510,32 @@ impl AuthManager {
             .map(PathBuf::from)
             .unwrap_or_else(|_| grok_home.join("auth.json"));
 
+        Self::new_xai_at_path(path, scope, grok_com_config, proxy_base_url, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_path(auth_json_path: &Path, grok_com_config: GrokComConfig) -> Self {
+        let scope = grok_com_config.auth_scope();
+        let proxy_base_url =
+            crate::agent::config::EndpointsConfig::from_effective_config().proxy_url();
+        Self::new_xai_at_path(
+            auth_json_path.to_owned(),
+            scope,
+            grok_com_config,
+            proxy_base_url,
+            false,
+        )
+    }
+
+    fn new_xai_at_path(
+        path: PathBuf,
+        scope: String,
+        grok_com_config: GrokComConfig,
+        proxy_base_url: String,
+        allow_inline_auth: bool,
+    ) -> Self {
         // GROK_AUTH: inline JSON credentials (highest priority, read-only).
-        if let Ok(inline_json) = std::env::var("GROK_AUTH") {
+        if allow_inline_auth && let Ok(inline_json) = std::env::var("GROK_AUTH") {
             if let Ok(auth) = serde_json::from_str::<GrokAuth>(&inline_json) {
                 return Self::assemble(
                     Some(auth),
@@ -416,6 +638,15 @@ impl AuthManager {
         let path = std::env::var("GROK_AUTH_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| grok_home.join("auth.json"));
+        Self::new_openai_codex_at_path(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_openai_codex_for_test_path(auth_json_path: &Path) -> Self {
+        Self::new_openai_codex_at_path(auth_json_path.to_owned())
+    }
+
+    fn new_openai_codex_at_path(path: PathBuf) -> Self {
         let scope = crate::auth::openai_codex::AUTH_SCOPE.to_owned();
         let (auth, disk_state) = match read_auth_json_owner_only(&path) {
             Ok(map) => {
@@ -465,6 +696,15 @@ impl AuthManager {
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(inner)),
+            selection_generation: AtomicU64::new(0),
+            selection_wait_lock: parking_lot::Mutex::new(()),
+            selection_changed: parking_lot::Condvar::new(),
+            #[cfg(test)]
+            selection_after_disk_before_memory_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            selection_snapshot_observed_odd_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            auth_state_after_inner_read_hook: parking_lot::Mutex::new(None),
             path,
             scope,
             xai_session,
@@ -491,6 +731,7 @@ impl AuthManager {
             power_listener_started: std::sync::atomic::AtomicBool::new(false),
             power_listener: parking_lot::Mutex::new(None),
             manual_auth: Default::default(),
+            first_party_env_api_key_ok: std::sync::atomic::AtomicBool::new(true),
             dark_wake_defer_since: parking_lot::RwLock::new(None),
             #[cfg(test)]
             dark_wake_override: parking_lot::Mutex::new(None),
@@ -516,6 +757,19 @@ impl AuthManager {
                 false
             }
         }
+    }
+
+    /// Whether initialize's first-party env-key probe still allows advertising.
+    pub(crate) fn first_party_env_api_key_ok(&self) -> bool {
+        self.first_party_env_api_key_ok
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record initialize probe result for cached-token fallthrough advertise.
+    pub(crate) fn set_first_party_env_api_key_ok(&self, ok: bool) {
+        let _mutation = self.begin_selection_mutation();
+        self.first_party_env_api_key_ok
+            .store(ok, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Clear the disk-loaded token if it violates the team pin (startup only;
@@ -593,9 +847,12 @@ impl AuthManager {
             ));
         }
 
-        let disk_mutation = self.write_scope_removal_durable(&self.scope)?;
-        self.finish_scope_removal(&self.scope, disk_mutation);
-        Ok(())
+        let outcome = self.write_scope_removal_durable(&self.scope)?;
+        self.finish_scope_removal(&self.scope, outcome.mutation);
+        match outcome.durability_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Remove a scope entry from auth.json. When `scope == self.scope`, also
@@ -634,10 +891,12 @@ impl AuthManager {
             })),
         );
         if scope == self.scope {
-            self.clear_inner();
             // Intentional logout/scope removal: drop sticky permanent so the
             // next state is NotLoggedIn, not a retained invalid_grant verdict.
-            *self.permanent_failure.write() = None;
+            self.publish_auth_state(|inner, failure| {
+                *inner = None;
+                *failure = None;
+            });
         }
     }
 
@@ -661,31 +920,108 @@ impl AuthManager {
     /// Strict counterpart used by provider logout: missing auth.json is an
     /// already-logged-out success, while unreadable data and write failures
     /// are surfaced so memory cannot diverge from durable state.
-    fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<ScopeRemoval> {
-        let mut auth_store = if self.xai_session {
-            read_auth_json_or_empty(&self.path)?
+    fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<DurableScopeRemoval> {
+        let (mut auth_store, file_existed) = if self.xai_session {
+            match read_auth_json(&self.path) {
+                Ok(store) => (store, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (AuthStore::new(), false)
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             match read_auth_json_owner_only(&self.path) {
-                Ok(store) => store,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthStore::new(),
+                Ok(store) => (store, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (AuthStore::new(), false)
+                }
                 Err(error) => return Err(error),
             }
         };
+        #[cfg(not(windows))]
+        let _ = file_existed;
         auth_store.remove(scope);
         if auth_store.is_empty() {
-            match std::fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            #[cfg(windows)]
+            if !self.xai_session && file_existed {
+                return self.persist_scope_removal_store(
+                    scope,
+                    &auth_store,
+                    ScopeRemoval::FileCleared,
+                    ScopeRemoval::FileClearedDurabilityFailed,
+                );
+            }
+
+            let removed = match std::fs::remove_file(&self.path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => return Err(error),
-            }
-            Ok(ScopeRemoval::FileDeleted)
-        } else {
-            if self.xai_session {
-                write_auth_json(&self.path, &auth_store)?;
+            };
+            let durability_error = if removed {
+                sync_auth_parent_directory(&self.path).err()
             } else {
-                write_auth_json_strict(&self.path, &auth_store)?;
+                None
+            };
+            Ok(DurableScopeRemoval {
+                mutation: if durability_error.is_some() {
+                    ScopeRemoval::FileDeletedSyncFailed
+                } else {
+                    ScopeRemoval::FileDeleted
+                },
+                durability_error,
+            })
+        } else {
+            self.persist_scope_removal_store(
+                scope,
+                &auth_store,
+                ScopeRemoval::EntryRemoved,
+                ScopeRemoval::EntryRemovedDurabilityFailed,
+            )
+        }
+    }
+
+    fn persist_scope_removal_store(
+        &self,
+        removed_scope: &str,
+        auth_store: &AuthStore,
+        success: ScopeRemoval,
+        visible_failure: ScopeRemoval,
+    ) -> std::io::Result<DurableScopeRemoval> {
+        if !self.xai_session {
+            return match write_auth_json_strict_classified(&self.path, auth_store) {
+                Ok(()) => Ok(DurableScopeRemoval {
+                    mutation: success,
+                    durability_error: None,
+                }),
+                Err(AuthWriteFailure::AfterPublication(error)) => Ok(DurableScopeRemoval {
+                    mutation: visible_failure,
+                    durability_error: Some(error),
+                }),
+                Err(AuthWriteFailure::BeforePublication(error)) => Err(error),
+            };
+        }
+
+        match write_auth_json(&self.path, auth_store) {
+            Ok(()) => Ok(DurableScopeRemoval {
+                mutation: success,
+                durability_error: None,
+            }),
+            Err(error) => {
+                // A final permission/directory barrier can fail after rename.
+                // Reconcile only when a safe read proves the exact scope is
+                // absent; pre-publication failures leave the old entry present.
+                let visible = read_auth_json(&self.path)
+                    .ok()
+                    .is_some_and(|store| !store.contains_key(removed_scope));
+                if visible {
+                    Ok(DurableScopeRemoval {
+                        mutation: visible_failure,
+                        durability_error: Some(error),
+                    })
+                } else {
+                    Err(error)
+                }
             }
-            Ok(ScopeRemoval::EntryRemoved)
         }
     }
 
@@ -693,7 +1029,7 @@ impl AuthManager {
     /// short-circuits with no live credential until a wire-valid login;
     /// non-sticky verdicts read absent once their scoped key is gone.
     fn clear_inner(&self) {
-        *self.inner.write() = None;
+        self.with_inner_write(|inner| *inner = None);
     }
 
     /// Re-read `auth.json` and reconcile the in-memory cache with it.
@@ -731,7 +1067,7 @@ impl AuthManager {
                 // permanent_failure here -- the token may just be a re-export
                 // of the same broken refresh_token.
                 DiskAuthState::Ok => {
-                    *self.inner.write() = auth;
+                    self.with_inner_write(|inner| *inner = auth);
                     // A re-read (e.g. relay reconnect) can adopt a wrong-team
                     // token a sibling wrote; clear it here, mirroring `new()`.
                     self.enforce_pin_on_loaded_token();
@@ -806,8 +1142,10 @@ impl AuthManager {
                 })),
             );
         }
-        self.clear_inner();
-        *self.permanent_failure.write() = None;
+        self.publish_auth_state(|inner, failure| {
+            *inner = None;
+            *failure = None;
+        });
     }
 
     // ── Read methods ─────────────────────────────────────────────────
@@ -901,8 +1239,164 @@ impl AuthManager {
     /// the lock is held. Prefer this over `self.inner.write()`.
     #[inline]
     pub(crate) fn with_inner_write<R>(&self, f: impl FnOnce(&mut Option<GrokAuth>) -> R) -> R {
+        let _mutation = self.begin_selection_mutation();
         let mut guard = self.inner.write();
         f(&mut guard)
+    }
+
+    /// Mutate the bearer and its key-scoped verdict as one publication.
+    ///
+    /// The caller must already own a selection mutation when model-selection
+    /// atomicity is required. The closure is synchronous so neither guard can
+    /// cross an `.await`.
+    #[inline]
+    fn with_auth_state_write<R>(
+        &self,
+        f: impl FnOnce(&mut Option<GrokAuth>, &mut Option<ScopedRefreshFailure>) -> R,
+    ) -> R {
+        let mut inner = self.inner.write();
+        let mut failure = self.permanent_failure.write();
+        f(&mut inner, &mut failure)
+    }
+
+    /// Selection-aware counterpart to [`Self::with_auth_state_write`].
+    #[inline]
+    fn publish_auth_state<R>(
+        &self,
+        f: impl FnOnce(&mut Option<GrokAuth>, &mut Option<ScopedRefreshFailure>) -> R,
+    ) -> R {
+        let _mutation = self.begin_selection_mutation();
+        self.with_auth_state_write(f)
+    }
+
+    fn begin_selection_mutation(&self) -> AuthSelectionMutationGuard<'_> {
+        let mut backoff = AuthSelectionBackoff::default();
+        loop {
+            let generation = self.selection_generation.load(Ordering::Acquire);
+            if generation % 2 == 1 {
+                self.wait_for_selection_progress(&mut backoff);
+                continue;
+            }
+            if self
+                .selection_generation
+                .compare_exchange(
+                    generation,
+                    generation.wrapping_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return AuthSelectionMutationGuard {
+                    generation: &self.selection_generation,
+                    wait_lock: &self.selection_wait_lock,
+                    changed: &self.selection_changed,
+                };
+            }
+            self.wait_for_selection_progress(&mut backoff);
+        }
+    }
+
+    fn wait_for_selection_progress(&self, backoff: &mut AuthSelectionBackoff) {
+        if !backoff.should_park() {
+            return;
+        }
+        let mut wait_guard = self.selection_wait_lock.lock();
+        while self.selection_generation.load(Ordering::Acquire) % 2 == 1 {
+            self.selection_changed.wait(&mut wait_guard);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_selection_after_disk_before_memory_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.selection_after_disk_before_memory_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn run_selection_after_disk_before_memory_hook(&self) {
+        let hook = self.selection_after_disk_before_memory_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_selection_snapshot_observed_odd_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.selection_snapshot_observed_odd_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn run_selection_snapshot_observed_odd_hook(&self) {
+        let hook = self.selection_snapshot_observed_odd_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Capture all auth authority inputs for implicit selection from one
+    /// stable even generation.
+    pub(crate) fn selection_snapshot(&self) -> AuthSelectionSnapshot {
+        let mut backoff = AuthSelectionBackoff::default();
+        loop {
+            let before = self.selection_generation.load(Ordering::Acquire);
+            if before % 2 == 1 {
+                #[cfg(test)]
+                self.run_selection_snapshot_observed_odd_hook();
+                self.wait_for_selection_progress(&mut backoff);
+                continue;
+            }
+            let session_eligibility = self.first_party_session_eligibility();
+            let current = self.current_or_expired();
+            let has_auth = current.is_some();
+            let is_session_auth = current.is_some_and(|auth| auth.is_session_auth());
+            let first_party_env_api_key_ok = self.first_party_env_api_key_ok();
+            let after = self.selection_generation.load(Ordering::Acquire);
+            if before == after && after.is_multiple_of(2) {
+                return AuthSelectionSnapshot {
+                    generation: after,
+                    has_auth,
+                    session_eligibility,
+                    is_session_auth,
+                    first_party_env_api_key_ok,
+                };
+            }
+            self.wait_for_selection_progress(&mut backoff);
+        }
+    }
+
+    /// Whether a previously captured selection snapshot is still current.
+    pub(crate) fn selection_generation_is_current(&self, generation: u64) -> bool {
+        generation.is_multiple_of(2)
+            && self.selection_generation.load(Ordering::Acquire) == generation
+    }
+
+    /// Pin a previously captured stable selection generation across a short,
+    /// synchronous commit plan. The guard must be dropped before any `.await`.
+    pub(crate) fn try_seal_selection(
+        self: &Arc<Self>,
+        generation: u64,
+    ) -> Option<AuthSelectionSeal> {
+        if !generation.is_multiple_of(2) {
+            return None;
+        }
+        self.selection_generation
+            .compare_exchange(
+                generation,
+                generation.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(AuthSelectionSeal {
+            manager: Arc::clone(self),
+            stable_generation: generation,
+        })
     }
 
     /// Closure-scoped read counterpart to [`Self::with_inner_write`].
@@ -910,6 +1404,33 @@ impl AuthManager {
     pub(crate) fn with_inner_read<R>(&self, f: impl FnOnce(Option<&GrokAuth>) -> R) -> R {
         let guard = self.inner.read();
         f(guard.as_ref())
+    }
+
+    /// Read bearer bytes and their key-scoped verdict from one linearizable
+    /// state. Lock order matches [`Self::with_auth_state_write`].
+    #[inline]
+    fn with_auth_state_read<R>(
+        &self,
+        f: impl FnOnce(Option<&GrokAuth>, Option<&ScopedRefreshFailure>) -> R,
+    ) -> R {
+        let inner = self.inner.read();
+        #[cfg(test)]
+        {
+            let hook = self.auth_state_after_inner_read_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let failure = self.permanent_failure.read();
+        f(inner.as_ref(), failure.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_auth_state_after_inner_read_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.auth_state_after_inner_read_hook.lock() = hook;
     }
 
     /// Returns true if credentials exist but have expired.
@@ -931,17 +1452,19 @@ impl AuthManager {
 
     /// Cached token if still wire-valid ([`Self::is_token_hard_expired`]),
     /// ignoring the early-invalidation buffer. For sync callers that cannot
-    /// refresh and must not demote a still-accepted token.
+    /// refresh and must not demote a still-accepted token. A bearer already
+    /// rejected by the provider on a request path is excluded even when its
+    /// local expiry has not elapsed.
     pub(crate) fn current_wire_valid(&self) -> Option<GrokAuth> {
         if !self.credential_store_is_safe() {
             return None;
         }
-        let auth = self
-            .inner
-            .read()
-            .as_ref()
-            .filter(|a| !self.is_token_hard_expired(a))
-            .cloned()?;
+        let auth = self.with_auth_state_read(|inner, failure| {
+            inner
+                .filter(|a| !self.is_token_hard_expired(a))
+                .filter(|a| !Self::failure_suppresses_wire_bearer(failure, &a.key))
+                .cloned()
+        })?;
         self.vet_cached(auth)
     }
 
@@ -1028,6 +1551,7 @@ impl AuthManager {
             return self.save_provider_strict(auth).await;
         }
         let update_started = std::time::Instant::now();
+        let _selection_mutation = self.begin_selection_mutation();
         let map = match read_auth_json_or_empty_recovering_corrupt(&self.path) {
             Ok(map) => map,
             Err(e) => {
@@ -1038,7 +1562,8 @@ impl AuthManager {
                     None,
                     Some(serde_json::json!({ "error": e.to_string() })),
                 );
-                self.with_inner_write(|inner| *inner = Some(auth.clone()));
+                *self.inner.write() = Some(auth.clone());
+                drop(_selection_mutation);
                 if self.xai_session {
                     self.spawn_user_info_enrichment(auth.clone());
                 }
@@ -1049,7 +1574,24 @@ impl AuthManager {
         // One entry per scope (personal and team share the scope key).
         tracing::debug!(scope = %self.scope, "auth: storing token");
         map.insert(self.scope.clone(), auth.clone());
+        // Disk must lead memory for refresh-token rotation safety, but both
+        // publications are one model-selection authority mutation. Without
+        // this outer guard, a snapshot can observe the new disk session and
+        // the old in-memory credential under an unchanged even generation.
         let write_result = write_auth_json(&self.path, &map);
+        #[cfg(test)]
+        if write_result.is_ok() {
+            self.run_selection_after_disk_before_memory_hook();
+        }
+        // Always update in-memory, even if disk write failed. This lets the
+        // current session work with fresh credentials while the user fixes the
+        // filesystem (e.g. read-only disk). Without this, a disk failure leaves
+        // the stale/dead token in memory and the user is completely stuck.
+        self.with_auth_state_write(|inner, failure| {
+            *inner = Some(auth.clone());
+            *failure = None;
+        });
+        drop(_selection_mutation);
         let elapsed_ms = update_started.elapsed().as_millis() as u64;
         match &write_result {
             Ok(()) => xai_grok_telemetry::unified_log::info(
@@ -1070,12 +1612,6 @@ impl AuthManager {
                 })),
             ),
         }
-        // Always update in-memory, even if disk write failed. This lets the
-        // current session work with fresh credentials while the user fixes the
-        // filesystem (e.g. read-only disk). Without this, a disk failure leaves
-        // the stale/dead token in memory and the user is completely stuck.
-        *self.permanent_failure.write() = None;
-        self.with_inner_write(|inner| *inner = Some(auth.clone()));
 
         // Fire-and-forget enrichment. Off the critical path -- a slow
         // `/user` would otherwise widen the sibling-process
@@ -1098,6 +1634,7 @@ impl AuthManager {
             return self.save_provider_strict(auth).await;
         }
         let started = std::time::Instant::now();
+        let _selection_mutation = self.begin_selection_mutation();
         let map = match read_auth_json_or_empty_recovering_corrupt(&self.path) {
             Ok(map) => map,
             Err(e) => {
@@ -1108,7 +1645,8 @@ impl AuthManager {
                     None,
                     Some(serde_json::json!({ "error": e.to_string() })),
                 );
-                self.with_inner_write(|inner| *inner = Some(auth.clone()));
+                *self.inner.write() = Some(auth.clone());
+                drop(_selection_mutation);
                 return Ok(auth);
             }
         };
@@ -1116,6 +1654,16 @@ impl AuthManager {
         tracing::debug!(scope = %self.scope, "auth: storing token (no enrichment)");
         map.insert(self.scope.clone(), auth.clone());
         let write_result = write_auth_json(&self.path, &map);
+        #[cfg(test)]
+        if write_result.is_ok() {
+            self.run_selection_after_disk_before_memory_hook();
+        }
+        // Always update in-memory, even if disk write failed (see update()).
+        self.with_auth_state_write(|inner, failure| {
+            *inner = Some(auth.clone());
+            *failure = None;
+        });
+        drop(_selection_mutation);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &write_result {
             Ok(()) => xai_grok_telemetry::unified_log::info(
@@ -1136,9 +1684,6 @@ impl AuthManager {
                 })),
             ),
         }
-        // Always update in-memory, even if disk write failed (see update()).
-        *self.permanent_failure.write() = None;
-        self.with_inner_write(|inner| *inner = Some(auth.clone()));
         write_result?;
         Ok(auth)
     }
@@ -1149,12 +1694,44 @@ impl AuthManager {
     async fn save_provider_strict(&self, mut auth: GrokAuth) -> std::io::Result<GrokAuth> {
         debug_assert!(!self.xai_session);
         crate::auth::openai_codex::normalize_workspace_metadata(&mut auth);
+        let _selection_mutation = self.begin_selection_mutation();
         let mut map = read_auth_json_owner_only_or_empty_recovering_corrupt(&self.path)?;
         map.insert(self.scope.clone(), auth.clone());
-        write_auth_json_strict(&self.path, &map)?;
-        *self.permanent_failure.write() = None;
-        self.with_inner_write(|inner| *inner = Some(auth.clone()));
-        Ok(auth)
+        let write_result = write_auth_json_strict(&self.path, &map);
+        #[cfg(test)]
+        self.run_selection_after_disk_before_memory_hook();
+        match write_result {
+            Ok(()) => {
+                self.with_auth_state_write(|inner, failure| {
+                    *inner = Some(auth.clone());
+                    *failure = None;
+                });
+                Ok(auth)
+            }
+            Err(error) => {
+                // A strict atomic writer can fail its final-path permission
+                // assertion after rename. Re-read the durable object through
+                // the owner-only path while the generation remains odd, then
+                // make memory match exactly what can safely be recovered.
+                // Pre-rename failures recover the prior credential; an unsafe
+                // or unreadable final object clears memory and fails closed.
+                let (committed, disk_state) = self.read_disk_auth_with_state();
+                let reconciled_present = committed.is_some();
+                *self.inner.write() = committed;
+                xai_grok_telemetry::unified_log::warn(
+                    "auth: strict credential write failed; durable state reconciled",
+                    None,
+                    Some(serde_json::json!({
+                        "error_kind": format!("{:?}", error.kind()),
+                        "disk_state": format!("{disk_state:?}"),
+                        "reconciled_present": reconciled_present,
+                        "path": self.path.display().to_string(),
+                        "scope": &self.scope,
+                    })),
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Spawn the `/user` enrichment task; body in the `enrichment` submodule.
@@ -1223,14 +1800,19 @@ impl AuthManager {
     }
 
     /// Hot-swap credentials (called by config watcher). Does NOT write to disk.
-    /// Clears a sticky permanent verdict only when the new bearer is wire-valid
-    /// (login / sibling adopt). Hard-expired swaps keep the sticky short-circuit
-    /// so a dead RT is not re-tried until a real login.
+    /// Clears a permanent verdict only when the new bearer is locally
+    /// wire-valid and is not the exact server-rejected bearer suppressed by
+    /// that verdict. Re-reading the same retained disk entry must never turn a
+    /// failed strict removal into a credential resurrection.
     pub(crate) fn hot_swap(&self, new_auth: GrokAuth) {
-        if !self.is_token_hard_expired(&new_auth) {
-            *self.permanent_failure.write() = None;
-        }
-        self.with_inner_write(|inner| *inner = Some(new_auth));
+        self.publish_auth_state(|inner, failure| {
+            *inner = Some(new_auth.clone());
+            if !self.is_token_hard_expired(&new_auth)
+                && !Self::failure_suppresses_wire_bearer(failure.as_ref(), &new_auth.key)
+            {
+                *failure = None;
+            }
+        });
     }
 
     /// Clear in-memory credentials. Does NOT touch disk. Sticky
@@ -1262,7 +1844,8 @@ impl AuthManager {
         }
         tracing::info!("auth: another process already refreshed, using disk token");
         self.hot_swap(disk_auth.clone());
-        Some(disk_auth.clone())
+        self.current_wire_valid()
+            .filter(|published| published.key == disk_auth.key)
     }
 
     /// Re-read disk and try to adopt a sibling-written token, emitting
@@ -1418,6 +2001,67 @@ impl AuthManager {
         self.current_or_expired()
             .is_some_and(|a| !self.is_token_hard_expired(&a))
             || self.has_usable_disk_token()
+    }
+
+    /// Single-observation snapshot: is there a **wire-usable first-party session**
+    /// (WebLogin / OIDC / first-party External) in memory or on disk?
+    ///
+    /// Used for #303 ambient xAI selection so usability and session-kind are
+    /// derived from the **same** credential observation — never
+    /// `has_usable_token() && current().is_session_auth()` which can disagree
+    /// when a soft-expiry buffer token is hard-valid (`current()` is None) or a
+    /// usable sibling-rotated disk token is not yet adopted into memory
+    /// (Pro P0). Hard expiry only (matches [`Self::has_usable_token`]); soft
+    /// early-invalidation buffer still counts as usable.
+    pub(crate) fn has_usable_first_party_session(&self) -> bool {
+        matches!(
+            self.first_party_session_eligibility(),
+            FirstPartySessionEligibility::WireUsable
+        )
+    }
+
+    /// One observation classifying first-party session for #303 ambient selection
+    /// (Pro P1): hard-valid wire session vs hard-expired-but-self-healing.
+    ///
+    /// `Refreshable` requires the mode's complete refresh authority: OIDC
+    /// needs a non-empty refresh_token + issuer + client_id; External needs a
+    /// configured nonblank provider command (#316). Malformed/incomplete
+    /// credentials must not pin Grok.
+    pub(crate) fn first_party_session_eligibility(&self) -> FirstPartySessionEligibility {
+        if !self.credential_store_is_safe() {
+            return FirstPartySessionEligibility::None;
+        }
+        let observe = |a: &GrokAuth| -> FirstPartySessionEligibility {
+            if !a.is_session_auth() {
+                return FirstPartySessionEligibility::None;
+            }
+            if !self.is_token_hard_expired(a) {
+                return FirstPartySessionEligibility::WireUsable;
+            }
+            if session_has_complete_refresh_surface(
+                a,
+                self.grok_com_config.auth_provider_command.as_deref(),
+            ) {
+                return FirstPartySessionEligibility::Refreshable;
+            }
+            FirstPartySessionEligibility::None
+        };
+        if let Some(a) = self.current_or_expired() {
+            let e = observe(&a);
+            if e != FirstPartySessionEligibility::None {
+                return e;
+            }
+        }
+        self.read_disk_auth()
+            .map(|a| observe(&a))
+            .unwrap_or(FirstPartySessionEligibility::None)
+    }
+
+    /// Wire-usable **or** complete-refreshable first-party session — the session
+    /// half of ambient xAI eligibility for #303 (keeps Grok over Codex).
+    pub(crate) fn has_ambient_first_party_session(&self) -> bool {
+        self.first_party_session_eligibility()
+            .preserves_ambient_precedence()
     }
 
     /// Like [`read_disk_auth`] but also returns the [`DiskAuthState`] so callers
@@ -1590,9 +2234,17 @@ impl AuthManager {
         if !self.credential_store_is_safe() {
             return Err(AuthError::NotLoggedIn);
         }
-        // Snapshot inner ONCE for dispatch atomicity (closes a TOCTOU
-        // where a concurrent `clear()` raced `token_type()` + `inner.read()`).
-        let snapshot: Option<GrokAuth> = self.with_inner_read(|inner| inner.cloned());
+        // Snapshot bearer bytes and their suppression verdict in one lock
+        // epoch. A concurrent login/sibling swap cannot clear the old key's
+        // verdict after we clone that old key but before its wire gate.
+        let (snapshot, snapshot_wire_suppressed): (Option<GrokAuth>, bool) = self
+            .with_auth_state_read(|inner, failure| {
+                let snapshot = inner.cloned();
+                let suppressed = snapshot
+                    .as_ref()
+                    .is_some_and(|auth| Self::failure_suppresses_wire_bearer(failure, &auth.key));
+                (snapshot, suppressed)
+            });
         // Kept alongside `snapshot`, which the grace arm below consumes: the
         // devbox arms still need to name the credential they gave up on.
         let snapshot_key: Option<String> = snapshot.as_ref().map(|a| a.key.clone());
@@ -1603,6 +2255,7 @@ impl AuthManager {
         // re-login isn't blocked by a stale failure).
         if let Some(ref auth) = snapshot
             && !self.is_token_expired(auth)
+            && !snapshot_wire_suppressed
         {
             return Ok(auth.clone());
         }
@@ -1610,9 +2263,13 @@ impl AuthManager {
         if let Some(err) = self.permanent_failure() {
             // The verdict is about the *refresh* token; a cached access token
             // that is still wire-valid ([`Self::is_token_hard_expired`]) is
-            // usable regardless (no IdP).
+            // normally usable regardless (no IdP). The exception is a refresh
+            // triggered by this same bearer being rejected on the request
+            // wire: retaining bytes after a pre-publication disk failure must
+            // not re-send a credential the provider already refused.
             if let Some(ref auth) = snapshot
                 && !self.is_token_hard_expired(auth)
+                && !snapshot_wire_suppressed
             {
                 return Ok(auth.clone());
             }
@@ -1681,6 +2338,7 @@ impl AuthManager {
                                     == crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected
                         );
                         if !deny_grace
+                            && !snapshot_wire_suppressed
                             && let Some(auth) = snapshot
                             && !self.is_token_hard_expired(&auth)
                         {
@@ -2253,22 +2911,54 @@ impl AuthManager {
                         (None, _, _) => (true, true),
                     };
                     if let Some(key) = tried_key.or(attempted_key) {
-                        self.record_permanent_failure(key, error);
+                        self.record_permanent_failure_with_wire_policy(
+                            key,
+                            error,
+                            reason == RefreshReason::ServerRejected,
+                        );
                     }
                     let mut disk_mutation = "unchanged";
+                    let mut clear_mem_after_disk = clear_mem;
                     if clear_disk {
-                        disk_mutation = match self.write_scope_removal(&self.scope) {
-                            Ok(m) => m.label(),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "auth: failed to clear credentials after permanent refresh failure"
-                                );
-                                "write_failed"
+                        if self.xai_session {
+                            disk_mutation = match self.write_scope_removal(&self.scope) {
+                                Ok(m) => m.label(),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "auth: failed to clear credentials after permanent refresh failure"
+                                    );
+                                    "write_failed"
+                                }
+                            };
+                        } else {
+                            match self.write_scope_removal_durable(&self.scope) {
+                                Ok(outcome) => {
+                                    disk_mutation = outcome.mutation.label();
+                                    if let Some(error) = outcome.durability_error {
+                                        tracing::warn!(
+                                            error = %error,
+                                            "auth: rejected provider credential removal is visible but not durably proven"
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "auth: failed to publish rejected provider credential removal"
+                                    );
+                                    disk_mutation = "write_failed_before_publication";
+                                    // The strict provider writer guarantees the
+                                    // old store is still authoritative on this
+                                    // path. Keep memory aligned with it; the
+                                    // sticky rejection verdict still prevents
+                                    // the known-bad credential from being used.
+                                    clear_mem_after_disk = false;
+                                }
                             }
-                        };
+                        }
                     }
-                    if clear_mem {
+                    if clear_mem_after_disk {
                         self.clear_inner();
                     }
                     xai_grok_telemetry::unified_log::warn(
@@ -2277,12 +2967,16 @@ impl AuthManager {
                         Some(serde_json::json!({
                             "reason": format!("{failed_reason:?}"),
                             "disk_mutation": disk_mutation,
-                            "cleared_mem": clear_mem,
+                            "cleared_mem": clear_mem_after_disk,
                             "cleared_disk": clear_disk,
                         })),
                     );
                 } else if let Some(key) = tried_key.or(attempted_key) {
-                    self.record_permanent_failure(key, error);
+                    self.record_permanent_failure_with_wire_policy(
+                        key,
+                        error,
+                        reason == RefreshReason::ServerRejected,
+                    );
                 }
                 Err(AuthError::permanent(failed_reason))
             }
@@ -2345,6 +3039,15 @@ impl AuthManager {
         token_key: String,
         error: crate::auth::error::RefreshTokenFailedError,
     ) {
+        self.record_permanent_failure_with_wire_policy(token_key, error, false);
+    }
+
+    fn record_permanent_failure_with_wire_policy(
+        &self,
+        token_key: String,
+        error: crate::auth::error::RefreshTokenFailedError,
+        suppress_wire_bearer: bool,
+    ) {
         // Don't advertise a TTL for a sticky (never-expiring) verdict.
         let ttl_seconds = (!error.reason.is_sticky()).then(|| PERMANENT_FAILURE_TTL.as_secs());
         xai_grok_telemetry::unified_log::warn(
@@ -2356,11 +3059,31 @@ impl AuthManager {
                 "ttl_seconds": ttl_seconds,
             })),
         );
-        *self.permanent_failure.write() = Some(ScopedRefreshFailure {
-            token_key,
-            error,
-            recorded_at: DualClock::now(),
+        self.publish_auth_state(|_, failure| {
+            *failure = Some(ScopedRefreshFailure {
+                token_key,
+                error,
+                suppress_wire_bearer,
+                recorded_at: DualClock::now(),
+            });
         });
+    }
+
+    fn failure_suppresses_wire_bearer(
+        failure: Option<&ScopedRefreshFailure>,
+        token_key: &str,
+    ) -> bool {
+        let Some(failure) = failure else {
+            return false;
+        };
+        if !failure.suppress_wire_bearer || failure.token_key != token_key {
+            return false;
+        }
+        if failure.error.reason.is_sticky() {
+            return true;
+        }
+        let (monotonic, wall) = failure.recorded_at.elapsed();
+        monotonic < PERMANENT_FAILURE_TTL && wall < PERMANENT_FAILURE_TTL
     }
 
     /// Key the sticky verdict is scoped to: the credential a refresh for
@@ -2461,8 +3184,9 @@ impl AuthManager {
     }
 
     fn is_external_provider_refresh_authority(&self) -> bool {
-        self.grok_com_config.auth_provider_command.is_some()
-            && self.token_type() == TokenType::ExternalBinary
+        super::has_nonblank_auth_provider_command(
+            self.grok_com_config.auth_provider_command.as_deref(),
+        ) && self.token_type() == TokenType::ExternalBinary
     }
 
     /// `true` iff a [`TokenRefresher`] is wired in. `false` for static-key

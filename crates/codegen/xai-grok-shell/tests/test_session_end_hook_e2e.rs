@@ -21,7 +21,7 @@ use xai_grok_test_support::*;
 /// Runs headless with a SessionEnd hook that writes stdin + a marker file.
 async fn run_with_session_end_hook() -> (HeadlessResult, MockInferenceServer, tempfile::TempDir) {
     let state_dir = tempfile::TempDir::new().expect("create state dir");
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let sandbox = TestSandbox::builder().mock_url(server.url()).git().build();

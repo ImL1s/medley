@@ -1171,8 +1171,15 @@ mod tests {
     /// forces the full Phase-2 wait + Phase-3 confirmation, and the sum
     /// must still land within the budget (pre-fix: `timeout + confirm`,
     /// ~57 s on a 45 s request).
+    ///
+    /// Algorithmic reservation is locked by
+    /// [`phase2_budget_reserves_confirmation_delay`]. This flock smoke only
+    /// proves the wedged holder is broken and the wait does not hang; a
+    /// tight sub-second wall-clock bound flakes under runner contention
+    /// (#301) even when `phase2_budget` is correct.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn total_wait_stays_within_timeout_budget() {
         let dir = TempDir::new().unwrap();
         let path = auth_json_path(&dir);
@@ -1204,11 +1211,12 @@ mod tests {
         let lock = try_lock_auth_file_async_with(&path, timeout, confirm).await;
         let elapsed = start.elapsed();
         assert!(lock.is_some(), "wedged holder must be broken");
-        // Generous slack for CI scheduling, but well under the pre-fix
-        // floor of timeout + confirm (1300 ms).
+        // Hang detector only. The 250 ms slack above `timeout` flakes under
+        // GHA contention (#301, 2.3 s observed). The phase-2 reservation
+        // contract lives in `phase2_budget_reserves_confirmation_delay`.
         assert!(
-            elapsed < timeout + StdDuration::from_millis(250),
-            "total wait must stay within the caller's budget, took {elapsed:?}"
+            elapsed < StdDuration::from_secs(10),
+            "wedged-holder acquire hung, took {elapsed:?}"
         );
     }
 

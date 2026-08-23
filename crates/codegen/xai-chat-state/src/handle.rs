@@ -92,8 +92,47 @@ impl ChatStateHandle {
     }
 
     /// Record a tool result.
-    pub fn push_tool_result(&self, item: ConversationItem) {
-        let _ = self.cmd_tx.send(ChatStateCommand::PushToolResult { item });
+    pub fn push_tool_result(
+        &self,
+        item: ConversationItem,
+        truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
+    ) {
+        self.push_tool_result_with_trusted_suffix(item, truncation_policy, None);
+    }
+
+    /// Record a tool result with an internally appended reminder suffix.
+    ///
+    /// This compatibility entry point carries only the exact suffix boundary.
+    /// New producers should use [`Self::push_tool_result_with_structured_suffix`]
+    /// so completion IDs remain independently retainable under a hard budget.
+    pub fn push_tool_result_with_trusted_suffix(
+        &self,
+        item: ConversationItem,
+        truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
+        trusted_suffix: Option<String>,
+    ) {
+        self.push_tool_result_with_structured_suffix(
+            item,
+            truncation_policy,
+            trusted_suffix.map(|exact| crate::types::TrustedPromptSuffix {
+                exact,
+                reminders: Vec::new(),
+            }),
+        );
+    }
+
+    /// Record a tool result with producer-authored reminder structure.
+    pub fn push_tool_result_with_structured_suffix(
+        &self,
+        item: ConversationItem,
+        truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
+        trusted_suffix: Option<crate::types::TrustedPromptSuffix>,
+    ) {
+        let _ = self.cmd_tx.send(ChatStateCommand::PushToolResult {
+            item,
+            truncation_policy,
+            trusted_suffix,
+        });
     }
 
     /// Record accumulated token usage.
@@ -168,6 +207,20 @@ impl ChatStateHandle {
         let _ = self
             .cmd_tx
             .send(ChatStateCommand::UpdateSamplingConfig { config });
+    }
+
+    /// Atomically update the sampling config and its bound credentials.
+    pub fn update_sampling_config_and_credentials(
+        &self,
+        config: SamplingConfig,
+        credentials: Credentials,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::UpdateSamplingConfigAndCredentials {
+                config,
+                credentials,
+            });
     }
 
     /// Track that the agent edited a file path.
@@ -446,6 +499,31 @@ impl ChatStateHandle {
     pub async fn get_sampling_config(&self) -> Option<SamplingConfig> {
         self.query("GetSamplingConfig", |reply| {
             ChatStateCommand::GetSamplingConfig { reply }
+        })
+        .await
+    }
+
+    /// Get sampling config together with the catalog identity committed in
+    /// the same actor transaction.
+    pub async fn get_sampling_config_with_model_id(
+        &self,
+    ) -> Option<(SamplingConfig, Option<crate::types::CatalogIdentity>)> {
+        self.query("GetSamplingConfigWithModelId", |reply| {
+            ChatStateCommand::GetSamplingConfigWithModelId { reply }
+        })
+        .await
+    }
+
+    /// Get routing identity and credentials from one actor transaction.
+    pub async fn get_prepared_model_state(
+        &self,
+    ) -> Option<(
+        SamplingConfig,
+        Option<crate::types::CatalogIdentity>,
+        Credentials,
+    )> {
+        self.query("GetPreparedModelState", |reply| {
+            ChatStateCommand::GetPreparedModelState { reply }
         })
         .await
     }

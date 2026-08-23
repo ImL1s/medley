@@ -35,7 +35,14 @@ fn start_test_model_switch(
         insert_ready_model(app, agent_id, &model_id);
     }
     assert_eq!(app.active_view, ActiveView::Agent(agent_id));
-    let effects = dispatch(Action::SwitchModel { model_id, effort }, app);
+    let effects = dispatch(
+        Action::SwitchModel {
+            model_id,
+            effort,
+            session_only: false,
+        },
+        app,
+    );
     switch_model_request_id(&effects)
 }
 
@@ -1037,6 +1044,7 @@ fn switch_model_complete_success_updates_model_and_pushes_message() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1076,6 +1084,7 @@ fn switch_model_complete_without_exact_request_id_is_ignored() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1109,6 +1118,7 @@ fn switch_model_complete_skips_message_and_persist_when_unchanged() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1160,6 +1170,7 @@ fn switch_model_complete_persists_resolved_effort_from_catalog_meta() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1224,6 +1235,7 @@ fn switch_to_non_reasoning_model_clears_persisted_effort() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1264,6 +1276,7 @@ fn switch_model_complete_failure_pushes_error_and_clears_pending() {
             request_id,
             result: Err(SwitchModelError::Other("model not found".into())),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1303,6 +1316,7 @@ fn switch_model_incompatible_agent_shows_question_modal() {
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1332,6 +1346,7 @@ fn incompatible_model_switch_opens_question_on_originating_session() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1360,6 +1375,7 @@ fn incompatible_model_switch_opens_question_on_originating_session() {
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1413,6 +1429,7 @@ fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1440,6 +1457,7 @@ fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1459,6 +1477,7 @@ fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question
         Action::SwitchModel {
             model_id: follow_on_model,
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1498,6 +1517,7 @@ fn incompatible_model_switch_holds_queue_until_declined() {
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1543,6 +1563,7 @@ fn incompatible_model_switch_cancel_keys_decline_and_release_queue() {
             Action::SwitchModel {
                 model_id: model_id.clone(),
                 effort: None,
+                session_only: false,
             },
             &mut app,
         );
@@ -1568,6 +1589,7 @@ fn incompatible_model_switch_cancel_keys_decline_and_release_queue() {
                     error,
                     prev_model_id: None,
                 }),
+                session_only: false,
                 prev_model_id: None,
             }),
             &mut app,
@@ -1640,6 +1662,7 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1712,6 +1735,7 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1777,6 +1801,7 @@ fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
                     error: incompatible,
                     prev_model_id: None,
                 }),
+                session_only: false,
                 prev_model_id: None,
             }),
             &mut app,
@@ -1830,6 +1855,7 @@ fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
                 request_id,
                 result,
                 prev_model_id: None,
+                session_only: false,
             }),
             &mut app,
         );
@@ -1895,6 +1921,7 @@ fn failed_deferred_target_preflight_aborts_transaction_and_restores_source_queue
                     error,
                     prev_model_id: None,
                 }),
+                session_only: false,
                 prev_model_id: None,
             }),
             &mut app,
@@ -1989,6 +2016,7 @@ fn failed_replacement_restores_and_drains_handed_queue_before_new_source_prompts
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2107,6 +2135,7 @@ fn incompatible_agent_rollback_restores_previous_model() {
                 prev_model_id: Some(prev_model.clone()),
             }),
             prev_model_id: Some(prev_model.clone()),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2193,6 +2222,7 @@ fn switch_model_unavailable_harness_rolls_back_default_without_new_session_modal
                 prev_model_id: Some(prev_model.clone()),
             }),
             prev_model_id: Some(prev_model.clone()),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2277,6 +2307,7 @@ fn confirmed_default_model_switch_persists_after_optimistic_mirror_update() {
             request_id,
             result: Ok(()),
             prev_model_id: Some(prev_model),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2343,6 +2374,7 @@ fn replacement_session_persists_confirmed_default_after_creation() {
                 prev_model_id: Some(previous.clone()),
             }),
             prev_model_id: Some(previous.clone()),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2401,6 +2433,7 @@ fn replacement_session_persists_confirmed_default_after_creation() {
         Action::SwitchModel {
             model_id: previous,
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -2446,6 +2479,7 @@ fn chat_mode_default_switch_does_not_persist_build_default() {
             request_id,
             result: Ok(()),
             prev_model_id: Some(previous),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2599,6 +2633,7 @@ fn generic_switch_failure_restores_exact_model_mirrors_and_effort() {
             request_id,
             result: Err(SwitchModelError::Other("transport closed".into())),
             prev_model_id: Some(prev_model.clone()),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2656,6 +2691,7 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
         Action::SwitchModel {
             model_id: session_target.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -2701,6 +2737,7 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
             request_id: second_request_id,
             result: Ok(()),
             prev_model_id: Some(global_original),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2714,6 +2751,7 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
             request_id: first_request_id,
             result: Err(SwitchModelError::Other("session switch failed".into())),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2761,6 +2799,7 @@ fn older_session_switch_success_cannot_overwrite_newer_committed_default() {
         Action::SwitchModel {
             model_id: session_target.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -2799,6 +2838,7 @@ fn older_session_switch_success_cannot_overwrite_newer_committed_default() {
             request_id: second_request_id,
             result: Ok(()),
             prev_model_id: Some(global_original),
+            session_only: false,
         }),
         &mut app,
     );
@@ -2816,6 +2856,7 @@ fn older_session_switch_success_cannot_overwrite_newer_committed_default() {
             request_id: first_request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2878,6 +2919,7 @@ fn rapid_model_selections_are_serialized_and_stale_completion_is_ignored() {
             request_id: first_request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2892,6 +2934,7 @@ fn rapid_model_selections_are_serialized_and_stale_completion_is_ignored() {
             request_id: first_request_id,
             result: Err(SwitchModelError::Other("late duplicate".into())),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2912,6 +2955,7 @@ fn rapid_model_selections_are_serialized_and_stale_completion_is_ignored() {
             request_id: second_request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -2957,6 +3001,7 @@ fn incompatible_agent_closes_active_modal() {
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -3004,6 +3049,7 @@ fn same_agent_type_switch_no_modal() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -3035,6 +3081,7 @@ fn switch_model_pending_lifecycle() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -3050,6 +3097,7 @@ fn switch_model_pending_lifecycle() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -4475,6 +4523,7 @@ fn adoption_persists_model(pre_session: bool) {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -4516,6 +4565,7 @@ fn adoption_persists_model(pre_session: bool) {
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -4555,4 +4605,72 @@ fn adoption_persists_model(pre_session: bool) {
          the adopted model — the model runs either way, so dropping the \
          preference on one entry point and keeping it on the other is the bug"
     );
+}
+
+#[test]
+fn session_only_model_switch_does_not_persist() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let model_a = acp::ModelId::new("model-a");
+    let model_b = acp::ModelId::new("model-b");
+    insert_ready_model(&mut app, agent_id, &model_a);
+    insert_ready_model(&mut app, agent_id, &model_b);
+
+    // Start with model_a as the default
+    app.models.current = Some(model_a.clone());
+
+    // Switch to model_b with session_only=true
+    let request_id = start_model_switch(
+        &mut app,
+        agent_id,
+        model_b.clone(),
+        None,
+        true, // session_only
+    );
+
+    // Complete the switch successfully
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id,
+            model_id: model_b.clone(),
+            effort: None,
+            request_id,
+            result: Ok(()),
+            prev_model_id: Some(model_a.clone()),
+            session_only: true,
+        }),
+        &mut app,
+    );
+
+    // Verify that NO PersistPreferredModel effect was emitted
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        "session_only switch must NOT emit PersistPreferredModel"
+    );
+
+    // Verify the session model was updated
+    assert_eq!(app.agents[&agent_id].session.models.current, Some(model_b));
+
+    // Verify app-global model was NOT persisted (it may be updated in memory for UI consistency)
+    // The key is that no PersistPreferredModel effect was emitted
+}
+
+fn start_model_switch(
+    app: &mut AppView,
+    _agent_id: AgentId,
+    model_id: acp::ModelId,
+    effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
+    session_only: bool,
+) -> u64 {
+    let effects = dispatch(
+        Action::SwitchModel {
+            model_id,
+            effort,
+            session_only,
+        },
+        app,
+    );
+    switch_model_request_id(&effects)
 }

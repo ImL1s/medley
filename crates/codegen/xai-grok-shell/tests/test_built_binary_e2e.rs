@@ -43,7 +43,7 @@ const CHAT_COMPLETIONS_MODEL: &str = "chat-completions-model";
 
 /// Start a mock server with one model named `model` on the given API backend.
 async fn single_model_server(model: &str, backend: &str) -> MockInferenceServer {
-    MockInferenceServer::start_with_models(vec![
+    MockInferenceServer::start_with_keyless_local_models(vec![
         MockModelEntry::new(model).with_api_backend(backend),
     ])
     .await
@@ -51,7 +51,7 @@ async fn single_model_server(model: &str, backend: &str) -> MockInferenceServer 
 }
 
 async fn grok_build_server() -> MockInferenceServer {
-    MockInferenceServer::start_with_models(vec![
+    MockInferenceServer::start_with_keyless_local_models(vec![
         MockModelEntry::with_agent_type("grok-4.5", "grok-build")
             .with_api_backend("responses")
             .with_supports_backend_search(true),
@@ -158,7 +158,7 @@ async fn test_version_with_crash_handler_exits_zero() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_session_in_git_repo() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -183,7 +183,7 @@ async fn test_headless_session_in_git_repo() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_session_in_non_git_dir() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = tempfile::tempdir().unwrap();
@@ -334,7 +334,7 @@ async fn test_headless_terminal_only_allowlist_is_foreground_only() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_free_usage_exhausted_prints_paywall_message() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let free_usage = || {
@@ -383,7 +383,7 @@ async fn test_headless_free_usage_exhausted_prints_paywall_message() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_streaming_json_output() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -449,7 +449,7 @@ async fn test_headless_streaming_json_output() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_streaming_messages_json_output() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -1195,7 +1195,7 @@ async fn invalid_json_schema_disables_structured_output_and_surfaces_error() {
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_stdio_full_session_lifecycle() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start().await.expect("start mock server");
+        let server = MockInferenceServer::start_keyless_local().await.expect("start mock server");
         let workdir = git_workdir();
         let client = GrokStdioClient::spawn(&server, workdir.workspace()).await;
 
@@ -1240,7 +1240,7 @@ async fn test_stdio_full_session_lifecycle() {
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_stdio_session_close() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start()
+        let server = MockInferenceServer::start_keyless_local()
             .await
             .expect("start mock server");
         let workdir = git_workdir();
@@ -1306,7 +1306,7 @@ async fn test_stdio_session_close() {
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_stdio_prompt_then_immediate_load_session() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start().await.expect("start mock server");
+        let server = MockInferenceServer::start_keyless_local().await.expect("start mock server");
         let workdir = git_workdir();
         let mut writer = GrokStdioClient::spawn(&server, workdir.workspace()).await;
 
@@ -1387,7 +1387,7 @@ fn line_with_escaped_method(req: &serde_json::Value, method: &str) -> String {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_stdio_xcode_escaped_slash_methods_get_responses() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -1499,7 +1499,7 @@ async fn test_stdio_xcode_escaped_slash_methods_get_responses() {
 async fn test_stdio_agent_exits_on_stdin_eof() {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let mut sandbox = TestSandbox::builder().git().build();
@@ -1671,7 +1671,7 @@ default = "grok-4.5"
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn headless_reasoning_efforts_payload_parses_and_legacy_effort_rides_wire() {
-    let server = MockInferenceServer::start_with_models(vec![
+    let server = MockInferenceServer::start_with_keyless_local_models(vec![
         MockModelEntry::new(CHAT_COMPLETIONS_MODEL)
             .with_api_backend("chat_completions")
             .with_supports_reasoning_effort(true)
@@ -1811,7 +1811,7 @@ fn enqueue_background_task_turn(server: &MockInferenceServer, pid_file: &std::pa
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_timeout_exit_kills_pending_background_task() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -1852,7 +1852,7 @@ async fn test_headless_timeout_exit_kills_pending_background_task() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_no_wait_exit_kills_background_task() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -1889,7 +1889,7 @@ async fn test_headless_no_wait_exit_kills_background_task() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_waits_for_short_background_task_and_exits_clean() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();

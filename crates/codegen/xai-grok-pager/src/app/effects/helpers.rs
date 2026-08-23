@@ -8,6 +8,7 @@ use super::agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::{
     RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
+    http_status_from_error,
 };
 use xai_grok_shell::session::ExtMethodResult;
 use xai_grok_shell::session::unified_list::ListScope;
@@ -88,7 +89,8 @@ pub(super) async fn fetch_plugin_cta_mcps(
 /// Rate-limit errors: free-usage paywall, else server detail (with API-key
 /// rewrite when the body pushes personal SuperGrok), else auth-aware fallback
 /// (see [`format_rate_limited_user_message`]).
-/// All other errors are sanitized to remove internal service names and jargon.
+/// All other errors render as the formatted request-failure banner text
+/// (status headline + sanitized detail).
 pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> String {
     if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
         let detail = err.data.as_ref().and_then(error_detail_from_data);
@@ -99,9 +101,20 @@ pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> Strin
     if err.code == acp::ErrorCode::InvalidParams && let Some(data) = &err.data
         && let Some(msg) = error_detail_from_data(data) && !msg.is_empty()
     {
-        return msg;
+        return sanitize_user_error(&msg);
     }
-    sanitize_user_error(&err.to_string())
+    let raw = err
+        .data
+        .as_ref()
+        .and_then(error_detail_from_data)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| err.to_string());
+    crate::app::error_display::format_request_failure(
+            http_status_from_error(err),
+            None,
+            &raw,
+        )
+        .message()
 }
 /// Format a Duration for user-visible restore progress messages.
 pub(super) fn format_restore_elapsed(d: std::time::Duration) -> String {
@@ -188,7 +201,8 @@ pub(crate) fn parse_session_scheduler_background_loops(
         .and_then(|v| v.as_bool())
 }
 /// #161: the web-search disable notice from a `session/new` / `session/load`
-/// response `_meta`. `None` means `web_search` is available.
+/// response `_meta`. `None` means the key is absent and `web_search` is
+/// available. A present malformed value fails closed with a generic notice.
 ///
 /// Sibling of [`parse_session_scheduler_background_loops`] and read the same
 /// way, because it is the same kind of value: session-scoped state the shell
@@ -204,20 +218,25 @@ pub(crate) fn parse_session_web_search_disabled(
     match serde_json::from_value(raw.clone()) {
         Ok(notice) => Some(notice),
         Err(err) => {
-            // Present-but-malformed must not collapse into "available" silently:
-            // that erases the absent-key == available contract (#161). Warn and
-            // treat as absent rather than inventing a notice from bad shape.
+            // Present-but-malformed must not collapse into "available": only
+            // an absent key carries that meaning. Keep the user-facing notice
+            // generic because malformed provider-controlled metadata is not a
+            // trustworthy source for model/reason details.
             tracing::warn!(
                 error = %err,
-                "ignoring malformed {} session meta",
+                "failing closed on malformed {} session meta",
                 xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY
             );
-            None
+            Some(xai_grok_shell::session::WebSearchDisabledNotice {
+                model_id: "unknown".to_string(),
+                reason: "invalid availability metadata".to_string(),
+                message: "web_search availability could not be verified because the session returned invalid metadata. Restart the session or check the provider and model configuration.".to_string(),
+            })
         }
     }
 }
 /// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
-fn is_disk_full_error(raw: &str) -> bool {
+pub(crate) fn is_disk_full_error(raw: &str) -> bool {
     raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)
         || raw.contains(xai_fast_worktree::ENOSPC_OS_MESSAGE)
         || raw.contains("Disk quota exceeded") || raw.contains("Out of disk space")
@@ -814,6 +833,11 @@ pub(super) fn parse_session_picker_entries(
                 .or_else(|| v.get("worktree_label"))
                 .and_then(|s| s.as_str())
                 .map(String::from);
+            let last_turn_summary = v
+                .get("lastTurnSummary")
+                .or_else(|| v.get("last_turn_summary"))
+                .and_then(|s| s.as_str())
+                .map(String::from);
             let repo_name = crate::views::session_picker::repo_name_from_cwd(&cwd_str);
             Some(SessionPickerEntry {
                 id,
@@ -829,6 +853,7 @@ pub(super) fn parse_session_picker_entries(
                 branch,
                 repo_name,
                 worktree_label,
+                last_turn_summary,
                 card_detail: None,
             })
         })
@@ -869,6 +894,7 @@ pub(super) fn session_picker_entry_to_roster(
         model_id: e.model_id.clone(),
         yolo: false,
         activity: RosterActivity::Dormant,
+        last_turn_summary: e.last_turn_summary.clone(),
         resident: false,
         last_change_unix_ms: last_change.timestamp_millis(),
         origin: RosterOrigin {
@@ -1046,6 +1072,14 @@ pub(crate) async fn persist_setting(
                 return Err(kind_mismatch("page_flip_on_send", "Bool", &value));
             };
             xai_grok_shell::util::config::set_page_flip_on_send(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "confirm_before_rewind" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("confirm_before_rewind", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_confirm_before_rewind(b)
                 .await
                 .map_err(|e| e.to_string())
         }

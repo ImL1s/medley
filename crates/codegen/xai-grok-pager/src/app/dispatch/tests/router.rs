@@ -32,7 +32,6 @@ fn external_prompt_editor_arms_typed_request_and_preserves_composer_modes() {
     for mode in [
         PromptInputMode::Normal,
         PromptInputMode::Bash,
-        PromptInputMode::Feedback,
         PromptInputMode::Remember,
     ] {
         let mut app = test_app_with_agent();
@@ -963,6 +962,7 @@ fn switch_model_dispatch_produces_effect_and_sets_pending() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1016,6 +1016,7 @@ fn switch_model_hard_blocks_unready() {
         Action::SwitchModel {
             model_id: unready_id,
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1044,6 +1045,7 @@ fn switch_model_hard_blocks_catalog_miss() {
         Action::SwitchModel {
             model_id: unknown_id,
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1159,6 +1161,8 @@ fn apply_deferred_switch_outcome_hard_blocks_unready() {
                 model_id: unready_id,
                 effort: None,
                 prev_model_id: None,
+                prev_model_id_captured: false,
+                session_only: false,
             }),
             effort_error: None,
         },
@@ -1190,6 +1194,8 @@ fn apply_deferred_switch_outcome_hard_blocks_catalog_miss() {
                 model_id: unknown_id,
                 effort: None,
                 prev_model_id: None,
+                prev_model_id_captured: false,
+                session_only: false,
             }),
             effort_error: None,
         },
@@ -1215,6 +1221,7 @@ fn switch_model_allowed_when_agent_chat_kind() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1233,6 +1240,7 @@ fn switch_model_allowed_when_app_chat_mode() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1292,6 +1300,8 @@ fn agent_type_mismatch_with_effort_stashes_deferred_switch() {
                 model_id,
                 effort,
                 prev_model_id: None,
+                prev_model_id_captured: false,
+                session_only: false,
             }),
             "effort override must be stashed for the shell via deferred_model_switch",
         );
@@ -1312,6 +1322,8 @@ fn deferred_model_switch_still_works_for_cli_override() {
             model_id: cli_model,
             effort: None,
             prev_model_id: None,
+            prev_model_id_captured: false,
+            session_only: false,
         }),
         "CLI -m override must still populate deferred_model_switch",
     );
@@ -1720,7 +1732,7 @@ fn all_constructor_paths_initialize_slash_fields() {
     }
 }
 #[test]
-fn deferred_switch_overwritten_by_second_switch() {
+fn rapid_deferred_switch_preserves_captured_none_rollback() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
@@ -1732,6 +1744,7 @@ fn deferred_switch_overwritten_by_second_switch() {
         Action::SwitchModel {
             model_id: model_a.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1739,6 +1752,7 @@ fn deferred_switch_overwritten_by_second_switch() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1747,7 +1761,9 @@ fn deferred_switch_overwritten_by_second_switch() {
         Some(crate::app::agent::DeferredModelSwitch {
             model_id: model_b.clone(),
             effort: None,
-            prev_model_id: Some(model_a),
+            prev_model_id: None,
+            prev_model_id_captured: true,
+            session_only: false,
         })
     );
 }
@@ -1769,11 +1785,14 @@ fn pick_over_cli_seed_keeps_display_as_rollback_target() {
         model_id: cli_model,
         effort: None,
         prev_model_id: None,
+        prev_model_id_captured: false,
+        session_only: false,
     });
     dispatch(
         Action::SwitchModel {
             model_id: picked.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1783,6 +1802,8 @@ fn pick_over_cli_seed_keeps_display_as_rollback_target() {
             model_id: picked,
             effort: None,
             prev_model_id: Some(displayed),
+            prev_model_id_captured: true,
+            session_only: false,
         })
     );
 }
@@ -1800,6 +1821,7 @@ fn deferred_switch_updates_display_and_persists() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1815,6 +1837,8 @@ fn deferred_switch_updates_display_and_persists() {
             model_id: model_id.clone(),
             effort: None,
             prev_model_id: None,
+            prev_model_id_captured: true,
+            session_only: false,
         }),
         "switch must still round-trip once the session exists"
     );
@@ -1836,6 +1860,7 @@ fn deferred_switch_updates_display_and_persists() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );

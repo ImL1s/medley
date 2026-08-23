@@ -17,10 +17,17 @@
 //! Definition discovery, gating, prompt context, runtime defaults, and
 //! capability/depth tool policy are shared here. Model catalog selection and
 //! workspace materialization remain host adapters.
+//!
+//! [`native_route`] is the optional plugin-facing native subagent route
+//! contract (#287): capability negotiation, ordered catalog candidates, and
+//! secret-free receipts. Live child spawn maps the session catalog through
+//! this resolver when `AgentDefinition.models` is set or when exact `model:`
+//! is declared; unknown exact ids fail closed instead of inheriting.
 
 pub mod config;
 pub mod context;
 pub mod definition;
+pub mod native_route;
 pub mod overrides;
 pub mod resume;
 pub mod types;
@@ -33,6 +40,13 @@ pub use definition::{
     render_subagent_initial_user_message, render_subagent_system_prompt, resolve_agent_definition,
     resolve_runtime_config, select_role, subagent_harness_flavor_is_representable,
     validate_agent_name,
+};
+pub use native_route::{
+    AgentRouteUxSnapshot, CapabilityRequirements, CapabilityState, DeclarativeNativeRouteSpec,
+    FallbackAdmission, LifecyclePhase, NativeModelSelection, NativeRouteError,
+    NativeSubagentRouteRequest, NativeSubagentRouteResult, RejectionCode, RouteReceipt,
+    SyntheticCatalog, WorkerRoute, discover_capabilities, inspect_document, parse_declarative_spec,
+    request_from_agent_definition, resolve_native_route, usage_facts_from_receipt,
 };
 pub use overrides::{
     intersect_capability_mode_ceiling, intersect_capability_modes, resolve_effective_overrides,

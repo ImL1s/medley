@@ -17,6 +17,20 @@ fn format_acp_error_reads_detail_from_wrapped_data() {
     assert_eq!(format_acp_error(&wrapped, false), "model does not support tools");
 }
 #[test]
+fn format_acp_error_formats_http_500_dump() {
+    let err = acp::Error::internal_error()
+        .data(
+            serde_json::json!({
+            "message": "API error (status 500 Internal Server Error): {\"error\":\"upstream exploded\"}",
+            "http_status": 500
+        }),
+        );
+    assert_eq!(
+            format_acp_error(&err, false),
+            "Server error (500) \u{2014} Something went wrong on our side. Wait a minute and send again."
+        );
+}
+#[test]
 fn format_acp_error_rate_limit_surfaces_detail_or_fallback() {
     use xai_grok_shell::sampling::error::{
         FREE_USAGE_USER_MESSAGE, RATE_LIMITED_ERROR_CODE,
@@ -754,16 +768,23 @@ fn parse_session_web_search_disabled_absent_key_is_none() {
     assert!(parse_session_web_search_disabled(Some(&meta)).is_none());
     assert!(parse_session_web_search_disabled(None).is_none());
 }
-/// Present-but-malformed collapses to None (with a warn), not a panic — and
-/// must not be mistaken for a successful disable notice.
+/// Present-but-malformed fails closed with a generic actionable notice. This
+/// is deliberately distinct from an absent key, which means available.
 #[test]
-fn parse_session_web_search_disabled_malformed_is_none() {
+fn parse_session_web_search_disabled_malformed_fails_closed() {
     let mut meta = acp::Meta::new();
     meta.insert(
         xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY.into(),
         serde_json::json!("not-an-object"),
     );
-    assert!(parse_session_web_search_disabled(Some(&meta)).is_none());
+    let notice = parse_session_web_search_disabled(Some(&meta))
+        .expect("present malformed metadata must not mean available");
+    assert_eq!(notice.model_id, "unknown");
+    assert_eq!(notice.reason, "invalid availability metadata");
+    assert_eq!(
+        notice.message,
+        "web_search availability could not be verified because the session returned invalid metadata. Restart the session or check the provider and model configuration."
+    );
 }
 /// Unknown keys return a descriptive error.
 #[tokio::test]
@@ -822,6 +843,17 @@ async fn persist_setting_type_mismatch_errors_page_flip_on_send() {
     let err = r.expect_err("page_flip_on_send with String payload must return Err");
     assert!(
             err.contains("persist_setting(page_flip_on_send) expected Bool"),
+            "got: {err}",
+        );
+}
+#[tokio::test]
+async fn persist_setting_type_mismatch_errors_confirm_before_rewind() {
+    use crate::settings::SettingValue;
+    let r = persist_setting("confirm_before_rewind", SettingValue::String("nope".into()))
+        .await;
+    let err = r.expect_err("confirm_before_rewind with String payload must return Err");
+    assert!(
+            err.contains("persist_setting(confirm_before_rewind) expected Bool"),
             "got: {err}",
         );
 }
@@ -2574,6 +2606,7 @@ fn session_picker_entry_maps_to_dormant_roster_row() {
         branch: None,
         repo_name: "repo-app".to_string(),
         worktree_label: Some("wt".to_string()),
+        last_turn_summary: Some("Fixed the parser".to_string()),
         card_detail: None,
     };
     let roster = session_picker_entry_to_roster(&entry);
@@ -2583,8 +2616,21 @@ fn session_picker_entry_maps_to_dormant_roster_row() {
     assert!(roster.is_worktree, "worktree_label present → is_worktree");
     assert_eq!(roster.model_id.as_deref(), Some("grok-4"));
     assert_eq!(roster.activity, RosterActivity::Dormant);
+    assert_eq!(
+            roster.last_turn_summary.as_deref(),
+            Some("Fixed the parser")
+        );
     assert!(!roster.resident);
     assert_eq!(roster.last_change_unix_ms, updated.timestamp_millis());
     assert_eq!(roster.origin.kind, "local");
     assert_eq!(roster.origin.host.as_deref(), Some("box"));
+}
+#[test]
+fn rewind_execute_params_sends_conversation_only_with_force() {
+    let params = rewind_execute_params("sess-1", 3);
+    assert_eq!(params["sessionId"], "sess-1");
+    assert_eq!(params["targetPromptIndex"], 3);
+    assert_eq!(params["force"], true);
+    assert_eq!(params["mode"], REWIND_MODE_WIRE);
+    assert_eq!(params["mode"], "conversation_only");
 }

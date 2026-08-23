@@ -17,7 +17,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
-from check_new_tests_are_filtered import added_tests, crate_of, selected, target_of  # noqa: E402
+from check_new_tests_are_filtered import (  # noqa: E402
+    added_tests,
+    crate_of,
+    selected,
+    target_of,
+    targets_of,
+)
 from check_test_filter_coverage import parse_workflow, uncovered  # noqa: E402
 
 
@@ -195,6 +201,40 @@ class Selected(unittest.TestCase):
                      {"slash::commands::model::"})
         )
 
+    def test_module_path_filter_respects_component_boundaries(self):
+        """`session::` names a module, not every filename starting with session.
+
+        Cargo does not select `extensions::session_state::tests::*` with the
+        filter `session::`. Treating the file path as one undelimited string
+        gave this exact case a false green in the new-test guard.
+        """
+        self.assertFalse(
+            selected(
+                "import_publishes_summary_and_removes_visibility_marker",
+                "crates/codegen/xai-grok-shell/src/extensions/session_state.rs",
+                {"session::"},
+            )
+        )
+
+    def test_module_path_filter_matches_an_exact_directory_component(self):
+        self.assertTrue(
+            selected(
+                "anything",
+                "crates/codegen/xai-grok-shell/src/session/persistence.rs",
+                {"session::"},
+            )
+        )
+
+    def test_path_included_tests_file_keeps_declaring_module_approximation(self):
+        """Sibling `*_tests.rs` files are commonly included from their module."""
+        self.assertTrue(
+            selected(
+                "anything",
+                "crates/codegen/xai-grok-workspace/src/restore_fetch_tests.rs",
+                {"restore_fetch::"},
+            )
+        )
+
 
 class EndToEnd(unittest.TestCase):
     SCRIPT = REPO / "scripts" / "check_new_tests_are_filtered.py"
@@ -258,6 +298,9 @@ class TargetOf(unittest.TestCase):
         "crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/load.rs",
         "crates/codegen/xai-grok-pager-bin/src/main.rs",
         "crates/codegen/xai-grok-pager/src/bin/mouse_events_playground.rs",
+        "crates/codegen/xai-grok-pager/tests/pty_e2e/minimal/minimal_quit_resets_bracketed_paste.rs",
+        "crates/codegen/xai-grok-pager/tests/pty_e2e/queue_reorder_moves_row_up.rs",
+        "crates/codegen/xai-grok-pager/tests/pty_e2e/common.rs",
     )
 
     def test_every_classified_path_exists_on_disk(self):
@@ -297,6 +340,51 @@ class TargetOf(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertEqual(target_of(path, crate_of(path)), "lib")
+
+    def test_a_tests_subdirectory_without_main_rs_is_not_a_target(self):
+        """`tests/pty_e2e/` names no target; its cases compile into nine roots.
+
+        Cargo's integration-test targets are the `.rs` files directly under
+        `tests/` (and `tests/<dir>/main.rs`). This repository splits one PTY
+        suite across nine roots so the families schedule separately, pulling
+        every case out of `tests/pty_e2e/` with `#[path]`.
+
+        Reporting the directory was how `ci.yml` came to carry
+        `--test pty_e2e`: `cargo test` errors on that target, so the invocation
+        never produced a count, and this classifier agreed with it, so the
+        guard passed too. Both readers were wrong in the same direction, which
+        is worse than either being wrong alone -- it hid that
+        `pty_e2e_queue` was named by nothing at all.
+        """
+        self.assertEqual(
+            target_of(
+                "crates/codegen/xai-grok-pager/tests/pty_e2e/minimal/"
+                "minimal_quit_resets_bracketed_paste.rs",
+                "xai-grok-pager",
+            ),
+            "test:pty_e2e_minimal",
+        )
+        self.assertEqual(
+            target_of(
+                "crates/codegen/xai-grok-pager/tests/pty_e2e/queue_reorder_moves_row_up.rs",
+                "xai-grok-pager",
+            ),
+            "test:pty_e2e_queue",
+        )
+
+    def test_a_module_shared_by_several_roots_reports_all_of_them(self):
+        """`pty_e2e/common.rs` compiles into every root that declares it.
+
+        A filter naming any one of them runs the file, so reporting a single
+        root would call a covered test uncovered whenever `ci.yml` named a
+        different sibling.
+        """
+        targets = targets_of(
+            "crates/codegen/xai-grok-pager/tests/pty_e2e/common.rs", "xai-grok-pager"
+        )
+        self.assertGreater(len(targets), 1, targets)
+        self.assertIn("test:pty_e2e_minimal", targets)
+        self.assertIn("test:pty_e2e_queue", targets)
 
     def test_bin_target_name_is_read_from_cargo_toml_not_inferred(self):
         """A `[[bin]]` entry can rename either kind of binary, so neither is inferable.

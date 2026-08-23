@@ -1166,7 +1166,7 @@ pub(crate) struct PtyLoadResult {
 /// Reconnect to a PTY, replaying the ring buffer so the client can reset its
 /// VTE emulator and feed all bytes from scratch. An exited PTY still loads, so
 /// its final output stays readable.
-pub async fn load(
+pub(crate) async fn load(
     pty_id: &str,
     gateway: &GatewaySender,
     target_client_id: TargetClientId,
@@ -1345,6 +1345,7 @@ mod tests {
     // the lint is allowed here rather than the cast removed -- removing it breaks
     // the build on macOS, which is where this test was written.
     #[allow(clippy::unnecessary_cast)]
+    #[cfg(unix)]
     fn stat_fd_identity(fd: std::os::fd::RawFd) -> std::io::Result<(u64, u64)> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
@@ -1356,6 +1357,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn dup_fd_is_not_inherited_by_exec_child() {
         use std::os::fd::AsRawFd;
         use std::process::Command;
@@ -1551,6 +1553,7 @@ mod tests {
 
     /// Covers the failure paths in [`create_pty`], which reap by returning.
     #[tokio::test]
+    #[cfg(unix)]
     async fn dropping_an_unregistered_shell_reaps_it() {
         let pair = native_pty_system()
             .openpty(PtySize {

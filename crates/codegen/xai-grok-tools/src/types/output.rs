@@ -137,6 +137,29 @@ impl MediaGenOutput {
 use crate::implementations::grok_build::todo::{TodoItem, TodoState};
 use crate::implementations::skills::skill::SkillOutput;
 use crate::util::truncate::{DEFAULT_SOFT_WRAP_WIDTH, soft_wrap_lines};
+
+/// One producer-authored reminder carried separately from its exact rendered
+/// suffix. `completion_ids` is structural provenance used to retain every
+/// one-shot completion notice when a catalog budget forces payload truncation;
+/// consumers must never recover it by parsing reminder text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReminderMessage {
+    /// Exact framed prefix, including any separator and opening tag.
+    pub prefix: String,
+    /// Producer-authored reminder body. This is the only truncatable part.
+    pub payload: String,
+    /// Exact framed suffix, including the closing tag.
+    pub suffix: String,
+    /// Completion identifiers whose one-shot delivery this reminder carries.
+    #[serde(default)]
+    pub completion_ids: Vec<String>,
+}
+
+impl ReminderMessage {
+    pub fn render(&self) -> String {
+        format!("{}{}{}", self.prefix, self.payload, self.suffix)
+    }
+}
 /// Result of running a tool through the ToolRunner pipeline.
 ///
 /// This is the **single return type** from `ToolRunner::run()`. It carries:
@@ -150,6 +173,16 @@ pub struct ToolRunResult {
     /// Prompt-ready text — layers can append system reminders, etc.
     /// Consumers use this for: model prompt (ConversationItem::tool_result).
     pub prompt_text: String,
+    /// Internally rendered reminder suffix appended by the tool runner after
+    /// tool output. Consumers that enforce output budgets must split this
+    /// exact suffix and reserve it a bounded share; reminder bodies can embed
+    /// arbitrary task or subagent output and are not exempt from the limit.
+    #[serde(default)]
+    pub trusted_prompt_suffix: String,
+    /// Structured provenance for `trusted_prompt_suffix`. Legacy proxy peers
+    /// omit this field; the exact suffix remains the compatibility fallback.
+    #[serde(default)]
+    pub trusted_prompt_reminders: Vec<ReminderMessage>,
     /// When a meta-tool dispatches to a different underlying tool (for example
     /// `use_tool` → `linear__save_issue`), this carries the effective tool name.
     /// `None` means the requested tool and executed tool are the same.
@@ -234,11 +267,9 @@ pub struct FileContent {
     /// offset-past-end vs genuinely-empty files.
     #[serde(default)]
     pub total_lines: usize,
-    /// Base64 images captured before per-line truncation. The session
-    /// layer turns these into multimodal `ContentPart::Image` follow-ups
-    /// (same pipeline as MCP image extraction); pre-truncation capture
-    /// prevents `truncate_line` from cutting a long single-line URI
-    /// mid-payload. Hidden from the model's JSON schema.
+    /// Pre-truncation image captures for session harvest. Must survive
+    /// ToolDyn hub `to_value`/`from_value`; session drains before PostToolUse
+    /// and ACP wire serialize.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(skip)]
     pub extracted_images: Vec<crate::util::base64_images::ExtractedImage>,
@@ -1208,6 +1239,11 @@ pub struct MCPOutput {
     pub is_timeout: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Pre-truncation image captures for session harvest (same contract as
+    /// [`FileContent::extracted_images`]). Must survive ToolDyn hub
+    /// `to_value`/`from_value`; session drains before PostToolUse and ACP.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extracted_images: Vec<crate::util::base64_images::ExtractedImage>,
 }
 impl MCPOutput {
     pub fn okay_output(tool_name: String, server_name: String, output: String) -> Self {
@@ -1219,6 +1255,7 @@ impl MCPOutput {
             auth_retry_attempted: false,
             is_timeout: false,
             is_error: false,
+            extracted_images: Vec::new(),
         }
     }
     pub fn errored(tool_name: String, server_name: String, error: String) -> Self {
@@ -1230,6 +1267,7 @@ impl MCPOutput {
             auth_retry_attempted: false,
             is_timeout: false,
             is_error: true,
+            extracted_images: Vec::new(),
         }
     }
     pub fn output(&self) -> &MCPOutputDetails {
@@ -1252,8 +1290,8 @@ impl xai_tool_runtime::ToolOutput for BashOutput {
         let mut stdout = String::from_utf8_lossy(&self.output).into_owned();
         let mut extra = serde_json::Map::new();
         if self.truncated {
-            let shown = crate::util::truncate::format_bytes(self.output.len());
-            let total = crate::util::truncate::format_bytes(self.total_bytes);
+            let shown = crate::util::truncate::format_bytes(self.output.len() as u64);
+            let total = crate::util::truncate::format_bytes(self.total_bytes as u64);
             stdout.push_str(&format!(
                 "\n[truncated: showing first/last {shown} of {total} - full output at: {}]",
                 self.output_file
@@ -1312,6 +1350,103 @@ mod tests {
     /// Serialize a ToolOutput to JSON value
     fn to_json(output: ToolOutput) -> serde_json::Value {
         serde_json::to_value(&output).unwrap()
+    }
+    #[test]
+    fn mcp_extracted_images_survive_hub_json_roundtrip() {
+        let mut mcp = MCPOutput::okay_output(
+            "browser_screenshot".into(),
+            "browser-use".into(),
+            crate::util::base64_images::IMAGE_CONTENT_PLACEHOLDER.into(),
+        );
+        let payload = "A".repeat(50_000);
+        mcp.extracted_images = vec![crate::util::base64_images::ExtractedImage {
+            data: payload.clone(),
+            mime_type: "image/png".into(),
+        }];
+        let v = serde_json::to_value(&mcp).unwrap();
+        assert!(
+            v.get("extracted_images").is_some(),
+            "hub ToolDyn to_value must keep non-empty extracted_images"
+        );
+        let back: MCPOutput = serde_json::from_value(v).unwrap();
+        assert_eq!(back.extracted_images.len(), 1);
+        assert_eq!(back.extracted_images[0].data, payload);
+        assert_eq!(back.extracted_images[0].mime_type, "image/png");
+    }
+    #[test]
+    fn tool_output_mcp_extracted_images_survive_hub_roundtrip() {
+        let mut mcp = MCPOutput::okay_output(
+            "t".into(),
+            "s".into(),
+            crate::util::base64_images::IMAGE_CONTENT_PLACEHOLDER.into(),
+        );
+        let payload = "C".repeat(12_000);
+        mcp.extracted_images = vec![crate::util::base64_images::ExtractedImage {
+            data: payload.clone(),
+            mime_type: "image/webp".into(),
+        }];
+        let output = ToolOutput::MCP(mcp);
+        let v = serde_json::to_value(&output).unwrap();
+        let back: ToolOutput = serde_json::from_value(v).unwrap();
+        let ToolOutput::MCP(mcp) = back else {
+            panic!("expected MCP");
+        };
+        assert_eq!(mcp.extracted_images.len(), 1);
+        assert_eq!(mcp.extracted_images[0].data, payload);
+    }
+    #[test]
+    fn file_content_extracted_images_survive_hub_json_roundtrip() {
+        let payload = "B".repeat(40_000);
+        let fc = FileContent {
+            content: crate::util::base64_images::IMAGE_CONTENT_PLACEHOLDER.into(),
+            content_concise: None,
+            absolute_path: PathBuf::from("/tmp/x.png"),
+            offset: None,
+            limit: None,
+            raw_output: String::new(),
+            total_lines: 1,
+            extracted_images: vec![crate::util::base64_images::ExtractedImage {
+                data: payload.clone(),
+                mime_type: "image/jpeg".into(),
+            }],
+        };
+        let v = serde_json::to_value(&fc).unwrap();
+        assert!(v.get("extracted_images").is_some());
+        let back: FileContent = serde_json::from_value(v).unwrap();
+        assert_eq!(back.extracted_images.len(), 1);
+        assert_eq!(back.extracted_images[0].data, payload);
+    }
+    #[test]
+    fn empty_extracted_images_omitted_from_json() {
+        let mcp = MCPOutput::okay_output("t".into(), "s".into(), "plain".into());
+        let v = serde_json::to_value(&mcp).unwrap();
+        assert!(v.get("extracted_images").is_none());
+    }
+    #[test]
+    fn tool_output_read_file_extracted_images_survive_hub_roundtrip() {
+        let payload = "D".repeat(18_000);
+        let fc = FileContent {
+            content: crate::util::base64_images::IMAGE_CONTENT_PLACEHOLDER.into(),
+            content_concise: None,
+            absolute_path: PathBuf::from("/tmp/y.png"),
+            offset: None,
+            limit: None,
+            raw_output: String::new(),
+            total_lines: 1,
+            extracted_images: vec![crate::util::base64_images::ExtractedImage {
+                data: payload.clone(),
+                mime_type: "image/png".into(),
+            }],
+        };
+        let output = ToolOutput::ReadFile(ReadFileOutput::FileContent(fc));
+        let v = serde_json::to_value(&output).unwrap();
+        let back: ToolOutput = serde_json::from_value(v).unwrap();
+        let ToolOutput::ReadFile(ReadFileOutput::FileContent(fc)) = back else {
+            panic!("expected FileContent");
+        };
+        assert_eq!(fc.extracted_images.len(), 1);
+        assert_eq!(fc.extracted_images[0].data, payload);
+        assert_eq!(fc.extracted_images[0].mime_type, "image/png");
     }
     fn empty_file_content(offset: Option<usize>, total_lines: usize) -> FileContent {
         FileContent {
@@ -2614,9 +2749,52 @@ mod tests {
     fn sample_run_result(output: ToolOutput) -> ToolRunResult {
         ToolRunResult {
             prompt_text: "prompt".into(),
+            trusted_prompt_suffix: String::new(),
+            trusted_prompt_reminders: Vec::new(),
             effective_tool_name: None,
             output,
         }
+    }
+
+    #[test]
+    fn tool_result_truncation_policy_proxy_round_trip_preserves_trusted_suffix() {
+        let suffix =
+            "\n\n<system-reminder>\nBackground task completed.\n</system-reminder>".to_owned();
+        let mut run = sample_run_result(ToolOutput::Text(TextOutput::from("tool output")));
+        run.prompt_text = format!("tool output{suffix}");
+        run.trusted_prompt_suffix = suffix.clone();
+        run.trusted_prompt_reminders = vec![ReminderMessage {
+            prefix: "\n\n<system-reminder>\n".into(),
+            payload: "Background task completed.".into(),
+            suffix: "\n</system-reminder>".into(),
+            completion_ids: vec!["bg-1".into()],
+        }];
+
+        let typed = run.into_typed_tool_output(xai_tool_protocol::ToolId::new("text").unwrap());
+        let decoded: ToolRunResult = serde_json::from_value(typed.value).unwrap();
+
+        assert_eq!(decoded.prompt_text, format!("tool output{suffix}"));
+        assert_eq!(decoded.trusted_prompt_suffix, suffix);
+        assert_eq!(decoded.trusted_prompt_reminders.len(), 1);
+        assert_eq!(decoded.trusted_prompt_reminders[0].completion_ids, ["bg-1"]);
+    }
+
+    #[test]
+    fn tool_result_truncation_policy_proxy_accepts_legacy_result_without_trusted_suffix() {
+        let run = sample_run_result(ToolOutput::Text(TextOutput::from("tool output")));
+        let mut value = serde_json::to_value(run).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("trusted_prompt_suffix");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("trusted_prompt_reminders");
+
+        let decoded: ToolRunResult = serde_json::from_value(value).unwrap();
+        assert!(decoded.trusted_prompt_suffix.is_empty());
+        assert!(decoded.trusted_prompt_reminders.is_empty());
     }
     fn bash_tool_id() -> xai_tool_protocol::ToolId {
         xai_tool_protocol::ToolId::new("bash").unwrap()

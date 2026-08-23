@@ -25,12 +25,13 @@ pub fn is_project_dir(cwd: &Path) -> bool {
         return false;
     }
 
-    if cwd.ancestors().any(|p| p.join(".git").exists()) {
-        return true;
-    }
-
+    // Excluded components (e.g. ~/.claude) must win over a .git ancestor.
     if has_excluded_component(cwd) {
         return false;
+    }
+
+    if cwd.ancestors().any(|p| p.join(".git").exists()) {
+        return true;
     }
 
     if is_platform_system_dir(cwd) {
@@ -370,6 +371,22 @@ mod tests {
             let sub = tmp.path().join("deep/sub/dir");
             std::fs::create_dir_all(&sub).unwrap();
             assert!(is_project_dir(&sub));
+        }
+
+        #[test]
+        fn git_ancestor_does_not_override_excluded_component() {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+
+            let claude_projects = home.join(".claude").join("projects");
+            std::fs::create_dir_all(&claude_projects).unwrap();
+            std::fs::create_dir(home.join(".claude").join(".git")).unwrap();
+            assert!(!is_project_dir(&claude_projects));
+
+            let app = home.join("src").join("app");
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::create_dir(app.join(".git")).unwrap();
+            assert!(is_project_dir(&app));
         }
     }
 }

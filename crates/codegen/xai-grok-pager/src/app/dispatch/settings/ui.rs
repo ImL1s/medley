@@ -4,13 +4,13 @@ use super::setters::{
     pr13_effective_default, set_ask_user_question_timeout_enabled_inner, set_auto_dark_theme_inner,
     set_auto_light_theme_inner, set_auto_update_inner, set_collapsed_edit_blocks_inner,
     set_combine_queued_prompts_inner, set_compact_mode, set_compact_mode_inner,
-    set_contextual_hint_inner, set_default_model_inner, set_default_selected_permission_inner,
-    set_display_refresh_auto_cadence_inner, set_fork_secondary_model_inner,
-    set_group_tool_verbs_inner, set_hunk_tracker_mode_inner, set_invert_scroll_inner,
-    set_keep_text_selection_inner, set_max_thoughts_width_inner, set_multiline_mode,
-    set_page_flip_on_send_inner, set_prompt_suggestions_inner, set_remember_tool_approvals_inner,
-    set_render_mermaid_inner, set_respect_manual_folds_inner, set_screen_mode_inner,
-    set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
+    set_confirm_before_rewind_inner, set_contextual_hint_inner, set_default_model_inner,
+    set_default_selected_permission_inner, set_display_refresh_auto_cadence_inner,
+    set_fork_secondary_model_inner, set_group_tool_verbs_inner, set_hunk_tracker_mode_inner,
+    set_invert_scroll_inner, set_keep_text_selection_inner, set_max_thoughts_width_inner,
+    set_multiline_mode, set_page_flip_on_send_inner, set_prompt_suggestions_inner,
+    set_remember_tool_approvals_inner, set_render_mermaid_inner, set_respect_manual_folds_inner,
+    set_screen_mode_inner, set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
     set_show_thinking_blocks_inner, set_show_tips_inner, set_simple_mode_inner, set_theme_inner,
     set_timeline_inner, set_timestamps, set_timestamps_inner, set_vim_mode_inner,
     set_voice_capture_mode_inner, set_voice_keybind_enabled_inner, set_voice_stt_language_inner,
@@ -68,18 +68,28 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
         };
         if let Some(state) = state_opt {
             state.rebuild_rows();
-            state.ui_snapshot = ui_snapshot.clone();
-            state.pager_snapshot = crate::settings::PagerLocalSnapshot {
+            let pager_snapshot = crate::settings::PagerLocalSnapshot {
                 multiline_mode: agent.multiline_mode,
                 yolo_mode: agent.session.is_yolo(),
                 auto_mode: agent.session.is_auto(),
                 current_model_name: agent.session.models.current_model_name(),
+                current_model_id: agent.session.models.current.clone(),
                 available_models: agent
                     .session
                     .models
-                    .available
-                    .iter()
+                    .selectable_models()
                     .map(|(id, info)| (info.name.clone(), id.clone()))
+                    .collect(),
+                model_unready_reasons: agent
+                    .session
+                    .models
+                    .selectable_models()
+                    .filter_map(|(id, info)| {
+                        crate::slash::commands::model::unready_reason_from_model_meta(
+                            info.meta.as_ref(),
+                        )
+                        .map(|reason| (id.0.to_string(), reason))
+                    })
                     .collect(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 coding_data_sharing_lock: coding_data_sharing_lock_from_app,
@@ -97,6 +107,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                     .scheduler_background_loops
                     .unwrap_or(scheduler_background_loops_seed),
             };
+            state.replace_snapshots(ui_snapshot.clone(), pager_snapshot);
         }
     }
 }
@@ -224,12 +235,21 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         yolo_mode: agent.session.is_yolo(),
         auto_mode: agent.session.is_auto(),
         current_model_name: agent.session.models.current_model_name(),
+        current_model_id: agent.session.models.current.clone(),
         available_models: agent
             .session
             .models
-            .available
-            .iter()
+            .selectable_models()
             .map(|(id, info)| (info.name.clone(), id.clone()))
+            .collect(),
+        model_unready_reasons: agent
+            .session
+            .models
+            .selectable_models()
+            .filter_map(|(id, info)| {
+                crate::slash::commands::model::unready_reason_from_model_meta(info.meta.as_ref())
+                    .map(|reason| (id.0.to_string(), reason))
+            })
             .collect(),
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
         coding_data_sharing_lock: coding_data_sharing_lock_from_app,
@@ -700,6 +720,15 @@ fn agent_current_model_name(app: &AppView) -> Option<String> {
     None
 }
 
+fn agent_current_model_id(app: &AppView) -> Option<agent_client_protocol::ModelId> {
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+    {
+        return agent.session.models.current.clone();
+    }
+    None
+}
+
 /// Helper to clone the `(display_name, ModelId)` pairs from the
 /// active agent's catalog. Returns an empty `Vec` when no agent is
 /// active OR when the catalog is empty.
@@ -713,12 +742,28 @@ fn agent_available_models(app: &AppView) -> Vec<(String, acp::ModelId)> {
         return agent
             .session
             .models
-            .available
-            .iter()
+            .selectable_models()
             .map(|(id, info)| (info.name.clone(), id.clone()))
             .collect();
     }
     Vec::new()
+}
+
+fn agent_model_unready_reasons(app: &AppView) -> std::collections::HashMap<String, String> {
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+    {
+        return agent
+            .session
+            .models
+            .selectable_models()
+            .filter_map(|(id, info)| {
+                crate::slash::commands::model::unready_reason_from_model_meta(info.meta.as_ref())
+                    .map(|reason| (id.0.to_string(), reason))
+            })
+            .collect();
+    }
+    std::collections::HashMap::new()
 }
 
 /// Build a `PagerLocalSnapshot` from the current `AppView`.
@@ -728,7 +773,9 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         yolo_mode: agent_yolo_mode(app),
         auto_mode: agent_auto_mode(app),
         current_model_name: agent_current_model_name(app),
+        current_model_id: agent_current_model_id(app),
         available_models: agent_available_models(app),
+        model_unready_reasons: agent_model_unready_reasons(app),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         coding_data_sharing_lock: app.coding_data_sharing_lock(),
         plan_mode_active: agent_plan_mode(app),
@@ -758,6 +805,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("show_timestamps", SettingValue::Bool(b)) => Some(Action::SetTimestamps(*b)),
         ("show_timeline", SettingValue::Bool(b)) => Some(Action::SetTimeline(*b)),
         ("page_flip_on_send", SettingValue::Bool(b)) => Some(Action::SetPageFlipOnSend(*b)),
+        ("confirm_before_rewind", SettingValue::Bool(b)) => {
+            Some(Action::SetConfirmBeforeRewind(*b))
+        }
         ("combine_queued_prompts", SettingValue::Bool(b)) => {
             Some(Action::SetCombineQueuedPrompts(*b))
         }
@@ -954,6 +1004,9 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("show_timestamps", SettingValue::Bool(b)) => set_timestamps_inner(app, *b),
         ("show_timeline", SettingValue::Bool(b)) => set_timeline_inner(app, *b),
         ("page_flip_on_send", SettingValue::Bool(b)) => set_page_flip_on_send_inner(app, *b),
+        ("confirm_before_rewind", SettingValue::Bool(b)) => {
+            set_confirm_before_rewind_inner(app, *b)
+        }
         ("combine_queued_prompts", SettingValue::Bool(b)) => {
             set_combine_queued_prompts_inner(app, *b)
         }
@@ -1106,6 +1159,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
                                     session_id: sid,
                                     model_id: id,
                                     effort: None,
+                                    session_only: false,
                                     request_id,
                                     prev_model_id: None,
                                 });

@@ -1,6 +1,10 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
 fn with_env_var<T>(name: &str, value: &str, f: impl FnOnce() -> T) -> T {
+    assert!(
+        serial_test::is_locked_serially(None),
+        "process-global env test helper requires #[serial_test::serial]"
+    );
     let previous = std::env::var(name).ok();
     unsafe {
         std::env::set_var(name, value);
@@ -24,6 +28,7 @@ fn with_env_var<T>(name: &str, value: &str, f: impl FnOnce() -> T) -> T {
     }
 }
 #[test]
+#[serial_test::serial]
 fn expands_env_vars_in_toml_strings() {
     with_env_var(
         "GROK_TEST_CONFIG_EXPAND",
@@ -98,6 +103,10 @@ static MEMORY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Run `f` with `name` set to `value` (Some) or removed (None).
 /// Saves and restores the previous value, even on panic.
 fn with_env_var_opt<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    assert!(
+        serial_test::is_locked_serially(None),
+        "process-global env test helper requires #[serial_test::serial]"
+    );
     let previous = std::env::var(name).ok();
     match value {
         Some(v) => unsafe { std::env::set_var(name, v) }
@@ -121,6 +130,7 @@ fn with_grok_memory<T>(value: &str, f: impl FnOnce() -> T) -> T {
     with_env_var_opt("GROK_MEMORY", Some(value), f)
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_default_disabled() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -129,6 +139,7 @@ fn memory_config_default_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_cli_flag_enables() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -137,6 +148,7 @@ fn memory_config_cli_flag_enables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_from_toml() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
@@ -145,6 +157,7 @@ fn memory_config_from_toml() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_toml_disabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
@@ -153,6 +166,7 @@ fn memory_config_toml_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_enables() {
     with_grok_memory(
         "1",
@@ -164,6 +178,7 @@ fn memory_config_env_var_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_true_enables() {
     with_grok_memory(
         "true",
@@ -175,6 +190,7 @@ fn memory_config_env_var_true_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_zero_does_not_enable() {
     with_grok_memory(
         "0",
@@ -186,6 +202,7 @@ fn memory_config_env_var_zero_does_not_enable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_false_does_not_enable() {
     with_grok_memory(
         "false",
@@ -197,6 +214,7 @@ fn memory_config_env_var_false_does_not_enable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_cli_overrides_toml_disabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
@@ -205,6 +223,7 @@ fn memory_config_cli_overrides_toml_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_zero_force_disables_toml_enabled() {
     with_grok_memory(
         "0",
@@ -220,6 +239,7 @@ fn memory_config_env_zero_force_disables_toml_enabled() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_false_force_disables_toml_enabled() {
     with_grok_memory(
         "false",
@@ -235,6 +255,7 @@ fn memory_config_env_false_force_disables_toml_enabled() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_cli_flag_overrides_env_disable() {
     with_grok_memory(
         "0",
@@ -249,6 +270,7 @@ fn memory_config_cli_flag_overrides_env_disable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_all() {
     with_grok_memory(
         "1",
@@ -264,6 +286,7 @@ fn memory_config_no_memory_overrides_all() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_alone_disables() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -272,6 +295,7 @@ fn memory_config_no_memory_alone_disables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_env_enable() {
     with_grok_memory(
         "1",
@@ -283,6 +307,7 @@ fn memory_config_no_memory_overrides_env_enable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_toml_enabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
@@ -294,6 +319,7 @@ fn memory_config_no_memory_overrides_toml_enabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_remote_enabled() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -309,6 +335,7 @@ fn memory_config_no_memory_overrides_remote_enabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_defaults_are_correct() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -358,6 +385,7 @@ fn memory_config_defaults_are_correct() {
 /// files that contain `debounce_ms` are still parsed without error
 /// (unknown fields are silently ignored by serde default).
 #[test]
+#[serial_test::serial]
 fn memory_config_watcher_debounce_ms_in_toml_is_silently_ignored() {
     without_grok_memory(|| {
         let toml_str = "[memory.watcher]\nenabled = true\ndebounce_ms = 2000\n";
@@ -368,6 +396,7 @@ fn memory_config_watcher_debounce_ms_in_toml_is_silently_ignored() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_full_toml_parsing() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -453,6 +482,7 @@ hard_clear_age_turns = 20
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_partial_toml_uses_defaults_for_missing() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -474,6 +504,7 @@ max_chunk_chars = 3200
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_settings_enable() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -489,6 +520,7 @@ fn memory_config_remote_settings_enable() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_settings_pruning() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -503,6 +535,7 @@ fn memory_config_remote_settings_pruning() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_settings_initial_injection() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -517,6 +550,7 @@ fn memory_config_remote_settings_initial_injection() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_initial_injection_overrides_remote() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -536,6 +570,7 @@ min_score = 0.25
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_disabled_blocks_remote_enable() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
@@ -551,6 +586,7 @@ fn memory_config_local_disabled_blocks_remote_enable() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_overrides_remote() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -570,6 +606,7 @@ max_results = 20
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_none_is_noop() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -588,6 +625,7 @@ fn memory_config_remote_none_is_noop() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_from_remote_when_no_local_flush() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -604,6 +642,7 @@ fn flush_semantic_dedup_threshold_from_remote_when_no_local_flush() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_clamped_from_remote() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -630,6 +669,7 @@ fn flush_semantic_dedup_threshold_clamped_from_remote() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_local_blocks_remote() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -651,6 +691,7 @@ semantic_dedup_threshold = 0.88
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_defaults_to_none() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -662,6 +703,7 @@ fn flush_semantic_dedup_threshold_defaults_to_none() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_defaults() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -674,6 +716,7 @@ fn memory_dream_config_defaults() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_toml_parsing() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -694,6 +737,7 @@ check_interval_secs = 600
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_remote_override_when_toml_absent() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -713,6 +757,7 @@ fn memory_dream_config_remote_override_when_toml_absent() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_remote_ignored_when_toml_present() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -736,6 +781,7 @@ min_hours = 6
     });
 }
 #[test]
+#[serial_test::serial]
 fn expands_multiple_vars_in_one_string() {
     with_env_var(
         "GROK_TEST_USER",
@@ -880,6 +926,7 @@ fn effective_half_life_disabled_legacy_recency_out_of_range_ignored() {
     }
 }
 #[test]
+#[serial_test::serial]
 fn mmr_lambda_clamped_above_one() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -901,6 +948,7 @@ lambda = 2.0
     });
 }
 #[test]
+#[serial_test::serial]
 fn mmr_lambda_clamped_below_zero() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -922,6 +970,7 @@ lambda = -0.5
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_temporal_decay() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -936,6 +985,7 @@ fn memory_config_remote_temporal_decay() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_mmr() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -950,6 +1000,7 @@ fn memory_config_remote_mmr() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_mmr_lambda_clamped() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -965,6 +1016,7 @@ fn memory_config_remote_mmr_lambda_clamped() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_search_blocks_remote_temporal_decay_and_mmr() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -1002,6 +1054,7 @@ fn with_grok_subagents<T>(value: &str, f: impl FnOnce() -> T) -> T {
     with_env_var_opt("GROK_SUBAGENTS", Some(value), f)
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_default_enabled() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -1060,6 +1113,7 @@ fn subagents_max_depth_invalid_env_falls_through() {
         );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_parses_max_depth_from_toml() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nmax_depth = 2\n")
@@ -1069,6 +1123,53 @@ fn subagents_config_parses_max_depth_from_toml() {
     });
 }
 #[test]
+fn subagent_limit_counts_resolve_env_over_toml_over_remote_over_default() {
+    use xai_grok_tools::implementations::grok_build::task::admission;
+    let resolve = SubagentsConfig::resolve_max_concurrent;
+    assert_eq!(resolve(Some("3"), Some(2), Some(4)), 3);
+    assert_eq!(resolve(None, Some(2), Some(4)), 2);
+    assert_eq!(resolve(None, None, Some(5)), 5);
+    assert_eq!(resolve(None, None, None), admission::DEFAULT_MAX_CONCURRENT);
+    assert_eq!(resolve(Some("-2"), Some(2), None), 2);
+    assert_eq!(resolve(None, Some(0), Some(3)), 1);
+    assert_eq!(
+            SubagentsConfig::resolve_workflow_max_concurrent(None, None, None),
+            crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS
+        );
+}
+#[test]
+fn subagent_limit_behavior_resolves_env_over_toml_over_remote_over_queue() {
+    use xai_grok_tools::implementations::grok_build::task::admission::LimitBehavior;
+    let resolve = SubagentsConfig::resolve_limit_behavior;
+    assert_eq!(
+            resolve(Some("fail"), Some("queue"), Some("queue")),
+            LimitBehavior::Fail
+        );
+    assert_eq!(resolve(None, Some("FAIL"), Some("queue")), LimitBehavior::Fail);
+    assert_eq!(resolve(None, None, Some("fail")), LimitBehavior::Fail);
+    assert_eq!(resolve(None, None, None), LimitBehavior::Queue);
+    assert_eq!(
+            resolve(Some("sometimes"), Some("fail"), None),
+            LimitBehavior::Fail
+        );
+    assert_eq!(resolve(None, Some("sometimes"), None), LimitBehavior::Queue);
+}
+#[test]
+#[serial_test::serial]
+fn subagents_config_parses_limits_from_toml() {
+    without_grok_subagents(|| {
+        let config: toml::Value = toml::from_str(
+                "[subagents]\nmax_concurrent = 4\nlimit_behavior = \"fail\"\nworkflow_max_concurrent = 8\n",
+            )
+            .unwrap();
+        let sa = SubagentsConfig::resolve(false, &config);
+        assert_eq!(sa.max_concurrent, Some(4));
+        assert_eq!(sa.limit_behavior.as_deref(), Some("fail"));
+        assert_eq!(sa.workflow_max_concurrent, Some(8));
+    });
+}
+#[test]
+#[serial_test::serial]
 fn subagents_config_parses_negative_max_depth_without_dropping_section() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1085,6 +1186,7 @@ fn subagents_config_parses_negative_max_depth_without_dropping_section() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_cli_flag_enables() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -1093,6 +1195,7 @@ fn subagents_config_cli_flag_enables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_env_var_enables() {
     with_grok_subagents(
         "1",
@@ -1104,6 +1207,7 @@ fn subagents_config_env_var_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_env_var_disables() {
     with_grok_subagents(
         "0",
@@ -1116,6 +1220,7 @@ fn subagents_config_env_var_disables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_toml_enables() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
@@ -1124,6 +1229,7 @@ fn subagents_config_toml_enables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_local_disabled_wins() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = false")
@@ -1133,6 +1239,7 @@ fn subagents_config_local_disabled_wins() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_env_var_disables_default() {
     with_grok_subagents(
         "0",
@@ -1149,6 +1256,7 @@ fn subagents_config_env_var_disables_default() {
 /// A `subagents_enabled` key served by an old cli-chat-proxy must parse
 /// as an unknown key and have no effect on resolution.
 #[test]
+#[serial_test::serial]
 fn subagents_config_remote_settings_key_is_ignored() {
     without_grok_subagents(|| {
         let _settings: crate::util::config::RemoteSettings = serde_json::from_str(
@@ -1161,6 +1269,7 @@ fn subagents_config_remote_settings_key_is_ignored() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_cli_flag_overrides_env_var() {
     with_grok_subagents(
         "0",
@@ -1175,6 +1284,7 @@ fn subagents_config_cli_flag_overrides_env_var() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_parsed() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1196,6 +1306,7 @@ fn subagents_config_models_parsed() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_empty_when_missing() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
@@ -1205,6 +1316,7 @@ fn subagents_config_models_empty_when_missing() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_without_enabled() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1224,6 +1336,7 @@ fn subagents_config_models_without_enabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_with_env_var_enables() {
     with_grok_subagents(
         "1",
@@ -1242,6 +1355,7 @@ fn subagents_config_models_with_env_var_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_toggle_mixed_values() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1267,6 +1381,7 @@ fn subagents_config_toggle_mixed_values() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_toggle_missing_defaults_to_empty() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
@@ -1473,18 +1588,32 @@ fn with_model_overrides_env_full<T>(
     ps: Option<&str>,
     f: impl FnOnce() -> T,
 ) -> T {
+    with_model_overrides_and_default_env(None, ws, ss, id, ps, f)
+}
+fn with_model_overrides_and_default_env<T>(
+    default: Option<&str>,
+    ws: Option<&str>,
+    ss: Option<&str>,
+    id: Option<&str>,
+    ps: Option<&str>,
+    f: impl FnOnce() -> T,
+) -> T {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_env_var_opt(
-        "GROK_WEB_SEARCH_MODEL",
-        ws,
+        "GROK_DEFAULT_MODEL",
+        default,
         || with_env_var_opt(
-            "GROK_SESSION_SUMMARY_MODEL",
-            ss,
+            "GROK_WEB_SEARCH_MODEL",
+            ws,
             || with_env_var_opt(
-                "GROK_IMAGE_DESCRIPTION_MODEL",
-                id,
-                || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
+                "GROK_SESSION_SUMMARY_MODEL",
+                ss,
+                || with_env_var_opt(
+                    "GROK_IMAGE_DESCRIPTION_MODEL",
+                    id,
+                    || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
+                ),
             ),
         ),
     )
@@ -1498,6 +1627,7 @@ fn with_model_overrides_env<T>(
     with_model_overrides_env_full(ws, ss, id, None, f)
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_remote_settings_blocked_by_local_config() {
     with_model_overrides_env(
         None,
@@ -1525,6 +1655,7 @@ fn model_overrides_remote_settings_blocked_by_local_config() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_overrides_everything() {
     with_model_overrides_env(
         Some("env-ws"),
@@ -1546,10 +1677,13 @@ fn model_overrides_cli_overrides_everything() {
             );
             assert_eq!(cfg.web_search, "cli-ws");
             assert_eq!(cfg.session_summary, Some("cli-ss".to_owned()));
+            assert!(!cfg.web_search_follows_default);
+            assert!(!cfg.session_summary_follows_default);
         },
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_remote_settings_applies_without_local_config() {
     with_model_overrides_env(
         None,
@@ -1571,6 +1705,7 @@ fn model_overrides_remote_settings_applies_without_local_config() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_local_image_description_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1594,6 +1729,7 @@ fn model_overrides_local_image_description_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_default_image_description_is_grok_build() {
     with_model_overrides_env(
         None,
@@ -1610,6 +1746,7 @@ fn model_overrides_default_image_description_is_grok_build() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_default_session_summary_is_grok_build() {
     with_model_overrides_env(
         None,
@@ -1626,6 +1763,184 @@ fn model_overrides_default_session_summary_is_grok_build() {
     );
 }
 #[test]
+#[serial_test::serial]
+fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "gpt-5.3-codex-spark"
+                "#,
+                )
+                .unwrap();
+            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+            // The point of the test: a Codex-only user must not have these
+            // two lanes silently resolve to the compiled xAI constant.
+            assert_eq!(cfg.session_summary, Some("gpt-5.3-codex-spark".to_owned()));
+            assert_eq!(
+                cfg.image_description,
+                Some("gpt-5.3-codex-spark".to_owned())
+            );
+            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark".to_owned());
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
+            assert_ne!(
+                cfg.session_summary.as_deref(),
+                Some(crate::models::default_session_summary_model()),
+                "the compiled default is xAI; following it is the bug"
+            );
+        },
+    );
+}
+#[test]
+#[serial_test::serial]
+fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
+    with_model_overrides_and_default_env(
+        Some("gpt-5.3-codex-spark"),
+        None,
+        None,
+        None,
+        None,
+        || {
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let cfg = ModelOverrideConfig::resolve(None, None, &empty, None);
+            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark");
+            assert_eq!(cfg.session_summary.as_deref(), Some("gpt-5.3-codex-spark"));
+            assert_eq!(cfg.image_description.as_deref(), Some("gpt-5.3-codex-spark"));
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
+        },
+    );
+}
+#[test]
+#[serial_test::serial]
+fn model_overrides_cli_configured_default_wins_over_other_defaults() {
+    with_model_overrides_and_default_env(
+        Some("env-default"),
+        None,
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "local-default"
+                "#,
+                )
+                .unwrap();
+            let remote = crate::util::config::RemoteSettings {
+                default_model: Some("remote-default".to_owned()),
+                ..Default::default()
+            };
+            let cfg = ModelOverrideConfig::resolve_with_default_model(
+                Some("cli-default"),
+                None,
+                None,
+                &config,
+                Some(&remote),
+            );
+            assert_eq!(cfg.web_search, "cli-default");
+            assert_eq!(cfg.session_summary.as_deref(), Some("cli-default"));
+            assert_eq!(cfg.image_description.as_deref(), Some("cli-default"));
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
+        },
+    );
+}
+#[test]
+fn model_overrides_inherited_web_search_uses_operative_model() {
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "rejected-configured-default",
+            "substituted-operative-model",
+            true,
+        ),
+        "substituted-operative-model",
+    );
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "explicit-web-search-pin",
+            "substituted-operative-model",
+            false,
+        ),
+        "explicit-web-search-pin",
+    );
+}
+#[test]
+fn model_overrides_inherited_image_uses_child_operative_model() {
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "configured-parent-default",
+            "child-operative-model",
+            true,
+        ),
+        "child-operative-model",
+    );
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "explicit-image-pin",
+            "child-operative-model",
+            false,
+        ),
+        "explicit-image-pin",
+    );
+}
+#[test]
+#[serial_test::serial]
+fn model_overrides_unset_auxiliary_lanes_follow_the_remote_configured_default() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let remote = crate::util::config::RemoteSettings {
+                default_model: Some("remote-default".to_owned()),
+                ..Default::default()
+            };
+            let cfg = ModelOverrideConfig::resolve(None, None, &empty, Some(&remote));
+            assert_eq!(cfg.session_summary, Some("remote-default".to_owned()));
+            assert_eq!(cfg.image_description, Some("remote-default".to_owned()));
+        },
+    );
+}
+#[test]
+#[serial_test::serial]
+fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "gpt-5.3-codex-spark"
+                "#,
+                )
+                .unwrap();
+            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+            // Deliberate exclusion, pinned so it cannot be "tidied up" into
+            // the rule later. `helpers::prompt_suggest` documents this lane
+            // as "deliberately NOT a session-model fallback", and the
+            // configured default is usually the session model — so feeding
+            // it in would break the lane's own stated contract on every
+            // turn. Its gate, `effective_suggest_model`, already drops the
+            // request when the model is absent from the catalog.
+            assert_eq!(cfg.prompt_suggestion, PromptSuggestModelPin::Unpinned);
+        },
+    );
+}
+#[test]
+#[serial_test::serial]
 fn model_overrides_local_session_summary_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1649,6 +1964,7 @@ fn model_overrides_local_session_summary_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_session_summary_overrides_remote() {
     with_model_overrides_env(
         None,
@@ -1666,6 +1982,7 @@ fn model_overrides_env_session_summary_overrides_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_session_summary_overrides_local() {
     with_model_overrides_env(
         None,
@@ -1685,6 +2002,7 @@ fn model_overrides_env_session_summary_overrides_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_session_summary_toml_uses_default() {
     with_model_overrides_env(
         None,
@@ -1707,6 +2025,7 @@ fn model_overrides_empty_session_summary_toml_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_session_summary_remote_uses_default() {
     with_model_overrides_env(
         None,
@@ -1727,6 +2046,7 @@ fn model_overrides_empty_session_summary_remote_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_session_summary_overrides_everything() {
     with_model_overrides_env(
         None,
@@ -1755,6 +2075,7 @@ fn model_overrides_cli_session_summary_overrides_everything() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_cli_session_summary_uses_default() {
     with_model_overrides_env(
         None,
@@ -1771,6 +2092,7 @@ fn model_overrides_empty_cli_session_summary_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_image_description_overrides_remote() {
     with_model_overrides_env(
         None,
@@ -1788,6 +2110,7 @@ fn model_overrides_env_image_description_overrides_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_image_description_overrides_local() {
     with_model_overrides_env(
         None,
@@ -1807,6 +2130,7 @@ fn model_overrides_env_image_description_overrides_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_image_description_toml_uses_default() {
     with_model_overrides_env(
         None,
@@ -1829,6 +2153,7 @@ fn model_overrides_empty_image_description_toml_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_image_description_remote_uses_default() {
     with_model_overrides_env(
         None,
@@ -1849,6 +2174,7 @@ fn model_overrides_empty_image_description_remote_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_unpinned_by_default() {
     with_model_overrides_env(
         None,
@@ -1862,6 +2188,7 @@ fn model_overrides_prompt_suggestion_unpinned_by_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_local_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1888,6 +2215,7 @@ fn model_overrides_prompt_suggestion_local_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_remote_applies_without_local() {
     with_model_overrides_env(
         None,
@@ -1908,6 +2236,7 @@ fn model_overrides_prompt_suggestion_remote_applies_without_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_env_wins_over_local_and_remote() {
     with_model_overrides_env_full(
         None,
@@ -1935,6 +2264,7 @@ fn model_overrides_prompt_suggestion_env_wins_over_local_and_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_blank_values_are_unset() {
     with_model_overrides_env_full(
         None,
@@ -2001,6 +2331,7 @@ fn with_grok_respect_gitignore<T>(value: &str, f: impl FnOnce() -> T) -> T {
     with_tools_env(Some(value), None, f)
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_default_disabled() {
     without_grok_respect_gitignore(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -2009,6 +2340,7 @@ fn tools_config_default_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_toml_disables() {
     without_grok_respect_gitignore(|| {
         let config: toml::Value = toml::from_str("[tools]\nrespect_gitignore = false")
@@ -2018,6 +2350,7 @@ fn tools_config_toml_disables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_env_var_disables() {
     with_grok_respect_gitignore(
         "0",
@@ -2029,6 +2362,7 @@ fn tools_config_env_var_disables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_env_var_overrides_toml() {
     with_grok_respect_gitignore(
         "1",
@@ -2043,6 +2377,7 @@ fn tools_config_env_var_overrides_toml() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_env_false_overrides_toml_true() {
     with_grok_respect_gitignore(
         "false",
@@ -2058,6 +2393,7 @@ fn tools_config_env_false_overrides_toml_true() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn zdr_incompatible_tools_env_overrides_toml_false() {
     with_tools_env(
         None,
@@ -2096,6 +2432,7 @@ fn zdr_video_output_s3_deserializes_from_tools_block() {
     assert!(s3.is_valid());
 }
 #[test]
+#[serial_test::serial]
 fn incomplete_zdr_video_output_s3_is_ignored() {
     without_grok_respect_gitignore(|| {
         let config: toml::Value = toml::from_str(
@@ -2117,6 +2454,7 @@ fn incomplete_zdr_video_output_s3_is_ignored() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn malformed_zdr_video_output_s3_preserves_zdr_flag() {
     without_grok_respect_gitignore(|| {
         let config: toml::Value = toml::from_str(
@@ -3124,13 +3462,13 @@ fn config_layers_system_managed_lowest_priority() {
 #[test]
 fn apply_requirements_value_overrides_user_settings() {
     let raw_config: toml::Value = toml::from_str(
-            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
+            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\nsession_summary = \"user-summary-model\"\nimage_description = \"user-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
         )
         .unwrap();
     let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw_config).unwrap();
     cfg.default_yolo_mode = true;
     let requirements: toml::Value = toml::from_str(
-            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
+            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\nsession_summary = \"managed-summary-model\"\nimage_description = \"managed-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
         )
         .unwrap();
     let source = RequirementSource::Requirements {
@@ -3157,6 +3495,26 @@ fn apply_requirements_value_overrides_user_settings() {
     assert!(!cfg.default_yolo_mode);
     assert_eq!(Some("managed-model"), cfg.models.default.as_deref());
     assert_eq!(Some("managed-ws-model"), cfg.models.web_search.as_deref());
+    assert_eq!(
+        Some("managed-summary-model"),
+        cfg.models.session_summary.as_deref()
+    );
+    assert_eq!(
+        Some("managed-image-model"),
+        cfg.models.image_description.as_deref()
+    );
+    assert_eq!(
+        Some("managed-ws-model".to_owned()),
+        cfg.requirements.web_search_model.pinned()
+    );
+    assert_eq!(
+        Some("managed-summary-model".to_owned()),
+        cfg.requirements.session_summary_model.pinned()
+    );
+    assert_eq!(
+        Some("managed-image-model".to_owned()),
+        cfg.requirements.image_description_model.pinned()
+    );
     assert_eq!(Some("stable"), cfg.cli.channel.as_deref());
     assert_eq!(
             Some("https://managed-proxy.example/v1"),
@@ -3219,6 +3577,196 @@ fn apply_requirements_value_overrides_user_settings() {
                 .iter()
                 .any(|e| e.path == "telemetry.mixpanel_token" && e.value == "[redacted]")
         );
+}
+
+#[test]
+fn rejected_requirements_reload_preserves_auxiliary_pins() {
+    let mut cfg = crate::agent::config::Config::default();
+    let path = std::path::PathBuf::from("/test/requirements.toml");
+    let initial: toml::Value = toml::from_str(
+        "[models]\nweb_search = \"required-search\"\nsession_summary = \"required-summary\"\nimage_description = \"required-image\"\n",
+    )
+    .unwrap();
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: initial,
+            source: xai_grok_config::RequirementsSource::File(path.clone()),
+            is_system: false,
+        })],
+    );
+
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Rejected(
+            xai_grok_config::RequirementsSource::File(path),
+        )],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("required-search")
+    );
+    assert_eq!(
+        cfg.requirements.session_summary_model.pinned().as_deref(),
+        Some("required-summary")
+    );
+    assert_eq!(
+        cfg.requirements.image_description_model.pinned().as_deref(),
+        Some("required-image")
+    );
+}
+
+#[test]
+fn rejected_user_requirements_still_apply_trusted_system_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let user_path = std::path::PathBuf::from("/test/user/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: toml::from_str("[models]\nweb_search = \"old-user-search\"\n").unwrap(),
+            source: xai_grok_config::RequirementsSource::File(user_path.clone()),
+            is_system: false,
+        })],
+    );
+
+    let system: toml::Value = toml::from_str(
+        "[models]\nweb_search = \"required-system-search\"\n",
+    )
+    .unwrap();
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                user_path,
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: system,
+                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                    "/test/system/requirements.toml",
+                )),
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("required-system-search")
+    );
+    assert!(enforced.iter().any(|field| field.path == "models.web_search"));
+}
+
+#[test]
+fn rejected_user_requirements_clear_removed_pin_from_accepted_system_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n").unwrap(),
+            source: xai_grok_config::RequirementsSource::File(system_path.clone()),
+            is_system: true,
+        })],
+    );
+
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                std::path::PathBuf::from("/test/user/requirements.toml"),
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::Value::Table(toml::map::Map::new()),
+                source: xai_grok_config::RequirementsSource::File(system_path),
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert!(enforced.is_empty());
+    assert_eq!(cfg.requirements.web_search_model.pinned(), None);
+}
+
+#[test]
+fn rejected_system_requirements_do_not_replace_prior_pin_with_user_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n").unwrap(),
+            source: xai_grok_config::RequirementsSource::File(system_path.clone()),
+            is_system: true,
+        })],
+    );
+
+    let user: toml::Value =
+        toml::from_str("[models]\nweb_search = \"new-user-search\"\n").unwrap();
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: user,
+                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                    "/test/user/requirements.toml",
+                )),
+                is_system: false,
+            }),
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(system_path)),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-system-search")
+    );
+}
+
+#[test]
+fn rejected_system_restores_pin_shadowed_by_removed_mdm_pin() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n")
+                    .unwrap(),
+                source: xai_grok_config::RequirementsSource::File(system_path.clone()),
+                is_system: true,
+            }),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::from_str("[models]\nweb_search = \"old-mdm-search\"\n").unwrap(),
+                source: xai_grok_config::RequirementsSource::Mdm,
+                is_system: true,
+            }),
+        ],
+    );
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-mdm-search")
+    );
+
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                system_path,
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::Value::Table(toml::map::Map::new()),
+                source: xai_grok_config::RequirementsSource::Mdm,
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-system-search")
+    );
+    assert_eq!(cfg.models.web_search.as_deref(), Some("old-system-search"));
 }
 /// Strict precedence: requirement always wins (covers from-None and
 /// from-higher-user cases). The enforced floor lives in

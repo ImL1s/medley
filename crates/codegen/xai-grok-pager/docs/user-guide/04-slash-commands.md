@@ -2,7 +2,7 @@
 
 Type `/` in the prompt to open the command menu. It fuzzy-matches as you type, and picking a command runs it immediately.
 
-Commands come from two places: **shell builtins**, handled by the agent backend (xai-grok-shell), and **pager builtins**, handled by the pager frontend (xai-grok-pager). Both show up in the same menu, and any enabled skill with `user-invocable: true` appears there too.
+Commands come from two places: **shell builtins**, handled by the agent backend (xai-grok-shell), and **pager builtins**, handled by the pager frontend (xai-grok-pager). Both show up in the same menu, and any enabled skill with `user-invocable: true` appears there too. If a skill reuses a built-in name such as `login`, the built-in keeps `/login` and the skill stays available as `/plugin-name:login` — the menu badges both so the collision is visible.
 
 Every command below lists its aliases where it has them. A few commands only appear when a feature or session state enables them; those cases are called out inline. The menu is also filtered by render mode — see [`/minimal` and `/fullscreen`](#minimal-and-fullscreen).
 
@@ -88,7 +88,7 @@ Leave the current session and return to the welcome screen. Alias: `/welcome`.
 
 ### `/delete`
 
-Delete the current session's history and return to the welcome screen. Confirms first.
+Delete the current session's history. Confirms first. Returns to the welcome screen, or to the dashboard when you opened the session from the dashboard.
 
 To delete a session you are not in, open `/resume` or the welcome session list and press `d` then `y`. On the dashboard, press `Ctrl+X` twice or click `[✗]`.
 
@@ -116,7 +116,9 @@ Switch models. Accepts a model ID or display name (case-insensitive), and for re
 
 ### `/effort <level>`
 
-Set reasoning effort on the **current** model without reselecting it. The canonical levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, and a model may also advertise its own named options — run `/effort` with no argument to list the levels the active model actually accepts. It only applies when the active model supports reasoning effort; for a custom model, declare that support with `supports_reasoning_effort` or a `reasoning_efforts` list in its `[model.<id>]` block (see [Custom Models](11-custom-models.md#reasoning-effort)).
+Set reasoning effort on the **current** model without reselecting it. The canonical levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`, and a model may also advertise its own named options — run `/effort` with no argument to list the levels the active model actually accepts. It only applies when the active model supports reasoning effort; for a custom model, declare that support with `supports_reasoning_effort` or a `reasoning_efforts` list in its `[model.<id>]` block (see [Custom Models](11-custom-models.md#reasoning-effort)). `ultra` remains a distinct client/session tier and is offered only when the active model's catalog or custom menu advertises it.
+
+On Responses-family backends, `ultra` is encoded as `max` on the wire. For an authenticated Codex session, it also adds proactive multi-agent guidance: the model decides whether the available tools and current task warrant spawning subagents, so a spawn is not guaranteed on every turn. Chat Completions and Messages send the literal `ultra` value; custom endpoints must support it. See [Reasoning Effort](11-custom-models.md#reasoning-effort) for the backend-specific contract.
 
 ```
 /effort high
@@ -289,7 +291,7 @@ Kick off a background research workflow. It plans a bounded set of questions, ga
 
 The command returns right away — follow progress in `/workflows`, and the final report appears in the conversation on its own.
 
-Model-launched workflows may set `agent_budget` on the `workflow` tool. It's an absolute cumulative cap on logical child-agent calls: every `agent()` call and every item in a `parallel()` panel spends one slot, while schema-correction retries don't. The default is 128, explicit values run 1–1,024, and a panel that would cross the remaining budget is rejected before any of its children launch. `budget()` reports the cap as `total`, admitted calls as `spent`, `reserved` (always zero), and `remaining`. Named slash launches use the default budget.
+Model-launched workflows may set `agent_budget` on the `workflow` tool. It's an absolute cumulative cap on logical child-agent calls: every `agent()` call and every item in a `parallel()` panel spends one slot, while schema-correction retries don't. The default is 128, explicit values run 1–1,024, and a panel that would cross the remaining budget is rejected before any of its children launch. Separately, a host-configured cap (32 by default) bounds how many children run at a time per run; larger panels queue and still act as a barrier. `budget()` reports the cap as `total`, admitted calls as `spent`, `reserved` (always zero), and `remaining`. Named slash launches use the default budget.
 
 ### `/workflow`
 
@@ -321,9 +323,10 @@ Switch the color theme. Alias: `/t`.
 
 ### `/feedback [message]`
 
-Report an issue or send feedback.
+Report an issue or send feedback. A message sends immediately. With none, a pane opens for a longer report: `Enter` sends, `Esc` discards.
 
 ```
+/feedback
 /feedback Something isn't working correctly
 ```
 
@@ -463,7 +466,7 @@ Skills from plugins work the same way. When two skills share a name across scope
 /user:commit       # User-scoped skill
 ```
 
-Built-in commands always win over a skill with the same name. Name a skill "compact" and `/compact` still runs the built-in — but `/local:compact` invokes the skill.
+Built-in commands always win the bare name. Name a skill "compact" and `/compact` still runs the built-in — the skill stays available as `/local:compact` (or `/acme:compact` for a plugin). Both appear in the slash menu: the built-in is tagged `built-in` and the skill is tagged `skill · local` / `skill · acme`.
 
 ---
 

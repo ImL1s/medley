@@ -233,11 +233,32 @@ pub(crate) async fn create_test_actor_ex(
     SessionActor,
     tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
 ) {
+    create_test_actor_with_terminal(
+        total_tokens,
+        context_window,
+        threshold_percent,
+        gateway_tx,
+        persistence_tx,
+        Arc::new(DummyTerminal {}),
+    )
+    .await
+}
+#[cfg(test)]
+pub(crate) async fn create_test_actor_with_terminal(
+    total_tokens: u64,
+    context_window: u64,
+    threshold_percent: u8,
+    gateway_tx: tokio::sync::mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
+    persistence_tx: tokio::sync::mpsc::UnboundedSender<PersistenceMsg>,
+    terminal: Arc<dyn crate::terminal::AsyncTerminalRunner>,
+) -> (
+    SessionActor,
+    tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+) {
     let cwd = xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
     let fs = Arc::new(xai_grok_workspace::file_system::MockFs::new(
         cwd.to_path_buf(),
     ));
-    let terminal = Arc::new(DummyTerminal {});
     let (hunk_tx, _hunk_rx) = tokio::sync::mpsc::unbounded_channel();
     let hunk_tracker_handle = xai_hunk_tracker::HunkTrackerActor::spawn(
         "test-actor".to_string(),
@@ -259,6 +280,7 @@ pub(crate) async fn create_test_actor_ex(
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
+        front_message_committed: false,
         nudges_used_this_session: 0,
     });
     let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -307,6 +329,7 @@ pub(crate) async fn create_test_actor_ex(
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
             persistence_is_noop: false,
+            disk_full: crate::session::notifications::idle_disk_full_rx(),
         },
         permissions: xai_grok_workspace::permission::PermissionHandle::allow_all(),
         tool_context,
@@ -322,6 +345,7 @@ pub(crate) async fn create_test_actor_ex(
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
         catalog_model_id: std::cell::Cell::new("test".to_string()),
+        committed_tool_result_truncation_policy: std::cell::Cell::new(None),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -350,6 +374,7 @@ pub(crate) async fn create_test_actor_ex(
             flush_config: crate::config::MemoryFlushConfig::default(),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+            configured_storage: None,
             storage: std::cell::RefCell::new(None),
             save_on_end: true,
             backend_params: None,
@@ -458,12 +483,17 @@ pub(crate) async fn create_test_actor_ex(
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
+        turn_summary_task: std::cell::RefCell::new(None),
+        turn_summary_generation: std::cell::Cell::new(0),
+        turn_summary_enabled: false,
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
-        image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+        image_description_model: std::cell::RefCell::new(
+            crate::test_support::TEST_MODEL.to_owned(),
+        ),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
@@ -578,6 +608,20 @@ pub(crate) fn input_with_origin_rx(
     };
     (item, rx)
 }
+/// A plain Agent-mode `queue_input` request with every optional field defaulted.
+#[cfg(test)]
+pub(crate) fn queue_input_request(
+    prompt_blocks: Vec<acp::ContentBlock>,
+    prompt_id: &str,
+    respond_to: oneshot::Sender<PromptTurnResult>,
+) -> QueueInputRequest {
+    QueueInputRequest::new(
+        prompt_blocks,
+        prompt_id.to_string(),
+        PromptMode::Agent,
+        respond_to,
+    )
+}
 /// A running-turn `AgentTask` stub: a 60s sleeper that keeps the turn "in
 /// flight" until aborted. Assign to `state.running_task`; requires a
 /// `LocalSet` (`spawn_local`).
@@ -661,4 +705,22 @@ pub(crate) fn assert_goal_discipline_in_reminder(reminder: &str, site: &str) {
         !reminder.contains("{DISCIPLINE_BLOCK}"),
         "{site} must not leave {{DISCIPLINE_BLOCK}} unsubstituted:\n{reminder}"
     );
+}
+/// An actor whose persistence channel answers the `FlushAndAck` barrier, so a
+/// turn driven with a `persist_ack` resolves (bare `build_actor` never acks).
+#[cfg(test)]
+pub(crate) async fn actor_with_persistence_drain() -> std::sync::Arc<SessionActor> {
+    let (gateway_tx, mut gateway_rx) =
+        tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+    tokio::task::spawn_local(async move { while gateway_rx.recv().await.is_some() {} });
+    let (persistence_tx, mut persistence_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+    tokio::task::spawn_local(async move {
+        while let Some(msg) = persistence_rx.recv().await {
+            if let PersistenceMsg::FlushAndAck { respond_to } = msg {
+                let _ = respond_to.send(Ok(()));
+            }
+        }
+    });
+    std::sync::Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await)
 }

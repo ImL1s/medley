@@ -1221,7 +1221,7 @@ mod tests {
                     "truncated output must contain truncation annotation, got: {}",
                     &text[text.len().saturating_sub(200)..],
                 );
-                let expected = format!("showing first {}", format_bytes(limit));
+                let expected = format!("showing first {}", format_bytes(limit as u64));
                 assert!(
                     text.contains(&expected),
                     "annotation must show the truncation limit ({expected})"
@@ -1280,7 +1280,7 @@ mod tests {
                     "truncated output must contain truncation annotation"
                 );
                 assert!(
-                    text.contains("showing first 5.0KB"),
+                    text.contains("showing first 4.9 KB"),
                     "annotation must reflect the custom limit"
                 );
             } else {
@@ -1693,7 +1693,7 @@ mod tests {
         use crate::types::resources::{EnabledNativeToolNames, Resources};
         let mut resources = Resources::new();
         let set: std::collections::HashSet<String> = native.iter().map(|s| s.to_string()).collect();
-        resources.insert(EnabledNativeToolNames(set));
+        resources.insert(EnabledNativeToolNames::new(set));
         resources.into_shared()
     }
 
@@ -1704,7 +1704,7 @@ mod tests {
         use crate::types::resources::{EnabledNativeToolNames, Params, Resources};
         let mut resources = Resources::new();
         let set: std::collections::HashSet<String> = native.iter().map(|s| s.to_string()).collect();
-        resources.insert(EnabledNativeToolNames(set));
+        resources.insert(EnabledNativeToolNames::new(set));
         resources.insert(Params(UseToolParams {
             native_tool_correction: false,
         }));

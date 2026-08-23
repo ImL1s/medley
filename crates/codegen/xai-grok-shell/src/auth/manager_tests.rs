@@ -4,10 +4,9 @@
 
 use super::*;
 use crate::auth::error::RefreshTokenError;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
-#[cfg(unix)]
 fn codex_auth(key: &str) -> GrokAuth {
     GrokAuth {
         key: key.into(),
@@ -18,6 +17,104 @@ fn codex_auth(key: &str) -> GrokAuth {
         oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.into()),
         ..GrokAuth::test_default()
     }
+}
+
+fn codex_manager(grok_home: &Path) -> AuthManager {
+    AuthManager::new_openai_codex_for_test_path(&grok_home.join("auth.json"))
+}
+
+fn test_manager(grok_home: &Path, config: GrokComConfig) -> AuthManager {
+    AuthManager::new_for_test_path(&grok_home.join("auth.json"), config)
+}
+
+#[test]
+fn exact_test_path_ignores_ambient_auth_carriers_without_changing_production_precedence() {
+    const CHILD_MARKER: &str = "GROK_TEST_EXACT_AUTH_PATH_CHILD";
+    const EXACT_PATH_ENV: &str = "GROK_TEST_EXACT_AUTH_PATH";
+    const AMBIENT_PATH_ENV: &str = "GROK_TEST_AMBIENT_AUTH_PATH";
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let exact_path = PathBuf::from(
+            std::env::var_os(EXACT_PATH_ENV).expect("child exact auth path must be present"),
+        );
+        let ambient_path = PathBuf::from(
+            std::env::var_os(AMBIENT_PATH_ENV).expect("child ambient auth path must be present"),
+        );
+
+        let exact = AuthManager::new_for_test_path(&exact_path, GrokComConfig::default());
+        assert!(
+            exact.auth_json_path() == exact_path,
+            "the test-only constructor must retain its explicit path"
+        );
+        assert!(
+            exact
+                .current()
+                .is_some_and(|auth| auth.key == "fixture-token"),
+            "the test-only constructor must ignore ambient credentials"
+        );
+
+        let production = AuthManager::new(
+            exact_path.parent().expect("exact auth path has a parent"),
+            GrokComConfig::default(),
+        );
+        assert!(
+            production.auth_json_path() == ambient_path,
+            "the production constructor must retain ambient path precedence"
+        );
+        assert!(
+            production
+                .current()
+                .is_some_and(|auth| auth.key == "ambient-token"),
+            "the production constructor must retain inline credential precedence"
+        );
+        return;
+    }
+
+    let exact_dir = tempfile::tempdir().unwrap();
+    let exact_path = exact_dir.path().join("auth.json");
+    let scope = GrokComConfig::default().auth_scope();
+    let mut store = AuthStore::new();
+    store.insert(
+        scope,
+        GrokAuth {
+            key: "fixture-token".into(),
+            expires_at: Some(Utc::now() + Duration::hours(1)),
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json(&exact_path, &store).unwrap();
+
+    let ambient_dir = tempfile::tempdir().unwrap();
+    let ambient_path = ambient_dir.path().join("ambient-auth.json");
+    let inline = serde_json::to_string(&GrokAuth {
+        key: "ambient-token".into(),
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+        ..GrokAuth::test_default()
+    })
+    .unwrap();
+
+    let mut command =
+        std::process::Command::new(std::env::current_exe().expect("current test binary"));
+    command
+        .args([
+            "--exact",
+            "auth::manager::tests::exact_test_path_ignores_ambient_auth_carriers_without_changing_production_precedence",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .env(EXACT_PATH_ENV, &exact_path)
+        .env(AMBIENT_PATH_ENV, &ambient_path)
+        .env("GROK_AUTH_PATH", &ambient_path)
+        .env("GROK_AUTH", inline)
+        .stdin(std::process::Stdio::null());
+    xai_tty_utils::detach_std_command(&mut command);
+    let output = command
+        .output()
+        .expect("spawn hostile credential subprocess");
+    assert!(
+        output.status.success(),
+        "hostile credential subprocess failed"
+    );
 }
 
 #[cfg(unix)]
@@ -32,10 +129,8 @@ fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
-#[cfg(unix)]
 struct PermissionRepairFault(PathBuf);
 
-#[cfg(unix)]
 impl PermissionRepairFault {
     fn install(path: &Path) -> Self {
         crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS
@@ -46,13 +141,82 @@ impl PermissionRepairFault {
     }
 }
 
-#[cfg(unix)]
 impl Drop for PermissionRepairFault {
     fn drop(&mut self) {
         let mut faults = crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        faults.retain(|path| path != &self.0);
+        if let Some(index) = faults.iter().rposition(|path| path == &self.0) {
+            faults.remove(index);
+        }
+    }
+}
+
+struct PostRenamePermissionFault(PathBuf);
+
+impl PostRenamePermissionFault {
+    fn install(path: &Path) -> Self {
+        crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(path.to_owned());
+        Self(path.to_owned())
+    }
+}
+
+impl Drop for PostRenamePermissionFault {
+    fn drop(&mut self) {
+        let mut faults = crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = faults.iter().rposition(|path| path == &self.0) {
+            faults.remove(index);
+        }
+    }
+}
+
+struct ParentSyncFault(PathBuf);
+
+impl ParentSyncFault {
+    fn install(path: &Path) -> Self {
+        crate::auth::storage::PARENT_SYNC_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(path.to_owned());
+        Self(path.to_owned())
+    }
+}
+
+struct StorageFullWriteFault(PathBuf);
+
+impl StorageFullWriteFault {
+    fn install(path: &Path) -> Self {
+        *crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+        Self(path.to_owned())
+    }
+}
+
+impl Drop for StorageFullWriteFault {
+    fn drop(&mut self) {
+        let mut fault = crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if fault.as_ref() == Some(&self.0) {
+            *fault = None;
+        }
+    }
+}
+
+impl Drop for ParentSyncFault {
+    fn drop(&mut self) {
+        let mut faults = crate::auth::storage::PARENT_SYNC_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = faults.iter().rposition(|path| path == &self.0) {
+            faults.remove(index);
+        }
     }
 }
 
@@ -83,7 +247,7 @@ fn codex_load_repairs_world_readable_store_before_use() {
     write_mixed_auth_store(&path);
     set_mode(&path, 0o644);
 
-    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let manager = Arc::new(codex_manager(dir.path()));
 
     assert_eq!(mode(&path), 0o600, "Codex load must repair auth.json");
     assert_eq!(manager.current().unwrap().key, "codex-secret");
@@ -98,11 +262,11 @@ fn codex_load_fails_closed_when_permission_repair_fails_but_xai_is_compatible() 
     set_mode(&path, 0o644);
     let _fault = PermissionRepairFault::install(&path);
 
-    let codex = AuthManager::new_openai_codex(dir.path());
+    let codex = codex_manager(dir.path());
     assert!(codex.current_or_expired().is_none());
     assert!(codex.read_disk_auth().is_none());
 
-    let xai = AuthManager::new(dir.path(), GrokComConfig::default());
+    let xai = test_manager(dir.path(), GrokComConfig::default());
     assert_eq!(
         xai.current().map(|auth| auth.key),
         Some("xai-secret".into()),
@@ -116,7 +280,7 @@ async fn codex_reload_and_sibling_adoption_cannot_bypass_permission_repair_failu
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("auth.json");
     write_mixed_auth_store(&path);
-    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let manager = Arc::new(codex_manager(dir.path()));
     assert_eq!(manager.current().unwrap().key, "codex-secret");
 
     set_mode(&path, 0o644);
@@ -157,6 +321,1062 @@ fn make_auth(expires_at: Option<DateTime<Utc>>, create_time: DateTime<Utc>) -> G
 }
 
 #[test]
+fn selection_snapshot_generation_tracks_auth_and_probe_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
+
+    let initial = mgr.selection_snapshot();
+    assert_eq!(initial.generation, 0);
+    assert!(!initial.has_auth);
+    assert_eq!(
+        initial.session_eligibility,
+        FirstPartySessionEligibility::None
+    );
+    assert!(!initial.is_session_auth);
+    assert!(initial.first_party_env_api_key_ok);
+
+    let mut auth = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    auth.auth_mode = AuthMode::Oidc;
+    mgr.hot_swap(auth);
+    let with_session = mgr.selection_snapshot();
+    assert_eq!(with_session.generation, initial.generation + 2);
+    assert!(with_session.has_auth);
+    assert_eq!(
+        with_session.session_eligibility,
+        FirstPartySessionEligibility::WireUsable
+    );
+    assert!(with_session.is_session_auth);
+
+    mgr.set_first_party_env_api_key_ok(false);
+    let failed_probe = mgr.selection_snapshot();
+    assert_eq!(failed_probe.generation, with_session.generation + 2);
+    assert!(!failed_probe.first_party_env_api_key_ok);
+    assert!(mgr.selection_generation_is_current(failed_probe.generation));
+
+    mgr.clear_in_memory();
+    let cleared = mgr.selection_snapshot();
+    assert_eq!(cleared.generation, failed_probe.generation + 2);
+    assert!(!cleared.has_auth);
+    assert!(!cleared.is_session_auth);
+    assert!(!mgr.selection_generation_is_current(failed_probe.generation));
+}
+
+#[test]
+fn selection_snapshot_waits_for_odd_mutation_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
+    let mutation = mgr.begin_selection_mutation();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = Arc::clone(&mgr);
+    let thread = std::thread::spawn(move || {
+        tx.send(reader.selection_snapshot()).unwrap();
+    });
+
+    assert!(
+        rx.recv_timeout(StdDuration::from_millis(25)).is_err(),
+        "a snapshot must not publish while the generation is odd"
+    );
+    drop(mutation);
+    let snapshot = rx.recv_timeout(StdDuration::from_secs(1)).unwrap();
+    assert_eq!(snapshot.generation % 2, 0);
+    thread.join().unwrap();
+}
+
+#[test]
+fn selection_seal_blocks_writers_without_advancing_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
+    let initial = mgr.selection_snapshot();
+    let seal = mgr
+        .try_seal_selection(initial.generation)
+        .expect("stable generation must be sealable");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = Arc::clone(&mgr);
+    let thread = std::thread::spawn(move || {
+        writer.set_first_party_env_api_key_ok(false);
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(StdDuration::from_millis(25)).is_err(),
+        "auth writers must wait while a synchronous selection seal is held"
+    );
+
+    drop(seal);
+    rx.recv_timeout(StdDuration::from_secs(1))
+        .expect("writer must resume after the seal drops");
+    let changed = mgr.selection_snapshot();
+    assert_eq!(
+        changed.generation,
+        initial.generation + 2,
+        "the read seal itself must not invent a mutation generation"
+    );
+    assert!(!changed.first_party_env_api_key_ok);
+    thread.join().unwrap();
+}
+
+#[test]
+fn selection_wait_never_parks_on_a_stable_even_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        // Model the saturated backoff left after a prior contended mutation.
+        // A selection seal may legally restore the same even generation, so
+        // the park predicate must be "currently odd", never "value changed".
+        let mut backoff = AuthSelectionBackoff { attempts: 96 };
+        mgr.wait_for_selection_progress(&mut backoff);
+        let _ = done_tx.send(());
+    });
+    let completed = done_rx.recv_timeout(StdDuration::from_secs(1));
+    let joined = if completed.is_ok() {
+        thread.join().is_ok()
+    } else {
+        drop(thread);
+        false
+    };
+
+    assert!(
+        completed.is_ok(),
+        "stable even generation must never enter the Condvar wait"
+    );
+    assert!(joined, "stable-generation waiter must finish");
+}
+
+#[derive(Clone, Copy)]
+enum XaiPublicationPath {
+    Update,
+    SaveWithoutEnrichment,
+}
+
+struct SelectionPublicationPause {
+    manager: Arc<AuthManager>,
+    publication_reached_rx: std::sync::mpsc::Receiver<()>,
+    reader_observed_odd_rx: std::sync::mpsc::Receiver<()>,
+    release_publication_tx: std::sync::mpsc::SyncSender<()>,
+}
+
+impl SelectionPublicationPause {
+    fn install(manager: Arc<AuthManager>) -> Self {
+        let (publication_reached_tx, publication_reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_publication_tx, release_publication_rx) = std::sync::mpsc::sync_channel(1);
+        let release_publication_rx = Arc::new(std::sync::Mutex::new(release_publication_rx));
+        let release_hook = Arc::clone(&release_publication_rx);
+        manager.set_selection_after_disk_before_memory_hook(Some(Arc::new(move || {
+            let _ = publication_reached_tx.try_send(());
+            // Last-resort cleanup guarantee: even if the test driver dies,
+            // never strand a runtime worker inside the publication seam.
+            let _ = release_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(StdDuration::from_secs(2));
+        })));
+
+        let (reader_observed_odd_tx, reader_observed_odd_rx) = std::sync::mpsc::sync_channel(1);
+        let observed_once = Arc::new(AtomicBool::new(false));
+        manager.set_selection_snapshot_observed_odd_hook(Some(Arc::new(move || {
+            if !observed_once.swap(true, Ordering::SeqCst) {
+                let _ = reader_observed_odd_tx.try_send(());
+            }
+        })));
+
+        Self {
+            manager,
+            publication_reached_rx,
+            reader_observed_odd_rx,
+            release_publication_tx,
+        }
+    }
+
+    fn release(&self) {
+        let _ = self.release_publication_tx.try_send(());
+    }
+}
+
+impl Drop for SelectionPublicationPause {
+    fn drop(&mut self) {
+        self.release();
+        self.manager
+            .set_selection_after_disk_before_memory_hook(None);
+        self.manager.set_selection_snapshot_observed_odd_hook(None);
+    }
+}
+
+struct SelectionPublicationObservation {
+    publication_reached: bool,
+    reader_observed_odd: bool,
+    early_snapshot: Option<AuthSelectionSnapshot>,
+    snapshot: Option<AuthSelectionSnapshot>,
+    reader_joined: bool,
+    writer_result: Result<std::io::Result<GrokAuth>, String>,
+}
+
+async fn observe_selection_publication<F>(
+    manager: Arc<AuthManager>,
+    pause: &SelectionPublicationPause,
+    mut writer: tokio::task::JoinHandle<std::io::Result<GrokAuth>>,
+    on_publication_reached: F,
+) -> SelectionPublicationObservation
+where
+    F: FnOnce(),
+{
+    let publication_reached = pause
+        .publication_reached_rx
+        .recv_timeout(StdDuration::from_secs(1))
+        .is_ok();
+    if publication_reached {
+        on_publication_reached();
+    }
+
+    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
+    let snapshot_thread = std::thread::spawn(move || {
+        let _ = snapshot_tx.send(manager.selection_snapshot());
+    });
+    let reader_observed_odd = pause
+        .reader_observed_odd_rx
+        .recv_timeout(StdDuration::from_secs(1))
+        .is_ok();
+    let early_snapshot = snapshot_rx.recv_timeout(StdDuration::from_millis(25)).ok();
+
+    // Every unbounded operation is released or timed out before assertions.
+    pause.release();
+    let writer_result = match tokio::time::timeout(StdDuration::from_secs(3), &mut writer).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(format!("publication task failed to join: {error}")),
+        Err(_) => {
+            writer.abort();
+            // Aborting cannot pre-empt synchronous filesystem work, but the
+            // publication seam has already been released. Give that work a
+            // bounded cleanup join instead of immediately detaching it.
+            let _ = tokio::time::timeout(StdDuration::from_secs(1), &mut writer).await;
+            Err("publication task timed out".to_string())
+        }
+    };
+    let snapshot =
+        early_snapshot.or_else(|| snapshot_rx.recv_timeout(StdDuration::from_secs(1)).ok());
+    let reader_joined = if snapshot.is_some() {
+        snapshot_thread.join().is_ok()
+    } else {
+        // Detach instead of allowing a failed regression to hang the suite.
+        drop(snapshot_thread);
+        false
+    };
+
+    SelectionPublicationObservation {
+        publication_reached,
+        reader_observed_odd,
+        early_snapshot,
+        snapshot,
+        reader_joined,
+        writer_result,
+    }
+}
+
+fn assert_selection_reader_was_blocked(observation: &SelectionPublicationObservation) {
+    assert!(
+        observation.publication_reached,
+        "credential must reach the disk/write-result publication seam"
+    );
+    assert!(
+        observation.reader_observed_odd,
+        "snapshot reader must actually observe the in-flight odd generation"
+    );
+    assert!(
+        observation.early_snapshot.is_none(),
+        "snapshot must not escape between durable disk publication and memory publication"
+    );
+    assert!(
+        observation.reader_joined,
+        "snapshot reader must complete after publication"
+    );
+}
+
+async fn assert_selection_snapshot_waits_for_disk_to_memory_auth_publication(
+    publication_path: XaiPublicationPath,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(
+        test_manager(dir.path(), GrokComConfig::default())
+            .with_proxy_base_url("http://127.0.0.1:9"),
+    );
+    let initial = mgr.selection_snapshot();
+    let pause = SelectionPublicationPause::install(Arc::clone(&mgr));
+
+    let mut auth = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    auth.auth_mode = AuthMode::Oidc;
+    let writer = Arc::clone(&mgr);
+    let update = tokio::spawn(async move {
+        match publication_path {
+            XaiPublicationPath::Update => writer.update(auth).await,
+            XaiPublicationPath::SaveWithoutEnrichment => writer.save_without_enrichment(auth).await,
+        }
+    });
+    let observation = observe_selection_publication(Arc::clone(&mgr), &pause, update, || {}).await;
+    drop(pause);
+
+    assert_selection_reader_was_blocked(&observation);
+    observation
+        .writer_result
+        .expect("publication task must join")
+        .expect("publication must succeed");
+    let snapshot = observation
+        .snapshot
+        .expect("snapshot must complete after publication");
+    assert_eq!(snapshot.generation, initial.generation + 2);
+    assert!(snapshot.has_auth);
+    assert_eq!(
+        snapshot.session_eligibility,
+        FirstPartySessionEligibility::WireUsable
+    );
+    assert!(snapshot.is_session_auth);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selection_snapshot_waits_for_disk_to_memory_auth_publication() {
+    assert_selection_snapshot_waits_for_disk_to_memory_auth_publication(
+        XaiPublicationPath::SaveWithoutEnrichment,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selection_snapshot_waits_for_update_disk_to_memory_auth_publication() {
+    assert_selection_snapshot_waits_for_disk_to_memory_auth_publication(XaiPublicationPath::Update)
+        .await;
+}
+
+async fn assert_codex_strict_publication(post_rename_failure: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(codex_manager(dir.path()));
+    if post_rename_failure {
+        manager
+            .save_without_enrichment(codex_auth("codex-initial"))
+            .await
+            .unwrap();
+    }
+    let before = manager.selection_snapshot();
+    let pause = SelectionPublicationPause::install(Arc::clone(&manager));
+    let _fault =
+        post_rename_failure.then(|| PostRenamePermissionFault::install(manager.auth_json_path()));
+    let expected_key = if post_rename_failure {
+        "codex-rotated"
+    } else {
+        "codex-success"
+    };
+    let writer_manager = Arc::clone(&manager);
+    let writer = tokio::spawn(async move {
+        writer_manager
+            .save_without_enrichment(codex_auth(expected_key))
+            .await
+    });
+    let observation =
+        observe_selection_publication(Arc::clone(&manager), &pause, writer, || {}).await;
+    drop(pause);
+
+    let disk = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+
+    assert_selection_reader_was_blocked(&observation);
+    let operation = observation
+        .writer_result
+        .expect("Codex publication task must join");
+    let snapshot = observation
+        .snapshot
+        .expect("blocked reader must complete after Codex publication");
+    if post_rename_failure {
+        assert_eq!(
+            operation.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    } else {
+        assert_eq!(operation.unwrap().key, expected_key);
+    }
+    assert_eq!(manager.current_or_expired().unwrap().key, expected_key);
+    assert_eq!(
+        disk.get(crate::auth::openai_codex::AUTH_SCOPE).unwrap().key,
+        expected_key,
+        "the strict writer must leave a complete owner-only durable credential"
+    );
+    assert_eq!(snapshot.generation, before.generation + 2);
+    assert!(snapshot.has_auth);
+    assert!(!snapshot.is_session_auth);
+    assert_eq!(
+        snapshot.session_eligibility,
+        FirstPartySessionEligibility::None
+    );
+    if post_rename_failure {
+        assert_strict_reconciliation_telemetry(DiskAuthState::Ok, true, expected_key);
+    }
+}
+
+fn assert_strict_reconciliation_telemetry(
+    expected_disk_state: DiskAuthState,
+    expected_reconciled_present: bool,
+    forbidden_secret: &str,
+) {
+    let bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("strict reconciliation must emit unified telemetry");
+    let expected_disk_state = format!("{expected_disk_state:?}");
+    let event = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .find(|entry| {
+            entry.get("msg").and_then(serde_json::Value::as_str)
+                == Some("auth: strict credential write failed; durable state reconciled")
+                && entry
+                    .pointer("/ctx/error_kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("PermissionDenied")
+                && entry
+                    .pointer("/ctx/disk_state")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected_disk_state.as_str())
+                && entry
+                    .pointer("/ctx/reconciled_present")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(expected_reconciled_present)
+        })
+        .expect("strict reconciliation telemetry must preserve its attributable outcome");
+    assert!(
+        !event.to_string().contains(forbidden_secret),
+        "strict reconciliation telemetry must never contain credential bytes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_strict_save_publishes_disk_and_memory_in_one_generation() {
+    assert_codex_strict_publication(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_post_rename_failure_reconciles_memory_to_safe_disk_before_generation_stabilizes() {
+    assert_codex_strict_publication(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_post_rename_unsafe_disk_clears_memory_before_generation_stabilizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(codex_manager(dir.path()));
+    manager
+        .save_without_enrichment(codex_auth("codex-initial"))
+        .await
+        .unwrap();
+    let before = manager.selection_snapshot();
+    let pause = SelectionPublicationPause::install(Arc::clone(&manager));
+    let _post_rename_fault = PostRenamePermissionFault::install(manager.auth_json_path());
+    let _repair_fault = PermissionRepairFault::install(manager.auth_json_path());
+    let unsafe_path = manager.auth_json_path().to_owned();
+    let writer_manager = Arc::clone(&manager);
+    let writer = tokio::spawn(async move {
+        writer_manager
+            .save_without_enrichment(codex_auth("codex-unsafe-rotated"))
+            .await
+    });
+    let observation =
+        observe_selection_publication(Arc::clone(&manager), &pause, writer, move || {
+            #[cfg(unix)]
+            set_mode(&unsafe_path, 0o644);
+            #[cfg(not(unix))]
+            let _ = unsafe_path;
+        })
+        .await;
+    drop(pause);
+
+    assert_selection_reader_was_blocked(&observation);
+    assert_eq!(
+        observation
+            .writer_result
+            .expect("Codex publication task must join")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let snapshot = observation
+        .snapshot
+        .expect("blocked reader must complete after failed-closed publication");
+    assert_eq!(snapshot.generation, before.generation + 2);
+    assert!(!snapshot.has_auth);
+    assert!(!snapshot.is_session_auth);
+    assert_eq!(
+        snapshot.session_eligibility,
+        FirstPartySessionEligibility::None
+    );
+    assert!(
+        manager.current_or_expired().is_none(),
+        "unsafe durable credentials must be cleared from memory before the generation stabilizes"
+    );
+    assert!(
+        read_auth_json_owner_only(manager.auth_json_path()).is_err(),
+        "test precondition: strict durable readback must reject the unsafe object"
+    );
+    assert_strict_reconciliation_telemetry(
+        DiskAuthState::Unreadable,
+        false,
+        "codex-unsafe-rotated",
+    );
+}
+
+#[tokio::test]
+async fn codex_parent_sync_failure_reconciles_memory_to_visible_strict_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = codex_manager(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-parent-initial"))
+        .await
+        .unwrap();
+    let _fault = ParentSyncFault::install(manager.auth_json_path());
+
+    let error = manager
+        .save_without_enrichment(codex_auth("codex-parent-rotated"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(
+        manager.current_or_expired().unwrap().key,
+        "codex-parent-rotated",
+        "memory must reconcile to the complete visible credential"
+    );
+    let disk = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    assert_eq!(
+        disk.get(crate::auth::openai_codex::AUTH_SCOPE).unwrap().key,
+        "codex-parent-rotated"
+    );
+    let log_bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("reconciliation must emit unified telemetry");
+    let log = String::from_utf8_lossy(&log_bytes);
+    assert!(log.contains("strict credential write failed; durable state reconciled"));
+    assert!(
+        !log.contains("codex-parent-rotated"),
+        "durability diagnostics must not contain credential bytes"
+    );
+}
+
+/// A last-scope unlink is already visible when its parent-directory fsync
+/// fails. Durable logout must report that failure, but retaining the deleted
+/// credential in memory would be a fail-open disk/memory split.
+#[tokio::test]
+async fn codex_durable_clear_reconciles_memory_after_visible_parent_sync_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = codex_manager(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-delete-secret"))
+        .await
+        .unwrap();
+    let path = manager.auth_json_path().to_owned();
+    let _fault = ParentSyncFault::install(&path);
+
+    let error = manager
+        .clear_durable(StdDuration::from_secs(1))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(
+        error.to_string(),
+        "injected auth parent-directory sync failure"
+    );
+    assert!(!path.exists(), "unlink must be visible before sync failure");
+    assert!(
+        manager.current_or_expired().is_none(),
+        "memory must reconcile to the visible deletion despite the durability error"
+    );
+    assert!(
+        !manager.selection_snapshot().has_auth,
+        "auth selection must fail closed after visible deletion"
+    );
+    let log_bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("visible deletion failure must emit unified telemetry");
+    let log = String::from_utf8_lossy(&log_bytes);
+    assert!(log.contains("file deleted but directory sync failed"));
+    assert!(
+        !log.contains("codex-delete-secret"),
+        "durable deletion diagnostics must not contain credential bytes"
+    );
+}
+
+#[tokio::test]
+async fn codex_mixed_scope_clear_reconciles_after_visible_parent_sync_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = codex_manager(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-mixed-delete-secret"))
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "sibling::scope".into(),
+        GrokAuth {
+            key: "sibling-secret".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+    let _fault = ParentSyncFault::install(manager.auth_json_path());
+
+    let error = manager
+        .clear_durable(StdDuration::from_secs(1))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(
+        manager.current_or_expired().is_none(),
+        "memory must drop the visibly removed current scope"
+    );
+    let durable = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    assert!(!durable.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert_eq!(
+        durable.get("sibling::scope").map(|auth| auth.key.as_str()),
+        Some("sibling-secret"),
+        "the sibling scope must survive the atomic replacement"
+    );
+    let log_bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("mixed-scope sync failure must emit unified telemetry");
+    let log = String::from_utf8_lossy(&log_bytes);
+    assert!(log.contains("entry removed but final durability proof failed"));
+    assert!(!log.contains("codex-mixed-delete-secret"));
+    assert!(!log.contains("sibling-secret"));
+}
+
+#[tokio::test]
+async fn codex_mixed_scope_clear_reconciles_after_post_rename_permission_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = codex_manager(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-permission-delete-secret"))
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "permission::sibling".into(),
+        GrokAuth {
+            key: "permission-sibling-secret".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+    let _fault = PostRenamePermissionFault::install(manager.auth_json_path());
+
+    let error = manager
+        .clear_durable(StdDuration::from_secs(1))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        manager.current_or_expired().is_none(),
+        "post-rename classification must clear the visibly removed credential without reread"
+    );
+    let durable = read_auth_json(manager.auth_json_path()).unwrap();
+    assert!(!durable.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert!(durable.contains_key("permission::sibling"));
+    let log_bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("permission failure must emit unified telemetry");
+    let log = String::from_utf8_lossy(&log_bytes);
+    assert!(log.contains("entry removed but final durability proof failed"));
+    assert!(!log.contains("codex-permission-delete-secret"));
+    assert!(!log.contains("permission-sibling-secret"));
+}
+
+/// A rejected provider refresh token must use the strict writer. ENOSPC before
+/// publication therefore leaves both the rejected scope and its in-memory
+/// mirror intact instead of entering the legacy truncate-and-rewrite fallback.
+/// Even a hard-valid access token rejected on the request wire stays inert
+/// behind the key-scoped sticky verdict, including after a disk reload.
+#[tokio::test]
+async fn codex_rejected_refresh_mixed_scope_storage_full_retains_authoritative_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(codex_manager(dir.path()));
+    let mut rejected = codex_auth("codex-rejected-before-publication");
+    rejected.expires_at = Some(Utc::now() + Duration::hours(1));
+    manager
+        .save_without_enrichment(rejected.clone())
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "sibling::scope".into(),
+        GrokAuth {
+            key: "sibling-before-publication".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+
+    struct Reject(GrokAuth);
+    #[async_trait::async_trait]
+    impl TokenRefresher for Reject {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::manager::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            crate::auth::refresh::RefreshOutcome::permanent_for(
+                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+                &self.0,
+            )
+        }
+    }
+    manager.set_refresher(Arc::new(Reject(rejected.clone())));
+    let _fault = StorageFullWriteFault::install(manager.auth_json_path());
+
+    let error = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthError::Refresh(RefreshTokenError::Permanent(_))
+    ));
+    assert_eq!(
+        manager.current_or_expired().map(|auth| auth.key),
+        Some(rejected.key.clone()),
+        "a before-publication failure must retain the disk-authoritative in-memory mirror"
+    );
+    assert!(
+        manager.permanent_failure().is_some(),
+        "retained bytes must remain inert behind the sticky rejection verdict"
+    );
+    assert!(
+        manager.current_wire_valid().is_none(),
+        "a server-rejected hard-valid bearer must not be exported after removal fails"
+    );
+    let provider = crate::auth::AuthProviderRef::openai_codex(Arc::clone(&manager));
+    let resolver = provider.bearer_resolver();
+    assert!(
+        resolver.current_bearer().is_none(),
+        "native Codex bearer resolver must honor the rejection verdict"
+    );
+    assert!(
+        resolver.current_credential().is_none(),
+        "native Codex credential resolver must honor the rejection verdict"
+    );
+    assert!(
+        resolver.current_credential_async().await.is_none(),
+        "async native Codex credential resolution must honor the rejection verdict"
+    );
+    assert!(
+        !resolver
+            .recover_rejected_credential_async("older-in-flight-codex-key")
+            .await,
+        "401 recovery must not substitute the retained rejected bearer for an older request"
+    );
+    let mut recovery = manager.unauthorized_recovery(
+        Some(codex_auth("older-in-flight-codex-key")),
+        crate::auth::recovery::RecoverySource::Background,
+    );
+    assert!(
+        recovery.next().await.is_err(),
+        "disk reload recovery must not hot-swap the retained rejected bearer back onto the wire"
+    );
+    assert!(
+        crate::auth::openai_codex::credential_snapshot(&manager).is_none(),
+        "catalog/request snapshots must not export the rejected bearer"
+    );
+    let auth_result = manager.auth().await;
+    assert!(
+        matches!(
+            auth_result,
+            Err(AuthError::Refresh(RefreshTokenError::Permanent(_)))
+        ),
+        "suppressed rejected bearer must surface its permanent verdict, got {}",
+        match &auth_result {
+            Ok(_) => "Ok(<redacted>)".to_owned(),
+            Err(error) => format!("Err({error})"),
+        }
+    );
+    let durable = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    assert_eq!(
+        durable
+            .get(crate::auth::openai_codex::AUTH_SCOPE)
+            .map(|auth| auth.key.as_str()),
+        Some("codex-rejected-before-publication")
+    );
+    assert_eq!(
+        durable.get("sibling::scope").map(|auth| auth.key.as_str()),
+        Some("sibling-before-publication"),
+        "strict ENOSPC handling must not truncate or drop sibling scopes"
+    );
+
+    manager.force_reload_from_disk();
+    assert_eq!(
+        manager.current_or_expired().map(|auth| auth.key),
+        Some(rejected.key),
+        "disk remains authoritative even though its rejected bearer is suppressed"
+    );
+    assert!(
+        manager.current_wire_valid().is_none(),
+        "reloading the retained disk entry must not re-enable wire export"
+    );
+    assert!(resolver.current_bearer().is_none());
+    assert!(resolver.current_credential().is_none());
+    assert!(crate::auth::openai_codex::credential_snapshot(&manager).is_none());
+}
+
+/// Once the strict atomic replacement is visible, a final durability failure
+/// must reconcile memory to the published removal while preserving siblings.
+#[tokio::test]
+async fn codex_rejected_refresh_mixed_scope_reconciles_after_publication_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(codex_manager(dir.path()));
+    let mut rejected = codex_auth("codex-rejected-after-publication");
+    rejected.expires_at = Some(Utc::now() - Duration::hours(1));
+    manager
+        .save_without_enrichment(rejected.clone())
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "sibling::scope".into(),
+        GrokAuth {
+            key: "sibling-after-publication".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+
+    struct Reject(GrokAuth);
+    #[async_trait::async_trait]
+    impl TokenRefresher for Reject {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::manager::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            crate::auth::refresh::RefreshOutcome::permanent_for(
+                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+                &self.0,
+            )
+        }
+    }
+    manager.set_refresher(Arc::new(Reject(rejected)));
+    let _fault = ParentSyncFault::install(manager.auth_json_path());
+
+    let error = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthError::Refresh(RefreshTokenError::Permanent(_))
+    ));
+    assert!(
+        manager.current_or_expired().is_none(),
+        "an after-publication failure must clear the visibly removed in-memory scope"
+    );
+    let durable = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    assert!(!durable.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert_eq!(
+        durable.get("sibling::scope").map(|auth| auth.key.as_str()),
+        Some("sibling-after-publication"),
+        "the strict replacement must preserve sibling scopes"
+    );
+}
+
+/// Readers racing the strict mixed-scope removal may observe either complete
+/// generation, never a truncated/intermediate JSON document and never a store
+/// that loses the unrelated sibling scope.
+#[tokio::test]
+async fn codex_rejected_refresh_mixed_scope_publication_is_atomic_for_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(codex_manager(dir.path()));
+    let mut rejected = codex_auth("codex-atomic-removal-old");
+    rejected.expires_at = Some(Utc::now() - Duration::hours(1));
+    manager
+        .save_without_enrichment(rejected.clone())
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "atomic::sibling".into(),
+        GrokAuth {
+            key: "atomic-sibling-secret".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+
+    struct Reject(GrokAuth);
+    #[async_trait::async_trait]
+    impl TokenRefresher for Reject {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::manager::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            crate::auth::refresh::RefreshOutcome::permanent_for(
+                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+                &self.0,
+            )
+        }
+    }
+    manager.set_refresher(Arc::new(Reject(rejected)));
+
+    let reader_ready = Arc::new(std::sync::Barrier::new(2));
+    let writer_done = Arc::new(AtomicBool::new(false));
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader = std::thread::spawn({
+        let auth_path = manager.auth_json_path().to_owned();
+        let reader_ready = Arc::clone(&reader_ready);
+        let writer_done = Arc::clone(&writer_done);
+        let observations = Arc::clone(&observations);
+        move || {
+            let mut reads = 0usize;
+            let mut post_publication_reads = 0usize;
+            while reads < 10_000
+                && (!writer_done.load(Ordering::Acquire) || post_publication_reads < 100)
+            {
+                let result = read_auth_json_owner_only(&auth_path).and_then(|store| {
+                    let sibling = store.get("atomic::sibling").map(|auth| auth.key.as_str());
+                    if sibling != Some("atomic-sibling-secret") {
+                        return Err(std::io::Error::other(format!(
+                            "sibling missing or changed: {sibling:?}"
+                        )));
+                    }
+                    match store.get(crate::auth::openai_codex::AUTH_SCOPE) {
+                        Some(auth) if auth.key == "codex-atomic-removal-old" => Ok(true),
+                        None => Ok(false),
+                        Some(auth) => Err(std::io::Error::other(format!(
+                            "unexpected current-scope generation: {}",
+                            auth.key
+                        ))),
+                    }
+                });
+                observations.lock().unwrap().push(result);
+                reads += 1;
+                if reads == 100 {
+                    reader_ready.wait();
+                }
+                if writer_done.load(Ordering::Acquire) {
+                    post_publication_reads += 1;
+                }
+            }
+        }
+    });
+    reader_ready.wait();
+
+    let error = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .unwrap_err();
+    writer_done.store(true, Ordering::Release);
+    reader.join().unwrap();
+
+    assert!(matches!(
+        error,
+        AuthError::Refresh(RefreshTokenError::Permanent(_))
+    ));
+    let observations = observations.lock().unwrap();
+    assert!(observations.len() >= 200);
+    for observation in observations.iter() {
+        observation
+            .as_ref()
+            .expect("every concurrent owner-only read must parse an old-or-new complete store");
+    }
+    assert!(
+        observations.iter().any(|result| matches!(result, Ok(true))),
+        "reader must observe the complete pre-removal generation"
+    );
+    assert!(
+        observations
+            .iter()
+            .any(|result| matches!(result, Ok(false))),
+        "reader must observe the complete post-removal generation"
+    );
+}
+
+#[tokio::test]
+async fn codex_rejected_refresh_mixed_scope_reconciles_after_permission_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(codex_manager(dir.path()));
+    let mut rejected = codex_auth("codex-rejected-after-permission-publication");
+    rejected.expires_at = Some(Utc::now() - Duration::hours(1));
+    manager
+        .save_without_enrichment(rejected.clone())
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "permission::sibling".into(),
+        GrokAuth {
+            key: "sibling-after-permission-publication".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+
+    struct Reject(GrokAuth);
+    #[async_trait::async_trait]
+    impl TokenRefresher for Reject {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::manager::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            crate::auth::refresh::RefreshOutcome::permanent_for(
+                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+                &self.0,
+            )
+        }
+    }
+    manager.set_refresher(Arc::new(Reject(rejected)));
+    let _fault = PostRenamePermissionFault::install(manager.auth_json_path());
+
+    let error = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthError::Refresh(RefreshTokenError::Permanent(_))
+    ));
+    assert!(
+        manager.current_or_expired().is_none(),
+        "post-rename permission failure must clear the visibly removed in-memory scope"
+    );
+    let durable = read_auth_json(manager.auth_json_path()).unwrap();
+    assert!(!durable.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert_eq!(
+        durable
+            .get("permission::sibling")
+            .map(|auth| auth.key.as_str()),
+        Some("sibling-after-permission-publication")
+    );
+}
+
+/// Windows has no documented directory fsync. Last-scope provider logout uses
+/// the write-through atomic replacement path and leaves a safe empty store.
+#[cfg(windows)]
+#[tokio::test]
+async fn codex_windows_last_scope_clear_replaces_with_empty_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = codex_manager(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-windows-delete-secret"))
+        .await
+        .unwrap();
+
+    manager
+        .clear_durable(StdDuration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert!(manager.current_or_expired().is_none());
+    assert!(manager.auth_json_path().exists());
+    assert!(
+        read_auth_json_owner_only(manager.auth_json_path())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn expired_within_5min_buffer() {
     let auth = make_auth(Some(Utc::now() + Duration::minutes(4)), Utc::now());
     assert!(is_expired(&auth));
@@ -177,7 +1397,7 @@ fn fallback_ttl_when_no_expires_at() {
 fn has_usable_disk_token_reads_disk_independent_of_memory() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     assert!(!mgr.has_usable_disk_token());
 
@@ -203,7 +1423,7 @@ fn has_usable_disk_token_reads_disk_independent_of_memory() {
 fn has_usable_token_covers_memory_and_disk() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     assert!(!mgr.has_usable_token(), "nothing in memory or on disk");
 
@@ -221,6 +1441,215 @@ fn has_usable_token_covers_memory_and_disk() {
         !mgr.has_usable_token(),
         "expired in memory and on disk is not usable"
     );
+}
+
+/// Pro P1: hard-expired OIDC with complete refresh surface is Refreshable;
+/// incomplete/malformed surface is None (must not pin Grok).
+#[test]
+fn first_party_session_eligibility_refreshable_vs_malformed() {
+    use crate::auth::XAI_OAUTH2_ISSUER;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
+
+    // Hard-expired OIDC with complete surface → Refreshable.
+    let mut complete = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    complete.auth_mode = AuthMode::Oidc;
+    complete.refresh_token = Some("rt-live".to_owned());
+    complete.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    complete.oidc_client_id = Some("client-id".to_owned());
+    mgr.hot_swap(complete);
+    assert_eq!(
+        mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::Refreshable
+    );
+    assert!(
+        mgr.has_ambient_first_party_session(),
+        "refreshable session preserves ambient Grok precedence"
+    );
+    assert!(
+        !mgr.has_usable_first_party_session(),
+        "wire-usable is false when hard-expired"
+    );
+
+    // Empty refresh_token string → not refreshable.
+    let mut empty_rt = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    empty_rt.auth_mode = AuthMode::Oidc;
+    empty_rt.refresh_token = Some("   ".to_owned());
+    empty_rt.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    empty_rt.oidc_client_id = Some("client-id".to_owned());
+    mgr.hot_swap(empty_rt);
+    assert_eq!(
+        mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
+    // Missing issuer → not refreshable.
+    let mut no_issuer = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    no_issuer.auth_mode = AuthMode::Oidc;
+    no_issuer.refresh_token = Some("rt".to_owned());
+    no_issuer.oidc_issuer = None;
+    no_issuer.oidc_client_id = Some("client-id".to_owned());
+    mgr.hot_swap(no_issuer);
+    assert_eq!(
+        mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
+    // RT present but no client_id → not refreshable.
+    let mut no_client = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    no_client.auth_mode = AuthMode::Oidc;
+    no_client.refresh_token = Some("rt".to_owned());
+    no_client.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    no_client.oidc_client_id = None;
+    mgr.hot_swap(no_client);
+    assert_eq!(
+        mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
+    // External refresh authority is its configured command, not OIDC
+    // refresh-token/client metadata.
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_mgr = Arc::new(test_manager(
+        external_dir.path(),
+        GrokComConfig {
+            auth_provider_command: Some(
+                "printf '%s' '{\"access_token\":\"fresh-external\",\"issuer\":\"https://auth.x.ai\"}'"
+                    .to_owned(),
+            ),
+            ..GrokComConfig::default()
+        },
+    ));
+    let mut external = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    external.auth_mode = AuthMode::External;
+    external.refresh_token = None;
+    external.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    external.oidc_client_id = None;
+    external_mgr.hot_swap(external.clone());
+    assert_eq!(
+        external_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::Refreshable
+    );
+
+    // First-party provenance alone is not refresh authority: without a
+    // configured command the same expired External credential stays closed.
+    let no_command_dir = tempfile::tempdir().unwrap();
+    let no_command_mgr = Arc::new(test_manager(
+        no_command_dir.path(),
+        GrokComConfig::default(),
+    ));
+    no_command_mgr.hot_swap(external.clone());
+    assert_eq!(
+        no_command_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
+    // Whitespace is not an executable provider command and therefore cannot
+    // make the same expired External credential self-healing.
+    let blank_command_dir = tempfile::tempdir().unwrap();
+    let blank_command_mgr = Arc::new(test_manager(
+        blank_command_dir.path(),
+        GrokComConfig {
+            auth_provider_command: Some(" \t\n".to_owned()),
+            ..GrokComConfig::default()
+        },
+    ));
+    blank_command_mgr.hot_swap(external.clone());
+    assert_eq!(
+        blank_command_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
+    // Third-party External credentials remain excluded even when a command is
+    // configured: is_session_auth() fail-closes before refresh classification.
+    external.oidc_issuer = Some("https://idp.acme.example".to_owned());
+    external_mgr.hot_swap(external);
+    assert_eq!(
+        external_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+}
+
+/// Pro P0: one observation classifies usability + first-party session kind.
+///
+/// Production disk sibling path uses **OIDC** — `lookup_auth` skips WebLogin on
+/// disk, so fixtures must not use WebLogin to claim disk coverage.
+#[test]
+fn has_usable_first_party_session_single_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
+
+    assert!(
+        !mgr.has_usable_first_party_session(),
+        "empty manager is not a usable first-party session"
+    );
+
+    // OIDC is the production first-party session that survives disk lookup.
+    let mut oidc = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    oidc.auth_mode = AuthMode::Oidc;
+    oidc.oidc_issuer = Some(crate::auth::config::XAI_OAUTH2_ISSUER.to_owned());
+    mgr.persist_and_swap(oidc.clone());
+    assert!(
+        mgr.has_usable_first_party_session(),
+        "persisted OIDC must count"
+    );
+    assert!(
+        mgr.read_disk_auth().is_some(),
+        "precondition: OIDC must be loadable from disk via lookup_auth"
+    );
+
+    // Disk-only sibling: clear memory; hard-valid OIDC remains on disk only.
+    // Old split: has_usable_token() && current().is_session_auth() → false.
+    mgr.clear_in_memory();
+    assert!(mgr.current().is_none(), "memory cleared");
+    assert!(mgr.has_usable_token(), "disk OIDC still wire-valid");
+    assert!(
+        mgr.has_usable_first_party_session(),
+        "disk-only OIDC must count as usable first-party session (single snapshot)"
+    );
+
+    // Soft-expired in memory (inside early buffer) with empty disk still counts
+    // via hard-valid current_or_expired path.
+    let mut soft = make_auth(Some(Utc::now() + Duration::minutes(2)), Utc::now());
+    soft.auth_mode = AuthMode::Oidc;
+    soft.oidc_issuer = Some(crate::auth::config::XAI_OAUTH2_ISSUER.to_owned());
+    // Overwrite disk with hard-expired so only soft memory remains.
+    let mut dead = soft.clone();
+    dead.expires_at = Some(Utc::now() - Duration::hours(1));
+    mgr.persist_and_swap(dead);
+    mgr.hot_swap(soft);
+    assert!(
+        mgr.current().is_none(),
+        "soft-expired token is filtered from current()"
+    );
+    assert!(
+        !mgr.has_usable_disk_token(),
+        "disk deliberately hard-expired for soft-memory isolation"
+    );
+    assert!(
+        mgr.has_usable_token(),
+        "soft-expired but hard-valid memory still usable"
+    );
+    assert!(
+        mgr.has_usable_first_party_session(),
+        "single snapshot must not require current() for soft-expired OIDC"
+    );
+
+    // OpenAiCodex is never first-party xAI session auth.
+    let mut codex = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    codex.auth_mode = AuthMode::OpenAiCodex;
+    mgr.persist_and_swap(codex);
+    assert!(
+        !mgr.has_usable_first_party_session(),
+        "OpenAiCodex must not count as first-party xAI session"
+    );
+
+    // Plain API key is not session auth either.
+    let mut api = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    api.auth_mode = AuthMode::ApiKey;
+    mgr.hot_swap(api);
+    assert!(!mgr.has_usable_first_party_session());
 }
 
 #[test]
@@ -252,7 +1681,7 @@ fn legacy_scope_fallback_reads_old_auth_json() {
     // AuthManager uses the new OAuth2 scope, but should still find the
     // token under the legacy key.
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
     let current = mgr.current();
     assert!(current.is_some(), "should fall back to legacy scope key");
     assert_eq!(current.unwrap().key, "test-key");
@@ -280,7 +1709,7 @@ fn new_scope_takes_precedence_over_legacy() {
     store.insert(scope, new_auth);
     write_auth_json(&auth_path, &store).unwrap();
 
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
     let current = mgr.current().expect("should find auth");
     assert_eq!(current.key, "new-key", "new scope should take precedence");
 }
@@ -294,7 +1723,7 @@ fn new_scope_takes_precedence_over_legacy() {
 fn near_expiry_token_invisible_to_current_visible_to_expired_auth() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     // Token expires in 3 minutes -- inside the 5-minute buffer.
     let near_expiry = GrokAuth {
@@ -339,7 +1768,7 @@ fn near_expiry_token_invisible_to_current_visible_to_expired_auth() {
 async fn update_preserves_other_scope_entries() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg.clone()));
+    let mgr = Arc::new(test_manager(dir.path(), cfg.clone()));
 
     // Pre-populate with an external auth entry
     let external = GrokAuth {
@@ -375,7 +1804,7 @@ async fn update_recovers_from_corrupt_auth_json_by_backing_up_old_file() {
     let dir = tempfile::tempdir().unwrap();
     let auth_path = dir.path().join("auth.json");
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg.clone()));
+    let mgr = Arc::new(test_manager(dir.path(), cfg.clone()));
 
     let bad_content = b"NOT VALID JSON {{{";
     std::fs::write(&auth_path, bad_content).unwrap();
@@ -434,7 +1863,7 @@ async fn update_preserves_team_fields_when_proxy_omits_them() {
     let cfg = GrokComConfig::default();
     // Point proxy_base_url to a non-existent server so the /user call
     // fails and falls back to the auth-flow values.
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg).with_proxy_base_url("http://127.0.0.1:1"));
+    let mgr = Arc::new(test_manager(dir.path(), cfg).with_proxy_base_url("http://127.0.0.1:1"));
 
     let team_auth = GrokAuth {
         key: "team-token".into(),
@@ -479,7 +1908,7 @@ async fn update_stores_team_token_under_base_scope() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let base_scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg).with_proxy_base_url("http://127.0.0.1:1"));
+    let mgr = Arc::new(test_manager(dir.path(), cfg).with_proxy_base_url("http://127.0.0.1:1"));
 
     let team_auth = GrokAuth {
         key: "team-token".into(),
@@ -509,7 +1938,7 @@ async fn team_login_then_personal_evicts_team_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let base_scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg).with_proxy_base_url("http://127.0.0.1:1"));
+    let mgr = Arc::new(test_manager(dir.path(), cfg).with_proxy_base_url("http://127.0.0.1:1"));
 
     // Step 1: login as team
     let team_auth = GrokAuth {
@@ -565,7 +1994,7 @@ fn clear_does_not_remove_legacy_scope() {
     store.insert(scope, oauth_auth);
     write_auth_json(&auth_path, &store).unwrap();
 
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
     // clear() should only remove the OAuth scope, not legacy
     mgr.clear().unwrap();
 
@@ -629,7 +2058,7 @@ fn is_data_collection_disabled_matrix() {
 #[test]
 fn manager_collection_predicates_fail_directions() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // No credential: disabled=false (fail-open), allows=false (fail-closed).
     assert!(!mgr.is_data_collection_disabled());
@@ -670,7 +2099,7 @@ fn manager_collection_predicates_fail_directions() {
 fn hot_swap_updates_in_memory_without_disk() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     assert!(mgr.current().is_none());
     let auth = GrokAuth {
@@ -684,10 +2113,117 @@ fn hot_swap_updates_in_memory_without_disk() {
 }
 
 #[test]
+fn hot_swap_same_server_rejected_bearer_preserves_wire_suppression() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = codex_manager(dir.path());
+    let rejected = codex_auth("same-rejected-hot-swap");
+    mgr.record_permanent_failure_with_wire_policy(
+        rejected.key.clone(),
+        crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected.into(),
+        true,
+    );
+
+    mgr.hot_swap(rejected.clone());
+
+    assert_eq!(
+        mgr.current_or_expired().map(|auth| auth.key),
+        Some(rejected.key)
+    );
+    assert!(mgr.permanent_failure().is_some());
+    assert!(mgr.current_wire_valid().is_none());
+}
+
+#[test]
+fn bearer_reader_started_before_hot_swap_cannot_export_rejected_old_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(codex_manager(dir.path()));
+    let rejected = codex_auth("rejected-before-concurrent-swap");
+    mgr.hot_swap(rejected.clone());
+    mgr.record_permanent_failure_with_wire_policy(
+        rejected.key.clone(),
+        crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected.into(),
+        true,
+    );
+
+    let reader_entered = Arc::new(std::sync::Barrier::new(2));
+    let release_reader = Arc::new(std::sync::Barrier::new(2));
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    mgr.set_auth_state_after_inner_read_hook(Some(Arc::new({
+        let reader_entered = Arc::clone(&reader_entered);
+        let release_reader = Arc::clone(&release_reader);
+        let hook_ran = Arc::clone(&hook_ran);
+        move || {
+            if !hook_ran.swap(true, Ordering::SeqCst) {
+                reader_entered.wait();
+                release_reader.wait();
+            }
+        }
+    })));
+
+    let reader = std::thread::spawn({
+        let mgr = Arc::clone(&mgr);
+        move || mgr.current_wire_valid()
+    });
+    reader_entered.wait();
+
+    let replacement = codex_auth("replacement-after-concurrent-swap");
+    let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+    let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn({
+        let mgr = Arc::clone(&mgr);
+        let replacement = replacement.clone();
+        move || {
+            writer_started_tx.send(()).unwrap();
+            mgr.hot_swap(replacement);
+            writer_done_tx.send(()).unwrap();
+        }
+    });
+    writer_started_rx.recv().unwrap();
+    assert!(
+        writer_done_rx
+            .recv_timeout(StdDuration::from_millis(50))
+            .is_err(),
+        "writer must remain behind the reader's inner read guard"
+    );
+
+    release_reader.wait();
+    assert!(
+        reader.join().unwrap().is_none(),
+        "reader that cloned the rejected key must also observe its suppression verdict"
+    );
+    writer.join().unwrap();
+    mgr.set_auth_state_after_inner_read_hook(None);
+    assert_eq!(
+        mgr.current_wire_valid().map(|auth| auth.key),
+        Some(replacement.key)
+    );
+}
+
+#[tokio::test]
+async fn native_codex_provider_recovers_hard_expired_rejected_bearer_via_refresh_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(codex_manager(dir.path()));
+    let mut expired = codex_auth("hard-expired-rejected-codex");
+    expired.expires_at = Some(Utc::now() - Duration::hours(1));
+    mgr.hot_swap(expired.clone());
+    let calls = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(CountingRefresher {
+        call_count: Arc::clone(&calls),
+        delay: StdDuration::ZERO,
+    }));
+    let provider = crate::auth::AuthProviderRef::openai_codex(Arc::clone(&mgr));
+
+    let replacement = provider.recover_rejected_token(&expired.key).await;
+
+    assert_eq!(replacement.as_deref(), Some("fresh-token"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn try_use_disk_token_accepts_valid_disk_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     let valid_disk = GrokAuth {
         key: "valid-disk".into(),
@@ -703,7 +2239,7 @@ fn try_use_disk_token_accepts_valid_disk_token() {
 fn try_use_disk_token_rejects_expired_disk_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     let expired_disk = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
     assert!(
@@ -716,7 +2252,7 @@ fn try_use_disk_token_rejects_expired_disk_token() {
 fn try_use_disk_token_rejects_same_key_on_server_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     let auth = GrokAuth {
         key: "same-key".into(),
@@ -735,7 +2271,7 @@ fn try_use_disk_token_rejects_same_key_on_server_rejected() {
 fn try_use_disk_token_accepts_different_key_on_server_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     let mem_auth = GrokAuth {
         key: "old-key".into(),
@@ -764,7 +2300,7 @@ async fn disk_refresh_wins_over_expired_in_memory() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     // Simulate: in-memory token is expired
     let expired = GrokAuth {
@@ -862,7 +2398,7 @@ async fn storm_cap_engages_with_empty_inner_and_dead_disk_refresh_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     // Disk: an expired token carrying the (dead) refresh_token the OIDC
     // refresher resolves. `inner` stays empty.
@@ -907,7 +2443,7 @@ async fn verdict_not_keyed_on_in_mem_bearer() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     // in-mem: stale bearer K_mem (expired, with RT).
     mgr.hot_swap(GrokAuth {
@@ -995,7 +2531,7 @@ async fn verdict_not_keyed_on_in_mem_bearer() {
 #[tokio::test]
 async fn refresh_persist_failure_is_transient_but_swaps_in_memory() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Expired in-mem bearer so the chain proceeds to the IdP (no early return).
     mgr.hot_swap(GrokAuth {
@@ -1044,7 +2580,7 @@ async fn refresh_persist_failure_is_transient_but_swaps_in_memory() {
 #[tokio::test]
 async fn auth_concurrent_refresh_deduplicates() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     let expired = GrokAuth {
         key: "expired-key".into(),
         auth_mode: AuthMode::Oidc,
@@ -1092,7 +2628,7 @@ async fn auth_concurrent_refresh_deduplicates() {
 #[tokio::test]
 async fn auth_permanent_failure_stops_retries() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     let expired = GrokAuth {
         key: "expired-key".into(),
         auth_mode: AuthMode::Oidc,
@@ -1145,7 +2681,7 @@ async fn auth_legacy_session_picks_up_sibling_disk_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     mgr.hot_swap(GrokAuth {
         key: "stale-oidc".into(),
@@ -1173,7 +2709,7 @@ async fn auth_legacy_session_picks_up_sibling_disk_token() {
 #[tokio::test]
 async fn refresh_chain_surfaces_transient_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "expired".into(),
         auth_mode: AuthMode::Oidc,
@@ -1209,7 +2745,7 @@ async fn refresh_chain_surfaces_transient_failure() {
 #[tokio::test]
 async fn auth_returns_expired_api_key_consistently_with_current() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Seed an API key that is past the 30-day TTL: `create_time` 60
     // days ago and no `expires_at`. `is_token_expired` falls through
@@ -1275,7 +2811,7 @@ async fn auth_returns_expired_api_key_consistently_with_current() {
 #[tokio::test]
 async fn proactive_refresh_backs_off_on_permanent_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Past-expiry OIDC token: without the backoff guard, the
     // proactive loop computes sleep_dur=0 forever.
@@ -1356,7 +2892,7 @@ async fn proactive_refresh_backs_off_on_permanent_failure() {
 #[tokio::test]
 async fn start_proactive_refresh_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     let stale_api_key = GrokAuth {
         key: "stale-api-key".into(),
@@ -1391,7 +2927,7 @@ async fn start_proactive_refresh_is_idempotent() {
 #[tokio::test]
 async fn proactive_refresh_and_consumer_see_fresh_token_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // expires_at inside the 5-min buffer -> proactive fires immediately.
     mgr.hot_swap(GrokAuth {
@@ -1425,7 +2961,7 @@ async fn proactive_refresh_and_consumer_see_fresh_token_end_to_end() {
 #[tokio::test]
 async fn reactive_401_recovery_produces_fresh_token_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     mgr.hot_swap(GrokAuth {
         key: "expired-bearer".into(),
@@ -1459,7 +2995,7 @@ async fn refresh_chain_demotes_when_disk_rt_differs_even_if_at_expired() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     // Memory has rt-old; disk has rt-new (different RT) but its
     // access_token is also expired so try_use_disk_token rejects it
@@ -1536,7 +3072,7 @@ async fn refresh_chain_demotes_when_attributed_tried_rt_differs_from_disk() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     // We hold, and spend, the predecessor RT.
     let tried = GrokAuth {
@@ -1612,7 +3148,7 @@ async fn refresh_chain_still_discards_when_attributed_tried_rt_matches_disk() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     let tried = GrokAuth {
         key: "only-key".into(),
@@ -1665,7 +3201,7 @@ async fn permanent_rtr_clears_only_the_tried_side_when_rts_diverge() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     // Mem: successor RT after a successful refresh whose disk write failed.
     mgr.hot_swap(GrokAuth {
@@ -1732,7 +3268,7 @@ async fn permanent_rtr_clears_only_the_tried_side_when_rts_diverge() {
 #[tokio::test]
 async fn client_rejected_graces_soft_expired_access_token() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Inside the early-invalidation buffer but still hard-valid.
     mgr.hot_swap(GrokAuth {
@@ -1775,7 +3311,7 @@ async fn client_rejected_graces_soft_expired_access_token() {
 #[tokio::test]
 async fn permanent_other_retains_credentials() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     let session = GrokAuth {
         key: "live-key".into(),
@@ -1829,7 +3365,7 @@ async fn sticky_permanent_allows_refresh_when_attempted_key_differs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     mgr.hot_swap(GrokAuth {
         key: "dead-key".into(),
@@ -1899,7 +3435,7 @@ async fn refresh_chain_demotes_to_transient_when_disk_rt_differs_and_at_valid() 
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     let stale = GrokAuth {
         key: "stale-key".into(),
@@ -1963,7 +3499,7 @@ async fn refresh_chain_demotes_to_transient_when_disk_rt_differs_and_at_valid() 
 #[tokio::test]
 async fn permanent_failure_reads_absent_after_clear_so_auth_reports_not_logged_in() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Seed + record a permanent failure (as if invalid_grant fired).
     let session = GrokAuth {
@@ -2030,7 +3566,7 @@ async fn permanent_failure_reads_absent_after_clear_so_auth_reports_not_logged_i
 #[tokio::test]
 async fn permanent_failure_expires_on_wall_clock_across_sleep() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Seed a credential so the verdict scopes to it (an unscoped verdict
     // reads through as absent), using the non-sticky `Other` reason — the
@@ -2067,7 +3603,7 @@ async fn permanent_failure_expires_on_wall_clock_across_sleep() {
 #[tokio::test]
 async fn oidc_refresh_not_blocked_by_model_api_key() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Expired OIDC token (user has config.toml with api_key on another model).
     let expired_oidc = GrokAuth {
@@ -2107,7 +3643,7 @@ async fn oidc_refresh_not_blocked_by_model_api_key() {
 #[test]
 fn compute_proactive_sleep_permanent_failure_returns_backoff() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     let oidc = GrokAuth {
         key: "x".into(),
         auth_mode: AuthMode::Oidc,
@@ -2133,7 +3669,7 @@ fn compute_proactive_sleep_permanent_failure_returns_backoff() {
 #[test]
 fn compute_proactive_sleep_non_refreshable_returns_backoff() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     // Inject a refresher so the "no refresher" branch doesn't mask
     // the gate we're testing.
     mgr.set_refresher(Arc::new(CountingRefresher {
@@ -2175,7 +3711,7 @@ fn compute_proactive_sleep_non_refreshable_returns_backoff() {
 #[test]
 fn compute_proactive_sleep_sleep_gated_returns_backoff() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.set_refresher(Arc::new(CountingRefresher {
         call_count: Arc::new(AtomicU32::new(0)),
         delay: StdDuration::from_millis(0),
@@ -2210,7 +3746,7 @@ fn compute_proactive_sleep_sleep_gated_returns_backoff() {
 #[test]
 fn compute_proactive_sleep_dark_wake_returns_backoff() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.set_refresher(Arc::new(CountingRefresher {
         call_count: Arc::new(AtomicU32::new(0)),
         delay: StdDuration::from_millis(0),
@@ -2259,7 +3795,7 @@ fn compute_proactive_sleep_dark_wake_returns_backoff() {
 #[test]
 fn compute_proactive_sleep_no_refresher_returns_backoff() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "oidc".into(),
         auth_mode: AuthMode::Oidc,
@@ -2277,7 +3813,7 @@ fn compute_proactive_sleep_no_refresher_returns_backoff() {
 #[test]
 fn compute_proactive_sleep_refreshable_no_expiry_returns_backoff() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.set_refresher(Arc::new(CountingRefresher {
         call_count: Arc::new(AtomicU32::new(0)),
         delay: StdDuration::from_millis(0),
@@ -2298,7 +3834,7 @@ fn compute_proactive_sleep_refreshable_no_expiry_returns_backoff() {
 #[test]
 fn compute_proactive_sleep_refreshable_past_expiry_returns_floor() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.set_refresher(Arc::new(CountingRefresher {
         call_count: Arc::new(AtomicU32::new(0)),
         delay: StdDuration::from_millis(0),
@@ -2321,7 +3857,7 @@ fn compute_proactive_sleep_refreshable_past_expiry_returns_floor() {
 #[test]
 fn compute_proactive_sleep_refreshable_future_expiry_returns_delta() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.set_refresher(Arc::new(CountingRefresher {
         call_count: Arc::new(AtomicU32::new(0)),
         delay: StdDuration::from_millis(0),
@@ -2350,7 +3886,7 @@ fn compute_proactive_sleep_refreshable_future_expiry_returns_delta() {
 #[tokio::test]
 async fn permanent_failure_expires_after_ttl() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "tok".into(),
         ..GrokAuth::test_default()
@@ -2406,7 +3942,7 @@ async fn sticky_verdict_survives_both_clocks_but_not_a_credential_change() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "dead".into(),
         ..GrokAuth::test_default()
@@ -2446,7 +3982,7 @@ async fn sticky_verdict_survives_both_clocks_but_not_a_credential_change() {
 #[tokio::test]
 async fn permanent_failure_is_scoped_to_its_credential() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     mgr.hot_swap(GrokAuth {
         key: "dead".into(),
@@ -2477,7 +4013,7 @@ async fn permanent_failure_is_scoped_to_its_credential() {
 #[tokio::test]
 async fn auth_serves_wire_valid_token_despite_permanent_verdict() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     // CI runs in K8s pods where is_devbox_environment() is true; without this
     // the past-expiry phase would mint via devbox recovery instead of
     // surfacing the permanent error.
@@ -2554,7 +4090,7 @@ async fn auth_returns_cached_token_when_refresh_fails_within_real_expiry() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     // Point at an unreachable proxy so refresh_chain fails fast.
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg).with_proxy_base_url("http://127.0.0.1:1"));
+    let mgr = Arc::new(test_manager(dir.path(), cfg).with_proxy_base_url("http://127.0.0.1:1"));
 
     // Token in the 5-min buffer (1 min before real expiry) -- past
     // the buffer threshold but still valid by the IdP's clock.
@@ -2604,7 +4140,7 @@ async fn update_writes_disk_before_user_enrichment() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let mgr = Arc::new(
-        AuthManager::new(dir.path(), cfg).with_proxy_base_url(&format!("http://127.0.0.1:{port}")),
+        test_manager(dir.path(), cfg).with_proxy_base_url(&format!("http://127.0.0.1:{port}")),
     );
 
     // user_id starts empty -- a freshly rotated OIDC token doesn't
@@ -2710,7 +4246,7 @@ async fn enrichment_task_preserves_interleaved_token_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let mgr = Arc::new(
-        AuthManager::new(dir.path(), cfg).with_proxy_base_url(&format!("http://127.0.0.1:{port}")),
+        test_manager(dir.path(), cfg).with_proxy_base_url(&format!("http://127.0.0.1:{port}")),
     );
 
     // Same user_id so neither enrichment aborts; only the rotated
@@ -2793,7 +4329,7 @@ async fn enrichment_aborts_when_disk_user_changes_mid_flight() {
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
     let mgr = Arc::new(
-        AuthManager::new(dir.path(), cfg.clone())
+        test_manager(dir.path(), cfg.clone())
             .with_proxy_base_url(&format!("http://127.0.0.1:{port}")),
     );
 
@@ -2901,7 +4437,7 @@ async fn enrichment_overlays_team_login_placeholder_user_id() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let mgr = Arc::new(
-        AuthManager::new(dir.path(), cfg).with_proxy_base_url(&format!("http://127.0.0.1:{port}")),
+        test_manager(dir.path(), cfg).with_proxy_base_url(&format!("http://127.0.0.1:{port}")),
     );
 
     // Mirrors what `extract_user_info` returns for a Team principal:
@@ -3037,7 +4573,7 @@ async fn current_api_key_async_drives_refresh_chain() {
     let _xai = EnvGuard::unset("XAI_API_KEY");
     let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "expired-oidc".into(),
         auth_mode: AuthMode::Oidc,
@@ -3069,7 +4605,7 @@ async fn update_recovers_from_empty_auth_json() {
     std::fs::write(&auth_path, b"").unwrap();
     assert_eq!(std::fs::metadata(&auth_path).unwrap().len(), 0);
 
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg.clone()));
+    let mgr = Arc::new(test_manager(dir.path(), cfg.clone()));
 
     let new_auth = GrokAuth {
         key: "recovered-token".into(),
@@ -3117,7 +4653,7 @@ async fn update_recovers_from_whitespace_only_auth_json() {
     let cfg = GrokComConfig::default();
     std::fs::write(&auth_path, b"  \n\t  ").unwrap();
 
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg.clone()));
+    let mgr = Arc::new(test_manager(dir.path(), cfg.clone()));
 
     let new_auth = GrokAuth {
         key: "ws-token".into(),
@@ -3166,7 +4702,7 @@ fn refresh_token_superseded_needs_a_successor_on_disk() {
 async fn sibling_different_rt_with_expired_at_is_still_sibling() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg.clone()));
+    let mgr = Arc::new(test_manager(dir.path(), cfg.clone()));
 
     // In-memory: the original RT (revoked via rotation), AT expired.
     let original = GrokAuth {
@@ -3202,7 +4738,7 @@ async fn sibling_different_rt_with_expired_at_is_still_sibling() {
 async fn sibling_different_rt_with_valid_at_is_treated_as_live() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg.clone()));
+    let mgr = Arc::new(test_manager(dir.path(), cfg.clone()));
 
     let original = GrokAuth {
         key: "original-at".into(),
@@ -3239,7 +4775,7 @@ async fn sibling_different_rt_with_valid_at_is_treated_as_live() {
 #[tokio::test]
 async fn refresh_chain_server_rejected_bypasses_valid_token_double_check() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Seed a valid (non-expired) token — simulates a JWT that is missing
     // the subscription claim but is otherwise fine.
@@ -3293,7 +4829,7 @@ async fn refresh_chain_server_rejected_bypasses_valid_token_double_check() {
 #[tokio::test]
 async fn refresh_chain_server_rejected_concurrent_skips_redundant_refresh() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Seed the "rejected" token that both tasks will see.
     let rejected = GrokAuth {
@@ -3348,7 +4884,7 @@ async fn refresh_chain_server_rejected_concurrent_skips_redundant_refresh() {
 #[tokio::test]
 async fn refresh_chain_pre_request_short_circuits_on_valid_token() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     let valid = GrokAuth {
         key: "still-good".into(),
@@ -3408,7 +4944,7 @@ async fn enrich_auth_inline_populates_zdr_flags() {
     let body = r#"{"userId":"u-1","teamBlockedReasons":["BLOCKED_REASON_NO_LOGS"],"codingDataRetentionOptOut":true}"#;
     let base = spawn_user_stub("tok", body).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = AuthManager::new(dir.path(), GrokComConfig::default()).with_proxy_base_url(&base);
+    let mgr = test_manager(dir.path(), GrokComConfig::default()).with_proxy_base_url(&base);
 
     let mut auth = GrokAuth {
         key: "tok".into(),
@@ -3428,7 +4964,7 @@ async fn enrich_auth_inline_keeps_fields_absent_from_response() {
     let body = r#"{"userId":"u-1","teamBlockedReasons":["BLOCKED_REASON_NO_LOGS_MODERATED"]}"#;
     let base = spawn_user_stub("tok", body).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = AuthManager::new(dir.path(), GrokComConfig::default()).with_proxy_base_url(&base);
+    let mgr = test_manager(dir.path(), GrokComConfig::default()).with_proxy_base_url(&base);
 
     let mut auth = GrokAuth {
         key: "tok".into(),
@@ -3456,7 +4992,7 @@ async fn enrich_auth_inline_unreachable_server_leaves_auth_unchanged() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
-    let mgr = AuthManager::new(dir.path(), GrokComConfig::default())
+    let mgr = test_manager(dir.path(), GrokComConfig::default())
         .with_proxy_base_url(&format!("http://127.0.0.1:{port}"));
 
     let mut auth = GrokAuth {
@@ -3547,7 +5083,7 @@ fn new_clears_wrong_team_token_loaded_from_disk() {
     store.insert(scope, oidc_session_for_team("team-wrong"));
     write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
 
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
     assert!(mgr.current().is_none(), "wrong-team token must be hidden");
     assert!(
         mgr.current_or_expired().is_none(),
@@ -3571,7 +5107,7 @@ fn new_keeps_matching_team_token_loaded_from_disk() {
     store.insert(scope, tok.clone());
     write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
 
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
     assert_eq!(mgr.current().map(|a| a.key), Some(tok.key));
     assert!(dir.path().join("auth.json").exists());
 }
@@ -3581,7 +5117,7 @@ fn new_keeps_matching_team_token_loaded_from_disk() {
 #[tokio::test]
 async fn auth_rejects_and_clears_wrong_team_cached_token() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), pinned_cfg("team-good")));
+    let mgr = Arc::new(test_manager(dir.path(), pinned_cfg("team-good")));
     // hot_swap bypasses the pin (like a sibling adoption mid-session).
     mgr.hot_swap(oidc_session_for_team("team-wrong"));
 
@@ -3602,7 +5138,7 @@ async fn auth_rejects_and_clears_wrong_team_cached_token() {
 #[tokio::test]
 async fn auth_accepts_matching_team_cached_token() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), pinned_cfg("team-good")));
+    let mgr = Arc::new(test_manager(dir.path(), pinned_cfg("team-good")));
     let tok = oidc_session_for_team("team-good");
     mgr.hot_swap(tok.clone());
 
@@ -3615,7 +5151,7 @@ async fn auth_accepts_matching_team_cached_token() {
 #[tokio::test]
 async fn no_pin_accepts_any_team_cached_token() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     let tok = oidc_session_for_team("team-anything");
     mgr.hot_swap(tok.clone());
 
@@ -3644,7 +5180,7 @@ async fn auth_rejects_token_refreshed_into_wrong_team() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), pinned_cfg("team-good")));
+    let mgr = Arc::new(test_manager(dir.path(), pinned_cfg("team-good")));
     // Expired matching session forces a refresh; the refresher returns a
     // wrong-team token (e.g. a re-pinned token family).
     mgr.hot_swap(GrokAuth {
@@ -3669,7 +5205,7 @@ fn force_reload_clears_wrong_team_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = pinned_cfg("team-good");
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg)); // empty disk at startup
+    let mgr = Arc::new(test_manager(dir.path(), cfg)); // empty disk at startup
 
     let mut store = AuthStore::new();
     store.insert(scope, oidc_session_for_team("team-wrong"));
@@ -3697,7 +5233,7 @@ fn force_reload_clears_wrong_team_token() {
 #[test]
 fn force_reload_retains_live_rt_on_transient_file_missing() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     let session = GrokAuth {
         key: "live-session".into(),
@@ -3731,7 +5267,7 @@ fn force_reload_retains_live_rt_on_transient_file_missing() {
 #[tokio::test]
 async fn force_reload_drops_rt_when_permanent_failure_set() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     let session = GrokAuth {
         key: "broken".into(),
@@ -3769,7 +5305,7 @@ async fn force_reload_drops_rt_when_permanent_failure_set() {
 #[test]
 fn force_reload_drops_creds_on_entry_missing() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     let session = GrokAuth {
         key: "live-session".into(),
@@ -3804,7 +5340,7 @@ fn force_reload_adopts_fresh_disk_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = GrokComConfig::default();
     let scope = cfg.auth_scope();
-    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+    let mgr = Arc::new(test_manager(dir.path(), cfg));
 
     let expired = GrokAuth {
         key: "stale".into(),
@@ -3834,7 +5370,7 @@ fn force_reload_adopts_fresh_disk_token() {
 #[tokio::test]
 async fn pin_matches_principal_id_without_principal_type() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), pinned_cfg("team-good")));
+    let mgr = Arc::new(test_manager(dir.path(), pinned_cfg("team-good")));
     mgr.hot_swap(GrokAuth {
         key: principal_id_only_jwt("team-good"),
         auth_mode: AuthMode::Oidc,
@@ -3862,7 +5398,7 @@ async fn cached_api_key_session_rejected_when_api_key_auth_disabled() {
 
     // Switch ON (via a team pin, which implies api_key_auth_disabled): reject.
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), pinned_cfg("team-good")));
+    let mgr = Arc::new(test_manager(dir.path(), pinned_cfg("team-good")));
     mgr.hot_swap(api_key_session());
     assert!(
         mgr.current().is_none(),
@@ -3875,7 +5411,7 @@ async fn cached_api_key_session_rejected_when_api_key_auth_disabled() {
 
     // Switch OFF (no pin / no disable): the api-key session is honored.
     let dir2 = tempfile::tempdir().unwrap();
-    let mgr2 = Arc::new(AuthManager::new(dir2.path(), GrokComConfig::default()));
+    let mgr2 = Arc::new(test_manager(dir2.path(), GrokComConfig::default()));
     mgr2.hot_swap(api_key_session());
     assert_eq!(
         mgr2.current().map(|a| a.key),
@@ -3887,7 +5423,7 @@ async fn cached_api_key_session_rejected_when_api_key_auth_disabled() {
 #[tokio::test]
 async fn shared_api_key_provider_resolves_live_bearer() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     let auth = GrokAuth {
         key: "shared-provider-token".into(),
         expires_at: Some(Utc::now() + Duration::hours(1)),
@@ -3935,7 +5471,7 @@ async fn shared_api_key_provider_static_fallthrough() {
     use xai_grok_test_support::EnvGuard;
 
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     let provider = shared_api_key_provider(mgr.clone());
 
     {
@@ -3979,7 +5515,7 @@ async fn shared_api_key_provider_kill_switch_blocks_static() {
 
     let _key = EnvGuard::set("XAI_API_KEY", "blocked");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(
+    let mgr = Arc::new(test_manager(
         dir.path(),
         GrokComConfig {
             disable_api_key_auth: Some(true),
@@ -3999,7 +5535,7 @@ async fn shared_api_key_provider_oidc_preferred_blocks_static() {
 
     let _key = EnvGuard::set("XAI_API_KEY", "should-not-use");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(
+    let mgr = Arc::new(test_manager(
         dir.path(),
         GrokComConfig {
             preferred_method: Some(crate::auth::PreferredAuthMethod::Oidc),
@@ -4021,7 +5557,7 @@ async fn shared_api_key_provider_api_key_preferred_skips_session() {
     let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
     let _key = EnvGuard::set("XAI_API_KEY", "static-preferred");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(
+    let mgr = Arc::new(test_manager(
         dir.path(),
         GrokComConfig {
             preferred_method: Some(crate::auth::PreferredAuthMethod::ApiKey),
@@ -4052,7 +5588,7 @@ async fn shared_api_key_provider_sync_falls_through_when_session_expired() {
     let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
     let _key = EnvGuard::set("XAI_API_KEY", "static-after-expiry");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "expired-oidc".into(),
         auth_mode: AuthMode::Oidc,
@@ -4083,7 +5619,7 @@ async fn shared_api_key_provider_sync_buffered_session_beats_static() {
     let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
     let _key = EnvGuard::set("XAI_API_KEY", "leftover-static");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     // Two minutes out: inside the 5-minute buffer, but accepted on the wire.
     mgr.hot_swap(GrokAuth {
         key: "buffered-oidc".into(),
@@ -4110,7 +5646,7 @@ async fn shared_api_key_comparison_uses_async_static_fallback_after_refresh_fail
     let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
     let _key = EnvGuard::set("XAI_API_KEY", "static-after-refresh-failure");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "buffered-oidc".into(),
         auth_mode: AuthMode::Oidc,
@@ -4148,7 +5684,7 @@ async fn shared_api_key_provider_disk_memo_follows_rewrites() {
     let _xai = EnvGuard::unset("XAI_API_KEY");
     let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     let provider = shared_api_key_provider(mgr);
 
     assert_eq!(provider.current_api_key_async().await, None);
@@ -4193,7 +5729,7 @@ async fn process_key_from_model_env_key() {
         .unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     assert!(mgr.current().is_none());
     mgr.set_process_static_api_key(Some(key));
     assert_eq!(
@@ -4213,7 +5749,7 @@ async fn process_key_precedence() {
     let _xai = EnvGuard::unset("XAI_API_KEY");
     let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     let provider = shared_api_key_provider(mgr.clone());
 
     assert_eq!(provider.current_api_key_async().await, None);
@@ -4245,7 +5781,7 @@ async fn process_key_precedence() {
     );
 
     let dir_blocked = tempfile::tempdir().unwrap();
-    let blocked = Arc::new(AuthManager::new(
+    let blocked = Arc::new(test_manager(
         dir_blocked.path(),
         GrokComConfig {
             disable_api_key_auth: Some(true),
@@ -4296,7 +5832,7 @@ impl TokenRefresher for BlockingRefresher {
 #[tokio::test]
 async fn sleep_gate_defers_refresh_without_calling_idp() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(expired_oidc());
     let call_count = Arc::new(AtomicU32::new(0));
     mgr.set_refresher(Arc::new(CountingRefresher {
@@ -4333,7 +5869,7 @@ async fn sleep_gate_defers_refresh_without_calling_idp() {
 #[tokio::test]
 async fn sleep_deferred_refresh_is_transient_no_kpi_no_verdict() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     // Pin non-devbox so a deferred refresh surfaces the transient error
     // instead of minting via devbox recovery (CI runs in K8s pods).
     mgr.set_devbox_env_for_test(false);
@@ -4392,7 +5928,7 @@ async fn sleep_deferred_refresh_is_transient_no_kpi_no_verdict() {
 #[tokio::test]
 async fn dark_wake_defers_refresh_while_a_live_token_can_be_served() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     // Inside the early-invalidation buffer: due for renewal (`current()` is
     // None, so `refresh_chain` proceeds) but still accepted on the wire.
     mgr.hot_swap(GrokAuth {
@@ -4436,7 +5972,7 @@ async fn dark_wake_defers_refresh_while_a_live_token_can_be_served() {
 #[tokio::test]
 async fn dark_wake_does_not_defer_when_no_usable_token() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(expired_oidc());
     let call_count = Arc::new(AtomicU32::new(0));
     mgr.set_refresher(Arc::new(CountingRefresher {
@@ -4458,7 +5994,7 @@ async fn dark_wake_does_not_defer_when_no_usable_token() {
 #[tokio::test]
 async fn dark_wake_does_not_defer_server_rejected_recovery() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "rejected-but-unexpired".into(),
         auth_mode: AuthMode::Oidc,
@@ -4492,7 +6028,7 @@ async fn dark_wake_does_not_defer_server_rejected_recovery() {
 #[tokio::test]
 async fn dark_wake_defer_forces_refresh_after_max() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     // Wire-valid but due for renewal, so the deferral path (and its budget) is
     // the thing under test — a hard-expired token is never deferred at all.
     mgr.hot_swap(GrokAuth {
@@ -4545,7 +6081,7 @@ async fn dark_wake_defer_forces_refresh_after_max() {
 #[test]
 fn dark_wake_defer_budget_survives_powered_on_during_dark_wake() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     // Begin a deferral run.
     mgr.set_dark_wake_for_test(true);
@@ -4581,7 +6117,7 @@ fn dark_wake_defer_budget_survives_powered_on_during_dark_wake() {
 fn is_dark_wake_false_when_power_listener_not_started() {
     let _unset = xai_grok_test_support::EnvGuard::unset("GROK_AUTH_FORCE_DARK_WAKE");
     let dir = tempfile::tempdir().unwrap();
-    let mgr = AuthManager::new(dir.path(), GrokComConfig::default());
+    let mgr = test_manager(dir.path(), GrokComConfig::default());
     assert!(
         !mgr.is_dark_wake(),
         "is_dark_wake must be false when the power listener was never started"
@@ -4598,7 +6134,7 @@ fn is_dark_wake_false_when_power_listener_not_started() {
 fn is_dark_wake_env_override_forces_both_states() {
     use xai_grok_test_support::EnvGuard;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = AuthManager::new(dir.path(), GrokComConfig::default());
+    let mgr = test_manager(dir.path(), GrokComConfig::default());
     // Precondition: no power listener, so without the override this is
     // unconditionally false.
     {
@@ -4623,7 +6159,7 @@ fn is_dark_wake_env_override_forces_both_states() {
 #[tokio::test]
 async fn sleep_gate_cleared_on_wake_allows_refresh() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(expired_oidc());
     let call_count = Arc::new(AtomicU32::new(0));
     mgr.set_refresher(Arc::new(CountingRefresher {
@@ -4642,7 +6178,7 @@ async fn sleep_gate_cleared_on_wake_allows_refresh() {
 #[tokio::test]
 async fn sleep_gate_auto_expires_after_max() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     mgr.set_system_sleep_imminent(true);
     assert!(mgr.is_sleep_gated(), "freshly-raised gate must be active");
@@ -4676,7 +6212,7 @@ async fn sleep_gate_auto_expires_after_max() {
 #[tokio::test]
 async fn sleep_gate_auto_expires_when_wall_clock_passes_during_sleep() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     mgr.set_system_sleep_imminent(true);
     assert!(mgr.is_sleep_gated(), "freshly-raised gate must be active");
@@ -4707,7 +6243,7 @@ async fn sleep_gate_auto_expires_when_wall_clock_passes_during_sleep() {
 #[tokio::test]
 async fn sleep_gate_lets_in_flight_refresh_complete() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(expired_oidc());
 
     let started = Arc::new(tokio::sync::Notify::new());
@@ -4768,7 +6304,7 @@ async fn sleep_gate_lets_in_flight_refresh_complete() {
 #[test]
 fn sleep_ack_hold_returns_immediately_when_nothing_in_flight() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
 
     let start = Instant::now();
     mgr.test_hold_sleep_ack(StdDuration::from_secs(5));
@@ -4785,7 +6321,7 @@ fn sleep_ack_hold_returns_immediately_when_nothing_in_flight() {
 #[test]
 fn sleep_ack_hold_releases_when_in_flight_refresh_drains() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.test_enter_refresh_in_flight();
 
     let releaser = mgr.clone();
@@ -4816,7 +6352,7 @@ fn sleep_ack_hold_releases_when_in_flight_refresh_drains() {
 #[test]
 fn sleep_ack_hold_times_out_when_refresh_never_drains() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.test_enter_refresh_in_flight(); // never exits
 
     let start = Instant::now();
@@ -4994,7 +6530,7 @@ async fn manual_auth_emits_only_for_user_facing_source() {
     use crate::auth::recovery::RecoverySource;
 
     fn mgr_with(dir: &std::path::Path, key: &str, mode: AuthMode) -> Arc<AuthManager> {
-        let mgr = Arc::new(AuthManager::new(dir, GrokComConfig::default()));
+        let mgr = Arc::new(test_manager(dir, GrokComConfig::default()));
         let mut auth = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
         auth.user_id = "u1".into();
         auth.key = key.into();
@@ -5059,7 +6595,7 @@ async fn manual_auth_emits_only_for_user_facing_source() {
 #[tokio::test]
 async fn requires_manual_reauth_false_for_refreshable_credential() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "expired-at".into(),
         auth_mode: AuthMode::Oidc,
@@ -5090,7 +6626,7 @@ async fn requires_manual_reauth_false_for_refreshable_credential() {
 #[tokio::test]
 async fn requires_manual_reauth_true_for_sticky_verdict_and_no_refresher() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir.path(), GrokComConfig::default()));
     mgr.hot_swap(GrokAuth {
         key: "expired-at".into(),
         auth_mode: AuthMode::Oidc,
@@ -5124,7 +6660,7 @@ async fn requires_manual_reauth_true_for_sticky_verdict_and_no_refresher() {
 #[tokio::test]
 async fn requires_manual_reauth_true_after_external_provider_refresh_failed() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(AuthManager::new(dir.path(), external_provider_config()));
+    let mgr = Arc::new(test_manager(dir.path(), external_provider_config()));
     mgr.hot_swap(GrokAuth {
         key: "expired-external".into(),
         auth_mode: AuthMode::External,
@@ -5200,7 +6736,7 @@ fn proactive_failure_backoff_shape() {
 /// Seed a credential that is locally valid but that the caller has been told
 /// the server rejects — the shape that made the double-check lie.
 fn devbox_manager(dir: &std::path::Path, key: &str) -> Arc<AuthManager> {
-    let mgr = Arc::new(AuthManager::new(dir, GrokComConfig::default()));
+    let mgr = Arc::new(test_manager(dir, GrokComConfig::default()));
     mgr.set_devbox_env_for_test(true);
     mgr.hot_swap(GrokAuth {
         key: key.into(),

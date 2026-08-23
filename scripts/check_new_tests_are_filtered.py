@@ -119,6 +119,81 @@ def _bin_target_name(crate_dir: str, rel_path: str, fallback: str) -> str:
     return fallback
 
 
+def _test_roots_including(crate_dir: str, rel_under_tests: str) -> list[str]:
+    """Every `tests/*.rs` root that pulls this file in, directly or through a `mod.rs`.
+
+    Plural on purpose. The roots share modules -- `pty_e2e/common.rs` is declared
+    by all nine -- so a file can compile into more than one target, and a filter
+    naming any one of them runs it. Returning a single root would report a
+    covered test as uncovered whenever `ci.yml` happens to name a different
+    sibling.
+
+    The walk up the ancestors is what finds a leaf: the root declares
+    `#[path = "pty_e2e/minimal/mod.rs"] mod minimal;`, and `mod.rs` declares the
+    case files. Only the root is a cargo target, so that is what gets reported.
+    """
+    tests_dir = Path(crate_dir) / "tests"
+    try:
+        roots = sorted(p for p in tests_dir.glob("*.rs") if p.is_file())
+    except OSError:
+        return []
+    parts = rel_under_tests.split("/")
+    needles = [f'#[path = "{rel_under_tests}"]']
+    for depth in range(len(parts) - 1, 0, -1):
+        needles.append(f'#[path = "{"/".join(parts[:depth])}/mod.rs"]')
+    found: list[str] = []
+    for root in roots:
+        try:
+            text = root.read_text()
+        except OSError:
+            continue
+        if any(n in text for n in needles):
+            found.append(root.stem)
+    return found
+
+
+def _test_root_including(crate_dir: str, rel_under_tests: str) -> str | None:
+    """Which `tests/*.rs` root pulls `tests/<rel_under_tests>` in via `#[path]`.
+
+    Cargo's integration-test targets are the `.rs` files directly under `tests/`
+    (plus `tests/<dir>/main.rs`). A subdirectory without a `main.rs` is not a
+    target; it is a pile of modules that some root declares. This repository
+    splits one PTY suite across nine such roots so the families can be scheduled
+    separately, and every case lives under `tests/pty_e2e/`.
+
+    Returning the *declaring root* is what lets a filter naming a real target
+    cover the file. Roots are read rather than inferred, for the same reason
+    `_bin_target_name` reads `Cargo.toml`: the mapping is a decision someone
+    wrote down, not a property of the path.
+    """
+    tests_dir = Path(crate_dir) / "tests"
+    try:
+        roots = sorted(p for p in tests_dir.glob("*.rs") if p.is_file())
+    except OSError:
+        return None
+    found = _test_roots_including(crate_dir, rel_under_tests)
+    return found[0] if found else None
+
+
+def targets_of(path: str, crate_name: str | None) -> list[str]:
+    """Every cargo target that compiles this file.
+
+    One entry for everything except a file shared by several integration-test
+    roots; [`target_of`] is the first of these and stays the answer to "which
+    target is this", which is what the classification tests assert.
+    """
+    split = _crate_split(path)
+    if split is not None:
+        crate_dir, rel = split
+        if rel and rel[0] == "tests" and len(rel) > 2:
+            if not (Path(crate_dir) / "tests" / rel[1] / "main.rs").exists():
+                roots = _test_roots_including(crate_dir, "/".join(rel[1:]))
+                if roots:
+                    return [f"test:{r}" for r in roots]
+    single = target_of(path, crate_name)
+    return [single] if single else []
+
+
 def target_of(path: str, crate_name: str | None) -> str | None:
     """Which cargo target compiles this file.
 
@@ -150,6 +225,24 @@ def target_of(path: str, crate_name: str | None) -> str | None:
     if not rel:
         return None
     if rel[0] == "tests" and len(rel) > 1:
+        if len(rel) > 2 or not rel[-1].endswith(".rs"):
+            # `tests/<dir>/**` is only a target when `tests/<dir>/main.rs`
+            # exists. Otherwise the files are pulled into one or more sibling
+            # roots by `#[path]`, and the directory names no target at all --
+            # `tests/pty_e2e/` has no `main.rs`, and its cases compile into
+            # `pty_e2e_minimal`, `pty_e2e_queue` and the rest.
+            #
+            # Naming the directory was how a `ci.yml` line came to say
+            # `--test pty_e2e`: `cargo test` errors on it, so the invocation
+            # never produced a count, and this classifier agreed with the
+            # fiction, so the guard passed too. Two readers agreeing on a
+            # target that does not exist is worse than either being wrong
+            # alone.
+            if (Path(crate_dir) / "tests" / rel[1] / "main.rs").exists():
+                return f"test:{rel[1]}"
+            including = _test_root_including(crate_dir, "/".join(rel[1:]))
+            if including:
+                return f"test:{including}"
         return f"test:{rel[1].rsplit('.rs', 1)[0]}"
     if rel[0] == "examples" and len(rel) > 1:
         return f"example:{rel[1].rsplit('.rs', 1)[0]}"
@@ -200,6 +293,41 @@ def added_tests(diff: str) -> list[tuple[str, str]]:
 
 
 def selected(test_fn: str, file_path: str, filters: set[str]) -> bool:
+    path = Path(file_path)
+    parts = list(path.parts)
+    try:
+        src_index = parts.index("src")
+    except ValueError:
+        module_components: list[str] = []
+    else:
+        module_components = parts[src_index + 1 :]
+        if module_components:
+            stem = Path(module_components[-1]).stem
+            if stem == "mod":
+                module_components.pop()
+            else:
+                module_components[-1] = stem
+
+    def module_filter_matches(filter_value: str) -> bool:
+        wanted = [component for component in filter_value.strip(":").split("::") if component]
+        if not wanted:
+            return False
+        candidates = [module_components + [test_fn]]
+        # This repository keeps some large test modules in sibling `*_tests.rs`
+        # files included with `#[path = "..."]`. Their Rust module is the stem
+        # before `_tests` (for example `restore_fetch_tests.rs` is declared from
+        # `restore_fetch.rs`). Preserve that established approximation without
+        # letting an arbitrary prefix such as `session` match `session_state`.
+        if module_components and module_components[-1].endswith("_tests"):
+            included = module_components.copy()
+            included[-1] = included[-1].removesuffix("_tests")
+            candidates.append(included + [test_fn])
+        return any(
+            candidate[start : start + len(wanted)] == wanted
+            for candidate in candidates
+            for start in range(len(candidate) - len(wanted) + 1)
+        )
+
     for f in filters:
         if not f:
             return True
@@ -207,10 +335,11 @@ def selected(test_fn: str, file_path: str, filters: set[str]) -> bool:
             return True
         # Module-path filters (`slash::commands::model::`) cannot be matched
         # against a bare fn name; approximate the module path from the file.
-        if "::" in f:
-            as_path = f.strip(":").replace("::", "/")
-            if as_path in file_path:
-                return True
+        # Compare Rust components rather than raw substrings: Cargo's
+        # `session::` filter selects a `session` module but not the
+        # `extensions::session_state` module.
+        if "::" in f and module_filter_matches(f):
+            return True
     return False
 
 
@@ -251,10 +380,13 @@ def main() -> int:
         if crate is None:
             continue
         target_filters = per_crate.get(crate, {})
-        t = target_of(file_path, crate)
-        if t is None:
-            t = "lib"
-        filters = target_filters.get(t, set()) | target_filters.get("*", set())
+        # Union over every target that compiles this file: a shared
+        # integration-test module belongs to each root that declares it, and a
+        # filter naming any one of them runs the test.
+        targets = targets_of(file_path, crate) or ["lib"]
+        filters = target_filters.get("*", set())
+        for t in targets:
+            filters = filters | target_filters.get(t, set())
         if not selected(fn, file_path, filters):
             unselected.append((crate, file_path, fn))
 

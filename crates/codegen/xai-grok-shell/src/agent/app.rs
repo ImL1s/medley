@@ -420,6 +420,13 @@ pub async fn run_stdio_agent(
     result
 }
 
+fn headless_api_key_needs_session(
+    has_xai_api_key_env: bool,
+    auth_provider_command: Option<&str>,
+) -> bool {
+    has_xai_api_key_env && !crate::auth::has_nonblank_auth_provider_command(auth_provider_command)
+}
+
 pub async fn run_headless(
     agent_config: &AgentConfig,
     reauthenticate: bool,
@@ -480,9 +487,10 @@ pub async fn run_headless(
         // Don't pre-resolve auth here: run_auth_flow below already mints
         // external/devbox creds, so it would run the provider twice.
         let auth_manager = Arc::new(AuthManager::new(&grok_home::grok_home(), ctx.clone()));
-        if crate::agent::auth_method::has_xai_api_key_env()
-            && ctx.auth_provider_command.is_none()
-            && crate::auth::try_ensure_fresh_auth(ctx).await.is_none()
+        if headless_api_key_needs_session(
+            crate::agent::auth_method::has_xai_api_key_env(),
+            ctx.auth_provider_command.as_deref(),
+        ) && crate::auth::try_ensure_fresh_auth(ctx).await.is_none()
         {
             anyhow::bail!("{}", headless_no_session());
         }
@@ -1850,6 +1858,24 @@ mod tests {
         watch::channel(crate::leader::ShutdownReason::Manual).0
     }
 
+    #[test]
+    fn blank_external_provider_does_not_bypass_headless_api_key_guard() {
+        for command in [None, Some(""), Some(" \t\n")] {
+            assert!(
+                headless_api_key_needs_session(true, command),
+                "missing or blank provider must keep the headless session guard closed: {command:?}"
+            );
+        }
+        assert!(
+            !headless_api_key_needs_session(true, Some("acme-auth")),
+            "a nonblank external provider can mint the required session"
+        );
+        assert!(
+            !headless_api_key_needs_session(false, None),
+            "without API-key auth this specialized guard does not apply"
+        );
+    }
+
     /// Helper: build a LeaderAutoUpdateConfig whose check_fn always returns the given value.
     fn always_config(update_available: bool) -> LeaderAutoUpdateConfig {
         LeaderAutoUpdateConfig {
@@ -2710,7 +2736,7 @@ mod tests {
         let cancel_for_actor = cancel.clone();
         let actor = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
-                if matches!(cmd, crate::session::SessionCommand::Shutdown) {
+                if matches!(cmd, crate::session::SessionCommand::Shutdown(_)) {
                     assert!(
                         !cancel_for_actor.is_cancelled(),
                         "session flush must happen BEFORE the leader is cancelled"

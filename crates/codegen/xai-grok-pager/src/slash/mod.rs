@@ -27,7 +27,9 @@ use crate::acp::model_state::ModelState;
 use matcher::FuzzyMatcher;
 use registry::{CommandRegistry, CommandSource, CommandTrigger};
 
-pub use command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
+pub use command::{
+    AppCtx, ArgItem, CommandExecCtx, CommandProvenance, CommandResult, SlashCommand,
+};
 pub use mode_support::{ModeSupport, Remedy};
 
 /// Maximum number of visible rows in the dropdown (scroll beyond this).
@@ -51,10 +53,16 @@ pub struct SuggestionRow {
     /// Free-form bracketed tag (e.g. "new") from the resolved tag map. `None`
     /// for untagged command rows and always `None` for arg rows.
     pub tag: Option<String>,
+    /// Provenance badge; `Some` only on rows in a builtin/skill name collision.
+    pub provenance: Option<CommandProvenance>,
 }
 
 impl SuggestionRow {
-    fn from_command(trigger: &CommandTrigger, takes_args: bool) -> Self {
+    fn from_command(
+        trigger: &CommandTrigger,
+        takes_args: bool,
+        collides_with_builtin_or_skill: bool,
+    ) -> Self {
         let mut insert_text = trigger.display.clone();
         if takes_args {
             insert_text.push(' ');
@@ -65,6 +73,7 @@ impl SuggestionRow {
             insert_text,
             indices: Vec::new(),
             tag: None,
+            provenance: collides_with_builtin_or_skill.then(|| trigger.provenance.clone()),
         }
     }
 
@@ -75,6 +84,7 @@ impl SuggestionRow {
             insert_text: item.insert_text.clone(),
             indices: Vec::new(),
             tag: None,
+            provenance: None,
         }
     }
 
@@ -106,6 +116,29 @@ fn command_prefix_matches_smart(full_name: &str, query: &str) -> bool {
 
 fn chars_eq_ignore_case(a: char, b: char) -> bool {
     a == b || a.eq_ignore_ascii_case(&b)
+}
+
+/// Bare trigger key: suffix after `:` for a qualified skill, else the key.
+fn trigger_bare_name(trigger: &CommandTrigger) -> &str {
+    let key = trigger
+        .alias
+        .as_deref()
+        .unwrap_or(trigger.canonical.as_str());
+    match key.rsplit_once(':') {
+        Some((_, bare)) if !bare.is_empty() => bare,
+        _ => key,
+    }
+}
+
+fn trigger_exact_query(trigger: &CommandTrigger, query: &str) -> bool {
+    trigger.match_text == query
+}
+
+/// True when the trigger's displayed identity (not a bare-suffix sibling)
+/// is exactly `query`. Owns the cross-command exactness tiebreak so MRU
+/// cannot rank a colliding skill above a fully-typed builtin.
+fn trigger_owns_typed_name(trigger: &CommandTrigger, query: &str) -> bool {
+    trigger.alias.as_deref().unwrap_or(&trigger.canonical) == query
 }
 
 /// Ghost suffix from the selected dropdown row (same ranker as Tab).
@@ -538,12 +571,14 @@ impl SlashController {
         // when the cursor is past the command token.
         if input.cursor_in_command {
             let matches = self.command_suggestions(&input.query, models);
-            snapshot.selected = Self::carry_selection(&previous, &matches, true, &input);
+            snapshot.selected = Self::carry_selection(&previous, &matches, true, &input, None);
             snapshot.open = !matches.is_empty();
             snapshot.matches = matches;
         } else if input.args_range.is_some() {
-            let matches = self.arg_suggestions_for_input(text, &input, models);
-            snapshot.selected = Self::carry_selection(&previous, &matches, false, &input);
+            let (matches, initially_preferred) =
+                self.arg_suggestions_for_input(text, &input, models);
+            snapshot.selected =
+                Self::carry_selection(&previous, &matches, false, &input, initially_preferred);
             snapshot.open = !matches.is_empty();
             snapshot.matches = matches;
         }
@@ -622,7 +657,7 @@ impl SlashController {
                     args_range: None,
                     args_query: String::new(),
                 };
-                let selected = Self::carry_selection(previous, &matches, true, &input);
+                let selected = Self::carry_selection(previous, &matches, true, &input, None);
                 SlashSnapshot {
                     active: true,
                     open: !matches.is_empty(),
@@ -732,7 +767,8 @@ impl SlashController {
             String::new()
         };
 
-        let arg_matches = self.arg_suggestions(command.as_ref(), models, &args_query);
+        let (arg_matches, initially_preferred) =
+            self.arg_suggestions(command.as_ref(), models, &args_query);
         let args_range = Some(start..args_end);
         let input = SlashInput {
             command_range: token.range.clone(),
@@ -746,7 +782,13 @@ impl SlashController {
         snapshot.args_range = args_range;
         snapshot.open = !arg_matches.is_empty();
         snapshot.matches = arg_matches;
-        snapshot.selected = Self::carry_selection(previous, &snapshot.matches, false, &input);
+        snapshot.selected = Self::carry_selection(
+            previous,
+            &snapshot.matches,
+            false,
+            &input,
+            initially_preferred,
+        );
         if args_empty {
             snapshot.args_placeholder = command.arg_placeholder().map(|s| s.to_string());
         }
@@ -790,6 +832,7 @@ impl SlashController {
         matches: &[SuggestionRow],
         cursor_in_command: bool,
         input: &SlashInput,
+        initially_preferred: Option<usize>,
     ) -> usize {
         if matches.is_empty() {
             return 0;
@@ -798,9 +841,14 @@ impl SlashController {
         let same_context = if cursor_in_command {
             previous.cursor_in_command && previous.query == input.query
         } else {
-            !previous.cursor_in_command && previous.args_range == input.args_range
+            !previous.cursor_in_command
+                && previous.query == input.query
+                && previous.args_range == input.args_range
         };
         if !same_context || previous.matches.is_empty() {
+            if !cursor_in_command && input.args_query.trim().is_empty() {
+                return initially_preferred.unwrap_or(0);
+            }
             return 0;
         }
 
@@ -870,6 +918,36 @@ impl SlashController {
             })
             .collect();
         let triggers = self.registry.triggers();
+        // Badge only visible skill ↔ non-skill collisions on the same bare name.
+        let mut skill_bares: HashSet<String> = HashSet::new();
+        let mut other_bares: HashSet<String> = HashSet::new();
+        for (_, trigger) in triggers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| visible_indices.contains(i))
+        {
+            let bare = trigger_bare_name(trigger).to_lowercase();
+            if matches!(trigger.provenance, CommandProvenance::Skill { .. }) {
+                skill_bares.insert(bare);
+            } else {
+                other_bares.insert(bare);
+            }
+        }
+        let colliding_bares: HashSet<&str> = skill_bares
+            .intersection(&other_bares)
+            .map(String::as_str)
+            .collect();
+        // Badge every visible trigger of a command that participates, including
+        // the canonical row when only an alias (e.g. `clear` → `/compact`) collides.
+        let colliding_command_indices: HashSet<usize> = triggers
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| {
+                visible_indices.contains(i)
+                    && colliding_bares.contains(trigger_bare_name(t).to_lowercase().as_str())
+            })
+            .map(|(_, t)| t.command_index)
+            .collect();
         let trimmed = query.trim();
         if trimmed.is_empty() {
             // Show all unique commands (deduplicate by command_index).
@@ -889,7 +967,11 @@ impl SlashController {
                         .commands_by_index(trigger.command_index)
                         .map(|cmd| cmd.takes_args_now(&ctx))
                         .unwrap_or(false);
-                    rows.push(SuggestionRow::from_command(trigger, takes));
+                    rows.push(SuggestionRow::from_command(
+                        trigger,
+                        takes,
+                        colliding_command_indices.contains(&trigger.command_index),
+                    ));
                     canonicals.push(trigger.canonical.as_str());
                 }
             }
@@ -927,11 +1009,7 @@ impl SlashController {
             |trigger| trigger.match_text.as_str(),
         );
 
-        // Deduplicate: keep the best-scoring trigger per command.
-        // At equal fuzzy scores the tiebreaker is:
-        //   1. Exact match on match_text wins (e.g. alias "/m" for query "m")
-        //   2. Canonical name beats aliases
-        //   3. Lexicographic display order as final fallback
+        // Dedup per command: higher score, else exact query, else canonical, else display.
         let mut best_per_command: HashMap<usize, (u32, usize)> = HashMap::new();
         for (visible_idx, score) in hits {
             let trigger = visible_triggers[visible_idx];
@@ -941,8 +1019,8 @@ impl SlashController {
                     let dominated = if score != current.0 {
                         score > current.0
                     } else {
-                        let new_exact = trigger.match_text == trimmed;
-                        let cur_exact = visible_triggers[current.1].match_text == trimmed;
+                        let new_exact = trigger_exact_query(trigger, trimmed);
+                        let cur_exact = trigger_exact_query(visible_triggers[current.1], trimmed);
                         if new_exact != cur_exact {
                             new_exact
                         } else {
@@ -975,7 +1053,11 @@ impl SlashController {
                         .commands_by_index(t.command_index)
                         .map(|cmd| cmd.takes_args_now(&ctx))
                         .unwrap_or(false);
-                    SuggestionRow::from_command(t, takes)
+                    SuggestionRow::from_command(
+                        t,
+                        takes,
+                        colliding_command_indices.contains(&t.command_index),
+                    )
                 })
                 .collect()
         };
@@ -1000,8 +1082,13 @@ impl SlashController {
                 .map(|(canonical, _)| m.rank_score(trimmed, canonical))
                 .collect()
         };
+        let owns_typed_name: Vec<bool> = visible_triggers
+            .iter()
+            .map(|t| trigger_owns_typed_name(t, trimmed))
+            .collect();
         deduped.sort_by(|a, b| {
             b.0.cmp(&a.0)
+                .then_with(|| owns_typed_name[b.1].cmp(&owns_typed_name[a.1]))
                 .then_with(|| mru_scores[b.1].cmp(&mru_scores[a.1]))
                 .then_with(|| {
                     let a_builtin = sort_meta[a.1].1 == CommandSource::Builtin;
@@ -1010,12 +1097,13 @@ impl SlashController {
                 })
                 .then_with(|| rows[a.1].display.cmp(&rows[b.1].display))
         });
-        for row in &mut rows {
-            row.indices = self.matcher.indices(row.display.as_str());
-        }
         deduped
             .into_iter()
-            .map(|(_, idx)| rows[idx].clone())
+            .map(|(_, idx)| {
+                let mut row = rows[idx].clone();
+                row.indices = self.matcher.indices(row.display.as_str());
+                row
+            })
             .collect()
     }
 
@@ -1025,14 +1113,14 @@ impl SlashController {
         text: &str,
         input: &SlashInput,
         models: &ModelState,
-    ) -> Vec<SuggestionRow> {
+    ) -> (Vec<SuggestionRow>, Option<usize>) {
         let Some(invocation) = parse_invocation(text) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         // Clone the Arc to release the borrow on self.registry before
         // calling arg_suggestions (which needs &mut self for the matcher).
         let Some(command) = self.registry.get(invocation.token).cloned() else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         // Hidden commands never produce arg suggestions either.
         let offered = {
@@ -1040,7 +1128,7 @@ impl SlashController {
             command_offered(command.as_ref(), &visible_ctx, self.hide_session_scoped)
         };
         if !offered {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         self.arg_suggestions(command.as_ref(), models, &input.args_query)
     }
@@ -1064,33 +1152,48 @@ impl SlashController {
         command: &dyn SlashCommand,
         models: &ModelState,
         query: &str,
-    ) -> Vec<SuggestionRow> {
+    ) -> (Vec<SuggestionRow>, Option<usize>) {
         let ctx = self.app_ctx(models);
         if !command.takes_args_now(&ctx) {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let Some(items) = command.suggest_args(&ctx, query) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         if items.is_empty() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let trimmed = query.trim();
+        let mut preferred_indices = items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| command.initially_preferred_arg(&ctx, item).then_some(idx));
+        let initially_preferred = preferred_indices
+            .next()
+            .and_then(|idx| preferred_indices.next().is_none().then_some(idx));
         if trimmed.is_empty() {
-            return items.iter().map(SuggestionRow::from_arg).collect();
+            return (
+                items.iter().map(SuggestionRow::from_arg).collect(),
+                initially_preferred,
+            );
         }
         let hits = self
             .matcher
             .rank(items.as_slice(), trimmed, items.len(), |item| {
                 item.match_text.as_str()
             });
-        hits.into_iter()
+        let rows = hits
+            .into_iter()
             .map(|(idx, _)| {
-                let mut row = SuggestionRow::from_arg(&items[idx]);
+                let item = &items[idx];
+                let mut row = SuggestionRow::from_arg(item);
                 row.indices = self.argument_highlight_indices(trimmed, &row.display);
                 row
             })
-            .collect()
+            .collect();
+        // Typed queries always start at fuzzy-rank zero, so the item-index
+        // preference is intentionally not translated into ranked-row space.
+        (rows, None)
     }
 }
 
@@ -1304,6 +1407,38 @@ pub fn is_command_complete(line: &str, registry: &CommandRegistry) -> bool {
     }
     // Args required -- complete only if non-empty.
     !invocation.args.trim().is_empty()
+}
+
+/// True when Enter should send `text` unchanged.
+///
+/// Accept turns `/doctor` into `/doctor ` and opens the arg menu. Skip accept
+/// only when the highlighted row is the typed command (or an alias of it).
+pub(crate) fn is_typed_slash_selected(
+    snap: &SlashSnapshot,
+    text: &str,
+    registry: &CommandRegistry,
+) -> bool {
+    if !snap.cursor_in_command {
+        return false;
+    }
+    let Some(invocation) = parse_invocation(text) else {
+        return false;
+    };
+    if !invocation.args.is_empty() || !is_command_complete(text, registry) {
+        return false;
+    }
+    let Some(typed) = registry.get_for_dispatch(invocation.token) else {
+        return false;
+    };
+    match snap.selection() {
+        None => true,
+        Some(row) => {
+            row.command_name().eq_ignore_ascii_case(invocation.token)
+                || registry
+                    .get_for_dispatch(row.command_name())
+                    .is_some_and(|selected| selected.name() == typed.name())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1647,6 +1782,64 @@ mod tests {
     }
 
     #[test]
+    fn shell_prequalified_skill_appears_beside_builtin() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let meta = serde_json::json!({
+            "scope": "plugin",
+            "path": "/plugins/acme/skills/login/SKILL.md",
+            "bareName": "login",
+            "pluginName": "acme",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        ctrl.registry_mut()
+            .set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+                "acme:login".to_string(),
+                "Acme account login".to_string(),
+            )
+            .meta(meta)]);
+
+        let state = SlashState::default();
+        let models = ModelState::default();
+        ctrl.refresh(&state, "/login", 6, &models);
+        let snapshot = state.snapshot();
+        let login = snapshot
+            .matches
+            .iter()
+            .find(|row| row.display == "/login")
+            .expect("builtin /login");
+        assert_eq!(login.provenance, Some(CommandProvenance::Builtin));
+        assert!(!login.description.contains("built-in"));
+        let skill = snapshot
+            .matches
+            .iter()
+            .find(|row| row.display == "/acme:login")
+            .expect("qualified skill");
+        assert_eq!(
+            skill.provenance,
+            Some(CommandProvenance::Skill {
+                source: "acme".to_string()
+            })
+        );
+        assert_eq!(skill.description, "Acme account login");
+        assert!(ctrl.registry().get("login").is_some_and(|c| !c.is_skill()));
+        assert!(
+            ctrl.registry()
+                .get("acme:login")
+                .is_some_and(|c| c.is_skill())
+        );
+
+        ctrl.refresh(&state, "/acme:login", 11, &models);
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.selection().map(|row| row.display.as_str()),
+            Some("/acme:login"),
+            "exact qualified query should select the skill"
+        );
+    }
+
+    #[test]
     fn controller_silences_double_slash() {
         let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
         let state = SlashState::default();
@@ -1802,6 +1995,125 @@ mod tests {
                 .any(|row| row.display.contains("Example"))
         );
         assert!(snapshot.args_range.is_some());
+    }
+
+    fn two_model_picker_state() -> ModelState {
+        let mut models = ModelState::default();
+        for (id, name) in [("alpha", "Alpha"), ("zulu", "Zulu")] {
+            let model_id = acp::ModelId::new(Arc::from(id));
+            models.available.insert(
+                model_id.clone(),
+                acp::ModelInfo::new(model_id, name.to_string()),
+            );
+        }
+        models.current = Some(acp::ModelId::new(Arc::from("zulu")));
+        models
+    }
+
+    #[test]
+    fn model_picker_initially_selects_current_model() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = two_model_picker_state();
+
+        ctrl.refresh(&state, "/model ", 7, &models);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.selected, 1, "catalog order keeps Zulu second");
+        assert_eq!(
+            snapshot.selection().map(|row| row.insert_text.trim_end()),
+            Some("zulu")
+        );
+    }
+
+    #[test]
+    fn model_picker_nonempty_query_keeps_fuzzy_rank_selection() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = two_model_picker_state();
+
+        let text = "/model alpha";
+        ctrl.refresh(&state, text, text.len(), &models);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.selected, 0);
+        assert_eq!(
+            snapshot.selection().map(|row| row.insert_text.trim_end()),
+            Some("alpha"),
+            "a typed query must use fuzzy rank, not the current-model preference"
+        );
+    }
+
+    #[test]
+    fn model_picker_refresh_preserves_user_navigation() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = two_model_picker_state();
+
+        ctrl.refresh(&state, "/model ", 7, &models);
+        ctrl.move_selection(&state, 1);
+        assert_eq!(
+            state
+                .snapshot()
+                .selection()
+                .map(|row| row.insert_text.trim_end().to_string()),
+            Some("alpha".to_string()),
+            "navigation wraps from preferred Zulu to Alpha"
+        );
+
+        ctrl.refresh(&state, "/model ", 7, &models);
+
+        assert_eq!(
+            state
+                .snapshot()
+                .selection()
+                .map(|row| row.insert_text.trim_end().to_string()),
+            Some("alpha".to_string()),
+            "refresh must carry the user's selection instead of reapplying preference"
+        );
+    }
+
+    #[test]
+    fn model_picker_preference_applies_after_same_range_command_change() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = two_model_picker_state();
+
+        ctrl.refresh(&state, "/theme ", 7, &models);
+        assert!(
+            state.snapshot().open,
+            "theme picker must establish args state"
+        );
+
+        ctrl.refresh(&state, "/model ", 7, &models);
+
+        assert_eq!(
+            state
+                .snapshot()
+                .selection()
+                .map(|row| row.insert_text.trim_end().to_string()),
+            Some("zulu".to_string()),
+            "same args range from another command is a fresh model context"
+        );
+    }
+
+    #[test]
+    fn model_picker_without_catalog_current_falls_back_to_first_row() {
+        for current in [None, Some(acp::ModelId::new(Arc::from("not-in-catalog")))] {
+            let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+            let state = SlashState::default();
+            let mut models = two_model_picker_state();
+            models.current = current;
+
+            ctrl.refresh(&state, "/model ", 7, &models);
+
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot.selected, 0);
+            assert_eq!(
+                snapshot.selection().map(|row| row.insert_text.trim_end()),
+                Some("alpha")
+            );
+        }
     }
 
     #[test]
@@ -2230,6 +2542,7 @@ mod tests {
             insert_text: "/Privacy ".to_string(),
             indices: Vec::new(),
             tag: None,
+            provenance: None,
         };
         // Without smart-case, starts_with("p") fails on "Privacy" and ghost disappears
         // while the dropdown still highlights the row via CaseMatching::Smart.
@@ -2458,6 +2771,139 @@ mod tests {
         assert_eq!(
             selected, "pager-headless",
             "MRU should make the recently-used skill win the /p tie"
+        );
+    }
+
+    #[test]
+    fn colliding_plugin_skill_appears_beside_builtin() {
+        let mut ctrl = SlashController::new(
+            CommandRegistry::new(vec![Arc::new(TieCmd("login"))]),
+            std::path::PathBuf::from("."),
+        );
+        let meta = serde_json::json!({
+            "scope": "plugin",
+            "path": "/plugins/acme/skills/login/SKILL.md",
+            "pluginName": "acme",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        ctrl.registry_mut()
+            .set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+                "acme:login".to_string(),
+                "Acme SSO helper".to_string(),
+            )
+            .meta(meta)]);
+
+        let state = SlashState::default();
+        let models = ModelState::default();
+        ctrl.refresh(&state, "/login", 6, &models);
+        let snap = state.snapshot();
+
+        let builtin = snap
+            .matches
+            .iter()
+            .find(|r| r.display == "/login")
+            .expect("builtin /login stays listed");
+        assert_eq!(builtin.provenance, Some(CommandProvenance::Builtin));
+
+        let skill = snap
+            .matches
+            .iter()
+            .find(|r| r.display == "/acme:login")
+            .expect("colliding plugin skill listed as /acme:login");
+        assert_eq!(
+            skill.provenance,
+            Some(CommandProvenance::Skill {
+                source: "acme".to_string()
+            })
+        );
+        assert_eq!(skill.description, "Acme SSO helper");
+
+        assert_eq!(snap.matches[0].display, "/login");
+
+        assert!(
+            !skill.indices.is_empty(),
+            "bare-suffix match must still highlight the row"
+        );
+        assert!(
+            skill
+                .indices
+                .iter()
+                .all(|i| (*i as usize) < "/acme:login".len()),
+            "indices must land within the display text: {:?}",
+            skill.indices
+        );
+
+        ctrl.record_command_use("acme:login", "acme:login");
+        ctrl.refresh(&state, "/login", 6, &models);
+        assert_eq!(
+            state.snapshot().matches[0].display,
+            "/login",
+            "recently-used colliding skill must not hijack the typed builtin name"
+        );
+    }
+
+    struct AliasCmd;
+    impl SlashCommand for AliasCmd {
+        fn name(&self) -> &str {
+            "compact"
+        }
+        fn aliases(&self) -> &[&str] {
+            &["clear"]
+        }
+        fn description(&self) -> &str {
+            "compact desc"
+        }
+        fn usage(&self) -> &str {
+            "/compact"
+        }
+        fn run(&self, _ctx: &mut CommandExecCtx, _args: &str) -> CommandResult {
+            CommandResult::Handled
+        }
+    }
+
+    #[test]
+    fn alias_collision_badges_canonical_builtin_row() {
+        let mut ctrl = SlashController::new(
+            CommandRegistry::new(vec![Arc::new(AliasCmd)]),
+            std::path::PathBuf::from("."),
+        );
+        let meta = serde_json::json!({
+            "scope": "plugin",
+            "path": "/plugins/acme/skills/clear/SKILL.md",
+            "pluginName": "acme",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        ctrl.registry_mut()
+            .set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+                "acme:clear".to_string(),
+                "Acme clear".to_string(),
+            )
+            .meta(meta)]);
+
+        let state = SlashState::default();
+        let models = ModelState::default();
+        ctrl.refresh(&state, "/", 1, &models);
+        let snap = state.snapshot();
+        let builtin = snap
+            .matches
+            .iter()
+            .find(|row| row.display == "/compact")
+            .expect("empty menu keeps the canonical builtin row");
+        assert_eq!(builtin.provenance, Some(CommandProvenance::Builtin));
+        let skill = snap
+            .matches
+            .iter()
+            .find(|row| row.display == "/acme:clear")
+            .expect("qualified skill listed");
+        assert_eq!(
+            skill.provenance,
+            Some(CommandProvenance::Skill {
+                source: "acme".to_string()
+            })
         );
     }
 

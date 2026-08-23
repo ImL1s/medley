@@ -83,7 +83,11 @@ pub enum ChatStateCommand {
     PushAssistantResponse { item: ConversationItem },
 
     /// Record a tool result.
-    PushToolResult { item: ConversationItem },
+    PushToolResult {
+        item: ConversationItem,
+        truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
+        trusted_suffix: Option<crate::types::TrustedPromptSuffix>,
+    },
 
     /// Record accumulated token usage from a streaming response.
     RecordTokenUsage { total_tokens: u64 },
@@ -120,6 +124,12 @@ pub enum ChatStateCommand {
 
     /// Update the sampling config (e.g., model switch).
     UpdateSamplingConfig { config: SamplingConfig },
+
+    /// Atomically update request routing and the credential bound to it.
+    UpdateSamplingConfigAndCredentials {
+        config: SamplingConfig,
+        credentials: Credentials,
+    },
 
     /// Track that the agent edited a file path.
     RecordAgentEditedPath { path: String },
@@ -255,6 +265,19 @@ pub enum ChatStateCommand {
     /// Get sampling config.
     GetSamplingConfig {
         reply: oneshot::Sender<SamplingConfig>,
+    },
+    /// Get sampling config and its atomically committed catalog identity.
+    GetSamplingConfigWithModelId {
+        reply: oneshot::Sender<(SamplingConfig, Option<crate::types::CatalogIdentity>)>,
+    },
+    /// Get every model/credential fact needed to prepare a child request from
+    /// one actor snapshot.
+    GetPreparedModelState {
+        reply: oneshot::Sender<(
+            SamplingConfig,
+            Option<crate::types::CatalogIdentity>,
+            Credentials,
+        )>,
     },
 
     /// Get the set of agent-edited file paths.
@@ -397,6 +420,8 @@ mod tests {
         };
         let _ = ChatStateCommand::PushToolResult {
             item: ConversationItem::tool_result("call-1", "result"),
+            truncation_policy: None,
+            trusted_suffix: None,
         };
         let _ = ChatStateCommand::RecordTokenUsage { total_tokens: 100 };
         let _ = ChatStateCommand::IncrementPromptIndex;

@@ -77,7 +77,8 @@ use crate::session::persistence::PersistenceHandle;
 use crate::session::worktree::BackgroundCopyContext;
 use crate::session::{
     ParsedPromptInfo, SCHEDULER_BACKGROUND_LOOPS_META_KEY, SessionCommand, SessionHandle,
-    SessionLiveState, SessionThread, WEB_SEARCH_DISABLED_META_KEY, WebSearchDisabledNotice,
+    CancelOptions, CancelTrigger, SessionLiveState, SessionThread, ShutdownKind,
+    WEB_SEARCH_DISABLED_META_KEY, WebSearchDisabledNotice,
     info::Info as SessionInfo, spawn_session_on_thread,
 };
 use crate::terminal::{AcpTerminalRunner, TerminalRunner};
@@ -284,11 +285,91 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
+    /// Immutable model sampler selected by `/new` before its auth-selection seal.
+    pub prepared_sampling_config: Option<SamplingConfig>,
+    /// Catalog identity captured from the same entry as `prepared_sampling_config`.
+    pub prepared_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+    /// Exact catalog entry captured with the prepared sampler and identity.
+    pub prepared_model_entry: Option<ModelEntry>,
+    /// Auth authority that must still hold at the final resident publication.
+    pub new_session_auth_authority: Option<NewSessionAuthAuthority>,
+    /// Pending only for `/new`; all externally visible actor startup and relay
+    /// work waits until the final auth-sealed resident commit publishes it.
+    pub publication_gate: Option<crate::session::SessionPublicationGate>,
+    /// Pure request-scoped verdict for auth-sealed `/new`; committed to the
+    /// process cache only by final resident publication.
+    pub folder_trust_snapshot: Option<folder_trust::FolderTrustSnapshot>,
+    /// Relay state forwarding is also publication: create its receiver while
+    /// the relay is provisional, but do not start forwarding until commit.
+    pub deferred_relay_state_rx: Option<
+        tokio::sync::watch::Receiver<crate::relay::ConnectionState>,
+    >,
+    /// Upgrade provisional local persistence only after resident publication.
+    pub upgrade_persistence_to_writeback: bool,
+    pub persisted_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
     /// Sticky chat product kind for ACU / product skills sourcing.
     pub is_chat_kind: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct NewSessionAuthAuthority {
+    pub generation: u64,
+    pub is_session_auth: bool,
+    pub catalog_generation: u64,
+    pub catalog_identity: xai_chat_state::CatalogIdentity,
+    pub model_ready: bool,
+}
+
+pub(crate) struct PreparedNewSessionModelPlan {
+    pub model_agent_type: Option<String>,
+    pub session_model_id: acp::ModelId,
+    pub sampling_config: SamplingConfig,
+    pub catalog_identity: xai_chat_state::CatalogIdentity,
+    pub model_entry: ModelEntry,
+    pub auth_authority: NewSessionAuthAuthority,
+    pub disallowed_custom: Option<String>,
+    pub auth_hidden_custom: Option<String>,
+    pub unreadiness_custom: Option<(String, String)>,
+}
+
+/// Result of actor construction. Loads and chat sessions are already published;
+/// auth-sealed build `/new` sessions stay wholly provisional until the outer
+/// response has been assembled and calls the synchronous commit path.
+pub(crate) enum SpawnedSession {
+    Committed(acp::ModelId),
+    Prepared(Box<PreparedNewSession>),
+}
+
+pub(crate) struct PreparedNewSession {
+    session_info: SessionInfo,
+    handle: Option<SessionHandle>,
+    thread: Option<SessionThread>,
+    permission_events_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PermissionEvent>>,
+    publication_gate: crate::session::SessionPublicationGate,
+    folder_trust_snapshot: Option<folder_trust::FolderTrustSnapshot>,
+    cleanup: Option<agent_ops::ProvisionalNewSessionCleanup>,
+    auth_authority: NewSessionAuthAuthority,
+    deferred_relay_state_rx:
+        Option<tokio::sync::watch::Receiver<crate::relay::ConnectionState>>,
+    upgrade_persistence_to_writeback: bool,
+    web_search_disable_notice: Option<config::WebSearchDisabled>,
+    unavailable_spawn_model:
+        Option<(acp::ModelId, xai_chat_state::CatalogIdentity, String)>,
+    loc_aggregate_rx: Option<tokio::sync::mpsc::UnboundedReceiver<xai_hunk_tracker::LocAggregate>>,
+    initialize_system_prompt: Option<String>,
+}
+
+impl PreparedNewSession {
+    pub(crate) fn model_id(&self) -> &acp::ModelId {
+        &self.handle.as_ref().expect("prepared session owns handle").model_id
+    }
+
+    pub(crate) fn handle(&self) -> &SessionHandle {
+        self.handle.as_ref().expect("prepared session owns handle")
+    }
 }
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -325,11 +406,27 @@ fn wants_chat_session_kind(meta: Option<&acp::Meta>) -> bool {
         crate::session::unified_list::SessionKind::Chat
     )
 }
-/// Chat-kind sessions are only active when the `chat` feature is compiled in.
-fn is_chat_session_kind(meta: Option<&acp::Meta>) -> bool {
-    {
-        let _ = meta;
-        false
+use crate::session::unified_list::SessionKind;
+/// A chat-kind assertion from a request; only a claim until checked. Always
+/// false without the `chat` feature.
+#[derive(Clone, Copy)]
+pub(crate) struct ChatKindClaim(bool);
+impl ChatKindClaim {
+    pub(crate) fn from_meta(meta: Option<&acp::Meta>) -> Self {
+        {
+            let _ = meta;
+            Self(false)
+        }
+    }
+    /// Which pipeline owns this id. The session decides; the claim answers
+    /// only for an id the registry has never seen.
+    pub(crate) fn resolve(self, agent: &MvpAgent, id: &acp::SessionId) -> SessionKind {
+        let _ = (agent, id);
+        self.declared()
+    }
+    /// What the request asked to create; authoritative only at `session/new`.
+    pub(crate) fn declared(self) -> SessionKind {
+        if self.0 { SessionKind::Chat } else { SessionKind::Build }
     }
 }
 /// Fail closed when a client requests `kind: "chat"` on a build-only binary.
@@ -448,6 +545,15 @@ pub(crate) fn chat_session_spawn_options<'a>(
         managed_mcp_expires_at: None,
         model_agent_type,
         session_model_id,
+        prepared_sampling_config: None,
+        prepared_catalog_identity: None,
+        prepared_model_entry: None,
+        new_session_auth_authority: None,
+        publication_gate: None,
+        folder_trust_snapshot: None,
+        deferred_relay_state_rx: None,
+        upgrade_persistence_to_writeback: false,
+        persisted_catalog_identity: None,
         session_yolo_mode,
         session_auto_mode: false,
         prompt_display_cwd: None,
@@ -727,32 +833,20 @@ struct RetainedResources {
         tokio::sync::mpsc::UnboundedReceiver<PermissionEvent>,
     >,
 }
-#[derive(Default)]
-struct SessionLoadMarkers {
-    /// Marker currently allowed to use the during-load bypass.
-    active: Option<tokio::sync::watch::Receiver<bool>>,
-    /// All in-flight load markers for waiter-side gating.
-    waiters: Vec<tokio::sync::watch::Receiver<bool>>,
-}
+/// Per-resident-session `(title, last_turn_summary)` display cache; see
+/// `resident_roster_titles`.
+type RosterDisplayCache = HashMap<String, (Option<String>, Option<String>)>;
 pub struct MvpAgent {
-    /// LEADER-SAFE(per-session). Removed by `remove_session` / `sweep_dead_sessions`.
-    pub(crate) sessions: RefCell<HashMap<acp::SessionId, SessionHandle>>,
     /// LEADER-SAFE(shared): `Send + Sync` mirror of per-session activity for the
     /// leader's auto-update checker, which cannot read the `!Send` maps. Expires
     /// when the actor exits. See [`crate::agent::activity::AgentActivity`].
     pub(crate) activity: crate::agent::activity::AgentActivity,
     /// LEADER-SAFE(per-session).
     session_registry: SessionRegistry,
-    /// Per-session load markers. `active` tracks the newest load allowed to use
-    /// the during-load bypass; `waiters` keeps every in-flight load visible to
-    /// external waiters until each guard drops.
-    loading_sessions: RefCell<
-        HashMap<acp::SessionId, SessionLoadMarkers>,
-    >,
-    /// Title per resident session id, refreshed each `build_roster`. Lets the
-    /// synchronous roster deltas reuse the title instead of emitting an empty
-    /// one — `resident_roster_entry` can't read disk.
-    resident_roster_titles: RefCell<HashMap<String, String>>,
+    /// `(title, last_turn_summary)` per resident session id, refreshed each
+    /// `build_roster`. Lets the synchronous roster deltas reuse both instead
+    /// of emitting empty ones — `resident_roster_entry` can't read disk.
+    resident_roster_titles: RefCell<RosterDisplayCache>,
     pub(crate) initialize_request: OnceLock<acp::InitializeRequest>,
     pub(crate) gateway: GatewaySender,
     /// Agent configuration. LEADER-SAFE(init-once): never mutated after construction.
@@ -767,6 +861,11 @@ pub struct MvpAgent {
     /// only api_key is written here (same for all clients). Per-session base_url
     /// is resolved at session creation time in `new_session` / `load_session`.
     pub(crate) sampling_config: RefCell<SamplingConfig>,
+    /// Catalog identity that owns `sampling_config`. Unlike
+    /// `ModelsManager::current_model_id`, this does not change when a session
+    /// switches models, so fallback consumers cannot attach the startup
+    /// config's capabilities to the switched model.
+    pub(crate) sampling_config_model_id: acp::ModelId,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) models_manager: crate::agent::models::ModelsManager,
     /// grok.com chat-product catalog (`/rest/modes`) for chat sessions; distinct
@@ -1167,6 +1266,21 @@ pub(crate) fn harnesses_are_compatible(
     !active.is_strict_harness() && !required.is_strict_harness()
 }
 
+/// Whether a discovered model harness carries an exact runtime contract.
+///
+/// Stock, non-strict harnesses deliberately allow an explicit ACP/CLI agent
+/// profile to keep its own prompt and tool configuration. Strict, plugin, and
+/// file-backed definitions do not: their wire contract and source identity are
+/// part of the model route and must be resolved exactly.
+pub(crate) fn definition_requires_exact_harness(
+    definition: &xai_grok_agent::AgentDefinition,
+) -> bool {
+    definition.is_strict_harness()
+        || definition.plugin_name.is_some()
+        || definition.source_path.is_some()
+        || definition.prompt_body.is_some()
+}
+
 /// Select the first ready model whose required harness can reuse the active
 /// session definition. Candidate order is preserved so catalog priority stays
 /// authoritative while incompatible strict harnesses are skipped.
@@ -1209,10 +1323,17 @@ impl ColdSpawnModelSelection {
         &self,
         registry: &SessionRegistry,
         session_id: &acp::SessionId,
+        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+        agent_name: Option<String>,
     ) {
         registry.take_unavailable_model(session_id);
         if let Some(model_id) = self.unavailable_model.as_ref() {
-            registry.set_unavailable_model(session_id, model_id.clone());
+            registry.set_unavailable_model_with_identity(
+                session_id,
+                model_id.clone(),
+                catalog_identity,
+                agent_name,
+            );
         }
     }
 }
@@ -1232,6 +1353,54 @@ pub(crate) fn cold_spawn_fallback_selection(
         model_id: current_only_fallback.unwrap_or_else(|| persisted_model.clone()),
         unavailable_model: Some(persisted_model.clone()),
     }
+}
+
+pub(crate) fn should_reject_unresolved_persisted_identity(
+    models: &IndexMap<String, ModelEntry>,
+    persisted_identity: Option<&xai_chat_state::CatalogIdentity>,
+    reconciled_identity: Option<&xai_chat_state::CatalogIdentity>,
+) -> bool {
+    persisted_identity.is_some() && !models.is_empty() && reconciled_identity.is_none()
+}
+
+pub(crate) fn reconcile_latched_catalog_snapshot(
+    models: &IndexMap<String, ModelEntry>,
+    available: &IndexMap<acp::ModelId, acp::ModelInfo>,
+    identity: &xai_chat_state::CatalogIdentity,
+) -> Option<(acp::ModelId, xai_chat_state::CatalogIdentity, ModelEntry)> {
+    crate::agent::models::reconcile_persisted_catalog_identity(models, identity).and_then(
+        |reconciled| {
+            let model_id = acp::ModelId::new(reconciled.model_id.clone());
+            available
+                .contains_key(&model_id)
+                .then_some(model_id)
+                .and_then(|model_id| {
+                    models
+                        .get(reconciled.model_id.as_str())
+                        .cloned()
+                        .map(|model| (model_id, reconciled, model))
+                })
+        },
+    )
+}
+
+pub(crate) fn recovered_model_harness_is_compatible(
+    active_definition: &xai_grok_agent::AgentDefinition,
+    model: &ModelEntry,
+    required_definition: Option<&xai_grok_agent::AgentDefinition>,
+) -> bool {
+    harnesses_are_compatible(
+        active_definition,
+        model.info().agent_type.as_str(),
+        required_definition,
+    )
+}
+
+pub(crate) fn latched_recovery_has_required_harness(
+    identity: Option<&xai_chat_state::CatalogIdentity>,
+    agent_name: Option<&str>,
+) -> bool {
+    identity.is_none() || agent_name.is_some()
 }
 
 /// Apply the main session's authoritative CLI clamps to a freshly discovered
@@ -1437,7 +1606,7 @@ impl AuthRequestMeta {
 ///    (requires the optional non-production feature).
 ///
 /// Existing entries are never overwritten so callers can pre-set a value.
-fn inject_proxy_headers(
+pub(crate) fn inject_proxy_headers(
     headers: &mut indexmap::IndexMap<String, String>,
     client_version: Option<&str>,
     alpha_test_key: Option<&str>,
@@ -1466,15 +1635,22 @@ fn inject_proxy_headers(
     }
     let _ = (alpha_test_key, base_url);
 }
+fn select_spawn_model_entry<'a>(
+    pinned: Option<&'a ModelEntry>,
+    prepared: Option<&'a ModelEntry>,
+    catalog: &'a indexmap::IndexMap<String, ModelEntry>,
+    catalog_identity: &xai_chat_state::CatalogIdentity,
+) -> Option<&'a ModelEntry> {
+    pinned
+        .or(prepared)
+        .or_else(|| catalog.get(catalog_identity.model_id.as_str()))
+}
+
 fn resolve_inference_idle_timeout_secs(
-    models: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
-    model: &str,
+    model: Option<&crate::agent::config::ModelEntry>,
     remote_settings: Option<&crate::util::config::RemoteSettings>,
 ) -> u64 {
-    let per_model = models
-        .get(model)
-        .or_else(|| models.values().find(|entry| entry.info.model == model))
-        .and_then(|entry| entry.info.inference_idle_timeout_secs);
+    let per_model = model.and_then(|entry| entry.info.inference_idle_timeout_secs);
     let remote = remote_settings.and_then(|s| s.inference_idle_timeout_secs);
     per_model.or(remote).unwrap_or(600).max(10)
 }
@@ -1514,11 +1690,11 @@ fn plan_hunk_tracking(mode_str: Option<&str>) -> HunkTrackingPlan {
         actor_mode: resolve_hunk_tracking_mode(mode_str),
     }
 }
-/// RAII marker for an in-flight `session/load` (see
-/// [`MvpAgent::begin_session_load`]). Holding the guard keeps the session id
-/// in `MvpAgent::loading_sessions`; dropping it removes the marker and wakes
-/// every [`MvpAgent::wait_for_in_flight_session_load`] waiter (the held
-/// watch sender drops with the guard, closing the channel).
+/// Bound on waiting out an evicted session's flushing actor thread.
+pub(super) const DRAIN_OLD_THREAD_WAIT: std::time::Duration = std::time::Duration::from_secs(
+    5,
+);
+/// RAII marker for an in-flight attach; dropping it wakes every waiter.
 pub(crate) struct SessionLoadGuard<'a> {
     agent: &'a MvpAgent,
     session_id: acp::SessionId,
@@ -1528,25 +1704,7 @@ pub(crate) struct SessionLoadGuard<'a> {
 }
 impl Drop for SessionLoadGuard<'_> {
     fn drop(&mut self) {
-        let mut map = self.agent.loading_sessions.borrow_mut();
-        let remove_entry = if let Some(markers) = map.get_mut(&self.session_id) {
-            markers.waiters.retain(|rx| !rx.same_channel(&self.rx));
-            if markers
-                .active
-                .as_ref()
-                .is_some_and(|rx| rx.same_channel(&self.rx))
-            {
-                // A superseded older load must not regain bypass ownership when
-                // the newer marker drops; owner-bound bypass remains closed.
-                markers.active = None;
-            }
-            markers.waiters.is_empty()
-        } else {
-            false
-        };
-        if remove_entry {
-            map.remove(&self.session_id);
-        }
+        self.agent.session_registry.settle_attach(&self.session_id, &self.rx);
     }
 }
 /// Outcome of [`MvpAgent::wait_for_in_flight_session_load`].
@@ -1570,7 +1728,11 @@ mod session_lifecycle;
 mod subagent_coordinator;
 mod agent_ops;
 mod acp_agent;
+mod session_setup;
 use session_registry::SessionRegistry;
+pub(crate) use session_registry::{
+    ModelSwitchCommitOutcome, UnavailableModelCommitPolicy, UnavailableRecoverySnapshot,
+};
 pub(crate) use session_lifecycle::RegistrySnapshot;
 pub(super) use super::ext_parsers;
 /// Emit the `auth.lifecycle` login span with optional user id and error
@@ -1829,7 +1991,7 @@ impl MvpAgent {
         if orphaned.is_empty() {
             return Vec::new();
         }
-        if self.sessions.borrow().get(session_id).is_some() {
+        if self.is_resident(session_id) {
             return Vec::new();
         }
         let mut completions = Vec::with_capacity(orphaned.len());
@@ -2263,12 +2425,7 @@ impl MvpAgent {
     }
     /// Snapshot live session senders and broadcast `RefreshSkillBaseline`.
     pub(super) fn refresh_skill_baseline_for_all_sessions(&self) {
-        let senders = self
-            .sessions
-            .borrow()
-            .values()
-            .map(|h| h.cmd_tx.clone())
-            .collect();
+        let senders = self.resident_cmd_txs();
         Self::broadcast_refresh_skill_baseline(senders);
     }
     /// Eagerly fan out the current on-disk plugin registry to every live
@@ -2289,17 +2446,18 @@ impl MvpAgent {
                 std::path::PathBuf,
                 tokio::sync::mpsc::UnboundedSender<crate::session::SessionCommand>,
             ),
-        > = self
-            .sessions
-            .borrow()
-            .iter()
-            .filter_map(|(sid, h)| {
-                if skip == Some(sid) {
-                    return None;
-                }
-                Some((std::path::PathBuf::from(&h.info.cwd), h.cmd_tx.clone()))
-            })
-            .collect();
+        > = {
+            let mut targets = Vec::new();
+            self.session_registry
+                .for_each_resident(|sid, h| {
+                    if skip == Some(sid) {
+                        return;
+                    }
+                    targets
+                        .push((std::path::PathBuf::from(&h.info.cwd), h.cmd_tx.clone()));
+                });
+            targets
+        };
         let remote_settings = self.cfg.borrow().remote_settings.clone();
         for (cwd, cmd_tx) in targets {
             let project_trusted = folder_trust::resolve_and_record(
@@ -2357,9 +2515,7 @@ impl MvpAgent {
         }
         let proxy_base_url = self.cli_chat_proxy_base_url();
         let alpha_test_key = self.alpha_test_key();
-        let senders: Vec<
-            tokio::sync::mpsc::UnboundedSender<crate::session::SessionCommand>,
-        > = self.sessions.borrow().values().map(|h| h.cmd_tx.clone()).collect();
+        let senders = self.resident_cmd_txs();
         tokio::task::spawn_local(async move {
             let result = maybe_sync_bundle_to_root(
                     &root,
@@ -2403,11 +2559,9 @@ async fn handle_synthetic_turn_trace(
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     let (info, turn_number, user_id, user_email, client_source, client_version, model) = {
         let this = agent_ref.get();
-        let session_info = {
-            let sessions = this.sessions.borrow();
-            let sid = &request.session_id;
-            sessions.get(sid).map(|h| h.info.clone())
-        };
+        let session_info = this
+            .resident_handle(&request.session_id)
+            .map(|h| h.info.clone());
         let Some(info) = session_info else {
             tracing::debug!(
                 session_id = %request.session_id.0,
@@ -2434,13 +2588,10 @@ async fn handle_synthetic_turn_trace(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let client_version = this.cfg.borrow().client_version.clone();
-        let model = {
-            let sessions = this.sessions.borrow();
-            sessions
-                .get(&request.session_id)
-                .map(|h| h.model_id.0.to_string())
-                .unwrap_or_else(|| this.models_manager.current_model_id().0.to_string())
-        };
+        let model = this
+            .resident_handle(&request.session_id)
+            .map(|h| h.model_id.0.to_string())
+            .unwrap_or_else(|| this.models_manager.current_model_id().0.to_string());
         (info, turn_number, user_id, user_email, client_source, client_version, model)
     };
     let this = agent_ref.get();

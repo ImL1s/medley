@@ -756,6 +756,7 @@ fn switch_model_without_session_sends_nothing_to_server() {
         Action::SwitchModel {
             model_id,
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -937,6 +938,7 @@ fn switch_model_deferred_when_no_session_id() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -954,6 +956,8 @@ fn switch_model_deferred_when_no_session_id() {
             model_id,
             effort: None,
             prev_model_id: None,
+            prev_model_id_captured: true,
+            session_only: false,
         })
     );
     assert!(!app.agents[&id].session.model_switch_pending);
@@ -980,6 +984,7 @@ fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1020,6 +1025,7 @@ fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
             agent_id: id,
             model_id: model_b,
             effort: None,
+            session_only: false,
             request_id,
             result: Err(SwitchModelError::HarnessUnavailable {
                 error,
@@ -1062,6 +1068,7 @@ fn pre_session_pick_with_no_prior_model_still_persists() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1089,6 +1096,7 @@ fn pre_session_pick_with_no_prior_model_still_persists() {
             agent_id: id,
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
             request_id,
             result: Ok(()),
             prev_model_id,
@@ -1127,6 +1135,7 @@ fn pre_session_effort_only_change_still_persists() {
         Action::SwitchModel {
             model_id: model_a.clone(),
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            session_only: false,
         },
         &mut app,
     );
@@ -1154,6 +1163,7 @@ fn pre_session_effort_only_change_still_persists() {
             agent_id: id,
             model_id: model_a.clone(),
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            session_only: false,
             request_id,
             result: Ok(()),
             prev_model_id,
@@ -1193,6 +1203,7 @@ fn deferred_pre_session_pick_persists_after_switch_succeeds() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1228,6 +1239,7 @@ fn deferred_pre_session_pick_persists_after_switch_succeeds() {
             agent_id: id,
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
             request_id,
             result: Ok(()),
             prev_model_id,
@@ -1260,6 +1272,7 @@ fn deferred_switch_threads_stash_prev_into_effect() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1300,6 +1313,8 @@ fn deferred_switch_prefers_authoritative_current_as_prev() {
         model_id: model_b.clone(),
         effort: None,
         prev_model_id: None,
+        prev_model_id_captured: false,
+        session_only: false,
     });
     agent.session.models.current = Some(server_model.clone());
     let effects = dispatch(
@@ -1334,6 +1349,8 @@ fn deferred_model_switch_applied_on_session_created() {
         model_id: model_id.clone(),
         effort: None,
         prev_model_id: None,
+        prev_model_id_captured: false,
+        session_only: false,
     });
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionCreated {
@@ -1396,6 +1413,8 @@ fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
             model_id: model_new.clone(),
             effort: None,
             prev_model_id: Some(model_old.clone()),
+            prev_model_id_captured: false,
+            session_only: false,
         });
         agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
             request_id: None,
@@ -1477,6 +1496,8 @@ fn deferred_switch_dropped_at_apply_releases_stash_time_slot() {
             model_id: acp::ModelId::new(std::sync::Arc::from("gone-model")),
             effort: None,
             prev_model_id: None,
+            prev_model_id_captured: false,
+            session_only: false,
         });
     }
     // The stash-time claim: this agent owns the slot, no request id yet.
@@ -1565,6 +1586,8 @@ fn a_refused_deferred_switch_restores_the_truth_not_a_stale_snapshot() {
                 model_id: model_new.clone(),
                 effort: None,
                 prev_model_id: Some(model_old.clone()),
+                prev_model_id_captured: false,
+                session_only: false,
             });
             agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
                 request_id: None,
@@ -1684,6 +1707,8 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
             model_id: model_c.clone(),
             effort: None,
             prev_model_id: Some(model_a.clone()),
+            prev_model_id_captured: true,
+            session_only: false,
         }),
     );
 
@@ -1709,6 +1734,7 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
             agent_id: id,
             model_id: model_c.clone(),
             effort: None,
+            session_only: false,
             request_id,
             result: Ok(()),
             prev_model_id: None,
@@ -1760,6 +1786,7 @@ fn both_pre_session_entry_points_stash_the_same_rollback_target() {
                     Action::SwitchModel {
                         model_id,
                         effort: None,
+                        session_only: false,
                     },
                     &mut app,
                 );
@@ -1835,6 +1862,7 @@ fn rapid_no_session_model_choice_failure_restores_original_model() {
             agent_id: id,
             model_id: model_c,
             effort: None,
+            session_only: false,
             request_id,
             result: Err(SwitchModelError::Other("rejected".into())),
             prev_model_id: None,
@@ -1846,6 +1874,75 @@ fn rapid_no_session_model_choice_failure_restores_original_model() {
         app.agents[&id].session.models.current.as_ref(),
         Some(&model_a)
     );
+}
+
+#[test]
+fn rapid_no_session_model_choice_failure_restores_original_none_end_to_end() {
+    use super::super::super::settings::setters::set_default_model_confirmed;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_b = acp::ModelId::new("none-origin-b");
+    let model_c = acp::ModelId::new("none-origin-c");
+    let infos = [&model_b, &model_c]
+        .into_iter()
+        .map(|model| acp::ModelInfo::new(model.clone(), model.0.to_string()))
+        .collect::<Vec<_>>();
+    for info in &infos {
+        app.models
+            .available
+            .insert(info.model_id.clone(), info.clone());
+        app.agents[&id]
+            .session
+            .models
+            .available
+            .insert(info.model_id.clone(), info.clone());
+    }
+    app.models.current = None;
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.models.current = None;
+        agent.session.session_id = None;
+    }
+
+    set_default_model_confirmed(&mut app, model_b.clone());
+    set_default_model_confirmed(&mut app, model_c.clone());
+    let deferred = app.agents[&id]
+        .session
+        .deferred_model_switch
+        .as_ref()
+        .expect("rapid picks remain deferred before session creation");
+    assert!(deferred.prev_model_id_captured);
+    assert_eq!(
+        deferred.prev_model_id, None,
+        "the original None is preserved"
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: acp::SessionId::new("none-origin-session"),
+            models: Some(acp::SessionModelState::new(model_b, infos)),
+            scheduler_background_loops: None,
+            web_search_disabled: None,
+        }),
+        &mut app,
+    );
+    let request_id = switch_model_request_id(&effects);
+    dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_c,
+            effort: None,
+            session_only: false,
+            request_id,
+            result: Err(SwitchModelError::Other("rejected".into())),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+    assert_eq!(app.models.current, None);
+    assert_eq!(app.agents[&id].session.models.current, None);
 }
 #[test]
 fn deferred_model_switch_applied_on_worktree_session_created() {
@@ -1869,6 +1966,8 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
         model_id: model_id.clone(),
         effort: None,
         prev_model_id: None,
+        prev_model_id_captured: false,
+        session_only: false,
     });
     let session_id: acp::SessionId = "wt-session".into();
     let effects = dispatch(
@@ -2484,6 +2583,213 @@ fn dispatch_new_session_has_empty_scrollback() {
     let new_id = AgentId(1);
     assert_eq!(app.agents[&new_id].scrollback.len(), 0);
 }
+/// Dashboard attach follows the new session after `/new`.
+#[test]
+fn dispatch_new_session_repoints_dashboard_attached_agent() {
+    use crate::views::dashboard::DashboardRowId;
+    let mut app = test_app_with_agent();
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(0));
+    app.active_view = ActiveView::Agent(AgentId(0));
+    dispatch(Action::NewSession, &mut app);
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(id) if id == AgentId(1)),
+        "new session must switch active view to the new agent"
+    );
+    let d = app.dashboard.as_ref().unwrap();
+    assert_eq!(
+        d.attached_agent,
+        Some(AgentId(1)),
+        "attached_agent must re-point after /new so overlay back-out keeps working",
+    );
+    assert_eq!(
+        d.selected,
+        Some(DashboardRowId::TopLevel(AgentId(1))),
+        "focus_row must move selection to the new agent row",
+    );
+}
+/// Failed `/new` restores overlay attach to the survivor (not a dead placeholder).
+#[test]
+fn session_failed_orphan_restores_dashboard_attach_to_survivor() {
+    use crate::views::dashboard::DashboardRowId;
+    let mut app = test_app_with_agent();
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(0));
+    app.active_view = ActiveView::Agent(AgentId(0));
+    dispatch(Action::NewSession, &mut app);
+    let fail_id = AgentId(1);
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(id) if id == fail_id),
+        "precondition: /new activated the orphan"
+    );
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().attached_agent,
+        Some(fail_id),
+        "precondition: attach followed /new onto the orphan"
+    );
+    assert!(
+        app.agents[&fail_id].session.session_id.is_none(),
+        "precondition: create has not completed"
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionFailed {
+            agent_id: fail_id,
+            error: "No space left on device".to_string(),
+        }),
+        &mut app,
+    );
+    assert!(!app.agents.contains_key(&fail_id));
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(id) if id == AgentId(0)),
+        "view recovery returns to the survivor"
+    );
+    let d = app.dashboard.as_ref().unwrap();
+    assert_eq!(
+        d.attached_agent,
+        Some(AgentId(0)),
+        "attach must follow back to the survivor so overlay back-out keeps working",
+    );
+    assert_eq!(
+        d.selected,
+        Some(DashboardRowId::TopLevel(AgentId(0))),
+        "row focus must follow attach to the survivor",
+    );
+}
+/// Last-session orphan failure clears overlay attach when returning to Welcome.
+#[test]
+fn session_failed_last_orphan_clears_dashboard_attach() {
+    let mut app = test_app_with_agent();
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(0));
+    app.active_view = ActiveView::Agent(AgentId(0));
+    {
+        let a = app.agents.get_mut(&AgentId(0)).unwrap();
+        a.session.session_id = None;
+        a.session.forked_from = None;
+    }
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionFailed {
+            agent_id: AgentId(0),
+            error: "No space left on device".to_string(),
+        }),
+        &mut app,
+    );
+    assert!(app.agents.is_empty());
+    assert!(matches!(app.active_view, ActiveView::Welcome));
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().attached_agent,
+        None,
+        "Welcome recovery must clear overlay attach",
+    );
+}
+/// `/new` must not invent dashboard attach when none was set.
+#[test]
+fn dispatch_new_session_without_dashboard_attach_leaves_attached_none() {
+    let mut app = test_app_with_agent();
+    ensure_dashboard_state(&mut app);
+    assert!(app.dashboard.as_ref().unwrap().attached_agent.is_none());
+    dispatch(Action::NewSession, &mut app);
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().attached_agent,
+        None,
+        "/new must not enable overlay chrome when the prior session was not attached",
+    );
+}
+#[test]
+fn dispatch_new_session_keeps_stale_attach_on_other_agent() {
+    let mut app = test_app_with_agent();
+    insert_placeholder_agent(&mut app, AgentId(1));
+    app.next_agent_id = 2;
+    app.active_view = ActiveView::Agent(AgentId(0));
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(1));
+    dispatch(Action::NewSession, &mut app);
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(id) if id == AgentId(2)),
+        "new session must switch active view to the new agent"
+    );
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().attached_agent,
+        Some(AgentId(1)),
+        "attach on a different agent must not be re-pointed to the new session",
+    );
+}
+/// Re-point must use top-level `active_view` id, not `get_active_agent`
+/// (subagent child views use placeholder `AgentId(0)`).
+#[test]
+fn dispatch_new_session_repoints_attach_while_subagent_view_open() {
+    use crate::views::dashboard::DashboardRowId;
+    let mut app = test_app();
+    let parent = AgentId(5);
+    let session = make_test_agent_session(&app, parent, "parent-session");
+    let mut parent_view = AgentView::new(session, ScrollbackState::new());
+    let child_session = make_test_agent_session(&app, AgentId(0), "child-session");
+    let child = AgentView::new(child_session, ScrollbackState::new());
+    parent_view
+        .subagent_views
+        .insert("child-sid".into(), Box::new(child));
+    parent_view.active_subagent = Some("child-sid".into());
+    app.agents.insert(parent, parent_view);
+    app.next_agent_id = 6;
+    app.active_view = ActiveView::Agent(parent);
+    assert_eq!(
+        get_active_agent(&app).map(|a| a.session.id),
+        Some(AgentId(0)),
+        "precondition: get_active_agent resolves subagent AgentId(0)"
+    );
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(parent);
+    dispatch(Action::NewSession, &mut app);
+    let new_id = AgentId(6);
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(id) if id == new_id),
+        "new session must switch to the new top-level agent"
+    );
+    let d = app.dashboard.as_ref().unwrap();
+    assert_eq!(
+        d.attached_agent,
+        Some(new_id),
+        "attach must re-point from top-level parent, not subagent AgentId(0)",
+    );
+    assert_eq!(
+        d.selected,
+        Some(DashboardRowId::TopLevel(new_id)),
+        "focus_row must select the new agent row",
+    );
+}
+/// Worktree Always `/new` must re-point attach the same way as plain `/new`.
+#[test]
+fn dispatch_new_worktree_session_repoints_dashboard_attached_agent() {
+    use crate::views::dashboard::DashboardRowId;
+    let mut app = test_app_with_agent();
+    app.cwd_has_git_ancestor = true;
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(0));
+    app.active_view = ActiveView::Agent(AgentId(0));
+    dispatch(
+        Action::NewWorktreeSession {
+            load_session_id: None,
+            label: None,
+            git_ref: None,
+        },
+        &mut app,
+    );
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(id) if id == AgentId(1)),
+        "worktree /new must switch active view to the new agent"
+    );
+    let d = app.dashboard.as_ref().unwrap();
+    assert_eq!(
+        d.attached_agent,
+        Some(AgentId(1)),
+        "attached_agent must re-point after worktree /new so overlay back-out keeps working",
+    );
+    assert_eq!(
+        d.selected,
+        Some(DashboardRowId::TopLevel(AgentId(1))),
+        "focus_row must move selection to the new agent row",
+    );
+}
 #[test]
 fn translate_local_submit_always_returns_persist_always_for_new_session() {
     use crate::views::question_view::{LocalQuestionKind, QuestionViewState};
@@ -2609,6 +2915,16 @@ fn delete_current_session_confirm_emits_effect() {
             .local_kind,
         Some(crate::views::question_view::LocalQuestionKind::DeleteCurrentSession)
     ));
+    assert_eq!(
+        app.agents[&AgentId(0)]
+            .question_view
+            .as_ref()
+            .unwrap()
+            .questions[0]
+            .options[0]
+            .description,
+        "Remove history and return home"
+    );
     assert!(
         dispatch(
             Action::DeleteCurrentSessionAnswered { confirmed: false },
@@ -2638,6 +2954,138 @@ fn delete_current_session_confirm_emits_effect() {
                 after: AfterSessionDelete::Welcome,
                 ..
             }) if session_id == "sess-current"
+        ),
+        "got {effects:?}"
+    );
+}
+#[test]
+fn delete_current_session_confirm_from_dashboard_emits_dashboard_after() {
+    use crate::app::actions::AfterSessionDelete;
+    let mut app = test_app_with_agent();
+    {
+        let a = app.agents.get_mut(&AgentId(0)).unwrap();
+        a.session.session_id = Some(acp::SessionId::new("sess-dashboard"));
+        a.session.cwd = std::path::PathBuf::from("/repo");
+    }
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(0));
+    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
+    assert_eq!(
+        app.agents[&AgentId(0)]
+            .question_view
+            .as_ref()
+            .unwrap()
+            .questions[0]
+            .options[0]
+            .description,
+        "Remove history and return to the dashboard"
+    );
+    let effects = dispatch(
+        Action::DeleteCurrentSessionAnswered { confirmed: true },
+        &mut app,
+    );
+    assert!(
+        matches!(
+            effects.first(),
+            Some(Effect::CancelTurn {
+                cancel_subagents: true,
+                ..
+            })
+        ),
+        "must cancel the turn/subagents before delete, got {effects:?}"
+    );
+    assert!(
+        matches!(
+            effects.last(),
+            Some(Effect::DeleteSession {
+                session_id,
+                after: AfterSessionDelete::Dashboard,
+                ..
+            }) if session_id == "sess-dashboard"
+        ),
+        "got {effects:?}"
+    );
+}
+/// Dashboard state can exist without overlay attach; must still Welcome.
+#[test]
+fn delete_current_session_dashboard_state_without_attach_stays_welcome() {
+    use crate::app::actions::AfterSessionDelete;
+    let mut app = test_app_with_agent();
+    {
+        let a = app.agents.get_mut(&AgentId(0)).unwrap();
+        a.session.session_id = Some(acp::SessionId::new("sess-no-attach"));
+        a.session.cwd = std::path::PathBuf::from("/repo");
+    }
+    ensure_dashboard_state(&mut app);
+    assert!(app.dashboard.as_ref().unwrap().attached_agent.is_none());
+    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
+    assert_eq!(
+        app.agents[&AgentId(0)]
+            .question_view
+            .as_ref()
+            .unwrap()
+            .questions[0]
+            .options[0]
+            .description,
+        "Remove history and return home"
+    );
+    let effects = dispatch(
+        Action::DeleteCurrentSessionAnswered { confirmed: true },
+        &mut app,
+    );
+    assert!(
+        matches!(
+            effects.last(),
+            Some(Effect::DeleteSession {
+                after: AfterSessionDelete::Welcome,
+                ..
+            })
+        ),
+        "got {effects:?}"
+    );
+}
+/// Stale attach on a different agent must not steer /delete to Dashboard.
+#[test]
+fn delete_current_session_stale_attach_other_agent_stays_welcome() {
+    use crate::app::actions::AfterSessionDelete;
+    let mut app = test_app_with_agent();
+    {
+        let a = app.agents.get_mut(&AgentId(0)).unwrap();
+        a.session.session_id = Some(acp::SessionId::new("sess-active"));
+        a.session.cwd = std::path::PathBuf::from("/repo");
+    }
+    let other = AgentId(1);
+    let session = make_test_agent_session(&app, other, "other");
+    app.agents
+        .insert(other, AgentView::new(session, ScrollbackState::new()));
+    app.agents.get_mut(&other).unwrap().session.session_id =
+        Some(acp::SessionId::new("sess-other"));
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(other);
+    app.active_view = ActiveView::Agent(AgentId(0));
+    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
+    assert_eq!(
+        app.agents[&AgentId(0)]
+            .question_view
+            .as_ref()
+            .unwrap()
+            .questions[0]
+            .options[0]
+            .description,
+        "Remove history and return home"
+    );
+    let effects = dispatch(
+        Action::DeleteCurrentSessionAnswered { confirmed: true },
+        &mut app,
+    );
+    assert!(
+        matches!(
+            effects.last(),
+            Some(Effect::DeleteSession {
+                session_id,
+                after: AfterSessionDelete::Welcome,
+                ..
+            }) if session_id == "sess-active"
         ),
         "got {effects:?}"
     );
@@ -2683,6 +3131,36 @@ fn delete_current_session_complete_welcome_and_guard() {
     assert!(matches!(app.active_view, ActiveView::Agent(id) if id == other));
     assert!(!app.agents.contains_key(&AgentId(0)));
     assert!(!effects.iter().any(|e| matches!(e, Effect::Quit)));
+}
+#[test]
+fn delete_current_session_complete_returns_to_dashboard() {
+    use crate::app::actions::{AfterSessionDelete, TaskResult};
+    let mut app = test_app_with_agent();
+    app.agents.get_mut(&AgentId(0)).unwrap().session.session_id =
+        Some(acp::SessionId::new("sess-dash"));
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(0));
+    app.active_view = ActiveView::Agent(AgentId(0));
+    let effects = dispatch_task_result(
+        TaskResult::DeleteSessionComplete {
+            source: "current".into(),
+            session_id: "sess-dash".into(),
+            after: AfterSessionDelete::Dashboard,
+        },
+        &mut app,
+    );
+    assert!(matches!(app.active_view, ActiveView::AgentDashboard));
+    assert!(app.agents.is_empty());
+    assert!(app.dashboard.is_some());
+    assert!(
+        app.dashboard.as_ref().unwrap().attached_agent.is_none(),
+        "delete complete must clear attach on the removed agent"
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::UnregisterActiveSession { .. }))
+    );
 }
 #[test]
 fn entry_title_falls_back_to_short_session_id_when_no_prompt() {

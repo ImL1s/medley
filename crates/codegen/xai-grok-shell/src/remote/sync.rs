@@ -34,7 +34,11 @@ enum SyncMsg {
     Queue(Box<acp::SessionNotification>),
     Flush,
     SetTitle(String),
-    SetModelId(String),
+    SetModel {
+        model_id: String,
+        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+        agent_name: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -80,8 +84,17 @@ impl RemoteSync {
         let _ = self.tx.send(SyncMsg::SetTitle(title));
     }
 
-    pub(crate) fn set_model_id(&self, model_id: String) {
-        let _ = self.tx.send(SyncMsg::SetModelId(model_id));
+    pub(crate) fn set_model(
+        &self,
+        model_id: String,
+        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+        agent_name: Option<String>,
+    ) {
+        let _ = self.tx.send(SyncMsg::SetModel {
+            model_id,
+            catalog_identity,
+            agent_name,
+        });
     }
 }
 
@@ -167,8 +180,12 @@ async fn sync_task(
                     tracing::warn!(?e, "Writeback: failed to sync title to backend");
                 }
             }
-            SyncMsg::SetModelId(id) => {
-                metadata.model_id = Some(id);
+            SyncMsg::SetModel {
+                model_id,
+                catalog_identity,
+                agent_name,
+            } => {
+                apply_model_metadata(&mut metadata, model_id, catalog_identity, agent_name);
                 metadata.updated_at = Some(chrono::Utc::now().to_rfc3339());
                 if let Err(e) = client
                     .save_session_data(&session_id, &[], Some(&metadata))
@@ -178,5 +195,61 @@ async fn sync_task(
                 }
             }
         }
+    }
+}
+
+fn apply_model_metadata(
+    metadata: &mut ExportedMetadata,
+    model_id: String,
+    catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+    agent_name: Option<String>,
+) {
+    metadata.model_id = Some(model_id);
+    metadata.catalog_identity = catalog_identity;
+    metadata.agent_name = agent_name;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_model_metadata;
+
+    #[test]
+    fn model_metadata_update_keeps_id_and_identity_atomic() {
+        let mut metadata = crate::session::export::ExportedMetadata {
+            title: None,
+            cwd: "/tmp".to_owned(),
+            model_id: Some("old-key".to_owned()),
+            catalog_identity: None,
+            agent_name: None,
+            created_at: None,
+            updated_at: None,
+            total_messages: None,
+            parent_session_id: None,
+            session_kind: None,
+            subagent_type: None,
+            subagent_persona: None,
+            subagent_role: None,
+            fork_context_source: None,
+            subagent_depth: None,
+        };
+        let identity = xai_chat_state::CatalogIdentity {
+            model_id: "new-key".to_owned(),
+            route: "new-route".to_owned(),
+            lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        };
+        apply_model_metadata(
+            &mut metadata,
+            "new-key".to_owned(),
+            Some(identity.clone()),
+            Some("codex".to_owned()),
+        );
+        assert_eq!(metadata.model_id.as_deref(), Some("new-key"));
+        assert_eq!(metadata.catalog_identity, Some(identity));
+        assert_eq!(metadata.agent_name.as_deref(), Some("codex"));
+        apply_model_metadata(&mut metadata, "legacy-key".to_owned(), None, None);
+        assert_eq!(metadata.model_id.as_deref(), Some("legacy-key"));
+        assert!(metadata.catalog_identity.is_none());
+        assert!(metadata.agent_name.is_none());
     }
 }

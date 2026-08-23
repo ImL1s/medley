@@ -16,6 +16,10 @@ struct CountingCodexRefresher {
     calls: Arc<AtomicUsize>,
 }
 
+struct ProviderInteractiveRequiredRefresher {
+    calls: Arc<AtomicUsize>,
+}
+
 #[async_trait::async_trait]
 impl crate::auth::refresh::TokenRefresher for CountingCodexRefresher {
     async fn refresh(
@@ -48,6 +52,21 @@ impl crate::auth::refresh::TokenRefresher for AlwaysSucceedRefresher {
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
             ..GrokAuth::test_default()
         }))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::auth::refresh::TokenRefresher for ProviderInteractiveRequiredRefresher {
+    async fn refresh(
+        &self,
+        reason: crate::auth::refresh::RefreshReason,
+    ) -> crate::auth::refresh::RefreshOutcome {
+        assert_eq!(reason, crate::auth::refresh::RefreshReason::ServerRejected);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        crate::auth::refresh::RefreshOutcome::permanent(
+            crate::auth::error::RefreshTokenFailedReason::ProviderInteractiveRequired,
+            None,
+        )
     }
 }
 
@@ -284,6 +303,140 @@ async fn sampler_401_recovery_returns_refresh_and_retry() {
                 "session-based auth with a working refresher must return RefreshAuthAndResubmit"
             );
             assert!(called.load(Ordering::SeqCst), "refresher must be invoked");
+        })
+        .await;
+}
+
+/// A locally live External credential can still be rejected by the backend.
+/// Keep this at the actor seam: the full ACP fixture's cleartext loopback
+/// endpoint must stay ineligible for ambient session credentials, while this
+/// test still proves the real 401 terminal surface end to end.
+#[tokio::test(flavor = "current_thread")]
+async fn external_session_401_surfaces_provider_login_retry_state() {
+    const PROVIDER_LABEL: &str = "Acme SSO";
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth_manager = Arc::new(AuthManager::new(
+                dir.path(),
+                GrokComConfig {
+                    auth_provider_command: Some("acme-auth".to_owned()),
+                    auth_provider_label: Some(PROVIDER_LABEL.to_owned()),
+                    ..GrokComConfig::default()
+                },
+            ));
+            auth_manager.hot_swap(GrokAuth {
+                key: "stale-external-token".to_owned(),
+                auth_mode: AuthMode::External,
+                create_time: chrono::Utc::now() - chrono::Duration::hours(9),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                ..GrokAuth::test_default()
+            });
+            // CI often resembles a devbox. This deployment's only authority is
+            // the operator binary, so automatic OIDC minting must not rescue it.
+            auth_manager.set_devbox_env_for_test(false);
+            let refresh_calls = Arc::new(AtomicUsize::new(0));
+            auth_manager.set_refresher(Arc::new(ProviderInteractiveRequiredRefresher {
+                calls: refresh_calls.clone(),
+            }));
+
+            let (gateway_tx, mut gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let mut actor =
+                create_test_actor(50_000, 100_000, 85, gateway_tx, persistence_tx).await;
+            actor.auth_manager = Some(auth_manager.clone());
+            actor.auth_method_id = test_auth_method_id("cached_token");
+            actor
+                .chat_state_handle
+                .update_credentials(xai_chat_state::Credentials::bound(
+                    Some("stale-external-token".to_owned()),
+                    xai_chat_state::AuthType::SessionToken,
+                    xai_grok_sampler::CredentialSource::XaiSession,
+                ));
+            let actor = Arc::new(actor);
+            pin_first_party_session_model(&actor).await;
+
+            let result = actor.handle_sampling_failure(auth_error()).await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("the provider cannot refresh the rejected credential"),
+            };
+            assert_eq!(
+                refresh_calls.load(Ordering::SeqCst),
+                1,
+                "the rejected credential gets one bounded provider refresh attempt"
+            );
+            let data = error.data.as_ref().expect("a failed turn explains itself");
+            let message = data
+                .get("message")
+                .unwrap_or(data)
+                .as_str()
+                .expect("the turn error message is a string")
+                .to_owned();
+            assert!(
+                !message.contains("no need to run /login"),
+                "the message must not describe a provider-required login as self-healing: {message}"
+            );
+            assert!(
+                message.contains(PROVIDER_LABEL) && message.contains("/login"),
+                "the message must name the provider and the remedy: {message}"
+            );
+            assert!(
+                message
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("Auth:")
+                        && line.contains("External")),
+                "the diagnostics must report the credential's real auth mode: {message}"
+            );
+
+            let (error_type, notified) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let msg = gateway_rx
+                            .recv()
+                            .await
+                            .expect("the actor must emit a terminal retry state");
+                        match msg {
+                            xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                                let _ = args.response_tx.send(Ok(()));
+                            }
+                            xai_acp_lib::AcpClientMessage::ExtNotification(args) => {
+                                let Ok(value) =
+                                    serde_json::from_str::<serde_json::Value>(args.params.get())
+                                else {
+                                    continue;
+                                };
+                                let Some(update) = value.get("update") else {
+                                    continue;
+                                };
+                                if update.get("sessionUpdate").and_then(|v| v.as_str())
+                                    == Some("retry_state")
+                                    && update.get("type").and_then(|v| v.as_str()) == Some("failed")
+                                {
+                                    break (
+                                        update
+                                            .get("error_type")
+                                            .and_then(|v| v.as_str())
+                                            .expect("terminal failure has an error type")
+                                            .to_owned(),
+                                        update
+                                            .get("message")
+                                            .and_then(|v| v.as_str())
+                                            .expect("terminal failure has a message")
+                                            .to_owned(),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .expect("terminal retry state timed out");
+            assert_eq!(error_type, "auth");
+            assert_eq!(notified, message, "the banner and turn error must agree");
         })
         .await;
 }
@@ -1734,6 +1887,7 @@ async fn an_unusable_route_reports_on_the_turn_path_and_stays_quiet_on_the_aux_p
                                 crate::extensions::notification::RetryState::Failed {
                                     error_type,
                                     message,
+                                    ..
                                 },
                             ) = &notif.update
                         {
@@ -3045,7 +3199,10 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("hall-pass", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "hall-pass helper mint");
             assert_eq!(token, "tok-1");
 
             let (actor, persistence_rx) =
@@ -3128,7 +3285,10 @@ async fn sampler_401_on_provider_model_remints_and_resubmits() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("test-4c-recover", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "4c recover helper mint");
             assert_eq!(token, "tok-1");
 
             let (actor, _rx) =
@@ -3169,7 +3329,10 @@ async fn sampler_non_auth_kind_401_on_provider_model_still_recovers() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("test-4c-non-auth-kind", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "4c non-auth-kind helper mint");
 
             let (actor, _rx) =
                 make_actor_with_auth_and_credentials(None, xai_chat_state::AuthType::ApiKey, token)
@@ -3242,7 +3405,10 @@ async fn sampler_401_on_provider_model_never_refreshes_session() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("test-4c-exclusive", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "4c exclusive helper mint");
 
             let called = Arc::new(AtomicBool::new(false));
             let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> =
@@ -3337,7 +3503,10 @@ async fn sampler_401_on_fresh_provider_token_surfaces_error() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("test-4c-guard", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "4c fresh-mint guard helper mint");
 
             let (actor, _rx) = make_actor_with_auth_and_credentials(
                 None,

@@ -300,7 +300,199 @@ pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
+#[cfg(windows)]
+fn path_occupied(path: &Path) -> bool {
+    match path.try_exists() {
+        Ok(true) => true,
+        Ok(false) => false,
+        // An unreadable name still occupies the no-replace slot.
+        Err(_) => true,
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace_finished(source: &Path, target: &Path) -> Option<Result<()>> {
+    let target_here = path_occupied(target);
+    let source_here = path_occupied(source);
+    if target_here && !source_here {
+        return Some(Ok(()));
+    }
+    if target_here {
+        return Some(Err(RelocationError::Collision(target.to_path_buf())));
+    }
+    None
+}
+
+#[cfg(windows)]
+pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_WRITE_ATTRIBUTES, FileRenameInfoEx, SYNCHRONIZE, SetFileInformationByHandle,
+    };
+    use xai_grok_shell_base::util::anchored_directory::AnchoredDirectory;
+
+    if path_occupied(target) {
+        return Err(RelocationError::Collision(target.to_path_buf()));
+    }
+
+    // FILE_RENAME_REPLACE_IF_EXISTS | POSIX | IGNORE_READONLY. Exclusive
+    // POSIX-without-replace is rejected; the dest probe above is the
+    // no-replace gate.
+    const POSIX_REPLACE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0040;
+    let handle_rename = (|| -> Result<()> {
+        let source_file = fs::OpenOptions::new()
+            .access_mode((DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE).0)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+            .open(source)
+            .map_err(|e| io_error("open", source, e))?;
+
+        let mut dest: Vec<u16> = {
+            let absolute =
+                std::path::absolute(target).map_err(|e| io_error("resolve", target, e))?;
+            let raw: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+            let prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+            if raw.starts_with(&prefix) {
+                raw
+            } else {
+                let mut extended = prefix.to_vec();
+                extended.extend(raw);
+                extended
+            }
+        };
+        dest.push(0);
+        let header_len = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let name_bytes = ((dest.len() - 1) * 2) as u32;
+        let total_len = header_len + dest.len() * 2;
+        let slot_count = total_len.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>());
+        let mut storage = vec![std::mem::MaybeUninit::<FILE_RENAME_INFO>::zeroed(); slot_count];
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let result = unsafe {
+            (*info).Anonymous.Flags = POSIX_REPLACE;
+            (*info).RootDirectory = HANDLE::default();
+            (*info).FileNameLength = name_bytes;
+            std::ptr::copy_nonoverlapping(
+                dest.as_ptr().cast::<u8>(),
+                storage.as_mut_ptr().cast::<u8>().add(header_len),
+                dest.len() * 2,
+            );
+            SetFileInformationByHandle(
+                HANDLE(source_file.as_raw_handle()),
+                FileRenameInfoEx,
+                storage.as_ptr().cast(),
+                total_len as u32,
+            )
+        };
+        drop(source_file);
+        if result.is_ok() {
+            return Ok(());
+        }
+        if let Some(done) = rename_no_replace_finished(source, target) {
+            return done;
+        }
+        Err(io_error(
+            "publish",
+            target,
+            io::Error::new(io::ErrorKind::PermissionDenied, "FileRenameInfoEx failed"),
+        ))
+    })();
+    if handle_rename.is_ok() {
+        return handle_rename;
+    }
+    if let Some(done) = rename_no_replace_finished(source, target) {
+        return done;
+    }
+
+    // Holding the source DELETE handle can block MoveFileEx. It is dropped
+    // above before this path rename.
+    if fs::rename(source, target).is_ok() {
+        return Ok(());
+    }
+    if let Some(done) = rename_no_replace_finished(source, target) {
+        return done;
+    }
+
+    let source_parent = source.parent().ok_or_else(|| {
+        RelocationError::Inconsistent(format!("source has no parent: {}", source.display()))
+    })?;
+    let source_name = source.file_name().ok_or_else(|| {
+        RelocationError::Inconsistent(format!("source has no name: {}", source.display()))
+    })?;
+    let target_parent = target.parent().ok_or_else(|| {
+        RelocationError::Inconsistent(format!("target has no parent: {}", target.display()))
+    })?;
+    let target_name = target.file_name().ok_or_else(|| {
+        RelocationError::Inconsistent(format!("target has no name: {}", target.display()))
+    })?;
+    let source_root = AnchoredDirectory::open_root(source_parent)
+        .map_err(|e| io_error("open", source_parent, e))?;
+    let target_root = AnchoredDirectory::open_root(target_parent)
+        .map_err(|e| io_error("open", target_parent, e))?;
+    match source_root.rename_child_dir_no_replace(source_name, &target_root, target_name) {
+        Ok(()) => return Ok(()),
+        Err(error) => {
+            if let Some(done) = rename_no_replace_finished(source, target) {
+                return done;
+            }
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                return Err(RelocationError::Collision(target.to_path_buf()));
+            }
+            if !source.is_dir() {
+                return Err(io_error("publish", target, error));
+            }
+        }
+    }
+
+    // Last resort: move each child so an open SHARE_DELETE writer follows
+    // its file object. The dest name is still exclusive (created here).
+    relocate_tree_no_replace(source, target)
+}
+
+#[cfg(windows)]
+fn relocate_tree_no_replace(source: &Path, target: &Path) -> Result<()> {
+    if path_occupied(target) {
+        return Err(RelocationError::Collision(target.to_path_buf()));
+    }
+    fs::create_dir(target).map_err(|error| match error.kind() {
+        io::ErrorKind::AlreadyExists => RelocationError::Collision(target.to_path_buf()),
+        _ => io_error("create", target, error),
+    })?;
+    let entries = fs::read_dir(source).map_err(|e| io_error("publish", source, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error("publish", source, e))?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|e| io_error("publish", &from, e))?;
+        if file_type.is_dir() {
+            relocate_tree_no_replace(&from, &to)?;
+        } else {
+            rename_no_replace(&from, &to)?;
+        }
+    }
+    match fs::remove_dir(source) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if !path_occupied(source) {
+                Ok(())
+            } else {
+                Err(io_error("publish", source, error))
+            }
+        }
+    }
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos",
+    windows
+)))]
 pub(super) fn rename_no_replace(_source: &Path, _target: &Path) -> Result<()> {
     Err(RelocationError::UnsupportedPublication)
 }
@@ -314,6 +506,73 @@ fn create_new_dir_durable(path: &Path) -> Result<()> {
         RelocationError::Inconsistent(format!("directory has no parent: {}", path.display()))
     })?;
     sync_dir(parent).map_err(|e| io_error("sync", parent, e))
+}
+
+#[cfg(all(
+    test,
+    any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_os = "macos",
+        windows
+    )
+))]
+mod publication_tests {
+    use std::io::Write as _;
+
+    use super::*;
+
+    #[test]
+    fn no_replace_collision_preserves_source_and_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("payload"), b"source-bytes").unwrap();
+        fs::write(target.join("payload"), b"target-bytes").unwrap();
+
+        assert!(matches!(
+            rename_no_replace(&source, &target),
+            Err(RelocationError::Collision(path)) if path == target
+        ));
+        assert_eq!(fs::read(source.join("payload")).unwrap(), b"source-bytes");
+        assert_eq!(fs::read(target.join("payload")).unwrap(), b"target-bytes");
+    }
+
+    #[test]
+    fn no_replace_publish_keeps_open_child_writer_bound_to_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        let event_path = source.join("events.jsonl");
+        let mut writer = {
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).append(true);
+            // Windows cannot rename a directory while a child is open without
+            // delete sharing. Unix ignores this flag.
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                options.share_mode(0x0000_0007);
+            }
+            options.open(&event_path).unwrap()
+        };
+        writer.write_all(b"before\n").unwrap();
+        writer.flush().unwrap();
+
+        rename_no_replace(&source, &target).unwrap();
+        writer.write_all(b"after\n").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(target.join("events.jsonl")).unwrap(),
+            "before\nafter\n"
+        );
+    }
 }
 
 pub(super) fn create_dir_durable(path: &Path) -> Result<()> {

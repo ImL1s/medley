@@ -42,6 +42,75 @@ pub(crate) fn resolve_catalog_key(
     None
 }
 
+/// Resolve a requested id and capture the resolver lineage at the same catalog
+/// read that selected the entry. Callers must carry this identity with the
+/// prepared sampler instead of reconstructing it after a catalog refresh.
+pub(crate) fn resolve_catalog_identity(
+    models: &IndexMap<String, ModelEntry>,
+    id: &acp::ModelId,
+) -> Option<xai_chat_state::CatalogIdentity> {
+    let key = resolve_catalog_key(models, id)?;
+    let entry = models
+        .get(key.0.as_ref())
+        .expect("resolve_catalog_key returns a present key");
+    Some(xai_chat_state::CatalogIdentity {
+        model_id: key.0.to_string(),
+        route: entry.info().model.clone(),
+        lineage: if key == *id {
+            xai_chat_state::CatalogResolutionLineage::ExactKey
+        } else {
+            xai_chat_state::CatalogResolutionLineage::UniqueRoute
+        },
+        auth_scheme: Some(match entry.info().auth_scheme {
+            xai_grok_sampler::AuthScheme::Bearer => xai_chat_state::CatalogAuthScheme::Bearer,
+            xai_grok_sampler::AuthScheme::XApiKey => xai_chat_state::CatalogAuthScheme::XApiKey,
+            xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+        }),
+    })
+}
+
+/// Reconcile a persisted catalog identity with one current catalog snapshot.
+///
+/// Exact-key lineage never follows a reused key to a different route. A
+/// unique-route identity may move to the one current entry that still carries
+/// its committed route, but ambiguity fails closed.
+pub(crate) fn reconcile_persisted_catalog_identity(
+    models: &IndexMap<String, ModelEntry>,
+    persisted: &xai_chat_state::CatalogIdentity,
+) -> Option<xai_chat_state::CatalogIdentity> {
+    let matching_key = models
+        .get(persisted.model_id.as_str())
+        .filter(|entry| entry.info().model == persisted.route)
+        .map(|entry| (persisted.model_id.clone(), entry));
+    let (model_id, entry) = match persisted.lineage {
+        xai_chat_state::CatalogResolutionLineage::ExactKey => matching_key?,
+        xai_chat_state::CatalogResolutionLineage::UniqueRoute => {
+            if let Some(matching_key) = matching_key {
+                matching_key
+            } else {
+                let mut matches = models
+                    .iter()
+                    .filter(|(_, entry)| entry.info().model == persisted.route);
+                let first = matches.next()?;
+                if matches.next().is_some() {
+                    return None;
+                }
+                (first.0.clone(), first.1)
+            }
+        }
+    };
+    Some(xai_chat_state::CatalogIdentity {
+        model_id,
+        route: persisted.route.clone(),
+        lineage: persisted.lineage,
+        auth_scheme: Some(match entry.info().auth_scheme {
+            xai_grok_sampler::AuthScheme::Bearer => xai_chat_state::CatalogAuthScheme::Bearer,
+            xai_grok_sampler::AuthScheme::XApiKey => xai_chat_state::CatalogAuthScheme::XApiKey,
+            xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+        }),
+    })
+}
+
 /// Persisted-model resolver constrained to selectable (`available`) entries.
 ///
 /// Unlike `resolve_catalog_key`, this reports ambiguity explicitly so restore
@@ -108,10 +177,160 @@ pub(crate) fn is_campaign_only_flip(
 /// The fourth return value is `Some(reason)` when an *explicit* configured
 /// preference is present in the catalog but unusable (#131): the id is kept
 /// (no silent substitute) and callers surface the readiness reason.
+/// Full ambient-xAI eligibility for #303 implicit default selection (Pro P1).
+///
+/// Distinct reasons so tests and future policy can pin transitions without
+/// collapsing everything to a single bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AmbientXaiEligibility {
+    /// No ambient first-party path that should keep Grok over ready Codex.
+    Unavailable,
+    /// Explicit `[auth] preferred_method` pin (`api_key` / `oidc`).
+    ExplicitlyPinned,
+    /// Non-blank `XAI_API_KEY` / legacy env or non-empty deployment key.
+    StaticKey,
+    /// Hard-valid first-party session (incl. soft early-invalidation buffer).
+    WireUsableSession,
+    /// Hard-expired first-party session with complete OIDC or external-command
+    /// refresh authority.
+    RefreshableSession,
+}
+
+impl AmbientXaiEligibility {
+    pub(crate) fn is_usable(self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+}
+
+/// Classify ambient first-party xAI for **implicit** default selection (#303).
+///
+/// Does not change [`crate::agent::config::model_readiness`] (first-party
+/// entries stay picker-ready without a live credential for login UX).
+/// Does **not** treat BYOK / Codex as ambient xAI.
+pub(crate) fn classify_ambient_xai_auth(
+    cfg: &config::Config,
+    session: crate::auth::FirstPartySessionEligibility,
+    env_api_key_ok: bool,
+) -> AmbientXaiEligibility {
+    use crate::auth::FirstPartySessionEligibility as Sess;
+    use crate::auth::PreferredAuthMethod;
+    if matches!(
+        cfg.grok_com_config.preferred_method,
+        Some(PreferredAuthMethod::ApiKey) | Some(PreferredAuthMethod::Oidc)
+    ) {
+        return AmbientXaiEligibility::ExplicitlyPinned;
+    }
+    match session {
+        Sess::WireUsable => return AmbientXaiEligibility::WireUsableSession,
+        Sess::Refreshable => return AmbientXaiEligibility::RefreshableSession,
+        Sess::None => {}
+    }
+    // Startup may optimistically classify a present env key before the
+    // `/api-key` probe completes. Once that probe publishes a negative
+    // verdict, every later manager re-resolution must keep that one route
+    // suppressed instead of reviving Grok from presence alone (#303).
+    if env_api_key_ok && crate::agent::auth_method::has_xai_api_key_env() {
+        return AmbientXaiEligibility::StaticKey;
+    }
+    if cfg
+        .endpoints
+        .deployment_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty())
+    {
+        return AmbientXaiEligibility::StaticKey;
+    }
+    AmbientXaiEligibility::Unavailable
+}
+
+/// Whether ambient first-party xAI auth can actually sample right now.
+///
+/// Thin bool wrapper over [`classify_ambient_xai_auth`]. Prefer the classifier
+/// when tests need to assert *why* Grok precedence was preserved.
+///
+/// `has_usable_xai_session` is true when the session half is
+/// [`FirstPartySessionEligibility::WireUsable`] **or**
+/// [`FirstPartySessionEligibility::Refreshable`].
+pub(crate) fn usable_ambient_xai_auth(cfg: &config::Config, has_usable_xai_session: bool) -> bool {
+    use crate::auth::FirstPartySessionEligibility as Sess;
+    let session = if has_usable_xai_session {
+        // Callers that only have a bool (tests / simple paths) map "yes" to
+        // WireUsable so static-key / pin layers still apply correctly.
+        Sess::WireUsable
+    } else {
+        Sess::None
+    };
+    classify_ambient_xai_auth(cfg, session, true).is_usable()
+}
+
+/// Official OpenAI Codex account route (not a third-party CodexResponses shim).
+///
+/// Requires the reserved wire base URL and/or the `openai-codex` auth provider.
+/// Bare `api_backend == CodexResponses` alone is not enough — otherwise a custom
+/// catalog entry could steal #303 default priority without being an OpenAI
+/// Codex account path (Pro P1 taxonomy).
+pub(crate) fn is_openai_codex_account_route(entry: &ModelEntry) -> bool {
+    if !entry.is_openai_codex_profile() {
+        return false;
+    }
+    let official = crate::auth::openai_codex::CODEX_API_BASE_URL.trim_end_matches('/');
+    let base = entry.info.base_url.trim_end_matches('/');
+    if base == official {
+        return true;
+    }
+    entry
+        .auth_provider
+        .as_ref()
+        .is_some_and(|p| p.name == crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID)
+}
+
+/// Shared #303 / login-suppression predicate: ready, picker-visible OpenAI Codex
+/// account entry. Same identity + readiness rules for default selection, warm
+/// reseat, and [`ModelsManager::has_selectable_openai_codex_model`].
+pub(crate) fn is_ready_selectable_openai_codex_entry(
+    entry: &ModelEntry,
+    is_session_auth: bool,
+) -> bool {
+    is_openai_codex_account_route(entry)
+        && entry.info.user_selectable
+        && entry.info.visible_for_auth(is_session_auth)
+        && crate::agent::config::model_readiness(entry).0
+}
+
+/// Bundled / ambient first-party xAI entry (no own credential, first-party origin).
+///
+/// Used to narrow #303 reseat so BYOK / `auth_scheme=none` / third-party routes
+/// are not yanked when a ready Codex catalog appears.
+pub(crate) fn is_first_party_ambient_xai_entry(entry: &ModelEntry) -> bool {
+    if entry.info.api_backend == crate::sampling::ApiBackend::CodexResponses {
+        return false;
+    }
+    if entry.has_own_credentials() {
+        return false;
+    }
+    if entry.info.auth_scheme == xai_grok_sampler::AuthScheme::None {
+        return false;
+    }
+    crate::util::is_xai_api_bearer_url(&entry.info.base_url)
+}
+
 pub(crate) fn resolve_default_model(
     cfg: &config::Config,
     catalog: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
+) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
+    // Test / simple callers: treat OAuth-visible session as usable. Production
+    // `ModelsManager` paths use [`resolve_default_model_with_usable_xai`] with a
+    // non-expired usable-token probe so hard-expired sessions do not pin Grok.
+    let usable_xai = usable_ambient_xai_auth(cfg, is_session_auth);
+    resolve_default_model_with_usable_xai(cfg, catalog, is_session_auth, usable_xai)
+}
+
+pub(crate) fn resolve_default_model_with_usable_xai(
+    cfg: &config::Config,
+    catalog: &IndexMap<String, ModelEntry>,
+    is_session_auth: bool,
+    usable_xai: bool,
 ) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
     // Visible ≠ ready (#133/#131): auth-gated listing must not collapse onto
     // the readiness bool. Ready entries are a separate filter used only when
@@ -130,6 +349,20 @@ pub(crate) fn resolve_default_model(
     let model_pref = configured_preference(cfg);
 
     let first_or_fallback = || -> (String, ModelEntry) {
+        // #303: when there is no usable ambient xAI credential, do not seat the
+        // bundled first-party Grok entry as the implicit default solely because
+        // it sorts first and is picker-ready. Prefer a ready Codex account entry.
+        if !usable_xai
+            && let Some((key, entry)) = ready_visible
+                .iter()
+                .find(|(_, e)| is_ready_selectable_openai_codex_entry(e, is_session_auth))
+        {
+            tracing::info!(
+                model_id = %entry.model,
+                "no usable ambient xAI auth; seating first ready Codex default"
+            );
+            return (key.clone(), entry.clone());
+        }
         if let Some((key, first)) = ready_visible.first() {
             return (key.clone(), first.clone());
         }
@@ -211,14 +444,19 @@ pub(crate) fn resolve_default_model(
                     // authenticate. An unready model is absent from
                     // `ready_visible`, so falling through here lands in the
                     // `found == None` branch where that recovery lives.
-                } else if selectable {
+                } else if selectable
+                    && (usable_xai || !campaign_driven || !is_first_party_ambient_xai_entry(entry))
+                {
                     return (key.clone(), entry.clone(), pref.source, None);
                 }
             }
 
             let found = ready_visible
                 .get_key_value(&pref.value)
-                .or_else(|| ready_visible.iter().find(|(_, m)| m.model == pref.value));
+                .or_else(|| ready_visible.iter().find(|(_, m)| m.model == pref.value))
+                .filter(|(_, entry)| {
+                    usable_xai || !campaign_driven || !is_first_party_ambient_xai_entry(entry)
+                });
 
             if let Some((key, entry)) = found {
                 (key.clone(), entry.clone(), pref.source, None)
@@ -244,6 +482,7 @@ pub(crate) fn resolve_default_model(
                     && let Some((key, entry)) = ready_visible
                         .get_key_value(prev)
                         .or_else(|| ready_visible.iter().find(|(_, m)| m.model == prev))
+                    && (usable_xai || !is_first_party_ambient_xai_entry(entry))
                 {
                     tracing::info!(
                         unavailable = %pref.value, fallback = %prev,
@@ -263,12 +502,92 @@ pub(crate) fn resolve_default_model(
     }
 }
 
+/// Resolve the default while preserving the authoritative-catalog identity
+/// invariant.
+///
+/// Before a real catalog arrives, [`resolve_default_model`] may synthesize the
+/// bundled default as a safe startup sentinel when every locally known entry
+/// is unready. Once a non-empty runtime catalog is authoritative, that same
+/// sentinel would be absent from `catalog`: session setup could then persist
+/// the synthetic id while sampling independently falls back to a real route.
+/// Keep the pre-catalog safety behavior, but seat an actual catalog entry once
+/// the caller says the snapshot is authoritative and at least one entry is
+/// selectable for the current auth mode (#296). An authoritative catalog with
+/// no auth-visible entry publishes the established empty-current state rather
+/// than seating a model the picker deliberately hides.
+pub(crate) fn resolve_default_model_for_catalog(
+    cfg: &config::Config,
+    catalog: &IndexMap<String, ModelEntry>,
+    is_session_auth: bool,
+    authoritative: bool,
+) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
+    let usable_xai = usable_ambient_xai_auth(cfg, is_session_auth);
+    resolve_default_model_for_catalog_with_usable_xai(
+        cfg,
+        catalog,
+        is_session_auth,
+        authoritative,
+        usable_xai,
+    )
+}
+
+pub(crate) fn resolve_default_model_for_catalog_with_usable_xai(
+    cfg: &config::Config,
+    catalog: &IndexMap<String, ModelEntry>,
+    is_session_auth: bool,
+    authoritative: bool,
+    usable_xai: bool,
+) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
+    let resolved = resolve_default_model_with_usable_xai(cfg, catalog, is_session_auth, usable_xai);
+    if !authoritative || catalog.is_empty() {
+        return resolved;
+    }
+
+    if catalog.get(&resolved.0).is_some_and(|entry| {
+        entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
+    }) {
+        return resolved;
+    }
+
+    let Some((key, entry)) = catalog.iter().find(|(_, entry)| {
+        entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
+    }) else {
+        let reason = "no model is selectable for the current authentication mode".to_owned();
+        let mut sentinel = ModelEntry::fallback("", &cfg.endpoints);
+        sentinel.info.user_selectable = false;
+        sentinel.config_validation_errors.push(reason.clone());
+        tracing::error!(
+            synthetic_model_id = %resolved.0,
+            "authoritative catalog has no auth-visible selectable model; publishing an empty current model"
+        );
+        return (
+            String::new(),
+            sentinel,
+            config::ConfigSource::Default,
+            Some(reason),
+        );
+    };
+    let (ready, reason) = crate::agent::config::model_readiness(entry);
+    let reason = (!ready).then(|| reason.unwrap_or_else(|| "model is not ready".to_owned()));
+    tracing::warn!(
+        synthetic_model_id = %resolved.0,
+        selected_model_id = %key,
+        "authoritative catalog has no ready default; seating a present model so identity and readiness stay observable"
+    );
+    (
+        key.clone(),
+        entry.clone(),
+        config::ConfigSource::Default,
+        reason,
+    )
+}
+
 /// The default-model preference the user configured, in precedence order
 /// (`--model` override, `GROK_DEFAULT_MODEL`, `[models] default`, remote).
 ///
 /// Shared by [`resolve_default_model`] and [`substituted_preference`] so the
 /// two can never disagree about *what* was configured.
-fn configured_preference(cfg: &config::Config) -> Option<config::Resolved<String>> {
+pub(crate) fn configured_preference(cfg: &config::Config) -> Option<config::Resolved<String>> {
     config::resolve_string_flag(
         cfg.default_model_override.as_deref(),
         "GROK_DEFAULT_MODEL",
@@ -405,7 +724,7 @@ pub(crate) fn substituted_preference(
 }
 
 /// Filter hidden and auth-gated entries out of `catalog` and convert to ACP wire format.
-pub fn available_models(
+pub(crate) fn available_models(
     catalog: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {
@@ -497,7 +816,7 @@ pub(crate) fn resolve_model_catalog(
     if let Some(effort) = cfg.models.default_reasoning_effort
         && let Some(default_id) = cfg.models.default.as_deref()
         && let Some(entry) = catalog.get_mut(default_id)
-        && entry.info.supports_reasoning_effort
+        && model_offers_reasoning_effort(&entry.info, effort)
     {
         entry.info.reasoning_effort = Some(effort);
     }
@@ -514,20 +833,29 @@ pub(crate) fn resolve_model_catalog(
 }
 
 /// Whether `effort` is a value this model will accept on the wire.
-fn model_offers_reasoning_effort(info: &config::ModelInfo, effort: ReasoningEffort) -> bool {
-    if !info.supports_reasoning_effort {
+pub(crate) fn model_offers_reasoning_effort(
+    info: &config::ModelInfo,
+    effort: ReasoningEffort,
+) -> bool {
+    reasoning_effort_is_offered(
+        info.supports_reasoning_effort,
+        &info.reasoning_efforts,
+        effort,
+    )
+}
+
+pub(crate) fn reasoning_effort_is_offered(
+    supports_reasoning_effort: bool,
+    reasoning_efforts: &[ReasoningEffortOption],
+    effort: ReasoningEffort,
+) -> bool {
+    if !supports_reasoning_effort {
         return false;
     }
-    if info.reasoning_efforts.is_empty() {
-        matches!(
-            effort,
-            ReasoningEffort::Low
-                | ReasoningEffort::Medium
-                | ReasoningEffort::High
-                | ReasoningEffort::Xhigh
-        )
+    if reasoning_efforts.is_empty() {
+        crate::agent::session_config::SELECTABLE_REASONING_EFFORTS.contains(&effort)
     } else {
-        info.reasoning_efforts.iter().any(|opt| opt.value == effort)
+        reasoning_efforts.iter().any(|opt| opt.value == effort)
     }
 }
 

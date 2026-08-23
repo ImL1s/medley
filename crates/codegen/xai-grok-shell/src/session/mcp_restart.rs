@@ -132,7 +132,7 @@ use crate::session::mcp_dispatcher::{
 ///
 /// Wall-clock targets: `t=1s, t=5s, t=21s` (cumulative). Total worst-case
 /// window before the task gives up and parks the server is 21 s.
-pub const BACKOFF: [Duration; 3] = [
+pub(crate) const BACKOFF: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(4),
     Duration::from_secs(16),
@@ -147,7 +147,7 @@ pub const BACKOFF: [Duration; 3] = [
 /// applied. Classification keys only off transport close — a server that
 /// stays up while "becoming useful" is never mis-parked, regardless of
 /// how long that takes.
-pub const STABILITY_WINDOW: Duration = Duration::from_secs(30);
+pub(crate) const STABILITY_WINDOW: Duration = Duration::from_secs(30);
 
 /// Consecutive handshake-then-early-exit cycles before auto-restart parks
 /// the server (until a dispatcher-observed `Ready` recovers it — see
@@ -158,7 +158,7 @@ pub const STABILITY_WINDOW: Duration = Duration::from_secs(30);
 /// a stability reset is the dual of that rule and stays deterministic
 /// under `tokio::time::pause`. A rolling wall-clock cap would still allow
 /// infinite restarts spaced just over the window.
-pub const MAX_EARLY_DEATHS: usize = 5;
+pub(crate) const MAX_EARLY_DEATHS: usize = 5;
 
 /// Backoff *between* early-death restart cycles (before the intra-cycle
 /// [`BACKOFF`] ladder). Indexed by `early_deaths - 1` for deaths 1..=5
@@ -166,7 +166,7 @@ pub const MAX_EARLY_DEATHS: usize = 5;
 ///
 /// Strictly non-decreasing so steady-state log/spawn volume stays bounded
 /// without multi-hour waits.
-pub const CYCLE_BACKOFF: [Duration; 5] = [
+pub(crate) const CYCLE_BACKOFF: [Duration; 5] = [
     Duration::from_secs(2),
     Duration::from_secs(8),
     Duration::from_secs(32),
@@ -403,7 +403,7 @@ impl RestartBudget {
 /// `http-mcp-server`) usually drops on a rolling redeploy that takes minutes to bring
 /// a healthy replica back; retrying across ~2.5 min lets it self-heal
 /// instead of parking until the next tool call. 8 attempts total.
-pub const HTTP_RECOVERY_BACKOFF: [Duration; 7] = [
+pub(crate) const HTTP_RECOVERY_BACKOFF: [Duration; 7] = [
     Duration::from_secs(1),
     Duration::from_secs(4),
     Duration::from_secs(16),
