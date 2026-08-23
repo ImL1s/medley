@@ -208,12 +208,34 @@ jobs:
           # packaged. protoc is pinned per platform by SHA-256 (the three Linux
           # and macOS-arm64 digests are the ones already committed in
           # `bin/protoc`; the macOS-x86_64 digest is the same upstream release).
+          #
+          # Three fields exist only to keep the Linux lanes apart (issue #82):
+          #
+          #   libc          `gnu` or `musl` on Linux, empty on macOS. The glibc
+          #                 floor step forks on this, because the gnu probe
+          #                 reads the highest `GLIBC_` symbol and a static musl
+          #                 artifact has none — it would fail for the absence
+          #                 of the thing that proves it correct.
+          #   host_triple   what rustc reports on the runner. Equal to `target`
+          #                 everywhere except a musl lane, where a glibc host
+          #                 builds a musl target of the same architecture.
+          #   cargo_target  passed to `cargo build --target` when non-empty.
+          #                 Empty for the four lanes that build for their host,
+          #                 so their command line is unchanged; the musl lanes
+          #                 must name the triple to pick up the rustflags
+          #                 `.cargo/config.toml` already carries for them.
           - target: aarch64-apple-darwin
             runner: macos-15
+            libc: ''
+            host_triple: aarch64-apple-darwin
+            cargo_target: ''
             protoc_asset: osx-aarch_64
             protoc_sha256: 2b8a3403cd097f95f3ba656e14b76c732b6b26d7f183330b11e36ef2bc028765
           - target: x86_64-apple-darwin
             runner: macos-15-intel
+            libc: ''
+            host_triple: x86_64-apple-darwin
+            cargo_target: ''
             protoc_asset: osx-x86_64
             protoc_sha256: 9a788036d8f9854f7b03c305df4777cf0e54e5b081e25bf15252da87e0e90875
           # Built on 22.04, not 24.04. A dynamically linked glibc binary runs
@@ -227,12 +249,64 @@ jobs:
           # measures the floor that actually resulted.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
+            libc: gnu
+            host_triple: x86_64-unknown-linux-gnu
+            cargo_target: ''
             protoc_asset: linux-x86_64
             protoc_sha256: 3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
+            libc: gnu
+            host_triple: aarch64-unknown-linux-gnu
+            cargo_target: ''
             protoc_asset: linux-aarch_64
             protoc_sha256: 6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32
+          # Static musl archives, added *alongside* the glibc pair rather than
+          # replacing it (issue #82). The gnu archives serve the majority well
+          # — real NSS, real locale semantics — and the floor step keeps
+          # governing them. What they cannot do is run below glibc 2.35 or on a
+          # distribution with no glibc at all, where the failure is the worst
+          # kind: the archive downloads, the checksum verifies, the installer
+          # reports success, and the binary then dies on a missing symbol or a
+          # missing loader. A container-built glibc artifact would only move
+          # that line to 2.34; a static binary retires the problem, and covers
+          # Alpine in the same move.
+          #
+          # This tree had already pre-paid most of the cost before the decision
+          # was taken: `.cargo/config.toml` carries the rustflags and jemalloc
+          # page size for both musl triples, jemalloc (not musl's allocator) is
+          # the shipped global allocator, TLS is rustls with no `openssl-sys`
+          # in the graph, and voice/ALSA is target-gated away from musl.
+          #
+          # Still native runners: a musl binary for the runner's own
+          # architecture runs on that runner, so every archive is still
+          # executed before it is packaged.
+          #
+          # x86_64 ONLY, and the aarch64 half is deferred to #424 rather than
+          # forgotten. The decision on #82 asked for both triples; arm64 turns
+          # out to need something that does not exist. `xai-grok-tools`
+          # embeds ripgrep into the executable on every release build, and
+          # picks the asset by target (build.rs:277-283): x86_64 already gets
+          # `x86_64-unknown-linux-musl`, but aarch64 gets
+          # `aarch64-unknown-linux-gnu`, because upstream ripgrep publishes no
+          # aarch64 musl asset at all — checked against 15.0.0, 14.1.1 and
+          # 14.1.0.
+          #
+          # An aarch64-musl archive would therefore be a static binary with a
+          # glibc-linked `rg` inside it. The step below catches that and
+          # blocks the release, which is the guard working; letting it through
+          # would ship a medley that starts on Alpine and dies at the first
+          # grep — the same silent failure #82 exists to end, moved one layer
+          # in. Fixing it means putting an unpinned, from-source ripgrep
+          # inside the shipped artifact, which is a supply-chain decision to
+          # take deliberately, not a side effect of adding libc lanes.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            libc: musl
+            host_triple: x86_64-unknown-linux-gnu
+            cargo_target: x86_64-unknown-linux-musl
+            protoc_asset: linux-x86_64
+            protoc_sha256: 3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
     steps:
       - name: Check out the release commit
         # Pinned to the resolved commit, never a moving branch: artifacts must
@@ -246,16 +320,62 @@ jobs:
         # Runner images get retired and relabelled. If a label ever resolves to
         # a different architecture, fail here rather than shipping an archive
         # whose name lies about what is inside it.
+        #
+        # A musl lane is the one place where the runner's host triple is not
+        # the packaged triple — ubuntu-22.04 is a glibc host building a musl
+        # target — so the expected host comes from the matrix rather than being
+        # assumed equal to `target`. The architecture is still asserted against
+        # `target` itself, which is the half a relabelled runner would break;
+        # dropping that and comparing only against `host_triple` would let both
+        # sides of the comparison move together and prove nothing.
+        env:
+          TARGET: ${{ matrix.target }}
+          EXPECTED_HOST: ${{ matrix.host_triple }}
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | awk '/^host: /{print $2}')"
+          if [ "$host" != "$EXPECTED_HOST" ]; then
+            echo "::error::runner '${RUNNER_NAME}' has host triple '${host}' but this job expects to build on '${EXPECTED_HOST}' while packaging '${TARGET}'"
+            exit 1
+          fi
+          if [ "${host%%-*}" != "${TARGET%%-*}" ]; then
+            echo "::error::runner '${RUNNER_NAME}' is a '${host%%-*}' machine but this job packages '${TARGET}'; the archive name would lie about what is inside it"
+            exit 1
+          fi
+          echo "Host triple: ${host}; packaging ${TARGET}"
+
+      - name: Install the musl toolchain
+        if: matrix.libc == 'musl'
+        # The runner is a glibc host, so the musl std has to be added to rustup
+        # and a musl C compiler installed for the two C dependencies that reach
+        # a release build: jemalloc — the shipped global allocator, which is
+        # why "musl's allocator is slow" does not apply to this binary — and
+        # aws-lc-sys, which rustls uses and which builds through cmake.
+        #
+        # Nothing in `.cargo/config.toml` needs to change: it already carries
+        # the hardening rustflags for both musl triples and jemalloc's musl
+        # page-size and background-thread settings.
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          host="$(rustc -vV | awk '/^host: /{print $2}')"
-          if [ "$host" != "$TARGET" ]; then
-            echo "::error::runner '${RUNNER_NAME}' has host triple '${host}' but this job packages '${TARGET}'"
-            exit 1
-          fi
-          echo "Host triple: ${host}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools musl-dev cmake
+          rustup target add "$TARGET"
+
+          # cc-rs looks up the compiler as CC_<triple>, with dashes replaced by
+          # underscores and the triple left lower-case; aws-lc-sys hands the
+          # same compiler to cmake as CMAKE_C_COMPILER. Without this both would
+          # compile against the host's glibc headers. TARGET_CC is cc-rs's
+          # triple-independent fallback and applies to target artifacts only,
+          # so host build scripts keep using the system compiler.
+          cc_var="CC_$(printf '%s' "$TARGET" | tr '-' '_')"
+          {
+            echo "${cc_var}=musl-gcc"
+            echo "TARGET_CC=musl-gcc"
+          } >> "$GITHUB_ENV"
+          echo "Set ${cc_var}=musl-gcc"
+          musl-gcc --version | head -n 1
 
       - name: Install pinned protoc
         env:
@@ -312,11 +432,22 @@ jobs:
         # microarchitecture most of the triple does not have.
         env:
           TARGET: ${{ matrix.target }}
+          CARGO_TARGET_TRIPLE: ${{ matrix.cargo_target }}
+          LIBC: ${{ matrix.libc }}
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/rustflags-probe.log"
-          CARGO_TARGET_DIR="${RUNNER_TEMP}/rustflags-probe" \
-            cargo build --release --locked -p xai-grok-version -v > "$log" 2>&1
+          # The probe has to compile for the triple that ships, or it reads the
+          # flags of a target nobody is building: on a musl lane an untargeted
+          # build resolves `.cargo/config.toml` against the runner's *gnu*
+          # host and every assertion below would be about the wrong artifact.
+          if [ -n "$CARGO_TARGET_TRIPLE" ]; then
+            CARGO_TARGET_DIR="${RUNNER_TEMP}/rustflags-probe" \
+              cargo build --release --locked --target "$CARGO_TARGET_TRIPLE" -p xai-grok-version -v > "$log" 2>&1
+          else
+            CARGO_TARGET_DIR="${RUNNER_TEMP}/rustflags-probe" \
+              cargo build --release --locked -p xai-grok-version -v > "$log" 2>&1
+          fi
 
           if ! grep -q 'Running.*rustc' "$log"; then
             echo "::error::the probe compiled nothing, so the assertions below would be vacuous"
@@ -328,6 +459,13 @@ jobs:
           fi
           if ! grep -q 'force-unwind-tables=yes' "$log"; then
             echo "::error::force-unwind-tables=yes was lost for ${TARGET}; release backtraces would be degraded"
+            exit 1
+          fi
+          # The musl triples are the only ones `.cargo/config.toml` hardens
+          # with full RELRO and a non-executable stack. Losing those silently
+          # would ship a weaker binary that still passes every other check.
+          if [ "$LIBC" = musl ] && ! grep -q 'relro' "$log"; then
+            echo "::error::the RELRO / noexecstack link args .cargo/config.toml sets for ${TARGET} did not reach rustc"
             exit 1
           fi
           echo "Effective flags verified for ${TARGET}: no microarch pin, unwind tables intact."
@@ -343,12 +481,39 @@ jobs:
           # (issue #71). It refuses either way — the marker is what turns a
           # blank "unverified build" refusal into medley's upgrade instructions.
           MEDLEY_CHANNEL: medley
+          CARGO_TARGET_TRIPLE: ${{ matrix.cargo_target }}
         run: |
           set -euo pipefail
-          cargo build --release --locked --package "$CARGO_PACKAGE" --bin "$CARGO_BIN"
+          # `--target` moves the output under target/<triple>/, so the path is
+          # published here rather than recomputed by each later step. The four
+          # lanes that build for their own host keep the untargeted command
+          # line they have always used — passing --target there would stop
+          # RUSTFLAGS reaching build scripts, which on macOS is where the
+          # dynamic-lookup link args are needed.
+          if [ -n "$CARGO_TARGET_TRIPLE" ]; then
+            cargo build --release --locked --target "$CARGO_TARGET_TRIPLE" --package "$CARGO_PACKAGE" --bin "$CARGO_BIN"
+            release_bin="target/${CARGO_TARGET_TRIPLE}/release/${CARGO_BIN}"
+          else
+            cargo build --release --locked --package "$CARGO_PACKAGE" --bin "$CARGO_BIN"
+            release_bin="target/release/${CARGO_BIN}"
+          fi
+
+          if [ ! -x "$release_bin" ]; then
+            echo "::error::the build reported success but produced no executable at ${release_bin}"
+            exit 1
+          fi
+          echo "RELEASE_BIN=${release_bin}" >> "$GITHUB_ENV"
+          echo "Built ${release_bin}"
 
       - name: Measure the glibc floor
-        if: runner.os == 'Linux'
+        # Forked by artifact kind rather than branched inside one probe, and
+        # not optional (issue #82). This step proves an artifact correct by
+        # reading the highest versioned glibc symbol out of it; a static musl
+        # artifact has no such symbols, so running it there would fail on the
+        # absence of the very evidence it needs. The musl step below asserts
+        # the opposite property — that there is nothing to measure — and has
+        # its own guard against passing for the wrong reason.
+        if: matrix.libc == 'gnu'
         # The runner image decides how old a distribution can run this archive,
         # and it decides it silently: nothing about a 24.04 build looks
         # different until it reaches a user on 22.04. Read the floor out of the
@@ -359,7 +524,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          bin="target/release/${CARGO_BIN}"
+          bin="${RELEASE_BIN}"
 
           # Versioned glibc symbols look like `GLIBC_2.34` in the dynamic
           # symbol table; the highest one is the floor. `sort -V` orders
@@ -386,6 +551,91 @@ jobs:
             echo "Requires \`GLIBC_${floor}\`; promised floor is \`${LINUX_GLIBC_FLOOR}\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Assert the musl artifact is static and glibc-free
+        if: matrix.libc == 'musl'
+        # The musl half of the forked floor check. A gnu artifact is judged by
+        # the highest glibc version it needs; a musl artifact is judged by
+        # needing no glibc at all — no interpreter to load one, no NEEDED entry
+        # naming one, and no versioned `GLIBC_` token anywhere in the file.
+        # Those three are what make the archive run on Debian 11 and Alpine
+        # alike, and they are the whole reason this lane exists.
+        #
+        # Every assertion here is about something being absent, which is the
+        # dangerous shape: a tool that read nothing at all would satisfy all of
+        # them. So each is paired with a positive fact from the same tool over
+        # the same file, and none of the checks depend on the symbol table,
+        # which `strip` can remove without changing whether the binary is
+        # static.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="${RELEASE_BIN}"
+
+          if ! readelf --file-header --wide "$bin" > "${RUNNER_TEMP}/elf-header.txt" 2>&1; then
+            echo "::error::readelf cannot read ${bin} as an ELF file, so nothing below would mean anything"
+            cat "${RUNNER_TEMP}/elf-header.txt"
+            exit 1
+          fi
+
+          # Positive control for readelf: a real executable has program
+          # headers. Zero of them means the file was not parsed, not that it
+          # has no interpreter.
+          readelf --program-headers --wide "$bin" > "${RUNNER_TEMP}/elf-segments.txt"
+          segments="$(grep -c '^  [A-Z_]\{3,\} ' "${RUNNER_TEMP}/elf-segments.txt" || true)"
+          if [ "${segments:-0}" -lt 4 ]; then
+            echo "::error::read only ${segments} program headers out of ${bin}; the interpreter check below would pass vacuously"
+            cat "${RUNNER_TEMP}/elf-segments.txt"
+            exit 1
+          fi
+
+          # A dynamically linked executable always carries a PT_INTERP naming
+          # its loader. Its absence is what "static" means at load time, and it
+          # holds for both plain-static and static-pie layouts.
+          if grep -q 'INTERP' "${RUNNER_TEMP}/elf-segments.txt"; then
+            interp="$(sed -n 's/.*Requesting program interpreter: \([^]]*\)\].*/\1/p' "${RUNNER_TEMP}/elf-segments.txt")"
+            echo "::error::${TARGET} requests the dynamic loader '${interp}'. A musl archive that needs a loader is not static, and would fail on exactly the distributions this lane exists to reach."
+            exit 1
+          fi
+
+          # And nothing may be left to resolve at run time.
+          readelf --dynamic --wide "$bin" > "${RUNNER_TEMP}/elf-dynamic.txt" 2>&1 || true
+          if grep -q '(NEEDED)' "${RUNNER_TEMP}/elf-dynamic.txt"; then
+            echo "::error::${TARGET} still links against shared libraries:"
+            grep '(NEEDED)' "${RUNNER_TEMP}/elf-dynamic.txt"
+            exit 1
+          fi
+
+          # Positive control for the string scan: any real binary yields
+          # thousands of strings. A short list means `strings` failed to read
+          # the file, and "no GLIBC_ tokens" would then be an artefact of that.
+          strings -a "$bin" > "${RUNNER_TEMP}/elf-strings.txt"
+          string_count="$(wc -l < "${RUNNER_TEMP}/elf-strings.txt" | tr -d ' ')"
+          if [ "${string_count:-0}" -lt 1000 ]; then
+            echo "::error::read only ${string_count} strings out of ${bin}; the glibc-symbol check below would pass vacuously"
+            exit 1
+          fi
+
+          # Versioned glibc references live in .gnu.version_r and .dynstr, both
+          # of which a static binary has no reason to contain. Scanning the
+          # whole file rather than a symbol table catches them wherever they
+          # survive, and keeps working on a stripped artifact.
+          glibc_tokens="$(grep -o 'GLIBC_[0-9][0-9.]*' "${RUNNER_TEMP}/elf-strings.txt" | sort -uV || true)"
+          if [ -n "$glibc_tokens" ]; then
+            echo "::error::${TARGET} carries versioned glibc references, so it is not the static artifact this lane promises:"
+            printf '%s\n' "$glibc_tokens"
+            exit 1
+          fi
+
+          echo "${TARGET}: static (${segments} segments, no PT_INTERP, no NEEDED), no GLIBC_ references in ${string_count} strings."
+
+          {
+            echo "### libc floor — ${TARGET}"
+            echo
+            echo "Static: no interpreter, no \`NEEDED\` entry, and no \`GLIBC_\` reference."
+            echo "Runs below the \`${LINUX_GLIBC_FLOOR}\` floor the gnu archives promise, and on distributions with no glibc at all."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Package the archive
         env:
           TARGET: ${{ matrix.target }}
@@ -398,7 +648,7 @@ jobs:
           dist="${GITHUB_WORKSPACE}/dist"
           mkdir -p "${dist}/${stage}"
 
-          cp "target/release/${CARGO_BIN}" "${dist}/${stage}/${DIST_NAME}"
+          cp "${RELEASE_BIN}" "${dist}/${stage}/${DIST_NAME}"
           chmod 755 "${dist}/${stage}/${DIST_NAME}"
           cp LICENSE "${dist}/${stage}/LICENSE"
 
@@ -434,6 +684,21 @@ jobs:
             *'"distChannel":"medley"'*) ;;
             *)
               echo "::error::binary reports ${dist_output}, which is not stamped as the medley distribution; check that MEDLEY_CHANNEL reached the build step"
+              exit 1
+              ;;
+          esac
+
+          # And that it was built for the triple the archive is named after.
+          # `buildTarget` (issue #100) exists so a binary can answer this
+          # without the repository beside it, which is what makes it the right
+          # signal for gnu-versus-musl rather than a second marker invented
+          # here. Two musl lanes build on glibc hosts, so a lost `--target`
+          # would otherwise produce a dynamically linked binary inside an
+          # archive named `...-musl.tar.gz`.
+          case "$dist_output" in
+            *"\"buildTarget\":\"${TARGET}\""*) ;;
+            *)
+              echo "::error::binary reports ${dist_output}, which was not built for ${TARGET}; the archive name would not match its contents"
               exit 1
               ;;
           esac
@@ -494,6 +759,129 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  musl-portability:
+    # The reason the musl lanes exist is a claim about machines no runner
+    # image is: glibc older than the 2.35 floor, or no glibc at all. Building
+    # the archive proves nothing about that, and neither does running it on the
+    # 22.04 host that built it — which is why the build job's own smoke test
+    # cannot stand in for this one.
+    #
+    # rockylinux:9 and amazonlinux:2023 are both glibc 2.34, the two
+    # distributions issue #82 names by name. Nothing is installed into either
+    # image: a static binary that needs a package installed first is not the
+    # thing being promised.
+    name: musl ${{ matrix.arch }} on ${{ matrix.image }}
+    needs: [meta, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 only, matching the build matrix — see #424 for the arm64
+          # rows, which arrive with the arm64 archive they would test.
+          - arch: x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            image: rockylinux:9
+          - arch: x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            image: amazonlinux:2023
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download the musl archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: medley-archive-${{ matrix.target }}
+          path: dist
+
+      - name: Test the bytes that were packaged
+        # The smoke test is only about the published archive if it is the
+        # published archive. Re-checking the digest the build job computed
+        # costs nothing and rules out a transfer that quietly truncated.
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check --strict "${DIST_NAME}-${VERSION}-${TARGET}.tar.gz.sha256"
+
+      - name: Mint a throwaway CA for the smoke harness
+        # The harness terminates TLS, so it needs a certificate medley will
+        # accept. `GROK_EXTRA_CA_BUNDLE` is the fork's existing opt-in for
+        # additional roots — additive to the webpki set — so no trust store
+        # inside the container has to be touched, and the container keeps
+        # answering the question it was chosen to answer.
+        #
+        # Two days of validity and a key that never leaves the runner: this
+        # exists for the length of one job.
+        run: |
+          set -euo pipefail
+          smoke="${RUNNER_TEMP}/smoke"
+          mkdir -p "$smoke"
+          cp tests/release/musl_smoke_server.py tests/release/musl_smoke.sh "$smoke/"
+
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -sha256 \
+            -keyout "${smoke}/ca.key" -out "${smoke}/ca.pem" \
+            -subj '/CN=medley musl smoke CA' \
+            -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
+            -addext 'keyUsage=critical,keyCertSign,cRLSign'
+
+          openssl req -newkey rsa:2048 -nodes -sha256 \
+            -keyout "${smoke}/server.key" -out "${smoke}/server.csr" \
+            -subj '/CN=medley-smoke.test'
+
+          # rustls goes by subjectAltName and extendedKeyUsage, not the CN, so
+          # a certificate without these is rejected however well-formed it
+          # looks. Written with printf rather than a heredoc because the YAML
+          # block indentation would end up inside the file.
+          printf '%s\n' \
+            'subjectAltName = DNS:medley-smoke.test' \
+            'basicConstraints = critical,CA:FALSE' \
+            'keyUsage = critical,digitalSignature,keyEncipherment' \
+            'extendedKeyUsage = serverAuth' > "${smoke}/leaf.ext"
+
+          openssl x509 -req -in "${smoke}/server.csr" -days 2 -sha256 \
+            -CA "${smoke}/ca.pem" -CAkey "${smoke}/ca.key" -CAcreateserial \
+            -extfile "${smoke}/leaf.ext" -out "${smoke}/server.pem"
+
+          # If the chain does not verify here it will not verify inside the
+          # container either, and the failure there would read as "musl cannot
+          # do TLS" rather than "this job minted a bad certificate".
+          openssl verify -CAfile "${smoke}/ca.pem" "${smoke}/server.pem"
+          openssl x509 -in "${smoke}/server.pem" -noout -text |
+            grep -A1 'Subject Alternative Name'
+
+      - name: Run the archive in ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="${DIST_NAME}-${VERSION}-${TARGET}.tar.gz"
+          docker run --rm \
+            --volume "${RUNNER_TEMP}/smoke:/smoke:ro" \
+            --volume "${GITHUB_WORKSPACE}/dist:/dist:ro" \
+            --workdir /tmp \
+            "$IMAGE" \
+            /bin/sh /smoke/musl_smoke.sh "/dist/${archive}" "$TARGET" "$VERSION"
+
+          {
+            echo "### ${TARGET} on ${IMAGE}"
+            echo
+            echo "Starts, reports its build target, execs a child, resolves a name, and completes a TLS handshake."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   checksums:
     name: Aggregate checksums
     needs: [meta, build]
@@ -522,14 +910,18 @@ jobs:
           cat ./*.tar.gz.sha256 | LC_ALL=C sort -k2 > "$checksums"
           sha256sum --check --strict "$checksums"
           # The per-archive files are kept and published alongside the
-          # aggregate. Checking the aggregate requires all four archives
+          # aggregate. Checking the aggregate requires all five archives
           # present, so a user who downloaded only their own platform would see
-          # three "No such file" errors and a non-zero exit from a verification
+          # four "No such file" errors and a non-zero exit from a verification
           # that actually succeeded for the file they have.
 
+          # Two macOS, two Linux gnu, one Linux musl (x86_64; arm64 musl is
+          # #424). This count is the only thing that notices a matrix lane that
+          # silently stopped uploading — `merge-multiple` is happy with
+          # however many artifacts arrive.
           found="$(find . -name '*.tar.gz' | wc -l | tr -d ' ')"
-          if [ "$found" != "4" ]; then
-            echo "::error::expected 4 archives, found ${found}"
+          if [ "$found" != "5" ]; then
+            echo "::error::expected 5 archives, found ${found}"
             exit 1
           fi
 
@@ -604,7 +996,10 @@ jobs:
 
   publish:
     name: Publish draft release
-    needs: [meta, checksums]
+    # The portability job gates the draft rather than merely reporting: a musl
+    # archive that does not run on the distributions it was added for is worse
+    # than not shipping one, because the installer would start selecting it.
+    needs: [meta, checksums, musl-portability]
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -666,19 +1061,40 @@ jobs:
             echo "\`medley\` installs to \`~/.medley/bin\` and keeps its state in \`~/.medley\`."
             echo "An existing official \`grok\` installation is left untouched."
             echo
-            echo "macOS 15+ on Apple silicon or Intel. Linux archives are dynamically"
-            echo "linked and need **glibc ${LINUX_GLIBC_FLOOR} or newer** — Ubuntu 22.04+,"
-            echo "Debian 12+, Fedora 36+. Distributions on an older glibc (RHEL/Rocky 9"
-            echo "and Amazon Linux 2023 are both 2.34, Debian 11 is 2.31) need a build"
-            echo "from source. The release job measures this floor out of the binary and"
-            echo "fails rather than shipping an archive that would not run."
+            echo "macOS 15+ on Apple silicon or Intel."
+            echo
+            echo "On Linux the installer picks the archive your host can run:"
+            echo
+            echo "| Archive | Linking | Requires |"
+            echo "| --- | --- | --- |"
+            echo "| \`x86_64-unknown-linux-gnu\` | dynamic | glibc ${LINUX_GLIBC_FLOOR}+ |"
+            echo "| \`aarch64-unknown-linux-gnu\` | dynamic | glibc ${LINUX_GLIBC_FLOOR}+ |"
+            echo "| \`x86_64-unknown-linux-musl\` | static | nothing |"
+            echo
+            echo "glibc ${LINUX_GLIBC_FLOOR}+ means Ubuntu 22.04+, Debian 12+, Fedora 36+."
+            echo "The x86_64 musl archive has no libc requirement at all, which covers"
+            echo "RHEL/Rocky 9 and Amazon Linux 2023 (glibc 2.34), Debian 11 (2.31),"
+            echo "and Alpine, where there is no glibc to be below. \`install.sh\` reads"
+            echo "the host's glibc version and downloads it when that is under"
+            echo "${LINUX_GLIBC_FLOOR} or absent; set \`MEDLEY_LIBC=gnu\` or"
+            echo "\`MEDLEY_LIBC=musl\` to choose yourself."
+            echo
+            echo "**There is no static aarch64 build yet.** An arm64 host below the"
+            echo "floor has no archive that runs, and the installer says so instead of"
+            echo "downloading one that will not start. Tracked in issue #424."
+            echo
+            echo "Prefer the gnu archives where they run: they use the system's NSS"
+            echo "and locale support, which a static binary cannot load. The release"
+            echo "job measures the glibc floor out of each gnu binary, and proves the"
+            echo "musl binary needs no loader and names no glibc symbol, rather than"
+            echo "shipping an archive that would not run."
             echo
             echo "### Verify"
             echo
             echo "Each archive ships its own \`.sha256\` next to it. Check that one —"
-            echo "the combined \`${DIST_NAME}-${VERSION}-checksums.txt\` lists all four"
-            echo "platforms, so checking it reports the three archives you did not"
-            echo "download as missing and exits non-zero."
+            echo "the combined \`${DIST_NAME}-${VERSION}-checksums.txt\` lists all five"
+            echo "archives, so checking it reports the four you did not download as"
+            echo "missing and exits non-zero."
             echo
             echo "On Linux:"
             echo

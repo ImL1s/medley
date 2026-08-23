@@ -240,14 +240,23 @@ Releases are published for `aarch64`/`x86_64` macOS and Linux. The installer
 refuses to install into `~/.grok`, never touches an existing `grok` binary, and
 warns when it finds one. Windows is not covered — build from source there.
 
-The Linux archives are dynamically linked and need **glibc 2.35 or newer** —
-Ubuntu 22.04+, Debian 12+, Fedora 36+. Distributions on an older glibc need a
-build from source: RHEL 9, Rocky 9, Alma 9, and Amazon Linux 2023 are all on
-2.34, and Debian 11 and Ubuntu 20.04 on 2.31. The release job measures this
-floor out of each binary and fails rather than publishing an archive that would
-not start, so the number above is asserted, not aspirational. Lowering it —
-static musl builds, or building against an older glibc in a container — is
-tracked in [#82](https://github.com/ImL1s/medley/issues/82).
+The `*-unknown-linux-gnu` archives are dynamically linked and need **glibc 2.35
+or newer** — Ubuntu 22.04+, Debian 12+, Fedora 36+. The release job measures
+that floor out of each binary and fails rather than publishing an archive that
+would not start, so the number is asserted, not aspirational.
+
+For hosts below it there is a **static `x86_64-unknown-linux-musl` archive**,
+which requires no libc at all: RHEL 9, Rocky 9, Alma 9 and Amazon Linux 2023
+(all glibc 2.34), Debian 11 and Ubuntu 20.04 (2.31), and Alpine, where there is
+no glibc to be below. `install.sh` reads the host's glibc version and picks it
+automatically; `MEDLEY_LIBC=gnu` or `MEDLEY_LIBC=musl` overrides the choice.
+Prefer the gnu archives where they run — they use the system's NSS and locale
+support, which a static binary cannot load.
+
+There is **no static aarch64 build yet**, so an arm64 host below the floor
+still needs a build from source; the installer says so rather than downloading
+an archive that would not start. That gap is
+[#424](https://github.com/ImL1s/medley/issues/424).
 
 ### Install upstream Grok Build (official xAI)
 
