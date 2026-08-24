@@ -137,10 +137,24 @@ pub(crate) fn compose_typed_provider_failure(
 /// Calling both outright is what makes the claim above true by construction
 /// rather than by review.
 ///
-/// It is a no-op on genuine banner text, which production already put
-/// through the same two functions: such a detail carries no carrier prefix,
-/// no `from http…` clause and no `Model:` dump, cannot start with `{`,
-/// cannot restate its own headline, and cannot be a 5xx body.
+/// It is a no-op on genuine banner text in almost every case — such a detail
+/// carries no carrier prefix, no `from http…` clause and no `Model:` dump,
+/// cannot start with `{`, cannot restate its own headline, and cannot be a
+/// 5xx body — but **not in all**, and the exception is worth knowing.
+///
+/// `extract_error_detail` is not a fixed point of itself. Its first two
+/// strips are prefix-anchored (`failed after N retries: `, `Internal error: `)
+/// while the carrier strips after them are position-tolerant. At production a
+/// carrier hides that text from the anchored strips; on re-compose the same
+/// text sits at position 0 and they fire. So a genuine
+/// `Bad request (400) — failed after 3 retries: the real reason` re-composes
+/// as `… — the real reason`. Measured: 3 shapes × the 100 4xx codes, 300 of
+/// 2400 round-trips. 5xx is immune because `is_server_fault` drops the body
+/// either way. Text loss on a genuine banner, not a leak.
+///
+/// Reordering the two anchored strips after the carrier strips would make
+/// this function genuinely idempotent and is the real fix; it changes shared
+/// behaviour, so it is tracked separately rather than folded into this P2.
 fn split_existing_banner(raw: &str) -> Option<FormattedRequestFailure> {
     let (headline, detail) = raw.split_once(" \u{2014} ")?;
     let headline = headline.trim();
@@ -751,13 +765,24 @@ fn trim_dangling_separator(s: &str) -> String {
 /// every enclosing `{` unmatched. Measured in a debug build: 2 KiB 5 ms,
 /// 4 KiB 15 ms, 8 KiB 41 ms, 17 KiB 168 ms, 34 KiB 670 ms, 68 KiB 2.7 s.
 ///
-/// 4 KiB caps the retained worst case at ~15 ms while staying far above
-/// anything this module needs to read: the longest detail it can *render* is
-/// ~200 characters ([`crate::app::effects::sanitize_user_error`] truncates
-/// past that), and the largest envelope in this file's fixtures is a few
-/// hundred bytes. The bound is per call, so a body over it behind a carrier
-/// prefix still gets a second chance at the post-strip site in
-/// [`extract_error_detail`] if what remains is under it.
+/// Those figures are one shape (`function(){if(a){`, ~17 bytes per unmatched
+/// open). All-braces is ~8× denser, and `extract_error_detail` calls this
+/// twice, so the retained worst case per *format* is higher than per call:
+/// measured at the bound, ~49 ms for one call and ~93 ms for a format. The
+/// absolute milliseconds are machine- and load-dependent; the ~4× growth per
+/// doubling and the 2× are not.
+///
+/// 4 KiB stays far above anything this module needs to read: the longest
+/// detail it can *render* is ~200 characters
+/// ([`crate::app::effects::sanitize_user_error`] truncates past that), and the
+/// largest envelope in this file's fixtures is a few hundred bytes.
+///
+/// There is no second bite. `extract_error_detail` calls this before the
+/// carrier strips as well as after, so an oversized body has already had
+/// everything from its first `{` cut by the time the strips run — only the two
+/// prefix-anchored strips (~25 and ~16 bytes) precede that call. A readable
+/// envelope just over the bound is therefore dropped unread rather than
+/// extracted, which is the conservative direction and a real discontinuity.
 const MAX_JSON_SCAN: usize = 4 * 1024;
 
 fn extract_from_json(s: &str) -> Option<String> {
