@@ -14,6 +14,12 @@ use crate::sampling::ConversationItem;
 use crate::session::export::ExportedMetadata;
 use xai_grok_shell_base::util::anchored_directory::AnchoredDirectory;
 use xai_grok_workspace::session::file_state::RewindPoint;
+// #406: one definition of the session-lock name derivation, shared with the
+// fresh-create/delete family in `xai_grok_workspace::session::id_lock`. A
+// second copy here made the two families coordinate only by coincidence.
+use xai_grok_workspace::session::id_lock::{
+    session_claim_lock_name, session_claim_lock_stem, session_mutation_lock_name,
+};
 
 use crate::session::signals::SessionSignals;
 use crate::session::storage::relocation::{RelocationError, RelocationView};
@@ -3518,21 +3524,11 @@ impl Drop for FreshSessionClaim {
     }
 }
 
-fn session_claim_lock_stem(session_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(session_id.as_bytes()))
-}
-
+/// The private staging container for one session id, named from the single
+/// shared lock stem so staging and the lease it is published under cannot
+/// disagree about which session they address.
 pub(crate) fn session_stage_container_name(session_id: &str) -> OsString {
     OsString::from(format!("session-{}", session_claim_lock_stem(session_id)))
-}
-
-fn session_claim_lock_name(session_id: &str) -> String {
-    format!("{}.namespace.lock", session_claim_lock_stem(session_id))
-}
-
-fn session_mutation_lock_name(session_id: &str) -> String {
-    format!("{}.mutation.lock", session_claim_lock_stem(session_id))
 }
 
 /// Cross-process ownership for one persisted session id.
