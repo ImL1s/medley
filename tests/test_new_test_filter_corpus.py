@@ -178,12 +178,16 @@ def _workflow_module_filters() -> list[tuple[str, str]]:
     """
 
     per_crate = guard.parse_workflow(WORKFLOW.read_text(encoding="utf-8"))
-    out: set[tuple[str, str]] = set()
+    out: set[tuple[str, str, str]] = set()
     for crate, targets in per_crate.items():
-        for filters in targets.values():
+        for target, filters in targets.items():
             for value in filters:
                 if "::" in value:
-                    out.add((crate, value))
+                    # Keep the TARGET. A filter attached to `--test api` must
+                    # not be resolved against the crate's lib or another test
+                    # binary; dropping it let a same-named module elsewhere
+                    # vouch for it (#458 review).
+                    out.add((crate, target, value))
     return sorted(out)
 
 
@@ -197,9 +201,41 @@ def _files_by_crate() -> dict[str, list[str]]:
     return grouped
 
 
-TEST_FN = re.compile(
-    r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b[\s\S]{0,400}?\bfn\s+([A-Za-z_][A-Za-z0-9_]*)"
-)
+FN_NAME = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _tests_in(source: str) -> list[str]:
+    """Every `#[test]`-marked function name, with no distance limit.
+
+    A `[\\s\\S]{0,400}` window between the marker and its `fn` silently drops a
+    test whose attribute block is longer — the same fixed-window proxy that
+    made `check_envguard_serial.py` read the next item's lock (#458 review).
+    Walking the attribute lines has no such cliff.
+    """
+
+    names: list[str] = []
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if not _is_test_attribute(line):
+            continue
+        cursor, depth = index + 1, 0
+        while cursor < len(lines):
+            candidate = lines[cursor].strip()
+            if depth > 0:
+                depth += candidate.count("[") - candidate.count("]")
+                cursor += 1
+                continue
+            if candidate.startswith("#["):
+                depth = candidate.count("[") - candidate.count("]")
+                cursor += 1
+                continue
+            if candidate.startswith("//") or not candidate:
+                cursor += 1
+                continue
+            break
+        if cursor < len(lines) and (match := FN_NAME.search(lines[cursor])):
+            names.append(match.group(1))
+    return names
 
 
 def _real_tests_by_crate() -> dict[str, list[tuple[str, str]]]:
@@ -220,8 +256,8 @@ def _real_tests_by_crate() -> dict[str, list[tuple[str, str]]]:
         if not crate:
             continue
         source = path.read_text(encoding="utf-8", errors="ignore")
-        for match in TEST_FN.finditer(source):
-            grouped.setdefault(crate, []).append((rel, match.group(1)))
+        for name in _tests_in(source):
+            grouped.setdefault(crate, []).append((rel, name))
     return grouped
 
 # Module filters that resolve to no file in their own crate, because the
@@ -261,10 +297,11 @@ class ModulePathApproximationCorpus(unittest.TestCase):
         cls.by_crate = _real_tests_by_crate()
         cls.unresolvable = {
             (crate, value)
-            for crate, value in cls.filters
+            for crate, target, value in cls.filters
             if not any(
                 guard.selected(fn, path, {value})
                 for path, fn in cls.by_crate.get(crate, [])
+                if target == "*" or target in guard.targets_of(path, crate)
             )
         }
 
@@ -278,7 +315,7 @@ class ModulePathApproximationCorpus(unittest.TestCase):
     def test_the_corpus_includes_filters_without_a_trailing_separator(self):
         # The bug this class had: only trailing-`::` filters were collected.
         self.assertTrue(
-            any(not value.endswith("::") for _crate, value in self.filters),
+            any(not value.endswith("::") for _c, _t, value in self.filters),
             "corpus omits filters that do not end in `::`",
         )
 
