@@ -990,6 +990,12 @@ jobs:
             permission::manager:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             permission::prompter:: -- --nocapture
+          # `permission::resolution` decides which rules apply. Unfiltered, 19 of
+          # its tests failed on every machine with a real `~/.claude` (the user
+          # tier merges into the resolved set) and CI never said a word (#443).
+          # Other `permission::` submodules are still unenrolled — see #408.
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::resolution:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             permission::types:: -- --nocapture
           # Upstream moved these tests into an external `restore_fetch_tests.rs`
