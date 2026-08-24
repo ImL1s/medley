@@ -247,9 +247,14 @@ async fn run_external_auth_provider(
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to start auth provider `{command}`: {e}"))?;
 
-    let stderr_task = if let Some(cb) = on_stderr {
+    let output = if let Some(cb) = on_stderr {
+        let mut stderr_vec = Vec::new();
+        let mut stdout_vec = Vec::new();
         let stderr = child.stderr.take().expect("stderr was set to piped");
-        Some(tokio::spawn(async move {
+        let stdout = child.stdout.take().expect("stdout was set to piped");
+
+        let stderr_fut = async {
+            use tokio::io::AsyncBufReadExt;
             let mut reader = tokio::io::BufReader::new(stderr);
             let mut line = String::new();
             loop {
@@ -260,6 +265,7 @@ async fn run_external_auth_provider(
                         let trimmed = line.trim_end();
                         tracing::debug!(line = trimmed, "auth: provider stderr");
                         cb(trimmed);
+                        stderr_vec.extend_from_slice(line.as_bytes());
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "auth: error reading provider stderr");
@@ -267,22 +273,34 @@ async fn run_external_auth_provider(
                     }
                 }
             }
-        }))
+        };
+        let stdout_fut = async {
+            use tokio::io::AsyncReadExt;
+            let mut reader = stdout;
+            let _ = reader.read_to_end(&mut stdout_vec).await;
+        };
+        let wait_fut = async { child.wait().await };
+        let (status_res, _, _) = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            tokio::join!(wait_fut, stderr_fut, stdout_fut)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("external auth provider `{command}` timed out after 300s"))?;
+        let status = status_res
+            .map_err(|e| anyhow::anyhow!("external auth provider `{command}` IO error: {e}"))?;
+        std::process::Output {
+            status,
+            stdout: stdout_vec,
+            stderr: stderr_vec,
+        }
     } else {
-        None
+        tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            child.wait_with_output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("external auth provider `{command}` timed out after 300s"))?
+        .map_err(|e| anyhow::anyhow!("external auth provider `{command}` IO error: {e}"))?
     };
-
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("external auth provider `{command}` timed out after 300s"))?
-    .map_err(|e| anyhow::anyhow!("external auth provider `{command}` IO error: {e}"))?;
-
-    if let Some(task) = stderr_task {
-        let _ = task.await;
-    }
 
     let mut auth = parse_output(&output)
         .map_err(|e| anyhow::anyhow!("external auth provider `{command}`: {e}"))?;
