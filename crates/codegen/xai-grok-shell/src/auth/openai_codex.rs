@@ -2535,9 +2535,25 @@ mod tests {
         manager.update(initial).await.unwrap();
 
         let path = dir.path().join("auth.json");
-        *super::super::storage::WRITE_STORAGE_FULL_FAULT_PATH
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(path.clone());
+        // RAII, and removes only its own entry: this used to assign the seam
+        // and clear it unconditionally, which disarmed any concurrent
+        // installer and leaked the fault entirely on an early return between
+        // the two statements (#435). It is co-scheduled with the storage-full
+        // tests in `auth::manager` under the `codex_` filter.
+        struct StorageFullFault(std::path::PathBuf);
+        impl Drop for StorageFullFault {
+            fn drop(&mut self) {
+                super::super::storage::remove_fault_path(
+                    &super::super::storage::WRITE_STORAGE_FULL_FAULT_PATHS,
+                    &self.0,
+                );
+            }
+        }
+        super::super::storage::install_fault_path(
+            &super::super::storage::WRITE_STORAGE_FULL_FAULT_PATHS,
+            &path,
+        );
+        let _storage_full = StorageFullFault(path.clone());
         let rotated = GrokAuth {
             key: "rotated-access".into(),
             refresh_token: Some("rotated-refresh".into()),
@@ -2548,9 +2564,7 @@ mod tests {
             ..GrokAuth::default()
         };
         let result = manager.update(rotated).await;
-        *super::super::storage::WRITE_STORAGE_FULL_FAULT_PATH
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+        drop(_storage_full);
 
         assert!(result.is_err());
         assert_eq!(manager.current_or_expired().unwrap().key, "initial-access");
