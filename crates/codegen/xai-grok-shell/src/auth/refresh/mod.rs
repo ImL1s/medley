@@ -166,7 +166,6 @@ impl std::fmt::Debug for SuspectConsumedRt {
 }
 
 /// Outcome of a refresh attempt. Data only -- `refresh_chain` handles mutations.
-#[derive(Debug)]
 #[must_use = "RefreshOutcome encodes a state transition; route it through refresh_chain"]
 pub(crate) enum RefreshOutcome {
     /// Authority returned a fresh token. Caller persists via `update()`.
@@ -264,6 +263,35 @@ impl RefreshOutcome {
         Self::TransientFailure {
             message: message.into(),
             suspect_consumed_rt: Some(suspect),
+        }
+    }
+}
+
+impl std::fmt::Debug for RefreshOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success(auth) => f.debug_tuple("Success").field(auth).finish(),
+            Self::PermanentFailure {
+                error,
+                tried_key,
+                tried_refresh_token,
+            } => f
+                .debug_struct("PermanentFailure")
+                .field("error", error)
+                .field("tried_key_present", &tried_key.is_some())
+                .field(
+                    "tried_refresh_token_present",
+                    &tried_refresh_token.is_some(),
+                )
+                .finish(),
+            Self::TransientFailure {
+                message,
+                suspect_consumed_rt,
+            } => f
+                .debug_struct("TransientFailure")
+                .field("message", message)
+                .field("suspect_consumed_rt", suspect_consumed_rt)
+                .finish(),
         }
     }
 }

@@ -110,12 +110,26 @@ mod tests {
         assert!(expiry_after_seconds(3600).is_some());
     }
 
+    fn success_status() -> std::process::ExitStatus {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit 0"])
+                .status()
+                .unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("true").status().unwrap()
+        }
+    }
+
     /// The provider path reads `refresh_token`, which the bare-token fallback
     /// cannot carry; only JSON output does.
     #[test]
     fn parse_token_output_reads_refresh_token_from_json_only() {
         let ok = |stdout: &str| std::process::Output {
-            status: std::process::Command::new("true").status().unwrap(),
+            status: success_status(),
             stdout: stdout.as_bytes().to_vec(),
             stderr: vec![],
         };
@@ -133,7 +147,7 @@ mod tests {
     #[test]
     fn parse_token_output_rejects_invalid_json_payloads() {
         let ok = |stdout: &str| std::process::Output {
-            status: std::process::Command::new("true").status().unwrap(),
+            status: success_status(),
             stdout: stdout.as_bytes().to_vec(),
             stderr: vec![],
         };
