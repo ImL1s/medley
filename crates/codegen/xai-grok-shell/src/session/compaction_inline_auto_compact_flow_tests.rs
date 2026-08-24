@@ -25,7 +25,7 @@ async fn create_test_actor(
     gateway_tx: mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
     persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
 ) -> SessionActor {
-    let cwd = AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
+    let cwd = AbsPathBuf::new(std::env::temp_dir()).unwrap();
     let fs = Arc::new(MockFs::new(cwd.to_path_buf()));
     let terminal = Arc::new(DummyTerminal {});
     let (hunk_tx, _hunk_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1617,6 +1617,31 @@ async fn get_transcript_path_returns_some_when_file_exists() {
             assert!(actor.transcript_hint().is_none());
             let _ = std::fs::remove_file(&updates_path);
             let _ = std::fs::remove_dir_all(&session_dir);
+        })
+        .await;
+}
+
+/// #259: catalog `auto_compact_token_limit` is an absolute trigger, not
+/// only percent of `context_window`.
+#[tokio::test(flavor = "current_thread")]
+async fn should_auto_compact_honors_catalog_token_limit() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) = mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(180_000, 272_000, 85, gateway_tx, persistence_tx).await;
+            let cw = std::num::NonZeroU64::new(272_000).expect("non-zero");
+            assert!(
+                actor.should_auto_compact(180_000, cw).is_none(),
+                "180k is below 85% of 272k without a catalog limit"
+            );
+            actor.compaction.token_limit.set(Some(180_000));
+            assert!(
+                actor.should_auto_compact(180_000, cw).is_some(),
+                "catalog absolute limit must trigger even below percent-of-window"
+            );
+            assert!(actor.should_auto_compact(179_999, cw).is_none());
         })
         .await;
 }
