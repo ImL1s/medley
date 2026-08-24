@@ -805,5 +805,128 @@ class UnknownVariableIsNotSafe(unittest.TestCase):
         self.assertEqual([f.name for f in found], ["t"])
         self.assertIn("could not be determined", found[0].reason)
 
+
+class ProtectorMustReallyOwnALock(unittest.TestCase):
+    """#449 round 3: owning a lock, not mentioning one."""
+
+    def test_identifier_containing_env_lock_is_not_a_lock_owner(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                let cfg = read_env_lock_setting();
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
+    def test_actual_lock_acquisition_is_a_lock_owner(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                let cfg = ENV_TEST_LOCK.lock().unwrap();
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual(guard.scan_source(src), [])
+
+    def test_helper_that_locks_but_returns_unit_does_not_protect_its_caller(self):
+        src = textwrap.dedent(
+            """\
+            fn set_a() {
+                let _l = ENV_TEST_LOCK.lock().unwrap();
+                unsafe { std::env::set_var("A", "1") };
+            }
+
+            #[test]
+            fn t() {
+                let result = set_a();
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
+    def test_helper_that_returns_the_guard_does_protect_its_caller(self):
+        src = textwrap.dedent(
+            """\
+            fn locked() -> std::sync::MutexGuard<'static, ()> {
+                let g = ENV_TEST_LOCK.lock().unwrap();
+                unsafe { std::env::set_var("A", "1") };
+                g
+            }
+
+            #[test]
+            fn t() {
+                let _held = locked();
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual(guard.scan_source(src), [])
+
+    def test_lock_taken_in_a_nested_block_does_not_protect_after_it(self):
+        # Rust drops the guard at the inner `}`.
+        src = textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                {
+                    let _lock = ENV_TEST_LOCK.lock().unwrap();
+                    unsafe { std::env::set_var("A", "1") };
+                }
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
+
+class MultipleKeysAreHeldJointly(unittest.TestCase):
+    def test_a_lone_test_with_two_keys_does_not_conflict_with_itself(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            #[serial_test::serial(a)]
+            #[serial_test::serial(b)]
+            fn t() {
+                unsafe { std::env::set_var("A", "1") };
+            }
+            """
+        )
+        self.assertEqual(guard.scan_source(src), [])
+
+    def test_two_tests_sharing_one_of_their_keys_do_not_clash(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            #[serial_test::serial(shared)]
+            #[serial_test::serial(a)]
+            fn one() { unsafe { std::env::set_var("A", "1") }; }
+
+            #[test]
+            #[serial_test::serial(shared)]
+            fn two() { unsafe { std::env::set_var("A", "2") }; }
+            """
+        )
+        self.assertEqual(guard.scan_source(src), [])
+
+    def test_two_tests_with_no_key_in_common_still_clash(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            #[serial_test::serial(a)]
+            fn one() { unsafe { std::env::set_var("A", "1") }; }
+
+            #[test]
+            #[serial_test::serial(b)]
+            fn two() { unsafe { std::env::set_var("A", "2") }; }
+            """
+        )
+        self.assertEqual(sorted(f.name for f in guard.scan_source(src)), ["one", "two"])
+
 if __name__ == "__main__":
     unittest.main()

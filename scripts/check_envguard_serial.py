@@ -83,6 +83,13 @@ IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # `ENV_TEST_LOCK` from this one — third instance of one mistake.
 ENV_LOCK_NAME = r"(?:[A-Z0-9_]*ENV[A-Z0-9_]*LOCK|LockedTestEnv|[a-z0-9_]*env_lock)"
 ENV_LOCK_ACQUIRE = re.compile(ENV_LOCK_NAME)
+# A bound RHS owns a lock only if it ACQUIRES one. Searching for the identifier
+# made `let cfg = read_env_lock_setting();` a lock owner and protected every
+# mutation after it (#449 review).
+ENV_LOCK_VALUE = re.compile(
+    r"(?:[A-Z0-9_]*ENV[A-Z0-9_]*LOCK|LockedTestEnv)\s*(?:\.|::)\s*lock\s*\("
+    r"|\b[a-z0-9_]*env_lock\s*\("
+)
 LOCK_CALL = re.compile(r"\.\s*lock\s*\(|::\s*lock\s*\(")
 REEXPORT = re.compile(
     r"pub\s+use\s+(?P<src>[a-z_][a-z0-9_]*)\s*::(?:[A-Za-z0-9_]+\s*::\s*)*"
@@ -565,7 +572,7 @@ def index_env_mutators(sources: list[tuple[Path, str]]) -> EnvMutators:
 
 def _file_helpers(
     source: str, code: str, types: dict[str, bool]
-) -> tuple[dict[str, bool], dict[str, frozenset[str]]]:
+) -> tuple[dict[str, bool], dict[str, frozenset[str]], dict[str, bool]]:
     """Same-file non-test fns that mutate env: do they self-lock, and what do
     they touch?
 
@@ -578,6 +585,7 @@ def _file_helpers(
     impl_spans = [(s, e) for _n, s, e in _impl_blocks(code)]
     helpers: dict[str, bool] = {}
     helper_vars: dict[str, frozenset[str]] = {}
+    returns_guard: dict[str, bool] = {}
     for match in FN_DEF.finditer(code):
         if any(start <= match.start() < end for start, end in impl_spans):
             continue  # an inherent method, reached through its type instead
@@ -586,21 +594,48 @@ def _file_helpers(
         body_range = _fn_body(source, match.end())
         if body_range is None:
             continue
+        # A helper that locks internally and returns `()` releases on return;
+        # binding its result gives the CALLER nothing (#449 review). Only a
+        # helper that hands the guard back can protect its caller.
+        signature = code[match.end() : body_range[0]]
+        hands_back = "->" in signature
         body = code[body_range[0] : body_range[1]]
         uses_guard = any(used in types for used in TYPE_ASSOC_CALL.findall(body))
         if not ENV_MUTATION.search(body) and not uses_guard:
             continue
         name = match.group("name")
-        helpers[name] = helpers.get(name, False) or _env_lock_is_live(body)
+        locks = _env_lock_is_live(body)
+        helpers[name] = helpers.get(name, False) or locks
+        returns_guard[name] = returns_guard.get(name, False) or (locks and hands_back)
         helper_vars[name] = helper_vars.get(name, frozenset()) | frozenset(
             _env_variables(source[body_range[0] : body_range[1]])
         )
-    return helpers, helper_vars
+    return helpers, helper_vars, returns_guard
 
 
 LET_BINDING = re.compile(
     r"let\s+(?P<bind>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]*)?=\s*(?P<rhs>[^;]*);"
 )
+
+
+def _enclosing_block_end(body: str, position: int) -> int:
+    """Offset of the `}` closing the block that contains ``position``.
+
+    Rust drops a binding at its enclosing block, so a guard taken inside a
+    nested block protects nothing after that block closes — but a span running
+    to the end of the body said otherwise (#449 review).
+    """
+
+    depth = 0
+    for index in range(position, len(body)):
+        char = body[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                return index
+            depth -= 1
+    return len(body)
 
 
 def _protected_spans(
@@ -610,6 +645,7 @@ def _protected_spans(
     crate: str,
     file: str,
     name_paths: dict[str, tuple[str, ...]],
+    returning: dict[str, bool] | None = None,
 ) -> list[tuple[int, int]]:
     """`(from, until)` offsets over which serialisation actually holds.
 
@@ -619,19 +655,22 @@ def _protected_spans(
     nothing, and an explicit `drop(x)` ends the span.
     """
 
+    returning = helpers if returning is None else returning
     spans: list[tuple[int, int]] = []
     for match in LET_BINDING.finditer(body):
         bind, rhs = match.group("bind"), match.group("rhs")
         if bind == "_":
             continue
-        holds = bool(re.search(ENV_LOCK_NAME, rhs)) or any(
+        holds = bool(ENV_LOCK_VALUE.search(rhs)) or any(
             mutators.self_locks(t, crate, file, name_paths.get(t, ()))
             for t in TYPE_ASSOC_CALL.findall(rhs)
-        ) or any(helpers.get(f) for f in FREE_CALL.findall(rhs))
+        ) or any(returning.get(f) for f in FREE_CALL.findall(rhs))
         if not holds:
             continue
         released = re.search(r"\bdrop\s*\(\s*" + re.escape(bind) + r"\s*\)", body)
-        spans.append((match.start(), released.start() if released else len(body)))
+        scope_end = _enclosing_block_end(body, match.end())
+        end = min(released.start(), scope_end) if released else scope_end
+        spans.append((match.start(), end))
     return spans
 
 
@@ -719,7 +758,7 @@ def analyze_source(
     code = _code_only(source)
     if mutators is None:
         mutators = index_env_mutators([(path, source)])
-    helpers, helper_vars = _file_helpers(source, code, mutators.types)
+    helpers, helper_vars, returning = _file_helpers(source, code, mutators.types)
     name_paths = _name_paths(code)
     test_count = 0
     raw: list[tuple[re.Match[str], list[str], tuple[int, int]]] = []
@@ -753,7 +792,7 @@ def analyze_source(
             # unprotected (#449 review). Every mutation must fall inside a span
             # where a bound protector is still alive.
             spans = _protected_spans(
-                body, mutators, helpers, crate, path.as_posix(), name_paths
+                body, mutators, helpers, crate, path.as_posix(), name_paths, returning
             )
             sites = _mutation_sites(body, mutators, helpers)
             if sites and all(
@@ -794,7 +833,7 @@ def analyze_source(
     return out
 
 
-def key_map(candidates: list[Candidate]) -> dict[tuple[str, str], set[str]]:
+def key_map(candidates: list[Candidate]) -> dict[tuple[str, str], list[frozenset[str]]]:
     """(test binary, variable) -> the serial keys under which it is mutated.
 
     Scoped per test BINARY: two crates never share a process, so comparing
@@ -804,7 +843,7 @@ def key_map(candidates: list[Candidate]) -> dict[tuple[str, str], set[str]]:
     under two entries is one no keyed `#[serial]` can protect.
     """
 
-    mapping: dict[tuple[str, str], set[str]] = {}
+    mapping: dict[tuple[str, str], list[frozenset[str]]] = {}
     for cand in candidates:
         # Sound tests stay in the map. Unkeyed `#[serial]` and `#[serial(home)]`
         # take DIFFERENT locks and can overlap, so skipping the unkeyed one let
@@ -813,17 +852,31 @@ def key_map(candidates: list[Candidate]) -> dict[tuple[str, str], set[str]]:
         # with a keyed one either. Being sound is about the test itself; it is
         # not a promise to anybody else's key.
         if cand.keyed:
-            label = set(cand.keyed)
+            # Jointly held: a test carrying #[serial(a)] and #[serial(b)] holds
+            # BOTH locks. Recording them as separate labels made the test
+            # conflict with itself (#449 review).
+            label = frozenset(cand.keyed)
         elif cand.regime == "sole-test-in-binary":
             continue  # alone in its process; it cannot clash with anyone
         else:
-            label = {f"<{cand.regime}>"}
+            label = frozenset({f"<{cand.regime}>"})
         for var in cand.variables:
-            mapping.setdefault((cand.group, var), set()).update(label)
+            mapping.setdefault((cand.group, var), []).append(label)
     return mapping
 
 
-def judge(candidates: list[Candidate], keys: dict[tuple[str, str], set[str]]) -> list[Finding]:
+def _shared_key(label_sets: list[frozenset[str]]) -> bool:
+    """Is there one lock every mutation of this variable holds?"""
+
+    if not label_sets:
+        return True
+    common = set(label_sets[0])
+    for other in label_sets[1:]:
+        common &= other
+    return bool(common)
+
+
+def judge(candidates: list[Candidate], keys: dict[tuple[str, str], list[frozenset[str]]]) -> list[Finding]:
     """Apply the key-consistency regime and emit findings.
 
     "Is a keyed `#[serial]` sufficient?" is not a global verdict, it is a
@@ -858,11 +911,17 @@ def judge(candidates: list[Candidate], keys: dict[tuple[str, str], set[str]]) ->
             clashes = sorted(
                 var
                 for var in cand.variables
-                if len(keys.get((cand.group, var), set())) > 1
+                if not _shared_key(keys.get((cand.group, var), []))
             )
             if not clashes:
                 continue
-            other = sorted(keys[(cand.group, clashes[0])] - {cand.keyed[0]})[0]
+            others = sorted(
+                lbl
+                for group in keys[(cand.group, clashes[0])]
+                for lbl in group
+                if lbl not in cand.keyed
+            )
+            other = others[0] if others else "another regime"
             reason = (
                 f"{cand.mention} with keyed #[serial({cand.keyed[0]})], but "
                 f"{clashes[0]} is also mutated under {other}"
