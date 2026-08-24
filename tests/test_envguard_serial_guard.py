@@ -1112,5 +1112,99 @@ class SelfLockingGuardCallIsNotAnUnprotectedSite(unittest.TestCase):
         )
         self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
 
+
+class HelperReturnTypeMustBeAGuard(unittest.TestCase):
+    """#449 round 6: `->` is not "hands back a guard"."""
+
+    def _src(self, ret, tail):
+        return textwrap.dedent(
+            f"""\
+            fn prepare() {ret} {{
+                let l = ENV_TEST_LOCK.lock().unwrap();
+                unsafe {{ std::env::set_var("A", "1") }};
+                {tail}
+            }}
+
+            #[test]
+            fn t() {{
+                let held = prepare();
+                unsafe {{ std::env::set_var("HOME", "/tmp") }};
+            }}
+            """
+        )
+
+    def test_a_bool_return_does_not_protect_the_caller(self):
+        found = guard.scan_source(self._src("-> bool", "true"))
+        self.assertEqual([f.name for f in found], ["t"])
+
+    def test_a_guard_return_does_protect_the_caller(self):
+        src = self._src("-> std::sync::MutexGuard<'static, ()>", "l")
+        self.assertEqual(guard.scan_source(src), [])
+
+
+class HelperLockDiesAtItsLexicalScope(unittest.TestCase):
+    """#449 round 6: scope tracking reached `_protected_spans` and not here."""
+
+    def test_helper_locking_in_a_nested_block_does_not_cover_a_later_mutation(self):
+        src = textwrap.dedent(
+            """\
+            fn prepare() {
+                {
+                    let l = ENV_TEST_LOCK.lock().unwrap();
+                    unsafe { std::env::set_var("A", "1") };
+                }
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+
+            #[test]
+            fn t() {
+                prepare();
+            }
+            """
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
+
+class HelperChainsPropagate(unittest.TestCase):
+    """#449 round 6: a delegating helper has no env call of its own."""
+
+    def test_a_two_hop_chain_is_still_seen(self):
+        src = textwrap.dedent(
+            """\
+            fn inner() {
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+
+            fn outer() {
+                inner();
+            }
+
+            #[test]
+            fn t() {
+                outer();
+            }
+            """
+        )
+        found = guard.scan_source(src)
+        self.assertEqual([f.name for f in found], ["t"])
+
+    def test_the_chain_carries_the_variable_too(self):
+        src = textwrap.dedent(
+            """\
+            fn inner() { unsafe { std::env::set_var("HOME", "/a") }; }
+            fn outer() { inner(); }
+
+            #[test]
+            #[serial_test::serial(a)]
+            fn one() { outer(); }
+
+            #[test]
+            #[serial_test::serial(b)]
+            fn two() { unsafe { std::env::set_var("HOME", "/b") }; }
+            """
+        )
+        found = guard.scan_source(src)
+        self.assertEqual(sorted(f.name for f in found), ["one", "two"])
+
 if __name__ == "__main__":
     unittest.main()
