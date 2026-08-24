@@ -766,14 +766,27 @@ fn replace_auth_file(tmp: &Path, auth_file: &Path) -> std::io::Result<()> {
         // ordinary move. Always use MoveFileExW so first publication receives
         // the same WRITE_THROUGH durability as replacement and avoids an
         // exists-check race.
-        unsafe {
-            MoveFileExW(
-                PCWSTR::from_raw(from.as_ptr()),
-                PCWSTR::from_raw(to.as_ptr()),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
+        // Under high reader contention on Windows, retry transient sharing/access errors.
+        for attempt in 0..50 {
+            let res = unsafe {
+                MoveFileExW(
+                    PCWSTR::from_raw(from.as_ptr()),
+                    PCWSTR::from_raw(to.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if let Err(e) = res {
+                let raw = e.code().0 as u32;
+                // 0x80070005 = ACCESS_DENIED (5), 0x80070020 = SHARING_VIOLATION (32), 0x80070021 = LOCK_VIOLATION (33)
+                if attempt < 49 && matches!(raw, 0x80070005 | 0x80070020 | 0x80070021 | 5 | 32 | 33)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                return Err(std::io::Error::other(e));
+            }
+            return Ok(());
         }
-        .map_err(std::io::Error::other)?;
         Ok(())
     }
     #[cfg(not(windows))]

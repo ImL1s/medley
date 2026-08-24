@@ -3247,13 +3247,22 @@ impl AuthManager {
                 }
                 Err(AuthError::permanent(failed_reason))
             }
-            RefreshOutcome::TransientFailure { message, .. } => {
+            RefreshOutcome::TransientFailure {
+                message,
+                suspect_consumed_rt,
+            } => {
                 tracing::warn!(%message, "auth.refresh.transient_failure");
                 xai_grok_telemetry::unified_log::warn(
                     "auth.refresh.transient_failure",
                     None,
                     Some(serde_json::json!({ "message": &message })),
                 );
+                if let Some(suspect) = suspect_consumed_rt.as_ref() {
+                    let live_lock = _lock
+                        .live(&self.path)
+                        .unwrap_or(crate::auth::storage::LiveAuthFileLock(_lock));
+                    self.record_consumed_sentinel(suspect, "straddled_exchange", &live_lock);
+                }
                 Err(AuthError::transient(message))
             }
         }
