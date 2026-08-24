@@ -156,7 +156,13 @@ async fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_us
             cfg.model = "test".to_string();
             actor.chat_state_handle.update_sampling_config(cfg);
             let creds = actor.chat_state_handle.get_credentials().await;
-            let creds = creds.clone().rebind(Some("test-key".to_string()), creds.auth_type(), creds.source_cloned().unwrap_or(xai_grok_sampling_types::CredentialSource::None));
+            let creds = creds.clone().rebind(
+                Some("test-key".to_string()),
+                creds.auth_type(),
+                creds
+                    .source_cloned()
+                    .unwrap_or(xai_grok_sampling_types::CredentialSource::ModelApiKey),
+            );
             actor.chat_state_handle.update_credentials(creds);
 
             actor

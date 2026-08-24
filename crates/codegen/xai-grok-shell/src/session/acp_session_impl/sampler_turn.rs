@@ -609,7 +609,7 @@ impl SessionActor {
                 stream_tool_calls: None,
             });
         let creds = self.chat_state_handle.get_credentials().await;
-        let catalog_model_id = self.catalog_model_id_str();
+        let catalog_model_id = self.catalog_model_id_or_wire(&cfg.model);
         let (model_facts, model_auth_provider) = self.model_auth_state(&catalog_model_id);
         let auth_method = self.auth_method_id.load();
         let gate = SessionTokenAuthGate::new(
@@ -1169,7 +1169,7 @@ impl SessionActor {
     /// rather than a built `acp::Error` so the single caller reports it before
     /// propagating -- see [`Self::fail_turn_unusable_route`].
     fn unusable_external_route(&self, config: &SamplingConfig) -> Result<(), String> {
-        let catalog_model_id = self.catalog_model_id_str();
+        let catalog_model_id = self.catalog_model_id_or_wire(&config.model);
         let facts = self.model_auth_facts(&catalog_model_id);
         let Some(reason) = facts.readiness.unusable_reason() else {
             return Ok(());
@@ -1392,7 +1392,7 @@ impl SessionActor {
             .await
             .map(|c| {
                 (
-                    self.catalog_model_id_str(),
+                    self.catalog_model_id_or_wire(&c.model),
                     c.base_url,
                     c.endpoint_trust,
                     (c.extra_headers, c.env_http_headers),
@@ -1753,7 +1753,13 @@ impl SessionActor {
     /// Soft failures with a still-usable access token still return here
     /// (grace / optimistic send); 401 recovery remains the safety net.
     pub(crate) async fn refresh_token_if_expired(&self) {
-        let current_model_id = self.catalog_model_id_str();
+        let wire_model = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|c| c.model)
+            .unwrap_or_default();
+        let current_model_id = self.catalog_model_id_or_wire(&wire_model);
         if let Some(provider) = self.model_auth_provider(&current_model_id)
             && provider.name == crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID
         {

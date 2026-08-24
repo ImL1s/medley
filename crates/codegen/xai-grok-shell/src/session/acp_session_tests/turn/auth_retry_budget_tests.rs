@@ -130,6 +130,7 @@ async fn session_token_actor(
         context_window: 256_000,
         max_retries: Some(0),
         idle_timeout_secs: Some(30),
+        endpoint_trust: Some(xai_grok_sampler::EndpointTrustClass::FirstPartyXai),
         ..Default::default()
     };
     let (sampler_event_tx, sampler_event_rx) =
@@ -162,12 +163,13 @@ async fn session_token_actor(
     cfg.base_url = server.url();
     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
     cfg.model = "test".to_string();
+    cfg.endpoint_trust = Some(xai_grok_sampling_types::EndpointTrustClass::FirstPartyXai);
     actor.chat_state_handle.update_sampling_config(cfg);
     let creds = actor.chat_state_handle.get_credentials().await;
     let creds = creds.clone().rebind(
         None,
         xai_chat_state::AuthType::SessionToken,
-        xai_grok_sampling_types::CredentialSource::None,
+        xai_grok_sampling_types::CredentialSource::XaiSession,
     );
     actor.chat_state_handle.update_credentials(creds);
 
@@ -179,7 +181,7 @@ async fn session_token_actor(
             model_id: "test".to_string(),
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::NotByok,
-                auth_scheme: Default::default(),
+                auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
                 readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: None,

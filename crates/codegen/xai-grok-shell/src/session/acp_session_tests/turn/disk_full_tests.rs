@@ -124,7 +124,7 @@ async fn actor_with_mock_sampler(
         creds.auth_type(),
         creds
             .source_cloned()
-            .unwrap_or(xai_grok_sampling_types::CredentialSource::None),
+            .unwrap_or(xai_grok_sampling_types::CredentialSource::ModelApiKey),
     );
     actor.chat_state_handle.update_credentials(creds);
 

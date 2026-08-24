@@ -159,6 +159,7 @@ async fn make_actor_with_method_and_credentials(
             auth_type,
             xai_grok_sampling_types::CredentialSource::None,
         ));
+    pin_first_party_session_model(&actor).await;
     (Arc::new(actor), persistence_rx)
 }
 

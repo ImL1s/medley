@@ -1374,6 +1374,17 @@ impl SessionActor {
         self.catalog_model_id.set(id);
         out
     }
+    /// Return the authoritative catalog model id if set, or fall back to the wire model slug.
+    pub(super) fn catalog_model_id_or_wire(&self, wire_model: &str) -> String {
+        let catalog = self.catalog_model_id_str();
+        if !catalog.is_empty() {
+            catalog
+        } else if !wire_model.is_empty() {
+            wire_model.to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
     /// Return the client-side tool-result truncation policy committed with the
     /// active model. Model switches replace this value only after the new
     /// chat generation has been persisted; catalog refreshes do not mutate it
