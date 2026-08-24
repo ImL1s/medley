@@ -1,0 +1,286 @@
+"""Tests for the #439 lint-level CI ratchet in `scripts/`.
+
+The checker exists because `ci.yml`'s clippy job names its crates one at a
+time: a crate that is not named is not linted, and nothing reports either the
+omission or the failures hiding behind it. `xai-grok-workspace` sat with three
+clippy errors while `providers` looked green.
+
+Every fixture here is synthetic. The guard's red direction has to be tested by
+feeding it a workflow with a crate removed, and doing that by editing the real
+`ci.yml` and restoring it afterwards is how a mutated workflow leaks into a
+commit -- so nothing below touches the repository's own tree.
+"""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "scripts"))
+
+from check_unlinted_crates import (  # noqa: E402
+    AllowlistError,
+    evaluate,
+    iter_crates,
+    linted_tokens,
+    load_allowlist,
+    main,
+    workspace_member_dirs,
+)
+
+CLIPPY = "cargo clippy --manifest-path crates/{d}/Cargo.toml --all-targets -- -D warnings"
+
+
+def _write(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(body), encoding="utf-8")
+
+
+def _workspace(root: Path, crates: dict[str, str]) -> None:
+    """`crates` maps member directory name -> package name."""
+    members = "".join(f'    "crates/{d}",\n' for d in sorted(crates))
+    _write(
+        root / "Cargo.toml",
+        f"[workspace]\nresolver = \"2\"\nmembers = [\n{members}]\n",
+    )
+    for directory, name in crates.items():
+        _write(
+            root / "crates" / directory / "Cargo.toml",
+            f'[package]\nname = "{name}"\nversion = "0.1.0"\n',
+        )
+
+
+def _workflow(*lines: str) -> str:
+    return "jobs:\n  lint:\n    steps:\n      - run: |\n" + "".join(
+        f"          {line}\n" for line in lines
+    )
+
+
+class LintedTokens(unittest.TestCase):
+    def test_counts_a_deny_level_all_targets_invocation(self):
+        text = _workflow(CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+    def test_ignores_an_invocation_without_all_targets(self):
+        # `--lib`-only clippy never sees test or bench targets; counting it
+        # would move the job's blind spot inside this guard.
+        text = _workflow(
+            "cargo clippy --manifest-path crates/xai-grok-shell/Cargo.toml --lib -- -D warnings"
+        )
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_ignores_an_invocation_without_deny_warnings(self):
+        text = _workflow(
+            "cargo clippy --manifest-path crates/xai-grok-shell/Cargo.toml --all-targets"
+        )
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_ignores_a_bare_package_mention_from_another_job(self):
+        # A `cargo test -p X` elsewhere in ci.yml says nothing about linting.
+        text = _workflow("cargo test -p xai-grok-shell --lib")
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_joins_line_continuations(self):
+        text = (
+            "      - run: |\n"
+            "          cargo clippy --manifest-path crates/xai-grok-tools/Cargo.toml \\\n"
+            "            --all-targets --features pi -- -D warnings\n"
+        )
+        self.assertEqual(linted_tokens(text), {"xai-grok-tools"})
+
+
+class Corpus(unittest.TestCase):
+    def test_enumerates_from_the_workspace_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _workspace(root, {"alpha": "alpha-crate", "beta": "beta-crate"})
+            self.assertEqual(workspace_member_dirs(root), ["crates/alpha", "crates/beta"])
+            self.assertEqual(
+                sorted(c.name for c in iter_crates(root)),
+                ["alpha-crate", "beta-crate"],
+            )
+
+    def test_a_crate_dir_outside_members_is_not_a_workspace_crate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _workspace(root, {"alpha": "alpha-crate"})
+            _write(
+                root / "crates" / "stray" / "Cargo.toml",
+                '[package]\nname = "stray-crate"\nversion = "0.1.0"\n',
+            )
+            self.assertEqual([c.name for c in iter_crates(root)], ["alpha-crate"])
+
+
+class Allowlist(unittest.TestCase):
+    def test_reads_name_and_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "allow"
+            _write(path, "# header\nalpha-crate = deliberately not linted, see #1\n")
+            self.assertEqual(
+                load_allowlist(path), {"alpha-crate": "deliberately not linted, see #1"}
+            )
+
+    def test_a_missing_reason_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "allow"
+            _write(path, "alpha-crate\n")
+            with self.assertRaises(AllowlistError):
+                load_allowlist(path)
+
+    def test_an_empty_reason_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "allow"
+            _write(path, "alpha-crate =   \n")
+            with self.assertRaises(AllowlistError):
+                load_allowlist(path)
+
+
+class Evaluate(unittest.TestCase):
+    def _root(self, tmp: str) -> Path:
+        root = Path(tmp)
+        _workspace(root, {"alpha": "alpha-crate", "beta": "beta-crate"})
+        return root
+
+    def test_an_unlinted_crate_that_is_not_allowlisted_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            report = evaluate(
+                root=root,
+                workflow_text=_workflow(CLIPPY.format(d="alpha")),
+                allowlisted={},
+            )
+            self.assertEqual(report.new_gaps, frozenset({"beta-crate"}))
+            self.assertFalse(report.ok)
+
+    def test_the_same_crate_allowlisted_is_not_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            report = evaluate(
+                root=root,
+                workflow_text=_workflow(CLIPPY.format(d="alpha")),
+                allowlisted={"beta-crate": "not yet triaged"},
+            )
+            self.assertEqual(report.new_gaps, frozenset())
+            self.assertTrue(report.ok)
+
+    def test_an_allowlisted_crate_that_became_linted_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            report = evaluate(
+                root=root,
+                workflow_text=_workflow(
+                    CLIPPY.format(d="alpha"), CLIPPY.format(d="beta")
+                ),
+                allowlisted={"beta-crate": "not yet triaged"},
+            )
+            self.assertEqual(report.stale, frozenset({"beta-crate"}))
+            self.assertFalse(report.ok)
+
+    def test_an_allowlist_entry_that_is_not_a_workspace_crate_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            report = evaluate(
+                root=root,
+                workflow_text=_workflow(
+                    CLIPPY.format(d="alpha"), CLIPPY.format(d="beta")
+                ),
+                allowlisted={"deleted-crate": "left behind by a rename"},
+            )
+            self.assertEqual(report.unknown, frozenset({"deleted-crate"}))
+            self.assertFalse(report.ok)
+
+
+class MainExitCodes(unittest.TestCase):
+    """Both directions the issue asks for, end to end through `main`."""
+
+    def _tree(self, tmp: str, *, allow: str) -> tuple[Path, Path, Path]:
+        root = Path(tmp)
+        _workspace(root, {"alpha": "alpha-crate", "beta": "beta-crate"})
+        # 20 filler crates so the corpus clears the implausibility floor.
+        filler = {f"f{i}": f"filler-{i}" for i in range(20)}
+        _workspace(root, {"alpha": "alpha-crate", "beta": "beta-crate", **filler})
+        workflow = root / "ci.yml"
+        _write(workflow, _workflow(CLIPPY.format(d="alpha")))
+        allowlist = root / "allow"
+        _write(allowlist, allow)
+        return root, workflow, allowlist
+
+    def test_fails_when_a_crate_is_not_linted_and_not_allowlisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            allow = "".join(f"filler-{i} = not triaged\n" for i in range(20))
+            root, workflow, allowlist = self._tree(tmp, allow=allow)
+            code = main(
+                [
+                    "--workflow", str(workflow),
+                    "--root", str(root),
+                    "--allowlist", str(allowlist),
+                ]
+            )
+            self.assertEqual(code, 1)
+
+    def test_passes_once_that_crate_is_allowlisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            allow = "beta-crate = not triaged\n" + "".join(
+                f"filler-{i} = not triaged\n" for i in range(20)
+            )
+            root, workflow, allowlist = self._tree(tmp, allow=allow)
+            code = main(
+                [
+                    "--workflow", str(workflow),
+                    "--root", str(root),
+                    "--allowlist", str(allowlist),
+                ]
+            )
+            self.assertEqual(code, 0)
+
+    def test_an_implausibly_small_corpus_fails_instead_of_reporting_ok(self):
+        """A broken manifest parse must not read as `no crates, no gaps, ok`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root / "Cargo.toml", "[workspace]\nresolver = \"2\"\n")
+            workflow = root / "ci.yml"
+            _write(workflow, _workflow(CLIPPY.format(d="alpha")))
+            allowlist = root / "allow"
+            _write(allowlist, "")
+            code = main(
+                [
+                    "--workflow", str(workflow),
+                    "--root", str(root),
+                    "--allowlist", str(allowlist),
+                ]
+            )
+            self.assertEqual(code, 1)
+
+
+class RealTree(unittest.TestCase):
+    """The shipped allowlist and workflow must agree with each other."""
+
+    def test_the_repository_is_green_and_the_corpus_is_real(self):
+        code = main(
+            [
+                "--workflow", str(REPO / ".github/workflows/ci.yml"),
+                "--root", str(REPO),
+                "--allowlist", str(REPO / "tests/ci/unlinted-crates.allowlist"),
+            ]
+        )
+        self.assertEqual(code, 0)
+        self.assertGreater(len(iter_crates(REPO)), 20)
+
+    def test_the_issues_motivating_crate_is_linted_not_allowlisted(self):
+        """#439 exists because `xai-grok-workspace` was unlinted and failing.
+
+        Allowlisting it would have made this guard's first run a lie about
+        its own motivating example.
+        """
+        text = (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("xai-grok-workspace", linted_tokens(text))
+        allowlisted = load_allowlist(REPO / "tests/ci/unlinted-crates.allowlist")
+        self.assertNotIn("xai-grok-workspace", allowlisted)
+
+
+if __name__ == "__main__":
+    unittest.main()

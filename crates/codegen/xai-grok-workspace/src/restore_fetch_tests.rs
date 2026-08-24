@@ -508,10 +508,10 @@ fn fetch_timeout_kills_process_group_with_grandchild() {
     let grandchild: u32 = {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Ok(contents) = std::fs::read_to_string(&pidfile) {
-                if let Ok(pid) = contents.trim().parse() {
-                    break pid;
-                }
+            if let Ok(contents) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = contents.trim().parse()
+            {
+                break pid;
             }
             assert!(
                 Instant::now() < deadline,
