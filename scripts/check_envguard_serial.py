@@ -94,6 +94,7 @@ ENV_VAR_ARG = re.compile(
     r"(?:\"(?P<lit>[^\"]*)\"|(?P<konst>[A-Z][A-Z0-9_]{2,}))"
 )
 IMPL_HEAD = re.compile(r"\bimpl\b[^{;]*\{")
+MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*[;{]", re.M)
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Serialisation regimes other than unkeyed `#[serial]`. A crate-wide `Mutex`
@@ -615,6 +616,7 @@ def _file_helpers(
     """
 
     impl_spans = [(s, e) for _n, s, e in _impl_blocks(code)]
+    consts = _string_consts(source)
     helpers: dict[str, bool] = {}
     helper_vars: dict[str, frozenset[str]] = {}
     returns_guard: dict[str, bool] = {}
@@ -640,7 +642,7 @@ def _file_helpers(
         helpers[name] = helpers.get(name, False) or locks
         returns_guard[name] = returns_guard.get(name, False) or (locks and hands_back)
         helper_vars[name] = helper_vars.get(name, frozenset()) | frozenset(
-            _env_variables(source[body_range[0] : body_range[1]])
+            _env_variables(source[body_range[0] : body_range[1]], consts)
         )
     return helpers, helper_vars, returns_guard
 
@@ -774,7 +776,23 @@ def _is_integration_target(path: Path) -> bool:
     return "src" not in parts and len(parts) >= 2 and parts[-2] == "tests"
 
 
-def _env_variables(raw_body: str) -> set[str]:
+STR_CONST = re.compile(
+    r"\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*&(?:'static\s+)?str\s*=\s*\"(?P<value>[^\"]*)\""
+)
+
+
+def _string_consts(raw_source: str) -> dict[str, str]:
+    """`const NAME: &str = "VALUE"` in this file.
+
+    Key consistency compares variable NAMES, so a test mutating `HOME_VAR`
+    and one mutating `"HOME"` recorded two different variables and were never
+    compared — although they touch the same process-global (#449 review).
+    """
+
+    return {m.group("name"): m.group("value") for m in STR_CONST.finditer(raw_source)}
+
+
+def _env_variables(raw_body: str, consts: dict[str, str] | None = None) -> set[str]:
     """Names of the env vars a test mutates.
 
     Read from the RAW body: `_code_only` masks string literals, which is
@@ -785,7 +803,8 @@ def _env_variables(raw_body: str) -> set[str]:
     found: set[str] = set()
     for match in ENV_VAR_ARG.finditer(raw_body):
         found.add(match.group("lit") or match.group("konst"))
-    return {v for v in found if v}
+    resolved = consts or {}
+    return {resolved.get(v, v) for v in found if v}
 
 
 def analyze_source(
@@ -802,6 +821,7 @@ def analyze_source(
         mutators = index_env_mutators([(path, source)])
     helpers, helper_vars, returning = _file_helpers(source, code, mutators.types)
     name_paths = _name_paths(code)
+    consts = _string_consts(source)
     test_count = 0
     raw: list[tuple[re.Match[str], list[str], tuple[int, int]]] = []
     for match in FN_DEF.finditer(code):
@@ -842,8 +862,20 @@ def analyze_source(
             # so there is nothing left for a caller span to protect.
             if all(any(start <= site < end for start, end in spans) for site in sites):
                 regime = "lock-covers-every-mutation"
-            elif _is_integration_target(path) and test_count == 1:
-                # Nothing shares its process, so there is no sibling to corrupt.
+            elif (
+                _is_integration_target(path)
+                and test_count == 1
+                and not MOD_DECL.search(code)
+            ):
+                # Nothing shares its process, so there is no sibling to
+                # corrupt -- but only if the target really is this one file.
+                # An integration root declaring modules (`mod common;`,
+                # `#[path = ".."] mod x;`) compiles their tests into the SAME
+                # binary, and `xai-grok-pager` does exactly that with
+                # `tests/pty_e2e/` (#449 review). Counting only local tests
+                # would declare an unprotected mutation isolated. Any module
+                # declaration disqualifies the regime: conservative, and the
+                # test still has four other ways to be sound.
                 regime = "sole-test-in-binary"
         sound = regime != "none"
         keys = tuple(
@@ -860,7 +892,7 @@ def analyze_source(
                 keyed=keys,
                 variables=tuple(
                     sorted(
-                        _env_variables(source[body_range[0] : body_range[1]])
+                        _env_variables(source[body_range[0] : body_range[1]], consts)
                         | {
                             var
                             for call in FREE_CALL.findall(body)

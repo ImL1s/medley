@@ -969,5 +969,60 @@ class HelperLockMustPrecedeItsMutation(unittest.TestCase):
         )
         self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
 
+
+class ConstantsResolveToTheirVariable(unittest.TestCase):
+    """#449 round 5: `HOME_VAR` and `"HOME"` are the same process-global."""
+
+    SRC = textwrap.dedent(
+        """\
+        const HOME_VAR: &str = "HOME";
+
+        #[test]
+        #[serial_test::serial(a)]
+        fn via_const() { unsafe { std::env::set_var(HOME_VAR, "/a") }; }
+
+        #[test]
+        #[serial_test::serial(b)]
+        fn via_literal() { unsafe { std::env::set_var("HOME", "/b") }; }
+        """
+    )
+
+    def test_const_and_literal_are_compared_as_one_variable(self):
+        found = guard.scan_source(self.SRC)
+        self.assertEqual(sorted(f.name for f in found), ["via_const", "via_literal"])
+
+    def test_the_constant_resolves_in_the_candidate(self):
+        by_name = {c.name: c for c in guard.analyze_source(self.SRC)}
+        self.assertIn("HOME", by_name["via_const"].variables)
+        self.assertNotIn("HOME_VAR", by_name["via_const"].variables)
+
+
+class SoleTestRegimeNeedsTheWholeBinary(unittest.TestCase):
+    """#449 round 5: an integration root can pull in more tests."""
+
+    BODY = textwrap.dedent(
+        """\
+        #[test]
+        fn only_local_test() {
+            unsafe { std::env::set_var("HOME", "/tmp") };
+        }
+        """
+    )
+
+    def test_a_single_file_target_is_still_isolated(self):
+        found = guard.scan_source(
+            self.BODY, relpath=Path("crates/codegen/x/tests/solo.rs")
+        )
+        self.assertEqual(found, [])
+
+    def test_a_target_declaring_modules_is_not_assumed_isolated(self):
+        # `mod common;` compiles its tests into the same binary, so "one test
+        # in this file" says nothing about how many share the process.
+        found = guard.scan_source(
+            "mod common;\n" + self.BODY,
+            relpath=Path("crates/codegen/x/tests/root.rs"),
+        )
+        self.assertEqual([f.name for f in found], ["only_local_test"])
+
 if __name__ == "__main__":
     unittest.main()
