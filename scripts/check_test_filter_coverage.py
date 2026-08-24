@@ -51,6 +51,28 @@ _BARE_FLAGS = {"--lib", "--all-targets", "--no-run", "--release", "--all-feature
 _warned_shell_tokens: set[tuple[str, str]] = set()
 
 
+def workspace_members(root: Path) -> set[str]:
+    """Crate names from the root manifest's `[workspace] members`.
+
+    The sweep cannot be derived from the workflow's own `cargo test` lines: a
+    crate whose last test lane is deleted then vanishes from the report, which
+    is the guard going quiet about exactly the change that made all of its tests
+    stop running. Nor from the baseline, which has no entry for a crate that is
+    fully covered -- `xai-grok-auth`, `xai-grok-pager-bin` and `xai-proto-build`
+    are all at 100% and would drop out of both sides (#408 review).
+    """
+    text = (root / "Cargo.toml").read_text()
+    block = re.search(r"^members\s*=\s*\[(.*?)\]", text, re.S | re.M)
+    if not block:
+        return set()
+    names = {
+        Path(m.group(1)).name
+        for m in re.finditer(r'"([^"]+)"', block.group(1))
+        if "*" not in m.group(1)
+    }
+    return names
+
+
 def _crate_from_manifest(path: str) -> str:
     """`crates/codegen/xai-grok-sampler/Cargo.toml` -> `xai-grok-sampler`."""
     return Path(path).parent.name
@@ -86,6 +108,12 @@ def _parse_workflow(text: str):
             continue
         # Drop anything after the `--` separator: those are libtest args
         # (`--nocapture`, `--skip <pat>`), not filters.
+        # `--exact` changes libtest's selection from substring to equality, so a
+        # lane carrying it must be judged by equality too -- otherwise a test
+        # whose path merely *contains* the filter is reported covered by a lane
+        # that will not run it (#408 review).
+        tail = m.group(1).split(" -- ")[1] if " -- " in m.group(1) else ""
+        exact = "--exact" in tail.split()
         args_text = m.group(1).split(" -- ")[0]
         try:
             args = shlex.split(args_text)
@@ -158,10 +186,13 @@ def _parse_workflow(text: str):
             targets = ["*"]
 
         feat = frozenset(features)
+        # An exact filter is recorded with a sentinel prefix so the matcher can
+        # tell the two selection semantics apart without a parallel structure.
+        marked = [(EXACT_PREFIX + f if exact else f) for f in filters]
         if filters:
             for t in targets:
                 per_crate[crate][t].update(filters)
-                by_features[crate][feat][t].update(filters)
+                by_features[crate][feat][t].update(marked)
         elif not has_original_filters:
             # No positional filter and no target restriction: the crate's lib
             # tests run unfiltered, so everything in it is covered. The
@@ -189,6 +220,17 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
     breaking eleven tests to accommodate a refactor is the wrong direction.
     """
     return _parse_workflow(text)[0]
+
+
+# Marks a filter that came from a lane carrying `--exact`, where libtest matches
+# by equality rather than substring.
+EXACT_PREFIX = "\0exact\0"
+
+
+def _selects(filter_: str, test: str) -> bool:
+    if filter_.startswith(EXACT_PREFIX):
+        return filter_[len(EXACT_PREFIX):] == test
+    return filter_ in test
 
 
 # Distinct from an empty listing, which is a legitimate "this crate has no lib
@@ -277,7 +319,18 @@ def main() -> int:
         }
         baseline_crates = {e.split("::", 1)[0] for e in baseline if "::" in e}
 
-    crates = args.crate or sorted(set(per_crate) | baseline_crates)
+    members = workspace_members(args.root)
+    if not args.crate and len(members) < 20:
+        # A manifest this tool cannot parse must read as red, not as "no crates,
+        # no gaps, ok" -- the failure mode this whole check exists to catch.
+        print(
+            f"error: only {len(members)} workspace member(s) parsed from "
+            f"{args.root / 'Cargo.toml'}; refusing to sweep from a corpus that "
+            "small.",
+            file=sys.stderr,
+        )
+        return 2
+    crates = args.crate or sorted(set(per_crate) | baseline_crates | members)
 
     all_uncovered: list[str] = []
     newly_uncovered: list[str] = []
@@ -294,6 +347,20 @@ def main() -> int:
         # crate as fully covered (#408 review: xai-grok-auth read 6/6 while 10
         # `retry_middleware` tests behind `--features middleware` ran nowhere).
         feature_sets = {frozenset()} | set(lanes)
+
+        if args.list_from and any(lanes):
+            # A captured `<crate>.list` has no feature dimension, so every test
+            # in it lands under default features while a `--features` lane's
+            # filters are judged against that lane's own listing. The verdict
+            # would be wrong in both directions, so refuse instead (#408 review).
+            if any(f for f in lanes if f):
+                print(
+                    f"error: {crate} has a --features lane; captured listings "
+                    "cannot express feature sets. Re-run without --list-from.",
+                    file=sys.stderr,
+                )
+                unlistable.append(crate)
+                continue
 
         if args.list_from:
             f = args.list_from / f"{crate}.list"
@@ -339,7 +406,7 @@ def main() -> int:
                 if test not in listings.get(feat, ()):
                     continue
                 fs = target_filters.get("lib", set()) | target_filters.get("*", set())
-                if any(f in test for f in fs):
+                if any(_selects(f, test) for f in fs):
                     return True
             return False
 
@@ -349,7 +416,17 @@ def main() -> int:
             for f in target_filters.get("lib", set()) | target_filters.get("*", set())
         }
         if not lanes:
-            print(f"{crate}: no filter in the workflow at all -- every test in it runs nowhere")
+            # Named loudly rather than silently skipped, which is the vanishing
+            # this sweep was widened to prevent. But its tests are NOT folded
+            # into this baseline: "no lane names this crate at all" is exactly
+            # `check_uncovered_crates.py`'s verdict (#280), and it has its own
+            # allowlist. Two guards owning one fact means two places to grant an
+            # exemption and one of them will drift.
+            print(
+                f"{crate}: no filter in the workflow at all -- deferring to "
+                "check_uncovered_crates.py (#280)"
+            )
+            continue
         missing = [t for t in tests if not _is_covered(t)]
 
         # Baseline hygiene, both directions (#408 review). An entry that a
