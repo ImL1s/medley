@@ -65,11 +65,25 @@ def workspace_members(root: Path) -> set[str]:
     block = re.search(r"^members\s*=\s*\[(.*?)\]", text, re.S | re.M)
     if not block:
         return set()
-    names = {
-        Path(m.group(1)).name
-        for m in re.finditer(r'"([^"]+)"', block.group(1))
-        if "*" not in m.group(1)
-    }
+    names = set()
+    for m in re.finditer(r'"([^"]+)"', block.group(1)):
+        rel = m.group(1)
+        if "*" in rel:
+            continue
+        # The package name is what `-p` takes, and it is NOT reliably the last
+        # path component: `prod/mc/cli-chat-proxy-types` is the package
+        # `prod-mc-cli-chat-proxy-types`. Deriving it from the path is right for
+        # 76 of these 81 and silently wrong for the rest, which surfaced as
+        # `did not match any packages` -- caught only because a failed listing
+        # is fatal (#408 review). Read the manifest.
+        manifest = root / rel / "Cargo.toml"
+        try:
+            decl = re.search(
+                r'^\s*name\s*=\s*"([^"]+)"', manifest.read_text(), re.M
+            )
+        except OSError:
+            decl = None
+        names.add(decl.group(1) if decl else Path(rel).name)
     return names
 
 
