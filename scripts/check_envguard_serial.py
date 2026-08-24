@@ -75,8 +75,47 @@ IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # held for the test's lifetime is exactly as sound (#319 names `serial` only
 # because that is what xai-grok-shell happened to use); `xai-grok-workspace`
 # uses `ENV_TEST_LOCK` + `LockedTestEnv` and is not thereby unprotected.
-LOCK_ACQUIRE = re.compile(
-    r"\.\s*lock\s*\(|::\s*lock\s*\(|\bMutexGuard\b|\b[A-Z][A-Z0-9_]*_LOCK\b"
+# Any `.lock(` used to count, so a test touching an UNRELATED mutex read as
+# serialised against env mutation (#449 review). The lock has to be the one
+# that serialises env, and its guard has to still be alive.
+# Note the leading `*`, not `+`. Requiring one character before `ENV` is the
+# same bug that hid `EnvVarGuard` from the old matcher, and it hid
+# `ENV_TEST_LOCK` from this one — third instance of one mistake.
+ENV_LOCK_NAME = r"(?:[A-Z0-9_]*ENV[A-Z0-9_]*LOCK|LockedTestEnv|[a-z0-9_]*env_lock)"
+ENV_LOCK_ACQUIRE = re.compile(ENV_LOCK_NAME)
+LOCK_CALL = re.compile(r"\.\s*lock\s*\(|::\s*lock\s*\(")
+REEXPORT = re.compile(
+    r"pub\s+use\s+(?P<src>[a-z_][a-z0-9_]*)\s*::(?:[A-Za-z0-9_]+\s*::\s*)*"
+    r"(?P<item>[A-Za-z_][A-Za-z0-9_]*)\s*;"
+)
+# Where a name is brought in from: `use a::b::Name;` or an inline `a::b::Name::`.
+USE_PATH = re.compile(
+    r"use\s+(?P<path>(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)(?P<item>[A-Za-z_][A-Za-z0-9_]*)\s*;"
+)
+INLINE_PATH = re.compile(
+    r"(?P<path>(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)(?P<item>[A-Za-z_][A-Za-z0-9_]*Guard)\s*::"
+)
+
+
+def _crate_from_segment(segment: str) -> str:
+    return segment.replace("_", "-")
+
+
+def _name_paths(code: str) -> dict[str, tuple[str, ...]]:
+    """Name -> the module path it is referred to by, in this file."""
+
+    paths: dict[str, tuple[str, ...]] = {}
+    for pattern in (USE_PATH, INLINE_PATH):
+        for match in pattern.finditer(code):
+            segs = tuple(
+                s.strip() for s in match.group("path").split("::") if s.strip()
+            )
+            paths.setdefault(match.group("item"), segs + (match.group("item"),))
+    return paths
+ENV_LOCK_BINDING = re.compile(
+    r"let\s+(?P<bind>_\b|[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]*)?=\s*[^;]*?"
+    + ENV_LOCK_NAME
+    + r"[^;]*;"
 )
 
 
@@ -291,10 +330,106 @@ class EnvMutators:
     """
 
     types: dict[str, bool]
+    by_crate: dict[tuple[str, str], bool]
     funcs: dict[str, bool]
+    module_alias: dict[tuple[str, str], str]
+    name_alias: dict[tuple[str, str], str]
 
-    def self_locks(self, name: str) -> bool:
-        return bool(self.types.get(name) or self.funcs.get(name))
+    def resolve_crate(self, name: str, crate: str, path: tuple[str, ...]) -> str:
+        """Follow `pub use` re-exports to the crate that DEFINES ``name``.
+
+        `crate::env::EnvVarGuard` in `xai-grok-shell` is
+        `pub use xai_grok_shell_base::env`, whose `env.rs` says
+        `pub use xai_grok_env::EnvVarGuard` — three crates from the use site to
+        the definition, and only the last one knows whether it locks.
+        """
+
+        current = crate
+        for module in path[:-1]:
+            if module in ("crate", "self", "super"):
+                continue
+            current = self.module_alias.get((current, module), current)
+        for _ in range(3):
+            nxt = self.name_alias.get((current, name))
+            if nxt is None or nxt == current:
+                break
+            current = nxt
+        return current
+
+    def self_locks(
+        self,
+        name: str,
+        crate: str | None = None,
+        file: str | None = None,
+        path: tuple[str, ...] = (),
+    ) -> bool:
+        """Does the guard named ``name``, as seen from ``crate``, self-lock?
+
+        Seven distinct types are called `EnvVarGuard` in this repo and they do
+        NOT agree: `xai-grok-env`'s holds a lock, `xai-grok-pager`'s
+        `test_util.rs` does not. Merging them by name with `or` made every use
+        of the pager one read as self-locking and suppressed real findings
+        (#449 review).
+
+        Resolution prefers the definition in the using crate, and otherwise
+        requires ALL definitions of that name to lock — conservative, because
+        the failure direction of a guess here is a silent pass.
+        """
+
+        # File first (a guard declared inside one test module answers only for
+        # that file), then the crate the import actually points at, then this
+        # crate, then the conservative global AND.
+        if file is not None and (file, name) in self.by_crate:
+            return self.by_crate[(file, name)]
+        if crate is not None and path:
+            target = self.resolve_crate(name, crate, path)
+            if (target, name) in self.by_crate:
+                return self.by_crate[(target, name)]
+        if crate is not None and (crate, name) in self.by_crate:
+            return self.by_crate[(crate, name)]
+        if name in self.types:
+            return self.types[name]
+        return bool(self.funcs.get(name))
+
+
+def _env_lock_is_live(body: str) -> bool:
+    """An env lock is acquired AND its guard outlives the mutation.
+
+    `let _ = ENV_LOCK.lock()` drops at the end of that statement and protects
+    nothing; an explicit `drop(guard)` releases it early. Both read as
+    "serialised" if you only look for the token.
+
+    Honest limit: this does not prove the guard outlives every mutation in the
+    body, only that it is bound and not explicitly dropped. Full liveness needs
+    real dataflow; the two shapes above are the ones that occur.
+    """
+
+    for match in ENV_LOCK_BINDING.finditer(body):
+        name = match.group("bind")
+        if name == "_":
+            continue
+        if re.search(r"\bdrop\s*\(\s*" + re.escape(name) + r"\s*\)", body):
+            continue
+        return True
+    return False
+
+
+def _crate_of(path: Path) -> str:
+    parts = path.parts
+    return parts[2] if len(parts) > 2 else str(path)
+
+
+def _process_group(path: Path) -> str:
+    """Which test BINARY this file's tests run in.
+
+    Key consistency only means something inside one process. Tests in two
+    crates never share one, so comparing their keys invents clashes that
+    cannot happen.
+    """
+
+    if _is_integration_target(path):
+        return f"bin:{path.as_posix()}"
+    return f"lib:{_crate_of(path)}"
 
 
 def _impl_blocks(code: str) -> list[tuple[str, int, int]]:
@@ -332,48 +467,100 @@ def index_env_mutators(sources: list[tuple[Path, str]]) -> EnvMutators:
       lock and delegates to `TestEnvGuard::set`, never naming `env::set_var`).
     """
 
-    parsed: list[tuple[str, list[tuple[str, int, int]]]] = []
-    for _rel, source in sources:
+    parsed: list[tuple[Path, str, list[tuple[str, int, int]]]] = []
+    for rel, source in sources:
         code = _code_only(source)
-        parsed.append((code, _impl_blocks(code)))
+        parsed.append((rel, code, _impl_blocks(code)))
 
     has_drop: set[str] = set()
     mutating: dict[str, bool] = {}
+    # Per FILE, not per name: seven distinct types are called `EnvVarGuard`
+    # here, so one global map lets the last file parsed answer for all of them
+    # — the same bare-name collision this function exists to fix.
+    structs_by_file: dict[str, dict[str, str]] = {}
     struct_bodies: dict[str, str] = {}
-    for code, blocks in parsed:
+    per_def: dict[str, list[bool]] = {}
+    by_crate: dict[tuple[str, str], bool] = {}
+    by_file: dict[tuple[str, str], bool] = {}
+    for rel, code, blocks in parsed:
         for match in re.finditer(r"\bimpl\b[^{;]*?\bDrop\b[^{;]*?\bfor\b([^{;]*)\{", code):
             idents = IDENT.findall(match.group(1))
             if idents:
                 has_drop.add(idents[-1])
+        local: dict[str, str] = {}
         for match in re.finditer(r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)[^\n{;]*\{", code):
             open_index = match.end() - 1
-            struct_bodies[match.group(1)] = code[open_index : _balanced_end(code, open_index)]
+            body = code[open_index : _balanced_end(code, open_index)]
+            local[match.group(1)] = body
+            struct_bodies.setdefault(match.group(1), body)
+        structs_by_file[rel.as_posix()] = local
+    for rel, code, blocks in parsed:
+        local = structs_by_file.get(rel.as_posix(), {})
         for name, start, end in blocks:
             block = code[start:end]
-            if ENV_MUTATION.search(block):
-                mutating[name] = mutating.get(name, False) or bool(LOCK_ACQUIRE.search(block))
+            if not ENV_MUTATION.search(block):
+                continue
+            # A guard self-locks when it OWNS the `MutexGuard` — the lock then
+            # lives exactly as long as the guard, which is the property that
+            # matters. Keying on the lock's NAME instead was wrong in both
+            # directions: `xai-grok-shell`'s `EarlyInvalidationGuard` holds
+            # `EARLY_INVALIDATION_LOCK` for its lifetime and is sound despite
+            # the name, while a guard could name a lock it never holds.
+            # Storing a `MutexGuard` field IS the property: the lock then
+            # lives exactly as long as the guard. Requiring a literal `.lock(`
+            # as well was wrong — `xai_grok_env::EnvVarGuard` is built from
+            # `env_lock()`, a helper that returns the guard.
+            locks = "MutexGuard" in local.get(name, "")
+            mutating[name] = mutating.get(name, False) or locks
+            per_def.setdefault(name, []).append(locks)
+            crate = _crate_of(rel)
+            by_crate[(crate, name)] = by_crate.get((crate, name), locks) and locks
+            by_file[(rel.as_posix(), name)] = locks
 
-    types = {n: locks for n, locks in mutating.items() if n in has_drop}
+    # Conservative AND across definition sites; per-crate entries win at a use
+    # site in that crate.
+    types = {n: all(per_def.get(n, [False])) for n in mutating if n in has_drop}
+    by_crate = {k: v for k, v in by_crate.items() if k[1] in types}
+    by_crate.update({k: v for k, v in by_file.items() if k[1] in types})
 
     # One hop for a wrapper that owns a guard instead of touching env itself.
     for _ in range(3):
         grew = False
-        for code, blocks in parsed:
+        for rel, code, blocks in parsed:
             for name, start, end in blocks:
                 if name in types:
                     continue
                 block = code[start:end]
                 if not any(used in types for used in TYPE_ASSOC_CALL.findall(block)):
                     continue
-                fields = struct_bodies.get(name, "")
+                fields = structs_by_file.get(rel.as_posix(), {}).get(name, "")
                 owns = "MutexGuard" in fields or any(t in fields for t in types)
                 if not owns:
                     continue
-                types[name] = bool(LOCK_ACQUIRE.search(block))
+                locks = "MutexGuard" in structs_by_file.get(rel.as_posix(), {}).get(name, "")
+                types[name] = locks
+                by_crate[(_crate_of(rel), name)] = locks
                 grew = True
         if not grew:
             break
-    return EnvMutators(types=types, funcs={})
+    module_alias: dict[tuple[str, str], str] = {}
+    name_alias: dict[tuple[str, str], str] = {}
+    for rel, code, _blocks in parsed:
+        crate = _crate_of(rel)
+        for match in REEXPORT.finditer(code):
+            source = _crate_from_segment(match.group("src"))
+            item = match.group("item")
+            if item[:1].isupper():
+                name_alias[(crate, item)] = source
+            else:
+                module_alias[(crate, item)] = source
+    return EnvMutators(
+        types=types,
+        by_crate=by_crate,
+        funcs={},
+        module_alias=module_alias,
+        name_alias=name_alias,
+    )
 
 
 def _file_helpers(source: str, code: str, types: dict[str, bool]) -> dict[str, bool]:
@@ -394,7 +581,7 @@ def _file_helpers(source: str, code: str, types: dict[str, bool]) -> dict[str, b
         if not ENV_MUTATION.search(body) and not uses_guard:
             continue
         name = match.group("name")
-        helpers[name] = helpers.get(name, False) or bool(LOCK_ACQUIRE.search(body))
+        helpers[name] = helpers.get(name, False) or _env_lock_is_live(body)
     return helpers
 
 
@@ -428,6 +615,8 @@ class Candidate:
     keyed: tuple[str, ...]
     variables: tuple[str, ...]
     sound: bool
+    regime: str
+    group: str
 
 
 def _is_integration_target(path: Path) -> bool:
@@ -469,6 +658,7 @@ def analyze_source(
     if mutators is None:
         mutators = index_env_mutators([(path, source)])
     helpers = _file_helpers(source, code, mutators.types)
+    name_paths = _name_paths(code)
     test_count = 0
     raw: list[tuple[re.Match[str], list[str], tuple[int, int]]] = []
     for match in FN_DEF.finditer(code):
@@ -489,17 +679,26 @@ def analyze_source(
             continue
         mention, vouchers = found
         kinds = [kind for attr in attrs if (kind := _serial_kind(attr))]
-        sound = "unkeyed" in kinds
-        # A crate-wide lock held for the test's lifetime is the same guarantee
-        # as unkeyed `#[serial]`, whether the test takes it itself, the guard
-        # type takes it in its constructor, or a same-file helper does.
-        sound = sound or bool(LOCK_ACQUIRE.search(body))
-        sound = sound or any(
-            mutators.self_locks(name) or helpers.get(name) for name in vouchers
-        )
-        # Sole test in its own integration binary: nothing shares its process,
-        # so there is no sibling for it to corrupt. A regime, not an exemption.
-        sound = sound or (_is_integration_target(path) and test_count == 1)
+        crate = _crate_of(path)
+        regime = "none"
+        if "unkeyed" in kinds:
+            regime = "unkeyed-serial"
+        elif _env_lock_is_live(body):
+            # A crate-wide lock held for the test's lifetime is the same
+            # guarantee as unkeyed `#[serial]`.
+            regime = "env-lock-in-body"
+        elif any(
+            mutators.self_locks(
+                name, crate, path.as_posix(), name_paths.get(name, ())
+            )
+            or helpers.get(name)
+            for name in vouchers
+        ):
+            regime = "guard-or-helper-locks"
+        elif _is_integration_target(path) and test_count == 1:
+            # Nothing shares its process, so there is no sibling to corrupt.
+            regime = "sole-test-in-binary"
+        sound = regime != "none"
         keys = tuple(
             (m.group("args") or "").strip()
             for attr in attrs
@@ -514,29 +713,43 @@ def analyze_source(
                 keyed=keys,
                 variables=tuple(sorted(_env_variables(source[body_range[0] : body_range[1]]))),
                 sound=sound,
+                regime=regime,
+                group=_process_group(path),
             )
         )
     return out
 
 
-def key_map(candidates: list[Candidate]) -> dict[str, set[str]]:
-    """variable -> the set of serial keys under which it is mutated.
+def key_map(candidates: list[Candidate]) -> dict[tuple[str, str], set[str]]:
+    """(test binary, variable) -> the serial keys under which it is mutated.
+
+    Scoped per test BINARY: two crates never share a process, so comparing
+    their keys invents clashes that cannot occur.
 
     `<unkeyed>` marks a mutation with no key at all. A variable appearing
     under two entries is one no keyed `#[serial]` can protect.
     """
 
-    mapping: dict[str, set[str]] = {}
+    mapping: dict[tuple[str, str], set[str]] = {}
     for cand in candidates:
-        if cand.sound:
-            continue
-        label = set(cand.keyed) or {"<unkeyed>"}
+        # Sound tests stay in the map. Unkeyed `#[serial]` and `#[serial(home)]`
+        # take DIFFERENT locks and can overlap, so skipping the unkeyed one let
+        # a variable look consistently keyed and approved the keyed test
+        # (#449 review). Same for a lock-serialised test: it does not compose
+        # with a keyed one either. Being sound is about the test itself; it is
+        # not a promise to anybody else's key.
+        if cand.keyed:
+            label = set(cand.keyed)
+        elif cand.regime == "sole-test-in-binary":
+            continue  # alone in its process; it cannot clash with anyone
+        else:
+            label = {f"<{cand.regime}>"}
         for var in cand.variables:
-            mapping.setdefault(var, set()).update(label)
+            mapping.setdefault((cand.group, var), set()).update(label)
     return mapping
 
 
-def judge(candidates: list[Candidate], keys: dict[str, set[str]]) -> list[Finding]:
+def judge(candidates: list[Candidate], keys: dict[tuple[str, str], set[str]]) -> list[Finding]:
     """Apply the key-consistency regime and emit findings.
 
     "Is a keyed `#[serial]` sufficient?" is not a global verdict, it is a
@@ -552,14 +765,16 @@ def judge(candidates: list[Candidate], keys: dict[str, set[str]]) -> list[Findin
             continue
         if cand.keyed:
             clashes = sorted(
-                var for var in cand.variables if len(keys.get(var, set())) > 1
+                var
+                for var in cand.variables
+                if len(keys.get((cand.group, var), set())) > 1
             )
             if not clashes:
                 continue
+            other = sorted(keys[(cand.group, clashes[0])] - {cand.keyed[0]})[0]
             reason = (
                 f"{cand.mention} with keyed #[serial({cand.keyed[0]})], but "
-                f"{clashes[0]} is also mutated under "
-                f"{sorted(keys[clashes[0]] - {cand.keyed[0]})[0]}"
+                f"{clashes[0]} is also mutated under {other}"
             )
         else:
             reason = f"{cand.mention} without unkeyed #[serial_test::serial]"

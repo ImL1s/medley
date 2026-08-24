@@ -412,6 +412,12 @@ class NameIndependentDetection(unittest.TestCase):
         self.assertTrue(guard.ENV_GUARD_NAME.search("EnvVarGuard::set"))
         self.assertTrue(guard.ENV_GUARD_NAME.search("TestEnvGuard::set"))
         self.assertTrue(guard.ENV_GUARD_NAME.search("EnvGuard::set"))
+        # Same shape, second regex: the env-lock matcher must not require a
+        # character before `ENV` either.
+        import re as _re
+
+        for lock in ("ENV_LOCK", "ENV_TEST_LOCK", "TOOL_STATE_ENV_LOCK"):
+            self.assertTrue(_re.search(guard.ENV_LOCK_NAME, lock), lock)
 
     def test_guard_that_takes_the_lock_itself_is_not_a_violation(self):
         self.assertEqual(guard.scan_source(SELF_LOCKING_GUARD), [])
@@ -460,6 +466,159 @@ class ScanRootVerdict(unittest.TestCase):
             [], [], finding_count=0, allowlist_count=0, scan_rel="crates/x/src"
         )
         self.assertIn("crates/x/src", text)
+
+
+# ── #449 review: three false negatives, each pinned in both directions ──────
+
+
+def _guard_src(name, *, locks, test_name, use=""):
+    field = "_lock: std::sync::MutexGuard<'static, ()>," if locks else "prev: Option<String>,"
+    build = "let _l = SOME_LOCK.lock().unwrap();" if locks else ""
+    return textwrap.dedent(
+        f"""\
+        struct {name} {{ {field} }}
+        impl {name} {{
+            fn set(k: &str, v: &str) -> Self {{
+                {build}
+                unsafe {{ std::env::set_var(k, v) }};
+                todo!()
+            }}
+        }}
+        impl Drop for {name} {{
+            fn drop(&mut self) {{ unsafe {{ std::env::remove_var("K") }} }}
+        }}
+
+        {use}
+        #[test]
+        fn {test_name}() {{
+            let _g = {name}::set("GROK_HOME", "/tmp");
+        }}
+        """
+    )
+
+
+class SameNameDifferentGuards(unittest.TestCase):
+    """Finding 1: two guards may share a name and disagree about locking."""
+
+    def test_two_definitions_do_not_vouch_for_each_other(self):
+        locking = _guard_src("EnvVarGuard", locks=True, test_name="uses_locking_guard")
+        plain = _guard_src("EnvVarGuard", locks=False, test_name="uses_plain_guard")
+        mutators = guard.index_env_mutators(
+            [
+                (Path("crates/codegen/a/src/locking.rs"), locking),
+                (Path("crates/codegen/b/src/plain.rs"), plain),
+            ]
+        )
+        # Resolved per definition site, not merged by name.
+        self.assertTrue(
+            mutators.self_locks("EnvVarGuard", "a", "crates/codegen/a/src/locking.rs")
+        )
+        self.assertFalse(
+            mutators.self_locks("EnvVarGuard", "b", "crates/codegen/b/src/plain.rs")
+        )
+        # And the non-locking one's user is still reported.
+        found = guard.scan_source(
+            plain, relpath=Path("crates/codegen/b/src/plain.rs"), mutators=mutators
+        )
+        self.assertEqual([f.name for f in found], ["uses_plain_guard"])
+        self.assertEqual(
+            guard.scan_source(
+                locking,
+                relpath=Path("crates/codegen/a/src/locking.rs"),
+                mutators=mutators,
+            ),
+            [],
+        )
+
+
+class LockMustBeLive(unittest.TestCase):
+    """Finding 2: the token appearing is not the guard being held."""
+
+    def _src(self, stmt):
+        return textwrap.dedent(
+            f"""\
+            #[test]
+            fn t() {{
+                {stmt}
+                unsafe {{ std::env::set_var("GROK_HOME", "/tmp") }};
+            }}
+            """
+        )
+
+    def test_discarded_lock_guard_is_not_serialisation(self):
+        # `let _ = ...` drops at the end of the statement.
+        found = guard.scan_source(self._src("let _ = ENV_TEST_LOCK.lock().unwrap();"))
+        self.assertEqual([f.name for f in found], ["t"])
+
+    def test_explicitly_dropped_lock_is_not_serialisation(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                let lock = ENV_TEST_LOCK.lock().unwrap();
+                drop(lock);
+                unsafe { std::env::set_var("GROK_HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
+    def test_unrelated_mutex_is_not_the_env_lock(self):
+        found = guard.scan_source(self._src("let _m = RENDER_CACHE.lock().unwrap();"))
+        self.assertEqual([f.name for f in found], ["t"])
+
+    def test_live_env_lock_guard_is_serialisation(self):
+        self.assertEqual(
+            guard.scan_source(self._src("let _lock = ENV_TEST_LOCK.lock().unwrap();")), []
+        )
+
+
+class UnkeyedCountsInTheKeyMap(unittest.TestCase):
+    """Finding 3: unkeyed `#[serial]` and `#[serial(k)]` take different locks."""
+
+    def test_keyed_test_clashing_with_an_unkeyed_serial_is_reported(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            #[serial_test::serial]
+            fn unkeyed_one() {
+                unsafe { std::env::set_var("HOME", "/tmp/a") };
+            }
+
+            #[test]
+            #[serial_test::serial(home)]
+            fn keyed_one() {
+                unsafe { std::env::set_var("HOME", "/tmp/b") };
+            }
+            """
+        )
+        found = guard.scan_source(src)
+        # The unkeyed one is sound on its own terms; the keyed one is not
+        # protected from it and must be reported.
+        self.assertEqual([f.name for f in found], ["keyed_one"])
+        self.assertIn("HOME", found[0].reason)
+
+
+class KeyMapIsScopedPerBinary(unittest.TestCase):
+    def test_two_crates_do_not_clash(self):
+        # Different crates never share a process, so their keys cannot collide.
+        one = textwrap.dedent(
+            """\
+            #[test]
+            #[serial_test::serial(home_a)]
+            fn a() { unsafe { std::env::set_var("HOME", "/x") }; }
+            """
+        )
+        two = textwrap.dedent(
+            """\
+            #[test]
+            #[serial_test::serial(home_b)]
+            fn b() { unsafe { std::env::set_var("HOME", "/y") }; }
+            """
+        )
+        cands = guard.analyze_source(one, relpath=Path("crates/codegen/a/src/x.rs"))
+        cands += guard.analyze_source(two, relpath=Path("crates/codegen/b/src/y.rs"))
+        self.assertEqual(guard.judge(cands, guard.key_map(cands)), [])
 
 if __name__ == "__main__":
     unittest.main()
