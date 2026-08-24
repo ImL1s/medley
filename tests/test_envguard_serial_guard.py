@@ -145,23 +145,26 @@ class ScanSource(unittest.TestCase):
 class AllowlistEvaluate(unittest.TestCase):
     def test_allowlisted_violation_is_suppressed(self):
         findings = guard.scan_source(VIOLATION, relpath=Path("src/fake.rs"))
-        new, stale = guard.evaluate(
+        new, stale, outside = guard.evaluate(
             findings, ["src/fake.rs::mutates_env_without_serial"]
         )
         self.assertEqual(new, [])
         self.assertEqual(stale, [])
+        self.assertEqual(outside, [])
 
     def test_new_violation_is_reported(self):
         findings = guard.scan_source(VIOLATION, relpath=Path("src/fake.rs"))
-        new, stale = guard.evaluate(findings, [])
+        new, stale, outside = guard.evaluate(findings, [])
         self.assertEqual([item.name for item in new], ["mutates_env_without_serial"])
         self.assertEqual(stale, [])
+        self.assertEqual(outside, [])
 
     def test_stale_allowlist_entry_is_reported(self):
         findings = guard.scan_source(SERIAL_OK, relpath=Path("src/fake.rs"))
-        new, stale = guard.evaluate(findings, ["src/fake.rs::already_fixed"])
+        new, stale, outside = guard.evaluate(findings, ["src/fake.rs::already_fixed"])
         self.assertEqual(new, [])
         self.assertEqual(stale, ["src/fake.rs::already_fixed"])
+        self.assertEqual(outside, [])
 
     def test_temp_tree_matches_allowlist_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -176,12 +179,12 @@ class AllowlistEvaluate(unittest.TestCase):
                 encoding="utf-8",
             )
             findings = guard.scan_tree(src, repo=root)
-            new, stale = guard.evaluate(findings, guard.load_allowlist(allow))
+            new, stale, _ = guard.evaluate(findings, guard.load_allowlist(allow))
             self.assertEqual(new, [])
             self.assertEqual(stale, [])
 
             allow.write_text("", encoding="utf-8")
-            new, stale = guard.evaluate(findings, guard.load_allowlist(allow))
+            new, stale, _ = guard.evaluate(findings, guard.load_allowlist(allow))
             self.assertEqual(
                 [item.allowlist_id for item in new],
                 ["crates/codegen/xai-grok-shell/src/bad.rs::mutates_env_without_serial"],
@@ -196,7 +199,7 @@ class RepositoryScan(unittest.TestCase):
     def test_repository_allowlist_is_exact(self):
         findings = guard.scan_tree(SHELL_SRC, repo=REPO)
         allowlist = guard.load_allowlist(ALLOWLIST_PATH)
-        new, stale = guard.evaluate(findings, allowlist)
+        new, stale, _ = guard.evaluate(findings, allowlist)
         self.assertEqual(
             (new, stale),
             ([], []),
@@ -212,6 +215,184 @@ class RepositoryScan(unittest.TestCase):
     def test_script_main_exits_zero_against_this_tree(self):
         self.assertEqual(guard.main(["--repo", str(REPO)]), 0)
 
+
+
+# ── #446: the guard used to find its subject by NAME ────────────────────────
+
+ALIASED_GUARD = textwrap.dedent(
+    """\
+    struct EnvVarGuard { prev: Option<String> }
+    impl EnvVarGuard {
+        fn set(k: &str, v: &str) -> Self {
+            let prev = std::env::var(k).ok();
+            unsafe { std::env::set_var(k, v) };
+            Self { prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) { unsafe { std::env::remove_var("K") } }
+    }
+
+    #[test]
+    fn uses_a_guard_that_is_not_called_EnvGuard() {
+        let _g = EnvVarGuard::set("GROK_HOME", "/tmp");
+    }
+    """
+)
+
+SELF_LOCKING_GUARD = textwrap.dedent(
+    """\
+    struct EnvVarGuard { _lock: std::sync::MutexGuard<'static, ()> }
+    impl EnvVarGuard {
+        fn set(k: &str, v: &str) -> Self {
+            let _lock = ENV_LOCK.lock().unwrap();
+            unsafe { std::env::set_var(k, v) };
+            Self { _lock }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) { unsafe { std::env::remove_var("K") } }
+    }
+
+    #[test]
+    fn guard_takes_the_lock_itself() {
+        let _g = EnvVarGuard::set("GROK_HOME", "/tmp");
+    }
+    """
+)
+
+LOCK_IN_BODY = textwrap.dedent(
+    """\
+    #[test]
+    fn body_holds_the_crate_lock() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("GROK_HOME", "/tmp") };
+    }
+    """
+)
+
+WRAPPER_OWNING_A_GUARD = textwrap.dedent(
+    """\
+    struct TestEnvGuard { prev: Option<String> }
+    impl TestEnvGuard {
+        fn set(k: &str, v: &str) -> Self {
+            let prev = None;
+            unsafe { std::env::set_var(k, v) };
+            Self { prev }
+        }
+    }
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) { unsafe { std::env::remove_var("K") } }
+    }
+
+    struct LockedTestEnv {
+        _env: Vec<TestEnvGuard>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl LockedTestEnv {
+        fn lock() -> Self {
+            Self { _env: Vec::new(), _lock: ENV_TEST_LOCK.lock().unwrap() }
+        }
+        fn set(mut self, k: &str, v: &str) -> Self {
+            self._env.push(TestEnvGuard::set(k, v));
+            self
+        }
+    }
+
+    #[test]
+    fn wrapper_is_sound_because_it_locks() {
+        let _env = LockedTestEnv::lock().set("HOME", "/tmp");
+    }
+    """
+)
+
+NON_LOCKING_GUARD_FOLLOWED_BY_A_LOCK = textwrap.dedent(
+    """\
+    struct TestEnvGuard { prev: Option<String> }
+    impl TestEnvGuard {
+        fn set(k: &str, v: &str) -> Self {
+            unsafe { std::env::set_var(k, v) };
+            Self { prev: None }
+        }
+    }
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) { unsafe { std::env::remove_var("K") } }
+    }
+
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn guard_does_not_lock_so_this_is_a_violation() {
+        let _g = TestEnvGuard::set("GROK_HOME", "/tmp");
+    }
+    """
+)
+
+
+class NameIndependentDetection(unittest.TestCase):
+    """#446: a guard is found by what it does, not by what it is called."""
+
+    def test_guard_not_named_EnvGuard_is_still_detected(self):
+        found = guard.scan_source(ALIASED_GUARD)
+        self.assertEqual(
+            [item.name for item in found], ["uses_a_guard_that_is_not_called_EnvGuard"]
+        )
+
+    def test_name_fallback_has_no_mandatory_prefix_character(self):
+        # The old matcher was `\bEnvGuard\s*::`, which cannot match
+        # `EnvVarGuard::`; a `[A-Za-z_][A-Za-z0-9_]*` prefix has the same bug
+        # because it demands at least one character before `Env`.
+        self.assertTrue(guard.ENV_GUARD_NAME.search("EnvVarGuard::set"))
+        self.assertTrue(guard.ENV_GUARD_NAME.search("TestEnvGuard::set"))
+        self.assertTrue(guard.ENV_GUARD_NAME.search("EnvGuard::set"))
+
+    def test_guard_that_takes_the_lock_itself_is_not_a_violation(self):
+        self.assertEqual(guard.scan_source(SELF_LOCKING_GUARD), [])
+
+    def test_lock_held_in_the_test_body_is_not_a_violation(self):
+        self.assertEqual(guard.scan_source(LOCK_IN_BODY), [])
+
+    def test_wrapper_owning_a_guard_and_a_lock_is_not_a_violation(self):
+        self.assertEqual(guard.scan_source(WRAPPER_OWNING_A_GUARD), [])
+
+    def test_lock_after_the_impl_block_does_not_vouch_for_the_guard(self):
+        # Regression: reading a fixed window past `impl` swept in the NEXT
+        # item's lock and called the guard self-locking — a silent pass, which
+        # is the failure mode this guard exists to prevent. Block-scoped now.
+        found = guard.scan_source(NON_LOCKING_GUARD_FOLLOWED_BY_A_LOCK)
+        self.assertEqual(
+            [item.name for item in found],
+            ["guard_does_not_lock_so_this_is_a_violation"],
+        )
+
+
+class ScanRootVerdict(unittest.TestCase):
+    """#446: "outside the scan root" is not "stale"."""
+
+    def test_entry_outside_the_scan_root_is_not_stale(self):
+        findings = guard.scan_source(SERIAL_OK, relpath=Path("crates/a/src/ok.rs"))
+        new, stale, outside = guard.evaluate(
+            findings,
+            ["crates/b/src/other.rs::some_test"],
+            scan_rel="crates/a/src",
+        )
+        self.assertEqual(new, [])
+        self.assertEqual(stale, [], "an unscanned file cannot be judged stale")
+        self.assertEqual(outside, ["crates/b/src/other.rs::some_test"])
+
+    def test_entry_inside_the_scan_root_with_no_finding_is_stale(self):
+        findings = guard.scan_source(SERIAL_OK, relpath=Path("crates/a/src/ok.rs"))
+        new, stale, outside = guard.evaluate(
+            findings, ["crates/a/src/ok.rs::already_fixed"], scan_rel="crates/a/src"
+        )
+        self.assertEqual(stale, ["crates/a/src/ok.rs::already_fixed"])
+        self.assertEqual(outside, [])
+
+    def test_report_names_the_scanned_scope(self):
+        text = guard.format_report(
+            [], [], finding_count=0, allowlist_count=0, scan_rel="crates/x/src"
+        )
+        self.assertIn("crates/x/src", text)
 
 if __name__ == "__main__":
     unittest.main()

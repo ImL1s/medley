@@ -42,9 +42,35 @@ SERIAL_ATTR = re.compile(
     r"#\s*\[\s*(?:serial_test\s*::\s*)?serial\s*(?:\((?P<args>.*)\))?\s*\]",
     re.DOTALL,
 )
-ENVGUARD_USE = re.compile(r"\bEnvGuard\s*::")
 ENV_MUTATION = re.compile(
     r"\b(?:std\s*::\s*)?env\s*::\s*(?:set_var|remove_var)\s*\("
+)
+
+# A test rarely calls `env::set_var` itself; it uses an RAII guard type or a
+# helper. Matching those by NAME is what made this guard under-report: the
+# literal `EnvGuard::` it used to look for matches neither `EnvVarGuard::` nor
+# `TestEnvGuard::` (nor `LockedTestEnv::`, which is not "…Guard" at all), so 63
+# env-mutating tests were invisible — 27 of them inside the one crate CI scans
+# (#446). Types and helpers are now found by DEFINITION: something is an env
+# mutator because its body mutates env, not because of what it is called.
+TYPE_ASSOC_CALL = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*::\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:::\s*<[^>]*>\s*)?\("
+)
+FREE_CALL = re.compile(r"(?<![:.\w])([a-z_][a-z0-9_]*)\s*\(")
+# Name fallback for a guard whose definition this run never read. Kept
+# deliberately narrow (an "…Env…Guard" type is an env guard and little else)
+# and note the leading `*`, not `+`: requiring one character before `Env` is
+# the bug that hid `EnvVarGuard` from the old matcher in the first place.
+ENV_GUARD_NAME = re.compile(r"\b([A-Za-z0-9_]*Env[A-Za-z0-9_]*Guard)\s*::")
+IMPL_HEAD = re.compile(r"\bimpl\b[^{;]*\{")
+IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# Serialisation regimes other than unkeyed `#[serial]`. A crate-wide `Mutex`
+# held for the test's lifetime is exactly as sound (#319 names `serial` only
+# because that is what xai-grok-shell happened to use); `xai-grok-workspace`
+# uses `ENV_TEST_LOCK` + `LockedTestEnv` and is not thereby unprotected.
+LOCK_ACQUIRE = re.compile(
+    r"\.\s*lock\s*\(|::\s*lock\s*\(|\bMutexGuard\b|\b[A-Z][A-Z0-9_]*_LOCK\b"
 )
 
 
@@ -247,19 +273,162 @@ def _fn_body(source: str, name_end: int) -> tuple[int, int] | None:
     return None
 
 
-def _mentions_env_mutation(body: str) -> str | None:
-    if ENVGUARD_USE.search(body):
-        return "EnvGuard::"
+@dataclass(frozen=True)
+class EnvMutators:
+    """Types and helpers that mutate process env, and whether they self-lock.
+
+    ``types`` is repo-wide: a guard type is imported across crates by name
+    (``xai-grok-shell-base`` re-exports ``xai_grok_env::EnvVarGuard``), so
+    resolving it per file would miss the majority. ``funcs`` is per-file: a
+    bare helper name is far more likely to collide across crates than a type
+    name, and one same-file hop is what the callers actually use.
+    """
+
+    types: dict[str, bool]
+    funcs: dict[str, bool]
+
+    def self_locks(self, name: str) -> bool:
+        return bool(self.types.get(name) or self.funcs.get(name))
+
+
+def _impl_blocks(code: str) -> list[tuple[str, int, int]]:
+    """`(type name, start, end)` for each `impl … { … }`, block-scoped.
+
+    Scoped with [`_balanced_end`] rather than a fixed window: a window that
+    overruns the block reads the NEXT item's lock and calls the type
+    self-locking when it is not — a silent pass, the failure mode this guard
+    exists to prevent.
+    """
+
+    blocks: list[tuple[str, int, int]] = []
+    for match in IMPL_HEAD.finditer(code):
+        idents = IDENT.findall(match.group(0))
+        if not idents:
+            continue
+        open_index = match.end() - 1
+        blocks.append((idents[-1], open_index, _balanced_end(code, open_index)))
+    return blocks
+
+
+def index_env_mutators(sources: list[tuple[Path, str]]) -> EnvMutators:
+    """Index RAII env-guard types, by shape rather than by name.
+
+    Deliberately narrow. "Any type whose impl mentions `env::set_var`" is far
+    too broad — `Config::load` reads config that sets env, and every test
+    calling `Config::anything()` would be flagged; measured, that verdict was
+    2505 violations in `xai-grok-shell` alone, all noise. A false red is worse
+    than a miss for a CI gate, so a type qualifies only if it is shaped like an
+    env guard:
+
+    * it has `impl Drop for T` AND one of its impls mutates env, or
+    * it STORES a known guard (or a `MutexGuard`) and its impl constructs one
+      — the wrapper case (`LockedTestEnv` holds `Vec<TestEnvGuard>` plus the
+      lock and delegates to `TestEnvGuard::set`, never naming `env::set_var`).
+    """
+
+    parsed: list[tuple[str, list[tuple[str, int, int]]]] = []
+    for _rel, source in sources:
+        code = _code_only(source)
+        parsed.append((code, _impl_blocks(code)))
+
+    has_drop: set[str] = set()
+    mutating: dict[str, bool] = {}
+    struct_bodies: dict[str, str] = {}
+    for code, blocks in parsed:
+        for match in re.finditer(r"\bimpl\b[^{;]*?\bDrop\b[^{;]*?\bfor\b([^{;]*)\{", code):
+            idents = IDENT.findall(match.group(1))
+            if idents:
+                has_drop.add(idents[-1])
+        for match in re.finditer(r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)[^\n{;]*\{", code):
+            open_index = match.end() - 1
+            struct_bodies[match.group(1)] = code[open_index : _balanced_end(code, open_index)]
+        for name, start, end in blocks:
+            block = code[start:end]
+            if ENV_MUTATION.search(block):
+                mutating[name] = mutating.get(name, False) or bool(LOCK_ACQUIRE.search(block))
+
+    types = {n: locks for n, locks in mutating.items() if n in has_drop}
+
+    # One hop for a wrapper that owns a guard instead of touching env itself.
+    for _ in range(3):
+        grew = False
+        for code, blocks in parsed:
+            for name, start, end in blocks:
+                if name in types:
+                    continue
+                block = code[start:end]
+                if not any(used in types for used in TYPE_ASSOC_CALL.findall(block)):
+                    continue
+                fields = struct_bodies.get(name, "")
+                owns = "MutexGuard" in fields or any(t in fields for t in types)
+                if not owns:
+                    continue
+                types[name] = bool(LOCK_ACQUIRE.search(block))
+                grew = True
+        if not grew:
+            break
+    return EnvMutators(types=types, funcs={})
+
+
+def _file_helpers(source: str, code: str, types: dict[str, bool]) -> dict[str, bool]:
+    """Same-file non-test fns that mutate env, and whether they self-lock."""
+
+    impl_spans = [(s, e) for _n, s, e in _impl_blocks(code)]
+    helpers: dict[str, bool] = {}
+    for match in FN_DEF.finditer(code):
+        if any(start <= match.start() < end for start, end in impl_spans):
+            continue  # an inherent method, reached through its type instead
+        if any(_is_test_attr(a) for a in _preceding_attributes(source, code, match.start())):
+            continue
+        body_range = _fn_body(source, match.end())
+        if body_range is None:
+            continue
+        body = code[body_range[0] : body_range[1]]
+        uses_guard = any(used in types for used in TYPE_ASSOC_CALL.findall(body))
+        if not ENV_MUTATION.search(body) and not uses_guard:
+            continue
+        name = match.group("name")
+        helpers[name] = helpers.get(name, False) or bool(LOCK_ACQUIRE.search(body))
+    return helpers
+
+
+def _env_mutation_reason(
+    body: str, mutators: EnvMutators, helpers: dict[str, bool]
+) -> tuple[str, list[str]] | None:
+    """`(reason, names whose own soundness can vouch for this test)`."""
+
+    used = [name for name in TYPE_ASSOC_CALL.findall(body) if name in mutators.types]
+    called = [name for name in FREE_CALL.findall(body) if name in helpers]
+    named = ENV_GUARD_NAME.findall(body)
     if ENV_MUTATION.search(body):
-        return "std::env::{set_var,remove_var}"
+        return "std::env::{set_var,remove_var}", used
+    if used:
+        return f"{used[0]}:: (env-mutating guard type)", used
+    if named:
+        return f"{named[0]}::", named
+    if called:
+        return f"{called[0]}() (env-mutating helper)", called
     return None
 
 
-def scan_source(source: str, *, relpath: Path | None = None) -> list[Finding]:
-    """Return test functions that mutate process env without unkeyed serial."""
+def scan_source(
+    source: str,
+    *,
+    relpath: Path | None = None,
+    mutators: EnvMutators | None = None,
+) -> list[Finding]:
+    """Return test functions that mutate process env with no serialisation.
+
+    ``mutators`` defaults to an index built from this source alone, so a
+    single-snippet caller (the unit tests) behaves the same as a tree scan
+    whose guard types happen to be defined in the same file.
+    """
 
     path = relpath or Path("<input>")
     code = _code_only(source)
+    if mutators is None:
+        mutators = index_env_mutators([(path, source)])
+    helpers = _file_helpers(source, code, mutators.types)
     findings: list[Finding] = []
     for match in FN_DEF.finditer(code):
         attrs = _preceding_attributes(source, code, match.start())
@@ -269,11 +438,19 @@ def scan_source(source: str, *, relpath: Path | None = None) -> list[Finding]:
         if body_range is None:
             continue
         body = code[body_range[0] : body_range[1]]
-        mention = _mentions_env_mutation(body)
-        if mention is None:
+        found = _env_mutation_reason(body, mutators, helpers)
+        if found is None:
             continue
+        mention, vouchers = found
         kinds = [kind for attr in attrs if (kind := _serial_kind(attr))]
         if "unkeyed" in kinds:
+            continue
+        # A crate-wide lock held for the test's lifetime is the same guarantee
+        # as unkeyed `#[serial]`, whether the test takes it itself, the guard
+        # type takes it in its constructor, or a same-file helper does (#446).
+        if LOCK_ACQUIRE.search(body):
+            continue
+        if any(mutators.self_locks(name) or helpers.get(name) for name in vouchers):
             continue
         reason = (
             f"{mention} without unkeyed #[serial_test::serial]"
@@ -295,12 +472,26 @@ def rust_files(scan_root: Path) -> list[Path]:
     return sorted(path for path in scan_root.rglob("*.rs") if path.is_file())
 
 
-def scan_tree(scan_root: Path, *, repo: Path) -> list[Finding]:
+def scan_tree(scan_root: Path, *, repo: Path, index_root: Path | None = None) -> list[Finding]:
+    """Scan ``scan_root``, resolving guard types against ``index_root``.
+
+    The index is built over the whole repo by default even when the scan is
+    narrower: `xai-grok-shell` uses `EnvVarGuard` re-exported from
+    `xai_grok_env`, so an index limited to the scanned files cannot tell
+    whether that guard locks.
+    """
+
+    index_dir = index_root or (repo / "crates")
+    if not index_dir.is_dir():
+        index_dir = scan_root
+    mutators = index_env_mutators(
+        [(p.relative_to(repo), p.read_text(encoding="utf-8")) for p in rust_files(index_dir)]
+    )
     found: list[Finding] = []
     for path in rust_files(scan_root):
         rel = path.relative_to(repo)
         text = path.read_text(encoding="utf-8")
-        found.extend(scan_source(text, relpath=rel))
+        found.extend(scan_source(text, relpath=rel, mutators=mutators))
     return found
 
 
@@ -316,15 +507,35 @@ def load_allowlist(path: Path) -> list[str]:
     return entries
 
 
+def _entry_path(entry: str) -> str:
+    return entry.rsplit("::", 1)[0]
+
+
 def evaluate(
     findings: list[Finding],
     allowlist: list[str],
-) -> tuple[list[Finding], list[str]]:
+    *,
+    scan_rel: str | None = None,
+) -> tuple[list[Finding], list[str], list[str]]:
+    """Split the allowlist into new / stale / outside-the-scan-root.
+
+    "Stale" used to mean "no matching finding", which lumped together two
+    unrelated things: an entry whose test was fixed (remove it) and an entry
+    naming a file this run never read (nothing is known about it). The second
+    is not evidence of anything, and reporting it as stale sent the reader to
+    the wrong fix — that mis-diagnosis is half of #446.
+    """
+
     allowed = set(allowlist)
     new = [item for item in findings if item.allowlist_id not in allowed]
     present = {item.allowlist_id for item in findings}
-    stale = [entry for entry in allowlist if entry not in present]
-    return new, stale
+    unmatched = [entry for entry in allowlist if entry not in present]
+    if scan_rel is None:
+        return new, unmatched, []
+    prefix = scan_rel.rstrip("/") + "/"
+    outside = [e for e in unmatched if not _entry_path(e).startswith(prefix)]
+    stale = [e for e in unmatched if _entry_path(e).startswith(prefix)]
+    return new, stale, outside
 
 
 def format_report(
@@ -333,11 +544,15 @@ def format_report(
     *,
     finding_count: int,
     allowlist_count: int,
+    outside: list[str] | None = None,
+    scan_rel: str | None = None,
 ) -> str:
+    outside = outside or []
+    scope = f" [scanned: {scan_rel}]" if scan_rel else ""
     lines = [
-        f"envguard-serial: {finding_count} violation(s), "
+        f"envguard-serial{scope}: {finding_count} violation(s), "
         f"{allowlist_count} allowlist entries, "
-        f"{len(new)} new, {len(stale)} stale",
+        f"{len(new)} new, {len(stale)} stale, {len(outside)} outside the scan root",
     ]
     if new:
         lines.append("")
@@ -354,6 +569,15 @@ def format_report(
         lines.append("")
         lines.append("Stale allowlist entries (no longer violations; remove them):")
         for entry in stale:
+            lines.append(f"  {entry}")
+    if outside:
+        lines.append("")
+        lines.append(
+            "Allowlist entries outside the scan root — this run read nothing "
+            "about them, so they are NOT stale. Widen --scan-root to judge "
+            "them, or drop them if the scope is deliberate:"
+        )
+        for entry in outside:
             lines.append(f"  {entry}")
     return "\n".join(lines)
 
@@ -413,15 +637,23 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(dump_allowlist(findings))
         return 0
 
+    try:
+        scan_rel = scan_root.relative_to(root).as_posix()
+    except ValueError:
+        scan_rel = None
     allowlist = load_allowlist(allowlist_path)
-    new, stale = evaluate(findings, allowlist)
+    new, stale, outside = evaluate(findings, allowlist, scan_rel=scan_rel)
     report = format_report(
         new,
         stale,
         finding_count=len(findings),
         allowlist_count=len(allowlist),
+        outside=outside,
+        scan_rel=scan_rel,
     )
     print(report)
+    # `outside` is deliberately not a failure: this run read nothing about
+    # those files, so it has no basis to call them anything.
     if new or stale:
         return 1
     return 0
