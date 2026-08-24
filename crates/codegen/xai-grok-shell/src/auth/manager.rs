@@ -490,6 +490,78 @@ enum LockOutcome {
     Adopted(Box<GrokAuth>),
 }
 
+/// Resolve the first-party xAI `auth.json` path the way production
+/// construction does.
+///
+/// Deliberately the same shape as
+/// [`crate::auth::openai_codex::resolved_auth_path`] (#409). Before that issue
+/// only the Codex side closed the process-global channel under test, so a
+/// fixture setting `GROK_AUTH_PATH` redirected this resolver and not Codex's,
+/// while a fixture pinning `CodexAuthPathGuard` redirected Codex's and not this
+/// one — and nothing said so. Both now resolve through a thread-local pin under
+/// `cfg(test)` and honour the env only in production.
+///
+/// Tests that cannot pass a path into a production entry point should pin
+/// [`XaiAuthPathGuard`] instead of `GROK_AUTH_PATH` (#343).
+pub(crate) fn resolved_xai_auth_path(grok_home: &Path) -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = XAI_AUTH_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
+    // In-process unit tests must not share process-global `GROK_AUTH_PATH`.
+    // Production still honors the env so a user-specified auth.json works.
+    if cfg!(test) {
+        grok_home.join("auth.json")
+    } else {
+        std::env::var("GROK_AUTH_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| grok_home.join("auth.json"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static XAI_AUTH_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Thread-local pin of the xAI `auth.json` path for production constructors
+/// that cannot take a path argument. Does not mutate process environment.
+/// `!Send`: Drop restores this thread's `XAI_AUTH_PATH_OVERRIDE` (#409).
+///
+/// The Codex mirror is [`crate::auth::openai_codex::CodexAuthPathGuard`]. The
+/// two are separate seams on purpose: pinning one must not redirect the other,
+/// because fixtures deliberately construct an *unredirected* manager of the
+/// opposite kind to establish a precondition (see the #303 Codex-only default
+/// fixtures in `agent::models::tests`). A test that needs both redirected holds
+/// both guards; `codex_and_xai_auth_path_resolvers_agree_on_a_shared_home`
+/// pins both and asserts each lands on its own pin.
+#[cfg(test)]
+pub(crate) struct XaiAuthPathGuard {
+    previous: Option<PathBuf>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl XaiAuthPathGuard {
+    pub(crate) fn pin(path: impl Into<PathBuf>) -> Self {
+        let previous = XAI_AUTH_PATH_OVERRIDE.with(|slot| slot.replace(Some(path.into())));
+        Self {
+            previous,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for XaiAuthPathGuard {
+    fn drop(&mut self) {
+        XAI_AUTH_PATH_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
 // ── Construction + builders ──────────────────────────────────────────
 
 impl AuthManager {
@@ -516,9 +588,7 @@ impl AuthManager {
         // also honor it: their later refresh persistence (`update()`) writes to
         // this path, and previously the inline branch hardcoded the default —
         // silently splitting reads (inline) from writes (default path).
-        let path = std::env::var("GROK_AUTH_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| grok_home.join("auth.json"));
+        let path = resolved_xai_auth_path(grok_home);
 
         Self::new_xai_at_path(path, scope, grok_com_config, proxy_base_url, true)
     }
@@ -1939,9 +2009,12 @@ impl AuthManager {
         }
     }
 
-    /// Path to the `auth.json` this manager reads/writes (respects
-    /// `GROK_AUTH_PATH` / constructor home). Prefer this over
-    /// `grok_home()/auth.json` so temp-home tests and custom stores stay isolated.
+    /// Path to the `auth.json` this manager reads/writes (whatever
+    /// [`resolved_xai_auth_path`] produced, or the exact path a constructor was
+    /// handed). Prefer this over `grok_home()/auth.json` so temp-home tests and
+    /// custom stores stay isolated. Note the resolver honours `GROK_AUTH_PATH`
+    /// in production only — under `cfg(test)` it reads the [`XaiAuthPathGuard`]
+    /// pin instead (#409).
     pub(crate) fn auth_json_path(&self) -> &Path {
         &self.path
     }

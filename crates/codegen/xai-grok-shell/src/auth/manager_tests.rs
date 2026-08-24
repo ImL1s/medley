@@ -29,8 +29,17 @@ fn test_manager(grok_home: &Path, config: GrokComConfig) -> AuthManager {
     AuthManager::new_for_test_path(&grok_home.join("auth.json"), config)
 }
 
+/// Ambient credential carriers must not reach the exact-path constructor, and
+/// under `cfg(test)` the ambient *path* carrier must not reach the production
+/// constructor either (#409).
+///
+/// Runs in a re-executed child so the carriers are present from process start,
+/// which is the only way to prove a fresh process behaves the same as a leaked
+/// one. `GROK_AUTH` (inline credential) is still process-global and still wins
+/// for `AuthManager::new`; `GROK_AUTH_PATH` no longer is, so both constructors
+/// resolve to the same file and only the inline branch separates them.
 #[test]
-fn exact_test_path_ignores_ambient_auth_carriers_without_changing_production_precedence() {
+fn exact_test_path_ignores_ambient_auth_carriers_and_cfg_test_closes_the_path_env_channel() {
     const CHILD_MARKER: &str = "GROK_TEST_EXACT_AUTH_PATH_CHILD";
     const EXACT_PATH_ENV: &str = "GROK_TEST_EXACT_AUTH_PATH";
     const AMBIENT_PATH_ENV: &str = "GROK_TEST_AMBIENT_AUTH_PATH";
@@ -60,14 +69,21 @@ fn exact_test_path_ignores_ambient_auth_carriers_without_changing_production_pre
             GrokComConfig::default(),
         );
         assert!(
-            production.auth_json_path() == ambient_path,
-            "the production constructor must retain ambient path precedence"
+            production.auth_json_path() != ambient_path,
+            "GROK_AUTH_PATH must not reach the production constructor under \
+             cfg(test), even from a fresh process (#409)"
+        );
+        assert!(
+            production.auth_json_path() == exact_path,
+            "with the path env closed, the production constructor must resolve \
+             grok_home/auth.json"
         );
         assert!(
             production
                 .current()
                 .is_some_and(|auth| auth.key == "ambient-token"),
-            "the production constructor must retain inline credential precedence"
+            "GROK_AUTH is still a process-global carrier: the production \
+             constructor must retain inline credential precedence"
         );
         return;
     }
@@ -100,7 +116,10 @@ fn exact_test_path_ignores_ambient_auth_carriers_without_changing_production_pre
     command
         .args([
             "--exact",
-            "auth::manager::tests::exact_test_path_ignores_ambient_auth_carriers_without_changing_production_precedence",
+            // Kept in sync with the `fn` name above by the `1 passed` assertion
+            // below: a stale filter matches zero tests and libtest exits 0, so
+            // `status.success()` alone would pass vacuously.
+            "auth::manager::tests::exact_test_path_ignores_ambient_auth_carriers_and_cfg_test_closes_the_path_env_channel",
             "--nocapture",
         ])
         .env(CHILD_MARKER, "1")
@@ -116,6 +135,114 @@ fn exact_test_path_ignores_ambient_auth_carriers_without_changing_production_pre
     assert!(
         output.status.success(),
         "hostile credential subprocess failed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 passed"),
+        "the child must have run exactly the test named above; a renamed test \
+         makes `--exact` match nothing and libtest still exits 0"
+    );
+}
+
+/// The Codex and xAI auth-path resolvers must agree about where "the auth
+/// file" is, and each test seam must move exactly one of them (#409).
+///
+/// Before this, only the Codex resolver ignored process-global `GROK_AUTH_PATH`
+/// under `cfg(test)` (#343). A fixture that set the env redirected the xAI
+/// manager and not Codex; a fixture that pinned `CodexAuthPathGuard` redirected
+/// Codex and not the xAI manager. Neither mechanism covered both and nothing
+/// said so, which made "did this test observe its own fixture?" depend on the
+/// order of two statements rather than on either mechanism.
+///
+/// `#[serial]`: the first half deliberately sets the process-global carrier.
+#[test]
+#[serial]
+fn codex_and_xai_auth_path_resolvers_agree_on_a_shared_home() {
+    let home = tempfile::tempdir().unwrap();
+    let poison = tempfile::tempdir().unwrap();
+    let expected = home.path().join("auth.json");
+
+    // The exact hazard: a process-global value live while both resolvers run.
+    // Under `cfg(test)` it must move neither of them.
+    let _poison_env = xai_grok_test_support::EnvGuard::set(
+        "GROK_AUTH_PATH",
+        poison.path().join("poison-auth.json"),
+    );
+
+    assert_eq!(
+        resolved_xai_auth_path(home.path()),
+        expected,
+        "the xAI resolver must ignore process-global GROK_AUTH_PATH under cfg(test) (#409)"
+    );
+    assert_eq!(
+        crate::auth::openai_codex::resolved_auth_path(home.path()),
+        expected,
+        "the Codex resolver must ignore process-global GROK_AUTH_PATH under cfg(test) (#343)"
+    );
+    // The constructor that cannot take a path must go through its resolver, so
+    // this cannot stay green while `AuthManager::new` keeps a private env read.
+    assert_eq!(
+        AuthManager::new(home.path(), GrokComConfig::default()).auth_json_path(),
+        expected,
+        "AuthManager::new must resolve through resolved_xai_auth_path (#409)"
+    );
+    assert_eq!(
+        AuthManager::new_openai_codex(home.path()).auth_json_path(),
+        expected,
+        "AuthManager::new_openai_codex must resolve through openai_codex::resolved_auth_path"
+    );
+
+    // Each seam redirects its own resolver and only its own. They are separate
+    // on purpose: fixtures construct an unredirected manager of the opposite
+    // kind to establish a precondition (see `agent::models::tests`), so a
+    // shared pin would silently rewrite those preconditions.
+    let xai_pinned = home.path().join("xai-pinned.json");
+    let codex_pinned = home.path().join("codex-pinned.json");
+    let _xai_pin = XaiAuthPathGuard::pin(xai_pinned.clone());
+    let _codex_pin = crate::auth::openai_codex::CodexAuthPathGuard::pin(codex_pinned.clone());
+
+    assert_eq!(resolved_xai_auth_path(home.path()), xai_pinned);
+    assert_eq!(
+        crate::auth::openai_codex::resolved_auth_path(home.path()),
+        codex_pinned
+    );
+    assert_eq!(
+        AuthManager::new(home.path(), GrokComConfig::default()).auth_json_path(),
+        xai_pinned,
+        "the xAI pin must reach AuthManager::new"
+    );
+    assert_eq!(
+        AuthManager::new_openai_codex(home.path()).auth_json_path(),
+        codex_pinned,
+        "the Codex pin must reach AuthManager::new_openai_codex"
+    );
+}
+
+/// Dropping either pin must restore the resolver it owns, and only that one.
+///
+/// A guard that leaked would turn the seam back into the shared-global hazard
+/// it replaces: the next test on this thread would silently inherit the path.
+#[test]
+fn codex_and_xai_auth_path_pins_restore_independently() {
+    let home = tempfile::tempdir().unwrap();
+    let expected = home.path().join("auth.json");
+    let xai_pinned = home.path().join("xai-pinned.json");
+    let codex_pinned = home.path().join("codex-pinned.json");
+
+    {
+        let _xai_pin = XaiAuthPathGuard::pin(xai_pinned.clone());
+        let _codex_pin = crate::auth::openai_codex::CodexAuthPathGuard::pin(codex_pinned);
+        assert_eq!(resolved_xai_auth_path(home.path()), xai_pinned);
+    }
+    assert_eq!(
+        resolved_xai_auth_path(home.path()),
+        expected,
+        "XaiAuthPathGuard must restore the previous pin on drop"
+    );
+    assert_eq!(
+        crate::auth::openai_codex::resolved_auth_path(home.path()),
+        expected,
+        "CodexAuthPathGuard must restore the previous pin on drop"
     );
 }
 

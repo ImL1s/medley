@@ -1240,6 +1240,14 @@ jobs:
           run_nonzero -p xai-grok-pager --test settings_e2e -- --nocapture
           run_nonzero -p xai-grok-shell --test acp_session_setup_wire \
             acp_session_setup_conformance -- --nocapture
+          # #409: the only assertion that production honours `GROK_AUTH_PATH`.
+          # It has to be an integration target -- `cfg(test)` builds resolve
+          # through the thread-local pin instead, so no unit test can reach the
+          # env branch. No positional after `--test`: the target name is not a
+          # module path inside the binary, and `run_nonzero` fails a filter that
+          # matches zero tests (see `grok_home_paths` above).
+          run_nonzero -p xai-grok-shell --test test_auth_path_env_precedence \
+            -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
             resolve_failure_refuses_for_deny_carrying_devbox_extends -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \

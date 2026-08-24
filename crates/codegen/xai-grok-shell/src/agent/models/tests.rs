@@ -5337,15 +5337,13 @@ fn codex_only_from_config_seats_codex_and_sampling_stack() {
     // Use a dedicated home that has no xAI entry. The Codex fixture overrides
     // are thread-local (`openai_codex::resolved_auth_path` and
     // `openai_codex::manager`), so they cannot redirect this xAI manager or any
-    // parallel test. `AuthManager::new` does still read process-global
-    // `GROK_AUTH_PATH`, so clear it across this one construction rather than
-    // pin it — otherwise a leaked value would give the "empty" home a session.
+    // parallel test — and since #409 the xAI seam is thread-local too, so
+    // `AuthManager::new` no longer reads process-global `GROK_AUTH_PATH` under
+    // `cfg(test)`. A leaked value can no longer give the "empty" home a session,
+    // so this construction needs neither an `EnvGuard` nor a pin.
     let xai_home = tmp.path().join("xai-empty");
     std::fs::create_dir_all(&xai_home).unwrap();
-    let auth = {
-        let _clear_path = EnvGuard::unset("GROK_AUTH_PATH");
-        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()))
-    };
+    let auth = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
     assert!(
         !auth.has_ambient_first_party_session(),
         "precondition: no ambient first-party session"
