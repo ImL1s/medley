@@ -66,8 +66,8 @@ def _strip_env_assignments_prefix(line: str) -> str:
         stripped = m.group(1).lstrip()
 
 
-def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
-    """Map crate -> target -> set of filter strings used against it.
+def _parse_workflow(text: str):
+    """Map crate -> target -> filters, and the same keyed by lane `--features`.
 
     Joins YAML line continuations first: `ci.yml` wraps long invocations with a
     trailing backslash, and the filter is usually on the continuation line.
@@ -180,6 +180,17 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
     return flat, nested
 
 
+def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
+    """Crate -> target -> filters, ignoring which `--features` each lane used.
+
+    Kept as the module's public shape because `tests/test_new_test_filter_guard.py`
+    pins it. The feature-keyed view is a strictly finer grouping of the same
+    parse, so it gets its own name rather than changing this one's contract --
+    breaking eleven tests to accommodate a refactor is the wrong direction.
+    """
+    return _parse_workflow(text)[0]
+
+
 # Distinct from an empty listing, which is a legitimate "this crate has no lib
 # tests". Both used to collapse into `[]`, so a crate whose harness could not be
 # launched vanished from the report and the run still exited 0.
@@ -246,7 +257,7 @@ def main() -> int:
                     help="write the current uncovered set to this file and exit 0")
     args = ap.parse_args()
 
-    per_crate, by_features = parse_workflow(args.workflow.read_text())
+    per_crate, by_features = _parse_workflow(args.workflow.read_text())
     if not per_crate:
         print("error: no cargo test invocations found -- has ci.yml's shape changed?", file=sys.stderr)
         return 2
