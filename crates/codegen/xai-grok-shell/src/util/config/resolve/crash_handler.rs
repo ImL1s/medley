@@ -97,6 +97,7 @@ pub fn load_crash_handler_enabled_sync() -> bool {
 mod crash_handler_gate_tests {
     use super::*;
     use crate::agent::config::ConfigSource;
+    use serial_test::serial;
 
     // `GROK_CRASH_HANDLER` is process-global; serialize and force it unset at
     // the top of each test so a developer's shell value can't make these flaky.
@@ -185,6 +186,7 @@ mod crash_handler_gate_tests {
     }
 
     #[test]
+    #[serial]
     fn env_overrides_config_and_remote() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_CRASH_HANDLER, "1") };
@@ -196,6 +198,7 @@ mod crash_handler_gate_tests {
     }
 
     #[test]
+    #[serial]
     fn env_can_force_disable_over_config() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_CRASH_HANDLER, "0") };
@@ -207,6 +210,7 @@ mod crash_handler_gate_tests {
     }
 
     #[test]
+    #[serial]
     fn requirement_beats_env() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_CRASH_HANDLER, "1") };

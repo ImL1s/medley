@@ -1590,6 +1590,15 @@ fn with_model_overrides_env_full<T>(
 ) -> T {
     with_model_overrides_and_default_env(None, ws, ss, id, ps, f)
 }
+fn opt_model_override_env(
+    key: &'static str,
+    value: Option<&str>,
+) -> xai_grok_test_support::EnvGuard {
+    match value {
+        Some(v) => xai_grok_test_support::EnvGuard::set(key, v),
+        None => xai_grok_test_support::EnvGuard::unset(key),
+    }
+}
 fn with_model_overrides_and_default_env<T>(
     default: Option<&str>,
     ws: Option<&str>,
@@ -1598,25 +1607,14 @@ fn with_model_overrides_and_default_env<T>(
     ps: Option<&str>,
     f: impl FnOnce() -> T,
 ) -> T {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    with_env_var_opt(
-        "GROK_DEFAULT_MODEL",
-        default,
-        || with_env_var_opt(
-            "GROK_WEB_SEARCH_MODEL",
-            ws,
-            || with_env_var_opt(
-                "GROK_SESSION_SUMMARY_MODEL",
-                ss,
-                || with_env_var_opt(
-                    "GROK_IMAGE_DESCRIPTION_MODEL",
-                    id,
-                    || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
-                ),
-            ),
-        ),
-    )
+    // Join the crate-wide EnvGuard lock instead of a helper-private mutex
+    // that cannot serialize against other model-selection env tests (#318).
+    let _default = opt_model_override_env("GROK_DEFAULT_MODEL", default);
+    let _ws = opt_model_override_env("GROK_WEB_SEARCH_MODEL", ws);
+    let _ss = opt_model_override_env("GROK_SESSION_SUMMARY_MODEL", ss);
+    let _id = opt_model_override_env("GROK_IMAGE_DESCRIPTION_MODEL", id);
+    let _ps = opt_model_override_env("GROK_PROMPT_SUGGESTIONS_MODEL", ps);
+    f()
 }
 fn with_model_overrides_env<T>(
     ws: Option<&str>,
@@ -1856,6 +1854,7 @@ fn model_overrides_cli_configured_default_wins_over_other_defaults() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_inherited_web_search_uses_operative_model() {
     assert_eq!(
         super::auxiliary_model_or_operative(
@@ -1875,6 +1874,7 @@ fn model_overrides_inherited_web_search_uses_operative_model() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_inherited_image_uses_child_operative_model() {
     assert_eq!(
         super::auxiliary_model_or_operative(

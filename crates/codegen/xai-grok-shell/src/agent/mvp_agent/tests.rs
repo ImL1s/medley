@@ -1912,6 +1912,36 @@ async fn unresolved_empty_current_model_uses_live_fail_closed_sampling_config() 
     );
     assert_eq!(sampling.api_key, None);
 }
+/// #360: `/new` must keep a valid built-in effort when the model
+/// advertises reasoning support but leaves `reasoning_efforts` empty.
+#[tokio::test]
+async fn new_session_keeps_effort_when_supported_menu_is_implicit() {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+    use xai_grok_sampling_types::ReasoningEffort;
+
+    let agent = build_minimal_agent_for_tests();
+    let mut entry = ModelEntry::fallback("implicit-effort-model", &EndpointsConfig::default());
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts.clear();
+    agent
+        .models_manager
+        .insert_test_entry("implicit-effort-model", entry);
+    agent
+        .models_manager
+        .set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    let mut sampling =
+        agent.resolve_sampling_config_for_model(&acp::ModelId::new("implicit-effort-model"), None);
+    sampling.model = "implicit-effort-model".into();
+    sampling.reasoning_effort = None;
+    agent.apply_current_reasoning_effort(&mut sampling);
+    assert_eq!(
+        sampling.reasoning_effort,
+        Some(ReasoningEffort::High),
+        "implicit catalog menu must keep the selected built-in effort"
+    );
+}
+
 #[tokio::test]
 async fn model_state_prefers_session_reasoning_effort_over_global() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
@@ -6373,6 +6403,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
             catalog_degraded_reason: None,
+            catalog_upgrade: None,
         },
         api_key: None,
         env_key: None,
@@ -8475,6 +8506,50 @@ async fn prepare_image_gen_config_fails_open_without_auth() {
         "no resolved auth ⇒ fail open (tools not tier-restricted)"
     );
 }
+#[test]
+fn inject_proxy_headers_omits_identity_on_third_party_origin() {
+    let mut headers = indexmap::IndexMap::new();
+    super::inject_proxy_headers(
+        &mut headers,
+        Some("9.9.9"),
+        None,
+        "https://vendor.example/v1",
+    );
+    assert!(headers.get("x-grok-client-version").is_none());
+    assert!(headers.get("x-grok-client-identifier").is_none());
+    assert!(headers.get("X-XAI-Token-Auth").is_none());
+}
+
+#[test]
+fn inject_proxy_headers_keeps_identity_on_trusted_xai_origin() {
+    let mut headers = indexmap::IndexMap::new();
+    super::inject_proxy_headers(&mut headers, Some("9.9.9"), None, "https://api.x.ai/v1");
+    assert_eq!(
+        headers.get("x-grok-client-version").map(String::as_str),
+        Some("9.9.9")
+    );
+    assert!(headers.get("x-grok-client-identifier").is_some());
+}
+
+#[test]
+fn inject_proxy_headers_keeps_identity_on_production_proxy() {
+    let mut headers = indexmap::IndexMap::new();
+    super::inject_proxy_headers(
+        &mut headers,
+        Some("9.9.9"),
+        None,
+        crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+    );
+    assert_eq!(
+        headers.get("x-grok-client-version").map(String::as_str),
+        Some("9.9.9")
+    );
+    assert_eq!(
+        headers.get("X-XAI-Token-Auth").map(String::as_str),
+        Some("xai-grok-cli")
+    );
+}
+
 /// The imagine tools bypass cli-chat-proxy (direct API calls), so the server
 /// can only scope the coding data-retention opt-out (`/privacy opt-out`) to
 /// Build traffic via the `x-grok-client-identifier` header. If this header is
@@ -9319,10 +9394,13 @@ fn cancel_does_not_forward_to_bridge_in_local_mode() {
 /// Regression (post-cancel slot hang, first bad release 0.2.101; see
 /// `dispatch_lock`). SDK e2e shape:
 /// `test_cancel_ends_in_flight_turn_and_frees_slot` (grok-agent-sdk).
+/// Fake actor must answer intake oneshots (#341); dropping them hangs `prompt`.
 #[test]
 fn cancel_never_overtakes_in_flight_prompt_intake() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
     use crate::session::SessionCommand;
+    use crate::session::commands::{PromptCompletionKind, PromptTurnOk};
+    use crate::session::plan_mode::PromptMode;
     use acp::Agent as _;
     run_local_for_bridge_test(|| async {
         let agent = build_minimal_agent_for_tests();
@@ -9339,15 +9417,20 @@ fn cancel_never_overtakes_in_flight_prompt_intake() {
         let order: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let (intake_parked_tx, intake_parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancel_started_tx, cancel_started_rx) = tokio::sync::oneshot::channel::<()>();
         let driver_order = order.clone();
         tokio::task::spawn_local(async move {
             let mut intake_parked_tx = Some(intake_parked_tx);
+            let mut cancel_started_rx = Some(cancel_started_rx);
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     SessionCommand::GetCurrentPromptMode { responds_to } => {
                         if let Some(tx) = intake_parked_tx.take() {
                             let _ = tx.send(());
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            if let Some(rx) = cancel_started_rx.take() {
+                                rx.await
+                                    .expect("cancel starts while prompt still holds intake");
+                            }
                         }
                         let _ = responds_to.send(Default::default());
                     }
@@ -9405,6 +9488,7 @@ fn cancel_never_overtakes_in_flight_prompt_intake() {
             intake_parked_rx
                 .await
                 .expect("prompt intake reaches the fake actor");
+            let _ = cancel_started_tx.send(());
             let _ = agent
                 .cancel(acp::CancelNotification::new(sid.clone()))
                 .await;
@@ -12045,10 +12129,7 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
         std::fs::create_dir_all(&xai_home).expect("create xAI home");
         let auth_manager =
             std::sync::Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
-        let _auth_path = EnvGuard::set(
-            "GROK_AUTH_PATH",
-            auth_path.to_str().expect("utf-8 auth path"),
-        );
+        let _auth_path = crate::auth::openai_codex::CodexAuthPathGuard::pin(auth_path);
 
         let empty = toml::Value::Table(toml::map::Map::new());
         let mut cfg = AgentConfig::new_from_toml_cfg(&empty).expect("production config");
@@ -12237,6 +12318,148 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
         );
     });
     println!("{CHILD_PASS}");
+}
+
+/// Production initialize must HTTP-probe a present first-party env key and,
+/// on an unusable verdict, reseat implicit Grok onto ready Codex (#303/#317).
+///
+/// In-process sibling of
+/// `initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex`: this
+/// one drives the probe through the shared race-free test-support helpers
+/// (`accept_with_deadline` / `read_http_request_headers`, #317) and pins the
+/// Codex auth file via `CodexAuthPathGuard` rather than `GROK_AUTH_PATH`, so it
+/// is the variant that guards those helpers and that resolution path. The
+/// fresh-process variant instead re-execs the test binary to prove the same
+/// reseat holds against a cold process-global state home and additionally
+/// covers the later soft-campaign `/new` nudge (#320). Both are wanted; keep
+/// the base name a strict prefix of this one so ci.yml's substring
+/// `run_nonzero` filter keeps matching, and so the sibling's `--exact`
+/// self-dispatch keeps resolving to exactly one test.
+#[test]
+#[serial_test::serial]
+fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex_in_process() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use crate::agent::config::Config as AgentConfig;
+        use crate::auth::{AuthManager, AuthMode, GrokAuth, GrokComConfig};
+        use xai_grok_test_support::{
+            DEFAULT_MAX_HTTP_HEADER_BYTES, EnvGuard, accept_with_deadline,
+            read_http_request_headers,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe listener");
+        let addr = listener.local_addr().expect("probe address");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking probe listener");
+        let probe_server = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut stream = accept_with_deadline(
+                &listener,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .expect("initialize did not send the production /api-key probe");
+            let request = read_http_request_headers(
+                &mut stream,
+                std::time::Duration::from_secs(1),
+                DEFAULT_MAX_HTTP_HEADER_BYTES,
+            )
+            .expect("read probe request");
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.starts_with("GET /v1/api-key "),
+                "initialize must use the production /api-key probe path: {request}"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"error\":\"Incorrect API key\"}",
+                )
+                .expect("write probe response");
+        });
+
+        let tmp = tempfile::tempdir().expect("temp home");
+        let state_home = tmp.path().join("state");
+        std::fs::create_dir_all(&state_home).expect("create isolated state home");
+        let _medley_home = EnvGuard::set("MEDLEY_HOME", &state_home);
+        let _grok_home = EnvGuard::set("GROK_HOME", &state_home);
+        let auth_path = tmp.path().join("auth.json");
+        let codex_auth = GrokAuth {
+            key: "live-codex-token".to_owned(),
+            auth_mode: AuthMode::OpenAiCodex,
+            refresh_token: Some("refresh".to_owned()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+            account_id: Some("account".to_owned()),
+            ..GrokAuth::default()
+        };
+        let auth_map = std::collections::HashMap::from([(
+            crate::auth::openai_codex::AUTH_SCOPE.to_owned(),
+            codex_auth,
+        )]);
+        std::fs::write(&auth_path, serde_json::to_vec(&auth_map).unwrap())
+            .expect("write Codex auth fixture");
+
+        let _xai_key = EnvGuard::set(XAI_API_KEY_ENV_VAR, "invalid-xai-key");
+        let _legacy_key = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+        let _default_model = EnvGuard::unset("GROK_DEFAULT_MODEL");
+        let xai_home = tmp.path().join("xai-empty");
+        std::fs::create_dir_all(&xai_home).expect("create xAI home");
+        let auth_manager =
+            std::sync::Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
+        let _auth_path = crate::auth::openai_codex::CodexAuthPathGuard::pin(auth_path);
+
+        let empty = toml::Value::Table(toml::map::Map::new());
+        let mut cfg = AgentConfig::new_from_toml_cfg(&empty).expect("production config");
+        // Keep the fixture cold and deterministic: production bootstrap otherwise
+        // fetches process-global remote settings, whose campaign default can
+        // explicitly pin a Codex model before the probe under test runs.
+        cfg.remote_settings = Some(Default::default());
+        cfg.endpoints.xai_api_base_url = format!("http://{addr}/v1");
+        cfg.models.default = None;
+        cfg.default_model_override = None;
+
+        assert!(
+            crate::agent::auth_method::has_xai_api_key_env(),
+            "fixture must expose the non-blank ambient xAI key to cold resolution"
+        );
+        let grok_key = crate::models::default_model().to_owned();
+        let mut prefetched = crate::agent::config::default_model_entries(
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        let grok = prefetched
+            .shift_remove(&grok_key)
+            .expect("bundled production Grok entry");
+        let (grok_ready, grok_reason) = crate::agent::config::model_readiness(&grok);
+        assert!(
+            grok_ready,
+            "bundled production Grok entry must be picker-ready: {grok_reason:?}"
+        );
+        prefetched.clear();
+        prefetched.insert(grok_key.clone(), grok);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth_manager, Some(prefetched))
+            .expect("valid production agent");
+        assert_eq!(
+            agent.models_manager.current_model_id().0.as_ref(),
+            grok_key.as_str(),
+            "presence-only cold resolution initially treats the non-blank xAI key as ambient"
+        );
+
+        <MvpAgent as acp::Agent>::initialize(
+            &agent,
+            acp::InitializeRequest::new(acp::ProtocolVersion::V1),
+        )
+        .await
+        .expect("initialize succeeds after invalid xAI probe");
+        probe_server.join().expect("probe server");
+
+        assert_eq!(
+            agent.models_manager.current_model_id().0.as_ref(),
+            crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
+            "invalid ambient xAI key must not leave the implicit cold-start model stranded on Grok when Codex OAuth is ready"
+        );
+    });
 }
 
 /// #131 B3: the deliverable is the `initialize` response `_meta` key, not the

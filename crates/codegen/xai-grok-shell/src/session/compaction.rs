@@ -115,6 +115,7 @@ impl From<PrefireOutcome> for PrefirePass1Run {
 #[cfg(test)]
 mod two_pass_prefire_helper_tests {
     use super::{fingerprint_prefix, prefire_lead_percent};
+    use serial_test::serial;
     use xai_grok_sampling_types::ConversationItem;
     #[test]
     fn fingerprint_stable_for_same_prefix() {
@@ -151,6 +152,7 @@ mod two_pass_prefire_helper_tests {
         assert_ne!(fingerprint_prefix(&short), fingerprint_prefix(&long));
     }
     #[test]
+    #[serial]
     fn prefire_lead_percent_defaults_to_10() {
         unsafe { std::env::remove_var("GROK_PREFIRE_LEAD_PERCENT") };
         assert_eq!(prefire_lead_percent(), 10);
@@ -1819,10 +1821,11 @@ impl SessionActor {
         context_window: std::num::NonZeroU64,
     ) -> Option<AutoCompactTriggerInfo> {
         let cw = context_window.get();
-        if xai_token_estimation::exceeds_threshold(
+        if crate::util::config::exceeds_auto_compact_threshold(
             total_tokens,
             cw,
             self.compaction.threshold_percent.get(),
+            self.compaction.token_limit.get(),
         ) {
             let percentage = xai_token_estimation::usage_percentage_u8(total_tokens, cw);
             Some(AutoCompactTriggerInfo {
@@ -2358,6 +2361,7 @@ mod inline_auto_compact_flow_tests {
             forked_tool_override: None,
             compaction: crate::session::compaction_config::CompactionConfig {
                 threshold_percent: std::cell::Cell::new(threshold_percent),
+                token_limit: std::cell::Cell::new(None),
                 force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 context_window_override: None,
                 count: std::sync::atomic::AtomicU64::new(0),
@@ -3800,6 +3804,31 @@ mod inline_auto_compact_flow_tests {
                     credential: xai_grok_sampling_types::SentCredential::Unknown,
                 };
                 assert!(!actor.should_compact_on_error(&err).await);
+            })
+            .await;
+    }
+    /// #259: catalog `auto_compact_token_limit` is an absolute trigger, not
+    /// only percent of `context_window`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_auto_compact_honors_catalog_token_limit() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _) = mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, _) = mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor =
+                    create_test_actor(180_000, 272_000, 85, gateway_tx, persistence_tx).await;
+                let cw = std::num::NonZeroU64::new(272_000).expect("non-zero");
+                assert!(
+                    actor.should_auto_compact(180_000, cw).is_none(),
+                    "180k is below 85% of 272k without a catalog limit"
+                );
+                actor.compaction.token_limit.set(Some(180_000));
+                assert!(
+                    actor.should_auto_compact(180_000, cw).is_some(),
+                    "catalog absolute limit must trigger even below percent-of-window"
+                );
+                assert!(actor.should_auto_compact(179_999, cw).is_none());
             })
             .await;
     }

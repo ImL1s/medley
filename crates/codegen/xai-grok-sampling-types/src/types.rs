@@ -771,6 +771,8 @@ pub enum ReasoningEffort {
     High,
     Xhigh,
     Max,
+    /// Catalog/session orchestration tier. Not a public Responses wire value:
+    /// [`to_responses_api`](Self::to_responses_api) lowers it to `Max`.
     Ultra,
 }
 
@@ -785,9 +787,11 @@ impl ReasoningEffort {
             Self::Xhigh => crate::rs::ReasoningEffort::Xhigh,
             Self::Max => crate::rs::ReasoningEffort::Max,
             // The app keeps Ultra as a distinct catalog/session tier, while
-            // the canonical async-openai client currently tops out at Max.
-            // The wrapper retains the app value for transports that need to
-            // apply an Ultra-specific wire policy after typed serialization.
+            // the pinned async-openai client currently tops out at Max and
+            // Codex Responses reject `effort=ultra` outright.
+            // `CreateResponseWrapper` retains the app value for transports
+            // that apply an Ultra-specific wire policy after typed
+            // serialization.
             Self::Ultra => crate::rs::ReasoningEffort::Max,
         }
     }
@@ -796,7 +800,7 @@ impl ReasoningEffort {
     ///
     /// This is intentionally not a strict inverse of
     /// [`to_responses_api`](Self::to_responses_api): app-level Ultra is encoded
-    /// as typed Max and therefore a server response containing Max remains Max.
+    /// as typed Max, so a server response containing Max remains Max.
     pub fn from_responses_api(effort: crate::rs::ReasoningEffort) -> Self {
         match effort {
             crate::rs::ReasoningEffort::None => Self::None,
@@ -1027,8 +1031,10 @@ pub fn reasoning_efforts_meta_value(opts: &[ReasoningEffortOption]) -> serde_jso
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexWireCapabilities {
     /// When `Some(true)`, the account catalog marks this model for the lite
-    /// Responses transport. Stored for diagnostics; wire mapping is applied
-    /// only where the request path already has a concrete use.
+    /// Responses transport. The request path applies that as
+    /// `reasoning.context = "all_turns"` and the
+    /// `x-openai-internal-codex-responses-lite` header (openai/codex
+    /// `add_responses_lite_header` / `build_reasoning`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_responses_lite: Option<bool>,
     /// Catalog `tool_mode` (e.g. `code_mode_only`). `None` means unrestricted.
@@ -1039,6 +1045,11 @@ pub struct CodexWireCapabilities {
     /// preset (Sol) accepts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_reasoning_summary_parameter: Option<bool>,
+    /// When `Some(true)`, the catalog advertises `input_image.detail = original`.
+    /// `async-openai`'s `ImageDetail` has no `Original` variant, so apply
+    /// never invents that wire string. The apply path still reads this flag
+    /// and fail-closes: `detail: "original"` is rewritten to `auto` unless
+    /// the catalog explicitly allows it (#261).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_image_detail_original: Option<bool>,
     /// e.g. `["text"]` or `["text","image"]`. Empty means unrestricted.
@@ -1048,11 +1059,23 @@ pub struct CodexWireCapabilities {
     /// session has not set an effort override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_level: Option<String>,
-    /// Client-side limit applied to text tool results before they enter
-    /// conversation history. This is catalog metadata, not a Responses API
-    /// request field (#263).
+    /// Client-side tool-result limit (#263) and, when `mode` is `tokens` with
+    /// a positive `limit`, a signal to emit Responses `truncation: "auto"`
+    /// instead of leaving the request field `None` (#259).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation_policy: Option<TruncationPolicyConfig>,
+    /// Catalog absolute auto-compact trigger. When present and positive it is
+    /// an additional token threshold, not only `percent * context_window`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u64>,
+    /// Legacy catalog string. Prefer [`CodexModelMessages::instructions_template`]
+    /// when both are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_instructions: Option<String>,
+    /// Catalog `model_messages` object. Parse keeps the whole payload so the
+    /// field is not silently dropped when only the template is applied (#261).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_messages: Option<CodexModelMessages>,
 }
 
 impl CodexWireCapabilities {
@@ -1071,7 +1094,71 @@ impl CodexWireCapabilities {
     pub fn include_reasoning_summary(&self) -> bool {
         self.supports_reasoning_summary_parameter != Some(false)
     }
+
+    /// Whether the shipped Codex request should use the Responses Lite profile.
+    ///
+    /// Only an explicit catalog `true` enables it. `None` and `Some(false)`
+    /// keep the historical non-lite body and omit the lite header.
+    pub fn responses_lite_enabled(&self) -> bool {
+        self.use_responses_lite == Some(true)
+    }
+
+    /// Whether apply may leave `input_image.detail = "original"` on the wire.
+    ///
+    /// Silent / `false` fail closed: original is not a typed request field
+    /// in this client, and we do not emit it.
+    pub fn allows_image_detail_original(&self) -> bool {
+        self.supports_image_detail_original == Some(true)
+    }
+
+    /// Responses `truncation` is `"auto" | "disabled"`. Catalog
+    /// `{mode: "tokens", limit: N}` is not that enum; it only tells us to
+    /// stop omitting the field. Bytes / missing / non-positive stay omitted.
+    pub fn request_truncation_auto(&self) -> bool {
+        matches!(
+            self.truncation_policy,
+            Some(TruncationPolicyConfig {
+                mode: TruncationMode::Tokens,
+                limit,
+            }) if limit > 0
+        )
+    }
+
+    /// Instruction text the Codex transport should attach.
+    ///
+    /// Prefers `model_messages.instructions_template` (current catalog
+    /// shape) and falls back to `base_instructions`. Empty strings are
+    /// treated as absent.
+    pub fn catalog_instructions(&self) -> Option<&str> {
+        let from_messages = self
+            .model_messages
+            .as_ref()
+            .and_then(|messages| messages.instructions_template.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        from_messages.or_else(|| {
+            self.base_instructions
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        })
+    }
 }
+
+/// Codex catalog `model_messages`. Only `instructions_template` is applied at
+/// the request boundary; remaining keys stay in [`Self::extra`] so parse does
+/// not drop the field.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexModelMessages {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_template: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Header official Codex sends when [`CodexWireCapabilities::use_responses_lite`]
+/// is `true`. Value is the literal `true`.
+pub const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 
 /// Unit used by a Codex catalog tool-output truncation policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1352,7 +1439,7 @@ pub struct CreateResponseWrapper {
     pub inner: crate::rs::CreateResponse,
 
     /// App-level effort before conversion into the typed Responses request.
-    /// This preserves tiers such as Ultra that intentionally share a typed
+    /// Preserves tiers such as Ultra that intentionally share a typed
     /// representation with Max.
     pub client_reasoning_effort: Option<ReasoningEffort>,
 
@@ -1582,12 +1669,25 @@ mod tests {
             ReasoningEffort::Ultra
         );
         assert_eq!(
+            "ultra".parse::<ReasoningEffort>().unwrap(),
+            ReasoningEffort::Ultra
+        );
+        assert_eq!(
             "max".parse::<ReasoningEffort>().unwrap(),
             ReasoningEffort::Max
         );
         assert_eq!(
             "xhigh".parse::<ReasoningEffort>().unwrap(),
             ReasoningEffort::Xhigh
+        );
+        assert_ne!(ReasoningEffort::Ultra, ReasoningEffort::Max);
+        assert_eq!(
+            ReasoningEffort::Ultra.to_responses_api(),
+            crate::rs::ReasoningEffort::Max
+        );
+        assert_eq!(
+            ReasoningEffort::from_responses_api(crate::rs::ReasoningEffort::Max),
+            ReasoningEffort::Max
         );
     }
 
@@ -1764,8 +1864,47 @@ mod tests {
             parse_reasoning_effort_meta(Some(&ultra)),
             Some(ReasoningEffort::Ultra)
         );
-        let unknown = as_map(serde_json::json!({"reasoningEffort": "FUTURE"}));
+        let unknown = as_map(serde_json::json!({"reasoningEffort": "quantum"}));
         assert_eq!(parse_reasoning_effort_meta(Some(&unknown)), None);
+        let future = as_map(serde_json::json!({"reasoningEffort": "FUTURE"}));
+        assert_eq!(parse_reasoning_effort_meta(Some(&future)), None);
+    }
+
+    #[test]
+    fn test_response_wrapper_keeps_client_ultra_separate_from_typed_max() {
+        let req = crate::ConversationRequest {
+            reasoning_effort: Some(ReasoningEffort::Ultra),
+            ..crate::ConversationRequest::from_items(vec![crate::ConversationItem::user("hi")])
+                .with_model("gpt-5.6-sol")
+        };
+        let mut wrapper = CreateResponseWrapper::new((&req).into());
+        wrapper.client_reasoning_effort = req.reasoning_effort;
+        assert_eq!(
+            wrapper.client_reasoning_effort,
+            Some(ReasoningEffort::Ultra)
+        );
+        assert_eq!(
+            wrapper
+                .inner
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.effort.clone()),
+            Some(crate::rs::ReasoningEffort::Max)
+        );
+        let json = serde_json::to_value(&wrapper.inner).unwrap();
+        assert_eq!(
+            json.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+            Some("max")
+        );
+        assert!(
+            json.to_string().contains(r#""effort":"max""#)
+                || json.pointer("/reasoning/effort") == Some(&serde_json::json!("max"))
+        );
+        assert_ne!(
+            wrapper.client_reasoning_effort,
+            Some(ReasoningEffort::Max),
+            "the wrapper must keep the client Ultra tier distinct from typed Max"
+        );
     }
 
     #[test]

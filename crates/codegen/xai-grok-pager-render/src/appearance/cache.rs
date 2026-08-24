@@ -205,12 +205,7 @@ thread_local! {
 pub fn load_simple_mode() -> bool {
     SIMPLE_MODE_LOADED.with(|loaded| {
         if !loaded.get() {
-            SIMPLE_MODE_CURRENT.with(|c| {
-                c.set(load_bool_from_effective_config(
-                    "simple_mode",
-                    SIMPLE_MODE_DEFAULT,
-                ))
-            });
+            SIMPLE_MODE_CURRENT.with(|c| c.set(load_simple_mode_from_effective_config()));
             loaded.set(true);
         }
     });
@@ -628,6 +623,28 @@ pub fn prime(ui: &UiConfig) {
     crate::appearance::permission_cursor::prime();
 }
 
+/// Seed `load_simple_mode` from `[ui]`. Prefers the public `readline_mode`
+/// key, then the issue #66 `simple_mode` alias. Falls back to
+/// [`SIMPLE_MODE_DEFAULT`] on any error.
+fn load_simple_mode_from_effective_config() -> bool {
+    let root = match xai_grok_config::load_effective_config_disk_only() {
+        Ok(r) => r,
+        Err(_) => return SIMPLE_MODE_DEFAULT,
+    };
+    let Some(ui) = root.get("ui") else {
+        return SIMPLE_MODE_DEFAULT;
+    };
+    simple_mode_from_ui_table(ui)
+}
+
+/// Prefer [`UiConfig::READLINE_MODE_KEY`], then the legacy `simple_mode` alias.
+fn simple_mode_from_ui_table(ui: &toml::Value) -> bool {
+    ui.get(UiConfig::READLINE_MODE_KEY)
+        .or_else(|| ui.get(UiConfig::SIMPLE_MODE_ALIAS_KEY))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(SIMPLE_MODE_DEFAULT)
+}
+
 /// Read a `[ui].<key>` boolean from the shell's layered effective config
 /// (managed → user → defaults). Falls back to `default` on any error.
 fn load_bool_from_effective_config(key: &str, default: bool) -> bool {
@@ -831,6 +848,37 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// Disk-seed helper: public `readline_mode` wins; legacy `simple_mode`
+    /// still loads when the public key is absent (issue #66).
+    #[test]
+    fn simple_mode_alias_prefers_public_key_issue66() {
+        let legacy: toml::Value = toml::from_str("simple_mode = false").unwrap();
+        assert!(
+            !simple_mode_from_ui_table(&legacy),
+            "legacy [ui] simple_mode = false must still load"
+        );
+
+        let public: toml::Value = toml::from_str("readline_mode = false").unwrap();
+        assert!(
+            !simple_mode_from_ui_table(&public),
+            "public [ui] readline_mode must seed the cache"
+        );
+
+        let both: toml::Value =
+            toml::from_str("readline_mode = true\nsimple_mode = false").unwrap();
+        assert!(
+            simple_mode_from_ui_table(&both),
+            "public key must win when both keys are present"
+        );
+
+        let unset: toml::Value = toml::from_str("compact_mode = true").unwrap();
+        assert_eq!(
+            simple_mode_from_ui_table(&unset),
+            SIMPLE_MODE_DEFAULT,
+            "missing keys must keep the default"
+        );
     }
 
     #[test]

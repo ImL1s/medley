@@ -50,13 +50,17 @@ pub(crate) const ENV_AUTO_COMPACT_THRESHOLD_PERCENT: &str = "GROK_AUTO_COMPACT_T
 ///      managed `[model.<id>]` sections)
 ///   3. user TOML `[session].auto_compact_threshold_percent`
 ///      (read from `cfg.session.auto_compact_threshold_percent: Option<u8>`)
-///   4. remote settings per-model `ModelInfo.auto_compact_threshold_percent`
+///   4. catalog `effective_context_window_percent` (Codex live catalog = 95)
+///      — stored on `ConfigModelOverride.effective_context_window_percent`,
+///      not `auto_compact_threshold_percent`, so it cannot masquerade as
+///      a user per-model TOML override (#264)
+///   5. remote settings per-model `ModelInfo.auto_compact_threshold_percent`
 ///      (populated from `grok_build_models[i].auto_compact_threshold_percent`;
 ///      intentionally NOT collapsed via `ConfigModelOverride::apply` so the
 ///      user-vs-GB per-model distinction is preserved)
-///   5. remote settings global `RemoteSettings.auto_compact_threshold_percent`
+///   6. remote settings global `RemoteSettings.auto_compact_threshold_percent`
 ///      (populated from `grok_build_settings.auto_compact_threshold_percent`)
-///   6. default `DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT` (85)
+///   7. default `DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT` (85)
 ///
 /// Values outside `0..=100` from the env var are ignored with a debug log and
 /// the resolver falls through to the next tier. TOML/remote fields are typed
@@ -66,11 +70,11 @@ pub(crate) fn resolve_auto_compact_threshold_percent(
     model_id: &str,
     model: Option<&crate::agent::config::ModelInfo>,
 ) -> u8 {
+    let override_entry = cfg.config_models.get(model_id);
     resolve_auto_compact_threshold_percent_from_tiers(
-        cfg.config_models
-            .get(model_id)
-            .and_then(|m| m.auto_compact_threshold_percent),
+        override_entry.and_then(|m| m.auto_compact_threshold_percent),
         cfg.session.auto_compact_threshold_percent,
+        override_entry.and_then(|m| m.effective_context_window_percent),
         model.and_then(|m| m.auto_compact_threshold_percent),
         cfg.remote_settings
             .as_ref()
@@ -85,11 +89,12 @@ pub(crate) fn resolve_auto_compact_threshold_percent(
 /// explicitly and the per-model lookup uses the SUBAGENT's resolved model id,
 /// not the parent's).
 ///
-/// Precedence: env > `user_per_model` > `user_global` > `gb_per_model`
-/// > `gb_global` > `DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT`.
+/// Precedence: env > `user_per_model` > `user_global` > `catalog_per_model`
+/// > `gb_per_model` > `gb_global` > `DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT`.
 pub(crate) fn resolve_auto_compact_threshold_percent_from_tiers(
     user_per_model: Option<u8>,
     user_global: Option<u8>,
+    catalog_per_model: Option<u8>,
     gb_per_model: Option<u8>,
     gb_global: Option<u8>,
 ) -> u8 {
@@ -115,9 +120,50 @@ pub(crate) fn resolve_auto_compact_threshold_percent_from_tiers(
     from_env()
         .or(user_per_model)
         .or(user_global)
+        .or(catalog_per_model)
         .or(gb_per_model)
         .or(gb_global)
         .unwrap_or(DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT)
+}
+
+/// Absolute token count at which auto-compact should fire.
+///
+/// Catalog `auto_compact_token_limit` is an additional absolute trigger
+/// (#259). When it is present and positive, the session fires at the
+/// earlier of that limit and `percent * context_window`. Percent-only
+/// remains when the catalog field is absent.
+pub(crate) fn resolve_auto_compact_token_threshold(
+    context_window: u64,
+    threshold_percent: u8,
+    auto_compact_token_limit: Option<u64>,
+) -> u64 {
+    let percent_tokens = context_window.saturating_mul(u64::from(threshold_percent)) / 100;
+    match auto_compact_token_limit.filter(|limit| *limit > 0) {
+        Some(limit) => percent_tokens.min(limit),
+        None => percent_tokens,
+    }
+}
+
+/// Whether usage has reached the resolved auto-compact trigger.
+///
+/// Keeps [`xai_token_estimation::exceeds_threshold`] for the percent path
+/// (same integer rounding as the rest of the session) and ORs in the
+/// catalog absolute limit when present.
+pub(crate) fn exceeds_auto_compact_threshold(
+    used: u64,
+    context_window: u64,
+    threshold_percent: u8,
+    auto_compact_token_limit: Option<u64>,
+) -> bool {
+    if context_window == 0 {
+        return false;
+    }
+    let percent_hit =
+        xai_token_estimation::exceeds_threshold(used, context_window, threshold_percent);
+    let absolute_hit = auto_compact_token_limit
+        .filter(|limit| *limit > 0)
+        .is_some_and(|limit| used >= limit);
+    percent_hit || absolute_hit
 }
 
 /// Client default per-compaction wall-clock budget (seconds). Fleet p99 of
@@ -215,5 +261,63 @@ mod compaction_tool_choice_tests {
         assert_eq!("AUTO".parse(), Ok(CompactionToolChoice::Auto));
         assert_eq!(" None ".parse(), Ok(CompactionToolChoice::None));
         assert!("required".parse::<CompactionToolChoice>().is_err());
+    }
+}
+
+#[cfg(test)]
+mod resolve_auto_compact_token_threshold_tests {
+    use super::{
+        DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT, exceeds_auto_compact_threshold,
+        resolve_auto_compact_token_threshold,
+    };
+
+    #[test]
+    fn resolve_auto_compact_token_threshold_uses_catalog_absolute_limit() {
+        assert_eq!(
+            resolve_auto_compact_token_threshold(272_000, 85, Some(180_000)),
+            180_000,
+            "catalog absolute limit must fire before 85% of the window"
+        );
+        assert_eq!(
+            resolve_auto_compact_token_threshold(200_000, 85, Some(180_000)),
+            170_000,
+            "tighter percent-of-window still wins when it is earlier"
+        );
+        assert_eq!(
+            resolve_auto_compact_token_threshold(200_000, 85, None),
+            170_000
+        );
+        assert_eq!(
+            resolve_auto_compact_token_threshold(200_000, 85, Some(0)),
+            170_000,
+            "non-positive catalog limits are absent"
+        );
+        assert_eq!(
+            resolve_auto_compact_token_threshold(
+                100_000,
+                DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                None,
+            ),
+            85_000
+        );
+
+        assert!(!exceeds_auto_compact_threshold(
+            179_999,
+            272_000,
+            85,
+            Some(180_000),
+        ));
+        assert!(exceeds_auto_compact_threshold(
+            180_000,
+            272_000,
+            85,
+            Some(180_000),
+        ));
+        assert!(
+            exceeds_auto_compact_threshold(85_000, 100_000, 85, Some(90_000)),
+            "percent path must still fire when it is earlier than the catalog"
+        );
+        assert!(!exceeds_auto_compact_threshold(84_999, 100_000, 85, None));
+        assert!(!exceeds_auto_compact_threshold(1, 0, 85, Some(1)));
     }
 }

@@ -3832,16 +3832,24 @@ fn test_catalog_auth_schemes_and_override() {
 /// Serialize #303 fixtures that mutate the process-wide xAI key variables.
 static CODEX_ONLY_DEFAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Both thread-local seams that point production Codex auth resolution at a
+/// fixture's `auth.json`. Held together so a caller cannot drop one and leave
+/// the other installed. Neither touches process-global `GROK_AUTH_PATH`.
+struct CodexFixtureAuthPins {
+    _resolved_path: crate::auth::openai_codex::CodexAuthPathGuard,
+    _manager_path: crate::auth::openai_codex::TestManagerAuthPathGuard,
+}
+
 /// Build a ready Codex preset entry backed by a live-looking scoped credential.
 ///
-/// The returned thread-local guard makes production model resolution attach
-/// this fixture without changing `GROK_AUTH_PATH` for unrelated parallel tests.
-fn ready_codex_entry(
-    auth_home: &std::path::Path,
-) -> (
-    ModelEntry,
-    crate::auth::openai_codex::TestManagerAuthPathGuard,
-) {
+/// Returns thread-local path pins so production constructors that cannot take
+/// a path still see this fixture. Do not mutate `GROK_AUTH_PATH` here — that
+/// env is process-global and leaks into parallel `new_openai_codex` tests
+/// (#343). Two seams need covering and they are not the same one:
+/// `CodexAuthPathGuard` redirects `openai_codex::resolved_auth_path`, which
+/// constructors resolve for themselves, while `TestManagerAuthPathGuard`
+/// redirects `openai_codex::manager` used by production model resolution.
+fn ready_codex_entry(auth_home: &std::path::Path) -> (ModelEntry, CodexFixtureAuthPins) {
     let auth_path = auth_home.join("auth.json");
     let auth = crate::auth::GrokAuth {
         key: "live-codex-token".to_owned(),
@@ -3857,7 +3865,10 @@ fn ready_codex_entry(
         std::collections::HashMap::from([(crate::auth::openai_codex::AUTH_SCOPE.to_owned(), auth)]);
     std::fs::write(&auth_path, serde_json::to_vec(&auth_map).unwrap()).unwrap();
 
-    let auth_path_guard = crate::auth::openai_codex::TestManagerAuthPathGuard::install(&auth_path);
+    let auth_path_guard = CodexFixtureAuthPins {
+        _resolved_path: crate::auth::openai_codex::CodexAuthPathGuard::pin(auth_path.clone()),
+        _manager_path: crate::auth::openai_codex::TestManagerAuthPathGuard::install(&auth_path),
+    };
 
     let slug = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID;
     let mut entry = ModelEntry::fallback(slug, &config::EndpointsConfig::default());
@@ -3866,7 +3877,7 @@ fn ready_codex_entry(
     entry.info.base_url = crate::auth::openai_codex::CODEX_API_BASE_URL.to_string();
     entry.info.user_selectable = true;
     entry.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
-        crate::auth::openai_codex::manager(auth_home),
+        crate::auth::openai_codex::manager_at_path(auth_path),
     ));
     let (ready, reason) = crate::agent::config::model_readiness(&entry);
     assert!(
@@ -5323,12 +5334,18 @@ fn codex_only_from_config_seats_codex_and_sampling_stack() {
     prefetched.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
 
     // Empty first-party xAI home — no ambient session on the models AuthManager.
-    // Use a dedicated path that has no xAI entry. The Codex fixture override is
-    // thread-local to `openai_codex::manager`, so it cannot redirect this xAI
-    // manager or any parallel test.
+    // Use a dedicated home that has no xAI entry. The Codex fixture overrides
+    // are thread-local (`openai_codex::resolved_auth_path` and
+    // `openai_codex::manager`), so they cannot redirect this xAI manager or any
+    // parallel test. `AuthManager::new` does still read process-global
+    // `GROK_AUTH_PATH`, so clear it across this one construction rather than
+    // pin it — otherwise a leaked value would give the "empty" home a session.
     let xai_home = tmp.path().join("xai-empty");
     std::fs::create_dir_all(&xai_home).unwrap();
-    let auth = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
+    let auth = {
+        let _clear_path = EnvGuard::unset("GROK_AUTH_PATH");
+        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()))
+    };
     assert!(
         !auth.has_ambient_first_party_session(),
         "precondition: no ambient first-party session"

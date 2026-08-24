@@ -1004,3 +1004,60 @@ async fn headless_web_search_notice_absent_meta_means_available() {
         "absent meta key must read as web_search available"
     );
 }
+
+/// #244 leftover: headless prompt `Err` must print the TUI typed banner,
+/// not ACP `Internal error: {json}`.
+#[test]
+fn issue244_headless_typed_provider_failure_omits_acp_internal_error_envelope() {
+    const SECRET_KEY: &str = "sk-test-secret-do-not-leak";
+    const SECRET_BEARER: &str = "Bearer secret-token-value";
+    let err = acp::Error::internal_error().data(serde_json::json!({
+        "message": "Provider request failed (HTTP 400).",
+        "http_status": 400,
+        "error_type": "api",
+        "api_key": SECRET_KEY,
+        "authorization": SECRET_BEARER,
+    }));
+    assert!(
+        err.to_string().contains("Internal error:"),
+        "fixture must still be the ACP Display envelope"
+    );
+    let msg = super::format_headless_prompt_error(&err, false);
+    assert!(
+        msg.contains("Bad request (400)"),
+        "HTTP 400 envelope must become the typed banner, got {msg}"
+    );
+    assert!(
+        msg.contains('\u{2014}'),
+        "banner is headline + em-dash detail, got {msg}"
+    );
+    assert!(
+        !msg.contains("Internal error:"),
+        "ACP Display prefix must not leak: {msg}"
+    );
+    assert!(
+        !msg.contains("Retry failed"),
+        "non-retryable 4xx must not be labelled Retry failed: {msg}"
+    );
+    assert!(!msg.contains('{'), "must not dump the envelope: {msg}");
+    assert!(
+        !msg.contains("http_status"),
+        "envelope field names must not leak: {msg}"
+    );
+    assert!(
+        !msg.contains(SECRET_KEY) && !msg.contains(SECRET_BEARER),
+        "credential bytes must not reach the banner: {msg}"
+    );
+
+    let generic = acp::Error::internal_error().data("connection reset");
+    let generic_msg = super::format_headless_prompt_error(&generic, false);
+    assert_eq!(
+        generic_msg,
+        generic.to_string(),
+        "non-request failures stay generic, not a 4xx banner"
+    );
+    assert!(
+        !generic_msg.contains("Bad request"),
+        "connection copy must not be forced into a 4xx banner: {generic_msg}"
+    );
+}

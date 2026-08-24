@@ -425,20 +425,22 @@ pub(crate) enum SwapOutcome {
     /// changed. See `toolset_terminal_is_session_owned`.
     SkippedExternallyOwned,
 }
-
 /// An unpublished claim on one workspace session identity.
 ///
 /// Only [`WorkspaceLocalSessionReservation::promote_with_external_toolset`]
-/// makes the session visible. Dropping the claim releases it without creating
-/// a session, emitting lifecycle events, or constructing session-path state.
+/// (or [`Self::promote_with_external_toolset_after`]) makes the session
+/// visible. Dropping the claim releases it without creating a session,
+/// emitting lifecycle events, or constructing session-path state.
 #[must_use = "dropping a workspace session reservation cancels it"]
 pub(crate) struct WorkspaceLocalSessionReservation {
     shared: Option<Arc<WorkspaceShared>>,
     session_id: String,
     claim: Arc<()>,
 }
-
 impl WorkspaceLocalSessionReservation {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
     pub(crate) fn promote_with_external_toolset(
         self,
         cwd: std::path::PathBuf,
@@ -449,6 +451,13 @@ impl WorkspaceLocalSessionReservation {
         self.promote_with_external_toolset_after(cwd, hunk_tracker, toolset, capability, || Ok(()))
     }
 
+    /// Run `before_publish` (the publication finalizer) before taking the
+    /// session-map write lock, then promote atomically on success.
+    ///
+    /// Cleanup ownership stays on `self` through the callback so a panic
+    /// still releases the reservation. The callback must not observe a live
+    /// session: visibility happens only after it returns `Ok` and `promote`
+    /// installs the entry.
     pub(crate) fn promote_with_external_toolset_after(
         self,
         cwd: std::path::PathBuf,
@@ -467,6 +476,9 @@ impl WorkspaceLocalSessionReservation {
         )
     }
 
+    /// [`Self::promote_with_external_toolset_after`] with a test-only hook
+    /// fired at the immediate pre-lock boundary, so a test holding the
+    /// session-map write lock can observe the promoter blocked on it.
     #[cfg(test)]
     pub(crate) fn promote_with_external_toolset_after_lock_attempt_for_test(
         self,
@@ -519,6 +531,10 @@ impl WorkspaceLocalSessionReservation {
             false,
             None,
         ));
+        // Finalizer runs without the session-map write lock so it can inspect
+        // or re-enter the map (#348). Do not `take()` cleanup ownership first:
+        // a panic here must still Drop-cancel the reservation (#349).
+        before_publish()?;
         before_lock();
         let mut sessions = shared.sessions.write();
         if shared.activity_tracker.is_draining() {
@@ -526,17 +542,11 @@ impl WorkspaceLocalSessionReservation {
             self.shared.take();
             return Err(WorkspaceError::ShuttingDown);
         }
-        if let Err(error) = before_publish() {
-            sessions.cancel_reservation(&self.session_id, &self.claim);
-            self.shared.take();
-            return Err(error);
-        }
         sessions.promote(self.session_id.clone(), &self.claim, session);
         self.shared.take();
         Ok(())
     }
 }
-
 impl Drop for WorkspaceLocalSessionReservation {
     fn drop(&mut self) {
         let Some(shared) = self.shared.take() else {
@@ -548,7 +558,6 @@ impl Drop for WorkspaceLocalSessionReservation {
             .cancel_reservation(&self.session_id, &self.claim);
     }
 }
-
 /// Public handle to a workspace instance. Owns shared state (sessions,
 /// MCP snapshot, tool config, event bus) and session lifecycle.
 #[derive(Clone)]
@@ -4956,6 +4965,185 @@ pub(crate) mod tests {
             .create_session("main")
             .expect("create main session should succeed");
         handle
+    }
+    fn reservation_promote_parts(
+        handle: &WorkspaceHandle,
+        id: &str,
+    ) -> (
+        std::path::PathBuf,
+        HunkTrackerHandle,
+        Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+    ) {
+        let donor_id = format!("{id}-donor");
+        let donor = handle
+            .create_session(&donor_id)
+            .expect("donor session for a finalized toolset");
+        let cwd = donor.cwd().to_path_buf();
+        let toolset = donor.toolset();
+        handle
+            .drop_session(&donor_id, &donor_id)
+            .expect("drop donor");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let tracker = HunkTrackerActor::spawn(
+            id.to_owned(),
+            cwd.clone(),
+            tx,
+            TrackingMode::AllDirty,
+            cancel,
+        );
+        (cwd, tracker, toolset)
+    }
+    #[tokio::test]
+    async fn local_session_reservation_runs_finalizer_before_atomic_promotion() {
+        let handle = WorkspaceHandle::for_test();
+        let id = "reserve-finalizer";
+        let reservation = handle
+            .reserve_new_local_session(id)
+            .expect("reserve unpublished identity");
+        let (cwd, tracker, toolset) = reservation_promote_parts(&handle, id);
+        let saw_unpublished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = saw_unpublished.clone();
+        let handle_for_finalizer = handle.clone();
+        reservation
+            .promote_with_external_toolset_after(
+                cwd,
+                tracker,
+                toolset,
+                CapabilityMode::All,
+                move || {
+                    // Re-enter the session-map write lock. Holding that lock
+                    // across this callback is the #348 deadlock.
+                    let sessions = handle_for_finalizer.shared.sessions.write();
+                    assert!(
+                        sessions.get(id).is_none(),
+                        "finalizer must run before the session is visible"
+                    );
+                    assert!(
+                        sessions.is_reserved(id),
+                        "identity stays reserved through the finalizer"
+                    );
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .expect("promote after finalizer");
+        assert!(
+            saw_unpublished.load(std::sync::atomic::Ordering::SeqCst),
+            "publication finalizer must have run"
+        );
+        assert!(
+            handle.session(id).is_some(),
+            "successful promotion must make the session visible"
+        );
+        assert!(
+            !handle.shared.sessions.read().is_reserved(id),
+            "promotion consumes the reservation"
+        );
+    }
+    #[tokio::test]
+    async fn local_session_reservation_releases_identity_when_publication_callback_panics() {
+        let handle = WorkspaceHandle::for_test();
+        let id = "reserve-panic";
+        let reservation = handle
+            .reserve_new_local_session(id)
+            .expect("reserve unpublished identity");
+        let (cwd, tracker, toolset) = reservation_promote_parts(&handle, id);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = reservation.promote_with_external_toolset_after(
+                cwd,
+                tracker,
+                toolset,
+                CapabilityMode::All,
+                || panic!("publication callback"),
+            );
+        }));
+        assert!(panicked.is_err(), "callback panic must propagate");
+        assert!(
+            handle.session(id).is_none(),
+            "a panicked publication must not leave a live session"
+        );
+        assert!(
+            !handle.shared.sessions.read().is_reserved(id),
+            "Drop must release the reservation after a callback panic"
+        );
+        handle
+            .reserve_new_local_session(id)
+            .expect("identity must be reusable immediately after a callback panic");
+    }
+    #[tokio::test]
+    async fn local_session_reservation_releases_identity_on_publication_error() {
+        let handle = WorkspaceHandle::for_test();
+        let id = "reserve-err";
+        let reservation = handle
+            .reserve_new_local_session(id)
+            .expect("reserve unpublished identity");
+        let (cwd, tracker, toolset) = reservation_promote_parts(&handle, id);
+        let err = reservation
+            .promote_with_external_toolset_after(cwd, tracker, toolset, CapabilityMode::All, || {
+                Err(WorkspaceError::Finalize("publication failed".into()))
+            })
+            .expect_err("callback error must fail promotion");
+        assert!(matches!(err, WorkspaceError::Finalize(_)));
+        assert!(handle.session(id).is_none());
+        assert!(!handle.shared.sessions.read().is_reserved(id));
+        handle
+            .reserve_new_local_session(id)
+            .expect("identity reusable after callback error");
+    }
+    #[tokio::test]
+    async fn local_session_reservation_drop_releases_identity() {
+        let handle = WorkspaceHandle::for_test();
+        let id = "reserve-drop";
+        {
+            let reservation = handle
+                .reserve_new_local_session(id)
+                .expect("reserve unpublished identity");
+            assert_eq!(reservation.session_id(), id);
+            assert!(handle.session(id).is_none());
+            assert!(handle.shared.sessions.read().is_reserved(id));
+            assert!(matches!(
+                handle.create_session(id),
+                Err(WorkspaceError::SessionAlreadyExists(_))
+            ));
+        }
+        assert!(!handle.shared.sessions.read().is_reserved(id));
+        handle
+            .create_session(id)
+            .expect("create after reservation drop");
+    }
+    #[tokio::test]
+    async fn local_session_reservation_promote_makes_session_visible() {
+        let handle = WorkspaceHandle::for_test();
+        let id = "reserve-ok";
+        let reservation = handle
+            .reserve_new_local_session(id)
+            .expect("reserve unpublished identity");
+        let (cwd, tracker, toolset) = reservation_promote_parts(&handle, id);
+        reservation
+            .promote_with_external_toolset(cwd, tracker, toolset, CapabilityMode::All)
+            .expect("promote");
+        assert!(handle.session(id).is_some());
+        assert!(matches!(
+            handle.reserve_new_local_session(id),
+            Err(WorkspaceError::SessionAlreadyExists(_))
+        ));
+    }
+    #[tokio::test]
+    async fn local_session_reservation_promote_rejects_when_draining() {
+        let handle = WorkspaceHandle::for_test();
+        let id = "reserve-drain";
+        let reservation = handle
+            .reserve_new_local_session(id)
+            .expect("reserve unpublished identity");
+        let (cwd, tracker, toolset) = reservation_promote_parts(&handle, id);
+        handle.activity_tracker().set_draining();
+        let err = reservation
+            .promote_with_external_toolset(cwd, tracker, toolset, CapabilityMode::All)
+            .expect_err("drain must refuse promotion");
+        assert!(matches!(err, WorkspaceError::ShuttingDown));
+        assert!(handle.session(id).is_none());
+        assert!(!handle.shared.sessions.read().is_reserved(id));
     }
     pub(crate) const BASH_CCO_STUB_NAME: &str = "bash_cco_stub";
     pub(crate) const BASH_CCO_STUB_STDOUT: &str = "cco-stdout";

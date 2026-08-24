@@ -30,7 +30,7 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
                     current_model = %current.0,
                     fallback = ?shell_fallback_current.as_ref().map(|m| m.0.as_ref()),
                     available_count = new_models.available.len(),
-                    "models update removed this agent's current model; preserving resident display"
+                    "models update removed this agent's current model; keeping the unavailable-resident placeholder as display-only"
                 );
             }
             agent.session.models.update_catalog_preserving_resident(
@@ -48,24 +48,94 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
         if let ActiveView::Agent(id) = app.active_view
             && let Some(agent) = app.agents.get(&id)
             && let Some(ref agent_model) = agent.session.models.current
-            && let Some(agent_info) = agent.session.models.available.get(agent_model)
         {
-            app_models
-                .available
-                .insert(agent_model.clone(), agent_info.clone());
+            if let Some(agent_info) = agent.session.models.available.get(agent_model) {
+                app_models
+                    .available
+                    .insert(agent_model.clone(), agent_info.clone());
+            }
             app_models.current = Some(agent_model.clone());
             app_models.reasoning_effort = agent.session.models.reasoning_effort;
         }
         app.models = app_models;
-        // Settings rows snapshot each agent's catalog when the modal opens.
-        // A live catalog update must rebuild those snapshots immediately so a
-        // removed model cannot remain selectable from a stale modal row.
-        crate::app::dispatch::refresh_open_settings_modals(app);
+        // Settings rows and an open `/model` argument picker snapshot the
+        // agent's catalog when they open. A live catalog update must rebuild
+        // both snapshots immediately so a removed model cannot remain
+        // selectable from a stale row.
+        refresh_open_model_selection_surfaces(app);
         true
     } else {
         tracing::warn!("Failed to parse x.ai/models/update");
         false
     }
+}
+
+/// Rebuild settings / `/model` pickers from the live catalog generation.
+pub(super) fn refresh_open_model_selection_surfaces(app: &mut AppView) {
+    crate::app::dispatch::refresh_open_settings_modals(app);
+    for agent in app.agents.values_mut() {
+        refresh_open_model_arg_picker(agent);
+    }
+}
+
+fn refresh_open_model_arg_picker(agent: &mut AgentView) {
+    use crate::views::modal::ActiveModal;
+
+    let (command, args_query, prev_insert) = match &agent.active_modal {
+        Some(ActiveModal::ArgPicker {
+            command,
+            args_query,
+            items,
+            state,
+            ..
+        }) if command == "model" || command == "m" => {
+            let prev = items.get(state.selected).map(|item| {
+                if item.identity.is_empty() {
+                    item.insert_text.clone()
+                } else {
+                    item.identity.clone()
+                }
+            });
+            (command.clone(), args_query.clone(), prev)
+        }
+        _ => return,
+    };
+
+    let new_items = {
+        let Some(cmd) = agent
+            .prompt
+            .slash_controller
+            .registry()
+            .get(&command)
+            .cloned()
+        else {
+            return;
+        };
+        let ctx = agent.prompt.slash_controller.app_ctx(&agent.session.models);
+        cmd.suggest_args(&ctx, &args_query).unwrap_or_default()
+    };
+
+    let Some(ActiveModal::ArgPicker {
+        items,
+        original_items,
+        state,
+        ..
+    }) = agent.active_modal.as_mut()
+    else {
+        return;
+    };
+    *original_items = new_items.clone();
+    let q = state.query().to_lowercase();
+    *items = new_items
+        .into_iter()
+        .filter(|item| {
+            q.is_empty()
+                || item.match_text.to_lowercase().contains(&q)
+                || item.display.to_lowercase().contains(&q)
+                || item.description.to_lowercase().contains(&q)
+        })
+        .collect();
+    state.selected = crate::slash::command::ArgItem::remap_selection(items, prev_insert.as_deref());
 }
 
 /// Handle `x.ai/settings/update` — remote settings refreshed on `/new`.

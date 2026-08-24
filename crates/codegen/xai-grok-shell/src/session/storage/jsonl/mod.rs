@@ -173,6 +173,52 @@ impl JsonlStorageAdapter {
         let chat_file = dir.join(super::CHAT_HISTORY_FILE);
         self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)
     }
+    /// Move a public session directory that has no `summary.json` aside.
+    /// Caller must hold the exclusive session-ID lease.
+    ///
+    /// Walks the publication parent without following links. A
+    /// `sessions/<encoded-cwd>` symlink must fail closed before any rename
+    /// so an outside occupant cannot be moved (#340 / Codex P1).
+    fn quarantine_incomplete_public_session(&self, info: &Info) -> io::Result<()> {
+        let Some(root) = self.lock_root() else {
+            return Ok(());
+        };
+        use std::ffi::OsStr;
+        use xai_grok_workspace::session::publication_parent::ensure_publication_parent;
+
+        let encoded = crate::util::grok_home::encode_cwd_dirname(&info.cwd);
+        let parent = ensure_publication_parent(root, OsStr::new(&encoded))?;
+        parent.revalidate()?;
+
+        let session_id = info.id.to_string();
+        let occupant = match parent
+            .parent_anchor()
+            .open_child_dir(OsStr::new(&session_id))
+        {
+            Ok(occupant) => occupant,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        match occupant.open_child_file(OsStr::new(super::SUMMARY_FILE)) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        parent.revalidate()?;
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let quarantine_name = format!("{session_id}.incomplete-{stamp}");
+        parent.parent_anchor().rename_child_dir_no_replace(
+            OsStr::new(&session_id),
+            parent.parent_anchor(),
+            OsStr::new(&quarantine_name),
+        )?;
+        Ok(())
+    }
+
     fn session_dir(&self, info: &Info) -> PathBuf {
         match &self.dir_mode {
             SessionDirMode::FromRoot(root) => root
@@ -182,6 +228,90 @@ impl JsonlStorageAdapter {
             SessionDirMode::Explicit(binding) => binding.path(),
         }
     }
+
+    fn lock_root(&self) -> Option<&Path> {
+        match &self.dir_mode {
+            SessionDirMode::FromRoot(root) => Some(root),
+            SessionDirMode::Explicit(_) => None,
+        }
+    }
+
+    fn init_session_published(
+        &self,
+        root: &Path,
+        info: &Info,
+        model_id: acp::ModelId,
+    ) -> io::Result<Summary> {
+        use std::ffi::OsStr;
+        use xai_grok_workspace::session::fresh_publication::{
+            FreshPublication, FreshPublicationFinalizeError,
+        };
+        use xai_grok_workspace::session::id_lock::acquire_session_id_lock_sync;
+
+        let session_id = info.id.to_string();
+        let _lease = acquire_session_id_lock_sync(root, &session_id)?;
+        let summary_path = self.summary_file(info);
+        if Path::new(&summary_path).exists() {
+            tracing::info!("Loading existing session from JSONL");
+            return self.read_summary_sync(info);
+        }
+
+        // Exclusive lease is held. A crash after creating the public
+        // directory but before writing summary.json leaves an occupant
+        // that finalize() would reject forever. Quarantine it first.
+        self.quarantine_incomplete_public_session(info)?;
+
+        tracing::info!("Creating new session in JSONL");
+        let parent_name = crate::util::grok_home::encode_cwd_dirname(&info.cwd);
+        let publication = FreshPublication::prepare(root, &session_id, OsStr::new(&parent_name))?;
+        let mut summary = Summary::new(info, model_id)?;
+        summary.sandbox_profile = xai_grok_sandbox::configured_profile_name().map(String::from);
+        let bytes = serde_json::to_vec_pretty(&summary)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        super::write_bytes_atomic(
+            &publication.stage_session().join(super::SUMMARY_FILE),
+            &bytes,
+        )?;
+        accept_fresh_publication(publication.finalize()).map(|()| summary)
+    }
+
+    /// `take_id_lease` is false only when the CALLER already holds the
+    /// session-id lease for `info.id`. `flock(2)` leases attach to the open
+    /// file description rather than the process, so a second acquisition
+    /// inside one process blocks against the first -- taking it again where
+    /// the caller owns it deadlocks rather than protecting anything.
+    fn delete_session_sync(&self, info: &Info, take_id_lease: bool) -> io::Result<()> {
+        use xai_grok_workspace::session::id_lock::acquire_session_id_lock_sync;
+        let session_id = info.id.to_string();
+        let _lease = match self.lock_root().filter(|_| take_id_lease) {
+            Some(root) => Some(acquire_session_id_lock_sync(root, &session_id)?),
+            None => None,
+        };
+        let dir = self.session_dir(info);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    async fn delete_session_inner(&self, info: &Info, take_id_lease: bool) -> io::Result<()> {
+        let adapter = self.clone();
+        let info = info.clone();
+        tokio::task::spawn_blocking(move || adapter.delete_session_sync(&info, take_id_lease))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    /// Delete a session whose id lease the caller already holds -- currently
+    /// `session::persistence::delete_session_history`, which takes it at the
+    /// top so the resolve-then-delete window stays closed against a still
+    /// provisional creator. Going through [`StorageAdapter::delete_session`]
+    /// from there would re-acquire the same `flock(2)` lease on a second open
+    /// file description and block forever.
+    pub(crate) async fn delete_session_holding_id_lease(&self, info: &Info) -> io::Result<()> {
+        self.delete_session_inner(info, false).await
+    }
+
     pub(super) fn updates_file(&self, info: &Info) -> PathBuf {
         self.session_dir(info).join(super::UPDATES_FILE)
     }
@@ -1242,9 +1372,38 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
     }
     next
 }
+
+/// A committed rename with an unverified public identity is not a usable
+/// session. Durability (fsync) failures after a verified commit may continue;
+/// identity failures must fail initialization so the caller does not expose a
+/// path that is missing, unreadable, or someone else's directory.
+pub(super) fn accept_fresh_publication(
+    result: Result<
+        (),
+        xai_grok_workspace::session::fresh_publication::FreshPublicationFinalizeError,
+    >,
+) -> io::Result<()> {
+    use xai_grok_workspace::session::fresh_publication::FreshPublicationFinalizeError;
+    match result {
+        Ok(()) => Ok(()),
+        Err(FreshPublicationFinalizeError::CommittedDurability { error, operation }) => {
+            tracing::error!(
+                error_kind = ?error.kind(),
+                ?operation,
+                "session persistence committed; continuing after durability error"
+            );
+            Ok(())
+        }
+        Err(error) => Err(io::Error::other(error)),
+    }
+}
+
 #[async_trait]
 impl StorageAdapter for JsonlStorageAdapter {
     async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary> {
+        if let Some(root) = self.lock_root() {
+            return self.init_session_published(root, info, model_id);
+        }
         let dir = self.session_dir(info);
         std::fs::create_dir_all(&dir)?;
         let summary_path = self.summary_file(info);
@@ -1724,12 +1883,7 @@ impl StorageAdapter for JsonlStorageAdapter {
             .map_err(io::Error::other)?
     }
     async fn delete_session(&self, info: &Info) -> io::Result<()> {
-        let dir = self.session_dir(info);
-        match tokio::fs::remove_dir_all(&dir).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        self.delete_session_inner(info, true).await
     }
     async fn append_rewind_point(&self, info: &Info, point: &RewindPoint) -> io::Result<()> {
         self.append_jsonl(self.rewind_points_file(info), point)

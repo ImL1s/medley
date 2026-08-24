@@ -1733,6 +1733,18 @@ impl ModelsManager {
             .unwrap_or(false)
     }
 
+    /// Per-model inference idle timeout from the live catalog.
+    ///
+    /// Outer `None` is a catalog miss or an entry with no per-model override;
+    /// callers then fall through to remote / default (same as a main session).
+    pub(crate) fn model_inference_idle_timeout_secs(&self, model_id: &str) -> Option<u64> {
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
+            .and_then(|e| e.info().inference_idle_timeout_secs)
+    }
+
     /// Catalog wire capabilities for one model.
     ///
     /// Read this instead of copying `codex_wire` off a `SamplingConfig`: the

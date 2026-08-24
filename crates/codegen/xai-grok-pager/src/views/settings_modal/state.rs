@@ -60,6 +60,8 @@ pub enum SettingsKeyOutcome {
     Changed,
     /// No-op.
     Unchanged,
+    /// Show a toast and keep the modal open (blocked picker commit).
+    Toast(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +695,10 @@ impl SettingsModalState {
                             canonical: c.canonical.to_string(),
                             display: c.display.to_string(),
                             description: c.description.to_string(),
-                            disabled_reason: None,
+                            // Static catalogs have no readiness metadata: every
+                            // choice is always committable.
+                            disabled: false,
+                            disabled_reason: String::new(),
                         })
                         .collect(),
                 ),
@@ -748,7 +753,7 @@ impl SettingsModalState {
                 .unwrap_or(0),
             Some(SettingValue::String(cur)) if !cur.is_empty() => resolved_choices
                 .iter()
-                .position(|c| c.canonical == *cur)
+                .position(|c| c.canonical == *cur || c.display == *cur)
                 .unwrap_or(unknown_dynamic_fallback_idx),
             Some(SettingValue::String(_)) => 0,
             _ => 0,
@@ -781,6 +786,64 @@ impl SettingsModalState {
         self.transition_to_picking_enum(key, choices_idx, original_value, supports_preview);
         self.hover_row = None;
         true
+    }
+
+    /// Canonical value under the current picker index, from the live snapshot.
+    pub fn picking_enum_selected_canonical(&self) -> Option<String> {
+        let SettingsMode::PickingEnum {
+            key, choices_idx, ..
+        } = &self.state.mode
+        else {
+            return None;
+        };
+        match self.registry.find(key).map(|m| &m.kind) {
+            Some(SettingKind::DynamicEnum { source, .. }) => {
+                dynamic_enum_choices(*source, &self.pager_snapshot)
+                    .get(*choices_idx)
+                    .map(|choice| choice.canonical.clone())
+            }
+            Some(SettingKind::Enum { choices, .. }) => {
+                effective_enum_choices(key, choices, &self.pager_snapshot)
+                    .get(*choices_idx)
+                    .map(|choice| choice.canonical.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Remap a live `PickingEnum` index onto the refreshed catalog by
+    /// canonical identity. If that value vanished, reset to the first row
+    /// (the DynamicEnum "(no override)" sentinel) instead of keeping a
+    /// stale numeric index that now names a different model.
+    pub fn remap_picking_enum_after_catalog_refresh(&mut self, selected: Option<String>) {
+        let SettingsMode::PickingEnum {
+            key, choices_idx, ..
+        } = &mut self.state.mode
+        else {
+            return;
+        };
+        let names: Vec<String> = match self.registry.find(key).map(|m| &m.kind) {
+            Some(SettingKind::DynamicEnum { source, .. }) => {
+                dynamic_enum_choices(*source, &self.pager_snapshot)
+                    .into_iter()
+                    .map(|choice| choice.canonical)
+                    .collect()
+            }
+            Some(SettingKind::Enum { choices, .. }) => {
+                effective_enum_choices(key, choices, &self.pager_snapshot)
+                    .into_iter()
+                    .map(|choice| choice.canonical.to_string())
+                    .collect()
+            }
+            _ => return,
+        };
+        if let Some(selected) = selected.as_deref()
+            && let Some(idx) = names.iter().position(|name| name == selected)
+        {
+            *choices_idx = idx;
+            return;
+        }
+        *choices_idx = 0;
     }
 
     /// Transition to `PickingGroup` if the focused row is a `Group`. Returns

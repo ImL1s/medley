@@ -1378,12 +1378,14 @@ impl AgentView {
                     if let Some(items) = cmd.suggest_args(&ctx, "")
                         && !items.is_empty()
                     {
+                        let mut state = crate::views::picker::PickerState::input_active();
+                        state.selected = crate::slash::command::ArgItem::preferred_index(&items);
                         self.active_modal = Some(crate::views::modal::ActiveModal::ArgPicker {
                             command: command.to_string(),
                             args_query: String::new(),
                             items: items.clone(),
                             original_items: items,
-                            state: crate::views::picker::PickerState::input_active(),
+                            state,
                             previous_palette: None,
                             window: crate::views::modal_window::ModalWindowState::new(),
                         });

@@ -187,6 +187,10 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         return false;
     }
     let mut plugins_changed_needs_skills_refetch = false;
+    let refresh_model_ui = matches!(
+        &session_notif.update,
+        XaiSessionUpdate::ModelAutoSwitched { .. } | XaiSessionUpdate::ModelChanged { .. }
+    );
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
     let mut active_model_state_changed = false;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
@@ -911,6 +915,10 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     "available_keys": available_keys,
                 })),
             );
+            // The shell is authoritative about the switch. `set_confirmed_resident`
+            // inserts a display-only placeholder when the target is not in the
+            // live catalog yet, so an uncatalogued auto-switch still shows the
+            // session's real identity instead of a ready-by-default row.
             if !new_model_id.is_empty() {
                 let confirmed_model = acp::ModelId::new(new_model_id.clone());
                 agent
@@ -1093,11 +1101,16 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             return false;
         }
     };
-    if active_model_state_changed {
-        if let Some(agent) = app.agents.get(&parent_id) {
-            app.models = agent.session.models.clone();
-        }
-        crate::app::dispatch::refresh_open_settings_modals(app);
+    // Mirror the active agent's model state into app state *before* rebuilding
+    // any surface, so the settings modal and the `/model` arg picker read the
+    // reconciled catalog rather than the previous generation.
+    if active_model_state_changed && let Some(agent) = app.agents.get(&parent_id) {
+        app.models = agent.session.models.clone();
+    }
+    if refresh_model_ui || active_model_state_changed {
+        // Superset of `refresh_open_settings_modals`: also rebuilds an open
+        // `/model` argument picker from the live catalog generation.
+        super::settings::refresh_open_model_selection_surfaces(app);
     }
     if plugins_changed_needs_skills_refetch {
         if let Some(agent) = app.agents.get(&parent_id)
@@ -1412,6 +1425,8 @@ pub(super) fn apply_retry_state(
                     error,
                     error_type: None,
                 }));
+            } else if crate::app::dispatch::scrollback_has_recent_error_banner(scrollback) {
+                // PromptResponse already composed the typed banner.
             } else {
                 scrollback.push_block(RenderBlock::session_event(
                     crate::app::error_display::format_request_failure(None, None, reason)
@@ -1451,7 +1466,13 @@ pub(super) fn apply_retry_state(
                     error: message.clone(),
                     error_type: Some(error_type.clone()),
                 }));
+            } else if crate::app::dispatch::scrollback_has_recent_error_banner(scrollback) {
+                // PromptResponse (or another rail) already composed the typed banner.
             } else {
+                // Pass the wire status straight through; `format_request_failure`
+                // recovers a status from the message text itself, but only for
+                // untyped wires — pre-parsing here would defeat that gate and
+                // demote a typed headline to generic status copy.
                 scrollback.push_block(RenderBlock::session_event(
                     crate::app::error_display::format_request_failure(
                         *http_status,

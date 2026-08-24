@@ -518,10 +518,6 @@ mod tests {
         dir
     }
 
-    /// The bug this guards: emitting a path Cargo cannot resolve makes the
-    /// build script permanently dirty, so every downstream crate recompiles on
-    /// every cargo invocation.
-    #[test]
     #[test]
     fn strip_descriptor_sink_prefix_accepts_unix_and_windows_devices() {
         assert_eq!(
@@ -542,6 +538,10 @@ mod tests {
         );
     }
 
+    /// The bug this guards: emitting a path Cargo cannot resolve makes the
+    /// build script permanently dirty, so every downstream crate recompiles on
+    /// every cargo invocation.
+    #[test]
     fn an_unresolvable_protoc_emits_nothing() {
         assert_eq!(
             rerun_if_changed_for_protoc(Path::new("/nonexistent-aXbYcZ/protoc")),

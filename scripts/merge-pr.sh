@@ -11,8 +11,10 @@
 #
 #   1. the PR's head SHA, the remote branch tip, and the SHA the receipt was
 #      taken at are the same commit, and
-#   2. that commit has a successful run of *this* repository's ci.yml, and
-#   3. every required check on the PR has actually concluded successfully.
+#   2. that commit has a successful run of *this* repository's ci.yml
+#      (absent / queued / skipped are distinct fail-closed verdicts), and
+#   3. every required check on the PR has actually concluded successfully
+#      (empty `gh pr checks` is "no checks reported", not a pass).
 #
 # After a successful merge it prints both the PR head and the landed
 # merge commit. Squash/rebase rewrite the SHA; tags must use merge_commit.
@@ -77,21 +79,12 @@ python3 -B "$GUARD" --branch "$BRANCH" --head-sha "$HEAD" --repo "$REPO" --remot
   die "no successful CI run for $HEAD"
 
 echo "==> Requiring every check on the PR to have concluded successfully"
+# Empty `gh pr checks` is the #202 shape: the command prints "no checks
+# reported", which reads like a pass. The evaluator fail-closes on absent,
+# and distinguishes pending (in progress) from skip-only from failed.
 gh pr checks "$PR" --repo "$REPO" --json name,state,bucket |
-  python3 -c '
-import json, sys
-rows = json.load(sys.stdin)
-if not rows:
-    # No checks at all is the #202 shape exactly: `gh pr checks` calls that
-    # "no checks reported", which reads like a pass and is not one.
-    print("merge-pr: the PR reports no checks at all", file=sys.stderr)
-    raise SystemExit(1)
-bad = [r["name"] for r in rows if r["bucket"] not in ("pass", "skipping")]
-if bad:
-    print("merge-pr: not concluded successfully: " + ", ".join(bad), file=sys.stderr)
-    raise SystemExit(1)
-print(f"    {len(rows)} checks, all green")
-' || die "checks are not green"
+  python3 -B "$GUARD" --evaluate-pr-checks ||
+  die "checks are not green"
 
 echo "==> Re-reading the head after the receipt"
 # The window this closes: everything above described `$HEAD`. A push that lands

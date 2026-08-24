@@ -239,6 +239,7 @@ pub(crate) fn auto_mode_classifier_defaults(
 mod auto_permission_mode_gate_tests {
     use super::*;
     use crate::agent::config::ConfigSource;
+    use serial_test::serial;
 
     // `GROK_AUTO_PERMISSION_MODE` is process-global; serialize every test that
     // reads it (all of them, via `BoolFlag::env`) and force it unset at the top
@@ -374,6 +375,7 @@ mod auto_permission_mode_gate_tests {
     }
 
     #[test]
+    #[serial]
     fn env_overrides_config_and_remote() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_AUTO_PERMISSION_MODE, "1") };
@@ -390,6 +392,7 @@ mod auto_permission_mode_gate_tests {
     }
 
     #[test]
+    #[serial]
     fn requirement_beats_env() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_AUTO_PERMISSION_MODE, "1") };
@@ -401,6 +404,7 @@ mod auto_permission_mode_gate_tests {
     }
 
     #[test]
+    #[serial]
     fn remote_cache_round_trips_and_disk_reader_honors_env() {
         let _g = guard();
         // Gate `enabled` round-trips through the single RwLock store.

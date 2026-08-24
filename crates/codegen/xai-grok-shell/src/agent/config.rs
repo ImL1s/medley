@@ -2389,7 +2389,36 @@ impl Config {
         };
         Ok((config, unrecognized_keys))
     }
+}
+
+/// Drop `[ui].simple_mode` when `[ui].readline_mode` is already present.
+///
+/// Serde `rename` + `alias` treat both keys as one field, so a merged
+/// config that still carries the legacy key fails before any precedence
+/// logic can run (Codex P2 3788601733). Public key wins.
+pub fn prefer_readline_mode_in_toml(root: &mut toml::Value) {
+    let Some(ui) = root.get_mut("ui").and_then(toml::Value::as_table_mut) else {
+        return;
+    };
+    if ui.contains_key(UiConfig::READLINE_MODE_KEY) {
+        ui.remove(UiConfig::SIMPLE_MODE_ALIAS_KEY);
+    }
+}
+
+impl Config {
     pub fn new_from_toml_cfg(raw_config: &toml::Value) -> Result<Self, String> {
+        Self::from_toml_cfg(raw_config, true)
+    }
+
+    /// Parse config without a live Codex `GET /models`.
+    ///
+    /// Used by standalone doctor / inspect so a usable Codex credential cannot
+    /// stall the report or mutate the catalog cache.
+    pub fn new_from_toml_cfg_offline(raw_config: &toml::Value) -> Result<Self, String> {
+        Self::from_toml_cfg(raw_config, false)
+    }
+
+    fn from_toml_cfg(raw_config: &toml::Value, allow_remote_catalog: bool) -> Result<Self, String> {
         let raw_config_with_project_models = if let Ok(cwd) = std::env::current_dir() {
             let project_trusted = crate::agent::folder_trust::project_scope_allowed(&cwd);
             crate::config::merge_project_model_sections(raw_config, &cwd, project_trusted)
@@ -2402,7 +2431,11 @@ impl Config {
             models: mut config_models,
             warnings: config_warnings,
         } = super::config_model_override_parse::parse_model_overrides(raw_config);
-        super::model_providers::merge_openai_codex_presets(&mut config_models);
+        if allow_remote_catalog {
+            super::model_providers::merge_openai_codex_presets(&mut config_models);
+        } else {
+            super::model_providers::merge_openai_codex_presets_offline(&mut config_models);
+        }
         let (mut auth_providers, auth_provider_warnings) = parse_auth_providers(raw_config);
         let (model_providers, mut model_provider_warnings) = parse_model_providers(raw_config);
         for (id, provider) in &model_providers {
@@ -2445,6 +2478,8 @@ impl Config {
         if let toml::Value::Table(ref mut t) = base {
             t.remove("mcp_servers");
         }
+        // Merged [ui] can carry both the public key and the legacy alias.
+        prefer_readline_mode_in_toml(&mut base);
         let (mut config, mut unrecognized_keys) =
             Self::deserialize_collecting_unrecognized(base, &raw_without_model_sections)?;
         config.endpoints.catalog_auth = config.models.catalog_auth_config()?;
@@ -4576,6 +4611,26 @@ impl std::fmt::Debug for ModelEntryConfig {
 fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
     cfg == &LazinessDetectorPerModelConfig::default()
 }
+/// Codex catalog `upgrade` advisory (#267). Display-only so picker/ACP can
+/// show a migration. Never used to rewrite the selected wire model.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CodexCatalogUpgrade {
+    pub model: String,
+    pub migration_markdown: String,
+}
+
+impl std::fmt::Debug for CodexCatalogUpgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexCatalogUpgrade")
+            .field("model_present", &!self.model.is_empty())
+            .field(
+                "migration_markdown_present",
+                &!self.migration_markdown.is_empty(),
+            )
+            .finish()
+    }
+}
+
 /// A `[model.foo]` entry from config.toml, parsed directly from raw TOML
 /// (bypassing deep merge). Scalar fields are `Option` so absent means "inherit
 /// from defaults/prefetched"; the collection fields (`extra_headers`,
@@ -4650,10 +4705,22 @@ pub struct ConfigModelOverride {
     /// `description` so a metadata-only user override cannot erase it.
     #[serde(skip)]
     pub(crate) catalog_degraded_reason: Option<String>,
+    /// Runtime-only catalog `upgrade` advisory (#267). Not a user TOML field.
+    #[serde(skip)]
+    pub(crate) catalog_upgrade: Option<CodexCatalogUpgrade>,
+    /// Catalog `effective_context_window_percent` (0-100). Not a user TOML
+    /// field — user `[model.<id>].auto_compact_threshold_percent` stays
+    /// distinct so the resolver can keep catalog below user-global (#264).
+    #[serde(skip)]
+    pub effective_context_window_percent: Option<u8>,
     /// Raw `auth_scheme` string when TOML parsing failed. Not persisted; used to
     /// fail-closed at resolve time instead of defaulting to Bearer.
     #[serde(skip)]
     pub(crate) invalid_auth_scheme: Option<String>,
+    /// Runtime-only: Codex-routed wire model is not a live/builtin catalog
+    /// slug (#260). Merge stamps it; `apply` turns it into a validation error.
+    #[serde(skip)]
+    pub(crate) unknown_codex_catalog_slug: Option<String>,
 }
 
 impl std::fmt::Debug for ConfigModelOverride {
@@ -4710,9 +4777,18 @@ impl std::fmt::Debug for ConfigModelOverride {
                 "catalog_degraded_reason_present",
                 &self.catalog_degraded_reason.is_some(),
             )
+            .field("catalog_upgrade", &self.catalog_upgrade)
+            .field(
+                "effective_context_window_percent",
+                &self.effective_context_window_percent,
+            )
             .field(
                 "invalid_auth_scheme_present",
                 &self.invalid_auth_scheme.is_some(),
+            )
+            .field(
+                "unknown_codex_catalog_slug_present",
+                &self.unknown_codex_catalog_slug.is_some(),
             )
             .finish()
     }
@@ -4820,6 +4896,7 @@ impl ConfigModelOverride {
             .info
             .catalog_degraded_reason
             .clone_from(&self.catalog_degraded_reason);
+        entry.info.catalog_upgrade.clone_from(&self.catalog_upgrade);
         if let Some(reason) = self.catalog_degraded_reason.as_deref() {
             let description = entry
                 .info
@@ -4852,6 +4929,11 @@ impl ConfigModelOverride {
             entry
                 .config_validation_errors
                 .push(invalid_auth_scheme_validation_error(raw));
+        }
+        if let Some(ref slug) = self.unknown_codex_catalog_slug {
+            entry
+                .config_validation_errors
+                .push(super::model_providers::openai_codex_unknown_catalog_slug_reason(slug));
         }
         entry
     }
@@ -4942,6 +5024,9 @@ pub struct ModelInfo {
     /// Never infer this from user-controlled display text.
     #[serde(skip)]
     pub(crate) catalog_degraded_reason: Option<String>,
+    /// Runtime-only catalog `upgrade` advisory (#267). Display-only.
+    #[serde(skip)]
+    pub(crate) catalog_upgrade: Option<CodexCatalogUpgrade>,
 }
 
 impl std::fmt::Debug for ModelInfo {
@@ -4993,6 +5078,7 @@ impl std::fmt::Debug for ModelInfo {
                 "catalog_degraded_reason_present",
                 &self.catalog_degraded_reason.is_some(),
             )
+            .field("catalog_upgrade", &self.catalog_upgrade)
             .finish()
     }
 }
@@ -5035,6 +5121,7 @@ impl ModelInfo {
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
             catalog_degraded_reason: None,
+            catalog_upgrade: None,
         }
     }
     /// Extract shared model metadata from a flat config entry.
@@ -5074,6 +5161,7 @@ impl ModelInfo {
             laziness_detector: entry.laziness_detector.clone(),
             codex_wire: None,
             catalog_degraded_reason: None,
+            catalog_upgrade: None,
         }
     }
     /// Derive the legacy effort gate/default from `reasoning_efforts` so the
@@ -5601,6 +5689,18 @@ pub(crate) fn resolve_credentials(
     model: &ModelEntry,
     session_key: Option<&str>,
 ) -> ResolvedCredentials {
+    resolve_credentials_with_origins(
+        model,
+        session_key,
+        &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
+    )
+}
+
+pub(crate) fn resolve_credentials_with_origins(
+    model: &ModelEntry,
+    session_key: Option<&str>,
+    trusted_xai_origins: &crate::agent::trusted_origins::TrustedXaiOrigins,
+) -> ResolvedCredentials {
     let info = model.info();
     if info.auth_scheme == AuthScheme::None {
         return ResolvedCredentials {
@@ -5658,12 +5758,27 @@ pub(crate) fn resolve_credentials(
         auth_type = ?auth_type,
         "resolved credentials"
     );
-    ResolvedCredentials {
+    let mut resolved = ResolvedCredentials {
         api_key,
         base_url,
         auth_type,
         auth_scheme,
+    };
+    // #110 STOP-1: do not hand an ambient xAI credential to a non-first-party
+    // origin. The sampling choke point still strips as defense in depth, but
+    // callers of `resolve_credentials` must already see the refuse.
+    let source = classify_credential_source(model, &resolved);
+    if source.is_ambient_xai()
+        && !crate::util::is_xai_api_bearer_url(&resolved.base_url)
+        && !trusted_xai_origins.is_trusted(&resolved.base_url)
+    {
+        tracing::error!(
+            model = %info.model,
+            "resolve_credentials: refusing ambient xAI credential for non-first-party origin"
+        );
+        resolved.api_key = None;
     }
+    resolved
 }
 /// `disable_api_key_auth` at the credential seam: swap a first-party xAI API
 /// key for the IdP session (absent => request fails => forces login). BYOK
@@ -6025,6 +6140,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 codex_wire: None,
                 catalog_degraded_reason: None,
+                catalog_upgrade: None,
             },
             api_key: Some(bearer),
             env_key: None,
@@ -6185,6 +6301,7 @@ pub(crate) fn resolve_chat_state_auth_type(
 /// That is the point: a consumer can log, serialize, or render this without
 /// knowing which of its fields used to be dangerous.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct EffectiveModelRoute {
     /// The key the catalog knows this model by.
     pub catalog_id: String,
@@ -6264,6 +6381,42 @@ pub(crate) fn effective_model_route(
             .unwrap_or(xai_grok_sampler::CredentialSource::Missing),
         ready,
         unready_reason,
+    }
+}
+
+/// Secret-free routes for `grok inspect`, derived from the same resolver the
+/// sampler uses (#110 Phase C).
+pub(crate) fn inspect_model_routes(cfg: &Config) -> Vec<EffectiveModelRoute> {
+    resolve_model_list(cfg, None)
+        .iter()
+        .map(|(id, entry)| {
+            let creds = resolve_credentials(entry, None);
+            effective_model_route(id, entry, &creds)
+        })
+        .collect()
+}
+
+/// Compact secret-free label for a route line (startup, switch, inspect).
+pub(crate) fn format_credential_source_label(
+    source: &xai_grok_sampler::CredentialSource,
+) -> String {
+    use xai_grok_sampler::CredentialSource;
+    match source {
+        CredentialSource::None => "none".to_owned(),
+        CredentialSource::ModelApiKey => "model_api_key".to_owned(),
+        CredentialSource::EnvKey { name } => format!("env:{name}"),
+        CredentialSource::AuthProvider { name } => format!("provider:{name}"),
+        CredentialSource::ExplicitHeader {
+            header,
+            env: Some(var),
+        } => format!("header:{header} env:{var}"),
+        CredentialSource::ExplicitHeader { header, env: None } => {
+            format!("header:{header}")
+        }
+        CredentialSource::XaiSession => "xai_session".to_owned(),
+        CredentialSource::XaiApiKeyEnv => "env:XAI_API_KEY".to_owned(),
+        CredentialSource::XaiDeploymentKey => "xai_deployment_key".to_owned(),
+        CredentialSource::Missing => "missing".to_owned(),
     }
 }
 /// An explicit, user-owned credential header declared on the model config
@@ -6655,6 +6808,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
             catalog_degraded_reason: None,
+            catalog_upgrade: None,
         },
         api_key: None,
         env_key: None,
@@ -7100,6 +7254,13 @@ pub(crate) fn model_readiness_with_origins(
                 )),
             );
         }
+        // #260. Origin allowlist stays first. A signed-in Codex credential
+        // still cannot make a non-catalog wire model ready.
+        if let Some(reason) =
+            crate::agent::model_providers::unknown_openai_codex_catalog_slug_reason(model)
+        {
+            return (false, Some(reason));
+        }
         if status.permanent_failure {
             return (
                 false,
@@ -7233,6 +7394,18 @@ pub(crate) fn unready_reason_for_model_id(
     })
 }
 
+/// Wire string for ACP `endpointTrust`. Keep in lockstep with
+/// pager `ProviderEndpointTrust::as_str`.
+fn endpoint_trust_meta_value(trust: xai_grok_sampler::EndpointTrustClass) -> &'static str {
+    use xai_grok_sampler::EndpointTrustClass::*;
+    match trust {
+        FirstPartyXai => "first_party_xai",
+        External => "external",
+        Local => "local",
+        UserDeclared => "user_declared",
+    }
+}
+
 pub(crate) fn to_acp_model_info(
     models: &IndexMap<String, ModelEntry>,
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {
@@ -7283,9 +7456,41 @@ pub(crate) fn to_acp_model_info(
                         serde_json::Value::String(reason.to_owned()),
                     );
                 }
+                if let Some(upgrade) = info.catalog_upgrade.as_ref() {
+                    map.insert(
+                        "catalogUpgradeModel".to_string(),
+                        serde_json::Value::String(upgrade.model.clone()),
+                    );
+                    if !upgrade.migration_markdown.is_empty() {
+                        map.insert(
+                            "catalogUpgradeMigrationMarkdown".to_string(),
+                            serde_json::Value::String(upgrade.migration_markdown.clone()),
+                        );
+                    }
+                }
                 map.insert(
                     "providerHint".to_string(),
                     serde_json::Value::String(provider_hint_for_url(&info.base_url)),
+                );
+                // Secret-free route facts for TUI `/doctor`. Ask the same
+                // sampler classifier inspect uses — never invent External.
+                let creds = resolve_credentials(model, None);
+                let route = effective_model_route(key, model, &creds);
+                map.insert(
+                    "sanitizedOrigin".to_string(),
+                    serde_json::Value::String(route.sanitized_origin),
+                );
+                map.insert(
+                    "credentialSource".to_string(),
+                    serde_json::Value::String(format_credential_source_label(
+                        &route.credential_source,
+                    )),
+                );
+                map.insert(
+                    "endpointTrust".to_string(),
+                    serde_json::Value::String(
+                        endpoint_trust_meta_value(route.endpoint_trust).to_string(),
+                    ),
                 );
                 if info.supports_reasoning_effort {
                     map.insert(
@@ -7656,6 +7861,7 @@ mod tests {
             system_prompt_label: Some(secret.to_owned()),
             agent_type: Some(secret.to_owned()),
             invalid_auth_scheme: Some(secret.to_owned()),
+            unknown_codex_catalog_slug: Some(secret.to_owned()),
             ..ConfigModelOverride::default()
         };
         assert_no_secret_windows(&format!("{model:?}"), secret);
@@ -8029,6 +8235,24 @@ reasoning_effort = "low"
         let mut cfg = Config::new_from_toml_cfg(&toml_on).unwrap();
         cfg.resolve_runtime_fields(&ctx(&toml_on, false));
         assert!(cfg.disable_web_search);
+    }
+    #[test]
+    fn new_from_toml_cfg_accepts_both_readline_mode_and_simple_mode_issue66() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [ui]
+            readline_mode = true
+            simple_mode = false
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw)
+            .expect("merged readline_mode + simple_mode must not fail deserialize");
+        assert_eq!(
+            cfg.ui.simple_mode,
+            Some(true),
+            "public readline_mode must win when both [ui] keys are present"
+        );
     }
     #[test]
     fn new_from_toml_cfg_restores_web_search_and_session_summary_models() {
@@ -9202,6 +9426,7 @@ reasoning_effort = "low"
     /// A set `env_key` shadows even a warm provider cache at resolve time, so
     /// the static credential wins on the wire and the provider never governs.
     #[tokio::test]
+    #[serial]
     async fn set_env_key_shadows_warm_provider_at_resolve_time() {
         use xai_grok_test_support::EnvGuard;
         let var = "GROK_TEST_ENVKEY_SHADOW";
@@ -9335,6 +9560,7 @@ reasoning_effort = "low"
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 codex_wire: None,
                 catalog_degraded_reason: None,
+                catalog_upgrade: None,
             },
             api_key: api_key.map(|s| s.to_string()),
             env_key: env_key.map(EnvKeys::single),
@@ -9708,7 +9934,7 @@ reasoning_effort = "low"
                 model.info.api_backend = backend.clone();
                 let config = sampling_config_for_model(
                     &model,
-                    resolve_credentials(&model, Some(SESSION)),
+                    resolve_credentials_with_origins(&model, Some(SESSION), &no_trusted_origins()),
                     None,
                     None,
                     Some("deployment-sentinel".to_owned()),
@@ -9764,7 +9990,7 @@ reasoning_effort = "low"
         let model = test_model_entry("ext", "https://gateway.internal:8443/v1", None, None, None);
         let config = sampling_config_for_model(
             &model,
-            resolve_credentials(&model, Some(SESSION)),
+            resolve_credentials_with_origins(&model, Some(SESSION), &trusted),
             None,
             None,
             Some("deployment-sentinel".to_owned()),
@@ -9836,7 +10062,7 @@ reasoning_effort = "low"
             let model = test_model_entry("ext", base_url, None, None, None);
             let config = sampling_config_for_model(
                 &model,
-                resolve_credentials(&model, Some(SESSION)),
+                resolve_credentials_with_origins(&model, Some(SESSION), &trusted),
                 None,
                 None,
                 None,
@@ -10771,6 +10997,46 @@ reasoning_effort = "low"
         assert_eq!(model_readiness(&m), (true, None));
     }
 
+    /// #110 STOP-1: `resolve_credentials` itself must not return an ambient
+    /// xAI credential for a non-first-party origin. The sampling choke point
+    /// remains defense in depth.
+    #[test]
+    #[serial]
+    fn resolve_credentials_refuses_ambient_xai_for_non_first_party_origin() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        const SESSION: &str = "XAI_SESSION_SENTINEL";
+        const API_KEY: &str = "XAI_API_KEY_SENTINEL";
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let external = test_model_entry("ext", "https://api.openai.com/v1", None, None, None);
+        let creds =
+            resolve_credentials_with_origins(&external, Some(SESSION), &no_trusted_origins());
+        assert_eq!(
+            creds.api_key, None,
+            "session must not attach to an external origin"
+        );
+
+        let loopback = test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None);
+        let creds =
+            resolve_credentials_with_origins(&loopback, Some(SESSION), &no_trusted_origins());
+        assert_eq!(creds.api_key, None, "session must not attach to loopback");
+
+        let first = test_model_entry("xai", "https://api.x.ai/v1", None, None, None);
+        let creds = resolve_credentials_with_origins(&first, Some(SESSION), &no_trusted_origins());
+        assert_eq!(creds.api_key.as_deref(), Some(SESSION));
+
+        let _set = EnvGuard::set(XAI_API_KEY_ENV_VAR, API_KEY);
+        let creds = resolve_credentials_with_origins(&external, None, &no_trusted_origins());
+        assert_eq!(
+            creds.api_key, None,
+            "XAI_API_KEY must not attach to an external origin"
+        );
+        let creds = resolve_credentials_with_origins(&first, None, &no_trusted_origins());
+        assert_eq!(creds.api_key.as_deref(), Some(API_KEY));
+    }
+
     /// #329: the named keyless-local mock catalog (`authScheme: none`) is ready
     /// on loopback. The shared `start()` Bearer default stays unready so we do
     /// not weaken the origin gate or reuse ambient xAI session credentials.
@@ -10927,7 +11193,7 @@ reasoning_effort = "low"
         let alias = "GROK_TEST_EMPTY_ENV_LC_ALIAS";
         let _primary = EnvGuard::set(primary, "");
         let _alias = EnvGuard::set(alias, "");
-        let mut model = test_model_entry("m", "https://inference.example/v1", None, None, None);
+        let mut model = test_model_entry("m", "https://api.x.ai/v1", None, None, None);
         model.env_key = Some(EnvKeys::new([primary, alias]));
         assert!(!model.has_own_credentials());
         let creds = resolve_credentials(&model, Some("session-jwt"));
@@ -10947,7 +11213,7 @@ reasoning_effort = "low"
         let _alias = EnvGuard::set(alias, "");
         let _global = EnvGuard::set(XAI_API_KEY_ENV_VAR, sentinel);
         let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-        let mut model = test_model_entry("m", "https://inference.example/v1", None, None, None);
+        let mut model = test_model_entry("m", "https://api.x.ai/v1", None, None, None);
         model.env_key = Some(EnvKeys::new([primary, alias]));
         assert!(!model.has_own_credentials());
         let creds = resolve_credentials(&model, None);
@@ -10957,7 +11223,7 @@ reasoning_effort = "low"
     #[test]
     fn resolve_credentials_empty_api_key_falls_through_to_session() {
         use xai_chat_state::AuthType;
-        let model = test_model_entry("m", "https://inference.example/v1", Some(""), None, None);
+        let model = test_model_entry("m", "https://api.x.ai/v1", Some(""), None, None);
         assert!(!model.has_own_credentials());
         let creds = resolve_credentials(&model, Some("session-jwt"));
         assert_eq!(creds.auth_type, AuthType::SessionToken);
@@ -12242,6 +12508,65 @@ reasoning_effort = "low"
         assert!(meta.get("readinessReason").is_none());
         assert_eq!(meta["providerHint"], "local");
     }
+
+    /// Codex P2 3788538943: ACP meta must carry the sampler-enforced
+    /// secret-free route so `/doctor` does not invent External.
+    #[test]
+    #[serial]
+    fn acp_model_meta_emits_secret_free_origin_source_and_trust() {
+        let mut models = IndexMap::new();
+        models.insert(
+            "local".to_string(),
+            test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None),
+        );
+        models.insert(
+            "openai".to_string(),
+            test_model_entry(
+                "openai",
+                "https://api.openai.com/v1",
+                Some("sk-test-not-a-real-key"),
+                None,
+                None,
+            ),
+        );
+        models.insert(
+            "proxy".to_string(),
+            test_model_entry(
+                "proxy",
+                crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+                Some("proxy-key"),
+                None,
+                None,
+            ),
+        );
+        let acp_models = to_acp_model_info(&models);
+        let local = acp_models
+            .get(&acp::ModelId::new(Arc::from("local")))
+            .and_then(|m| m.meta.clone())
+            .expect("local meta");
+        assert_eq!(local["sanitizedOrigin"], "http://127.0.0.1:11434/v1");
+        assert_eq!(local["endpointTrust"], "local");
+        assert_eq!(local["credentialSource"], "missing");
+
+        let openai = acp_models
+            .get(&acp::ModelId::new(Arc::from("openai")))
+            .and_then(|m| m.meta.clone())
+            .expect("openai meta");
+        assert_eq!(openai["sanitizedOrigin"], "https://api.openai.com/v1");
+        assert_eq!(openai["endpointTrust"], "external");
+        assert_eq!(openai["credentialSource"], "model_api_key");
+        let rendered = format!("{openai:?}");
+        assert!(
+            !rendered.contains("sk-test-not-a-real-key"),
+            "ACP meta Debug must stay secret-free: {rendered}"
+        );
+
+        let proxy = acp_models
+            .get(&acp::ModelId::new(Arc::from("proxy")))
+            .and_then(|m| m.meta.clone())
+            .expect("proxy meta");
+        assert_eq!(proxy["endpointTrust"], "first_party_xai");
+    }
     #[test]
     fn acp_model_meta_invalid_auth_scheme_is_not_ready() {
         let (_, models) = resolve_models_from_toml(
@@ -12336,30 +12661,60 @@ reasoning_effort = "low"
     /// `session_key` is only meaningful when the stored credential really is a
     /// session token. `resolve_credentials`' third arm takes whatever it is
     /// handed and stamps it `AuthType::SessionToken`, so passing a BYOK key
-    /// there re-labels it — and passing a real session token carries it to a
-    /// model that may point anywhere.
+    /// there re-labels it.
     ///
     /// The function documents the guard as the caller's job; this pins what
     /// happens when a caller forgets, so the reason the guard exists survives
     /// in a test rather than only in a doc comment (#136).
+    ///
+    /// The label is no longer the whole story. #110 STOP-1 taught
+    /// `resolve_credentials` to drop the credential when the relabelled
+    /// `XaiSession` would reach a non-first-party origin, so the re-labelled
+    /// key now only survives on an origin allowed to see an xAI session. Both
+    /// halves are pinned below, and both go through
+    /// `resolve_credentials_with_origins` so the trusted-origin set is the
+    /// test's, not whatever the ambient config happens to declare.
     #[test]
     fn a_key_passed_as_session_key_is_relabelled_a_session_token() {
         let entry = test_model_entry("vendor", "https://vendor.example/v1", None, None, None);
 
         // No own credential, no provider: the `session_key` arm is what fires.
-        let with_key = resolve_credentials(&entry, Some("not-actually-a-session-token"));
+        let with_key = resolve_credentials_with_origins(
+            &entry,
+            Some("not-actually-a-session-token"),
+            &no_trusted_origins(),
+        );
         assert_eq!(
             with_key.auth_type,
             xai_chat_state::AuthType::SessionToken,
             "the arm stamps whatever it is handed, which is why the caller must guard"
         );
         assert_eq!(
-            with_key.api_key.as_deref(),
+            with_key.api_key, None,
+            "#110 STOP-1: the relabel makes it an ambient xAI session, and a \
+             non-first-party origin must not receive one"
+        );
+
+        // The gate does not fire on a first-party origin, so there the relabel
+        // still carries the key — the half of the #136 hazard that remains.
+        let first_party = test_model_entry("xai", "https://api.x.ai/v1", None, None, None);
+        let carried = resolve_credentials_with_origins(
+            &first_party,
+            Some("not-actually-a-session-token"),
+            &no_trusted_origins(),
+        );
+        assert_eq!(
+            carried.auth_type,
+            xai_chat_state::AuthType::SessionToken,
+            "the relabel itself does not depend on the origin"
+        );
+        assert_eq!(
+            carried.api_key.as_deref(),
             Some("not-actually-a-session-token")
         );
 
         // Guarded correctly, the same model resolves without inheriting it.
-        let without = resolve_credentials(&entry, None);
+        let without = resolve_credentials_with_origins(&entry, None, &no_trusted_origins());
         assert_ne!(
             without.auth_type,
             xai_chat_state::AuthType::SessionToken,
@@ -16933,6 +17288,7 @@ default = "grok-4.5"
                 system_prompt_label: None,
                 codex_wire: None,
                 catalog_degraded_reason: None,
+                catalog_upgrade: None,
             },
             api_key: None,
             env_key: None,
@@ -17667,6 +18023,7 @@ default = "grok-4.5"
     }
     /// Keyed path: prod proxy origin can disarm; env override cannot.
     #[test]
+    #[serial]
     #[serial_test::serial(remote_sig_disarm)]
     fn remote_settings_disarm_requires_prod_proxy_when_keys_embedded() {
         xai_grok_config::signed_policy::apply_remote_managed_config_signature_verification(

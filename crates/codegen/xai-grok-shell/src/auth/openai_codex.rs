@@ -5,7 +5,7 @@
 //! is not the OpenAI Platform API and can evolve independently.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -927,6 +927,61 @@ fn classify_refresh_error(error: &TokenRequestError) -> Option<RefreshTokenFaile
     }
 }
 
+/// Resolve the Codex auth.json path the same way production construction does.
+///
+/// Tests that cannot pass a path into a production entry point should pin
+/// [`CodexAuthPathGuard`] (thread-local) instead of `GROK_AUTH_PATH` (#343).
+pub(crate) fn resolved_auth_path(grok_home: &Path) -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = AUTH_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
+    // In-process unit tests must not share process-global `GROK_AUTH_PATH`.
+    // Production still honors the env so a user-specified auth.json works.
+    if cfg!(test) {
+        grok_home.join("auth.json")
+    } else {
+        std::env::var("GROK_AUTH_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| grok_home.join("auth.json"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AUTH_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Thread-local pin of the Codex auth.json path for production constructors
+/// that cannot take a path argument. Does not mutate process environment.
+/// `!Send`: Drop restores this thread's `AUTH_PATH_OVERRIDE` (#343).
+#[cfg(test)]
+pub struct CodexAuthPathGuard {
+    previous: Option<PathBuf>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl CodexAuthPathGuard {
+    pub fn pin(path: impl Into<PathBuf>) -> Self {
+        let previous = AUTH_PATH_OVERRIDE.with(|slot| slot.replace(Some(path.into())));
+        Self {
+            previous,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CodexAuthPathGuard {
+    fn drop(&mut self) {
+        AUTH_PATH_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
 /// Convenience constructor that also installs the existing single-flight OIDC
 /// refresher used by proactive and bounded 401 recovery paths.
 pub fn manager(grok_home: &Path) -> Arc<AuthManager> {
@@ -941,6 +996,14 @@ pub fn manager(grok_home: &Path) -> Arc<AuthManager> {
     });
     #[cfg(not(test))]
     let manager = Arc::new(AuthManager::new_openai_codex(grok_home));
+    manager.configure_refresher(None, None);
+    manager
+}
+
+/// Like [`manager`], but bound to an exact auth.json path and independent of
+/// `GROK_AUTH_PATH` (#343).
+pub fn manager_at_path(path: PathBuf) -> Arc<AuthManager> {
+    let manager = Arc::new(AuthManager::new_openai_codex_at_path(path));
     manager.configure_refresher(None, None);
     manager
 }
@@ -992,6 +1055,55 @@ mod tests {
 
     fn reload_test_manager(grok_home: &Path) -> AuthManager {
         AuthManager::new_openai_codex_for_test_path(&grok_home.join("auth.json"))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn openai_codex_path_constructor_ignores_grok_auth_path_env() {
+        fn write_codex_auth(path: &Path, key: &str) {
+            let auth = GrokAuth {
+                key: key.into(),
+                auth_mode: AuthMode::OpenAiCodex,
+                refresh_token: Some(format!("{key}-refresh")),
+                oidc_issuer: Some(ISSUER.into()),
+                oidc_client_id: Some(CLIENT_ID.into()),
+                expires_at: Some(Utc::now() + Duration::hours(1)),
+                ..GrokAuth::default()
+            };
+            std::fs::write(
+                path,
+                serde_json::to_vec(&HashMap::from([(AUTH_SCOPE.to_owned(), auth)])).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let poison_home = tempfile::tempdir().unwrap();
+        write_codex_auth(&poison_home.path().join("auth.json"), "poison-token");
+        let real_home = tempfile::tempdir().unwrap();
+        let real_path = real_home.path().join("auth.json");
+        write_codex_auth(&real_path, "real-token");
+
+        // Process-global env must not be required (or used) by these constructors.
+        let _clear = xai_grok_test_support::EnvGuard::unset("GROK_AUTH_PATH");
+
+        let via_path = AuthManager::new_openai_codex_at_path(real_path.clone());
+        assert_eq!(
+            via_path
+                .current()
+                .expect("path constructor loaded fixture")
+                .key,
+            "real-token"
+        );
+
+        let _pin = CodexAuthPathGuard::pin(real_path);
+        let via_pin = AuthManager::new_openai_codex(poison_home.path());
+        assert_eq!(
+            via_pin
+                .current()
+                .expect("thread-local pin loaded fixture")
+                .key,
+            "real-token"
+        );
     }
 
     #[derive(Debug)]

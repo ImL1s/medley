@@ -80,6 +80,7 @@ pub(crate) fn remember_tool_approvals_from_disk() -> bool {
 mod remember_tool_approvals_gate_tests {
     use super::*;
     use crate::agent::config::ConfigSource;
+    use serial_test::serial;
 
     // `GROK_REMEMBER_TOOL_APPROVALS` is process-global; serialize and force it
     // unset at the top of each test so a developer's shell value can't make
@@ -158,6 +159,7 @@ mod remember_tool_approvals_gate_tests {
     }
 
     #[test]
+    #[serial]
     fn env_overrides_config_and_remote() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_REMEMBER_TOOL_APPROVALS, "1") };
@@ -169,6 +171,7 @@ mod remember_tool_approvals_gate_tests {
     }
 
     #[test]
+    #[serial]
     fn requirement_beats_env() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_REMEMBER_TOOL_APPROVALS, "1") };

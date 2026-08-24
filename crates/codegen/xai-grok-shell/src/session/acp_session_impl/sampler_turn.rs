@@ -19,6 +19,69 @@ fn model_auth_facts_are_cacheable(facts: &crate::agent::config::ModelAuthFacts) 
     facts.byok != ModelByok::Unknown
 }
 
+/// Remainder after a bounded HTTP-400 carrier. Accepts
+/// `API error (status 400):` / `API error (status 400 Bad Request):` and
+/// `Request failed (HTTP 400).` — never free-form provider text.
+fn remainder_after_http_400_prefix(message: &str) -> Option<&str> {
+    const HEADS: &[&str] = &["API error (status 400", "Request failed (HTTP 400"];
+    for head in HEADS {
+        let Some(rest) = message.strip_prefix(head) else {
+            continue;
+        };
+        let after_code = if let Some(stripped) = rest.strip_prefix(')') {
+            stripped
+        } else if rest.starts_with(' ') {
+            let close = rest.find(')')?;
+            &rest[close + 1..]
+        } else {
+            continue;
+        };
+        let after_code = after_code.trim_start_matches('.').trim_start();
+        let after_code = after_code
+            .strip_prefix(':')
+            .unwrap_or(after_code)
+            .trim_start();
+        let after_code = after_code
+            .strip_prefix("Request failed (HTTP 400).")
+            .unwrap_or(after_code)
+            .trim_start();
+        return Some(after_code);
+    }
+    None
+}
+
+#[cfg(test)]
+mod http_400_prefix_tests {
+    use super::remainder_after_http_400_prefix;
+
+    #[test]
+    fn remainder_after_http_400_prefix_accepts_status_and_reason_phrase() {
+        assert_eq!(
+            remainder_after_http_400_prefix(
+                "API error (status 400): Invalid value for reasoning.effort"
+            ),
+            Some("Invalid value for reasoning.effort")
+        );
+        assert_eq!(
+            remainder_after_http_400_prefix(
+                "API error (status 400 Bad Request): Invalid value for reasoning.effort"
+            ),
+            Some("Invalid value for reasoning.effort")
+        );
+        assert_eq!(
+            remainder_after_http_400_prefix(
+                "Request failed (HTTP 400). Invalid value for reasoning.effort"
+            ),
+            Some("Invalid value for reasoning.effort")
+        );
+        assert_eq!(
+            remainder_after_http_400_prefix("the server said status 400 somewhere"),
+            None,
+            "must not free-form match"
+        );
+    }
+}
+
 /// Auth-failure detector for tool errors. Matches strictly on HTTP 401
 /// when the error carries a structured status code, mirroring
 /// `SamplingError::is_auth_error` in xai-grok-sampling-types: 403 is
@@ -1964,8 +2027,9 @@ impl SessionActor {
 
 /// Build the terminal provider message exclusively from sampler-classified,
 /// secret-scrubbed fields. For 400 responses, retain the safe provider detail
-/// only behind one of the two exact API display prefixes emitted by the
-/// sampler; do not scan arbitrary free-form text for a status or body.
+/// only behind one of the bounded display carriers the sampler emits
+/// ([`remainder_after_http_400_prefix`]); do not scan arbitrary free-form text
+/// for a status or body.
 fn safe_provider_failure_message(error: &xai_grok_sampler::SamplingErrorInfo) -> String {
     let Some(status) = error.status_code else {
         return format!("Provider request failed ({}).", error.kind.as_str());
@@ -1975,20 +2039,10 @@ fn safe_provider_failure_message(error: &xai_grok_sampler::SamplingErrorInfo) ->
         return out;
     }
 
-    const PREFIXES: &[&str] = &[
-        "API error (status 400): ",
-        "API error (status 400 Bad Request): ",
-    ];
-    let Some(mut detail) = PREFIXES
-        .iter()
-        .find_map(|prefix| error.message.strip_prefix(prefix))
-    else {
+    let Some(detail) = remainder_after_http_400_prefix(&error.message) else {
         return out;
     };
-    detail = detail
-        .strip_prefix("Request failed (HTTP 400).")
-        .unwrap_or(detail)
-        .trim();
+    let detail = detail.trim();
     if !detail.is_empty() {
         out.push(' ');
         out.push_str(detail);

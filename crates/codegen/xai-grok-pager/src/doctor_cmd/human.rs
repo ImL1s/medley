@@ -1,7 +1,7 @@
 use crate::clipboard::{ClipboardDelivery, NativeClipboardPreflight};
 use crate::diagnostics::{
     DataControlFact, DiagnosticFinding, DiagnosticReport, FindingDisposition, NewlineFact,
-    ProbeStatus, RuntimeFact, VoiceFacts,
+    ProbeStatus, ProviderRouteFact, RuntimeFact, VoiceFacts,
 };
 use crate::host::{DisplayServer, HostOs};
 
@@ -138,6 +138,10 @@ pub(super) fn format(report: &DiagnosticReport) -> String {
         }
     }
 
+    if !facts.providers.is_empty() {
+        format_providers(&facts.providers, &mut out);
+    }
+
     if !report.findings.is_empty() {
         out.push_str("\nFindings\n");
         for finding in &report.findings {
@@ -223,6 +227,28 @@ fn format_finding(out: &mut String, finding: &DiagnosticFinding) {
     }
     if let Some(note) = &finding.note {
         out.push_str(&format!("      {note}\n"));
+    }
+}
+
+fn format_providers(routes: &[ProviderRouteFact], out: &mut String) {
+    out.push_str("\nProviders\n");
+    for (index, route) in routes.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        fact(out, "model", &route.catalog_id);
+        if route.wire_model != route.catalog_id {
+            fact(out, "wire", &route.wire_model);
+        }
+        fact(out, "origin", &route.sanitized_origin);
+        fact(out, "auth", route.auth_scheme.as_str());
+        fact(out, "source", &route.credential_source);
+        fact(out, "trust", route.endpoint_trust.as_str());
+        match (route.ready, route.unready_reason.as_deref()) {
+            (true, _) => fact(out, "status", "ready"),
+            (false, Some(reason)) => fact(out, "status", &format!("unready ({reason})")),
+            (false, None) => fact(out, "status", "unready"),
+        }
     }
 }
 

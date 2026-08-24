@@ -2054,6 +2054,10 @@ pub(super) fn apply_settings_outcome(
         }
         SettingsKeyOutcome::Changed => InputOutcome::Changed,
         SettingsKeyOutcome::Unchanged => InputOutcome::Unchanged,
+        SettingsKeyOutcome::Toast(msg) => {
+            agent.show_toast(&msg);
+            InputOutcome::Changed
+        }
     }
 }
 /// Whether this key event represents `#` (hash).

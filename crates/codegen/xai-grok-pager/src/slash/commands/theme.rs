@@ -89,6 +89,7 @@ impl SlashCommand for ThemeCommand {
             display: "auto".to_string(),
             match_text: "auto".to_string(),
             insert_text: "auto".to_string(),
+            identity: String::new(),
             description: format!("auto (follow system){auto_active}"),
             ..Default::default()
         }];
@@ -104,6 +105,7 @@ impl SlashCommand for ThemeCommand {
                 display: kind.display_name().to_string(),
                 match_text: kind.display_name().to_string(),
                 insert_text: kind.display_name().to_string(),
+                identity: String::new(),
                 description: format!("{}{active}", kind.display_name()),
                 ..Default::default()
             }

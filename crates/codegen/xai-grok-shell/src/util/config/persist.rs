@@ -183,6 +183,7 @@ fn merge_section<T: serde::Serialize>(
                 .or_insert_with(|| TomlValue::Table(TomlMap::new()));
             if let TomlValue::Table(existing) = section {
                 merge_toml_tables(existing, new_fields);
+                strip_retired_ui_aliases(key, existing);
             } else {
                 *section = TomlValue::Table(new_fields);
             }
@@ -191,6 +192,19 @@ fn merge_section<T: serde::Serialize>(
         Ok(_) | Err(_) => {
             table.remove(key);
         }
+    }
+}
+
+/// Drop `[ui].simple_mode` once the public `readline_mode` key is written so
+/// serde cannot see both names (the field uses `alias = "simple_mode"`).
+fn strip_retired_ui_aliases(section_key: &str, existing: &mut TomlMap<String, TomlValue>) {
+    if section_key != "ui" {
+        return;
+    }
+    let ui = crate::agent::config::UiConfig::READLINE_MODE_KEY;
+    let alias = crate::agent::config::UiConfig::SIMPLE_MODE_ALIAS_KEY;
+    if existing.contains_key(ui) {
+        existing.remove(alias);
     }
 }
 /// Update settings with a read-modify-write, preserving unrelated fields.
@@ -264,6 +278,29 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(false),
             "scalar [toolset] must be replaced so the write lands"
+        );
+    }
+
+    #[test]
+    fn load_config_from_toml_keeps_compact_mode_when_both_ui_keys_present() {
+        let root: TomlValue = toml::from_str(
+            r#"
+            [ui]
+            readline_mode = true
+            simple_mode = false
+            compact_mode = true
+            "#,
+        )
+        .unwrap();
+        let cfg = load_config_from_toml(&root);
+        assert_eq!(
+            cfg.ui.simple_mode,
+            Some(true),
+            "public readline_mode must win"
+        );
+        assert!(
+            cfg.ui.compact_mode,
+            "dual-key [ui] must not fall back to UiConfig::default and drop compact_mode"
         );
     }
     #[test]
@@ -1190,6 +1227,62 @@ auto_update = true
             assert_eq!(resolve(&cfg, None), DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT);
         }
         #[test]
+        fn catalog_effective_context_window_percent_beats_hardcoded_default() {
+            let _g = EnvVarGuard::unset();
+            let mut cfg = make_cfg(None, None, None);
+            cfg.config_models.insert(
+                TEST_MODEL.to_owned(),
+                ConfigModelOverride {
+                    effective_context_window_percent: Some(95),
+                    ..ConfigModelOverride::default()
+                },
+            );
+            assert_eq!(resolve(&cfg, None), 95);
+            assert!(
+                !xai_token_estimation::exceeds_threshold(94_999, 100_000, 95),
+                "90+% of the window must not compact when catalog calibrates to 95%"
+            );
+            assert!(
+                xai_token_estimation::exceeds_threshold(95_000, 100_000, 95),
+                "auto-compact must fire at the catalog 95% line"
+            );
+        }
+        #[test]
+        fn user_session_beats_catalog_effective_context_window_percent() {
+            let _g = EnvVarGuard::unset();
+            let mut cfg = make_cfg(Some(80), None, None);
+            cfg.config_models.insert(
+                TEST_MODEL.to_owned(),
+                ConfigModelOverride {
+                    effective_context_window_percent: Some(95),
+                    ..ConfigModelOverride::default()
+                },
+            );
+            assert_eq!(resolve(&cfg, None), 80);
+        }
+        #[test]
+        fn user_per_model_beats_catalog_effective_context_window_percent() {
+            let _g = EnvVarGuard::unset();
+            let mut cfg = make_cfg(Some(75), Some(80), None);
+            if let Some(entry) = cfg.config_models.get_mut(TEST_MODEL) {
+                entry.effective_context_window_percent = Some(95);
+            }
+            assert_eq!(resolve(&cfg, Some(90)), 80);
+        }
+        #[test]
+        fn catalog_effective_context_window_percent_beats_gb_global() {
+            let _g = EnvVarGuard::unset();
+            let mut cfg = make_cfg(None, None, Some(40));
+            cfg.config_models.insert(
+                TEST_MODEL.to_owned(),
+                ConfigModelOverride {
+                    effective_context_window_percent: Some(95),
+                    ..ConfigModelOverride::default()
+                },
+            );
+            assert_eq!(resolve(&cfg, Some(70)), 95);
+        }
+        #[test]
         fn apply_does_not_merge_auto_compact_threshold_percent_into_model_info() {
             use crate::agent::config::{EndpointsConfig, ModelEntry};
             let endpoints = EndpointsConfig::default();
@@ -1354,12 +1447,15 @@ custom_user_key = "preserve-me"
              this is the merge_section invariant the new helpers depend on"
         );
     }
-    /// Same merge round-trip for `show_timestamps` and `simple_mode`.
+    /// Same merge round-trip for `show_timestamps` and `readline_mode`.
+    /// A pre-existing `simple_mode` alias is dropped so both keys cannot
+    /// coexist after a write (issue #66).
     #[test]
     fn set_show_timestamps_and_simple_mode_round_trip_through_merge() {
         let original = r#"
 [ui]
 compact_mode = true
+simple_mode = true
 custom_unknown_key = 42
 "#;
         let root: TomlValue = toml::from_str(original).unwrap();
@@ -1373,7 +1469,16 @@ custom_unknown_key = 42
             ui.get("show_timestamps").and_then(|v| v.as_bool()),
             Some(false),
         );
-        assert_eq!(ui.get("simple_mode").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            ui.get(crate::agent::config::UiConfig::READLINE_MODE_KEY)
+                .and_then(|v| v.as_bool()),
+            Some(false),
+        );
+        assert!(
+            ui.get(crate::agent::config::UiConfig::SIMPLE_MODE_ALIAS_KEY)
+                .is_none(),
+            "retired simple_mode must be dropped when readline_mode is written"
+        );
         assert_eq!(
             ui.get("compact_mode").and_then(|v| v.as_bool()),
             Some(true),

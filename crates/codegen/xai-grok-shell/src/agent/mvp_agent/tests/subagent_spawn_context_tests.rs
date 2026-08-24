@@ -444,3 +444,61 @@ async fn issue14_spawn_refresh_parent_actor_unavailable_is_actionable_error() {
     assert!(ctx.parent_tool_definitions.is_none());
     assert!(ctx.parent_skills.is_none());
 }
+
+fn issue281_idle_timeout_entry(id: &str, timeout: u64) -> crate::agent::config::ModelEntry {
+    let endpoints = crate::agent::config::EndpointsConfig::default();
+    let mut entry = crate::agent::config::ModelEntry::fallback(id, &endpoints);
+    entry.info.inference_idle_timeout_secs = Some(timeout);
+    entry
+}
+
+/// #281: idle timeout is a per-model catalog fact. Construction still
+/// snapshots the parent; the applied value must come from the child's
+/// catalog entry via the same resolver `run_shell_child` uses.
+#[tokio::test]
+async fn issue281_inference_idle_timeout_uses_child_model() {
+    const PARENT_MODEL: &str = "issue281-parent-model";
+    const CHILD_MODEL: &str = "issue281-child-model";
+    const PARENT_TIMEOUT: u64 = 120;
+    const CHILD_TIMEOUT: u64 = 900;
+
+    let agent = build_minimal_agent_for_tests();
+    agent.models_manager.insert_test_entry(
+        PARENT_MODEL,
+        issue281_idle_timeout_entry(PARENT_MODEL, PARENT_TIMEOUT),
+    );
+    agent.models_manager.insert_test_entry(
+        CHILD_MODEL,
+        issue281_idle_timeout_entry(CHILD_MODEL, CHILD_TIMEOUT),
+    );
+
+    let sid = acp::SessionId::new("issue281-parent");
+    agent.insert_resident(&sid, make_test_handle(PARENT_MODEL, false, None));
+
+    let mut ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
+    assert_eq!(ctx.model_id.0.as_ref(), PARENT_MODEL);
+    assert_eq!(
+        ctx.inference_idle_timeout_secs, PARENT_TIMEOUT,
+        "shipped construction still snapshots the parent; applying that value is the bug"
+    );
+
+    let parent_timeout = ctx.resolve_inference_idle_timeout_secs(ctx.model_id.0.as_ref());
+    assert_eq!(parent_timeout, PARENT_TIMEOUT);
+
+    // The child model is assigned after construction (via [subagents.models]
+    // or AgentDefinition.model). Resolution must follow that id.
+    ctx.model_id = acp::ModelId::new(CHILD_MODEL);
+    let applied = ctx.resolve_inference_idle_timeout_secs(ctx.model_id.0.as_ref());
+    assert_ne!(
+        PARENT_TIMEOUT, CHILD_TIMEOUT,
+        "parent and child must differ or this test proves nothing"
+    );
+    assert_eq!(
+        applied, CHILD_TIMEOUT,
+        "applied idle timeout must come from the child's catalog entry, not the parent's"
+    );
+    assert_ne!(
+        ctx.inference_idle_timeout_secs, applied,
+        "the parent snapshot must not be the value applied to the child"
+    );
+}

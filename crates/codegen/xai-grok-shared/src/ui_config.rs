@@ -19,8 +19,15 @@ pub struct UiConfig {
     /// Compact mode. Read by pager, declared here for `serde_ignored`.
     #[serde(default)]
     pub compact_mode: bool,
-    /// Simple mode. Read by pager, declared here for `serde_ignored`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Readline-style composer editing (`true`, default). `false` enables
+    /// experimental vim keys in the prompt. Public `[ui]` key is
+    /// [`Self::READLINE_MODE_KEY`]; legacy `simple_mode` still loads.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "readline_mode",
+        alias = "simple_mode"
+    )]
     pub simple_mode: Option<bool>,
     /// Read by `load_permission_mode()`. Declared for `serde_ignored`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +301,13 @@ impl Default for UiConfig {
 }
 
 impl UiConfig {
+    /// Canonical `[ui]` key for readline-style prompt editing (issue #66).
+    /// Legacy `simple_mode` still deserializes via `#[serde(alias)]`.
+    pub const READLINE_MODE_KEY: &'static str = "readline_mode";
+
+    /// Retired `[ui]` key accepted as an alias of [`Self::READLINE_MODE_KEY`].
+    pub const SIMPLE_MODE_ALIAS_KEY: &'static str = "simple_mode";
+
     /// The single source of truth for the timeline-sidebar default (opt-in).
     /// Flip this one line to change the default everywhere.
     ///
@@ -407,6 +421,40 @@ mod tests {
         let from_flash: UiConfig =
             serde_json::from_str(r#"{"keep_text_selection": "flash"}"#).unwrap();
         assert_eq!(from_flash.keep_text_selection.as_deref(), Some("flash"));
+    }
+
+    #[test]
+    fn simple_mode_alias_loads_legacy_ui_key_issue66() {
+        let from_legacy: UiConfig = serde_json::from_str(r#"{"simple_mode": false}"#).unwrap();
+        assert_eq!(
+            from_legacy.simple_mode,
+            Some(false),
+            "legacy [ui] simple_mode = false must still load"
+        );
+
+        let from_public: UiConfig = serde_json::from_str(r#"{"readline_mode": false}"#).unwrap();
+        assert_eq!(
+            from_public.simple_mode,
+            Some(false),
+            "public [ui] readline_mode must populate the same field"
+        );
+
+        let written = serde_json::to_value(&UiConfig {
+            simple_mode: Some(false),
+            ..UiConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            written
+                .get(UiConfig::READLINE_MODE_KEY)
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "writes must use the public readline_mode key"
+        );
+        assert!(
+            written.get(UiConfig::SIMPLE_MODE_ALIAS_KEY).is_none(),
+            "writes must not emit the retired simple_mode key"
+        );
     }
 
     #[test]

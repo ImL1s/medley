@@ -5,7 +5,13 @@
 //! record when a prompt cut is requested. Chat history stays materialized: its
 //! transforms need random access and the compacted history is bounded by the
 //! context window.
+//!
+//! Inherited compaction summaries embed an absolute `session_dir/compaction`
+//! pointer (`SessionActor::transcript_hint`). After the archive is copied,
+//! that prefix is rewritten to the child's dir so deleting the parent cannot
+//! break the child's history.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
@@ -51,20 +57,29 @@ fn is_orchestration_projection_update(update: &SessionUpdate) -> bool {
 /// The referenced path or even a quoted hint can legitimately appear in the
 /// summary body. `build_compacted_history` appends the generated hint as the
 /// final suffix, so only that suffix is eligible for rebinding.
+///
+/// Returns whether anything was rebound, so a caller that re-serializes can
+/// leave an untouched artifact byte-identical instead of reformatting it.
 fn rebind_compaction_hint(
     items: &mut [ConversationItem],
     mode: xai_chat_state::CompactionMode,
     source_path: &Path,
     target_path: &Path,
-) {
+) -> bool {
     let source_path = source_path.to_string_lossy();
     let target_path = target_path.to_string_lossy();
     let (Some(source_hint), Some(target_hint)) = (
         mode.transcript_hint(Some(source_path.as_ref())),
         mode.transcript_hint(Some(target_path.as_ref())),
     ) else {
-        return;
+        return false;
     };
+    // Mirrors `CompactionHintRewrite::between`: a rebind onto the same text
+    // changes nothing, so don't report one.
+    if source_hint == target_hint {
+        return false;
+    }
+    let mut rebound_any = false;
     for item in items {
         let ConversationItem::User(user) = item else {
             continue;
@@ -81,9 +96,11 @@ fn rebind_compaction_hint(
                 rebound.push_str(prefix);
                 rebound.push_str(&target_hint);
                 *text = rebound.into();
+                rebound_any = true;
             }
         }
     }
+    rebound_any
 }
 
 /// Updates written plus the `compaction_checkpoints/{uuid}.json` files the
@@ -990,6 +1007,76 @@ fn for_each_jsonl_line_capped<R: BufRead>(
     result
 }
 
+/// Parent `session_dir/compaction` as `SessionActor::transcript_hint` writes
+/// it (`Path::to_string_lossy` of `session_dir.join(COMPACTION_DIR)`). Only
+/// this prefix is rewritten so workspace cwd text stays put. Serves the copied
+/// `summary.json` alone — every other surface rebinds the typed hint instead.
+struct CompactionHintRewrite {
+    from: String,
+    to: String,
+}
+
+impl CompactionHintRewrite {
+    fn between(source_session_dir: &Path, target_session_dir: &Path) -> Option<Self> {
+        let from = source_session_dir
+            .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+            .to_string_lossy()
+            .into_owned();
+        let to = target_session_dir
+            .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+            .to_string_lossy()
+            .into_owned();
+        if from.is_empty() || from == to {
+            None
+        } else {
+            Some(Self { from, to })
+        }
+    }
+
+    fn apply<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if !text.contains(&self.from) {
+            return Cow::Borrowed(text);
+        }
+        Cow::Owned(replace_compaction_dir_prefix(text, &self.from, &self.to))
+    }
+}
+
+/// Replace `from` only at a path-component boundary so a sibling such as
+/// `.../compaction_checkpoints` is not rewritten as a prefix of `.../compaction`.
+fn replace_compaction_dir_prefix(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find(from) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + from.len()..];
+        let continues_component = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+        if continues_component {
+            out.push_str(from);
+        } else {
+            out.push_str(to);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn rewrite_string(text: &mut String, rewrite: &CompactionHintRewrite) {
+    if let Cow::Owned(replaced) = rewrite.apply(text) {
+        *text = replaced;
+    }
+}
+
+fn rewrite_summary_compaction_hint(summary: &mut Summary, rewrite: &CompactionHintRewrite) {
+    rewrite_string(&mut summary.session_summary, rewrite);
+    if let Some(ref mut last) = summary.last_turn_summary {
+        rewrite_string(last, rewrite);
+    }
+}
+
 /// Indexes (in non-empty-line order) of the source lines that survive rewind
 /// filtering and the `target_prompt_index` cut, holding one classification per
 /// line instead of the lines. As in replay, an unparseable line classifies as
@@ -1041,12 +1128,19 @@ impl<'a> UpdateLineWriter<'a> {
     }
 
     fn copy_line(&mut self, line: &[u8]) -> io::Result<()> {
-        let update = match std::str::from_utf8(line).map(SessionUpdateEnvelope::from_str) {
-            Ok(Ok(update)) => update,
-            Ok(Err(error)) => {
+        let utf8 = match std::str::from_utf8(line) {
+            Ok(s) => s,
+            Err(error) => {
                 self.skip_torn_line(&error);
                 return Ok(());
             }
+        };
+        // Copied as written: every string in a transcript record is content a
+        // user or the model produced. The generated compaction hint's replay
+        // home is a checkpoint's `compacted_history`, rebound where that file
+        // is copied — rewriting paths here would edit words nobody wrote.
+        let update = match SessionUpdateEnvelope::from_str(utf8) {
+            Ok(update) => update,
             Err(error) => {
                 self.skip_torn_line(&error);
                 return Ok(());
@@ -1153,6 +1247,11 @@ impl JsonlStorageAdapter {
         options: CopySessionOptions,
     ) -> io::Result<CopySessionResult> {
         let public_target_dir = self.session_dir(target_info);
+        // Hints must name the child's final public location, never the private
+        // staging directory this copy writes through: staging disappears at
+        // publication, and a hint pointing there would dangle.
+        let hint_rewrite =
+            CompactionHintRewrite::between(&self.session_dir(source_info), &public_target_dir);
         let publication = match &self.dir_mode {
             SessionDirMode::FromRoot(root_dir) => Some(CopyPublication::begin(
                 root_dir,
@@ -1262,6 +1361,15 @@ impl JsonlStorageAdapter {
             chat_to_copy = xai_chat_state::compaction_utils::strip_reasoning_blocks(chat_to_copy);
         }
 
+        // Every conversation surface is retargeted by the typed rebinds only:
+        // they replace the exact generated hint on a compaction-meta item and
+        // nothing else, so a path a user quoted in their own message survives
+        // the fork verbatim. The same rebind runs on each copied checkpoint's
+        // `compacted_history`, which is what a cross-compaction rewind
+        // replays. `updates.jsonl` is deliberately copied untouched: it holds
+        // no generated hint, only words a user or the model wrote (#345).
+        // The blunt prefix rewrite below now serves the copied summary alone.
+
         let num_chat_messages = chat_to_copy.len();
         let cwd_switch_bookkeeping_generation = chat_to_copy
             .iter()
@@ -1298,7 +1406,7 @@ impl JsonlStorageAdapter {
         let checkpoint_files = copied_updates.checkpoint_files;
         let num_messages = copied_updates.count;
 
-        let target_summary = fork_summary(
+        let mut target_summary = fork_summary(
             source_summary,
             target_info,
             &options,
@@ -1309,6 +1417,9 @@ impl JsonlStorageAdapter {
                 inherited_prefix_len,
             },
         );
+        if let Some(rewrite) = &hint_rewrite {
+            rewrite_summary_compaction_hint(&mut target_summary, rewrite);
+        }
         let summary_bytes = serde_json::to_vec_pretty(&target_summary).map_err(invalid_data)?;
         std::fs::write(target_adapter.summary_file(target_info), summary_bytes)?;
 
@@ -1361,11 +1472,27 @@ impl JsonlStorageAdapter {
             0
         };
 
+        // As above, hints must name the child's final public location, never
+        // the staging directory this copy writes through.
+        let checkpoint_rebinds = CheckpointRebinds {
+            segments: options.copy_compaction_segments.then(|| {
+                (
+                    self.session_dir(source_info)
+                        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR),
+                    public_target_dir.join(xai_chat_state::compaction_transcript::COMPACTION_DIR),
+                )
+            }),
+            transcript: (
+                self.updates_file(source_info),
+                public_target_dir.join("updates.jsonl"),
+            ),
+        };
         let compaction_checkpoints_copied = copy_referenced_checkpoints(
             &checkpoint_files,
             &self.session_dir(source_info),
             &target_dir,
             &source_info.id,
+            &checkpoint_rebinds,
         )?;
 
         let result = CopySessionResult {
@@ -1500,6 +1627,68 @@ fn copy_sidecar_file(enabled: bool, src: &Path, dst: &Path) -> io::Result<bool> 
     Ok(true)
 }
 
+/// The typed hint rebinds a copied checkpoint needs, in the same shape and
+/// under the same conditions the chat lane applies them: the segment archive
+/// when this fork copies it, and the raw transcript, which any fork reaching
+/// here has copied — a `fork_filter` copy retains no checkpoint records, so
+/// [`copy_referenced_checkpoints`] returns early.
+struct CheckpointRebinds {
+    segments: Option<(PathBuf, PathBuf)>,
+    transcript: (PathBuf, PathBuf),
+}
+
+/// Rebind one checkpoint's `compacted_history` onto the child's archive.
+///
+/// `Ok(None)` means write the source bytes unchanged: either nothing matched,
+/// or the file does not read as a checkpoint (an older schema, or one a user
+/// edited). A fork must not fail on history it cannot interpret, and a
+/// checkpoint this copy does not touch must stay byte-identical rather than be
+/// reformatted by a serde round-trip.
+fn rebound_checkpoint_bytes(
+    bytes: &[u8],
+    rebinds: &CheckpointRebinds,
+    src: &Path,
+    source_id: &acp::SessionId,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut file: crate::extensions::notification::CompactionCheckpointFile =
+        match serde_json::from_slice(bytes) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %src.display(),
+                    session_id = %source_id,
+                    "compaction checkpoint does not read as a checkpoint file; copying it unchanged",
+                );
+                return Ok(None);
+            }
+        };
+    let mut rebound = false;
+    if let Some((source, target)) = &rebinds.segments {
+        rebound |= rebind_compaction_hint(
+            &mut file.compacted_history,
+            xai_chat_state::CompactionMode::Segments(xai_chat_state::CompactionDetail::default()),
+            source,
+            target,
+        );
+    }
+    let (source, target) = &rebinds.transcript;
+    rebound |= rebind_compaction_hint(
+        &mut file.compacted_history,
+        xai_chat_state::CompactionMode::Transcript,
+        source,
+        target,
+    );
+    if !rebound {
+        return Ok(None);
+    }
+    // `write_compaction_checkpoint` writes pretty JSON; match it so a rebound
+    // file stays diffable against one this session writes later.
+    Ok(Some(
+        serde_json::to_vec_pretty(&file).map_err(invalid_data)?,
+    ))
+}
+
 /// Copy the `compaction_checkpoints/{uuid}.json` files referenced by the
 /// retained records; returns how many copied. Records are user-editable data,
 /// so only the exact path shape this feature writes may resolve, symlinks are
@@ -1510,6 +1699,7 @@ fn copy_referenced_checkpoints(
     source_session_dir: &Path,
     target_dir: &Path,
     source_id: &acp::SessionId,
+    rebinds: &CheckpointRebinds,
 ) -> io::Result<usize> {
     if checkpoint_files.is_empty() {
         return Ok(0);
@@ -1584,7 +1774,31 @@ fn copy_referenced_checkpoints(
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(&src, &dst)?;
+        // A checkpoint's `compacted_history` is what a cross-compaction rewind
+        // restores verbatim, so it carries the same generated hint the chat
+        // lane rebinds — without this the child keeps pointing at an archive
+        // the parent's deletion takes with it (#345). Rebind the typed items,
+        // never the file text: the suffix match then holds however JSON
+        // escaped the path, where a textual replace does not (on Windows the
+        // file stores `\\` where the path has `\` — Codex P2 3793486694).
+        let bytes = match std::fs::read(&src) {
+            Ok(bytes) => bytes,
+            // Raced with a delete since the check above; same policy as an
+            // already-dangling record.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %src.display(),
+                    session_id = %source_id,
+                    "compaction checkpoint file vanished during copy; skipping",
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match rebound_checkpoint_bytes(&bytes, rebinds, &src, source_id)? {
+            Some(rebound) => std::fs::write(&dst, rebound)?,
+            None => std::fs::write(&dst, &bytes)?,
+        }
         copied += 1;
     }
     Ok(copied)

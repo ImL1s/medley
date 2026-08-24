@@ -9,6 +9,7 @@ pub mod feedback_client;
 pub mod folder_trust;
 pub(crate) mod handlers;
 pub mod init;
+mod inspect_routes;
 pub mod model_providers;
 pub mod models;
 pub mod mvp_agent;
@@ -26,6 +27,10 @@ pub(crate) mod subscription_check;
 pub(crate) mod trusted_origins;
 pub(crate) mod update_chunk_merge;
 
+pub use inspect_routes::{
+    InspectedAuthScheme, InspectedEndpointTrust, InspectedModelRoute,
+    inspect_model_routes_from_toml, inspect_model_routes_offline,
+};
 pub use mvp_agent::MvpAgent;
 pub use relay::{RelayConfig, RelayHandle, spawn_relay_connection};
 pub use server::{MIN_REMOTE_SECRET_BYTES, ServerConfig, run_agent_server};

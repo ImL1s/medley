@@ -175,7 +175,8 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
 ///
 /// The generic `CreateResponse` conversion cannot see catalog flags; the Codex
 /// transport calls this after serialize so a Spark entry that rejects
-/// `reasoning.summary` does not inherit Sol's wire shape (#245).
+/// `reasoning.summary` does not inherit Sol's wire shape (#245), and so a Sol
+/// entry with `use_responses_lite` gets `reasoning.context = all_turns` (#274).
 pub fn apply_codex_wire_capabilities(
     body: &mut serde_json::Value,
     caps: &crate::CodexWireCapabilities,
@@ -184,6 +185,26 @@ pub fn apply_codex_wire_capabilities(
         && let Some(reasoning) = body.get_mut("reasoning").and_then(|v| v.as_object_mut())
     {
         reasoning.remove("summary");
+    }
+    // Established from openai/codex `build_reasoning`: lite requires
+    // `reasoning.context = all_turns` or the server 400s. Parallel tool
+    // calls are disabled on that same path.
+    if caps.responses_lite_enabled() {
+        match body
+            .get_mut("reasoning")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            Some(reasoning) => {
+                reasoning.insert(
+                    "context".to_owned(),
+                    serde_json::Value::String("all_turns".to_owned()),
+                );
+            }
+            None => {
+                body["reasoning"] = serde_json::json!({ "context": "all_turns" });
+            }
+        }
+        body["parallel_tool_calls"] = serde_json::Value::Bool(false);
     }
     if !caps.allows_image_input()
         && let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut())
@@ -198,32 +219,128 @@ pub fn apply_codex_wire_capabilities(
             }
         }
     }
+    apply_codex_image_detail_original(body, caps);
+    if caps.request_truncation_auto() {
+        body["truncation"] = serde_json::Value::String("auto".into());
+    }
+}
+
+/// Fail closed on `input_image.detail`.
+///
+/// The typed `CreateResponse` path only has `ImageDetail::{Auto,Low,High}`,
+/// so this client never invents `detail: "original"`. The catalog flag is
+/// still read: unless it is `Some(true)`, any existing `"original"` is
+/// rewritten to `"auto"` so a Spark-like entry cannot inherit Sol's detail.
+fn apply_codex_image_detail_original(
+    body: &mut serde_json::Value,
+    caps: &crate::CodexWireCapabilities,
+) {
+    if caps.allows_image_detail_original() {
+        return;
+    }
+    let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for item in input {
+        let Some(content) = item.get_mut("content").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for part in content {
+            if part.get("type").and_then(|t| t.as_str()) != Some("input_image") {
+                continue;
+            }
+            if part.get("detail").and_then(|d| d.as_str()) == Some("original")
+                && let Some(obj) = part.as_object_mut()
+            {
+                obj.insert("detail".into(), serde_json::Value::String("auto".into()));
+            }
+        }
+    }
+}
+
+/// Stable marker injected once into Codex Ultra `instructions`.
+///
+/// First-party Codex keeps Ultra as a client mode, lowers the wire effort to
+/// `max`, and activates proactive multi-agent developer instructions. Generic
+/// Responses / Chat Completions must not receive this marker.
+pub const CODEX_ULTRA_PROACTIVE_MARKER: &str = "<codex_ultra_proactive_multi_agent>";
+
+const CODEX_ULTRA_PROACTIVE_INSTRUCTION: &str = concat!(
+    "<codex_ultra_proactive_multi_agent> ",
+    "Proactively delegate independent subtasks to specialized agents when that ",
+    "completes the user's work faster or more reliably. Keep coordination, ",
+    "synthesis, and final decisions yourself."
+);
+
+/// Codex-only Responses boundary: client `ultra` → wire `max`, and inject the
+/// proactive multi-agent instruction marker at most once.
+pub fn prepare_codex_ultra_responses(
+    body: &mut serde_json::Value,
+    client_effort: Option<crate::ReasoningEffort>,
+) {
+    if client_effort != Some(crate::ReasoningEffort::Ultra) {
+        return;
+    }
+
+    match body.get_mut("reasoning") {
+        Some(serde_json::Value::Object(reasoning)) => {
+            reasoning.insert(
+                "effort".to_string(),
+                serde_json::Value::String("max".to_string()),
+            );
+        }
+        _ => {
+            body["reasoning"] = serde_json::json!({ "effort": "max" });
+        }
+    }
+
+    let existing = body
+        .get("instructions")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if existing.contains(CODEX_ULTRA_PROACTIVE_MARKER) {
+        return;
+    }
+    body["instructions"] = serde_json::Value::String(if existing.is_empty() {
+        CODEX_ULTRA_PROACTIVE_INSTRUCTION.to_string()
+    } else {
+        format!("{existing}\n\n{CODEX_ULTRA_PROACTIVE_INSTRUCTION}")
+    });
 }
 
 /// Codex expects system guidance in the top-level `instructions` field rather
 /// than as a `role: "system"` item inside `input`. Keep the generic Responses
 /// conversion unchanged and apply this only at the Codex transport boundary.
-pub fn patch_codex_instructions(body: &mut serde_json::Value) {
-    let Some(input) = body
+///
+/// `catalog` is the shipped hook for catalog `base_instructions` /
+/// `model_messages.instructions_template` (#261). No live I/O: the strings
+/// are already on [`crate::CodexWireCapabilities`].
+pub fn patch_codex_instructions(
+    body: &mut serde_json::Value,
+    catalog: Option<&crate::CodexWireCapabilities>,
+) {
+    let mut system_text = Vec::new();
+    if let Some(catalog_text) = catalog.and_then(crate::CodexWireCapabilities::catalog_instructions)
+    {
+        system_text.push(catalog_text.to_owned());
+    }
+    if let Some(input) = body
         .get_mut("input")
         .and_then(serde_json::Value::as_array_mut)
-    else {
-        return;
-    };
-
-    let mut system_text = Vec::new();
-    input.retain(|item| {
-        if item.get("role").and_then(serde_json::Value::as_str) != Some("system") {
-            return true;
-        }
-        if let Some(content) = item.get("content").and_then(codex_instruction_text) {
-            system_text.push(content);
-            return false;
-        }
-        // Do not silently discard a valid-but-unsupported content shape.
-        // Leaving it in `input` is safer than stripping system guidance.
-        true
-    });
+    {
+        input.retain(|item| {
+            if item.get("role").and_then(serde_json::Value::as_str) != Some("system") {
+                return true;
+            }
+            if let Some(content) = item.get("content").and_then(codex_instruction_text) {
+                system_text.push(content);
+                return false;
+            }
+            // Do not silently discard a valid-but-unsupported content shape.
+            // Leaving it in `input` is safer than stripping system guidance.
+            true
+        });
+    }
 
     if system_text.is_empty() {
         return;

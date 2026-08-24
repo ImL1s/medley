@@ -86,9 +86,11 @@ pub(crate) struct AutoCompactThresholdTiers {
     pub user_per_model: std::collections::HashMap<String, u8>,
     /// `cfg.remote_settings.auto_compact_threshold_percent` (GB global).
     pub remote_global: Option<u8>,
+    /// Catalog `effective_context_window_percent` per model id (#264).
+    pub catalog_per_model: std::collections::HashMap<String, u8>,
 }
 impl AutoCompactThresholdTiers {
-    /// Slice the parent's `Config` into the four tier inputs we'll resolve
+    /// Slice the parent's `Config` into the tier inputs we'll resolve
     /// against later. Only fields relevant to the auto-compact threshold
     /// are captured; the parent's `Config` is not held by reference.
     pub(crate) fn capture(cfg: &crate::agent::config::Config) -> Self {
@@ -97,6 +99,11 @@ impl AutoCompactThresholdTiers {
             .iter()
             .filter_map(|(k, v)| v.auto_compact_threshold_percent.map(|t| (k.clone(), t)))
             .collect();
+        let catalog_per_model = cfg
+            .config_models
+            .iter()
+            .filter_map(|(k, v)| v.effective_context_window_percent.map(|t| (k.clone(), t)))
+            .collect();
         Self {
             user_session: cfg.session.auto_compact_threshold_percent,
             user_per_model,
@@ -104,6 +111,7 @@ impl AutoCompactThresholdTiers {
                 .remote_settings
                 .as_ref()
                 .and_then(|r| r.auto_compact_threshold_percent),
+            catalog_per_model,
         }
     }
 }
@@ -148,7 +156,10 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_depth: u32,
     pub subagents_max_depth: u32,
     pub workflow_max_concurrent_agents: usize,
-    /// Inference idle timeout (secs), resolved from the parent's model config at spawn-context creation time.
+    /// Inference idle timeout (secs). Construction snapshots the parent as a
+    /// fallback only. The value applied to the child must be resolved for the
+    /// subagent's model via [`Self::resolve_inference_idle_timeout_secs`]
+    /// once that id is known — the next field documents why (#281).
     pub inference_idle_timeout_secs: u64,
     /// Tier inputs for resolving `auto_compact_threshold_percent` at
     /// spawn time — once the subagent's actual model id is known.
@@ -352,15 +363,33 @@ impl SubagentSpawnContext {
     fn would_strip_fallback_key(&self, resolved_api_key: Option<&str>) -> bool {
         self.auth.is_none() && resolved_api_key.is_some()
     }
+    /// Inference idle timeout for `model_id` (the subagent's catalog id,
+    /// typically `ctx.model_id` after the child is selected — not the
+    /// parent snapshot stored on this context).
+    ///
+    /// Same precedence as a main session: per-model catalog >
+    /// remote settings > 600, then clamp to ≥ 10.
+    pub(crate) fn resolve_inference_idle_timeout_secs(&self, model_id: &str) -> u64 {
+        let per_model = self
+            .models_manager
+            .model_inference_idle_timeout_secs(model_id);
+        let remote = self
+            .remote_settings
+            .as_ref()
+            .and_then(|s| s.inference_idle_timeout_secs);
+        per_model.or(remote).unwrap_or(600).max(10)
+    }
+
     /// Resolve `auto_compact_threshold_percent` for the subagent's actual
     /// model id (the one selected by `resolve_subagent_sampling_config`,
     /// not the parent's). Walks the same precedence as the main session's
-    /// resolver: env > user [model.<id>] > user [session] > GB per-model
-    /// > GB global > 85.
+    /// resolver: env > user [model.<id>] > user [session] > catalog
+    /// > GB per-model > GB global > 85.
     ///
     /// The caller supplies the GB per-model tier from the same prepared
-    /// catalog snapshot as the subagent's `SamplerConfig`; user TOML and GB
-    /// global tiers remain sourced from the parent's spawn-context snapshot.
+    /// catalog snapshot as the subagent's `SamplerConfig`; user TOML, catalog,
+    /// and GB global tiers remain sourced from the parent's spawn-context
+    /// snapshot.
     pub(crate) fn resolve_auto_compact_threshold_percent(
         &self,
         subagent_model_id: &str,
@@ -372,6 +401,10 @@ impl SubagentSpawnContext {
                 .get(subagent_model_id)
                 .copied(),
             self.auto_compact_threshold_tiers.user_session,
+            self.auto_compact_threshold_tiers
+                .catalog_per_model
+                .get(subagent_model_id)
+                .copied(),
             gb_per_model,
             self.auto_compact_threshold_tiers.remote_global,
         )

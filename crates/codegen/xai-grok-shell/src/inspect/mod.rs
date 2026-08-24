@@ -95,6 +95,9 @@ pub(crate) struct InspectReport {
     /// `"<sanitized entry> (<reason>)"`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_xai_origins_rejected: Vec<String>,
+    /// #110: secret-free effective routes used by the sampler.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_routes: Vec<crate::agent::config::EffectiveModelRoute>,
 }
 
 #[derive(Debug, Serialize)]
@@ -329,7 +332,7 @@ async fn build_report(cwd: &Path) -> InspectReport {
         table.remove("compat");
     }
     let parsed_config =
-        crate::agent::config::Config::new_from_toml_cfg(&config_without_compat).ok();
+        crate::agent::config::Config::new_from_toml_cfg_offline(&config_without_compat).ok();
 
     let git_root = git2::Repository::discover(cwd)
         .ok()
@@ -500,6 +503,10 @@ async fn build_report(cwd: &Path) -> InspectReport {
         catalog_credential_source,
         trusted_xai_origins,
         trusted_xai_origins_rejected,
+        model_routes: parsed_config
+            .as_ref()
+            .map(crate::agent::config::inspect_model_routes)
+            .unwrap_or_default(),
     }
 }
 
@@ -1630,6 +1637,22 @@ fn print_human(r: &InspectReport) {
         println!("  {TREE} Credential source: {}", src);
     }
 
+    if !r.model_routes.is_empty() {
+        println!();
+        println!("  Model Routes");
+        for route in &r.model_routes {
+            let ready = if route.ready { "ready" } else { "unready" };
+            println!(
+                "  {TREE} {} → {} | {} | {} | auth: {} ({ready})",
+                route.catalog_id,
+                route.wire_model,
+                route.sanitized_origin,
+                format!("{:?}", route.endpoint_trust).to_ascii_lowercase(),
+                crate::agent::config::format_credential_source_label(&route.credential_source),
+            );
+        }
+    }
+
     if !r.trusted_xai_origins.is_empty() || !r.trusted_xai_origins_rejected.is_empty() {
         println!();
         println!("  Trusted xAI Origins (user-declared)");
@@ -1817,6 +1840,28 @@ mod tests {
     use super::*;
     use xai_grok_agent::prompt::skills::{SkillInfo, SkillsConfig};
     use xai_grok_tools::implementations::skills::types::SkillScope;
+
+    #[test]
+    fn inspect_model_route_line_is_secret_free() {
+        let route = crate::agent::config::EffectiveModelRoute {
+            catalog_id: "my-model".to_owned(),
+            wire_model: "wire-model".to_owned(),
+            sanitized_origin: "https://api.example.com/v1".to_owned(),
+            endpoint_trust: xai_grok_sampler::EndpointTrustClass::External,
+            credential_source: xai_grok_sampler::CredentialSource::EnvKey {
+                name: "OPENAI_API_KEY".to_owned(),
+            },
+            ready: true,
+            unready_reason: None,
+        };
+        let json = serde_json::to_string(&route).expect("route serializes");
+        assert!(json.contains("sanitizedOrigin"), "{json}");
+        assert!(json.contains("credentialSource"), "{json}");
+        assert_eq!(
+            crate::agent::config::format_credential_source_label(&route.credential_source),
+            "env:OPENAI_API_KEY"
+        );
+    }
 
     #[test]
     fn harness_compatibility_human_output_stays_compact() {
@@ -2184,6 +2229,33 @@ mod tests {
             alias_warning["reason"]
                 .as_str()
                 .is_some_and(|r| !r.is_empty())
+        );
+    }
+
+    #[test]
+    fn issue15_inspect_config_load_does_not_attempt_live_codex_catalog_fetch() {
+        crate::agent::model_providers::reset_live_codex_catalog_fetch_attempts();
+        let effective: toml::Value = toml::from_str(
+            r#"
+            [model.local]
+            model = "local"
+            base_url = "http://127.0.0.1:11434/v1"
+            auth_scheme = "none"
+            "#,
+        )
+        .unwrap();
+        let mut without_compat = effective;
+        if let Some(table) = without_compat.as_table_mut() {
+            table.remove("compat");
+        }
+        assert!(
+            crate::agent::config::Config::new_from_toml_cfg_offline(&without_compat).is_ok(),
+            "inspect must still parse a local keyless model offline"
+        );
+        assert_eq!(
+            crate::agent::model_providers::live_codex_catalog_fetch_attempts(),
+            0,
+            "grok inspect must not GET /models"
         );
     }
 

@@ -179,6 +179,7 @@ pub fn resolve_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn resolve_hints_requirements_overrides_user_when_effective_missing() {
@@ -305,6 +306,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn contextual_hints_env_master_forces_all_on() {
         let _g = contextual_hints_guard();
         unsafe { std::env::set_var(ENV_CONTEXTUAL_HINTS, "1") };
@@ -339,6 +341,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn contextual_hints_env_master_zero_forces_all_off() {
         let _g = contextual_hints_guard();
         unsafe { std::env::set_var(ENV_CONTEXTUAL_HINTS, "0") };

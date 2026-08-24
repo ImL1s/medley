@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::clipboard::{ClipboardDelivery, NativeClipboardPreflight, Osc52Capability};
 use crate::diagnostics::{
     DataControlFact, DiagnosticFinding, DiagnosticReport, FindingDisposition, NewlineFact,
-    ProbeNote, ProbeStatus, RuntimeFact, VoiceFacts,
+    ProbeNote, ProbeStatus, ProviderRouteFact, RuntimeFact, VoiceFacts,
 };
 use crate::host::HostOs;
 use crate::terminal::{ByobuBackend, ModifierFate, MultiplexerKind, TerminalName};
@@ -58,6 +58,8 @@ struct JsonFacts<'a> {
     clipboard: JsonClipboardFacts<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     voice: Option<JsonVoiceFacts<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    providers: Vec<ProviderRouteFact>,
 }
 
 impl<'a> From<&'a DiagnosticReport> for JsonFacts<'a> {
@@ -91,6 +93,7 @@ impl<'a> From<&'a DiagnosticReport> for JsonFacts<'a> {
             newline: facts.newline.as_ref().map(JsonNewlineFact::from),
             clipboard: JsonClipboardFacts::from(&facts.clipboard),
             voice: facts.voice.as_ref().map(JsonVoiceFacts::from),
+            providers: facts.providers.clone(),
         }
     }
 }

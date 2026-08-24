@@ -425,8 +425,11 @@ impl MvpAgent {
         };
         let am = self.auth_manager.clone();
         let inference_idle_timeout_secs = {
-            let per_model = config::find_model_by_id(&available_models, parent_model_id.0.as_ref())
-                .and_then(|e| e.info.inference_idle_timeout_secs);
+            // Parent snapshot only — applied timeout is re-resolved for the
+            // child's model once that id is known (#281).
+            let per_model = self
+                .models_manager
+                .model_inference_idle_timeout_secs(parent_model_id.0.as_ref());
             let cfg = self.cfg.borrow();
             let remote = cfg
                 .remote_settings

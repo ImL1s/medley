@@ -17,6 +17,7 @@ use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::extensions::task::{CancelSubagentRequest, KillTaskRequest};
 use xai_grok_shell::sampling::error::{
     RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
+    http_status_from_error,
 };
 use xai_grok_shell::sampling::types::{
     REASONING_EFFORT_META_KEY, parse_canonical_effort_token, reasoning_effort_meta_value,
@@ -1423,15 +1424,7 @@ pub async fn run_single_turn(
             }
         }
         Some(Err(err)) => {
-            let msg = if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
-                let detail = err.data.as_ref().and_then(error_detail_from_data);
-                crate::app::sanitize_user_error(&format_rate_limited_user_message(
-                    detail.as_deref(),
-                    is_api_key_auth,
-                ))
-            } else {
-                err.to_string()
-            };
+            let msg = format_headless_prompt_error(&err, is_api_key_auth);
             if let Some(usage) = xai_grok_shell::sampling::error::prompt_usage_from_error(&err) {
                 match serde_json::to_value(&usage) {
                     Ok(v) => emitter.usage = Some(v),
@@ -1456,6 +1449,43 @@ pub async fn run_single_turn(
         return Err(anyhow::Error::new(err).context("headless: stdout write failed"));
     }
     outcome
+}
+
+/// User-facing copy for a headless prompt-turn ACP error.
+///
+/// Rate-limit stays on the existing special-case path. Typed provider /
+/// HTTP failures reuse the TUI banner (`Headline — detail`) so the ACP
+/// `Internal error: {json}` envelope is never the printed line. Other
+/// failures keep generic `Display` (not forced into a 4xx banner).
+pub(crate) fn format_headless_prompt_error(err: &acp::Error, is_api_key_auth: bool) -> String {
+    if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
+        let detail = err.data.as_ref().and_then(error_detail_from_data);
+        return crate::app::sanitize_user_error(&format_rate_limited_user_message(
+            detail.as_deref(),
+            is_api_key_auth,
+        ));
+    }
+    let http_status = http_status_from_error(err);
+    let error_type = err
+        .data
+        .as_ref()
+        .and_then(|data| data.get("error_type"))
+        .and_then(|v| v.as_str());
+    // Unwrap `data.message` / string data — do not pass `err.to_string()`.
+    // ACP Display is `Internal error: {…}`; that shape would make every
+    // object-data internal error look typed.
+    let raw = err
+        .data
+        .as_ref()
+        .and_then(error_detail_from_data)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    if let Some(formatted) =
+        crate::app::error_display::compose_typed_provider_failure(http_status, error_type, &raw)
+    {
+        return formatted.message();
+    }
+    err.to_string()
 }
 
 /// Background work tracked for exit: bash/monitor tasks and background subagents, keyed by id.

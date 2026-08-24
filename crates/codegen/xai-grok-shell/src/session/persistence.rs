@@ -5568,8 +5568,12 @@ pub async fn delete_session_history(
         });
     };
 
+    // This function holds the session-id lease from its top (above), so the
+    // adapter must not take it again: `flock(2)` leases attach to the open
+    // file description, and a second acquisition inside this process blocks
+    // against the one we already hold.
     JsonlStorageAdapter::default()
-        .delete_session(&info)
+        .delete_session_holding_id_lease(&info)
         .await
         .map_err(DeleteSessionError::Local)?;
 

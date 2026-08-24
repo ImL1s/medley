@@ -8,7 +8,8 @@ use crate::diagnostics::probes::{
 };
 use crate::diagnostics::{
     ClipboardFacts, ColorFacts, DataControlFact, DiagnosticFacts, DiagnosticReport,
-    DiagnosticSnapshot, KeyboardFact, RuntimeFact, view,
+    DiagnosticSnapshot, KeyboardFact, ProviderAuthScheme, ProviderEndpointTrust, ProviderRouteFact,
+    RuntimeFact, view,
 };
 use crate::host::HostOs;
 use crate::terminal::{
@@ -654,6 +655,7 @@ fn keyboard_fact_formats_from_explicit_target_evidence() {
                 fix: None,
             },
             voice: None,
+            providers: Vec::new(),
         },
         findings: Vec::new(),
         probe_notes: Vec::new(),
@@ -679,5 +681,288 @@ fn keyboard_fact_formats_from_explicit_target_evidence() {
             "\n",
             "No issues found.\n",
         )
+    );
+}
+
+/// Sentinel that would appear if a route leaked userinfo, query, or key bytes.
+const ISSUE15_SECRET: &str = "sk-live-issue15-secret-0123456789";
+
+fn issue15_provider_rows() -> Vec<ProviderRouteFact> {
+    vec![
+        ProviderRouteFact {
+            catalog_id: "local-llama".to_owned(),
+            wire_model: "llama3".to_owned(),
+            sanitized_origin: "http://127.0.0.1:11434/v1".to_owned(),
+            auth_scheme: ProviderAuthScheme::None,
+            credential_source: "none".to_owned(),
+            endpoint_trust: ProviderEndpointTrust::Local,
+            ready: true,
+            unready_reason: None,
+        },
+        ProviderRouteFact {
+            catalog_id: "openai".to_owned(),
+            wire_model: "gpt-4o".to_owned(),
+            sanitized_origin: "https://api.openai.com/v1".to_owned(),
+            auth_scheme: ProviderAuthScheme::Bearer,
+            credential_source: "env:OPENAI_API_KEY".to_owned(),
+            endpoint_trust: ProviderEndpointTrust::External,
+            ready: true,
+            unready_reason: None,
+        },
+        ProviderRouteFact {
+            catalog_id: "anthropic".to_owned(),
+            wire_model: "claude-sonnet".to_owned(),
+            sanitized_origin: "https://api.anthropic.com".to_owned(),
+            auth_scheme: ProviderAuthScheme::XApiKey,
+            credential_source: "env:ANTHROPIC_API_KEY".to_owned(),
+            endpoint_trust: ProviderEndpointTrust::External,
+            ready: true,
+            unready_reason: None,
+        },
+    ]
+}
+
+fn report_with_providers(providers: Vec<ProviderRouteFact>) -> DiagnosticReport {
+    let terminal = ghostty(false);
+    let mut report = view(DiagnosticSnapshot::from(snapshot(
+        &terminal,
+        unavailable_tmux(),
+        &LOCAL_ROUTE,
+        "pbcopy",
+        false,
+        ColorLevel::TrueColor,
+        runtime(None, true),
+    )));
+    report.facts.providers = providers;
+    report
+}
+
+fn assert_issue15_secret_free(rendered: &str) {
+    for window in ISSUE15_SECRET.as_bytes().windows(8) {
+        let window = std::str::from_utf8(window).expect("ascii secret");
+        assert!(
+            !rendered.contains(window),
+            "doctor providers leaked secret fragment {window}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn issue15_doctor_providers_keyless_bearer_and_x_api_key_rows_are_stable() {
+    let output = format_doctor(&report_with_providers(issue15_provider_rows()));
+    assert_eq!(
+        output,
+        concat!(
+            "Environment\n",
+            "  terminal     Ghostty\n",
+            "  multiplexer  None detected\n",
+            "  ssh          no\n",
+            "  color        truecolor\n",
+            "  themes       all\n",
+            "\n",
+            "Clipboard\n",
+            "  native       local (pbcopy)\n",
+            "  tmux         off\n",
+            "  osc 52       off\n",
+            "  wrap         off\n",
+            "  status       confirmed\n",
+            "\n",
+            "Providers\n",
+            "  model        local-llama\n",
+            "  wire         llama3\n",
+            "  origin       http://127.0.0.1:11434/v1\n",
+            "  auth         none\n",
+            "  source       none\n",
+            "  trust        local\n",
+            "  status       ready\n",
+            "\n",
+            "  model        openai\n",
+            "  wire         gpt-4o\n",
+            "  origin       https://api.openai.com/v1\n",
+            "  auth         bearer\n",
+            "  source       env:OPENAI_API_KEY\n",
+            "  trust        external\n",
+            "  status       ready\n",
+            "\n",
+            "  model        anthropic\n",
+            "  wire         claude-sonnet\n",
+            "  origin       https://api.anthropic.com\n",
+            "  auth         x-api-key\n",
+            "  source       env:ANTHROPIC_API_KEY\n",
+            "  trust        external\n",
+            "  status       ready\n",
+            "\n",
+            "No issues found.\n",
+        )
+    );
+}
+
+#[test]
+fn issue15_doctor_providers_never_emit_secret_bytes() {
+    // Same leak shape EffectiveModelRoute sanitizes: userinfo + query + key bytes.
+    let hostile_url = format!(
+        "https://user:{ISSUE15_SECRET}@api.example.com:8443/v1/x?api_key={ISSUE15_SECRET}#frag"
+    );
+    let routes = vec![ProviderRouteFact {
+        catalog_id: "my-model".to_owned(),
+        wire_model: "wire-model".to_owned(),
+        sanitized_origin: "https://api.example.com:8443/v1/x".to_owned(),
+        auth_scheme: ProviderAuthScheme::Bearer,
+        credential_source: "env:OPENAI_API_KEY".to_owned(),
+        endpoint_trust: ProviderEndpointTrust::External,
+        ready: true,
+        unready_reason: None,
+    }];
+    let report = report_with_providers(routes.clone());
+    let text = format_doctor(&report);
+    let debug = format!("{report:?}");
+    let json = serde_json::to_string(&routes).expect("provider rows serialize");
+
+    assert!(hostile_url.contains(ISSUE15_SECRET));
+    assert!(!text.contains(&hostile_url));
+    assert!(text.contains("https://api.example.com:8443/v1/x"));
+    assert!(text.contains("env:OPENAI_API_KEY"));
+    assert!(json.contains("OPENAI_API_KEY"));
+    assert!(json.contains("\"authScheme\":\"bearer\""));
+    for rendered in [text.as_str(), debug.as_str(), json.as_str()] {
+        assert_issue15_secret_free(rendered);
+    }
+}
+
+#[test]
+fn issue15_doctor_providers_unready_reason_is_a_label_not_a_secret() {
+    let output = format_doctor(&report_with_providers(vec![ProviderRouteFact {
+        catalog_id: "anthropic".to_owned(),
+        wire_model: "claude-sonnet".to_owned(),
+        sanitized_origin: "https://api.anthropic.com".to_owned(),
+        auth_scheme: ProviderAuthScheme::XApiKey,
+        credential_source: "missing".to_owned(),
+        endpoint_trust: ProviderEndpointTrust::External,
+        ready: false,
+        unready_reason: Some("missing env:ANTHROPIC_API_KEY".to_owned()),
+    }]));
+    assert!(output.contains("  auth         x-api-key\n"));
+    assert!(output.contains("  source       missing\n"));
+    assert!(output.contains("  status       unready (missing env:ANTHROPIC_API_KEY)\n"));
+    assert_issue15_secret_free(&output);
+}
+
+#[test]
+fn doctor_providers_empty_omits_the_section() {
+    let terminal = ghostty(false);
+    let output = build_doctor(snapshot(
+        &terminal,
+        unavailable_tmux(),
+        &LOCAL_ROUTE,
+        "pbcopy",
+        false,
+        ColorLevel::TrueColor,
+        runtime(None, true),
+    ));
+    assert!(!output.contains("Providers"));
+    assert!(!output.contains("  auth         "));
+}
+
+#[test]
+fn issue15_provider_facts_from_model_state_mark_unready_without_secrets() {
+    use crate::acp::model_state::ModelState;
+    use agent_client_protocol as acp;
+    use std::sync::Arc;
+
+    let mut models = ModelState::default();
+    let id = acp::ModelId::new(Arc::from("codex-sol"));
+    let info = acp::ModelInfo::new(id.clone(), "GPT-5.6 Sol".to_string()).meta(Some(
+        serde_json::Map::from_iter([
+            ("ready".into(), serde_json::json!(false)),
+            (
+                "readinessReason".into(),
+                serde_json::json!("missing OPENAI_API_KEY"),
+            ),
+            ("authScheme".into(), serde_json::json!("bearer")),
+            (
+                "credentialSource".into(),
+                serde_json::json!("env:OPENAI_API_KEY"),
+            ),
+            ("modelSlug".into(), serde_json::json!("gpt-5.6-sol")),
+            (
+                "sanitizedOrigin".into(),
+                serde_json::json!("https://chatgpt.com"),
+            ),
+        ]),
+    ));
+    models.available.insert(id, info);
+    let rows = crate::diagnostics::provider_facts_from_model_state(&models);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].catalog_id, "codex-sol");
+    assert!(!rows[0].ready);
+    assert_eq!(
+        rows[0].unready_reason.as_deref(),
+        Some("missing OPENAI_API_KEY")
+    );
+    assert!(!format!("{rows:?}").contains(ISSUE15_SECRET));
+}
+
+#[test]
+fn issue15_provider_facts_from_model_state_does_not_fabricate_external_trust() {
+    use crate::acp::model_state::ModelState;
+    use crate::diagnostics::ProviderEndpointTrust;
+    use agent_client_protocol as acp;
+    use std::sync::Arc;
+
+    let mut models = ModelState::default();
+    let missing = acp::ModelId::new(Arc::from("missing-trust"));
+    models.available.insert(
+        missing.clone(),
+        acp::ModelInfo::new(missing, "Missing Trust".to_string()).meta(Some(
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("authScheme".into(), serde_json::json!("bearer")),
+            ]),
+        )),
+    );
+    let first = acp::ModelId::new(Arc::from("first-party"));
+    models.available.insert(
+        first.clone(),
+        acp::ModelInfo::new(first, "First Party".to_string()).meta(Some(
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("endpointTrust".into(), serde_json::json!("first_party_xai")),
+                (
+                    "sanitizedOrigin".into(),
+                    serde_json::json!("https://cli-chat-proxy.grok.com/v1"),
+                ),
+            ]),
+        )),
+    );
+    let local = acp::ModelId::new(Arc::from("local-ollama"));
+    models.available.insert(
+        local.clone(),
+        acp::ModelInfo::new(local, "Local".to_string()).meta(Some(serde_json::Map::from_iter([
+            ("ready".into(), serde_json::json!(true)),
+            ("endpointTrust".into(), serde_json::json!("local")),
+            (
+                "sanitizedOrigin".into(),
+                serde_json::json!("http://127.0.0.1:11434/v1"),
+            ),
+        ]))),
+    );
+
+    let rows = crate::diagnostics::provider_facts_from_model_state(&models);
+    let by_id = |id: &str| {
+        rows.iter()
+            .find(|row| row.catalog_id == id)
+            .unwrap_or_else(|| panic!("missing row {id}"))
+    };
+    assert_eq!(
+        by_id("missing-trust").endpoint_trust,
+        ProviderEndpointTrust::Unknown
+    );
+    assert_eq!(
+        by_id("first-party").endpoint_trust,
+        ProviderEndpointTrust::FirstPartyXai
+    );
+    assert_eq!(
+        by_id("local-ollama").endpoint_trust,
+        ProviderEndpointTrust::Local
     );
 }

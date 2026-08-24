@@ -31,6 +31,25 @@ fn format_acp_error_formats_http_500_dump() {
         );
 }
 #[test]
+fn issue244_typed_provider_failure_format_acp_error_http_400_envelope() {
+    let err = acp::Error::internal_error().data(serde_json::json!({
+        "message": "Provider request failed (HTTP 400).",
+        "http_status": 400
+    }));
+    let msg = format_acp_error(&err, false);
+    assert!(
+        !msg.contains("Retry failed"),
+        "non-retryable 4xx must not say Retry failed: {msg}"
+    );
+    assert!(!msg.contains('{'), "must not dump the envelope: {msg}");
+    assert!(!msg.contains("http_status"), "envelope fields must not leak: {msg}");
+    assert!(!msg.contains("Internal error"), "ACP Display must not leak: {msg}");
+    assert!(
+        msg.contains("Bad request (400)"),
+        "must be the typed 400 banner, got {msg}"
+    );
+}
+#[test]
 fn format_acp_error_rate_limit_surfaces_detail_or_fallback() {
     use xai_grok_shell::sampling::error::{
         FREE_USAGE_USER_MESSAGE, RATE_LIMITED_ERROR_CODE,

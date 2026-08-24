@@ -167,6 +167,23 @@ impl MvpAgent {
             fs_write,
         }
     }
+
+    /// Keep the user's selected reasoning effort across `/new` when the
+    /// model supports effort but omits a per-model menu (#360). Empty
+    /// `reasoning_efforts` still accepts the built-in selectable set.
+    pub(crate) fn apply_current_reasoning_effort(
+        &self,
+        session_sampling: &mut xai_grok_sampler::SamplerConfig,
+    ) {
+        if let Some(effort) = self.models_manager.current_reasoning_effort()
+            && self
+                .models_manager
+                .model_offers_reasoning_effort(&session_sampling.model, effort)
+        {
+            session_sampling.reasoning_effort = Some(effort);
+        }
+    }
+
     /// Resolve the workspace both pipelines run in. Folder trust is recorded
     /// before the MCP merge so an untrusted workspace's repo-local servers
     /// are dropped before anything spawns against them.

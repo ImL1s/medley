@@ -554,7 +554,9 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
     }
 }
 /// Build extra headers for API calls routed through the chat proxy.
-/// Mirrors the shell's `inject_proxy_headers` logic.
+/// Mirrors the shell's `inject_proxy_headers` logic. Identity and proxy
+/// auth headers are injected only for trusted first-party origins; the
+/// web-search client still scrubs the merged map at the request boundary.
 fn build_proxy_headers(base_url: &str) -> indexmap::IndexMap<String, String> {
     let mut headers = indexmap::IndexMap::new();
     let version = xai_grok_version::VERSION;
@@ -562,17 +564,21 @@ fn build_proxy_headers(base_url: &str) -> indexmap::IndexMap<String, String> {
         "user-agent".to_string(),
         format!("xai-grok-workspace/{version}"),
     );
-    headers.insert("x-grok-client-version".to_string(), version.to_string());
-    headers.insert(
-        "x-grok-client-identifier".to_string(),
-        std::env::var("GROK_CLIENT_NAME").unwrap_or_else(|_| "grok-shell".to_string()),
-    );
-    if base_url.contains("cli-chat-proxy") || base_url.contains("chat-proxy") {
-        headers.insert("X-XAI-Token-Auth".to_string(), "xai-grok-cli".to_string());
+    if xai_grok_tools::implementations::web_search::is_trusted_first_party_web_search_origin(
+        base_url,
+    ) {
+        headers.insert("x-grok-client-version".to_string(), version.to_string());
         headers.insert(
-            "x-authenticateresponse".to_string(),
-            "authenticate-response".to_string(),
+            "x-grok-client-identifier".to_string(),
+            std::env::var("GROK_CLIENT_NAME").unwrap_or_else(|_| "grok-shell".to_string()),
         );
+        if base_url.contains("cli-chat-proxy") || base_url.contains("chat-proxy") {
+            headers.insert("X-XAI-Token-Auth".to_string(), "xai-grok-cli".to_string());
+            headers.insert(
+                "x-authenticateresponse".to_string(),
+                "authenticate-response".to_string(),
+            );
+        }
     }
     headers
 }
@@ -1385,5 +1391,51 @@ mod tests {
                 "a different session_id must cold-start, never inherit sess-A state"
             );
         }
+    }
+
+    #[test]
+    fn build_proxy_headers_omits_identity_on_third_party_origin() {
+        let headers = build_proxy_headers("https://vendor.example/v1");
+        assert!(headers.get("x-grok-client-version").is_none());
+        assert!(headers.get("x-grok-client-identifier").is_none());
+        assert!(headers.get("X-XAI-Token-Auth").is_none());
+        assert!(headers.get("x-authenticateresponse").is_none());
+        assert!(headers.get("user-agent").is_some());
+    }
+
+    #[test]
+    fn build_proxy_headers_does_not_treat_proxy_lookalike_as_first_party() {
+        let headers = build_proxy_headers("https://evil.example/cli-chat-proxy");
+        assert!(headers.get("x-grok-client-version").is_none());
+        assert!(headers.get("X-XAI-Token-Auth").is_none());
+        assert!(headers.get("x-authenticateresponse").is_none());
+    }
+
+    #[test]
+    fn build_proxy_headers_keeps_identity_on_trusted_xai_origin() {
+        let headers = build_proxy_headers("https://api.x.ai/v1");
+        assert_eq!(
+            headers.get("x-grok-client-version").map(String::as_str),
+            Some(xai_grok_version::VERSION)
+        );
+        assert!(headers.get("x-grok-client-identifier").is_some());
+        assert!(headers.get("X-XAI-Token-Auth").is_none());
+    }
+
+    #[test]
+    fn build_proxy_headers_keeps_identity_on_production_proxy() {
+        let headers = build_proxy_headers(xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL);
+        assert_eq!(
+            headers.get("x-grok-client-version").map(String::as_str),
+            Some(xai_grok_version::VERSION)
+        );
+        assert_eq!(
+            headers.get("X-XAI-Token-Auth").map(String::as_str),
+            Some("xai-grok-cli")
+        );
+        assert_eq!(
+            headers.get("x-authenticateresponse").map(String::as_str),
+            Some("authenticate-response")
+        );
     }
 }

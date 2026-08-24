@@ -41,8 +41,8 @@ use super::model::{
 };
 use super::refresh::{RefreshOutcome, TokenRefresher, resolve_refresh_credential};
 use super::storage::{
-    AuthFileLock, AuthWriteFailure, ensure_auth_json_owner_only, read_auth_json,
-    read_auth_json_or_empty_recovering_corrupt, read_auth_json_owner_only,
+    AuthFileLock, DurableAuthWriteError, DurableAuthWritePhase, ensure_auth_json_owner_only,
+    read_auth_json, read_auth_json_or_empty_recovering_corrupt, read_auth_json_owner_only,
     read_auth_json_owner_only_or_empty_recovering_corrupt, sync_auth_parent_directory,
     write_auth_json, write_auth_json_strict, write_auth_json_strict_classified,
 };
@@ -394,6 +394,10 @@ pub struct AuthManager {
     /// `DevboxRecovery` adopt a seeded valid token; `Some(_)` pins the result.
     #[cfg(test)]
     devbox_override: parking_lot::Mutex<Option<bool>>,
+    /// Last classified durable-removal failure from a permanent provider
+    /// rejection. `None` after a successful or skipped disk mutation.
+    #[cfg(test)]
+    last_rejected_scope_publication_phase: parking_lot::Mutex<Option<DurableAuthWritePhase>>,
 }
 
 /// Discriminated outcome of a disk read, for transition logging.
@@ -467,6 +471,12 @@ impl ScopeRemoval {
             Self::SkippedUnreadable => "skipped (auth.json unreadable)",
         }
     }
+}
+
+/// Disk/memory outcome of clearing a permanently rejected provider scope.
+struct PermanentRejectionRemoval {
+    disk_mutation: &'static str,
+    publication_phase: Option<DurableAuthWritePhase>,
 }
 
 /// Outcome of [`AuthManager::acquire_refresh_lock_or_adopt`] and
@@ -635,10 +645,10 @@ impl AuthManager {
     /// (including `GROK_AUTH_PATH`) so atomic multi-scope writes and locking are
     /// reused without replacing the active xAI entry.
     pub fn new_openai_codex(grok_home: &Path) -> Self {
-        let path = std::env::var("GROK_AUTH_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| grok_home.join("auth.json"));
-        Self::new_openai_codex_at_path(path)
+        // `resolved_auth_path` still honours `GROK_AUTH_PATH` in production; in
+        // tests it prefers the thread-local pin so a serial fixture cannot leak
+        // a process-global path into parallel `new_openai_codex` callers (#343).
+        Self::new_openai_codex_at_path(crate::auth::openai_codex::resolved_auth_path(grok_home))
     }
 
     #[cfg(test)]
@@ -646,7 +656,12 @@ impl AuthManager {
         Self::new_openai_codex_at_path(auth_json_path.to_owned())
     }
 
-    fn new_openai_codex_at_path(path: PathBuf) -> Self {
+    /// Construct a Codex manager against an exact auth.json path.
+    ///
+    /// In-process fixtures must pass the file they just wrote rather than
+    /// pinning `GROK_AUTH_PATH`. That env is process-global; a serial fixture
+    /// that sets it still leaks into parallel `new_openai_codex` callers (#343).
+    pub fn new_openai_codex_at_path(path: PathBuf) -> Self {
         let scope = crate::auth::openai_codex::AUTH_SCOPE.to_owned();
         let (auth, disk_state) = match read_auth_json_owner_only(&path) {
             Ok(map) => {
@@ -737,6 +752,8 @@ impl AuthManager {
             dark_wake_override: parking_lot::Mutex::new(None),
             #[cfg(test)]
             devbox_override: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            last_rejected_scope_publication_phase: parking_lot::Mutex::new(None),
         }
     }
 
@@ -921,37 +938,25 @@ impl AuthManager {
     /// already-logged-out success, while unreadable data and write failures
     /// are surfaced so memory cannot diverge from durable state.
     fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<DurableScopeRemoval> {
-        let (mut auth_store, file_existed) = if self.xai_session {
-            match read_auth_json(&self.path) {
-                Ok(store) => (store, true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    (AuthStore::new(), false)
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            match read_auth_json_owner_only(&self.path) {
-                Ok(store) => (store, true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    (AuthStore::new(), false)
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        #[cfg(not(windows))]
-        let _ = file_existed;
+        if !self.xai_session {
+            return self
+                .write_provider_scope_removal_durable(scope)
+                .map_err(Into::into);
+        }
+        self.write_session_scope_removal_durable(scope)
+    }
+
+    /// Legacy xAI session store. Its writer keeps the in-place ENOSPC fallback,
+    /// so a failure here cannot be classified around the rename; a read-back
+    /// decides whether the removal actually became visible.
+    fn write_session_scope_removal_durable(
+        &self,
+        scope: &str,
+    ) -> std::io::Result<DurableScopeRemoval> {
+        debug_assert!(self.xai_session);
+        let mut auth_store = read_auth_json_or_empty(&self.path)?;
         auth_store.remove(scope);
         if auth_store.is_empty() {
-            #[cfg(windows)]
-            if !self.xai_session && file_existed {
-                return self.persist_scope_removal_store(
-                    scope,
-                    &auth_store,
-                    ScopeRemoval::FileCleared,
-                    ScopeRemoval::FileClearedDurabilityFailed,
-                );
-            }
-
             let removed = match std::fs::remove_file(&self.path) {
                 Ok(()) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -971,8 +976,85 @@ impl AuthManager {
                 durability_error,
             })
         } else {
-            self.persist_scope_removal_store(
-                scope,
+            match write_auth_json(&self.path, &auth_store) {
+                Ok(()) => Ok(DurableScopeRemoval {
+                    mutation: ScopeRemoval::EntryRemoved,
+                    durability_error: None,
+                }),
+                Err(error) => {
+                    // A final permission/directory barrier can fail after rename.
+                    // Reconcile only when a safe read proves the exact scope is
+                    // absent; pre-publication failures leave the old entry present.
+                    let visible = read_auth_json(&self.path)
+                        .ok()
+                        .is_some_and(|store| !store.contains_key(scope));
+                    if visible {
+                        Ok(DurableScopeRemoval {
+                            mutation: ScopeRemoval::EntryRemovedDurabilityFailed,
+                            durability_error: Some(error),
+                        })
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove `scope` from the owner-only store without an in-place rewrite.
+    /// Failures are classified around atomic publication so the caller can
+    /// reconcile memory with whatever actually landed on disk: an
+    /// after-publication failure is a *visible* removal that still owes the
+    /// caller a durability error, while a before-publication failure leaves the
+    /// previous file authoritative.
+    fn write_provider_scope_removal_durable(
+        &self,
+        scope: &str,
+    ) -> Result<DurableScopeRemoval, DurableAuthWriteError> {
+        debug_assert!(!self.xai_session);
+        let (mut auth_store, file_existed) = match read_auth_json_owner_only(&self.path) {
+            Ok(store) => (store, true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (AuthStore::new(), false),
+            Err(error) => return Err(DurableAuthWriteError::before(error)),
+        };
+        #[cfg(not(windows))]
+        let _ = file_existed;
+        auth_store.remove(scope);
+        if auth_store.is_empty() {
+            // Windows has no documented directory fsync: publish an empty
+            // owner-only store through the write-through replacement instead of
+            // unlinking, so the logout is durable and not merely visible.
+            #[cfg(windows)]
+            if file_existed {
+                return self.persist_provider_scope_removal_store(
+                    &auth_store,
+                    ScopeRemoval::FileCleared,
+                    ScopeRemoval::FileClearedDurabilityFailed,
+                );
+            }
+
+            let removed = match std::fs::remove_file(&self.path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(DurableAuthWriteError::before(error)),
+            };
+            // The unlink is already visible, so its directory barrier is an
+            // after-publication durability error, never a lost removal.
+            let durability_error = if removed {
+                sync_auth_parent_directory(&self.path).err()
+            } else {
+                None
+            };
+            Ok(DurableScopeRemoval {
+                mutation: if durability_error.is_some() {
+                    ScopeRemoval::FileDeletedSyncFailed
+                } else {
+                    ScopeRemoval::FileDeleted
+                },
+                durability_error,
+            })
+        } else {
+            self.persist_provider_scope_removal_store(
                 &auth_store,
                 ScopeRemoval::EntryRemoved,
                 ScopeRemoval::EntryRemovedDurabilityFailed,
@@ -980,47 +1062,158 @@ impl AuthManager {
         }
     }
 
-    fn persist_scope_removal_store(
+    /// Publish an owner-only store that still holds scopes. The strict writer
+    /// classifies its own failures, so no read-back is needed to decide whether
+    /// the removal became visible.
+    fn persist_provider_scope_removal_store(
         &self,
-        removed_scope: &str,
         auth_store: &AuthStore,
         success: ScopeRemoval,
         visible_failure: ScopeRemoval,
-    ) -> std::io::Result<DurableScopeRemoval> {
-        if !self.xai_session {
-            return match write_auth_json_strict_classified(&self.path, auth_store) {
-                Ok(()) => Ok(DurableScopeRemoval {
-                    mutation: success,
-                    durability_error: None,
-                }),
-                Err(AuthWriteFailure::AfterPublication(error)) => Ok(DurableScopeRemoval {
-                    mutation: visible_failure,
-                    durability_error: Some(error),
-                }),
-                Err(AuthWriteFailure::BeforePublication(error)) => Err(error),
-            };
-        }
-
-        match write_auth_json(&self.path, auth_store) {
+    ) -> Result<DurableScopeRemoval, DurableAuthWriteError> {
+        debug_assert!(!self.xai_session);
+        match write_auth_json_strict_classified(&self.path, auth_store) {
             Ok(()) => Ok(DurableScopeRemoval {
                 mutation: success,
                 durability_error: None,
             }),
-            Err(error) => {
-                // A final permission/directory barrier can fail after rename.
-                // Reconcile only when a safe read proves the exact scope is
-                // absent; pre-publication failures leave the old entry present.
-                let visible = read_auth_json(&self.path)
-                    .ok()
-                    .is_some_and(|store| !store.contains_key(removed_scope));
-                if visible {
-                    Ok(DurableScopeRemoval {
-                        mutation: visible_failure,
-                        durability_error: Some(error),
-                    })
-                } else {
-                    Err(error)
+            Err(error) if error.phase == DurableAuthWritePhase::AfterPublication => {
+                Ok(DurableScopeRemoval {
+                    mutation: visible_failure,
+                    durability_error: Some(error.into()),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Drop a permanently rejected provider scope through the strict writer
+    /// and make in-memory state match the owner-only file after any failure.
+    fn apply_permanent_rejection_scope_removal(
+        &self,
+        clear_disk: bool,
+        clear_mem: bool,
+    ) -> PermanentRejectionRemoval {
+        let removal = if !clear_disk {
+            if clear_mem {
+                self.clear_inner();
+            }
+            PermanentRejectionRemoval {
+                disk_mutation: "unchanged",
+                publication_phase: None,
+            }
+        } else if self.xai_session {
+            let disk_mutation = match self.write_scope_removal(&self.scope) {
+                Ok(mutation) => mutation.label(),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "auth: failed to clear credentials after permanent refresh failure"
+                    );
+                    "write_failed"
                 }
+            };
+            if clear_mem {
+                self.clear_inner();
+            }
+            PermanentRejectionRemoval {
+                disk_mutation,
+                publication_phase: None,
+            }
+        } else {
+            match self.write_provider_scope_removal_durable(&self.scope) {
+                Ok(removal) => match removal.durability_error {
+                    // Removal published; nothing anomalous to reconcile.
+                    None => {
+                        if clear_mem {
+                            self.clear_inner();
+                        }
+                        PermanentRejectionRemoval {
+                            disk_mutation: removal.mutation.label(),
+                            publication_phase: None,
+                        }
+                    }
+                    // Visible on disk but not durably proven. Report the phase
+                    // and reconcile memory against the file rather than
+                    // trusting `clear_mem`: after any durable-removal anomaly
+                    // memory must match disk, or a rejected credential can
+                    // survive in one of the two (#353).
+                    Some(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "auth: rejected provider credential removal is visible but not durably proven"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "auth.refresh.rejected_scope_removal_not_durable",
+                            None,
+                            Some(serde_json::json!({
+                                "publication_phase":
+                                    DurableAuthWritePhase::AfterPublication.as_str(),
+                                "disk_mutation": removal.mutation.label(),
+                                "error_kind": format!("{:?}", error.kind()),
+                            })),
+                        );
+                        self.reconcile_provider_scope_from_owner_only_disk();
+                        PermanentRejectionRemoval {
+                            disk_mutation: removal.mutation.label(),
+                            publication_phase: Some(DurableAuthWritePhase::AfterPublication),
+                        }
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        publication_phase = error.phase.as_str(),
+                        "auth: durable provider-scope removal failed after permanent refresh failure"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "auth.refresh.rejected_scope_removal_failed",
+                        None,
+                        Some(serde_json::json!({
+                            "publication_phase": error.phase.as_str(),
+                            "error_kind": format!("{:?}", error.kind()),
+                        })),
+                    );
+                    self.reconcile_provider_scope_from_owner_only_disk();
+                    PermanentRejectionRemoval {
+                        disk_mutation: match error.phase {
+                            DurableAuthWritePhase::BeforePublication => {
+                                "write_failed_before_publication"
+                            }
+                            DurableAuthWritePhase::AfterPublication => {
+                                "write_failed_after_publication"
+                            }
+                        },
+                        publication_phase: Some(error.phase),
+                    }
+                }
+            }
+        };
+        #[cfg(test)]
+        {
+            *self.last_rejected_scope_publication_phase.lock() = removal.publication_phase;
+        }
+        removal
+    }
+
+    /// Align this provider manager's cache with the owner-only file after a
+    /// classified durable-removal failure. The sticky permanent verdict is
+    /// left in place so a rejected credential that remains on disk stays
+    /// unusable.
+    fn reconcile_provider_scope_from_owner_only_disk(&self) {
+        debug_assert!(!self.xai_session);
+        match read_auth_json_owner_only(&self.path) {
+            Ok(store) => match self.lookup_scoped_auth(&store) {
+                Some(auth) => self.with_inner_write(|inner| *inner = Some(auth)),
+                None => self.clear_inner(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.clear_inner(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "auth: failed to re-read owner-only auth.json while reconciling rejected scope"
+                );
+                self.clear_inner();
             }
         }
     }
@@ -2387,6 +2580,13 @@ impl AuthManager {
         *self.devbox_override.lock() = Some(is_devbox);
     }
 
+    #[cfg(test)]
+    pub(in crate::auth) fn last_rejected_scope_publication_phase(
+        &self,
+    ) -> Option<DurableAuthWritePhase> {
+        *self.last_rejected_scope_publication_phase.lock()
+    }
+
     /// Last-resort devbox auth recovery: purge existing auth.json entirely
     /// and mint fresh OIDC credentials via the remote devbox login helper.
     /// Only callable on devboxes (where the local service-account token is
@@ -2917,58 +3117,24 @@ impl AuthManager {
                             reason == RefreshReason::ServerRejected,
                         );
                     }
-                    let mut disk_mutation = "unchanged";
-                    let mut clear_mem_after_disk = clear_mem;
-                    if clear_disk {
-                        if self.xai_session {
-                            disk_mutation = match self.write_scope_removal(&self.scope) {
-                                Ok(m) => m.label(),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "auth: failed to clear credentials after permanent refresh failure"
-                                    );
-                                    "write_failed"
-                                }
-                            };
-                        } else {
-                            match self.write_scope_removal_durable(&self.scope) {
-                                Ok(outcome) => {
-                                    disk_mutation = outcome.mutation.label();
-                                    if let Some(error) = outcome.durability_error {
-                                        tracing::warn!(
-                                            error = %error,
-                                            "auth: rejected provider credential removal is visible but not durably proven"
-                                        );
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        error = %error,
-                                        "auth: failed to publish rejected provider credential removal"
-                                    );
-                                    disk_mutation = "write_failed_before_publication";
-                                    // The strict provider writer guarantees the
-                                    // old store is still authoritative on this
-                                    // path. Keep memory aligned with it; the
-                                    // sticky rejection verdict still prevents
-                                    // the known-bad credential from being used.
-                                    clear_mem_after_disk = false;
-                                }
-                            }
-                        }
-                    }
-                    if clear_mem_after_disk {
-                        self.clear_inner();
-                    }
+                    // `apply_permanent_rejection_scope_removal` owns every
+                    // branch that used to be inlined here: the xAI writer, the
+                    // classified provider writer, the "visible but not durably
+                    // proven" warning, and the disk/memory reconcile that
+                    // replaces the old `clear_mem_after_disk` flag.
+                    let removal =
+                        self.apply_permanent_rejection_scope_removal(clear_disk, clear_mem);
                     xai_grok_telemetry::unified_log::warn(
                         "auth: cleared credentials after permanent refresh failure",
                         None,
                         Some(serde_json::json!({
                             "reason": format!("{failed_reason:?}"),
-                            "disk_mutation": disk_mutation,
-                            "cleared_mem": clear_mem_after_disk,
+                            "disk_mutation": removal.disk_mutation,
+                            "cleared_mem": clear_mem,
                             "cleared_disk": clear_disk,
+                            "publication_phase": removal
+                                .publication_phase
+                                .map(DurableAuthWritePhase::as_str),
                         })),
                     );
                 } else if let Some(key) = tried_key.or(attempted_key) {

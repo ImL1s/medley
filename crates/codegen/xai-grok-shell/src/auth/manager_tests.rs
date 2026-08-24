@@ -4,6 +4,8 @@
 
 use super::*;
 use crate::auth::error::RefreshTokenError;
+use crate::auth::storage::DurableAuthWritePhase;
+use serial_test::serial;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -6113,6 +6115,7 @@ fn dark_wake_defer_budget_survives_powered_on_during_dark_wake() {
 /// those processes never treat the OS power state as a dark wake. Exercises the
 /// guard directly (no dark-wake override installed).
 #[test]
+#[serial]
 #[serial_test::serial(force_dark_wake_env)] // reads GROK_AUTH_FORCE_DARK_WAKE
 fn is_dark_wake_false_when_power_listener_not_started() {
     let _unset = xai_grok_test_support::EnvGuard::unset("GROK_AUTH_FORCE_DARK_WAKE");
@@ -6130,6 +6133,7 @@ fn is_dark_wake_false_when_power_listener_not_started() {
 /// exists precisely so such a run can drive the dark-wake paths against a
 /// real binary.
 #[test]
+#[serial]
 #[serial_test::serial(force_dark_wake_env)]
 fn is_dark_wake_env_override_forces_both_states() {
     use xai_grok_test_support::EnvGuard;
@@ -6789,4 +6793,303 @@ async fn devbox_recovery_short_circuits_on_a_credential_someone_else_landed() {
         .await
         .expect("a different live credential is a recovery");
     assert_eq!(auth.key, "landed-by-a-sibling-task");
+}
+
+// ── #353: permanent provider-scope rejection uses atomic durable removal ──
+
+fn rejected_codex_auth() -> GrokAuth {
+    GrokAuth {
+        key: "codex-rejected-at".into(),
+        auth_mode: AuthMode::OpenAiCodex,
+        refresh_token: Some("codex-rejected-rt".into()),
+        expires_at: Some(Utc::now() - Duration::hours(1)),
+        oidc_issuer: Some(crate::auth::openai_codex::ISSUER.into()),
+        oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.into()),
+        ..GrokAuth::test_default()
+    }
+}
+
+fn xai_sibling_auth() -> GrokAuth {
+    GrokAuth {
+        key: "xai-sibling-at".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("xai-sibling-rt".into()),
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+        ..GrokAuth::test_default()
+    }
+}
+
+fn write_mixed_xai_codex_store(path: &Path) {
+    let mut store = AuthStore::new();
+    store.insert(
+        crate::auth::openai_codex::AUTH_SCOPE.into(),
+        rejected_codex_auth(),
+    );
+    store.insert(GrokComConfig::default().auth_scope(), xai_sibling_auth());
+    write_auth_json(path, &store).unwrap();
+}
+
+struct RejectedCodexRefresher(GrokAuth);
+
+#[async_trait::async_trait]
+impl TokenRefresher for RejectedCodexRefresher {
+    async fn refresh(&self, _reason: RefreshReason) -> crate::auth::refresh::RefreshOutcome {
+        crate::auth::refresh::RefreshOutcome::permanent_for(
+            crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+            &self.0,
+        )
+    }
+}
+
+struct PathScopedWriteFault {
+    slot: &'static std::sync::Mutex<Option<PathBuf>>,
+}
+
+impl PathScopedWriteFault {
+    fn install(slot: &'static std::sync::Mutex<Option<PathBuf>>, path: PathBuf) -> Self {
+        *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(path);
+        Self { slot }
+    }
+}
+
+impl Drop for PathScopedWriteFault {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+async fn reject_mixed_codex_scope(dir: &Path) -> Arc<AuthManager> {
+    let path = dir.join("auth.json");
+    write_mixed_xai_codex_store(&path);
+    let manager = Arc::new(AuthManager::new_openai_codex(dir));
+    let tried = rejected_codex_auth();
+    manager.hot_swap(tried.clone());
+    manager.set_refresher(Arc::new(RejectedCodexRefresher(tried)));
+    let err = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest)
+        .await
+        .expect_err("permanent Codex rejection must surface");
+    assert!(
+        matches!(err, AuthError::Refresh(RefreshTokenError::Permanent(_))),
+        "genuine Codex invalid_grant must stay permanent, got: {err:?}"
+    );
+    assert!(
+        manager.permanent_failure().is_some(),
+        "rejected Codex credential must remain unusable"
+    );
+    manager
+}
+
+fn assert_xai_sibling_preserved(path: &Path) {
+    let store = read_auth_json(path).unwrap();
+    let xai = store
+        .get(&GrokComConfig::default().auth_scope())
+        .expect("xAI sibling scope must survive Codex rejection");
+    assert_eq!(xai.key, "xai-sibling-at");
+    assert_eq!(xai.refresh_token.as_deref(), Some("xai-sibling-rt"));
+}
+
+/// Mixed xAI/Codex file: a permanent Codex rejection removes only Codex.
+#[tokio::test]
+async fn permanent_codex_rejection_removes_only_codex_and_preserves_xai() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    let manager = reject_mixed_codex_scope(dir.path()).await;
+
+    let store = read_auth_json(&path).unwrap();
+    assert!(
+        !store.contains_key(crate::auth::openai_codex::AUTH_SCOPE),
+        "rejected Codex scope must be dropped from the durable file"
+    );
+    assert_xai_sibling_preserved(&path);
+    assert!(
+        manager.current_or_expired().is_none(),
+        "Codex memory must match the removed durable scope"
+    );
+    assert!(manager.last_rejected_scope_publication_phase().is_none());
+    assert!(
+        manager.auth().await.is_err(),
+        "a permanently rejected Codex credential must not remain usable"
+    );
+}
+
+/// ENOSPC / before-publication: previous durable file stays intact and memory matches it.
+#[tokio::test]
+async fn permanent_codex_rejection_enospc_keeps_prior_file_and_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    write_mixed_xai_codex_store(&path);
+    let prior = std::fs::read(&path).unwrap();
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let tried = rejected_codex_auth();
+    manager.hot_swap(tried.clone());
+    manager.set_refresher(Arc::new(RejectedCodexRefresher(tried)));
+    let _fault = PathScopedWriteFault::install(
+        &crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATH,
+        path.clone(),
+    );
+
+    let err = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest)
+        .await
+        .expect_err("permanent Codex rejection must surface even if disk removal fails");
+    assert!(
+        matches!(err, AuthError::Refresh(RefreshTokenError::Permanent(_))),
+        "got: {err:?}"
+    );
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        prior,
+        "before-publication ENOSPC must not rewrite the live auth.json"
+    );
+    assert_xai_sibling_preserved(&path);
+    let disk = read_auth_json(&path).unwrap();
+    assert_eq!(
+        disk.get(crate::auth::openai_codex::AUTH_SCOPE)
+            .map(|auth| auth.key.as_str()),
+        Some("codex-rejected-at")
+    );
+    assert_eq!(
+        manager.current_or_expired().map(|auth| auth.key),
+        Some("codex-rejected-at".into()),
+        "memory must reconcile to the still-present durable Codex scope"
+    );
+    assert_eq!(
+        manager.last_rejected_scope_publication_phase(),
+        Some(DurableAuthWritePhase::BeforePublication)
+    );
+    assert!(
+        manager.permanent_failure().is_some() && manager.auth().await.is_err(),
+        "the leftover on-disk Codex credential must stay unusable"
+    );
+}
+
+/// Post-rename permission failure: new durable state is published; memory follows it.
+#[tokio::test]
+async fn permanent_codex_rejection_post_rename_reconciles_to_published_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    write_mixed_xai_codex_store(&path);
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let tried = rejected_codex_auth();
+    manager.hot_swap(tried.clone());
+    manager.set_refresher(Arc::new(RejectedCodexRefresher(tried)));
+    let _fault = PathScopedWriteFault::install(
+        &crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATH,
+        path.clone(),
+    );
+
+    let _ = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest)
+        .await
+        .expect_err("classified post-rename failure still surfaces the rejection");
+
+    let store = read_auth_json(&path).unwrap();
+    assert!(!store.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert_xai_sibling_preserved(&path);
+    assert!(
+        manager.current_or_expired().is_none(),
+        "memory must follow the newly published Codex-less file"
+    );
+    assert_eq!(
+        manager.last_rejected_scope_publication_phase(),
+        Some(DurableAuthWritePhase::AfterPublication)
+    );
+}
+
+/// Parent-directory sync failure: same after-publication classification and reconcile.
+#[tokio::test]
+async fn permanent_codex_rejection_parent_dir_sync_is_after_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    write_mixed_xai_codex_store(&path);
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let tried = rejected_codex_auth();
+    manager.hot_swap(tried.clone());
+    manager.set_refresher(Arc::new(RejectedCodexRefresher(tried)));
+    let _fault = PathScopedWriteFault::install(
+        &crate::auth::storage::PARENT_DIR_SYNC_FAULT_PATH,
+        path.clone(),
+    );
+
+    let _ = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest)
+        .await
+        .expect_err("parent-directory sync failure is still a permanent rejection");
+
+    let store = read_auth_json(&path).unwrap();
+    assert!(!store.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert_xai_sibling_preserved(&path);
+    assert!(manager.current_or_expired().is_none());
+    assert_eq!(
+        manager.last_rejected_scope_publication_phase(),
+        Some(DurableAuthWritePhase::AfterPublication)
+    );
+}
+
+/// Concurrent unlocked readers must only ever observe well-formed JSON.
+#[tokio::test]
+async fn permanent_codex_rejection_never_exposes_torn_json_to_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    write_mixed_xai_codex_store(&path);
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let tried = rejected_codex_auth();
+    manager.hot_swap(tried.clone());
+    manager.set_refresher(Arc::new(RejectedCodexRefresher(tried)));
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let malformed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reader = {
+        let path = path.clone();
+        let stop = Arc::clone(&stop);
+        let malformed = Arc::clone(&malformed);
+        let observed = Arc::clone(&observed);
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match std::fs::read_to_string(&path) {
+                    Ok(bytes) => {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if serde_json::from_str::<serde_json::Value>(&bytes).is_err() {
+                            malformed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {}
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    let started = std::time::Instant::now();
+    while observed.load(std::sync::atomic::Ordering::Relaxed) == 0
+        && started.elapsed() < StdDuration::from_secs(1)
+    {
+        std::thread::yield_now();
+    }
+
+    let _ = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest)
+        .await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    reader.join().expect("reader thread");
+
+    assert_eq!(
+        malformed.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "atomic publication must never show torn JSON to concurrent readers"
+    );
+    assert!(
+        observed.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "reader must have sampled the file during removal"
+    );
+    assert_xai_sibling_preserved(&path);
+    assert!(
+        !read_auth_json(&path)
+            .unwrap()
+            .contains_key(crate::auth::openai_codex::AUTH_SCOPE)
+    );
 }
