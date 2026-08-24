@@ -314,12 +314,15 @@ impl ThinkingBlock {
         let width = ctx.width as usize;
         let blend_factor = config.bg_blend;
         let emphasis = body_emphasis_patch(ctx);
-        let strip = QuoteBarStrip::new(!self.content.is_raw());
+        let raw = self.content.is_raw();
 
         self.content.with_wrapped_lines(width, |wrapped| {
             if wrapped.lines.is_empty() {
                 return self.render_empty_placeholder(ctx);
             }
+            // Inside the snapshot: the bar style must be the one these lines
+            // were painted with, not a fresh read of the global (#430).
+            let strip = QuoteBarStrip::for_snapshot(!raw, &wrapped);
 
             let theme = Theme::current();
             let bg_base = theme.bg_base;
@@ -385,12 +388,15 @@ impl ThinkingBlock {
         let width = ctx.width as usize;
         let blend_factor = config.bg_blend;
         let emphasis = body_emphasis_patch(ctx);
-        let strip = QuoteBarStrip::new(!self.content.is_raw());
+        let raw = self.content.is_raw();
 
         self.content.with_wrapped_lines(width, |wrapped| {
             if wrapped.lines.is_empty() {
                 return self.render_empty_placeholder(ctx);
             }
+            // Inside the snapshot: the bar style must be the one these lines
+            // were painted with, not a fresh read of the global (#430).
+            let strip = QuoteBarStrip::for_snapshot(!raw, &wrapped);
 
             let theme = Theme::current();
             let bg_base = theme.bg_base;
@@ -623,6 +629,74 @@ mod tests {
             .expect("quote line rendered");
         assert!(line_plain_text(&line.content).starts_with("│ "));
         assert!(matches!(line.selectable, Selectable::Spans(_)));
+        assert_eq!(derive_selection_text(line), "QUOTE alpha");
+    }
+
+    /// #430 without the race: the quote-bar strip style and the styles the
+    /// cached spans were painted with come from two separate reads of the
+    /// process-global theme, and nothing makes them agree.
+    ///
+    /// Engaging the terminal-native lock changes what `Theme::current()`
+    /// returns but NOT what `theme_cache::current_kind()` reports, so
+    /// `ensure_wrapped`'s `cache_theme` comparison sees no change and keeps
+    /// the spans painted under the previous palette -- while
+    /// `QuoteBarStrip::new` recomputes the bar style from the new one. The
+    /// styles no longer compare equal, the bar stops being recognised, and
+    /// selection silently regains the `|` prefix.
+    ///
+    /// Sequential and deterministic: no second thread, no scheduling window.
+    #[test]
+    fn thinking_quote_selection_survives_a_terminal_native_lock_toggle() {
+        use crate::scrollback::types::{derive_selection_text, line_plain_text};
+
+        let _guard = crate::theme::cache::test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct LockReset;
+        impl Drop for LockReset {
+            fn drop(&mut self) {
+                crate::theme::cache::set_terminal_native_lock(false);
+                crate::theme::cache::reset_for_test();
+            }
+        }
+        let _reset = LockReset;
+        crate::theme::cache::set_terminal_native_lock(false);
+        crate::theme::cache::set(crate::theme::ThemeKind::GrokNight);
+
+        let mut appearance = AppearanceConfig::default();
+        appearance.scrollback.blocks.thinking.header = false;
+        let ctx = BlockContext {
+            appearance,
+            ..ctx(DisplayMode::Expanded, 40)
+        };
+        let block = ThinkingBlock::new("> QUOTE alpha");
+
+        // Populate the wrap cache under the unlocked palette.
+        let first = block.output(&ctx);
+        let first_line = first
+            .lines
+            .iter()
+            .find(|l| line_plain_text(&l.content).contains("QUOTE"))
+            .expect("quote line rendered before the toggle");
+        assert!(
+            matches!(first_line.selectable, Selectable::Spans(_)),
+            "precondition: the bar is excluded before the toggle"
+        );
+
+        crate::theme::cache::set_terminal_native_lock(true);
+        let out = block.output(&ctx);
+
+        let line = out
+            .lines
+            .iter()
+            .find(|l| line_plain_text(&l.content).contains("QUOTE"))
+            .expect("quote line rendered after the toggle");
+        assert!(line_plain_text(&line.content).starts_with("\u{2502} "));
+        assert!(
+            matches!(line.selectable, Selectable::Spans(_)),
+            "a palette change must not make the rendered bar unrecognisable: {:?}",
+            line.selectable
+        );
         assert_eq!(derive_selection_text(line), "QUOTE alpha");
     }
 

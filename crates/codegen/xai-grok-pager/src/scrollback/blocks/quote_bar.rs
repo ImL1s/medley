@@ -17,9 +17,16 @@ use ratatui::text::{Line, Span};
 use crate::scrollback::types::Selectable;
 use crate::theme::Theme;
 
-/// Per-render quote-bar stripping context: the raw-mode gate plus the
-/// theme-derived bar style. Build once per output pass; raw mode skips the
-/// `Theme::current()` lookup entirely.
+/// Per-render quote-bar stripping context: the raw-mode gate plus the bar
+/// style the rendered lines were actually painted with.
+///
+/// #430: this used to derive the style from its own read of the global,
+/// separate from the read that painted the spans it compares against. Two
+/// reads of one process-global that must agree is a race, and when they
+/// disagreed the bar went unrecognised and the `|` gutter silently re-entered
+/// copied text. The style now travels with the wrapped lines
+/// ([`WrappedLines::bar_style`](super::markdown_content::WrappedLines)), so
+/// the comparison source and the paint source are the same stored value.
 #[derive(Clone, Copy)]
 pub(crate) struct QuoteBarStrip {
     /// `None` = stripping disabled (raw mode shows source `>` markers).
@@ -27,9 +34,19 @@ pub(crate) struct QuoteBarStrip {
 }
 
 impl QuoteBarStrip {
-    pub(crate) fn new(enabled: bool) -> Self {
+    /// Build from the wrap snapshot the lines came from.
+    ///
+    /// Taking `WrappedLines` rather than a loose `Style` is the point: the
+    /// only way to obtain one is from `with_wrapped_lines`, so the style used
+    /// for bar detection cannot be anything other than the style those lines
+    /// were painted with. A caller cannot reintroduce #430's second read here
+    /// without fabricating a snapshot.
+    pub(crate) fn for_snapshot(
+        enabled: bool,
+        wrapped: &super::markdown_content::WrappedLines<'_>,
+    ) -> Self {
         Self {
-            bar_style: enabled.then(quote_bar_style),
+            bar_style: enabled.then_some(wrapped.bar_style),
         }
     }
 
@@ -43,12 +60,16 @@ impl QuoteBarStrip {
 }
 
 /// The exact ratatui style the renderer paints parser-generated blockquote
-/// bars with: `md_style` sets `blockquote_outer = fg(md_muted).dimmed()` and
-/// a `Reset` fg is dropped in the anstyle round-trip, leaving DIM alone.
-/// Mirrors pager-render theme/md_style.rs `blockquote_outer` (breadcrumbed
-/// there); the end-to-end tests below trip if either side drifts.
-fn quote_bar_style() -> Style {
-    let muted = Theme::current().md_muted;
+/// bars with, for one theme: `md_style` sets
+/// `blockquote_outer = fg(md_muted).dimmed()` and a `Reset` fg is dropped in
+/// the anstyle round-trip, leaving DIM alone. Mirrors pager-render
+/// theme/md_style.rs `blockquote_outer` (breadcrumbed there); the end-to-end
+/// tests below trip if either side drifts.
+///
+/// Takes the theme rather than reading the global: the caller stores the
+/// result beside the lines it painted, so both come from one read (#430).
+pub(crate) fn quote_bar_style_for(theme: &Theme) -> Style {
+    let muted = theme.md_muted;
     let style = Style::default().add_modifier(Modifier::DIM);
     if muted == Color::Reset {
         style
@@ -178,6 +199,14 @@ mod tests {
         BlockLine, BlockOutput, derive_selection_text, line_plain_text, selectable_cols,
     };
 
+    /// A bar style from a locally built theme. Unit fixtures below construct
+    /// their own lines with it and pass the same value in, so the assertion is
+    /// self-consistent under any ambient theme — the #166 remedy, applied to a
+    /// selectability test rather than a colour one.
+    fn test_bar_style() -> Style {
+        quote_bar_style_for(&Theme::groknight())
+    }
+
     fn find_line<'a>(out: &'a BlockOutput, needle: &str) -> &'a BlockLine {
         out.lines
             .iter()
@@ -185,9 +214,43 @@ mod tests {
             .unwrap_or_else(|| panic!("no output line contains {needle:?}"))
     }
 
+    /// Source-scan guard (#430), same idiom as
+    /// `colour_asserting_tests_do_not_use_theme_current` in `user.rs`.
+    ///
+    /// Selection metadata is decided by comparing painted span styles against
+    /// the bar style. Deriving that style here from the process-global theme
+    /// makes it a second read that has to agree with the read that painted the
+    /// spans — and when they disagree the bar goes unrecognised and the `│`
+    /// gutter silently re-enters copied text. The style must arrive from the
+    /// wrap snapshot instead.
+    ///
+    /// This guards the *mechanism*, not the symptom, deliberately. The test
+    /// that fired for #430 asserts selectability and calls no theme API at all,
+    /// so no source scan over test bodies could have classified it as
+    /// theme-sensitive without re-implementing the renderer. Extending a list
+    /// of "theme-sensitive test names" would not have caught it; forbidding the
+    /// second read does.
+    #[test]
+    fn selection_metadata_never_reads_the_global_theme() {
+        // Split so this guard's own needle is not a match for itself.
+        let needle = concat!("Theme::", "current()");
+        let offenders: Vec<(usize, &str)> = include_str!("quote_bar.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(needle))
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "selection metadata must take the bar style from the wrap snapshot \
+             (WrappedLines::bar_style), never from a second read of the global \
+             theme — that is the #430 defect. Offending lines: {offenders:?}"
+        );
+    }
+
     #[test]
     fn rendered_quote_prefix_len_shapes() {
-        let bq = quote_bar_style();
+        let bq = test_bar_style();
         let quote = Line::from(vec![Span::styled("│", bq), Span::raw(" text")]);
         assert_eq!(rendered_quote_prefix_len(&quote, bq), Some(4));
 
@@ -232,7 +295,7 @@ mod tests {
 
     #[test]
     fn rendered_quote_prefix_len_rejects_content_bars_after_genuine_prefix() {
-        let bq = quote_bar_style();
+        let bq = test_bar_style();
         // Source `> │ box art`: genuine bar, then a literal (unstyled) bar as
         // the first content char — must not be consumed as a nesting level.
         let literal_second = Line::from(vec![Span::styled("│", bq), Span::raw(" │ box art")]);
@@ -258,16 +321,16 @@ mod tests {
         // parser-generated quote bar and must stay fully selectable.
         let mut line = Line::from(vec![Span::raw("│"), Span::raw(" text")]);
         assert_eq!(
-            quote_prefix_selectable(&mut line, quote_bar_style()),
+            quote_prefix_selectable(&mut line, test_bar_style()),
             Selectable::All
         );
 
         let mut line = Line::from(vec![
-            Span::styled("│", quote_bar_style()),
+            Span::styled("│", test_bar_style()),
             Span::raw(" text"),
         ]);
         assert_eq!(
-            quote_prefix_selectable(&mut line, quote_bar_style()),
+            quote_prefix_selectable(&mut line, test_bar_style()),
             Selectable::Spans(2..3)
         );
         // The glued " text" span was split so the prefix ends on a boundary.

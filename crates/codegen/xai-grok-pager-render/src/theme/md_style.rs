@@ -101,12 +101,22 @@ fn heading_outer_styles(colors: [ratatui::style::Color; 6]) -> [Style; 6] {
 /// Built fresh from [`Theme::current()`] on each call. Both the theme
 /// construction and style mapping are trivial struct copies.
 pub fn style() -> MarkdownStyle {
-    build_style()
+    style_for(&super::Theme::current())
 }
 
-fn build_style() -> MarkdownStyle {
-    let theme = super::Theme::current();
+/// Build the markdown style from one explicit theme snapshot.
+///
+/// #430: the pager recognises a rendered blockquote bar by comparing span
+/// styles against `blockquote_outer`. When the detector's style and the
+/// painted spans come from two separate `Theme::current()` reads, a theme
+/// change between them makes the two disagree and the bar silently stops
+/// being excluded from copied text. Callers that need both values take this
+/// so they derive from the same read.
+pub fn style_for(theme: &super::Theme) -> MarkdownStyle {
+    build_style(theme)
+}
 
+fn build_style(theme: &super::Theme) -> MarkdownStyle {
     let heading_colors = [
         theme.md_heading_h1,
         theme.md_heading_h2,

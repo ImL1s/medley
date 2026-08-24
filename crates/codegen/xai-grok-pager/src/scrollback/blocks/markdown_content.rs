@@ -9,16 +9,17 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 
+use ratatui::style::Style;
 use ratatui::text::Line;
 
 use crate::render::wrapping::word_wrap_lines_with_joiners;
 use crate::scrollback::types::{BlockLine, BlockOutput};
 
-use super::quote_bar::QuoteBarStrip;
+use super::quote_bar::{QuoteBarStrip, quote_bar_style_for};
 
 pub(crate) const MARKDOWN_BODY_RANGE: u16 = 0;
 use crate::syntax::get_syntect;
-use crate::theme::{ThemeKind, cache as theme_cache, md_style};
+use crate::theme::{Theme, ThemeKind, cache as theme_cache, md_style};
 use xai_grok_markdown::StreamingMarkdownRenderer;
 
 /// Mutable rendering state behind a single `RefCell`.
@@ -33,6 +34,11 @@ struct RenderState {
     cache_width: usize,
     cache_generation: u64,
     cache_theme: ThemeKind,
+    /// The blockquote-bar style `cache_lines` were painted with, captured from
+    /// the same theme read that built the renderer's `MarkdownStyle`. Bar
+    /// detection compares against this rather than re-reading the global, so
+    /// the two can never disagree (#430).
+    cache_bar_style: Style,
     cache_lines: Vec<Line<'static>>,
     cache_joiners: Vec<Option<String>>,
     /// Number of pre-wrap (renderer output) lines that were frozen at the time
@@ -66,6 +72,10 @@ pub struct MarkdownContent {
 pub struct WrappedLines<'a> {
     pub lines: &'a [Line<'static>],
     pub joiners: &'a [Option<String>],
+    /// The blockquote-bar style `lines` were painted with. Travelling with the
+    /// snapshot is what makes it impossible to build a `QuoteBarStrip` from a
+    /// different theme read than the one that painted these spans (#430).
+    pub bar_style: Style,
 }
 
 /// Expand tab characters to spaces using the current global tab_width.
@@ -109,7 +119,11 @@ impl MarkdownContent {
         max_table_width: Option<usize>,
         collapse_soft_breaks: bool,
     ) -> Self {
-        let mut renderer = StreamingMarkdownRenderer::new(md_style::style(), true);
+        // One snapshot: the renderer's style and the bar style the detector
+        // compares against must come from the same read (#430).
+        let cache_theme = theme_cache::current_kind();
+        let theme = Theme::current();
+        let mut renderer = StreamingMarkdownRenderer::new(md_style::style_for(&theme), true);
         renderer.set_max_table_width(max_table_width);
         renderer.set_collapse_soft_breaks(collapse_soft_breaks);
         let text = text.into();
@@ -124,7 +138,8 @@ impl MarkdownContent {
                 renderer,
                 cache_width: 0,
                 cache_generation: 0,
-                cache_theme: theme_cache::current_kind(),
+                cache_theme,
+                cache_bar_style: quote_bar_style_for(&theme),
                 cache_lines: Vec::new(),
                 cache_joiners: Vec::new(),
                 frozen_pre_wrap_count: 0,
@@ -137,12 +152,15 @@ impl MarkdownContent {
 
     /// Create empty for streaming.
     pub fn streaming() -> Self {
+        let cache_theme = theme_cache::current_kind();
+        let theme = Theme::current();
         Self {
             state: RefCell::new(RenderState {
-                renderer: StreamingMarkdownRenderer::new(md_style::style(), true),
+                renderer: StreamingMarkdownRenderer::new(md_style::style_for(&theme), true),
                 cache_width: 0,
                 cache_generation: 0,
-                cache_theme: theme_cache::current_kind(),
+                cache_theme,
+                cache_bar_style: quote_bar_style_for(&theme),
                 cache_lines: Vec::new(),
                 cache_joiners: Vec::new(),
                 frozen_pre_wrap_count: 0,
@@ -320,7 +338,11 @@ impl MarkdownContent {
         // below picks up the new colors. Resetting cache_generation forces
         // the cache to rebuild even if width and content haven't changed.
         if state.cache_theme != current_theme {
-            state.renderer.set_style(md_style::style());
+            // One read for both: the style the spans get painted with and the
+            // style bar detection compares them against (#430).
+            let theme = Theme::current();
+            state.renderer.set_style(md_style::style_for(&theme));
+            state.cache_bar_style = quote_bar_style_for(&theme);
             state.cache_theme = current_theme;
             state.cache_generation = u64::MAX; // force cache miss
             // set_style resets renderer frozen state, so our tracking is stale
@@ -411,6 +433,7 @@ impl MarkdownContent {
         f(WrappedLines {
             lines: &state.cache_lines,
             joiners: &state.cache_joiners,
+            bar_style: state.cache_bar_style,
         })
     }
 
@@ -420,9 +443,12 @@ impl MarkdownContent {
     /// background color (from the line's style, e.g., for code blocks).
     /// This is the common path used by [`AgentMessageBlock`](super::AgentMessageBlock).
     pub fn output(&self, width: usize) -> BlockOutput {
-        // Raw mode shows the source `>` markers verbatim — nothing to exclude.
-        let strip = QuoteBarStrip::new(!self.current_raw);
+        let raw = self.current_raw;
         self.with_wrapped_lines(width, |wrapped| {
+            // Raw mode shows the source `>` markers verbatim — nothing to
+            // exclude. Built here, inside the snapshot, so the style can only
+            // be the one these lines were painted with (#430).
+            let strip = QuoteBarStrip::for_snapshot(!raw, &wrapped);
             if wrapped.lines.is_empty() {
                 BlockOutput {
                     lines: vec![Line::from("").into()],
