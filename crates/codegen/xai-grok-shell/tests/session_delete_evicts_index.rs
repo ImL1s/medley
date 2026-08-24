@@ -9,7 +9,6 @@ use xai_grok_shell::session::info::Info;
 use xai_grok_shell::session::persistence::delete_session_history;
 use xai_grok_shell::session::storage::search::{SessionSearchRequest, execute_search};
 use xai_grok_shell::session::storage::{JsonlStorageAdapter, StorageAdapter};
-use xai_grok_test_support::EnvGuard;
 
 fn home() -> &'static std::path::Path {
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
