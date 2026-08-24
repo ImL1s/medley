@@ -249,7 +249,7 @@ async fn run_external_auth_provider(
 
     let stderr_task = if let Some(cb) = on_stderr {
         let stderr = child.stderr.take().expect("stderr was set to piped");
-        Some(tokio::task::spawn_local(async move {
+        Some(tokio::spawn(async move {
             let mut reader = tokio::io::BufReader::new(stderr);
             let mut line = String::new();
             loop {
