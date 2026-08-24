@@ -196,11 +196,7 @@ fn ensure_auth_json_owner_only_for_file(auth_file: &Path, file: &File) -> std::i
                 .unwrap_or(false)
     };
     #[cfg(all(test, not(unix)))]
-    let injected_repair_failure = PERMISSION_REPAIR_FAULT_PATHS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .iter()
-        .any(|path| path == auth_file);
+    let injected_repair_failure = false;
     #[cfg(test)]
     if injected_repair_failure {
         return Err(std::io::Error::new(

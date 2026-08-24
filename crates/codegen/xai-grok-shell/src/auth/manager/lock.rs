@@ -312,6 +312,19 @@ enum StuckLivePolicy {
 
 /// Execute one iteration of the acquire loop.
 ///
+fn is_lock_busy_error(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if matches!(e.raw_os_error(), Some(32 | 33)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// `lock_path` is the resolved path to `auth.json.lock` — computed once
 /// by the caller to avoid re-deriving it on every poll iteration.
 fn try_acquire_once(lock_path: &Path, stuck_live: StuckLivePolicy) -> LockAttempt {
@@ -381,8 +394,8 @@ fn try_acquire_once(lock_path: &Path, stuck_live: StuckLivePolicy) -> LockAttemp
             }
         }
 
-        // Step 4: EWOULDBLOCK — lock is held by someone else.
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+        // Step 4: EWOULDBLOCK / ERROR_LOCK_VIOLATION — lock is held by someone else.
+        Err(e) if is_lock_busy_error(&e) => {
             let breakable = match holder_state(&mut file) {
                 HolderState::Dead => true,
                 HolderState::StuckLive => match stuck_live {

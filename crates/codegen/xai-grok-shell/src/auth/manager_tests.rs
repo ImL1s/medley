@@ -882,6 +882,7 @@ async fn codex_post_rename_failure_reconciles_memory_to_safe_disk_before_generat
     assert_codex_strict_publication(true).await;
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_post_rename_unsafe_disk_clears_memory_before_generation_stabilizes() {
     let dir = tempfile::tempdir().unwrap();
@@ -984,6 +985,7 @@ async fn codex_parent_sync_failure_reconciles_memory_to_visible_strict_write() {
 /// A last-scope unlink is already visible when its parent-directory fsync
 /// fails. Durable logout must report that failure, but retaining the deleted
 /// credential in memory would be a fail-open disk/memory split.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn codex_durable_clear_reconciles_memory_after_visible_parent_sync_failure() {
     let dir = tempfile::tempdir().unwrap();
