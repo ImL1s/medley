@@ -55,18 +55,76 @@ fn brief_policy() -> super::pending::PendingPolicy {
 /// answers, then says its answer was premature, is answered again on the drain
 /// after the one that heard it — and which drain lands where is a race with the
 /// mock's own scheduling, not something worth pinning down.
+///
+/// The budget is a hang guard, not the verdict (#428). What it waits for is a
+/// verdict from a mock server running in its own process, reached over a pipe,
+/// and nothing deterministic stands in for it: the only event that says the
+/// answer has arrived *is* the answer. So the budget stays, and what it prints
+/// when it runs out has to earn its keep instead. Reaching this line used to
+/// say one sentence about three different states, which made an overloaded
+/// runner and a genuine regression in what answered read identically. The
+/// manager's state at the moment we give up tells them apart, so that is what
+/// the panic carries.
 async fn drain_until_reported(mgr: &tokio::sync::Mutex<LspManager>, needle: &str) -> String {
     let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT + WAIT_TIMEOUT;
+    // Kept rather than dropped: a summary that arrived and said something else
+    // is the loudest evidence there is that the wrong thing answered, and
+    // filtering it away in place was what left only "nothing came" to report.
+    let mut discarded: Vec<String> = Vec::new();
     while tokio::time::Instant::now() < deadline {
-        if let Some(summary) = drain_lsp_diagnostics(mgr, std::time::Duration::from_millis(500))
-            .await
-            .filter(|summary| summary.text.contains(needle))
+        if let Some(summary) =
+            drain_lsp_diagnostics(mgr, std::time::Duration::from_millis(500)).await
         {
-            return summary.text;
+            if summary.text.contains(needle) {
+                return summary.text;
+            }
+            discarded.push(summary.text);
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("no summary mentioning {needle:?} within the deadline");
+    panic!("{}", gave_up_draining(mgr, needle, &discarded).await);
+}
+
+/// Why [`drain_until_reported`] gave up, in the terms that separate a wait that
+/// expired from a verdict that was wrong.
+///
+/// Written once here rather than at each call site, so every test that waits on
+/// a summary reports its give-up the same way.
+async fn gave_up_draining(
+    mgr: &tokio::sync::Mutex<LspManager>,
+    needle: &str,
+    discarded: &[String],
+) -> String {
+    let lsp = mgr.lock().await;
+    let mut servers: Vec<String> = lsp
+        .clients
+        .iter()
+        .map(|(name, client)| {
+            format!(
+                "{name}: publishes={} pull={:?}",
+                client.diagnostics.server_publishes(),
+                client.pull.support()
+            )
+        })
+        .collect();
+    servers.sort_unstable();
+    format!(
+        "no summary mentioning {needle:?} within {budget:?}. Three states reach \
+         this line and the facts below tell them apart, so read them before \
+         blaming any of the three. (1) SOMETHING ANSWERED IT IN SILENCE: \
+         pending=0 with nothing drained. A file leaves the pending set whether \
+         or not it produced a line to show, so an empty verdict settles it \
+         without a summary — an answer from a source that should not have been \
+         consulted looks exactly like this from here. (2) A DIFFERENT VERDICT \
+         ARRIVED: drained is not empty. Something answered, just not with what \
+         was expected; the text below is what it said. (3) NOTHING ARRIVED: \
+         pending>0 with nothing drained. Nobody answered at all, and on a \
+         loaded host that is this wait expiring rather than a verdict about \
+         anything. pending={pending} servers=[{servers}] drained={discarded:?}",
+        budget = WAIT_TIMEOUT + WAIT_TIMEOUT,
+        pending = lsp.pending_count(),
+        servers = servers.join(", "),
+    )
 }
 
 fn mock_server_config(script_path: &Path) -> LspServerConfig {
@@ -1640,21 +1698,46 @@ async fn a_pushed_verdict_on_the_previous_revision_does_not_settle_the_edit() {
 async fn a_server_that_publishes_is_not_second_guessed_with_a_pull() {
     let (_dir, script_path) = write_push_and_pull_server();
     let workspace = tempfile::tempdir().unwrap();
-    let mgr = tokio::sync::Mutex::new(single_server_manager(&script_path, &workspace).await);
+    let mut mgr = single_server_manager(&script_path, &workspace).await;
 
     let file = workspace.path().join("checked.rs.ts");
     std::fs::write(&file, "const y = 1;\n").unwrap();
-    mgr.lock()
-        .await
-        .notify_file_changed(&file, "const y = 1;\n");
+    mgr.notify_file_changed(&file, "const y = 1;\n");
 
+    // What settles the channel is the server's first push reaching the store,
+    // not the summary that push eventually produces. Waiting on the fact keeps
+    // the two apart: this wait names what it was waiting for when it expires,
+    // and cannot be mistaken for the channel having been chosen wrongly (#428).
+    wait_until("the server's first publish", || {
+        mgr.clients["mock-ts"].diagnostics.server_publishes()
+    })
+    .await;
+
+    // The wait above established the first of the two facts the rule combines.
+    // This is the other, and the load-bearing one: the server never refused a
+    // pull, so declining to ask it is a choice rather than an inability. That
+    // the choice follows from the pair is pinned with no server, no drain and
+    // no clock in `pull::tests`.
+    //
+    // The mock's `pulls=` count is deliberately not asserted on. A pull sent
+    // before the first publish is legitimate — the client cannot yet know what
+    // kind of server this is, which is why the mock has a `pending_pull` branch
+    // at all — and the confirming re-ask inside that same episode lands up to
+    // `CONFIRM_DELAY` after the publish. The raw count is racy in a correct
+    // implementation too, so asserting on it would trade this defect for a
+    // worse one.
+    assert_eq!(
+        mgr.clients["mock-ts"].pull.support(),
+        super::pull::PullSupport::Asking,
+        "not rejected"
+    );
+
+    let mgr = tokio::sync::Mutex::new(mgr);
     let summary = drain_until_reported(&mgr, "the check that only the push channel runs").await;
     assert!(
         summary.contains("the check that only the push channel runs"),
         "{summary}"
     );
-    let before = mgr.lock().await.clients["mock-ts"].pull.support();
-    assert_eq!(before, super::pull::PullSupport::Asking, "not rejected");
     // And from here on it is not asked at all — its own reports are the truth.
     for round in 0..3 {
         let text = format!("const y = {round};\n");

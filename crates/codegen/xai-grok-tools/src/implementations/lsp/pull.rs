@@ -575,6 +575,48 @@ mod tests {
         assert_eq!(pull.store.covers("file:///a.cs"), Some(0));
     }
 
+    /// The rule its end-to-end sibling can only watch from downstream: the
+    /// moment a server's first push lands, it stops being one we ask — even
+    /// though it has never refused a pull, so nothing about its own answers
+    /// rules it out.
+    ///
+    /// Kept here as well as end to end because the two fail differently. This
+    /// is the decision itself, with no server, no clock and no drain between
+    /// the fact and the verdict, so a loaded host cannot reach it; the e2e test
+    /// can only observe what the decision produces, and that a loaded host can
+    /// delay (#428).
+    #[tokio::test]
+    async fn a_server_that_publishes_is_not_asked_as_well() {
+        let pull = detached_pull();
+        let uri = Url::parse("file:///a.rs").unwrap();
+        pull.documents
+            .commit(uri.as_str(), 0, "rust", Default::default());
+        assert!(
+            pull.worth_asking(),
+            "a server that has told us nothing yet is worth asking"
+        );
+
+        // Its first `publishDiagnostics`. That, and nothing else, is what tells
+        // us it has a push channel.
+        pull.store
+            .record_push(uri.as_str(), vec![Diagnostic::default()], Some(0), Some(0));
+
+        assert_eq!(
+            pull.support(),
+            PullSupport::Asking,
+            "it never refused a pull, so nothing has written it off"
+        );
+        assert!(
+            !pull.worth_asking(),
+            "but a server with a push channel is not second-guessed with a pull"
+        );
+        assert!(
+            !pull.will_answer(uri.clone()),
+            "so an edit to one of its documents starts no pull"
+        );
+        assert!(!pull.refresh_all(), "and a refresh from it re-asks nothing");
+    }
+
     #[test]
     fn a_document_with_a_pull_running_is_queued_rather_than_raced() {
         let pull = detached_pull();
