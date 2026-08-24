@@ -581,6 +581,13 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture
+          # #408 review: the coverage checker listed this crate with default
+          # features and reported 6/6 covered, while these ten lived behind
+          # `#[cfg(feature = "middleware")]` and ran in no lane at all --
+          # including `opaque_middleware_errors_drop_provider_controlled_sources`,
+          # a credential-leak guard. The checker is feature-aware now; this is
+          # the enrolment it was blind to.
+          run_nonzero -p xai-grok-auth --features middleware --lib retry_middleware:: -- --nocapture
           run_nonzero -p xai-grok-telemetry --lib unified_log -- --nocapture
           # #121: for_test is the single place that names SamplingConfig fork
           # fields. Unique substrings — run_nonzero only fails on *zero* matches.
