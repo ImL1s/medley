@@ -27,6 +27,8 @@ CI runs on `providers` only. `main` moving triggers nothing.
 
 **A green test suite can mean a filter matched nothing.** CI wraps its hot-path filters in `run_nonzero`, which fails when a filter matches zero tests. `cargo test --exact <short-name>` matches nothing and exits 0 — it needs the full module path.
 
+**And it can mean a filter matched something you never aimed at.** libtest filters are **substring** matches, not prefixes, so `session::` also selects `terminal::pty_session::tests::*`. That accident was the only thing running five of #132's PTY guards (#417). Both directions of the same property have now cost this repo a surprise: assume a filter's reach is wider than the name suggests, and enrol what you mean to run by name.
+
 **`cargo check --lib` does not compile `#[cfg(test)]` code.** Neither does clippy on `--lib`. A workspace can pass check, clippy, fmt, and a filtered hot-path run while the test build of the largest crate is broken — that is exactly what the 2026-08-04 upstream sync did, and only CI caught it. Run `cargo test --workspace --no-run` before pushing anything that touches shared types: it compiles every test target without running them, which is the cheapest way to find a fork test still calling something upstream deleted.
 
 **Fork fields on `SamplingConfig` / `SamplerConfig` are a per-sync tax (#121).** Rust struct literals must name every field. The 2026-08-04 sync paid **11 of 25** test-build errors for a single fork field (`endpoint_trust`) on `SamplingConfig` — all upstream constructors that did not know the field existed. Today `SamplingConfig` still carries **one** fork field (`endpoint_trust`); `SamplerConfig` carries **two** (`endpoint_trust`, `credential_source`). Before adding another:
