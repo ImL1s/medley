@@ -928,5 +928,46 @@ class MultipleKeysAreHeldJointly(unittest.TestCase):
         )
         self.assertEqual(sorted(f.name for f in guard.scan_source(src)), ["one", "two"])
 
+
+class HelperLockMustPrecedeItsMutation(unittest.TestCase):
+    """#449 round 4: the same positional rule, applied to helpers."""
+
+    def _src(self, helper_body):
+        return textwrap.dedent(
+            f"""\
+            fn prepare() {{
+            {helper_body}
+            }}
+
+            #[test]
+            fn t() {{
+                prepare();
+            }}
+            """
+        )
+
+    def test_helper_locking_after_its_mutation_does_not_serialise_it(self):
+        src = self._src(
+            '    unsafe { std::env::set_var("HOME", "/tmp") };\n'
+            "    let _lock = ENV_TEST_LOCK.lock().unwrap();"
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
+    def test_helper_locking_before_its_mutation_does_serialise_it(self):
+        src = self._src(
+            "    let _lock = ENV_TEST_LOCK.lock().unwrap();\n"
+            '    unsafe { std::env::set_var("HOME", "/tmp") };'
+        )
+        self.assertEqual(guard.scan_source(src), [])
+
+    def test_helper_releasing_before_its_last_mutation_does_not_serialise_it(self):
+        src = self._src(
+            "    let lock = ENV_TEST_LOCK.lock().unwrap();\n"
+            '    unsafe { std::env::set_var("A", "1") };\n'
+            "    drop(lock);\n"
+            '    unsafe { std::env::set_var("HOME", "/tmp") };'
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
 if __name__ == "__main__":
     unittest.main()

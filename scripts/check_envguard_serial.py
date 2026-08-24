@@ -425,23 +425,30 @@ class EnvMutators:
 
 
 def _env_lock_is_live(body: str) -> bool:
-    """An env lock is acquired AND its guard outlives the mutation.
+    """An env lock is acquired BEFORE the first mutation and still held at it.
 
-    `let _ = ENV_LOCK.lock()` drops at the end of that statement and protects
-    nothing; an explicit `drop(guard)` releases it early. Both read as
-    "serialised" if you only look for the token.
+    Used to classify HELPERS. Test bodies go through [`_protected_spans`],
+    which is positional per mutation site; this is the same property for a
+    helper, whose mutations are all its own.
 
-    Honest limit: this does not prove the guard outlives every mutation in the
-    body, only that it is bound and not explicitly dropped. Full liveness needs
-    real dataflow; the two shapes above are the ones that occur.
+    `let _ = ENV_LOCK.lock()` drops at the end of that statement, an explicit
+    `drop(guard)` releases it early, and a lock taken AFTER the mutation never
+    covered it — all three read as "serialised" if you only look for the token.
     """
 
+    mutations = [m.start() for m in ENV_MUTATION.finditer(body)]
+    if not mutations:
+        return bool(ENV_LOCK_BINDING.search(body))
+    first, last = mutations[0], mutations[-1]
     for match in ENV_LOCK_BINDING.finditer(body):
         name = match.group("bind")
         if name == "_":
             continue
-        if re.search(r"\bdrop\s*\(\s*" + re.escape(name) + r"\s*\)", body):
-            continue
+        if match.start() > first:
+            continue  # taken after a mutation it therefore never covered
+        released = re.search(r"\bdrop\s*\(\s*" + re.escape(name) + r"\s*\)", body)
+        if released and released.start() <= last:
+            continue  # let go before the last mutation
         return True
     return False
 
@@ -702,12 +709,22 @@ def _protected_spans(
 def _mutation_sites(
     body: str, mutators: EnvMutators, helpers: dict[str, bool]
 ) -> list[int]:
-    """Offsets where this body mutates process env."""
+    """Offsets where this body mutates env and needs a protector of its own.
+
+    A call to a helper that locks around its OWN mutations is already covered
+    by that lock, so it does not need a span here. That is a different question
+    from whether the helper protects the CALLER's later mutations — it does not
+    unless it hands the guard back, which [`_protected_spans`] decides.
+    """
 
     sites = [m.start() for m in ENV_MUTATION.finditer(body)]
     sites += [m.start() for m in TYPE_ASSOC_CALL.finditer(body) if m.group(1) in mutators.types]
     sites += [m.start() for m in ENV_GUARD_NAME.finditer(body)]
-    sites += [m.start() for m in FREE_CALL.finditer(body) if m.group(1) in helpers]
+    sites += [
+        m.start()
+        for m in FREE_CALL.finditer(body)
+        if m.group(1) in helpers and not helpers[m.group(1)]
+    ]
     return sorted(set(sites))
 
 
@@ -820,9 +837,10 @@ def analyze_source(
                 body, mutators, helpers, crate, path.as_posix(), name_paths, returning
             )
             sites = _mutation_sites(body, mutators, helpers)
-            if sites and all(
-                any(start <= site < end for start, end in spans) for site in sites
-            ):
+            # No remaining sites means every mutation this test performs is
+            # already covered where it happens (inside a self-locking helper),
+            # so there is nothing left for a caller span to protect.
+            if all(any(start <= site < end for start, end in spans) for site in sites):
                 regime = "lock-covers-every-mutation"
             elif _is_integration_target(path) and test_count == 1:
                 # Nothing shares its process, so there is no sibling to corrupt.
