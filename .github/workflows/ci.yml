@@ -52,6 +52,14 @@ jobs:
       - name: Test the new-test filter guard
         run: python3 -B -m unittest tests.test_new_test_filter_guard -v
 
+      # Its examples are hand-written, and so are its patterns -- one mental
+      # model produces both, so a wrong one produces a matching wrong test.
+      # This checks the same patterns against identifiers taken FROM THE TREE
+      # by a different mechanism. `check_envguard_serial.py` shipped a matcher
+      # that saw one guard type in five for exactly this reason (#455).
+      - name: Corpus-test the new-test filter patterns
+        run: python3 -B -m unittest tests.test_new_test_filter_corpus -v
+
       - name: Test the uncovered-crate ratchet
         run: python3 -B -m unittest tests.test_uncovered_crates_guard -v
 
