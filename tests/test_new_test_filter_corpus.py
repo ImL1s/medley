@@ -154,104 +154,120 @@ class FunctionSignatureCorpus(unittest.TestCase):
             self.assertIsNone(guard._FN.match(not_a_fn), not_a_fn)
 
 
-def _inline_and_path_module_names() -> tuple[set[str], set[str]]:
-    """Module names declared in SOURCE rather than implied by a file name.
+def _workflow_module_filters() -> list[tuple[str, str]]:
+    """`(crate, filter)` for every module-path filter, from the GUARD's parser.
 
-    The independent half of the module-path comparison: the guard approximates
-    module paths from file paths, so parsing the actual `mod` declarations is a
-    different source, not a restatement of the same assumption.
+    Re-deriving the filter list with a second regex was itself a proxy: mine
+    captured only filters ending in `::`, so `agent::models` and friends were
+    absent and a regression in them left this test green (#458 review).
+    `parse_workflow` is what the guard actually uses, and it is crate-scoped,
+    which is also what makes resolution checkable against the right crate.
     """
 
-    inline_decl = re.compile(
-        r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{", re.M
-    )
-    path_decl = re.compile(
-        r'#\[path\s*=\s*"[^"]+"\]\s*(?:pub\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;'
-    )
-    inline: set[str] = set()
-    path_mods: set[str] = set()
+    per_crate = guard.parse_workflow(WORKFLOW.read_text(encoding="utf-8"))
+    out: set[tuple[str, str]] = set()
+    for crate, targets in per_crate.items():
+        for filters in targets.values():
+            for value in filters:
+                if "::" in value:
+                    out.add((crate, value))
+    return sorted(out)
+
+
+def _files_by_crate() -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
     for path in CRATES.rglob("*.rs"):
-        if "src" not in path.parts:
-            continue
-        source = path.read_text(encoding="utf-8", errors="ignore")
-        inline |= set(inline_decl.findall(source))
-        path_mods |= set(path_decl.findall(source))
-    return inline, path_mods
+        rel = path.relative_to(REPO).as_posix()
+        crate = guard.crate_of(rel)
+        if crate:
+            grouped.setdefault(crate, []).append(rel)
+    return grouped
 
 
-def _file_provided_components() -> set[str]:
-    """Module components the guard CAN derive, i.e. file and directory names."""
+# A name chosen so `selected`'s substring branch cannot fire: only the
+# module-path branch can make these resolve.
+SENTINEL_FN = "zz_no_substring_match_zz"
 
-    provided: set[str] = set()
-    for path in CRATES.rglob("*.rs"):
-        if "src" not in path.parts:
-            continue
-        provided.add(path.stem)
-        provided.add(path.parent.name)
-    return provided
-
-
-def _workflow_module_filters() -> list[str]:
-    text = WORKFLOW.read_text(encoding="utf-8")
-    return sorted(
-        {
-            token
-            for token in re.findall(
-                r"(?<![\w$/.-])([a-z_][a-z0-9_]*(?:::[a-z_][a-z0-9_]*)*::)(?=\s|$)", text
-            )
-        }
-    )
+# Module filters that resolve to no file in their own crate, because the
+# component they name is an INLINE module and the guard derives module paths
+# from file paths. Each is a filter that works in Cargo and that the guard
+# would report as selecting nothing -- #460. This list is a ratchet: it must
+# not grow, and it shrinks to empty when #460 is fixed.
+KNOWN_UNRESOLVABLE = {
+    ("xai-grok-shell", "auth::manager::tests::"),
+    ("xai-grok-shell", "auth::openai_codex::tests::"),
+    (
+        "xai-grok-shell",
+        "auth::openai_codex::tests::full_login_flow_persists_provider_scoped_codex_credential",
+    ),
+    ("xai-grok-shell", "leader::lock::tests::reclaim"),
+    ("xai-grok-shell", "terminal::pty_session::tests::"),
+    ("xai-grok-shell", "terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child"),
+    ("xai-grok-subagent-resolution", "resume::tests"),
+}
 
 
 class ModulePathApproximationCorpus(unittest.TestCase):
-    """#171's `::` -> file-path approximation, against real `mod` declarations.
+    """#171's file-path approximation, against filters the guard itself parsed.
 
-    The approximation reads module components off the FILE path, so a module
-    declared inline (`mod x_tests { .. }`) or relocated with `#[path = ".."]`
-    is invisible to it: a correct filter naming one reads as unenrolled.
-
-    That gap is real but currently LATENT — every module-path filter in
-    `ci.yml` names components a file provides. This pins that, so the day
-    someone writes a filter naming an inline module the guard's silent wrong
-    answer becomes a loud one. Closing the gap itself is out of scope (#455).
+    The property is that a module-path filter RESOLVES: some real file in its
+    own crate makes `selected()` true through the module-path branch. Checking
+    instead that each component appears somewhere in the repository is a proxy
+    -- `auth::openai_codex::tests::` passes that because some unrelated file
+    contributes a `tests` component, while the guard rejects a new test in that
+    module (#458 review). A component set is exactly the kind of container
+    whose non-emptiness reads as success.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.inline, cls.path_mods = _inline_and_path_module_names()
-        cls.provided = _file_provided_components()
         cls.filters = _workflow_module_filters()
+        cls.by_crate = _files_by_crate()
+        cls.unresolvable = {
+            (crate, value)
+            for crate, value in cls.filters
+            if not any(
+                guard.selected(SENTINEL_FN, path, {value})
+                for path in cls.by_crate.get(crate, [])
+            )
+        }
 
-    def test_the_corpora_are_not_empty(self):
-        self.assertGreater(len(self.filters), 20, self.filters)
-        self.assertGreater(len(self.inline), 20, len(self.inline))
+    def test_the_corpus_is_not_empty(self):
+        self.assertGreater(len(self.filters), 50, len(self.filters))
+        self.assertGreater(len(self.by_crate), 10, len(self.by_crate))
 
-    def test_every_workflow_module_filter_resolves_to_file_components(self):
-        unresolved = []
-        for filter_value in self.filters:
-            segments = [s for s in filter_value.strip(":").split("::") if s]
-            missing = [s for s in segments if s not in self.provided]
-            if missing:
-                kinds = [
-                    f"{m} ({'inline mod' if m in self.inline else '#[path] mod' if m in self.path_mods else 'unknown'})"
-                    for m in missing
-                ]
-                unresolved.append(f"{filter_value} -> {', '.join(kinds)}")
+    def test_the_corpus_includes_filters_without_a_trailing_separator(self):
+        # The bug this class had: only trailing-`::` filters were collected.
+        self.assertTrue(
+            any(not value.endswith("::") for _crate, value in self.filters),
+            "corpus omits filters that do not end in `::`",
+        )
+
+    def test_no_new_unresolvable_module_filter(self):
+        new = self.unresolvable - KNOWN_UNRESOLVABLE
         self.assertEqual(
-            unresolved,
-            [],
-            "these ci.yml filters name modules the file-path approximation "
-            f"cannot see, so the guard judges them unenrolled: {unresolved}",
+            new,
+            set(),
+            "these ci.yml module filters resolve to no file in their crate, so "
+            f"the guard judges tests in them unenrolled (see #460): {sorted(new)}",
+        )
+
+    def test_the_known_list_does_not_go_stale(self):
+        fixed = KNOWN_UNRESOLVABLE - self.unresolvable
+        self.assertEqual(
+            fixed,
+            set(),
+            f"these now resolve; remove them from KNOWN_UNRESOLVABLE: {sorted(fixed)}",
         )
 
     def test_the_approximation_really_cannot_see_an_inline_module(self):
-        # Pins WHY the assertion above matters. If this ever starts passing,
-        # the approximation has been improved and the docstring above is stale.
+        # Pins WHY the list above exists. If this starts passing, #460 is fixed
+        # and the list should be emptied rather than left as folklore.
         self.assertFalse(
             guard.selected(
-                "some_unrelated_test_name",
+                SENTINEL_FN,
                 "crates/codegen/x/src/main.rs",
                 {"version_json_payload_tests::"},
             ),
-            "the file-path approximation now resolves inline modules; update #455's note",
+            "the file-path approximation now resolves inline modules; see #460",
         )
