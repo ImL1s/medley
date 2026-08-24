@@ -75,10 +75,11 @@ pub enum SessionEvent {
     },
     /// Auto-compaction was cancelled (turn was cancelled mid-compact).
     CompactionCancelled,
-    /// Retry failed — all retries exhausted or a non-retryable error.
-    ///
-    /// Covers both `RetryState::Exhausted` (tried N times, all failed) and
-    /// `RetryState::Failed` (non-retryable error like auth or 413).
+    /// Retry exhausted — used for actual retry exhaustion (rate-limit
+    /// `RetryState::Exhausted`) and a few Failed-state specials (legacy_auth,
+    /// encrypted-content mismatch). Generic non-retryable 4xx is
+    /// [`SessionEvent::RequestFailed`], not this variant: `message()` must
+    /// never label those as "Retry failed".
     RetryFailed {
         /// Human-readable error description.
         error: String,
@@ -220,14 +221,24 @@ impl SessionEvent {
             SessionEvent::CompactionCancelled => "Compaction cancelled.".to_string(),
             SessionEvent::RetryFailed { error, error_type } => {
                 use crate::app::error_display::WireErrorType;
-                if WireErrorType::parse(error_type.as_deref())
-                    == WireErrorType::EncryptedContentMismatch
-                {
-                    "This session's conversation history is incompatible with the \
-                     current model. Please start a new session."
-                        .to_string()
-                } else {
-                    format!("Retry failed: {error}")
+                match WireErrorType::parse(error_type.as_deref()) {
+                    WireErrorType::EncryptedContentMismatch => {
+                        "This session's conversation history is incompatible with the \
+                         current model. Please start a new session."
+                            .to_string()
+                    }
+                    // Non-retryable Failed-state (legacy_auth, 4xx, …): never
+                    // label as "Retry failed". Legacy auth keeps its own
+                    // logout/login guidance; everything else uses the typed
+                    // request-failure banner.
+                    WireErrorType::LegacyAuth => error.clone(),
+                    _ if error_type.is_some() => crate::app::error_display::format_request_failure(
+                        crate::app::error_display::parse_http_status(error),
+                        error_type.as_deref(),
+                        error,
+                    )
+                    .message(),
+                    _ => format!("Retry failed: {error}"),
                 }
             }
             SessionEvent::RequestFailed {
@@ -883,12 +894,34 @@ mod tests {
     }
 
     #[test]
-    fn retry_failed_other_error_type_shows_raw() {
+    fn issue244_retry_failed_non_retryable_4xx_is_not_labelled_retry_failed() {
+        let event = SessionEvent::RetryFailed {
+            error: "Provider request failed (HTTP 400). Invalid value for reasoning.effort".into(),
+            error_type: Some("api".into()),
+        };
+        let msg = event.message();
+        assert!(
+            !msg.contains("Retry failed"),
+            "non-retryable 4xx must not be labelled Retry failed: {msg}"
+        );
+        assert!(!msg.contains('{'), "must not dump an envelope: {msg}");
+        assert!(
+            msg.contains("400") && msg.contains("Invalid value for reasoning.effort"),
+            "typed 400 + safe reason, got {msg}"
+        );
+    }
+
+    #[test]
+    fn issue244_retry_failed_other_error_type_is_not_retry_failed_prefix() {
         let event = SessionEvent::RetryFailed {
             error: "bad request".into(),
             error_type: Some("api_400".into()),
         };
-        assert_eq!(event.message(), "Retry failed: bad request");
+        let msg = event.message();
+        assert!(
+            !msg.contains("Retry failed"),
+            "Failed-state RetryFailed is not a retry: {msg}"
+        );
     }
 
     #[test]

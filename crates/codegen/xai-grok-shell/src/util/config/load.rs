@@ -60,6 +60,8 @@ pub async fn load_config() -> Config {
 }
 /// Parse `Config` from a pre-loaded TOML value. Used by both async and sync paths.
 pub fn load_config_from_toml(root: &TomlValue) -> Config {
+    let mut root = root.clone();
+    crate::agent::config::prefer_readline_mode_in_toml(&mut root);
     let table = match root.as_table() {
         Some(t) => t,
         None => return Config::default(),

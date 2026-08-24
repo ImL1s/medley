@@ -302,6 +302,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         forked_tool_override: None,
         compaction: crate::session::compaction_config::CompactionConfig {
             threshold_percent: std::cell::Cell::new(threshold_percent),
+            token_limit: std::cell::Cell::new(None),
             force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),

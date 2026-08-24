@@ -39,6 +39,7 @@ impl SlashCommand for AnnouncementsCommand {
                 display: "hide".to_string(),
                 match_text: "hide".to_string(),
                 insert_text: "hide".to_string(),
+                identity: String::new(),
                 description: "Hide the announcement banner".to_string(),
                 ..Default::default()
             },
@@ -46,6 +47,7 @@ impl SlashCommand for AnnouncementsCommand {
                 display: "show".to_string(),
                 match_text: "show".to_string(),
                 insert_text: "show".to_string(),
+                identity: String::new(),
                 description: "Show the announcement banner".to_string(),
                 ..Default::default()
             },

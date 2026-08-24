@@ -27,8 +27,8 @@ use xai_grok_sampling_types::error::{
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    ReasoningEffort, ResponseModelMetadata, Result, SamplingError, SentCredential,
-    build_messages_request, is_check_event, messages, rs,
+    ResponseModelMetadata, Result, SamplingError, SentCredential, build_messages_request,
+    is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, EndpointTrustClass, OriginClientInfo, SamplerConfig};
@@ -50,11 +50,12 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION: &str = "<multi_agent_mode>Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.</multi_agent_mode>";
 const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-id");
 const OPENAI_FEDRAMP: HeaderName = HeaderName::from_static("x-openai-fedramp");
 const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
 const GROK_BUILD_ORIGINATOR: HeaderValue = HeaderValue::from_static("grok_build");
+const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE: HeaderName =
+    HeaderName::from_static(xai_grok_sampling_types::CODEX_RESPONSES_LITE_HEADER);
 
 /// L3 ambient-origin refusal. Shared with tests so the "exact identity" match
 /// is the same string the production gate returns (#180).
@@ -158,17 +159,9 @@ fn is_loopback_url(url: &str) -> bool {
 
 /// First-party metadata namespaces that must never reach a non-xAI endpoint,
 /// regardless of how they were injected (defaults, extra_headers, env
-/// headers, or a per-request header injector).
+/// headers, or a per-request header injector). Shared with web search.
 fn is_internal_metadata_header(name: &HeaderName) -> bool {
-    let name = name.as_str();
-    name.starts_with("x-grok-")
-        || name.starts_with("x-xai-")
-        || name == "x-compactions-remaining"
-        || name == "x-compaction-at"
-        || name == "x-authenticateresponse"
-        || name == "traceparent"
-        || name == "tracestate"
-        || name == "baggage"
+    xai_grok_auth::is_internal_metadata_header(name)
 }
 
 /// Replace a stable first-party session identifier in `prompt_cache_key`
@@ -1286,6 +1279,20 @@ impl SamplingClient {
                     .is_some_and(|credential| credential.chatgpt_account_is_fedramp),
                 codex_user_agent,
             );
+            // After the Codex allowlist wipe so extra_headers cannot spoof it.
+            // Official Codex (`add_responses_lite_header`) sends this only
+            // when the catalog marks the model lite (#274).
+            if self
+                .defaults
+                .codex_wire
+                .as_ref()
+                .is_some_and(xai_grok_sampling_types::CodexWireCapabilities::responses_lite_enabled)
+            {
+                headers.insert(
+                    X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE,
+                    HeaderValue::from_static("true"),
+                );
+            }
         } else {
             strip_codex_routing_headers(&mut headers);
         }
@@ -1693,20 +1700,17 @@ impl SamplingClient {
             return;
         }
 
-        xai_grok_sampling_types::patch_codex_instructions(body);
-        if request.client_reasoning_effort == Some(ReasoningEffort::Ultra) {
-            let existing = body
-                .get("instructions")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if !existing.contains(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION) {
-                body["instructions"] = serde_json::Value::String(if existing.is_empty() {
-                    CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION.to_owned()
-                } else {
-                    format!("{existing}\n\n{CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION}")
-                });
-            }
-        }
+        // `patch_codex_instructions` also folds in catalog `base_instructions` /
+        // `model_messages.instructions_template` when the model carries them (#261),
+        // so the Codex wire capabilities are passed through here.
+        xai_grok_sampling_types::patch_codex_instructions(body, self.defaults.codex_wire.as_ref());
+        // Ultra lowering + the proactive multi-agent marker live in the shared
+        // sampling-types boundary (#357) so streaming and non-streaming
+        // Responses, and any future Codex transport, cannot drift apart.
+        xai_grok_sampling_types::prepare_codex_ultra_responses(
+            body,
+            request.client_reasoning_effort,
+        );
         if let Some(caps) = self.defaults.codex_wire.as_ref() {
             xai_grok_sampling_types::apply_codex_wire_capabilities(body, caps);
         }
@@ -2637,8 +2641,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
-    use xai_grok_sampling_types::ApiErrorCode;
     use xai_grok_sampling_types::types::ChatRequestMessage;
+    use xai_grok_sampling_types::{ApiErrorCode, ReasoningEffort};
 
     #[derive(Clone, Default)]
     struct SecretLogCapture {
@@ -4450,6 +4454,60 @@ mod tests {
         }
     }
 
+    /// #274: Sol's catalog flag must reach the shipped Codex request, Spark's
+    /// `false` must not. The header is applied after `retain_codex_headers`.
+    #[test]
+    fn codex_transport_use_responses_lite_header_follows_catalog() {
+        let resolver = std::sync::Arc::new(CodexCredentialResolver {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sol = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::CodexResponses,
+            base_url: CODEX_BASE_URL.to_owned(),
+            bearer_resolver: Some(resolver.clone()),
+            codex_wire: Some(xai_grok_sampling_types::CodexWireCapabilities {
+                use_responses_lite: Some(true),
+                ..xai_grok_sampling_types::CodexWireCapabilities::default()
+            }),
+            ..minimal_config()
+        })
+        .expect("Sol Codex client should build");
+        let sol_request = sol
+            .post(sol.endpoint("responses"))
+            .0
+            .build()
+            .expect("Sol request should build");
+        assert_eq!(
+            sol_request.headers()[X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE],
+            "true",
+            "Sol catalog use_responses_lite=true must send the lite header"
+        );
+
+        let spark = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::CodexResponses,
+            base_url: CODEX_BASE_URL.to_owned(),
+            bearer_resolver: Some(resolver),
+            codex_wire: Some(xai_grok_sampling_types::CodexWireCapabilities {
+                use_responses_lite: Some(false),
+                ..xai_grok_sampling_types::CodexWireCapabilities::default()
+            }),
+            ..minimal_config()
+        })
+        .expect("Spark Codex client should build");
+        let spark_request = spark
+            .post(spark.endpoint("responses"))
+            .0
+            .build()
+            .expect("Spark request should build");
+        assert!(
+            spark_request
+                .headers()
+                .get(X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE)
+                .is_none(),
+            "Spark catalog use_responses_lite=false must omit the lite header"
+        );
+    }
+
     #[test]
     fn codex_defaults_enable_parallel_tools_without_overriding_explicit_choice() {
         let resolver = std::sync::Arc::new(CodexCredentialResolver {
@@ -4505,7 +4563,7 @@ mod tests {
         assert!(instructions.starts_with("existing guidance\n\n"));
         assert_eq!(
             instructions
-                .matches(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION)
+                .matches(xai_grok_sampling_types::CODEX_ULTRA_PROACTIVE_MARKER)
                 .count(),
             1
         );
@@ -4538,7 +4596,7 @@ mod tests {
         assert!(
             !body
                 .to_string()
-                .contains(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION)
+                .contains(xai_grok_sampling_types::CODEX_ULTRA_PROACTIVE_MARKER)
         );
     }
 
@@ -4562,7 +4620,7 @@ mod tests {
         assert!(
             !body
                 .to_string()
-                .contains(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION)
+                .contains(xai_grok_sampling_types::CODEX_ULTRA_PROACTIVE_MARKER)
         );
     }
 
@@ -4868,7 +4926,7 @@ mod tests {
         assert!(instructions.starts_with("system guidance\n\n"));
         assert_eq!(
             instructions
-                .matches(CODEX_ULTRA_PROACTIVE_MULTI_AGENT_INSTRUCTION)
+                .matches(xai_grok_sampling_types::CODEX_ULTRA_PROACTIVE_MARKER)
                 .count(),
             1,
             "Codex Ultra must append the proactive multi-agent instruction exactly once"
@@ -5625,5 +5683,117 @@ mod tests {
             event,
             rs::ResponseStreamEvent::ResponseOutputTextDelta(_)
         ));
+    }
+
+    /// Same contract as
+    /// `codex_ultra_preparation_preserves_max_wire_effort_and_injects_marker_once`,
+    /// asserted one layer down on the shared sampling-types helper so a client
+    /// refactor cannot silently move the guarantee out from under it (#357).
+    #[test]
+    fn codex_ultra_preparation_preserves_max_wire_effort_and_injects_marker_once_via_shared_helper()
+    {
+        use xai_grok_sampling_types::{
+            CODEX_ULTRA_PROACTIVE_MARKER, ReasoningEffort, prepare_codex_ultra_responses,
+        };
+
+        let mut body = serde_json::json!({
+            "reasoning": { "effort": "ultra", "summary": "concise" },
+            "instructions": "existing guidance"
+        });
+        prepare_codex_ultra_responses(&mut body, Some(ReasoningEffort::Ultra));
+        prepare_codex_ultra_responses(&mut body, Some(ReasoningEffort::Ultra));
+
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+            Some("max")
+        );
+        let instructions = body["instructions"].as_str().expect("instructions string");
+        assert!(
+            instructions.starts_with("existing guidance"),
+            "existing Codex instructions must be preserved: {instructions}"
+        );
+        assert_eq!(
+            instructions.matches(CODEX_ULTRA_PROACTIVE_MARKER).count(),
+            1,
+            "the proactive marker must be injected exactly once: {instructions}"
+        );
+        assert!(
+            !instructions.contains("\"ultra\""),
+            "instructions must not reintroduce the rejected wire token: {instructions}"
+        );
+    }
+
+    /// Sweeps every non-Ultra tier through the shared helper; the client-level
+    /// `codex_non_ultra_preparation_does_not_inject_proactive_marker` covers the
+    /// same guarantee at the transport boundary for a single tier.
+    #[test]
+    fn codex_non_ultra_preparation_does_not_inject_proactive_marker_across_efforts() {
+        use xai_grok_sampling_types::{
+            CODEX_ULTRA_PROACTIVE_MARKER, ReasoningEffort, prepare_codex_ultra_responses,
+        };
+
+        for effort in [
+            None,
+            Some(ReasoningEffort::Max),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::Xhigh),
+        ] {
+            let mut body = serde_json::json!({
+                "reasoning": { "effort": "max" },
+                "instructions": "existing guidance"
+            });
+            prepare_codex_ultra_responses(&mut body, effort);
+            assert_eq!(
+                body.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+                Some("max"),
+                "non-ultra {effort:?} must not rewrite the wire effort"
+            );
+            assert_eq!(
+                body["instructions"].as_str(),
+                Some("existing guidance"),
+                "non-ultra {effort:?} must not inject the proactive marker"
+            );
+            assert!(
+                !body.to_string().contains(CODEX_ULTRA_PROACTIVE_MARKER),
+                "non-ultra {effort:?} leaked the Codex Ultra marker"
+            );
+        }
+    }
+
+    /// The client-level sibling proves the Codex-only *transport* gate refuses
+    /// to run for a generic Responses client. This one proves the typed
+    /// conversion itself never carries the marker, on either wire shape (#357).
+    #[test]
+    fn generic_responses_never_receive_codex_ultra_proactive_marker_in_typed_conversion() {
+        use xai_grok_sampling_types::{
+            CODEX_ULTRA_PROACTIVE_MARKER, ConversationItem, ConversationRequest, ReasoningEffort,
+        };
+
+        let req = ConversationRequest {
+            reasoning_effort: Some(ReasoningEffort::Ultra),
+            items: vec![
+                ConversationItem::system("system guidance"),
+                ConversationItem::user("hi"),
+            ],
+            ..ConversationRequest::from_items(vec![]).with_model("gpt-5.6-sol")
+        };
+        let typed: rs::CreateResponse = (&req).into();
+        let json = serde_json::to_value(&typed).expect("serialize generic Responses body");
+        assert_eq!(
+            json.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+            Some("max"),
+            "generic Responses must lower client Ultra to typed Max, never send ultra: {json}"
+        );
+        assert!(
+            !json.to_string().contains(CODEX_ULTRA_PROACTIVE_MARKER),
+            "generic Responses must not receive the Codex Ultra proactive marker: {json}"
+        );
+
+        let chat: xai_grok_sampling_types::ChatCompletionRequest = req.into();
+        let chat_json = serde_json::to_value(&chat).expect("serialize Chat Completions body");
+        assert!(
+            !chat_json.to_string().contains(CODEX_ULTRA_PROACTIVE_MARKER),
+            "Chat Completions must not receive the Codex Ultra proactive marker: {chat_json}"
+        );
     }
 }

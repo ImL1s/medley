@@ -92,9 +92,11 @@ pub struct OwnedEnumChoice {
     pub canonical: String,
     pub display: String,
     pub description: String,
-    /// Present when the row should remain visible for diagnostics but must not
-    /// be committed (for example, a model missing required authentication).
-    pub disabled_reason: Option<String>,
+    /// When true, keyboard/mouse commit is blocked. The row stays visible for
+    /// diagnostics (for example, a model missing required authentication).
+    pub disabled: bool,
+    /// Visible readiness / blocked reason when `disabled`; empty otherwise.
+    pub disabled_reason: String,
 }
 
 /// Source of runtime choices for a `SettingKind::DynamicEnum`.
@@ -121,18 +123,35 @@ pub fn dynamic_enum_choices(
                 canonical: String::new(),
                 display: "(no override)".to_string(),
                 description: "Inherit the default model (no per-user override).".to_string(),
-                disabled_reason: None,
+                disabled: false,
+                disabled_reason: String::new(),
             });
             for (name, id) in &snapshot.available_models {
+                let id_key = id.0.as_ref();
+                // Readiness arrives on two stores that were introduced
+                // independently (pair form and map form). Consult both so
+                // either producer path marks the row.
+                let unready_reason = snapshot
+                    .unavailable_model_reasons
+                    .iter()
+                    .find(|(key, _)| key == id_key)
+                    .map(|(_, reason)| reason.as_str())
+                    .or_else(|| {
+                        snapshot
+                            .model_unready_reasons
+                            .get(id_key)
+                            .map(String::as_str)
+                    });
+                // Display names are labels, not identity: disambiguate a
+                // collision by catalog id so two rows never read the same.
                 let duplicate_name = snapshot
                     .available_models
                     .iter()
                     .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
                     .count()
                     > 1;
-                let unready_reason = snapshot.model_unready_reasons.get(id.0.as_ref());
                 let display = if duplicate_name {
-                    format!("{name} ({})", id.0)
+                    format!("{name} ({id_key})")
                 } else {
                     name.clone()
                 };
@@ -143,12 +162,12 @@ pub fn dynamic_enum_choices(
                     } else {
                         display
                     },
-                    description: if let Some(reason) = unready_reason {
-                        format!("{} · {reason}", id.0)
-                    } else {
-                        id.0.to_string()
+                    description: match unready_reason {
+                        Some(reason) => format!("{id_key} · {reason}"),
+                        None => id_key.to_string(),
                     },
-                    disabled_reason: unready_reason.cloned(),
+                    disabled: unready_reason.is_some(),
+                    disabled_reason: unready_reason.unwrap_or_default().to_string(),
                 });
             }
             out
@@ -297,6 +316,11 @@ pub struct PagerLocalSnapshot {
     /// remains visible in settings, but the picker labels it before dispatch
     /// applies the authoritative readiness gate.
     pub model_unready_reasons: std::collections::HashMap<String, String>,
+    /// The same readiness facts in pair form: catalog model IDs that are
+    /// visible but not committable, with the reason shown on the picker row.
+    /// Producers fill this from the same catalog as `model_unready_reasons`;
+    /// `dynamic_enum_choices` reads both so either producer marks the row.
+    pub unavailable_model_reasons: Vec<(String, String)>,
     /// Whether the user has opted OUT of coding data sharing.
     /// Lives in auth metadata (no `UiConfig` field). Inverted mapping:
     /// `opt_out == false` → canonical "opt-in". Snapshot default is
@@ -349,6 +373,7 @@ impl Default for PagerLocalSnapshot {
             current_model_id: None,
             available_models: Vec::new(),
             model_unready_reasons: std::collections::HashMap::new(),
+            unavailable_model_reasons: Vec::new(),
             coding_data_sharing_opt_out: true,
             coding_data_sharing_lock: None,
             plan_mode_active: false,
@@ -420,6 +445,12 @@ impl PagerLocalSnapshot {
     }
 
     /// Resolve a canonical model id or an unambiguous display name.
+    ///
+    /// Dynamic pickers commit [`OwnedEnumChoice::canonical`] which is the
+    /// catalog `ModelId`, not the display name. Typed editors still pass
+    /// display text. Match id first so a colliding display name cannot
+    /// steal an Enter on a sibling row, and report a name shared by two
+    /// catalog ids as `Ambiguous` rather than picking one.
     pub fn resolve_model_name(&self, query: &str) -> ModelResolution {
         if let Some((_, id)) = self
             .available_models
@@ -753,7 +784,9 @@ pub fn current_value_for(
         "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
         "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(true))),
         // fork_secondary_model: baseline value folds to empty string. The
-        // mirror and DynamicEnum canonicals both use the ModelId slug.
+        // mirror and DynamicEnum canonicals both use the ModelId slug. Row
+        // text is the catalog display name; picker identity/remap uses the
+        // ModelId.
         "fork_secondary_model" => Some(SettingValue::String({
             let baseline = xai_grok_shell::models::default_model();
             if ui.fork_secondary_model == baseline {

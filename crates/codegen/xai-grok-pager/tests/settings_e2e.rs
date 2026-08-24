@@ -929,6 +929,9 @@ fn slash_enters_filter_mode_and_chars_go_to_query_no_action_leak() {
             SettingsKeyOutcome::Close => {
                 panic!("filter mode unexpectedly closed on char {c:?}");
             }
+            SettingsKeyOutcome::Toast(msg) => {
+                panic!("filter mode leaked Toast({msg:?}) for char {c:?}");
+            }
         }
     }
     assert_eq!(s.query(), "compact density");

@@ -537,6 +537,7 @@ mod tests {
                 indices: vec![],
                 tag: None,
                 provenance: None,
+                initially_selected: false,
             })
             .collect();
         assert_eq!(desired_item_rows(&matches, 80), MAX_DROPDOWN_ROWS);
@@ -559,6 +560,7 @@ mod tests {
                 indices: vec![],
                 tag: None,
                 provenance: None,
+                initially_selected: false,
             })
             .collect();
         let snap = SlashSnapshot {
@@ -601,6 +603,7 @@ mod tests {
                 indices: vec![],
                 tag: None,
                 provenance: Some(CommandProvenance::Builtin),
+                initially_selected: false,
             },
             SuggestionRow {
                 display: "/acme:login".into(),
@@ -611,6 +614,7 @@ mod tests {
                 provenance: Some(CommandProvenance::Skill {
                     source: "acme".to_string(),
                 }),
+                initially_selected: false,
             },
         ];
         let snap = SlashSnapshot {
@@ -644,6 +648,7 @@ mod tests {
             indices: vec![],
             tag: None,
             provenance: None,
+            initially_selected: false,
         }
     }
 

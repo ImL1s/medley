@@ -1835,7 +1835,7 @@ fn prompt_suggestion_loaded_behind_divergent_draft_defers_shown() {
 /// the scrollback, not a session flag; the control case proves it drives suppression.
 #[test]
 fn prompt_response_context_overflow_suppresses_turn_failed_and_toast() {
-    fn run_failed_turn(context_overflow: bool) -> (bool, bool) {
+    fn run_failed_turn(context_overflow: bool) -> (bool, bool, bool, bool) {
         let mut app = test_app_with_agent();
         let id = AgentId(0);
         {
@@ -1860,36 +1860,57 @@ fn prompt_response_context_overflow_suppresses_turn_failed_and_toast() {
             }),
             &mut app,
         );
-        let has_turn_failed = (0..app.agents[&id].scrollback.len()).any(|idx| {
-            matches!(
-                app.agents[&id].scrollback.entry(idx).map(|e| &e.block),
-                Some(RenderBlock::SessionEvent(ev))
-                    if matches!(ev.event, SessionEvent::TurnFailed { .. })
-            )
-        });
-        (has_turn_failed, app.deferred_notification.is_some())
+        let mut turn_failed = false;
+        let mut request_failed = false;
+        let mut context_too_large = false;
+        for idx in 0..app.agents[&id].scrollback.len() {
+            if let Some(RenderBlock::SessionEvent(ev)) =
+                app.agents[&id].scrollback.entry(idx).map(|e| &e.block)
+            {
+                match &ev.event {
+                    SessionEvent::TurnFailed { .. } => turn_failed = true,
+                    SessionEvent::RequestFailed { .. } => request_failed = true,
+                    SessionEvent::ContextTooLarge => context_too_large = true,
+                    _ => {}
+                }
+            }
+        }
+        (
+            turn_failed,
+            request_failed,
+            context_too_large,
+            app.deferred_notification.is_some(),
+        )
     }
 
-    // Control: with no ContextTooLarge block, PromptResponse still ends the
-    // turn with TurnFailed + a toast. Overflow copy in the error string must
-    // not change that — only a prior ContextTooLarge banner (from RetryState
-    // `error_type=context_length`) suppresses the marker.
-    let (failed_block, toast) = run_failed_turn(false);
-    assert!(failed_block, "baseline: a failed turn pushes TurnFailed");
-    assert!(toast, "baseline: a failed turn emits an error toast");
-
-    // With the block present, both are suppressed in favour of the actionable prompt.
-    let (failed_block, toast) = run_failed_turn(true);
+    // Control: overflow-shaped copy without ContextTooLarge is a typed
+    // request failure, not the overflow prompt and not a TurnFailed dump.
+    let (turn_failed, request_failed, overflow, toast) = run_failed_turn(false);
     assert!(
-        !failed_block,
-        "context overflow must suppress the redundant TurnFailed block"
+        !turn_failed,
+        "HTTP 500 composes RequestFailed, not TurnFailed"
     );
+    assert!(request_failed, "baseline: typed request-failure banner");
+    assert!(
+        !overflow,
+        "overflow copy without error_type=context_length is not ContextTooLarge"
+    );
+    assert!(!toast, "the banner is the only terminal surface");
+
+    // With the block present, the typed banner is suppressed too.
+    let (turn_failed, request_failed, overflow, toast) = run_failed_turn(true);
+    assert!(!turn_failed, "context overflow must not add TurnFailed");
+    assert!(
+        !request_failed,
+        "context overflow must not add a second RequestFailed"
+    );
+    assert!(overflow, "the ContextTooLarge prompt stays");
     assert!(!toast, "context overflow must suppress the error toast");
 }
 
 #[test]
 fn prompt_response_request_failed_banner_suppresses_turn_failed_and_toast() {
-    fn run_failed_turn(banner_shown: bool) -> (bool, bool) {
+    fn run_failed_turn(banner_shown: bool) -> (bool, usize, bool) {
         let mut app = test_app_with_agent();
         let id = AgentId(0);
         {
@@ -1918,28 +1939,120 @@ fn prompt_response_request_failed_banner_suppresses_turn_failed_and_toast() {
             }),
             &mut app,
         );
-        let has_turn_failed = (0..app.agents[&id].scrollback.len()).any(|idx| {
-            matches!(
-                app.agents[&id].scrollback.entry(idx).map(|e| &e.block),
-                Some(RenderBlock::SessionEvent(ev))
-                    if matches!(ev.event, SessionEvent::TurnFailed { .. })
-            )
-        });
-        (has_turn_failed, app.deferred_notification.is_some())
+        let mut turn_failed = false;
+        let mut request_faileds = 0usize;
+        for idx in 0..app.agents[&id].scrollback.len() {
+            if let Some(RenderBlock::SessionEvent(ev)) =
+                app.agents[&id].scrollback.entry(idx).map(|e| &e.block)
+            {
+                match &ev.event {
+                    SessionEvent::TurnFailed { .. } => turn_failed = true,
+                    SessionEvent::RequestFailed { .. } => request_faileds += 1,
+                    _ => {}
+                }
+            }
+        }
+        (
+            turn_failed,
+            request_faileds,
+            app.deferred_notification.is_some(),
+        )
     }
 
-    let (failed_block, toast) = run_failed_turn(false);
-    assert!(failed_block, "baseline: a failed turn pushes TurnFailed");
-    assert!(toast, "baseline: a failed turn emits an error toast");
+    let (turn_failed, banners, toast) = run_failed_turn(false);
+    assert!(!turn_failed, "HTTP 500 PromptResponse is RequestFailed");
+    assert_eq!(banners, 1, "exactly one typed banner");
+    assert!(!toast, "the banner is the only terminal surface");
 
-    let (failed_block, toast) = run_failed_turn(true);
+    let (turn_failed, banners, toast) = run_failed_turn(true);
     assert!(
-        !failed_block,
-        "a RequestFailed banner must suppress the redundant TurnFailed"
+        !turn_failed,
+        "a RequestFailed banner must suppress TurnFailed"
+    );
+    assert_eq!(
+        banners, 1,
+        "late PromptResponse must not add a second banner"
     );
     assert!(
         !toast,
         "a RequestFailed banner must suppress the error toast"
+    );
+}
+
+#[test]
+fn issue244_typed_provider_failure_prompt_only_http_400_is_one_request_failed() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.turn_started_at = Some(std::time::Instant::now());
+    }
+    dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Err(
+                "Internal error: {\n  \"message\": \"Provider request failed (HTTP 400).\",\n  \"http_status\": 400\n}"
+                    .to_string(),
+            ),
+            http_status: Some(400),
+            prompt_id: None,
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    let mut request_faileds = Vec::new();
+    let mut turn_failed = false;
+    let mut retry_failed = false;
+    for idx in 0..agent.scrollback.len() {
+        if let Some(RenderBlock::SessionEvent(ev)) = agent.scrollback.entry(idx).map(|e| &e.block) {
+            match &ev.event {
+                SessionEvent::RequestFailed { .. } => request_faileds.push(ev.event.clone()),
+                SessionEvent::TurnFailed { .. } => turn_failed = true,
+                SessionEvent::RetryFailed { .. } => retry_failed = true,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        request_faileds.len(),
+        1,
+        "prompt-only 400 is one typed banner, got {request_faileds:?}"
+    );
+    assert!(!turn_failed, "must not also push TurnFailed");
+    assert!(
+        !retry_failed,
+        "must not label a non-retryable 4xx as RetryFailed"
+    );
+    let msg = request_faileds[0].message();
+    assert!(
+        !msg.contains("Retry failed"),
+        "non-retryable 4xx must not say Retry failed: {msg}"
+    );
+    assert!(
+        !msg.contains('{'),
+        "must not dump the internal envelope: {msg}"
+    );
+    assert!(
+        !msg.contains("http_status"),
+        "envelope field names must not leak: {msg}"
+    );
+    assert!(
+        !msg.contains("Internal error"),
+        "ACP Display prefix must not leak: {msg}"
+    );
+    match &request_faileds[0] {
+        SessionEvent::RequestFailed {
+            status, headline, ..
+        } => {
+            assert_eq!(*status, Some(400));
+            assert_eq!(headline, "Bad request (400)");
+        }
+        other => panic!("expected RequestFailed, got {other:?}"),
+    }
+    assert!(
+        app.deferred_notification.is_none(),
+        "the banner is the only terminal surface"
     );
 }
 

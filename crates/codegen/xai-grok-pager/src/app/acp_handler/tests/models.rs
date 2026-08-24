@@ -182,6 +182,9 @@
         assert_eq!(ids, vec!["ready"]);
     }
 
+    /// A machine-wide catalog drop keeps the agent's resident listed as a
+    /// display-only placeholder (#358/#359) and never lets the shell fallback
+    /// pose as the session's model (#332).
     #[test]
     fn models_update_preserves_resident_until_session_confirms_a_switch() {
         let mut app = make_app_with_agent("sess-1");
@@ -204,6 +207,11 @@
             Some("grok-3"),
             "a machine-wide catalog update must not invent a per-session switch"
         );
+        assert_eq!(
+            app.models.current_model_name().as_deref(),
+            Some("grok-3 (unavailable)"),
+            "the status surface must show the resident's own flagged identity, not the shell fallback's label"
+        );
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
         assert_eq!(
@@ -216,13 +224,17 @@
             Some("grok-3"),
             "the resident actor remains authoritative until a session notification switches it"
         );
+        let placeholder = agent
+            .session
+            .models
+            .available
+            .get(&id_3)
+            .expect("removed resident should remain as a display-only placeholder");
         assert!(crate::acp::model_state::is_unavailable_resident_model(
-            agent
-                .session
-                .models
-                .available
-                .get(&id_3)
-                .expect("removed resident should remain as a display-only placeholder")
+            placeholder
+        ));
+        assert!(crate::slash::commands::model::is_unavailable_resident_meta(
+            placeholder.meta.as_ref()
         ));
     }
 
@@ -322,8 +334,9 @@
             "agent A's model must be preserved"
         );
 
-        // B's grok-5 was removed, but the machine-wide notification cannot
-        // claim B's resident actor switched to either global/default model.
+        // B's resident (`id_5`, grok-4.5) was removed from the catalog. Keep it
+        // as B's placeholder: a machine-wide notification cannot claim B's
+        // actor switched to A's model or to the shell default.
         let agent_b = app.agents.get(&AgentId(1)).unwrap();
         assert_eq!(
             agent_b
@@ -333,7 +346,7 @@
                 .as_ref()
                 .map(|id| id.0.as_ref()),
             Some("grok-4.5"),
-            "inactive live sessions must also preserve their resident model"
+            "inactive live sessions must keep their own unavailable resident, not the active agent's model"
         );
         assert!(crate::acp::model_state::is_unavailable_resident_model(
             agent_b
@@ -647,5 +660,132 @@
                 .map(|id| id.0.as_ref()),
             Some("grok-3"),
             "unrelated-session broadcast must not touch this agent's model"
+        );
+    }
+
+    #[test]
+    fn models_update_refreshes_open_settings_model_picker() {
+        use crate::views::modal::ActiveModal;
+        use crate::views::settings_modal::SettingsModalState;
+
+        let mut app = make_app_with_agent("sess-1");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            seed_models(agent, "grok-3", &["grok-3", "grok-4", "retired"]);
+        }
+        let registry = app.settings_registry.clone();
+        let snapshot = crate::app::dispatch::build_pager_snapshot(&app);
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        let mut state = Box::new(SettingsModalState::new(
+            registry,
+            xai_grok_shell::agent::config::UiConfig::default(),
+            snapshot,
+        ));
+        assert!(state.focus_key("default_model"));
+        assert!(state.try_enter_picking_enum());
+        agent.active_modal = Some(ActiveModal::Settings { state });
+
+        let notif = make_models_update_notif("grok-3", &["grok-3", "grok-4"]);
+        handle_models_update(&notif, &mut app);
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let Some(ActiveModal::Settings { state }) = &agent.active_modal else {
+            panic!("settings modal must stay open");
+        };
+        let names: Vec<&str> = state
+            .pager_snapshot
+            .available_models
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"grok-3") && names.contains(&"grok-4"),
+            "refreshed catalog must list live models, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("retired")),
+            "removed catalog entry must leave the open picker, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn model_auto_switched_reconciles_resident_after_placeholder() {
+        let mut app = make_app_with_agent("sess-1");
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        seed_models(agent, "grok-3", &["grok-3", "grok-4"]);
+
+        let drop = make_models_update_notif("grok-4", &["grok-4"]);
+        handle_models_update(&drop, &mut app);
+        assert_eq!(
+            app.agents[&AgentId(0)]
+                .session
+                .models
+                .current
+                .as_ref()
+                .map(|id| id.0.as_ref()),
+            Some("grok-3")
+        );
+
+        let payload = SessionNotification {
+            session_id: acp::SessionId::new("sess-1"),
+            update: XaiSessionUpdate::ModelAutoSwitched {
+                previous_model_id: "grok-3".into(),
+                new_model_id: "grok-4".into(),
+                reason: "previous model no longer available".into(),
+            },
+            meta: None,
+        };
+        let raw = serde_json::value::to_raw_value(&payload).unwrap();
+        let notif = acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw));
+        assert!(handle_ext_notification(&notif, &mut app));
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent
+                .session
+                .models
+                .current
+                .as_ref()
+                .map(|id| id.0.as_ref()),
+            Some("grok-4"),
+            "ModelAutoSwitched must reconcile the displayed resident"
+        );
+        assert_eq!(
+            agent.session.models.current_model_name().as_deref(),
+            Some("grok-4")
+        );
+    }
+
+    #[test]
+    fn model_auto_switched_uncatalogued_target_is_unavailable_resident() {
+        let mut app = make_app_with_agent("sess-1");
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        seed_models(agent, "grok-3", &["grok-3"]);
+
+        let payload = SessionNotification {
+            session_id: acp::SessionId::new("sess-1"),
+            update: XaiSessionUpdate::ModelAutoSwitched {
+                previous_model_id: "grok-3".into(),
+                new_model_id: "missing-from-catalog".into(),
+                reason: "previous model no longer available".into(),
+            },
+            meta: None,
+        };
+        let raw = serde_json::value::to_raw_value(&payload).unwrap();
+        let notif = acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw));
+        assert!(handle_ext_notification(&notif, &mut app));
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let new_id = acp::ModelId::new("missing-from-catalog");
+        assert_eq!(agent.session.models.current.as_ref(), Some(&new_id));
+        let inserted = agent
+            .session
+            .models
+            .available
+            .get(&new_id)
+            .expect("uncatalogued auto-switch must insert a placeholder");
+        assert!(
+            crate::slash::commands::model::is_unavailable_resident_meta(inserted.meta.as_ref()),
+            "placeholder must be unavailable, not ready-by-default"
         );
     }

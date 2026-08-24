@@ -12,15 +12,16 @@ use xai_grok_shell::session::storage::{JsonlStorageAdapter, StorageAdapter};
 use xai_grok_test_support::EnvGuard;
 
 fn home() -> &'static std::path::Path {
-    static HOME: OnceLock<(tempfile::TempDir, EnvGuard, EnvGuard)> = OnceLock::new();
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     HOME.get_or_init(|| {
         let dir = tempfile::TempDir::new().unwrap();
         let _ = xai_grok_config::pin_grok_home(dir.path().to_path_buf());
-        let guard_medley = EnvGuard::set("MEDLEY_HOME", dir.path());
-        let guard_grok = EnvGuard::set("GROK_HOME", dir.path());
-        (dir, guard_medley, guard_grok)
+        unsafe {
+            std::env::set_var("MEDLEY_HOME", dir.path());
+            std::env::set_var("GROK_HOME", dir.path());
+        }
+        dir
     })
-    .0
     .path()
 }
 

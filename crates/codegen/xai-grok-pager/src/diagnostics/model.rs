@@ -97,6 +97,174 @@ pub struct DiagnosticFacts {
     /// Passive mic enumeration when voice capture is available. `None` omits the
     /// Voice section (no-audio builds, or TUI when voice mode is off).
     pub voice: Option<VoiceFacts>,
+    /// Offline model-route facts, shaped like inspect's secret-free
+    /// `EffectiveModelRoute`. Empty omits the Providers section. Fields are
+    /// names, classes, and sanitized origins only — never credential bytes.
+    pub providers: Vec<ProviderRouteFact>,
+}
+
+/// Wire auth header a model route will send. Display/JSON labels only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthScheme {
+    /// `auth_scheme = "none"`: deliberately keyless.
+    None,
+    Bearer,
+    #[serde(rename = "x-api-key")]
+    XApiKey,
+}
+
+impl ProviderAuthScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bearer => "bearer",
+            Self::XApiKey => "x-api-key",
+        }
+    }
+}
+
+/// Endpoint trust class copied from the inspect route (sampler-enforced).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderEndpointTrust {
+    FirstPartyXai,
+    External,
+    Local,
+    UserDeclared,
+    /// ACP meta omitted or used an unrecognized class. Do not invent External.
+    Unknown,
+}
+
+impl ProviderEndpointTrust {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstPartyXai => "first_party_xai",
+            Self::External => "external",
+            Self::Local => "local",
+            Self::UserDeclared => "user_declared",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One secret-free provider/model row for `/doctor` and `grok doctor --json`.
+///
+/// Mirrors `EffectiveModelRoute` plus the inspect auth scheme. `credential_source`
+/// is the already-formatted label (`env:NAME`, `none`, `missing`, …) — env-var
+/// **names** are allowed; secret bytes are not.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRouteFact {
+    pub catalog_id: String,
+    pub wire_model: String,
+    /// Scheme + host [+ port] [+ path]. Userinfo, query, and fragment must
+    /// already have been stripped by the inspect/route builder.
+    pub sanitized_origin: String,
+    pub auth_scheme: ProviderAuthScheme,
+    pub credential_source: String,
+    pub endpoint_trust: ProviderEndpointTrust,
+    pub ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unready_reason: Option<String>,
+}
+
+/// Offline provider rows from inspect's secret-free routes (`grok doctor`).
+///
+/// Trust is copied from the sampler class. Do not invent `External` when
+/// the inspect route already classified the origin.
+pub fn provider_facts_from_inspect_routes(
+    routes: &[xai_grok_shell::agent::InspectedModelRoute],
+) -> Vec<ProviderRouteFact> {
+    use xai_grok_shell::agent::{InspectedAuthScheme, InspectedEndpointTrust};
+    routes
+        .iter()
+        .map(|route| ProviderRouteFact {
+            catalog_id: route.catalog_id.clone(),
+            wire_model: route.wire_model.clone(),
+            sanitized_origin: route.sanitized_origin.clone(),
+            auth_scheme: match route.auth_scheme {
+                InspectedAuthScheme::None => ProviderAuthScheme::None,
+                InspectedAuthScheme::Bearer => ProviderAuthScheme::Bearer,
+                InspectedAuthScheme::XApiKey => ProviderAuthScheme::XApiKey,
+            },
+            credential_source: route.credential_source.clone(),
+            endpoint_trust: match route.endpoint_trust {
+                InspectedEndpointTrust::FirstPartyXai => ProviderEndpointTrust::FirstPartyXai,
+                InspectedEndpointTrust::External => ProviderEndpointTrust::External,
+                InspectedEndpointTrust::Local => ProviderEndpointTrust::Local,
+                InspectedEndpointTrust::UserDeclared => ProviderEndpointTrust::UserDeclared,
+            },
+            ready: route.ready,
+            unready_reason: route.unready_reason.clone(),
+        })
+        .collect()
+}
+
+/// Offline provider rows from the pager's live `ModelState` (TUI `/doctor`).
+///
+/// Origins and credential bytes are not on ACP `ModelInfo`; those stay
+/// empty / source labels from meta only.
+pub fn provider_facts_from_model_state(
+    models: &crate::acp::model_state::ModelState,
+) -> Vec<ProviderRouteFact> {
+    models
+        .available
+        .iter()
+        .map(|(id, info)| {
+            let meta = info.meta.as_ref();
+            let ready = meta
+                .and_then(|m| m.get("ready"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let auth = meta
+                .and_then(|m| m.get("authScheme"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("bearer");
+            let source = meta
+                .and_then(|m| m.get("credentialSource"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            ProviderRouteFact {
+                catalog_id: id.0.to_string(),
+                wire_model: meta
+                    .and_then(|m| m.get("modelSlug"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(info.name.as_str())
+                    .to_string(),
+                sanitized_origin: meta
+                    .and_then(|m| m.get("sanitizedOrigin"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                auth_scheme: match auth {
+                    "none" => ProviderAuthScheme::None,
+                    "x-api-key" => ProviderAuthScheme::XApiKey,
+                    _ => ProviderAuthScheme::Bearer,
+                },
+                credential_source: source.to_string(),
+                endpoint_trust: match meta
+                    .and_then(|m| m.get("endpointTrust"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some("first_party_xai") => ProviderEndpointTrust::FirstPartyXai,
+                    Some("local") => ProviderEndpointTrust::Local,
+                    Some("user_declared") => ProviderEndpointTrust::UserDeclared,
+                    Some("external") => ProviderEndpointTrust::External,
+                    _ => ProviderEndpointTrust::Unknown,
+                },
+                ready,
+                unready_reason: if ready {
+                    None
+                } else {
+                    meta.and_then(|m| m.get("readinessReason"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                },
+            }
+        })
+        .collect()
 }
 
 /// Result of a passive input-device lookup (does not open a capture stream).

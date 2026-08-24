@@ -11,6 +11,7 @@ use crate::session::storage::{CopySessionOptions, JsonlStorageAdapter, StorageAd
 use crate::util::grok_home::grok_home;
 use agent_client_protocol as acp;
 use std::io;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,10 +82,20 @@ pub async fn fork_session(
     agent_id: &str,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
 ) -> io::Result<ForkSessionResponse> {
+    fork_session_in(grok_home(), request, agent_id, auth_manager).await
+}
+
+/// [`fork_session`] against an explicit GROK_HOME root (tests and the shipped
+/// wrapper share this body).
+pub(crate) async fn fork_session_in(
+    root_dir: PathBuf,
+    request: ForkSessionRequest,
+    agent_id: &str,
+    auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
+) -> io::Result<ForkSessionResponse> {
     let t0 = std::time::Instant::now();
 
-    let root_dir = grok_home();
-    let storage = JsonlStorageAdapter::with_root(root_dir.clone());
+    let storage = JsonlStorageAdapter::with_root(root_dir);
 
     // Build source and target Info
     let source_info = Info {

@@ -14,6 +14,12 @@ use crate::sampling::ConversationItem;
 use crate::session::export::ExportedMetadata;
 use xai_grok_shell_base::util::anchored_directory::AnchoredDirectory;
 use xai_grok_workspace::session::file_state::RewindPoint;
+// #406: one definition of the session-lock name derivation, shared with the
+// fresh-create/delete family in `xai_grok_workspace::session::id_lock`. A
+// second copy here made the two families coordinate only by coincidence.
+use xai_grok_workspace::session::id_lock::{
+    session_claim_lock_name, session_claim_lock_stem, session_mutation_lock_name,
+};
 
 use crate::session::signals::SessionSignals;
 use crate::session::storage::relocation::{RelocationError, RelocationView};
@@ -3560,21 +3566,11 @@ impl Drop for FreshSessionClaim {
     }
 }
 
-fn session_claim_lock_stem(session_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(session_id.as_bytes()))
-}
-
+/// The private staging container for one session id, named from the single
+/// shared lock stem so staging and the lease it is published under cannot
+/// disagree about which session they address.
 pub(crate) fn session_stage_container_name(session_id: &str) -> OsString {
     OsString::from(format!("session-{}", session_claim_lock_stem(session_id)))
-}
-
-fn session_claim_lock_name(session_id: &str) -> String {
-    format!("{}.namespace.lock", session_claim_lock_stem(session_id))
-}
-
-fn session_mutation_lock_name(session_id: &str) -> String {
-    format!("{}.mutation.lock", session_claim_lock_stem(session_id))
 }
 
 /// Cross-process ownership for one persisted session id.
@@ -5599,37 +5595,38 @@ pub async fn delete_session_history(
         false
     };
 
-    let removed = match local_info {
-        Some(info) => {
-            JsonlStorageAdapter::default()
-                .delete_session(&info)
-                .await
-                .map_err(DeleteSessionError::Local)?;
-            Some(info)
+    let Some(info) = local_info else {
+        if cwd.is_none() {
+            crate::session::storage::search::evict_session(
+                &crate::util::grok_home::grok_home(),
+                session_id,
+            )
+            .await;
         }
-        None => None,
+        return Ok(SessionDeletion {
+            local_removed: false,
+            remote_removed,
+        });
     };
-    let local_removed = removed.is_some();
 
-    // Evict whenever this delete removed the session, and also when no workspace was named, since
-    // that row outlives the directory and nothing else prunes it while search is off. A delete
-    // scoped to a workspace that held nothing leaves the row alone, because the session lives in
-    // another workspace.
-    if local_removed || cwd.is_none() {
-        crate::session::storage::search::evict_session(
-            &crate::util::grok_home::grok_home(),
-            session_id,
-        )
-        .await;
-    }
-    // The eviction above is a point in time. Queue the indexer as well so an upsert already under
-    // way, which would otherwise write the row back, is followed by a re-read that finds nothing.
-    if let Some(info) = removed {
-        crate::session::storage::search::notify_session_updated(&info.id.to_string(), &info.cwd);
-    }
+    // This function holds the session-id lease from its top (above), so the
+    // adapter must not take it again: `flock(2)` leases attach to the open
+    // file description, and a second acquisition inside this process blocks
+    // against the one we already hold.
+    JsonlStorageAdapter::default()
+        .delete_session_holding_id_lease(&info)
+        .await
+        .map_err(DeleteSessionError::Local)?;
+
+    crate::session::storage::search::evict_session(
+        &crate::util::grok_home::grok_home(),
+        session_id,
+    )
+    .await;
+    crate::session::storage::search::notify_session_updated(&info.id.to_string(), &info.cwd);
 
     Ok(SessionDeletion {
-        local_removed,
+        local_removed: true,
         remote_removed,
     })
 }
@@ -7521,6 +7518,55 @@ mod fresh_session_claim_tests {
     const CHILD_RESULT_PREFIX: &str = "__GROK_SESSION_CLAIM_RESULT__=";
     const CHILD_FINISH_TIMEOUT: Duration = Duration::from_secs(15);
 
+    /// A deliberately generous ceiling for joining a worker thread that may be
+    /// parked on a session-id lease.
+    ///
+    /// It is not tuned to how long a healthy join takes -- once the publication
+    /// barrier is released that is microseconds. It is tuned so that host
+    /// pressure can never reach it: several cargo builds routinely run
+    /// concurrently on CI runners and on developer machines, and a tight bound
+    /// would make an overloaded runner and a genuine lease race print the same
+    /// red, which is its own filed defect (#428). 45s is far past anything
+    /// scheduling pressure alone produces, and still costs one test's wall clock
+    /// instead of a whole lane's when a thread genuinely never wakes (#416).
+    const BLOCKED_THREAD_JOIN_BUDGET: Duration = Duration::from_secs(45);
+
+    /// Joins `handle`, failing with a diagnosable message instead of hanging.
+    ///
+    /// `std::thread::JoinHandle::join` is unbounded, so a thread parked forever
+    /// on a session-id lease takes the whole CI lane's wall clock with it --
+    /// observed at over 3h30m against a 44m baseline, cancelled by hand, with no
+    /// `test result:` line ever printed (#416). Polling `is_finished` against a
+    /// deadline turns that silent outage into a red test with a message.
+    ///
+    /// Module-private so any sibling test that spawns a lease-waiting thread can
+    /// reuse it; today only the remote-pull test below spawns threads at all.
+    #[track_caller]
+    fn join_within<T>(handle: std::thread::JoinHandle<T>, what: &str) -> T {
+        let deadline = std::time::Instant::now() + BLOCKED_THREAD_JOIN_BUDGET;
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not finish within {BLOCKED_THREAD_JOIN_BUDGET:?}. Two causes \
+                 reach this line and the same job log tells them apart, so read it before \
+                 blaming either. (1) A lost session-id-lease race (#416): this test is the \
+                 ONLY straggler -- every sibling in the `session::` lane reports `ok` and \
+                 the lane's wall clock is near its baseline. (2) An overloaded runner: this \
+                 test has company -- several siblings in the same lane are also slow or \
+                 carry libtest's `has been running for over 60 seconds` notice, and the \
+                 lane's wall clock is well above baseline. The discriminating artifact is \
+                 the lane's per-test results, not this message."
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        match handle.join() {
+            Ok(value) => value,
+            // The thread bodies here are full of asserts; re-raise the original
+            // payload so their messages survive instead of being flattened.
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     fn test_session_dir(root: &Path, cwd: &str, session_id: &str) -> PathBuf {
         root.join("sessions")
             .join(crate::util::grok_home::encode_cwd_dirname(cwd))
@@ -9079,7 +9125,7 @@ mod fresh_session_claim_tests {
         *lock.lock().expect("publication barrier mutex") = true;
         ready.notify_one();
         for loader in loaders {
-            let published = loader.join().expect("remote miss loader");
+            let published = join_within(loader, "remote miss loader");
             assert!(!published.path().join("partial").exists());
         }
         let visible = reader_rx
@@ -9090,7 +9136,7 @@ mod fresh_session_claim_tests {
             visible.read_summary().unwrap().info.id.to_string(),
             SESSION_ID
         );
-        reader.join().expect("published reader thread");
+        join_within(reader, "published reader thread");
         assert_eq!(publishers.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!session_dir.join(UNPUBLISHED_SESSION_MARKER).exists());
         assert!(!session_dir.join("partial").exists());

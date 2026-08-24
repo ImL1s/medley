@@ -970,14 +970,17 @@ impl AgentView {
                                                 state: state.clone(),
                                             })
                                         };
+                                        let mut picker =
+                                            crate::views::picker::PickerState::input_active();
+                                        picker.selected =
+                                            crate::slash::command::ArgItem::preferred_index(&items);
                                         self.active_modal = Some(ActiveModal::ArgPicker {
                                             command: trimmed,
                                             args_query: String::new(),
                                             items: items.clone(),
                                             original_items: items,
                                             // Type-to-find: open in input mode (vim: Esc→nav, i→input).
-                                            state: crate::views::picker::PickerState::input_active(
-                                            ),
+                                            state: picker,
                                             previous_palette: prev,
                                             window:
                                                 crate::views::modal_window::ModalWindowState::new(),

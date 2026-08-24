@@ -45,6 +45,7 @@ Relative to `xai-org/grok-build` `main`, this fork's `providers` branch adds:
 | TUI readiness | `/model` and Ctrl+M show `ready` / `missing` / `none` badges; hard-block unready; soft-confirm auth-class changes. |
 | Optional native subagent route contract | Generic exact / ordered-candidate / receipt types plus `/agents` route-status text. Lives on `providers`. Not an upstream Grok Build claim. Spawn wiring and #18 fallback remain incomplete. See [`docs/architecture/native-subagent-route-contract.md`](docs/architecture/native-subagent-route-contract.md). |
 | State directory | State resolves to `~/.medley` instead of upstream's `~/.grok`, honouring `MEDLEY_HOME` ahead of `GROK_HOME`. An existing `~/.grok` is still read, and an interactive run offers a one-time copy into `~/.medley`; declining writes a `.medley-keep-legacy` marker so the prompt does not repeat. |
+| Session-ID locks | Per-session leases live in `$MEDLEY_HOME/.locks/session-ids` as owner-only (`0700`/`0600`) files opened through retained handles (`O_NOFOLLOW`). v0.2.119 shipped no lock protocol — drain every Medley process before upgrading; there is no rolling coexistence with already-running 0.2.119 processes, and no compatibility for unshipped PR #332 hex lock names. |
 | Packaging | [`install.sh`](install.sh) and [`.github/workflows/release.yml`](.github/workflows/release.yml) publish the binary as `medley` with SHA-256 checksums and build provenance, installing a launcher that supplies the install location as the state directory unless the caller exported `MEDLEY_HOME` or `GROK_HOME`. Upstream's `x.ai/cli` installers are not used. |
 | Fork ops | [`FORK.md`](FORK.md), [`scripts/sync-upstream.sh`](scripts/sync-upstream.sh), and providers-only [CI](.github/workflows/ci.yml). |
 
@@ -143,6 +144,21 @@ In order, cheapest first:
   That catches callers which stopped *compiling*. It cannot catch the ones that
   still compile and now read the wrong thing — only the grep does.
 
+#409 later closed the other half of the same channel. `AuthManager::new` read
+`GROK_AUTH_PATH` unconditionally, so the env was shut out of the Codex resolver
+and still wired into the xAI one: setting it moved one manager, pinning
+`CodexAuthPathGuard` moved the other, and nothing said so. Both resolvers now
+follow one rule — thread-local pin, else `grok_home/auth.json` under
+`cfg(test)`, else the env in production. The two seams stay *separate*
+(`XaiAuthPathGuard` in `auth::manager`, `CodexAuthPathGuard` in
+`auth::openai_codex`) because fixtures construct an unredirected manager of the
+opposite kind on purpose; `codex_and_xai_auth_path_resolvers_agree_on_a_shared_home`
+pins both and fails if either drifts back onto the env. Under `cfg(test)`,
+`GROK_AUTH_PATH` no longer influences path resolution anywhere — it survives
+only in the `AuthManager::new` telemetry line, which reports the raw env value
+and does not feed resolution. Integration targets (`tests/*.rs`, which link the
+lib built without `cfg(test)`) are what still exercise the production branch.
+
 ### The neighbouring failure that is *not* this
 
 PR #383's other late CI failure looks identical from the outside and is not.
@@ -158,6 +174,33 @@ file them together. Keep them apart, because the check that catches each one is
 different: the first needs the grep above, the second needs a test to be
 *enrolled* (#408). Attributing an unenrolled-test blindspot to the merge would
 send the next reader looking for a conflict that was never there.
+
+### The third shape: two copies of one user-facing string
+
+The two above are about *plumbing*. The third is about *duplication*, and it is
+the one a merge is most likely to produce silently.
+
+`5f63802e` (#335/#346/#358/#359) centralised the changed-catalog toast on
+`CATALOG_CHANGED_TOAST` and left a comment above the call site saying so:
+"Single source of truth for the wording". `c113580a` (#332) independently added
+`set_default_model_confirmed`, a second live path for the same
+`!available_has_new` condition, carrying its own literal — and a test pinning
+that literal. Neither side touched the other's lines, so the merge produced one
+file with **two different messages for the same condition**, a comment claiming
+single-sourcing that was now false, and a test pinning whichever wording its own
+side had written.
+
+CI reported it as a plain assertion mismatch, which is the cheap outcome. The
+expensive part is that it survived at all: `set_default_model_confirmed` had **no
+test covering its toast**, so nothing pinned what it said. The tested half was
+tested; the untested half is the half that drifted.
+
+Generalisation, distinct from the plumbing one: **when one side introduces a
+constant for a literal, grep the other side for the literal's text, not for the
+constant's name.** A new duplicate cannot mention a constant it never knew about,
+so a name-based search finds nothing and reads as clean. And when a merge leaves
+two paths for one condition, ask which of them a test actually pins — the answer
+is usually "one".
 
 ## Tagging
 
@@ -219,7 +262,41 @@ feature PR branches it resolves the branch head with `git ls-remote`, lists
 merge commit). For `providers`, where CI push runs actually exist, it keeps the
 release-gate identity shape (`event == "push"`, `head_branch`, exact
 `head_sha`, and workflow `path == ".github/workflows/ci.yml"`). It
-intentionally does **not** use `gh pr checks`.
+intentionally does **not** use `gh pr checks` to answer "did this SHA get CI".
+
+`gh pr checks` is the wrong probe for that question: an empty result prints
+**"no checks reported"**, which looks unfinished rather than fail-closed, and
+cannot tell a dropped webhook from a run that has not started. The guard
+prints a `verdict:` line so those states stay distinct:
+
+- `success` — completed successful `ci.yml` run for this exact head
+- `absent` — zero runs for this head. Three causes, and they need opposite
+  responses: a dropped webhook, a run that was never created, or **the PR is
+  `CONFLICTING`**, in which case GitHub cannot compute `refs/pull/<n>/merge` and
+  never dispatches the `pull_request` run at all. Check `mergeable` before
+  assuming one of the first two — those you wait out, the third you fix by
+  merging the base in. Observed on #383 on 2026-08-23: merging #404 into
+  `providers` flipped it to `CONFLICTING`, and the next push produced zero check
+  runs while a PR opened minutes later ran normally. It reads exactly like a
+  slow queue. Corollary: **merging anything into `providers` can flip every
+  other open PR to `CONFLICTING` in the same instant**, so sweep
+  `gh pr list --json number,mergeable` after each merge rather than waiting to
+  notice that a PR's CI "stopped moving".
+- `in_progress` — a run exists and is queued / in progress / waiting
+- `skipped` — a run completed as skipped / cancelled, not success
+- `failed` / `identity_rejected` — finished unsuccessfully, or the path/event
+  identity check rejected the run
+
+`scripts/merge-pr.sh` still reads `gh pr checks --json` as a second gate
+(`python3 -B scripts/check_pr_head_ci_run.py --evaluate-pr-checks`): empty is
+`absent` and fail-closed; pending is `in_progress`, not absent; skip-only is
+not success. Do not treat `gh pr checks` with no rows as green. To answer
+"did this push get CI" yourself:
+
+```bash
+gh run list --repo ImL1s/medley --workflow ci.yml --branch <branch> \
+  --limit 5 --json headSha,status,conclusion,event,url
+```
 
 `main` has no fork workflows — it stays an upstream fast-forward mirror. Do not merge `providers` into `main`.
 

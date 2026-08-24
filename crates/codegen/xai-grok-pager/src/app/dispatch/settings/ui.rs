@@ -68,6 +68,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
             _ => None,
         };
         if let Some(state) = state_opt {
+            let selected = state.picking_enum_selected_canonical();
             state.rebuild_rows();
             let pager_snapshot = crate::settings::PagerLocalSnapshot {
                 multiline_mode: agent.multiline_mode,
@@ -92,6 +93,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                         .map(|reason| (id.0.to_string(), reason))
                     })
                     .collect(),
+                unavailable_model_reasons: agent.session.models.catalog_unready_reasons(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 coding_data_sharing_lock: coding_data_sharing_lock_from_app,
                 // Prefer optimistic pending over confirmed active.
@@ -108,7 +110,13 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                     .scheduler_background_loops
                     .unwrap_or(scheduler_background_loops_seed),
             };
+            // `replace_snapshots` installs both snapshots and re-anchors a live
+            // `PickingEnum` on the canonical it was highlighting (falling back
+            // to Browse when that canonical vanished). The explicit remap then
+            // re-applies the canonical captured before `rebuild_rows`, which is
+            // a no-op once the snapshot swap already landed on it.
             state.replace_snapshots(ui_snapshot.clone(), pager_snapshot);
+            state.remap_picking_enum_after_catalog_refresh(selected);
         }
     }
 }
@@ -252,6 +260,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
                     .map(|reason| (id.0.to_string(), reason))
             })
             .collect(),
+        unavailable_model_reasons: agent.session.models.catalog_unready_reasons(),
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
         coding_data_sharing_lock: coding_data_sharing_lock_from_app,
         // Prefer optimistic pending over confirmed active.
@@ -741,12 +750,24 @@ fn agent_available_models(app: &AppView) -> Vec<(String, acp::ModelId)> {
     if let ActiveView::Agent(id) = app.active_view
         && let Some(agent) = app.agents.get(&id)
     {
+        // `selectable_models` (not the raw catalog): the unavailable-resident
+        // placeholder is presentation state and must never reach a picker.
         return agent
             .session
             .models
             .selectable_models()
             .map(|(id, info)| (info.name.clone(), id.clone()))
             .collect();
+    }
+    Vec::new()
+}
+
+/// Pair-form readiness store consumed by the picker's disabled-row gate.
+fn agent_unavailable_model_reasons(app: &AppView) -> Vec<(String, String)> {
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+    {
+        return agent.session.models.catalog_unready_reasons();
     }
     Vec::new()
 }
@@ -778,6 +799,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         current_model_id: agent_current_model_id(app),
         available_models: agent_available_models(app),
         model_unready_reasons: agent_model_unready_reasons(app),
+        unavailable_model_reasons: agent_unavailable_model_reasons(app),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         coding_data_sharing_lock: app.coding_data_sharing_lock(),
         plan_mode_active: agent_plan_mode(app),

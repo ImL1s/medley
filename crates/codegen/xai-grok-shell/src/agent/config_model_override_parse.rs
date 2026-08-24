@@ -751,7 +751,10 @@ mod tests {
             auth_scheme: Some(xai_grok_sampler::AuthScheme::None),
             codex_wire: None,
             catalog_degraded_reason: None,
+            catalog_upgrade: None,
+            effective_context_window_percent: Some(95),
             invalid_auth_scheme: None,
+            unknown_codex_catalog_slug: None,
         }
     }
 

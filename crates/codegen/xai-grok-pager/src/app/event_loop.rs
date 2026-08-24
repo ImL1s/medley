@@ -3099,9 +3099,10 @@ pub(crate) async fn run(
 /// Falls back to `UiConfig::default()` on any failure.
 pub(crate) fn load_initial_ui_config() -> xai_grok_shell::agent::config::UiConfig {
     use xai_grok_shell::agent::config::UiConfig;
-    let Ok(root) = xai_grok_shell::config::load_effective_config() else {
+    let Ok(mut root) = xai_grok_shell::config::load_effective_config() else {
         return UiConfig::default();
     };
+    xai_grok_shell::agent::config::prefer_readline_mode_in_toml(&mut root);
     let Some(ui_value) = root.get("ui").cloned() else {
         return UiConfig::default();
     };

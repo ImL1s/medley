@@ -9,7 +9,7 @@ use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
-use crate::notifications::{NotificationEvent, NotificationEventKind};
+use crate::notifications::NotificationEventKind;
 use crate::scrollback::block::RenderBlock;
 
 /// Temporary kill switch: client share links are disabled.
@@ -497,12 +497,10 @@ pub(super) fn notify_session_ready(
     notification_service: &crate::notifications::NotificationService,
     agent: &AgentView,
 ) {
-    notification_service.notify(NotificationEvent {
-        kind: NotificationEventKind::SessionReady,
-        title: "Grok".into(),
-        body: NotificationEventKind::SessionReady.as_str().into(),
-        session_id: agent.session.session_id.as_ref().map(|s| s.0.to_string()),
-    });
+    notification_service.notify(crate::notifications::chrome_notification(
+        NotificationEventKind::SessionReady,
+        agent.session.session_id.as_ref().map(|s| s.0.to_string()),
+    ));
 }
 
 // TaskResult handlers.

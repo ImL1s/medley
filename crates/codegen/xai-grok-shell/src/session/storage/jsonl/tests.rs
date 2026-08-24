@@ -1402,6 +1402,214 @@ async fn list_sessions_recent_skips_corrupt_summary() {
     assert_eq!(recent[0].info.id, acp::SessionId::new("good"));
 }
 
+#[tokio::test]
+async fn init_session_publishes_summary_once_and_lists_only_committed() {
+    let tmp = TempDir::new().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("019c0000-0000-7000-8000-000000000399"),
+        cwd: "/repo/publication/shell-init".to_string(),
+    };
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let summary = adapter
+        .init_session(&info, default_model_id())
+        .await
+        .expect("published new session");
+    let public = adapter.session_dir(&info);
+    assert!(public.join("summary.json").is_file());
+    assert!(!public.join(".unpublished").exists());
+    assert_eq!(summary.info.id, info.id);
+    assert!(
+        tmp.path()
+            .join(".locks/session-ids")
+            .read_dir()
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".namespace.lock")
+            })
+    );
+
+    let listed = adapter.list_sessions_sync(Some(&info.cwd)).unwrap();
+    assert_eq!(listed.len(), 1);
+
+    let exclusive = xai_grok_workspace::session::id_lock::acquire_session_id_lock_sync(
+        tmp.path(),
+        &info.id.to_string(),
+    )
+    .unwrap();
+    let hidden = adapter.list_sessions_sync(Some(&info.cwd)).unwrap();
+    assert!(
+        hidden.is_empty(),
+        "discovery must omit a session while the exclusive lease is held"
+    );
+    drop(exclusive);
+}
+
+#[tokio::test]
+async fn init_session_recovers_occupied_directory_without_summary() {
+    let tmp = TempDir::new().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("019c0000-0000-7000-8000-000000000400"),
+        cwd: "/repo/publication/incomplete-occupant".to_string(),
+    };
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let public = adapter.session_dir(&info);
+    std::fs::create_dir_all(&public).unwrap();
+    std::fs::write(public.join("partial"), b"winner-from-crash").unwrap();
+    assert!(!public.join("summary.json").exists());
+
+    let summary = adapter
+        .init_session(&info, default_model_id())
+        .await
+        .expect("incomplete occupant must not pin the session id");
+    assert_eq!(summary.info.id, info.id);
+    assert!(
+        public.join("summary.json").is_file(),
+        "retry must publish a complete session"
+    );
+    assert!(
+        !public.join("partial").exists(),
+        "the crash occupant must not remain on the public path"
+    );
+    let parent = public.parent().expect("session parent");
+    let quarantined = std::fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry.file_name().to_string_lossy().contains(".incomplete-")
+                && entry.path().join("partial").is_file()
+        });
+    assert!(
+        quarantined,
+        "the occupant must be renamed aside, not deleted silently"
+    );
+}
+
+/// #340 / Codex P1: a crash occupant under a *symlinked* encoded-CWD
+/// parent must not be renamed. `FreshPublication::prepare` would reject
+/// that parent, but quarantine used to run first via lexical rename.
+#[cfg(unix)]
+#[tokio::test]
+async fn init_session_rejects_symlinked_encoded_cwd_occupant_without_summary() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::symlink;
+
+    fn snapshot(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.file_type().is_symlink() {
+                    out.insert(
+                        rel,
+                        format!(
+                            "symlink->{}",
+                            std::fs::read_link(&path).unwrap().display()
+                        )
+                        .into_bytes(),
+                    );
+                } else if meta.is_dir() {
+                    out.insert(rel, b"dir".to_vec());
+                    walk(root, &path, out);
+                } else {
+                    out.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        walk(root, root, &mut out);
+        out
+    }
+
+    let grok = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    std::fs::write(outside.path().join("canary"), b"outside-untouched-quarantine").unwrap();
+    let info = Info {
+        id: acp::SessionId::new("019c0000-0000-7000-8000-000000000401"),
+        cwd: "/repo/publication/symlink-occupant".to_string(),
+    };
+    let adapter = JsonlStorageAdapter::with_root(grok.path().to_path_buf());
+    let encoded = crate::util::grok_home::encode_cwd_dirname(&info.cwd);
+    let sessions = grok.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    symlink(outside.path(), sessions.join(&encoded)).unwrap();
+
+    let occupant = outside.path().join(info.id.to_string());
+    std::fs::create_dir_all(&occupant).unwrap();
+    std::fs::write(occupant.join("partial"), b"outside-crash-occupant").unwrap();
+    assert!(!occupant.join("summary.json").exists());
+    let before = snapshot(outside.path());
+
+    let published = adapter.init_session(&info, default_model_id()).await;
+    assert!(
+        published.is_err(),
+        "init must fail closed on a symlinked encoded-CWD parent: {published:?}"
+    );
+    assert_eq!(snapshot(outside.path()), before);
+    assert_eq!(
+        std::fs::read(outside.path().join("canary")).unwrap(),
+        b"outside-untouched-quarantine"
+    );
+    assert_eq!(
+        std::fs::read(occupant.join("partial")).unwrap(),
+        b"outside-crash-occupant"
+    );
+    assert!(
+        !outside
+            .path()
+            .read_dir()
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".incomplete-")),
+        "quarantine must not rename the outside occupant"
+    );
+}
+
+#[test]
+fn accept_fresh_publication_continues_only_for_committed_durability() {
+    use std::io;
+    use super::accept_fresh_publication;
+    use xai_grok_workspace::session::fresh_publication::{
+        FinalizeOperation, FreshPublicationFinalizeError,
+    };
+
+    let durable = FreshPublicationFinalizeError::CommittedDurability {
+        operation: FinalizeOperation::Sync,
+        error: io::Error::other("fsync failed after verified commit"),
+    };
+    accept_fresh_publication(Err(durable))
+        .expect("verified commit with a durability miss may continue");
+
+    let identity = FreshPublicationFinalizeError::CommittedIdentity {
+        operation: FinalizeOperation::ValidateSummary,
+        error: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "committed publication is missing a valid summary",
+        ),
+    };
+    let err = accept_fresh_publication(Err(identity))
+        .expect_err("unverified identity must fail initialization");
+    assert!(
+        err.to_string().contains("canonical identity is unverified"),
+        "identity failure must stay visible: {err}"
+    );
+}
 
 #[tokio::test]
 async fn list_sessions_recent_fills_limit_after_newer_candidate_fails_revalidation() {

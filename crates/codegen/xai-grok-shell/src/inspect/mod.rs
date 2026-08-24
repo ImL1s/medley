@@ -78,6 +78,23 @@ pub(crate) struct InspectReport {
     /// Invalid or ignored `[mcp_servers.*]` entries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mcp_config_problems: Vec<crate::util::config::McpServerConfigProblem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_auth_scheme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_credential_source: Option<String>,
+    /// #123: origins the local user/managed config tiers declare trusted for
+    /// ambient xAI credentials. Empty unless the user widened their
+    /// credential's blast radius — the report is how they can see that they
+    /// did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trusted_xai_origins: Vec<String>,
+    /// `trusted_xai_origins` entries that were refused, as
+    /// `"<sanitized entry> (<reason>)"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trusted_xai_origins_rejected: Vec<String>,
+    /// #110: secret-free effective routes used by the sampler.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_routes: Vec<crate::agent::config::EffectiveModelRoute>,
 }
 
 #[derive(Debug, Serialize)]
@@ -312,7 +329,7 @@ async fn build_report(cwd: &Path) -> InspectReport {
         table.remove("compat");
     }
     let parsed_config =
-        crate::agent::config::Config::new_from_toml_cfg(&config_without_compat).ok();
+        crate::agent::config::Config::new_from_toml_cfg_offline(&config_without_compat).ok();
 
     let git_root = git2::Repository::discover(cwd)
         .ok()
@@ -394,6 +411,37 @@ async fn build_report(cwd: &Path) -> InspectReport {
         .unwrap_or_default();
     let mcp_config_problems = crate::util::config::load_mcp_server_problems_with_project(cwd);
 
+    let trusted_xai_origins = crate::agent::trusted_origins::TrustedXaiOrigins::load();
+    let trusted_xai_origins_rejected = trusted_xai_origins
+        .rejected()
+        .iter()
+        .map(|(entry, reason)| format!("{entry} ({reason})"))
+        .collect();
+    let trusted_xai_origins = trusted_xai_origins.declared_display();
+
+    let (catalog_auth_scheme, catalog_credential_source) = if let Some(ref cfg) = parsed_config {
+        let catalog_auth = cfg.models.catalog_auth_config().unwrap_or_default();
+        let scheme_str = catalog_auth.auth_scheme.map(|s| match s {
+            xai_grok_sampler::AuthScheme::Bearer => "bearer".to_string(),
+            xai_grok_sampler::AuthScheme::XApiKey => "x_api_key".to_string(),
+            xai_grok_sampler::AuthScheme::None => "none".to_string(),
+        });
+
+        let source_str = if let Some(ref scheme) = catalog_auth.auth_scheme {
+            match scheme {
+                xai_grok_sampler::AuthScheme::None => Some("none".to_string()),
+                xai_grok_sampler::AuthScheme::XApiKey | xai_grok_sampler::AuthScheme::Bearer => {
+                    catalog_auth.env_key.as_ref().map(|k| format!("env: {k}"))
+                }
+            }
+        } else {
+            None
+        };
+        (scheme_str, source_str)
+    } else {
+        (None, None)
+    };
+
     InspectReport {
         grok_version: xai_grok_version::VERSION.to_string(),
         channel: crate::util::config::channel_name_from_cache()
@@ -416,6 +464,14 @@ async fn build_report(cwd: &Path) -> InspectReport {
         external_compat,
         config_warnings,
         mcp_config_problems,
+        catalog_auth_scheme,
+        catalog_credential_source,
+        trusted_xai_origins,
+        trusted_xai_origins_rejected,
+        model_routes: parsed_config
+            .as_ref()
+            .map(crate::agent::config::inspect_model_routes)
+            .unwrap_or_default(),
     }
 }
 
@@ -1303,6 +1359,104 @@ fn render_config_warnings(
     out
 }
 
+fn terminal_safe(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
+fn render_tool_capabilities(
+    capabilities: &crate::config::tool_capabilities::ResolvedTrustedToolCapabilities,
+) -> String {
+    use std::fmt::Write as _;
+
+    if capabilities.trusted.classifications.is_empty()
+        && capabilities.trusted.unclassified_overrides.is_empty()
+        && capabilities.diagnostics.is_empty()
+    {
+        return String::new();
+    }
+
+    let mut out = String::from("\n  Trusted Tool Capabilities\n");
+    let _ = writeln!(
+        out,
+        "  {TREE} {} descriptor(s), {} unclassified override(s)",
+        capabilities.trusted.classifications.len(),
+        capabilities.trusted.unclassified_overrides.len()
+    );
+    let mut classifications = capabilities
+        .trusted
+        .classifications
+        .iter()
+        .collect::<Vec<_>>();
+    classifications.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (tool_id, capability) in classifications {
+        let effects = capability
+            .descriptor
+            .effects()
+            .map(|effects| {
+                effects
+                    .iter()
+                    .map(|effect| match effect {
+                        xai_tool_types::capability::ToolEffect::LocalRead => "local-read",
+                        xai_tool_types::capability::ToolEffect::LocalWrite => "local-write",
+                        xai_tool_types::capability::ToolEffect::Execute => "execute",
+                        xai_tool_types::capability::ToolEffect::NetworkRead => "network-read",
+                        xai_tool_types::capability::ToolEffect::ExternalMutation => {
+                            "external-mutation"
+                        }
+                        xai_tool_types::capability::ToolEffect::SecretAccess => "secret-access",
+                        xai_tool_types::capability::ToolEffect::SubagentSpawn => "subagent-spawn",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "unclassified".to_owned());
+        let tool_id = terminal_safe(tool_id);
+        let _ = writeln!(out, "    {TREE} {tool_id}: {effects}");
+    }
+    let mut overrides = capabilities
+        .trusted
+        .unclassified_overrides
+        .iter()
+        .collect::<Vec<_>>();
+    overrides.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (tool_id, override_entry) in overrides {
+        let modes = override_entry
+            .modes
+            .iter()
+            .map(xai_tool_types::SubagentCapabilityMode::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tool_id = terminal_safe(tool_id);
+        let reason = terminal_safe(&override_entry.reason);
+        let source = terminal_safe(&override_entry.source.display_short());
+        let _ = writeln!(
+            out,
+            "    {TREE} WARNING override {tool_id} [{modes}] — {reason} ({source})",
+        );
+    }
+    for diagnostic in &capabilities.diagnostics {
+        if matches!(
+            diagnostic.kind,
+            crate::config::tool_capabilities::ToolCapabilityConfigDiagnosticKind::UnclassifiedOverrideActive
+        ) {
+            continue;
+        }
+        let source = terminal_safe(&diagnostic.source.display_short());
+        let path = terminal_safe(&diagnostic.path);
+        let reason = terminal_safe(&diagnostic.reason);
+        let _ = writeln!(out, "    {TREE} WARNING [{source}] {path} — {reason}");
+    }
+    out
+}
+
 fn render_mcp_config_problems(problems: &[crate::util::config::McpServerConfigProblem]) -> String {
     use crate::util::config::McpServerProblemSeverity;
     use std::fmt::Write as _;
@@ -1437,6 +1591,43 @@ fn print_human(r: &InspectReport) {
         "  {TREE} api_key_auth_disabled: {}",
         r.login_policy.api_key_auth_disabled
     );
+
+    println!();
+    println!("  Model Catalog Auth");
+    println!(
+        "  {TREE} Scheme: {}",
+        r.catalog_auth_scheme.as_deref().unwrap_or("(default)")
+    );
+    if let Some(ref src) = r.catalog_credential_source {
+        println!("  {TREE} Credential source: {}", src);
+    }
+
+    if !r.model_routes.is_empty() {
+        println!();
+        println!("  Model Routes");
+        for route in &r.model_routes {
+            let ready = if route.ready { "ready" } else { "unready" };
+            println!(
+                "  {TREE} {} → {} | {} | {} | auth: {} ({ready})",
+                route.catalog_id,
+                route.wire_model,
+                route.sanitized_origin,
+                format!("{:?}", route.endpoint_trust).to_ascii_lowercase(),
+                crate::agent::config::format_credential_source_label(&route.credential_source),
+            );
+        }
+    }
+
+    if !r.trusted_xai_origins.is_empty() || !r.trusted_xai_origins_rejected.is_empty() {
+        println!();
+        println!("  Trusted xAI Origins (user-declared)");
+        for origin in &r.trusted_xai_origins {
+            println!("  {TREE} {origin} — ambient xAI credentials are forwarded here");
+        }
+        for rejected in &r.trusted_xai_origins_rejected {
+            println!("  {TREE} ignored: {rejected}");
+        }
+    }
 
     print_columns(
         "Skills",
@@ -1613,6 +1804,28 @@ mod tests {
     use super::*;
     use xai_grok_agent::prompt::skills::{SkillInfo, SkillsConfig};
     use xai_grok_tools::implementations::skills::types::SkillScope;
+
+    #[test]
+    fn inspect_model_route_line_is_secret_free() {
+        let route = crate::agent::config::EffectiveModelRoute {
+            catalog_id: "my-model".to_owned(),
+            wire_model: "wire-model".to_owned(),
+            sanitized_origin: "https://api.example.com/v1".to_owned(),
+            endpoint_trust: xai_grok_sampler::EndpointTrustClass::External,
+            credential_source: xai_grok_sampler::CredentialSource::EnvKey {
+                name: "OPENAI_API_KEY".to_owned(),
+            },
+            ready: true,
+            unready_reason: None,
+        };
+        let json = serde_json::to_string(&route).expect("route serializes");
+        assert!(json.contains("sanitizedOrigin"), "{json}");
+        assert!(json.contains("credentialSource"), "{json}");
+        assert_eq!(
+            crate::agent::config::format_credential_source_label(&route.credential_source),
+            "env:OPENAI_API_KEY"
+        );
+    }
 
     #[test]
     fn harness_compatibility_human_output_stays_compact() {
@@ -1983,6 +2196,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn issue15_inspect_config_load_does_not_attempt_live_codex_catalog_fetch() {
+        crate::agent::model_providers::reset_live_codex_catalog_fetch_attempts();
+        let effective: toml::Value = toml::from_str(
+            r#"
+            [model.local]
+            model = "local"
+            base_url = "http://127.0.0.1:11434/v1"
+            auth_scheme = "none"
+            "#,
+        )
+        .unwrap();
+        let mut without_compat = effective;
+        if let Some(table) = without_compat.as_table_mut() {
+            table.remove("compat");
+        }
+        assert!(
+            crate::agent::config::Config::new_from_toml_cfg_offline(&without_compat).is_ok(),
+            "inspect must still parse a local keyless model offline"
+        );
+        assert_eq!(
+            crate::agent::model_providers::live_codex_catalog_fetch_attempts(),
+            0,
+            "grok inspect must not GET /models"
+        );
+    }
+
+    #[test]
+    fn subagent_trusted_tool_capabilities_render_in_human_and_json_views() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [subagents.tool_capabilities."mcp__docs__read"]
+            classification = "classified"
+            effects = ["network-read"]
+
+            [subagents.unclassified_tool_overrides."mcp__legacy__read"]
+            modes = ["read-only"]
+            reason = "Temporarily audited connector"
+            "#,
+        )
+        .unwrap();
+        let capabilities =
+            crate::config::tool_capabilities::resolve_trusted_tool_capabilities_from_values(
+                &raw,
+                ConfigSource::ConfigToml {
+                    path: "/home/test/.grok/config.toml".into(),
+                },
+                std::iter::empty::<(ConfigSource, &toml::Value)>(),
+                false,
+            );
+
+        let human = render_tool_capabilities(&capabilities);
+        assert!(human.contains("Trusted Tool Capabilities"), "{human}");
+        assert!(human.contains("mcp__docs__read"), "{human}");
+        assert!(
+            human.contains("WARNING override mcp__legacy__read [read-only]"),
+            "{human}"
+        );
+        assert!(human.contains("Temporarily audited connector"), "{human}");
+
+        let json = serde_json::to_value(&capabilities).unwrap();
+        assert_eq!(
+            json["classifications"]["mcp__docs__read"]["descriptor"]["classification"],
+            "classified"
+        );
+        assert_eq!(
+            json["unclassifiedOverrides"]["mcp__legacy__read"]["modes"][0],
+            "read-only"
+        );
+        assert_eq!(
+            json["unclassifiedOverrides"]["mcp__legacy__read"]["reason"],
+            "Temporarily audited connector"
+        );
+    }
     // ── skill source mapping (skill_entry_source) ─────────────────────────
 
     fn skill_fixture(name: &str, path: &str, scope: SkillScope) -> SkillInfo {

@@ -60,6 +60,7 @@ mod system_prompt_label_tests {
         DEFAULT_SYSTEM_PROMPT_LABEL, ENV_SYSTEM_PROMPT_LABEL,
         resolve_system_prompt_label_from_tiers,
     };
+    use serial_test::serial;
 
     /// Serialize access to `GROK_SYSTEM_PROMPT_LABEL` and clear it for tier tests.
     /// `env_wins_over_all_tiers` mutates the env; without this lock, parallel tests
@@ -148,6 +149,7 @@ mod system_prompt_label_tests {
     }
 
     #[test]
+    #[serial]
     fn env_wins_over_all_tiers() {
         let _guard = ENV_LOCK.lock().unwrap();
         // Safety: test-only, locked.

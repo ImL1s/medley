@@ -1372,6 +1372,201 @@ async fn copy_session_data_copies_compaction_segments_when_enabled() {
     );
 }
 
+/// Inherited `transcript_hint` text names the parent `session_dir/compaction`.
+/// After a production-style fork copy the child must point at its own copied
+/// archive so deleting the parent cannot break history (issue #345) — while
+/// the transcript and `summary.json`, which are words a user or the model
+/// wrote, copy through untouched even when they quote that same path.
+#[tokio::test]
+async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
+    use crate::extensions::notification::CompactionSegmentFile;
+    use xai_chat_state::{CompactionDetail, CompactionMode};
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let sid = "issue345-parent";
+    let source_info = Info {
+        id: acp::SessionId::new(sid),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+
+    adapter
+        .write_compaction_segment(
+            &source_info,
+            &CompactionSegmentFile {
+                items: vec![ConversationItem::user("pre-compact turn")],
+                summary: "segment for issue345".to_string(),
+                detail: CompactionDetail::Verbose,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let parent_compaction = adapter
+        .session_dir(&source_info)
+        .join(xai_compaction_transcript::COMPACTION_DIR);
+    let parent_loc = parent_compaction.to_string_lossy().into_owned();
+    let hint = CompactionMode::Segments(CompactionDetail::Verbose)
+        .transcript_hint(Some(parent_loc.as_str()))
+        .expect("segments hint needs a location");
+    // Workspace path that cwd transform would rewrite; hint rewrite must not.
+    let decoy_cwd_path = "/source/workspace/src/main.rs";
+    let inherited = format!("Compacted history still needs {decoy_cwd_path}.{hint}");
+    adapter
+        .append_chat_message(&source_info, &ConversationItem::user_meta(inherited))
+        .await
+        .unwrap();
+    // The agent quoted the generated hint in its own reply. That is content,
+    // not metadata: the fork must leave it alone.
+    adapter
+        .append_update(&source_info, &fork_agent_chunk(sid, &hint))
+        .await
+        .unwrap();
+
+    // The dashboard one-liner worded exactly like the generated hint. #423
+    // inverted this: it is the model's own display text, so the fork copies
+    // it as authored instead of retargeting it.
+    let mut source_summary = adapter.read_summary_sync(&source_info).unwrap();
+    source_summary.last_turn_summary = Some(hint.clone());
+    adapter
+        .write_summary_sync(&source_info, &source_summary)
+        .unwrap();
+
+    let target_info = Info {
+        id: acp::SessionId::new("issue345-child"),
+        cwd: "/target/workspace".to_string(),
+    };
+    // Same options the production fork path uses, plus skip_cwd_transform so
+    // a worktree-style copy still rewrites only the compaction hint.
+    adapter
+        .copy_session_data_sync(
+            &source_info,
+            &target_info,
+            CopySessionOptions {
+                parent_session_id: Some(sid.to_string()),
+                copy_compaction_segments: true,
+                skip_cwd_transform: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let child_compaction = adapter
+        .session_dir(&target_info)
+        .join(xai_compaction_transcript::COMPACTION_DIR);
+    let child_loc = child_compaction.to_string_lossy().into_owned();
+    assert_ne!(parent_loc, child_loc, "fork must land in a new session dir");
+
+    let loaded = adapter.load_session(&target_info).await.unwrap();
+    let chat_blob: String = loaded
+        .chat_history
+        .iter()
+        .map(ConversationItem::text_content)
+        .collect();
+    assert!(
+        chat_blob.contains(&child_loc),
+        "child chat must name the child compaction dir, got {chat_blob}"
+    );
+    assert!(
+        !chat_blob.contains(&parent_loc),
+        "child chat must not keep the parent compaction dir, got {chat_blob}"
+    );
+    assert!(
+        chat_blob.contains(decoy_cwd_path),
+        "hint rewrite must not touch workspace cwd text, got {chat_blob}"
+    );
+
+    let last = loaded
+        .summary
+        .last_turn_summary
+        .as_deref()
+        .expect("copied last_turn_summary");
+    assert_eq!(
+        last, hint,
+        "copied summary must keep the authored last_turn_summary verbatim"
+    );
+    assert!(
+        !last.contains(&child_loc),
+        "fork must not retarget the copied summary, got {last}"
+    );
+
+    let updates_blob = std::fs::read_to_string(adapter.updates_file(&target_info)).unwrap();
+    assert!(
+        updates_blob.contains(&parent_loc),
+        "agent message content must survive the fork verbatim, got {updates_blob}"
+    );
+    assert!(
+        !updates_blob.contains(&child_loc),
+        "fork must not rewrite transcript content, got {updates_blob}"
+    );
+
+    std::fs::remove_dir_all(adapter.session_dir(&source_info)).unwrap();
+    let copied_segment = std::fs::read_to_string(child_compaction.join("segment_000.md")).unwrap();
+    assert!(
+        copied_segment.contains("# HISTORICAL -- DO NOT EDIT"),
+        "child compaction files must stay readable after the parent is deleted"
+    );
+    assert!(child_compaction.join("INDEX.md").is_file());
+}
+
+/// Successor to `issue345_updates_rewrite_runs_after_json_unescape`, which
+/// pinned the deleted `updates.jsonl` walk. Windows checkpoints store
+/// `C:\\…\\compaction` where `Path::to_string_lossy` yields `C:\…\compaction`,
+/// so a textual replace on the file bytes never matches (Codex P2 3793486694).
+/// The rebind runs on the deserialized items, so the escaping never enters —
+/// this pins that it stays that way.
+#[test]
+fn issue345_checkpoint_rebind_runs_on_deserialized_items() {
+    use crate::extensions::notification::CompactionCheckpointFile;
+    use xai_chat_state::{CompactionDetail, CompactionMode};
+
+    let source = std::path::PathBuf::from(r"C:\Users\iml1s\.grok\sessions\parent\compaction");
+    let target = std::path::PathBuf::from(r"C:\Users\iml1s\.grok\sessions\child\compaction");
+    let hint = CompactionMode::Segments(CompactionDetail::default())
+        .transcript_hint(Some(source.to_string_lossy().as_ref()))
+        .expect("segments hint needs a location");
+    let file = CompactionCheckpointFile {
+        checkpoint_id: "win".to_string(),
+        prompt_index_at_compaction: 1,
+        compacted_history: vec![ConversationItem::user_meta(format!("summary body{hint}"))],
+        schema_version: 1,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        original_user_info: None,
+        reread_file_paths: vec![],
+    };
+    let bytes = serde_json::to_vec_pretty(&file).expect("checkpoint bytes");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains(r"C:\\Users"),
+        "fixture must JSON-escape backslashes"
+    );
+
+    let rebinds = super::CheckpointRebinds {
+        segments: Some((source, target)),
+        // Not under test: a pair pointing at itself rebinds nothing.
+        transcript: (
+            std::path::PathBuf::from(r"C:\same\updates.jsonl"),
+            std::path::PathBuf::from(r"C:\same\updates.jsonl"),
+        ),
+    };
+    let rebound = super::rebound_checkpoint_bytes(
+        &bytes,
+        &rebinds,
+        std::path::Path::new("checkpoint.json"),
+        &acp::SessionId::new("win-src"),
+    )
+    .expect("rebind")
+    .expect("segments hint must rebind");
+    let out: CompactionCheckpointFile = serde_json::from_slice(&rebound).expect("reparse");
+    let text = out.compacted_history[0].text_content();
+    assert!(text.contains(r"\child\compaction"), "got {text}");
+    assert!(!text.contains(r"\parent\compaction"), "got {text}");
+}
+
 #[tokio::test]
 async fn copied_compaction_hint_survives_source_deletion() {
     use crate::extensions::notification::CompactionSegmentFile;
@@ -1608,6 +1803,153 @@ async fn write_checkpoint_file(adapter: &JsonlStorageAdapter, info: &Info, id: &
         )
         .await
         .unwrap();
+}
+
+/// #345 with the case Codex flagged on PR #383: the fork must rebind the
+/// checkpoint's generated hint — the copy a cross-compaction rewind replays —
+/// while leaving a transcript that quotes the very same path byte-identical.
+/// Transcript records are words a user and the model wrote; rewriting them
+/// would hand the model back a prompt nobody typed.
+#[tokio::test]
+async fn fork_rebinds_checkpoint_hint_without_touching_quoted_transcript_paths() {
+    use crate::extensions::notification::{CompactionCheckpointFile, CompactionSegmentFile};
+    use xai_chat_state::{CompactionDetail, CompactionMode};
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source_info = Info {
+        id: acp::SessionId::new("ckpt-rebind-src"),
+        cwd: "/shared/workspace".to_string(),
+    };
+    let target_info = Info {
+        id: acp::SessionId::new("ckpt-rebind-dst"),
+        cwd: "/shared/workspace".to_string(),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+    adapter
+        .write_compaction_segment(
+            &source_info,
+            &CompactionSegmentFile {
+                items: vec![ConversationItem::user("pre-compact turn")],
+                summary: "segment summary".to_string(),
+                detail: CompactionDetail::Verbose,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let parent_archive = adapter
+        .session_dir(&source_info)
+        .join(xai_compaction_transcript::COMPACTION_DIR);
+    let parent_loc = parent_archive.to_string_lossy().into_owned();
+    let hint = CompactionMode::Segments(CompactionDetail::Verbose)
+        .transcript_hint(Some(parent_loc.as_str()))
+        .expect("segments hint needs a location");
+
+    // The user asked about the archive by name, and the agent answered naming
+    // a file inside it. Both are content; neither is a generated hint. The
+    // trailing `/` matters: the deleted rewrite's component boundary let it
+    // through, so these are exactly the bytes it corrupted.
+    let quoted_prompt = format!("what is in {parent_loc}/segment_000.md?");
+    adapter
+        .append_update(&source_info, &prompt_user_chunk(&quoted_prompt, 0))
+        .await
+        .unwrap();
+    let quoted_reply = format!("I read {parent_loc}/INDEX.md for you.");
+    adapter
+        .append_update(
+            &source_info,
+            &fork_agent_chunk("ckpt-rebind-src", &quoted_reply),
+        )
+        .await
+        .unwrap();
+
+    // The generated hint's replay home: the checkpoint the fork must rebind.
+    adapter
+        .append_update(&source_info, &checkpoint_record("ckpt-rebind"))
+        .await
+        .unwrap();
+    adapter
+        .write_compaction_checkpoint(
+            &source_info,
+            &CompactionCheckpointFile {
+                checkpoint_id: "ckpt-rebind".to_string(),
+                prompt_index_at_compaction: 1,
+                compacted_history: vec![ConversationItem::user_meta(format!("summary body{hint}"))],
+                schema_version: 1,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                original_user_info: None,
+                reread_file_paths: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    adapter
+        .copy_session_data(
+            &source_info,
+            &target_info,
+            CopySessionOptions {
+                copy_compaction_segments: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let child_archive = adapter
+        .session_dir(&target_info)
+        .join(xai_compaction_transcript::COMPACTION_DIR);
+    let child_loc = child_archive.to_string_lossy().into_owned();
+    assert_ne!(parent_loc, child_loc, "fork must land in a new session dir");
+
+    // Transcript: unchanged. Compare JSON-escaped forms so this also holds on
+    // Windows, where the path's `\` is stored as `\\`.
+    let child_updates = std::fs::read_to_string(adapter.updates_file(&target_info)).unwrap();
+    let escaped = |text: &str| {
+        serde_json::to_string(text)
+            .expect("escape")
+            .trim_matches('"')
+            .to_string()
+    };
+    assert!(
+        child_updates.contains(&escaped(&quoted_prompt)),
+        "user prompt must survive the fork verbatim, got {child_updates}"
+    );
+    assert!(
+        child_updates.contains(&escaped(&quoted_reply)),
+        "agent reply must survive the fork verbatim, got {child_updates}"
+    );
+    assert!(
+        !child_updates.contains(&escaped(&child_loc)),
+        "no transcript record may name the child archive, got {child_updates}"
+    );
+
+    // Checkpoint: rebound, and readable once the parent is gone.
+    std::fs::remove_dir_all(adapter.session_dir(&source_info)).unwrap();
+    let copied: CompactionCheckpointFile = serde_json::from_slice(
+        &std::fs::read(
+            adapter
+                .session_dir(&target_info)
+                .join("compaction_checkpoints/ckpt-rebind.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let restored = copied.compacted_history[0].text_content();
+    assert!(
+        restored.contains(&child_loc),
+        "replayed compacted history must name the child archive, got {restored}"
+    );
+    assert!(
+        !restored.contains(&parent_loc),
+        "replayed compacted history must not keep the parent archive, got {restored}"
+    );
+    assert!(child_archive.join("segment_000.md").is_file());
 }
 
 #[tokio::test]
@@ -2536,5 +2878,111 @@ fn capped_line_reader_discards_overlong_lines_without_shifting_indexes() {
     assert_eq!(
         collect(b"aa\nbb", 4),
         vec![(0, b"aa".to_vec()), (1, b"bb".to_vec())]
+    );
+}
+
+/// `summary.json` carries authored display text, never a generated pointer:
+/// `session_summary` is the session title (an LLM one, a `/rename`, or the
+/// first ten words of the user's own opening message via
+/// `title_fallback_from_user_text`) and `last_turn_summary` is the model's
+/// per-turn dashboard one-liner. No writer of either produces a
+/// `transcript_hint` -- `build_compacted_history` is the only thing that
+/// appends one, and it never reaches a `Summary`. A fork must therefore copy
+/// both verbatim, including when the text quotes the parent's archive or
+/// reads exactly like a generated hint (issue #423).
+#[tokio::test]
+async fn issue423_fork_preserves_authored_summary_text_verbatim() {
+    use crate::extensions::notification::CompactionSegmentFile;
+    use xai_chat_state::{CompactionDetail, CompactionMode};
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source_info = Info {
+        id: acp::SessionId::new("issue423-parent"),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+    // Fork a genuinely compacted session: that is when the deleted rewrite
+    // had a source and target dir to substitute between.
+    adapter
+        .write_compaction_segment(
+            &source_info,
+            &CompactionSegmentFile {
+                items: vec![ConversationItem::user("pre-compact turn")],
+                summary: "segment for issue423".to_string(),
+                detail: CompactionDetail::Verbose,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let parent_loc = adapter
+        .session_dir(&source_info)
+        .join(xai_compaction_transcript::COMPACTION_DIR)
+        .to_string_lossy()
+        .into_owned();
+
+    // A title quoting the parent archive one component deep: the deleted
+    // rewrite stopped only at a component *continuation*, so a trailing `/`
+    // did not protect this.
+    let title = format!("Why {parent_loc}/segment_000.md keeps growing");
+    // A per-turn summary worded as the generated hint itself -- the exact
+    // text the deleted rewrite was hunting for, here authored by the model.
+    let last_turn = CompactionMode::Segments(CompactionDetail::Verbose)
+        .transcript_hint(Some(parent_loc.as_str()))
+        .expect("segments hint needs a location");
+
+    let mut source_summary = adapter.read_summary_sync(&source_info).unwrap();
+    source_summary.session_summary = title.clone();
+    source_summary.last_turn_summary = Some(last_turn.clone());
+    adapter
+        .write_summary_sync(&source_info, &source_summary)
+        .unwrap();
+
+    let target_info = Info {
+        id: acp::SessionId::new("issue423-child"),
+        cwd: "/target/workspace".to_string(),
+    };
+    adapter
+        .copy_session_data_sync(
+            &source_info,
+            &target_info,
+            CopySessionOptions {
+                parent_session_id: Some(source_info.id.to_string()),
+                copy_compaction_segments: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let child_loc = adapter
+        .session_dir(&target_info)
+        .join(xai_compaction_transcript::COMPACTION_DIR)
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(
+        parent_loc, child_loc,
+        "fork must land in a new session dir, or this pins nothing"
+    );
+
+    let copied = adapter.read_summary_sync(&target_info).unwrap();
+    assert_eq!(
+        copied.session_summary, title,
+        "fork must copy the session title verbatim"
+    );
+    assert_eq!(
+        copied.last_turn_summary.as_deref(),
+        Some(last_turn.as_str()),
+        "fork must copy the per-turn summary verbatim"
+    );
+    // Total guard: no field of the copied summary was retargeted.
+    let raw = std::fs::read_to_string(adapter.summary_file(&target_info)).unwrap();
+    assert!(
+        !raw.contains(&child_loc),
+        "fork must not retarget any summary.json text, got {raw}"
     );
 }

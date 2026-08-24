@@ -1425,9 +1425,12 @@ mod tests {
     fn grok_login_legacy_token_does_not_require_login() {
         use crate::auth::{AuthManager, AuthMode, GrokAuth, GrokComConfig};
 
-        // Ensure clean slate for "no other auth available".
-        let _g1 = EnvGuard::unset("GROK_AUTH_PATH");
-        let _g2 = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        // Ensure clean slate for "no other auth available". `GROK_AUTH_PATH` is
+        // no longer part of that slate: under `cfg(test)` `AuthManager::new`
+        // resolves through `XaiAuthPathGuard`/`grok_home`, so the env cannot
+        // move which file it reads (#409). Unsetting it here would only mutate
+        // process-global state that no longer decides anything.
+        let _g1 = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
 
         // Construct a legacy-style token exactly as `grok login --legacy`
         // produces: WebLogin mode, no OIDC fields, no refresh_token, no
@@ -1509,8 +1512,10 @@ mod tests {
     fn no_legacy_token_means_no_cached_token_advertised() {
         use crate::auth::{AuthManager, GrokComConfig};
 
+        // `GROK_AUTH` still decides which credential this manager loads; since
+        // #409 `GROK_AUTH_PATH` no longer decides which file it reads under
+        // `cfg(test)`, so only the inline-credential carrier needs clearing.
         let _g1 = EnvGuard::unset("GROK_AUTH");
-        let _g2 = EnvGuard::unset("GROK_AUTH_PATH");
 
         let dir = tempfile::tempdir().unwrap();
         // No auth.json in the tempdir.

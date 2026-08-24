@@ -3309,6 +3309,7 @@ mod tests {
     ///
     /// Step 3 must not remove the live socket from step 2.
     #[test]
+    #[cfg(unix)]
     fn leaders_kill_issue183_interleaving_preserves_new_leader_socket() {
         use std::fs::OpenOptions;
         use std::os::fd::AsRawFd;

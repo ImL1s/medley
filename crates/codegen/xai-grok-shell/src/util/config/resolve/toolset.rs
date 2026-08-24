@@ -133,6 +133,7 @@ fn resolve_login_shell_capture_tiers(
 #[cfg(test)]
 mod login_shell_capture_tests {
     use super::{ENV_LOGIN_SHELL_CAPTURE, resolve_login_shell_capture_tiers};
+    use serial_test::serial;
     use toml::Value as TomlValue;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -189,6 +190,7 @@ mod login_shell_capture_tests {
     }
 
     #[test]
+    #[serial]
     fn env_beats_config_and_remote() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_LOGIN_SHELL_CAPTURE, "0") };
@@ -198,6 +200,7 @@ mod login_shell_capture_tests {
     }
 
     #[test]
+    #[serial]
     fn requirements_win_outright() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_LOGIN_SHELL_CAPTURE, "1") };
@@ -266,6 +269,7 @@ fn resolve_scheduler_background_loops_tiers(
 #[cfg(test)]
 mod scheduler_background_loops_tests {
     use super::{ENV_SCHEDULER_BACKGROUND_LOOPS, resolve_scheduler_background_loops_tiers};
+    use serial_test::serial;
     use toml::Value as TomlValue;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -319,6 +323,7 @@ mod scheduler_background_loops_tests {
     }
 
     #[test]
+    #[serial]
     fn env_beats_config_and_remote() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_SCHEDULER_BACKGROUND_LOOPS, "0") };
@@ -334,6 +339,7 @@ mod scheduler_background_loops_tests {
     }
 
     #[test]
+    #[serial]
     fn requirements_win_outright() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_SCHEDULER_BACKGROUND_LOOPS, "1") };
@@ -694,6 +700,7 @@ mod web_search_domains_tests {
 mod ask_user_question_timeout_tests {
     use super::*;
     use crate::agent::config::ConfigSource;
+    use serial_test::serial;
     use xai_grok_tools::implementations::grok_build::ask_user_question::RESPONSE_TIMEOUT_ENV;
 
     // Both env vars are process-global (a dev exports the secs var for TUI

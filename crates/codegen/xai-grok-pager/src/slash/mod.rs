@@ -55,6 +55,8 @@ pub struct SuggestionRow {
     pub tag: Option<String>,
     /// Provenance badge; `Some` only on rows in a builtin/skill name collision.
     pub provenance: Option<CommandProvenance>,
+    /// Preferred initial highlight for a fresh empty-query argument surface.
+    pub initially_selected: bool,
 }
 
 impl SuggestionRow {
@@ -74,6 +76,7 @@ impl SuggestionRow {
             indices: Vec::new(),
             tag: None,
             provenance: collides_with_builtin_or_skill.then(|| trigger.provenance.clone()),
+            initially_selected: false,
         }
     }
 
@@ -85,6 +88,7 @@ impl SuggestionRow {
             indices: Vec::new(),
             tag: None,
             provenance: None,
+            initially_selected: item.initially_selected,
         }
     }
 
@@ -879,9 +883,19 @@ impl SlashController {
                 && previous.query == input.query
                 && previous.args_range == input.args_range
         };
+        let query_empty = input.args_query.trim().is_empty();
         if !same_context || previous.matches.is_empty() {
-            if !cursor_in_command && input.args_query.trim().is_empty() {
-                return initially_preferred.unwrap_or(0);
+            if !cursor_in_command && query_empty {
+                // Caller-computed preference first (`initially_preferred_arg`),
+                // then the row-level `initially_selected` flag. Both name the
+                // same "start here on a fresh empty-query arg surface" rule;
+                // either mechanism alone must still be honoured.
+                if let Some(idx) = initially_preferred {
+                    return idx;
+                }
+                return crate::slash::command::preferred_initial_index(
+                    matches.iter().map(|row| row.initially_selected),
+                );
             }
             return 0;
         }
@@ -897,7 +911,12 @@ impl SlashController {
             return pos;
         }
 
-        previous.selected.min(matches.len().saturating_sub(1))
+        if !cursor_in_command && query_empty {
+            return crate::slash::command::preferred_initial_index(
+                matches.iter().map(|row| row.initially_selected),
+            );
+        }
+        0
     }
 
     /// Byte ranges of recognized `/command` tokens anywhere in `text`.
@@ -2248,6 +2267,130 @@ mod tests {
         assert_eq!(state.snapshot().selected, len - 1);
     }
 
+    fn model_catalog_with_current_second() -> ModelState {
+        let mut state = ModelState::default();
+        let grok = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
+        let sol = acp::ModelId::new(std::sync::Arc::from("gpt-5.6-sol"));
+        state.available.insert(
+            grok,
+            acp::ModelInfo::new(
+                acp::ModelId::new(std::sync::Arc::from("grok-4.5")),
+                "Grok 4.5".to_string(),
+            ),
+        );
+        state.available.insert(
+            sol.clone(),
+            acp::ModelInfo::new(
+                acp::ModelId::new(std::sync::Arc::from("gpt-5.6-sol")),
+                "GPT-5.6-Sol".to_string(),
+            ),
+        );
+        state.set_current(sol, None);
+        state
+    }
+
+    #[test]
+    fn fresh_model_suggestions_highlight_current_row_when_not_first() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = model_catalog_with_current_second();
+        let text = "/model ";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let snap = state.snapshot();
+        assert!(snap.open);
+        assert!(
+            snap.selected > 0,
+            "current model must not stay at catalog index 0, selected={}",
+            snap.selected
+        );
+        let row = &snap.matches[snap.selected];
+        assert!(
+            row.display.contains("(current)") && row.display.contains("GPT-5.6-Sol"),
+            "fresh /model must highlight the (current) row, got {}",
+            row.display
+        );
+        assert!(row.initially_selected);
+    }
+
+    #[test]
+    fn model_suggestion_refresh_preserves_user_selection_after_navigation() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = model_catalog_with_current_second();
+        let text = "/model ";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let before = state.snapshot().selected;
+        ctrl.move_selection(&state, 1);
+        let after_down = state.snapshot().selected;
+        assert_ne!(after_down, before);
+        ctrl.refresh(&state, text, text.len(), &models);
+        assert_eq!(
+            state.snapshot().selected,
+            after_down,
+            "refresh must keep the user's arrow selection"
+        );
+    }
+
+    #[test]
+    fn nonempty_fuzzy_model_query_uses_ranked_matches() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let models = model_catalog_with_current_second();
+        let text = "/model grok";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let snap = state.snapshot();
+        assert!(snap.open);
+        assert_eq!(snap.selected, 0);
+        assert!(
+            snap.matches[0].display.contains("Grok 4.5"),
+            "ranked fuzzy query must surface Grok, got {:?}",
+            snap.matches
+                .iter()
+                .map(|r| r.display.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !snap.matches[0].display.contains("(current)"),
+            "fuzzy winner must not be forced to the current model"
+        );
+    }
+
+    #[test]
+    fn preferred_model_row_falls_back_when_none_or_multiple() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let mut models = model_catalog_with_current_second();
+        models.current = None;
+        let text = "/model ";
+        ctrl.refresh(&state, text, text.len(), &models);
+        assert_eq!(state.snapshot().selected, 0);
+
+        let mut both = models;
+        let first = both.available.first().unwrap().0.clone();
+        let second = both.available.get_index(1).unwrap().0.clone();
+        both.current = Some(first);
+        both.set_current(second, None);
+        // Only one current exists; double-preferred is covered by ArgItem::preferred_index.
+        let mut items = crate::slash::commands::model::ModelCommand
+            .suggest_args(
+                &AppCtx {
+                    models: &both,
+                    cwd: std::path::Path::new("."),
+                    has_session_announcements: false,
+                    billing_surface_visible: true,
+                    usage_command_visible: true,
+                    workflows_available: true,
+                    screen_mode: crate::app::ScreenMode::Fullscreen,
+                    current_title: None,
+                },
+                "",
+            )
+            .unwrap();
+        items[0].initially_selected = true;
+        items[1].initially_selected = true;
+        assert_eq!(crate::slash::command::ArgItem::preferred_index(&items), 0);
+    }
+
     #[test]
     fn non_slash_text_produces_inactive_snapshot() {
         let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
@@ -2609,6 +2752,7 @@ mod tests {
             indices: Vec::new(),
             tag: None,
             provenance: None,
+            initially_selected: false,
         };
         // Without smart-case, starts_with("p") fails on "Privacy" and ghost disappears
         // while the dropdown still highlights the row via CaseMatching::Smart.
@@ -3353,6 +3497,7 @@ mod tests {
                 display: display.into(),
                 match_text: match_text.into(),
                 insert_text: insert.into(),
+                identity: String::new(),
                 description: String::new(),
                 ..Default::default()
             };

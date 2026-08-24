@@ -200,6 +200,7 @@ struct ModelReadinessMeta {
     readiness_reason: String,
     provider_hint: String,
     catalog_degraded_reason: String,
+    upgrade_model: String,
 }
 
 fn parse_model_readiness(
@@ -223,11 +224,16 @@ fn parse_model_readiness(
         readiness_reason: get_str("readinessReason"),
         provider_hint: get_str("providerHint"),
         catalog_degraded_reason: get_str("catalogDegradedReason"),
+        upgrade_model: get_str("catalogUpgradeModel"),
     }
 }
 
 /// User-facing reason when a model id is missing from the catalog or not ready.
 pub(crate) const MODEL_CATALOG_MISS_REASON: &str = "Model no longer available";
+/// Toast when a picker commit targets a row the live catalog no longer owns.
+pub(crate) const CATALOG_CHANGED_TOAST: &str = "Model catalog changed — select a model again.";
+/// ACP meta flag on the unavailable-resident placeholder kept after a catalog drop.
+pub(crate) const UNAVAILABLE_RESIDENT_META: &str = "unavailableResident";
 
 pub(crate) fn model_not_ready_reason(models: &ModelState, id: &acp::ModelId) -> Option<String> {
     let Some(info) = models.available.get(id) else {
@@ -268,6 +274,50 @@ pub(crate) fn auth_class_from_model_meta(
     parse_model_readiness(meta).auth_class
 }
 
+/// Model-id → readiness-reason pairs for settings picker disablement.
+///
+/// Identity is the catalog `ModelId`. Display names may collide, so a
+/// name-only lookup would disable every row that shares an unready model's
+/// label.
+pub(crate) fn unready_reasons_from_catalog(
+    available: &indexmap::IndexMap<acp::ModelId, acp::ModelInfo>,
+) -> Vec<(String, String)> {
+    available
+        .iter()
+        .filter_map(|(id, info)| {
+            unready_reason_from_model_meta(info.meta.as_ref())
+                .map(|reason| (id.0.to_string(), reason))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn is_unavailable_resident_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    meta.and_then(|m| m.get(UNAVAILABLE_RESIDENT_META))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Placeholder `ModelInfo` for a resident model the live catalog dropped.
+pub(crate) fn unavailable_resident_placeholder(
+    id: &acp::ModelId,
+    previous_name: Option<&str>,
+) -> acp::ModelInfo {
+    let name = previous_name
+        .filter(|n| !n.is_empty())
+        .unwrap_or(id.0.as_ref())
+        .to_string();
+    let meta = serde_json::json!({
+        "ready": false,
+        "readinessReason": MODEL_CATALOG_MISS_REASON,
+        "providerHint": "catalog",
+        "unavailableResident": true,
+    });
+    acp::ModelInfo::new(id.clone(), name).meta(meta.as_object().cloned())
+}
+
 /// Split `args` into `(prefix, last_token)` on the final whitespace run.
 /// Returns `None` when there is no interior whitespace to split on. The token is
 /// resolved to an effort against the picked model's options by the caller.
@@ -281,8 +331,12 @@ fn split_trailing_token(args: &str) -> Option<(&str, &str)> {
 }
 
 /// Returns the matched model id when `args_query` is `"<reasoning-model> ..."`.
-/// Longest-name-first to disambiguate names that share a prefix.
+/// Prefer catalog-id prefixes (picker `insert_text`), then display names.
+/// Longest prefix first so `"Grok 4.5 "` is not stolen by `"Grok "`.
 fn detect_effort_phase(models: &ModelState, args_query: &str) -> Option<acp::ModelId> {
+    // `selectable_models`, not the raw catalog: an unavailable-resident row is
+    // presentation state and must not be typable. A display name shared by two
+    // catalog ids is dropped as a prefix so it cannot resolve to one of them.
     let reasoning_models: Vec<_> = models
         .selectable_models()
         .filter(|(_, info)| supports_reasoning_effort(info))
@@ -301,16 +355,105 @@ fn detect_effort_phase(models: &ModelState, args_query: &str) -> Option<acp::Mod
     }
     candidates.sort_by_key(|(_, name)| std::cmp::Reverse(name.len()));
 
-    for (id, name) in candidates {
-        if args_query.len() > name.len()
-            && args_query.is_char_boundary(name.len())
-            && args_query[..name.len()].eq_ignore_ascii_case(name)
-            && args_query[name.len()..].starts_with(char::is_whitespace)
+    for (id, prefix) in candidates {
+        if args_query.len() > prefix.len()
+            && args_query.is_char_boundary(prefix.len())
+            && args_query[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && args_query[prefix.len()..].starts_with(char::is_whitespace)
         {
             return Some(id.clone());
         }
     }
     None
+}
+
+/// Append `raw` to the `/model` search index unless it is empty or already present.
+fn push_unique_search_token(tokens: &mut Vec<String>, raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if tokens
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+    {
+        return;
+    }
+    tokens.push(trimmed.to_string());
+}
+
+/// Collect capability tokens from a meta string or string array.
+fn collect_capability_tokens(value: Option<&serde_json::Value>, tokens: &mut Vec<String>) {
+    match value {
+        Some(serde_json::Value::String(s)) => {
+            for part in s.split_whitespace() {
+                if !part.is_empty() {
+                    tokens.push(part.to_string());
+                }
+            }
+        }
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        tokens.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Capability tokens from ACP model meta (explicit lists plus known flags).
+fn capability_tokens_from_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Vec<String> {
+    let Some(meta) = meta else {
+        return Vec::new();
+    };
+    let mut tokens = Vec::new();
+    collect_capability_tokens(meta.get("capabilityTokens"), &mut tokens);
+    collect_capability_tokens(meta.get("capabilities"), &mut tokens);
+    if meta
+        .get("supportsReasoningEffort")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        tokens.push("reasoning".to_string());
+    }
+    if meta
+        .get("supportsBackendSearch")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        tokens.push("search".to_string());
+    }
+    tokens
+}
+
+/// Search index for a `/model` row: display name plus identity and capability tokens.
+///
+/// `insert_text` is the catalog `ModelId` so Enter commits the focused row
+/// even when two entries share a display name.
+fn model_item_match_text(id: &acp::ModelId, info: &acp::ModelInfo, provider_hint: &str) -> String {
+    let mut tokens = Vec::new();
+    push_unique_search_token(&mut tokens, &info.name);
+    push_unique_search_token(&mut tokens, id.0.as_ref());
+    if let Some(slug) = info
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("modelSlug"))
+        .and_then(|v| v.as_str())
+    {
+        push_unique_search_token(&mut tokens, slug);
+    }
+    push_unique_search_token(&mut tokens, provider_hint);
+    for token in capability_tokens_from_meta(info.meta.as_ref()) {
+        push_unique_search_token(&mut tokens, &token);
+    }
+    tokens.join(" ")
 }
 
 /// One row per logical model. Reasoning models get a trailing space in
@@ -343,6 +486,8 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
         // expected" to the prompt widget so Enter advances to effort
         // phase instead of submitting. Unready models stay non-chaining
         // so selection is hard-blocked instead of advancing to effort.
+        // Insert the catalog id, not the display name: colliding labels
+        // would otherwise commit the first name match (Codex P2 3788538942).
         let insert_text = if supports && readiness.ready {
             format!("{} ", id.0)
         } else {
@@ -359,16 +504,21 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
         } else {
             readiness.auth_scheme.clone()
         };
-        let description = if readiness.catalog_degraded_reason.is_empty() {
+        let mut description = if readiness.catalog_degraded_reason.is_empty() {
             format!("{hint} · {scheme}")
         } else {
             format!("{hint} · {scheme} · {}", readiness.catalog_degraded_reason)
         };
+        if !readiness.upgrade_model.is_empty() {
+            description = format!("{description} · upgrade to {}", readiness.upgrade_model);
+        }
 
         let badge = if !readiness.ready {
             "missing".to_string()
         } else if !readiness.catalog_degraded_reason.is_empty() {
             "degraded".to_string()
+        } else if !readiness.upgrade_model.is_empty() {
+            "upgrade".to_string()
         } else if readiness.auth_scheme == "none" || readiness.auth_class == "none" {
             "none".to_string()
         } else {
@@ -377,8 +527,12 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
 
         items.push(ArgItem {
             display,
-            match_text: format!("{} {}", info.name, id.0),
+            // Name + catalog id + wire slug + provider hint + capability
+            // tokens (#17): the picker must be searchable by identity, not by
+            // display name alone.
+            match_text: model_item_match_text(id, info, &readiness.provider_hint),
             insert_text,
+            identity: id.0.to_string(),
             description,
             badge,
             dimmed: !readiness.ready,
@@ -390,25 +544,26 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
             } else {
                 readiness.readiness_reason
             },
+            initially_selected: is_current,
         });
     }
     items
 }
 
 /// One row per effort level for the `/model` chained effort phase.
-/// `insert_text` is `"model-id high"` so selecting a row completes both tokens.
+/// `insert_text` is `"<catalog-id> high"` so selecting a row completes both tokens.
 fn build_effort_items(models: &ModelState, model_id: &acp::ModelId) -> Vec<ArgItem> {
     if !models.available.contains_key(model_id) {
         return Vec::new();
     }
-    let model_id_text = model_id.0.to_string();
+    let catalog_id = model_id.0.to_string();
     let is_current_model = models.current.as_ref() == Some(model_id);
     let options = models.reasoning_effort_options_for(model_id);
     build_effort_arg_items(
         &options,
         models.reasoning_effort,
         is_current_model,
-        |option| format!("{model_id_text} {}", option.id),
+        |option| format!("{catalog_id} {}", option.id),
     )
 }
 
@@ -502,18 +657,17 @@ mod tests {
         // Reasoning model has trailing space in insert_text -- this is the
         // signal the prompt widget reads to keep the dropdown open after
         // Enter so the effort sub-menu can render.
-        let reasoning = items
-            .iter()
-            .find(|i| i.match_text == "Reasoning X reasoning-x")
-            .unwrap();
+        // Look rows up by display/identity, not by an exact `match_text`:
+        // the search index also carries slug, provider hint and capability
+        // tokens (#17), so equality on it is not a stable row selector.
+        let reasoning = row_named(&items, "Reasoning X");
         assert_eq!(reasoning.insert_text, "reasoning-x ");
+        assert_eq!(reasoning.identity, "reasoning-x");
 
         // Plain model has no trailing space -- Enter commits immediately.
-        let plain = items
-            .iter()
-            .find(|i| i.match_text == "Grok 4.5 grok-4.5")
-            .unwrap();
+        let plain = row_named(&items, "Grok 4.5");
         assert_eq!(plain.insert_text, "grok-4.5");
+        assert_eq!(plain.identity, "grok-4.5");
     }
 
     #[test]
@@ -1073,6 +1227,25 @@ mod tests {
         (id, info)
     }
 
+    fn row_named<'a>(items: &'a [ArgItem], name: &str) -> &'a ArgItem {
+        items
+            .iter()
+            .find(|item| {
+                item.display == name
+                    || item.display == format!("{name} (current)")
+                    || item.identity == name
+            })
+            .unwrap_or_else(|| panic!("expected model row {name}"))
+    }
+
+    fn selectable_by_match<'a>(items: &'a [ArgItem], query: &str) -> Vec<&'a ArgItem> {
+        let q = query.to_lowercase();
+        items
+            .iter()
+            .filter(|item| !item.non_selectable && item.match_text.to_lowercase().contains(&q))
+            .collect()
+    }
+
     #[test]
     fn build_model_items_badges_ready_missing_none() {
         let mut state = ModelState::default();
@@ -1115,32 +1288,217 @@ mod tests {
         state.available.insert(none_id, none_info);
 
         let items = build_model_items(&state);
-        let ready = items
-            .iter()
-            .find(|i| i.match_text == "Ready Model ready-m")
-            .unwrap();
+        let ready = row_named(&items, "Ready Model");
         assert_eq!(ready.badge, "ready");
         assert!(!ready.dimmed);
         assert!(!ready.non_selectable);
         assert_eq!(ready.description, "xAI · bearer");
 
-        let missing = items
-            .iter()
-            .find(|i| i.match_text == "Missing Model missing-m")
-            .unwrap();
+        let missing = row_named(&items, "Missing Model");
         assert_eq!(missing.badge, "missing");
         assert!(missing.dimmed);
         assert!(missing.non_selectable);
         assert_eq!(missing.blocked_reason, "missing OPENAI_API_KEY");
         assert_eq!(missing.description, "api.openai.com · bearer");
 
-        let none = items
-            .iter()
-            .find(|i| i.match_text == "None Model none-m")
-            .unwrap();
+        let none = row_named(&items, "None Model");
         assert_eq!(none.badge, "none");
         assert!(!none.non_selectable);
         assert_eq!(none.description, "local · none");
+    }
+
+    /// #17 first slice: picker search matches catalog id / wire slug /
+    /// provider hint / capability tokens, not display name only. Two rows
+    /// share a name so a name query cannot disambiguate; identity queries
+    /// leave only the matching id selectable. `insert_text` is the catalog id.
+    #[test]
+    fn build_model_items_match_issue17_duplicate_display_name() {
+        let mut state = ModelState::default();
+        let display = "Shared Twin";
+        let (id_a, info_a) = model_with_meta(
+            "issue17-catalog-a",
+            display,
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("session")),
+                ("ready".into(), serde_json::json!(true)),
+                (
+                    "providerHint".into(),
+                    serde_json::json!("issue17-provider-a"),
+                ),
+                ("modelSlug".into(), serde_json::json!("issue17-wire-a")),
+                (
+                    "capabilityTokens".into(),
+                    serde_json::json!(["issue17-vision"]),
+                ),
+            ]),
+        );
+        let (id_b, info_b) = model_with_meta(
+            "issue17-catalog-b",
+            display,
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("session")),
+                ("ready".into(), serde_json::json!(true)),
+                (
+                    "providerHint".into(),
+                    serde_json::json!("issue17-provider-b"),
+                ),
+                ("modelSlug".into(), serde_json::json!("issue17-wire-b")),
+                ("capabilities".into(), serde_json::json!(["issue17-search"])),
+            ]),
+        );
+        state.available.insert(id_a, info_a);
+        state.available.insert(id_b, info_b);
+
+        let items = build_model_items(&state);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| {
+            !item.non_selectable
+                && (item.insert_text == "issue17-catalog-a"
+                    || item.insert_text == "issue17-catalog-b")
+        }));
+
+        let by_name = selectable_by_match(&items, display);
+        assert_eq!(by_name.len(), 2, "shared display name still matches both");
+
+        let by_id = selectable_by_match(&items, "issue17-catalog-a");
+        assert_eq!(by_id.len(), 1, "catalog id must isolate one row");
+        assert!(by_id[0].match_text.contains("issue17-catalog-a"));
+        assert!(!by_id[0].match_text.contains("issue17-catalog-b"));
+        assert_eq!(by_id[0].insert_text, "issue17-catalog-a");
+
+        let by_provider = selectable_by_match(&items, "issue17-provider-b");
+        assert_eq!(by_provider.len(), 1, "provider hint must isolate one row");
+        assert!(by_provider[0].match_text.contains("issue17-catalog-b"));
+        assert_eq!(by_provider[0].insert_text, "issue17-catalog-b");
+
+        let by_slug = selectable_by_match(&items, "issue17-wire-a");
+        assert_eq!(by_slug.len(), 1);
+        assert!(by_slug[0].match_text.contains("issue17-catalog-a"));
+
+        let by_cap_a = selectable_by_match(&items, "issue17-vision");
+        assert_eq!(by_cap_a.len(), 1);
+        assert!(by_cap_a[0].match_text.contains("issue17-catalog-a"));
+
+        let by_cap_b = selectable_by_match(&items, "issue17-search");
+        assert_eq!(by_cap_b.len(), 1);
+        assert!(by_cap_b[0].match_text.contains("issue17-catalog-b"));
+    }
+
+    /// Codex P2 3788538942: picker Enter inserts the focused catalog id, so
+    /// two rows that share a display name cannot collapse to the first match.
+    #[test]
+    fn issue17_run_commits_focused_catalog_id_when_display_names_collide() {
+        let mut state = ModelState::default();
+        let display = "Shared Twin";
+        let (id_a, info_a) = model_with_meta(
+            "issue17-catalog-a",
+            display,
+            serde_json::Map::from_iter([("ready".into(), serde_json::json!(true))]),
+        );
+        let (id_b, info_b) = model_with_meta(
+            "issue17-catalog-b",
+            display,
+            serde_json::Map::from_iter([("ready".into(), serde_json::json!(true))]),
+        );
+        state.available.insert(id_a.clone(), info_a);
+        state.available.insert(id_b.clone(), info_b);
+
+        let focused = build_model_items(&state)
+            .into_iter()
+            .find(|item| item.identity == "issue17-catalog-b")
+            .expect("sibling B");
+        assert_eq!(focused.insert_text, "issue17-catalog-b");
+
+        let mut ctx = dummy_exec_ctx(&state);
+        match ModelCommand.run(&mut ctx, focused.insert_text.trim()) {
+            CommandResult::Action(Action::SetDefaultModel(resolved)) => {
+                assert_eq!(resolved, id_b);
+                assert_ne!(resolved, id_a);
+            }
+            other => panic!("expected SetDefaultModel(issue17-catalog-b), got {other:?}"),
+        }
+
+        // A typed colliding display name is refused, not silently resolved.
+        //
+        // This assertion previously expected the first match (`id_a`). That was
+        // written before `06208096` (#388) made an ambiguous name an error, and
+        // the two halves first coexisted at the providers merge on this branch.
+        // Refusing is the behaviour to keep: picking one of two rows the user
+        // cannot tell apart is the same defect this test's own header describes
+        // for the picker, one input away. It is also what #260's third
+        // criterion was closed on, and `run_model_session_flag_rejects_ambiguous`
+        // already pins the same refusal on the `--session` path -- so the old
+        // expectation contradicted a sibling in this same file.
+        let mut ctx = dummy_exec_ctx(&state);
+        match ModelCommand.run(&mut ctx, display) {
+            CommandResult::Error(msg) => {
+                assert!(
+                    msg.contains("Ambiguous model name") && msg.contains("model id"),
+                    "the refusal must name the way out, not just say no: {msg}"
+                );
+            }
+            other => {
+                panic!("expected an ambiguity refusal for a typed display name, got {other:?}")
+            }
+        }
+    }
+
+    /// Catalog refresh remaps an open `/model` picker by ModelId, not display
+    /// `insert_text` (Codex P2 3788439758).
+    #[test]
+    fn remap_model_picker_selection_keeps_focused_id_when_display_names_collide() {
+        let mut state = ModelState::default();
+        let (id_a, info_a) = model_with_meta(
+            "issue-remap-a",
+            "Shared Name",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("a")),
+            ]),
+        );
+        let (id_b, info_b) = model_with_meta(
+            "issue-remap-b",
+            "Shared Name",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("b")),
+            ]),
+        );
+        state.available.insert(id_a, info_a);
+        state.available.insert(id_b, info_b);
+        let before = build_model_items(&state);
+        let focused = before
+            .iter()
+            .find(|item| item.identity == "issue-remap-b")
+            .expect("sibling B");
+        assert_eq!(focused.insert_text, "issue-remap-b");
+
+        // Display names both change; identities stay.
+        let mut renamed = ModelState::default();
+        let (id_a, info_a) = model_with_meta(
+            "issue-remap-a",
+            "Renamed Shared",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("a")),
+            ]),
+        );
+        let (id_b, info_b) = model_with_meta(
+            "issue-remap-b",
+            "Renamed Shared",
+            serde_json::Map::from_iter([
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("b")),
+            ]),
+        );
+        renamed.available.insert(id_a, info_a);
+        renamed.available.insert(id_b, info_b);
+        let after = build_model_items(&renamed);
+        let idx = ArgItem::remap_selection(&after, Some(focused.identity.as_str()));
+        assert_eq!(after[idx].identity, "issue-remap-b");
+        assert_eq!(after[idx].insert_text, "issue-remap-b");
     }
 
     #[test]
@@ -1165,6 +1523,50 @@ mod tests {
         assert!(!item.dimmed);
         assert!(!item.non_selectable);
         assert!(item.description.contains(reason));
+    }
+
+    #[test]
+    fn codex_catalog_upgrade_migration_is_visible_in_model_picker() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_meta(
+            "gpt-5.4",
+            "GPT-5.4",
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("session")),
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("chatgpt.com")),
+                ("modelSlug".into(), serde_json::json!("gpt-5.4")),
+                (
+                    "catalogUpgradeModel".into(),
+                    serde_json::json!("gpt-5.6-terra"),
+                ),
+                (
+                    "catalogUpgradeMigrationMarkdown".into(),
+                    serde_json::json!(
+                        "GPT-5.4 will be deprecated soon\n\n\
+                         Codex now uses GPT-5.6 Terra in place of GPT-5.4."
+                    ),
+                ),
+            ]),
+        );
+        state.available.insert(id, info);
+
+        let item = build_model_items(&state).pop().expect("gpt-5.4 row");
+        assert_eq!(item.badge, "upgrade");
+        assert!(!item.dimmed);
+        assert!(!item.non_selectable);
+        assert!(
+            item.description.contains("upgrade to gpt-5.6-terra"),
+            "picker must name the migration target: {}",
+            item.description
+        );
+        assert!(
+            item.match_text.to_ascii_lowercase().contains("gpt-5.4"),
+            "match_text must still include the display name/id: {}",
+            item.match_text
+        );
+        assert_eq!(item.insert_text, "gpt-5.4");
     }
 
     /// #306 C-min gate 1 (**component presentation** — not cold-boot/ACP
@@ -1306,10 +1708,7 @@ mod tests {
         let items = build_model_items(&state);
         assert_eq!(items.len(), 2, "picker must list both catalog entries");
 
-        let codex = items
-            .iter()
-            .find(|i| i.match_text == "GPT-5.6 Sol gpt-5.6-sol")
-            .expect("live Codex row in picker");
+        let codex = row_named(&items, "GPT-5.6 Sol");
         assert_eq!(codex.badge, "ready");
         assert!(!codex.dimmed);
         assert!(!codex.non_selectable);
@@ -1321,10 +1720,7 @@ mod tests {
             codex.display
         );
 
-        let grok = items
-            .iter()
-            .find(|i| i.match_text == "Grok 4.5 grok-4.5")
-            .expect("Grok row in picker");
+        let grok = row_named(&items, "Grok 4.5");
         assert_eq!(grok.badge, "missing");
         assert!(grok.dimmed);
         assert!(grok.non_selectable);
@@ -1384,11 +1780,8 @@ mod tests {
         state.available.insert(grok_id, grok_info);
 
         let items = build_model_items(&state);
-        for (id, name) in &ready_ids {
-            let row = items
-                .iter()
-                .find(|i| i.match_text == format!("{name} {}", id.0))
-                .expect("ready Codex row in picker");
+        for (_, name) in &ready_ids {
+            let row = row_named(&items, name);
             assert_eq!(row.badge, "ready");
             assert!(!row.non_selectable);
         }
@@ -1515,6 +1908,34 @@ mod tests {
             CommandResult::Error(msg) => assert_eq!(msg, reason),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_model_items_marks_single_current_row_initially_selected() {
+        let mut state = ModelState::default();
+        let (grok_id, grok_info) = plain_model("grok-4.5", "Grok 4.5");
+        let (sol_id, sol_info) = plain_model("gpt-5.6-sol", "GPT-5.6-Sol");
+        state.available.insert(grok_id, grok_info);
+        state.available.insert(sol_id.clone(), sol_info);
+        state.set_current(sol_id, None);
+
+        let items = build_model_items(&state);
+        assert_eq!(ArgItem::preferred_index(&items), 1);
+        assert!(items[0].display.contains("Grok 4.5"));
+        assert!(!items[0].initially_selected);
+        assert!(items[1].display.contains("(current)"));
+        assert!(items[1].initially_selected);
+
+        let mut none = ModelState::default();
+        let (g_id, g_info) = plain_model("grok-4.5", "Grok 4.5");
+        let (s_id, s_info) = plain_model("gpt-5.6-sol", "GPT-5.6-Sol");
+        none.available.insert(g_id, g_info);
+        none.available.insert(s_id, s_info);
+        assert_eq!(ArgItem::preferred_index(&build_model_items(&none)), 0);
+
+        let mut both = items.clone();
+        both[0].initially_selected = true;
+        assert_eq!(ArgItem::preferred_index(&both), 0);
     }
 
     #[test]

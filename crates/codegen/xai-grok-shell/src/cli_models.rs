@@ -163,10 +163,22 @@ mod tests {
         _codex_path: crate::auth::openai_codex::TestManagerAuthPathGuard,
     }
 
-    /// Isolate auth sources without changing `GROK_AUTH_PATH` process-wide.
-    fn isolate_auth_sources() -> (tempfile::TempDir, IsolatedAuthSourceGuards) {
+    /// Isolate the auth sources that `AuthStatus::resolve` consults, without
+    /// changing `GROK_AUTH_PATH` process-wide.
+    ///
+    /// Three seams, none of them the same one: `TestXaiAuthHomeGuard` for the
+    /// xAI home (`grok_home()` is OnceLock-cached, so the env cannot move it),
+    /// `TestManagerAuthPathGuard` for `openai_codex::manager`, and the
+    /// `CodexAuthPathGuard` pin for Codex constructors that resolve the
+    /// auth.json path themselves (#343).
+    fn isolate_auth_sources() -> (
+        tempfile::TempDir,
+        crate::auth::openai_codex::CodexAuthPathGuard,
+        IsolatedAuthSourceGuards,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("no-auth.json");
+        let pin = crate::auth::openai_codex::CodexAuthPathGuard::pin(auth_path.clone());
         let env = [
             EnvGuard::unset(XAI_API_KEY_ENV_VAR),
             EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR),
@@ -180,7 +192,7 @@ mod tests {
             _xai_home: TestXaiAuthHomeGuard::install(dir.path()),
             _codex_path: crate::auth::openai_codex::TestManagerAuthPathGuard::install(&auth_path),
         };
-        (dir, guards)
+        (dir, pin, guards)
     }
 
     fn byok_and_deployment_toml(model_id: &str) -> String {
@@ -204,7 +216,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_api_key_env() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let _key = EnvGuard::set(XAI_API_KEY_ENV_VAR, "xai-test-key");
         assert_eq!(AuthStatus::resolve(&Config::default()), AuthStatus::ApiKey);
     }
@@ -212,7 +224,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_legacy_api_key_env() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let _key = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "legacy-key");
         assert_eq!(AuthStatus::resolve(&Config::default()), AuthStatus::ApiKey);
     }
@@ -220,7 +232,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_oauth_session() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let token = GrokAuth {
             key: "session-token".into(),
             auth_mode: AuthMode::WebLogin,
@@ -238,7 +250,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_model_api_key_byok() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let dm = crate::models::default_model();
         let cfg = config_from_toml(&format!(
             r#"
@@ -256,7 +268,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_model_env_key_byok() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         const TEST_ENV: &str = "TEST_AUTH_STATUS_BYOK_ENV_KEY";
         let dm = crate::models::default_model();
         let cfg = config_from_toml(&format!(
@@ -280,10 +292,33 @@ mod tests {
         }
     }
 
+    /// Without a Codex credential the preset is unready, so the banner must
+    /// still read "not authenticated" — the Codex status is not merely
+    /// "a Codex entry exists in the catalog".
+    #[test]
+    #[serial]
+    fn resolve_not_authenticated_when_the_codex_preset_is_unready() {
+        let (_dir, _pin, _g) = isolate_auth_sources();
+        assert_eq!(
+            AuthStatus::resolve(&config_from_toml("")),
+            AuthStatus::NotAuthenticated
+        );
+    }
+
+    /// A deployment key is an xAI-side credential, so it outranks the
+    /// Codex-only status — whose message asserts there is no xAI credential.
+    #[test]
+    #[serial]
+    fn resolve_prefers_deployment_key_over_codex_only_status() {
+        let (_dir, _pin, _g) = isolate_auth_sources();
+        let mut cfg = config_from_toml("");
+        cfg.endpoints.deployment_key = Some("deploy-key".into());
+        assert_eq!(AuthStatus::resolve(&cfg), AuthStatus::DeploymentKey);
+    }
     #[test]
     #[serial]
     fn resolve_deployment_key() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let mut cfg = Config::default();
         cfg.endpoints.deployment_key = Some("deploy-key".into());
         assert_eq!(AuthStatus::resolve(&cfg), AuthStatus::DeploymentKey);
@@ -314,7 +349,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_not_authenticated() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         assert_eq!(
             AuthStatus::resolve(&Config::default()),
             AuthStatus::NotAuthenticated
@@ -324,7 +359,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_priority_api_key_over_byok_and_deployment() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let _key = EnvGuard::set(XAI_API_KEY_ENV_VAR, "xai-test-key");
         let dm = crate::models::default_model();
         let cfg = config_from_toml(&byok_and_deployment_toml(dm));
@@ -334,7 +369,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_priority_session_over_byok_and_deployment() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let token = GrokAuth {
             key: "session-token".into(),
             auth_mode: AuthMode::WebLogin,
@@ -354,7 +389,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_priority_byok_over_deployment() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let dm = crate::models::default_model();
         let cfg = config_from_toml(&byok_and_deployment_toml(dm));
         assert_eq!(
@@ -366,7 +401,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_disable_api_key_auth_suppresses_byok_banner() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let dm = crate::models::default_model();
         let cfg = config_from_toml(&format!(
             r#"
@@ -384,7 +419,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_disable_api_key_auth_falls_through_to_deployment() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let dm = crate::models::default_model();
         let cfg = config_from_toml(&format!(
             r#"
@@ -405,7 +440,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_model_credentials_uses_first_catalog_key() {
-        let (_dir, _g) = isolate_auth_sources();
+        let (_dir, _pin, _g) = isolate_auth_sources();
         let cfg = config_from_toml(
             r#"
             [model."my-openai"]

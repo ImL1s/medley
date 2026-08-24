@@ -127,10 +127,13 @@ fn handle_picking_enum(state: &mut SettingsModalState, key: &KeyEvent) -> Settin
         KeyCode::Enter => {
             // Disabled dynamic choices stay focusable so keyboard users can
             // read their readiness reason, but Enter must not close the picker
-            // or dispatch an action. The dispatcher retains its fail-closed
-            // guard for catalog changes between this check and dispatch.
-            if picker_choice_is_disabled(state, setting_key, choices_idx) {
-                return SettingsKeyOutcome::Unchanged;
+            // or dispatch an action. Surfacing the reason as a toast keeps the
+            // refusal explainable instead of silently swallowing the keystroke;
+            // the modal stays open either way. The dispatcher retains its
+            // fail-closed guard for catalog changes between this check and
+            // dispatch.
+            if let Some(reason) = picker_disabled_reason(state, setting_key, choices_idx) {
+                return SettingsKeyOutcome::Toast(reason);
             }
             // Commit: dispatch the typed COMMIT Action for the
             // currently-focused choice. This is the single place
@@ -549,6 +552,34 @@ pub(super) fn picker_choice_at(
         .map(|c| c.canonical)
 }
 
+/// Read the reason attached to a disabled runtime choice. Static enum choices
+/// carry no disabled metadata and therefore always return `None`.
+///
+/// This is the single disabled-choice classifier for the picker: both the
+/// keyboard commit path and the mouse commit path route through it, so a row
+/// can never be blocked in one and committable in the other. A disabled row
+/// with an empty reason falls back to the catalog-changed toast rather than
+/// showing a blank message.
+fn picker_disabled_reason(
+    state: &SettingsModalState,
+    key: SettingKey,
+    idx: usize,
+) -> Option<String> {
+    let meta = state.registry.find(key)?;
+    let SettingKind::DynamicEnum { source, .. } = &meta.kind else {
+        return None;
+    };
+    let choices = dynamic_enum_choices(*source, &state.pager_snapshot);
+    let choice = choices.get(idx)?;
+    choice.disabled.then(|| {
+        if choice.disabled_reason.is_empty() {
+            crate::slash::commands::model::CATALOG_CHANGED_TOAST.to_string()
+        } else {
+            choice.disabled_reason.clone()
+        }
+    })
+}
+
 /// Owned-string variant of `picker_choice_at` for picker kinds whose
 /// canonicals are runtime-built (`SettingKind::DynamicEnum`).
 ///
@@ -580,18 +611,15 @@ fn picker_choice_at_owned(
     }
 }
 
-/// Read the reason attached to a disabled runtime choice. Static enum choices
-/// have no disabled metadata and therefore always return `None`.
+/// Whether the choice at `idx` is present but not committable (for example, a
+/// model whose provider has no usable credential). Static enum choices carry no
+/// disabled metadata and are never disabled.
+///
+/// Deliberately delegates to `picker_disabled_reason` rather than re-deriving
+/// the predicate: a second classifier is a second chance to disagree with the
+/// keyboard path about whether a row can be committed.
 fn picker_choice_is_disabled(state: &SettingsModalState, key: SettingKey, idx: usize) -> bool {
-    let Some(meta) = state.registry.find(key) else {
-        return false;
-    };
-    let SettingKind::DynamicEnum { source, .. } = &meta.kind else {
-        return false;
-    };
-    dynamic_enum_choices(*source, &state.pager_snapshot)
-        .get(idx)
-        .is_some_and(|choice| choice.disabled_reason.is_some())
+    picker_disabled_reason(state, key, idx).is_some()
 }
 
 /// F2 / Ctrl+, / Cmd+, are the modal-internal close keys.
@@ -1158,6 +1186,9 @@ fn handle_picker_mouse(
         return SettingsKeyOutcome::Unchanged;
     };
     if target_idx == current_idx {
+        if let Some(reason) = picker_disabled_reason(state, setting_key, target_idx) {
+            return SettingsKeyOutcome::Toast(reason);
+        }
         // Already focused — re-clicking the same choice is a no-op
         // (kept for parity with the row-list's "already-focused
         // click commits" semantics; commit fires on Enter, not on

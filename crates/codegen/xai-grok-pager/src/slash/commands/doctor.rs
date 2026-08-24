@@ -84,6 +84,7 @@ impl SlashCommand for DoctorCommand {
                     display: handle.into(),
                     match_text: format!("fix {handle} {id}"),
                     insert_text: format!("fix {handle}"),
+                    identity: String::new(),
                     description: label.into(),
                     ..Default::default()
                 })
@@ -94,6 +95,7 @@ impl SlashCommand for DoctorCommand {
             display: "fix".into(),
             match_text: "fix".into(),
             insert_text: "fix".into(),
+            identity: String::new(),
             description: "Show automatic fixes available here".into(),
             ..Default::default()
         }])

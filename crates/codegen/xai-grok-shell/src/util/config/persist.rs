@@ -183,6 +183,7 @@ fn merge_section<T: serde::Serialize>(
                 .or_insert_with(|| TomlValue::Table(TomlMap::new()));
             if let TomlValue::Table(existing) = section {
                 merge_toml_tables(existing, new_fields);
+                strip_retired_ui_aliases(key, existing);
             } else {
                 *section = TomlValue::Table(new_fields);
             }
@@ -191,6 +192,19 @@ fn merge_section<T: serde::Serialize>(
         Ok(_) | Err(_) => {
             table.remove(key);
         }
+    }
+}
+
+/// Drop `[ui].simple_mode` once the public `readline_mode` key is written so
+/// serde cannot see both names (the field uses `alias = "simple_mode"`).
+fn strip_retired_ui_aliases(section_key: &str, existing: &mut TomlMap<String, TomlValue>) {
+    if section_key != "ui" {
+        return;
+    }
+    let ui = crate::agent::config::UiConfig::READLINE_MODE_KEY;
+    let alias = crate::agent::config::UiConfig::SIMPLE_MODE_ALIAS_KEY;
+    if existing.contains_key(ui) {
+        existing.remove(alias);
     }
 }
 /// Update settings with a read-modify-write, preserving unrelated fields.

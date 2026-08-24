@@ -58,7 +58,7 @@ pub use handle::{
 pub use hub::HubConfig;
 pub use permission::*;
 pub use session::{WorkspaceSession, WorkspaceShared};
-pub use session::{file_state, git, jj};
+pub use session::{anchored, file_state, fresh_publication, git, id_lock, jj, publication_parent};
 pub use upload::environment::{WorkspaceEnvironment, WorkspaceIdentity};
 pub use workspace_ops::{WorkspaceOp, WorkspaceOps};
 pub use xai_grok_workspace_client::WorkspaceClient;

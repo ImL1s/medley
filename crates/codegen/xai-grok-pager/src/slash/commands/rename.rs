@@ -58,10 +58,7 @@ impl SlashCommand for RenameCommand {
             match_text: title.to_owned(),
             insert_text: title.to_owned(),
             description: "current title".to_string(),
-            badge: String::new(),
-            dimmed: false,
-            non_selectable: false,
-            blocked_reason: String::new(),
+            ..Default::default()
         }])
     }
 

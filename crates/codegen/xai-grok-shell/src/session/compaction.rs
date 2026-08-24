@@ -1777,10 +1777,11 @@ impl SessionActor {
         context_window: std::num::NonZeroU64,
     ) -> Option<AutoCompactTriggerInfo> {
         let cw = context_window.get();
-        if xai_token_estimation::exceeds_threshold(
+        if crate::util::config::exceeds_auto_compact_threshold(
             total_tokens,
             cw,
             self.compaction.threshold_percent.get(),
+            self.compaction.token_limit.get(),
         ) {
             let percentage = xai_token_estimation::usage_percentage_u8(total_tokens, cw);
             Some(AutoCompactTriggerInfo {

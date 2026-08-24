@@ -2056,6 +2056,13 @@ pub(crate) async fn spawn_session_actor(
         forked_tool_override,
         compaction: super::compaction_config::CompactionConfig {
             threshold_percent: std::cell::Cell::new(auto_compact_threshold_percent),
+            token_limit: std::cell::Cell::new(
+                sampling_config
+                    .codex_wire
+                    .as_ref()
+                    .and_then(|capabilities| capabilities.auto_compact_token_limit)
+                    .filter(|limit| *limit > 0),
+            ),
             force_compact: force_compact.clone(),
             context_window_override,
             count: std::sync::atomic::AtomicU64::new(0),

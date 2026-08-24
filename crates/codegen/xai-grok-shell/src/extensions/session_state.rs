@@ -83,15 +83,21 @@ struct ImportRequest {
 /// `x.ai/session/import`: recreate a session on this host from mirrored columns and
 /// transcript. A session that already exists locally is left unchanged.
 pub(crate) async fn handle_import(args: &acp::ExtRequest) -> ExtResult {
+    handle_import_in(&crate::util::grok_home::grok_home(), args).await
+}
+
+/// [`handle_import`] against an explicit GROK_HOME root. The shipped handler
+/// and symlink-escape tests share this body.
+pub(crate) async fn handle_import_in(root: &Path, args: &acp::ExtRequest) -> ExtResult {
     let mut request: ImportRequest = super::parse_params(args)?;
     validate_session_uuid(&request.session_id)?;
 
-    let info = crate::session::info::Info {
-        id: acp::SessionId::new(request.session_id.clone()),
-        cwd: request.cwd.clone(),
-    };
-    let dir = crate::session::persistence::session_dir(&info);
-    let sessions_root = crate::util::grok_home::grok_home().join("sessions");
+    // Same layout `session_dir` resolves for the shipped root, expressed
+    // against `root` so symlink-escape tests can drive a temporary GROK_HOME.
+    let sessions_root = root.join("sessions");
+    let dir = sessions_root
+        .join(crate::util::grok_home::encode_cwd_dirname(&request.cwd))
+        .join(&request.session_id);
     let imported = import_into_root(&mut request, &sessions_root, dir).await?;
     super::to_raw_response(&json!({ "imported": imported }))
 }
@@ -227,7 +233,18 @@ fn write_import(
     state: &std::collections::HashMap<String, Value>,
     updates: &[Value],
 ) -> std::io::Result<()> {
+    write_import_checked(dir, state, updates, || Ok(()))
+}
+
+fn write_import_checked(
+    dir: &Path,
+    state: &std::collections::HashMap<String, Value>,
+    updates: &[Value],
+    revalidate: impl Fn() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    revalidate()?;
     crate::util::grok_home::create_dir_all_owner_only(dir)?;
+    revalidate()?;
 
     // Clear every file this import owns so a leftover from a failed attempt can't
     // merge with the new snapshot; this import is authoritative.
@@ -236,6 +253,7 @@ fn write_import(
     for (_, rel) in COLUMNS {
         let _ = std::fs::remove_file(dir.join(rel));
     }
+    revalidate()?;
 
     if !updates.is_empty() {
         st::write_jsonl_atomic(&dir.join(st::UPDATES_FILE), updates)?;
@@ -378,6 +396,118 @@ mod tests {
         assert!(
             !dir.join("signals.json").exists(),
             "orphan column from a failed import dropped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fork_and_import_reject_symlinked_encoded_cwd_parent() {
+        use crate::session::fork::{ForkSessionRequest, fork_session_in};
+        use crate::session::info::Info;
+        use crate::session::storage::{JsonlStorageAdapter, StorageAdapter};
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+
+        fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            let mut out = BTreeMap::new();
+            fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+                let mut entries: Vec<_> = std::fs::read_dir(dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .collect();
+                entries.sort_by_key(|entry| entry.file_name());
+                for entry in entries {
+                    let path = entry.path();
+                    let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                    let meta = std::fs::symlink_metadata(&path).unwrap();
+                    if meta.file_type().is_symlink() {
+                        out.insert(
+                            rel,
+                            format!("symlink->{}", std::fs::read_link(&path).unwrap().display())
+                                .into_bytes(),
+                        );
+                    } else if meta.is_dir() {
+                        out.insert(rel, b"dir".to_vec());
+                        walk(root, &path, out);
+                    } else {
+                        out.insert(rel, std::fs::read(&path).unwrap());
+                    }
+                }
+            }
+            walk(root, root, &mut out);
+            out
+        }
+
+        let grok = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("canary"), b"outside-untouched-340").unwrap();
+        let before = snapshot(outside.path());
+
+        let target_cwd = "/repo/issue-340/workspace";
+        let encoded = crate::util::grok_home::encode_cwd_dirname(target_cwd);
+        let sessions = grok.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        symlink(outside.path(), sessions.join(&encoded)).unwrap();
+
+        let source_cwd = "/repo/issue-340/source";
+        let source_id = "019c0000-0000-7000-8000-000000000340";
+        let storage = JsonlStorageAdapter::with_root(grok.path().to_path_buf());
+        let source_info = Info {
+            id: acp::SessionId::new(source_id),
+            cwd: source_cwd.to_string(),
+        };
+        storage
+            .init_session(&source_info, acp::ModelId::new("grok-code-fast-1"))
+            .await
+            .unwrap();
+
+        let fork = fork_session_in(
+            grok.path().to_path_buf(),
+            ForkSessionRequest {
+                source_session_id: source_id.to_string(),
+                source_cwd: source_cwd.to_string(),
+                new_cwd: target_cwd.to_string(),
+                new_session_id: Some("019c0000-0000-7000-8000-000000000341".to_string()),
+                ..Default::default()
+            },
+            "test-agent",
+            None,
+        )
+        .await;
+        assert!(
+            fork.is_err(),
+            "fork must reject a symlinked encoded-CWD parent: {fork:?}"
+        );
+
+        let import_id = "019c0000-0000-7000-8000-000000000342";
+        let import_info = Info {
+            id: acp::SessionId::new(import_id),
+            cwd: target_cwd.to_string(),
+        };
+        let summary = crate::session::persistence::Summary::new(
+            &import_info,
+            acp::ModelId::new("grok-code-fast-1"),
+        )
+        .unwrap();
+        let params = json!({
+            "sessionId": import_id,
+            "cwd": target_cwd,
+            "state": { "summary": summary },
+            "updates": []
+        });
+        let raw = serde_json::value::to_raw_value(&params).unwrap();
+        let args = acp::ExtRequest::new("x.ai/session/import", std::sync::Arc::from(raw));
+        let imported = handle_import_in(grok.path(), &args).await;
+        assert!(
+            imported.is_err(),
+            "import must reject a symlinked encoded-CWD parent: {imported:?}"
+        );
+
+        assert_eq!(snapshot(outside.path()), before);
+        assert_eq!(
+            std::fs::read(outside.path().join("canary")).unwrap(),
+            b"outside-untouched-340"
         );
     }
 

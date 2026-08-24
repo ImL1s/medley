@@ -95,6 +95,9 @@ pub struct ArgItem {
     pub match_text: String,
     /// Text inserted into the prompt on acceptance.
     pub insert_text: String,
+    /// Stable row identity for catalog remaps. `/model` stores the
+    /// catalog `ModelId` here; empty means remap by `insert_text`.
+    pub identity: String,
     /// Description shown alongside the item.
     pub description: String,
     /// Optional badge shown after the label (e.g. "ready", "missing").
@@ -105,6 +108,45 @@ pub struct ArgItem {
     pub non_selectable: bool,
     /// Toast / error text when a non-selectable row is activated.
     pub blocked_reason: String,
+    /// When true, a fresh empty-query argument surface should highlight this
+    /// row instead of catalog index 0. Exactly one preferred row is honored;
+    /// zero or multiple fall back to 0.
+    pub initially_selected: bool,
+}
+
+impl ArgItem {
+    /// Index of the single preferred row, or 0 when none / more than one.
+    pub fn preferred_index(items: &[Self]) -> usize {
+        preferred_initial_index(items.iter().map(|item| item.initially_selected))
+    }
+
+    /// Prefer catalog `identity` (ModelId) so a display-name refresh or a
+    /// colliding sibling cannot move the focused `/model` row.
+    pub fn remap_selection(items: &[Self], prev: Option<&str>) -> usize {
+        if let Some(prev) = prev
+            && let Some(idx) = items.iter().position(|item| {
+                (!item.identity.is_empty() && item.identity == prev) || item.insert_text == prev
+            })
+        {
+            return idx;
+        }
+        Self::preferred_index(items)
+    }
+}
+
+/// Shared preferred-row rule for arg items and suggestion rows.
+pub(crate) fn preferred_initial_index(flags: impl IntoIterator<Item = bool>) -> usize {
+    let mut found = None;
+    for (idx, preferred) in flags.into_iter().enumerate() {
+        if !preferred {
+            continue;
+        }
+        if found.is_some() {
+            return 0;
+        }
+        found = Some(idx);
+    }
+    found.unwrap_or(0)
 }
 
 /// Read-only context for generating suggestions.

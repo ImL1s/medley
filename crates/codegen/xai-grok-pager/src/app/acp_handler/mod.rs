@@ -27,7 +27,7 @@ use crate::app::agent::{
     AgentId, AgentSession, AgentState, BgTaskState, BgTaskStatus, GoalDisplayPhase,
     GoalDisplayState, GoalDisplayStatus,
 };
-use crate::notifications::{NotificationEvent, NotificationEventKind};
+use crate::notifications::NotificationEventKind;
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SessionEvent;
 use crate::views::permission_view::{

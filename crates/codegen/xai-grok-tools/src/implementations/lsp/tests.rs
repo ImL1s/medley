@@ -1653,16 +1653,16 @@ async fn a_server_that_publishes_is_not_second_guessed_with_a_pull() {
         summary.contains("the check that only the push channel runs"),
         "{summary}"
     );
-
-    // And from here on it is not asked at all — its own reports are the truth.
     let before = mgr.lock().await.clients["mock-ts"].pull.support();
     assert_eq!(before, super::pull::PullSupport::Asking, "not rejected");
+    // And from here on it is not asked at all — its own reports are the truth.
     for round in 0..3 {
         let text = format!("const y = {round};\n");
         std::fs::write(&file, &text).unwrap();
         mgr.lock().await.notify_file_changed(&file, &text);
-        // Same wait as the open above: a one-shot drain can return before the
-        // mock's publish is processed, even after a previous edit succeeded.
+        // Condition-based wait (#295), same as the open above: a one-shot drain
+        // can return before the mock's publish is processed, even after a
+        // previous edit succeeded.
         let summary = drain_until_reported(&mgr, "the check that only the push channel runs").await;
         assert!(
             summary.contains("the check that only the push channel runs"),

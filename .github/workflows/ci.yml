@@ -3,6 +3,9 @@ name: CI
 # Product-line CI for the ImL1s fork.
 # `main` stays a pristine upstream mirror (no fork workflows there).
 # Feature / sync PRs target `providers`; pushes to `providers` also run CI.
+#
+# Every GitHub Action is pinned to a full commit SHA (issue #30); the
+# version tag in the trailing comment is documentation only.
 
 on:
   push:
@@ -32,7 +35,7 @@ jobs:
     name: Audit publisher tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Validate checked-in audit manifest
         run: python3 -B scripts/publish-audit-issues.py --validate-only
@@ -60,6 +63,9 @@ jobs:
       - name: Guard distChannel docs against the release stamp
         run: python3 -B -m unittest tests.test_dist_channel_docs_guard -v
 
+      - name: Enforce SHA-pinned GitHub Actions
+        run: python3 -B -m unittest tests.test_workflow_action_pins -v
+
       # The user guide is extracted to <grok_home>/docs/user-guide/ at startup
       # and docs/architecture/ is not, so a relative link out of the guide
       # directory is broken for installed readers (#385 shipped one).
@@ -79,7 +85,7 @@ jobs:
     name: Installer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # The installer is the one thing here that runs on machines unlike this
       # one, and until now nothing exercised it at all — every claim about it
@@ -142,7 +148,7 @@ jobs:
     name: Sync upstream script
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Lint sync-upstream shell scripts
         run: |
@@ -158,10 +164,10 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
           components: rustfmt
@@ -174,7 +180,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Full history: the check needs a merge base to find what this branch added.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -203,10 +209,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
 
@@ -229,7 +235,7 @@ jobs:
           & $protoc --version
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: providers-windows-session-publication
           cache-targets: true
@@ -269,10 +275,10 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
 
@@ -283,7 +289,7 @@ jobs:
           "$PROTOC" --version
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: providers-macos-session-publication
           cache-targets: true
@@ -313,10 +319,10 @@ jobs:
     name: Compile every test target
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
 
@@ -327,7 +333,7 @@ jobs:
           "$PROTOC" --version
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: providers-compile-tests
           cache-targets: true
@@ -342,10 +348,10 @@ jobs:
     name: Clippy (hot path)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
           components: clippy
@@ -357,7 +363,7 @@ jobs:
           "$PROTOC" --version
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: providers-lint
           cache-targets: true
@@ -384,10 +390,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.94.0"
 
@@ -408,7 +414,7 @@ jobs:
           "$PROTOC" --version
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: providers-test
           cache-targets: true
@@ -573,10 +579,39 @@ jobs:
             codex_wire_capabilities_omit_reasoning_summary_when_unsupported -- --nocapture
           run_nonzero -p xai-grok-sampling-types --lib \
             codex_wire_capabilities_keep_summary_when_catalog_allows_or_is_silent -- --nocapture
+          # #259 / #261: catalog compact, truncation, effort, and image-detail
+          # fields reach parse + apply (unique names so run_nonzero still binds).
+          run_nonzero -p xai-grok-sampling-types --lib \
+            codex_wire_capabilities_set_request_truncation_for_token_policy -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            codex_wire_capabilities_read_image_detail_original_fail_closed -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            codex_instructions_receive_catalog_base_instructions -- --nocapture
+          # #274: Sol catalog use_responses_lite must reshape the request body.
+          run_nonzero -p xai-grok-sampling-types --lib \
+            use_responses_lite -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            use_responses_lite -- --nocapture
           # #263: the catalog parser and the single chat-state mutation must
           # both run; xai-chat-state previously had no CI filter (#280).
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_and_validates_truncation_policy -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_reads_auto_compact_token_limit -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_keeps_image_detail_original_and_instructions -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            resolve_auto_compact_token_threshold_uses_catalog_absolute_limit -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            should_auto_compact_honors_catalog_token_limit -- --nocapture
+          # #260: a Codex-routed entry whose wire model is not a catalog slug
+          # is unready before request I/O; a real slug override stays ready.
+          run_nonzero -p xai-grok-shell --lib \
+            codex_wire_model_catalog_slug_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_reads_minimal_client_version -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_reads_upgrade_migration -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             tool_result_truncation_policy_catalog_refresh_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -613,6 +648,24 @@ jobs:
           # authoritative streamed items survive partial terminal output.
           run_nonzero -p xai-grok-tools --lib \
             codex_web_search_reconciles_partial_terminal_output_for_both_entry_points -- --nocapture
+          # #354: web-search must strip xAI identity / internal metadata at
+          # third-party origins after every header source has merged.
+          run_nonzero -p xai-grok-tools --lib \
+            third_party_request_build_strips_merged_identity_headers -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            mixed_case_extra_headers_cannot_bypass_request_build_scrub -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            mixed_case_env_header_names_cannot_bypass_third_party_scrub -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            trusted_xai_request_build_keeps_first_party_headers -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            trusted_proxy_request_build_keeps_first_party_headers -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            third_party_wire_request_has_no_internal_metadata -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            primary_subagent_and_model_switch_request_builds_share_boundary -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            codex_web_search_drops_internal_metadata_from_merged_headers -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_errors_never_echo_provider_controlled_credentials -- --nocapture
           # #151: an unlabelled chat-state credential reaching an external origin
@@ -632,10 +685,11 @@ jobs:
             keyless_local_server_catalog_emits_auth_scheme_none -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             keyless_local_mock_catalog_entry_is_ready_on_loopback -- --nocapture
-          # #132: the reader's dup must not be inherited by children. Named
-          # explicitly rather than by a `pty_session` prefix: the rest of that
-          # module is the hang this change fixes, and this one is the fd leak
-          # the fix introduced.
+          # #132: the reader's dup must not be inherited by children -- the fd
+          # leak the hang fix introduced. The rest of that module is enrolled by
+          # name in "Restricted subagent capability boundaries" (#417); an
+          # earlier version of this comment claimed it was not run at all, which
+          # a substring filter had already made untrue.
           run_nonzero -p xai-grok-shell --lib \
             dup_fd_is_not_inherited_by_exec_child -- --nocapture
           # #13: env-key normalization. In this step rather than the auth one
@@ -777,6 +831,14 @@ jobs:
             test_typed_response_max_reasoning_effort_stamped_on_assistant_as_max -- --nocapture
           run_nonzero -p xai-grok-sampling-types --lib \
             test_response_wrapper_keeps_client_ultra_separate_from_typed_max -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_preserves_mixed_ultra_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_preserves_ultra_only_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            subagent_reasoning_override_preserves_ultra_when_child_menu_offers_it -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            pager_model_state_exposes_ultra_in_the_menu -- --nocapture
           # #360: `/new` must use the same implicit built-in effort menu as
           # model switching when support is explicit but the catalog list is empty.
           run_nonzero -p xai-grok-shell --lib \
@@ -879,6 +941,9 @@ jobs:
             gateway_refresh_fence_prevents_stale_snapshot_reconciliation -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             resolve_session_toolset_mcp_kind_none_dropped_under_readonly -- --nocapture
+          # #354: workspace proxy-header injection is first-party only.
+          run_nonzero -p xai-grok-workspace --lib \
+            build_proxy_headers_ -- --nocapture
           run_nonzero -p xai-computer-hub-sdk --lib \
             unavailable_handlers_are_absent_from_publish_and_dispatch -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
@@ -893,6 +958,16 @@ jobs:
             unrestricted_generation_guard_rejects_reused_session_id -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             drop_cleanup_clears_old_generation_resources_written_in_flight -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            local_session_reservation_ -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            session::anchored -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            session::fresh_publication -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            session::publication_parent -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            session::id_lock -- --nocapture
           run_nonzero -p xai-circuit-breaker --lib \
             edge_client_retries_transient_edge_codes_but_not_origin_tls -- --nocapture
           run_nonzero -p xai-sqlite-journal --lib \
@@ -995,6 +1070,8 @@ jobs:
             anchored_directory:: -- --nocapture
           run_nonzero -p xai-grok-auth --lib \
             bearer_fragment:: -- --nocapture
+          run_nonzero -p xai-grok-auth --lib \
+            internal_metadata:: -- --nocapture
           run_nonzero -p xai-grok-markdown --lib \
             render:: -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
@@ -1103,6 +1180,9 @@ jobs:
           # mutate GROK_HOME / XAI_API_KEY in parallel and steal their isolation.
           run_nonzero -p xai-grok-shell --lib \
             agent::mvp_agent:: -- --nocapture --test-threads=1
+          # #354: identity headers are not injected for third-party origins.
+          run_nonzero -p xai-grok-shell --lib \
+            inject_proxy_headers_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::otel_gate:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -1147,8 +1227,18 @@ jobs:
             remote:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             sampling:: -- --nocapture
+          # libtest filters are substring matches, not prefixes, so a bare
+          # `session::` also selects `terminal::pty_session::tests::*` -- five
+          # PTY guards reached CI that way and nothing said so (#417). Skip
+          # them here and enrol the module by name below, so PTY coverage is a
+          # decision rather than a side effect of this filter's reach.
           run_nonzero -p xai-grok-shell --lib \
-            session:: -- --nocapture
+            session:: -- --nocapture --skip terminal::
+          # #132/#417: all six PTY guards, named. Process lifetime and fd
+          # inheritance are exactly the class where a silent coverage loss is
+          # expensive, and #408 means no other check would report it.
+          run_nonzero -p xai-grok-shell --lib \
+            terminal::pty_session::tests:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             terminal:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -1231,6 +1321,14 @@ jobs:
           run_nonzero -p xai-grok-pager --test settings_e2e -- --nocapture
           run_nonzero -p xai-grok-shell --test acp_session_setup_wire \
             acp_session_setup_conformance -- --nocapture
+          # #409: the only assertion that production honours `GROK_AUTH_PATH`.
+          # It has to be an integration target -- `cfg(test)` builds resolve
+          # through the thread-local pin instead, so no unit test can reach the
+          # env branch. No positional after `--test`: the target name is not a
+          # module path inside the binary, and `run_nonzero` fails a filter that
+          # matches zero tests (see `grok_home_paths` above).
+          run_nonzero -p xai-grok-shell --test test_auth_path_env_precedence \
+            -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
             resolve_failure_refuses_for_deny_carrying_devbox_extends -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
@@ -1393,6 +1491,9 @@ jobs:
             models_update_meta_clears_substitution_after_catalog_lands -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             warm_cache_refresh_does_not_reseat_over_user_model_pick -- --nocapture
+          # #358: 400 detail extraction must tolerate an optional reason phrase.
+          run_nonzero -p xai-grok-shell --lib \
+            remainder_after_http_400_prefix -- --nocapture
 
       - name: Pager model picker / readiness
         run: |
@@ -1425,6 +1526,35 @@ jobs:
           # the tests are about what the pager mirrors after a failed write.
           run_nonzero -p xai-grok-pager --lib \
             preferred_model_persist_failure -- --nocapture
+          # #335 / #346 / #358 / #359: live catalog coherence, settings
+          # disablement, 4xx retry banners, and /model initial highlight.
+          # `run_nonzero`, not a bare `cargo test`: this step no longer has a
+          # single unguarded invocation, so a filter that stops matching fails
+          # the job instead of reporting a green `0 passed`.
+          run_nonzero -p xai-grok-pager --lib \
+            unavailable_resident -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            models_update_refreshes_open_settings -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            model_auto_switched_reconciles -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            settings_model_picker_enter_on_disabled -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            settings_model_picker_mouse_on_disabled -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            dynamic_enum_choices_marks_unavailable -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            provider_request_failed_http -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            provider_http_400 -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            fresh_model_suggestions_highlight -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            model_suggestion_refresh_preserves -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            nonempty_fuzzy_model_query -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            preferred_model_row_falls_back -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             refresh_open_settings_modals_exits_dynamic_picker_when_highlighted_model_disappears -- --nocapture
 
@@ -1547,6 +1677,26 @@ jobs:
             fork_registration_remote_pull_preserves_inherited_model_identity_and_harness -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             copy_session_data_with_model_override -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue345_fork_rewrites_parent_compaction_transcript_hint -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue345_checkpoint_rebind_runs_on_deserialized_items -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue423_fork_preserves_authored_summary_text_verbatim -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            fork_rebinds_checkpoint_hint_without_touching_quoted_transcript_paths -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            fork_and_import_reject_symlinked_encoded_cwd_parent -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            init_session_rejects_symlinked_encoded_cwd_occupant_without_summary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_interruption_before_intent_rename_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_interruption_after_intent_rename_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            list_sessions_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            list_sessions_recent_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
 
       # #166: these assert on colour, and used to inherit the ambient colour
       # level. Run them under both settings of NO_COLOR -- one pass alone would
@@ -1962,6 +2112,82 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_fallback_uses_builtin_preset_when_fetch_is_empty -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            resolve_credentials_refuses_ambient_xai_for_non_first_party_origin -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            openai_codex_path_constructor_ignores_grok_auth_path_env -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            inspect_model_route_line_is_secret_free -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue281_inference_idle_timeout_uses_child_model -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            new_session_keeps_effort_when_supported_menu_is_implicit -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            clone_drop_does_not_cancel_sibling_publication -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            concurrent_uncommitted_clone_drops_remove_private_stage -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            session::publication_parent -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            dynamic_enum_choices_disables_by_model_id_not_display_name -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            remap_picking_enum_resets_when_focused_model_disappears -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            remap_picking_enum_keeps_the_focused_model_id_when_display_names_collide -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            action_for_string_commits_catalog_model_id_not_display_name -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            every_dynamic_enum_setting_has_action_for_string_arm -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue244_typed_provider_failure -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue244_headless_typed_provider_failure_omits_acp_internal_error_envelope -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue244_retry_failed_non_retryable_4xx_is_not_labelled_retry_failed -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_catalog_upgrade_migration_is_visible_in_model_picker -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            build_model_items_match_issue17_duplicate_display_name -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            remap_model_picker_selection_keeps_focused_id_when_display_names_collide -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue15_doctor_providers -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            doctor_providers_empty_omits_the_section -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue15_doctor_json_providers_rows_are_secret_free -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue15_provider_facts_from_model_state_mark_unready_without_secrets -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue15_provider_facts_from_model_state_does_not_fabricate_external_trust -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue15_standalone_doctor_collects_provider_rows_from_inspect_routes -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue15_inspect_model_routes_from_toml_covers_keyless_bearer_and_x_api_key -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue15_inspect_model_routes_from_toml_is_empty_when_config_parse_fails -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue15_inspect_model_routes_from_toml_does_not_attempt_live_codex_catalog_fetch -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue15_inspect_config_load_does_not_attempt_live_codex_catalog_fetch -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue17_run_commits_focused_catalog_id_when_display_names_collide -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            resolve_by_name_or_id_prefers_catalog_id_when_display_names_collide -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            model_auto_switched_uncatalogued_target_is_unavailable_resident -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue49 -- --nocapture
+          run_nonzero -p xai-grok-shared --lib \
+            simple_mode_alias_loads_legacy_ui_key_issue66 -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            new_from_toml_cfg_accepts_both_readline_mode_and_simple_mode_issue66 -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            load_config_from_toml_keeps_compact_mode_when_both_ui_keys_present -- --nocapture
+          run_nonzero -p xai-grok-pager-render --lib \
+            simple_mode_alias_prefers_public_key_issue66 -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            accept_fresh_publication_continues_only_for_committed_durability -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             codex_catalog_credential_source_must_be_openai_codex_provider -- --nocapture
           # #262: last-good catalogs are account-isolated and degraded state is visible.
           run_nonzero -p xai-grok-shell --lib \
@@ -2026,9 +2252,29 @@ jobs:
             hard_expired_nonrefreshable_session_seats_codex -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_only_from_config_seats_codex_and_sampling_stack -- --nocapture
+          # #317: invalid-xAI production probe drain + reseat.
+          run_nonzero -p xai-grok-shell --lib \
+            initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            invalid_env_probe -- --nocapture
+          run_nonzero -p xai-grok-test-support --lib \
+            read_http_request_headers -- --nocapture
+          run_nonzero -p xai-grok-test-support --lib \
+            accept_then_drain_survives_nonblocking_listener -- --nocapture
+          # #318: EnvGuard users of model-selection env vars must serialize.
+          run_nonzero -p xai-grok-test-support --lib \
+            env_guard_serializes_concurrent_mutations -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            construction_fallback_is_unusable_when_the_catalog_endpoint_is_external -- --nocapture
           # #245: catalog wire flags that differ from the Sol preset must parse.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture
+          # #274: parsed use_responses_lite must reach apply_codex_wire_capabilities.
+          run_nonzero -p xai-grok-shell --lib \
+            use_responses_lite -- --nocapture
+          # #264: catalog 95% is the auto-compact tier below user TOML.
+          run_nonzero -p xai-grok-shell --lib \
+            effective_context_window_percent -- --nocapture
           # #261: catalog reasoning menus must reach ACP and remain model-specific in the TUI.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_supported_reasoning_levels_drive_acp_effort_options -- --nocapture
@@ -2084,6 +2330,12 @@ jobs:
             deferred_cli_accepts_minimal_for_menu_less_reasoning_model -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             codex_catalog_effort_options_are_model_specific -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            pager_model_state_exposes_ultra_in_the_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_preserves_mixed_ultra_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_preserves_ultra_only_menu -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release
