@@ -1600,6 +1600,8 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             issue345_checkpoint_rebind_runs_on_deserialized_items -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            issue423_fork_preserves_authored_summary_text_verbatim -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             fork_rebinds_checkpoint_hint_without_touching_quoted_transcript_paths -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             fork_and_import_reject_symlinked_encoded_cwd_parent -- --nocapture
