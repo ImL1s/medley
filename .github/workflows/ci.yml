@@ -344,6 +344,27 @@ jobs:
       - name: cargo test --workspace --no-run
         run: cargo test --workspace --no-run
 
+      # #408: the complement of "New tests run somewhere" (#171). That guard
+      # reads the diff -- which is what lets it work without a `--list` build
+      # and see `#[cfg(target_os = "linux")]` tests -- and the price is that it
+      # cannot see a test that predates the base. This compares a per-crate
+      # `--list` against the same filter set, reusing the build above.
+      #
+      # It runs here, on Linux, deliberately. `--list` omits `#[cfg(target_os =
+      # "linux")]` tests everywhere else, so a baseline written on a developer's
+      # macOS machine would be missing exactly the entries whose absence made
+      # #171's gap invisible.
+      #
+      # The baseline exempts the standing set and fails only on additions, so
+      # this number can shrink deliberately but cannot grow by accident. Do not
+      # regenerate it to make a red build green -- that is the one edit that
+      # turns the guard back into decoration.
+      - name: Tests no filter selects (#408)
+        run: |
+          python3 scripts/check_test_filter_coverage.py \
+            --workflow .github/workflows/ci.yml \
+            --baseline tests/ci/unenrolled-tests.baseline
+
   lint:
     name: Clippy (hot path)
     runs-on: ubuntu-latest

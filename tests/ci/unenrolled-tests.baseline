@@ -1,0 +1,14 @@
+# Tests that no `ci.yml` filter selects, as of the commit that wrote this file.
+#
+# Written by `scripts/check_test_filter_coverage.py --write-baseline`, checked
+# by the "Tests no filter selects (#408)" step of the `compile-tests` job.
+# Entries are `<crate>::<test path>`.
+#
+# This file exempts the standing set so the guard fails only on ADDITIONS.
+# It is allowed to shrink. Regenerating it to turn a red build green is the one
+# edit that converts the guard back into decoration -- if the guard fires,
+# either enrol the new test in a filter or justify the exemption in review.
+#
+# Seeded from CI, not from a developer machine: `cargo test -- --list` omits
+# `#[cfg(target_os = "linux")]` tests everywhere except Linux, and those are
+# exactly the entries whose absence made #171's gap invisible.
