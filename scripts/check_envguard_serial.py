@@ -145,10 +145,17 @@ def _name_paths(code: str) -> dict[str, tuple[str, ...]]:
             )
             paths.setdefault(match.group("item"), segs + (match.group("item"),))
     return paths
-ENV_LOCK_BINDING = re.compile(
+# Binding an expression that merely CONTAINS an env-lock-shaped identifier is
+# not acquiring a lock: `let cfg = read_env_lock_setting();` matched, and every
+# later mutation in that helper then read as serialised. `_protected_spans` was
+# given `ENV_LOCK_VALUE` for this and the helper path was not — the fourth time
+# in this file a property was fixed in one path and left in its sibling
+# (#449 review).
+ENV_LOCK_ACQUIRING_BINDING = re.compile(
     r"let\s+(?P<bind>_\b|[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]*)?=\s*[^;]*?"
-    + ENV_LOCK_NAME
-    + r"[^;]*;"
+    r"(?:(?:[A-Z0-9_]*ENV[A-Z0-9_]*LOCK|LockedTestEnv)\s*(?:\.|::)\s*lock\s*\("
+    r"|\b[a-z0-9_]*env_lock\s*\()"
+    r"[^;]*;"
 )
 
 
@@ -440,9 +447,9 @@ def _env_lock_is_live(body: str) -> bool:
 
     mutations = [m.start() for m in ENV_MUTATION.finditer(body)]
     if not mutations:
-        return bool(ENV_LOCK_BINDING.search(body))
+        return bool(ENV_LOCK_ACQUIRING_BINDING.search(body))
     first, last = mutations[0], mutations[-1]
-    for match in ENV_LOCK_BINDING.finditer(body):
+    for match in ENV_LOCK_ACQUIRING_BINDING.finditer(body):
         name = match.group("bind")
         if name == "_":
             continue
@@ -473,8 +480,19 @@ def _process_group(path: Path) -> str:
     cannot happen.
     """
 
-    if _is_integration_target(path):
-        return f"bin:{path.as_posix()}"
+    parts = path.parts
+    if "tests" in parts and "src" not in parts:
+        # `tests/root.rs` and everything under `tests/root/` compile into ONE
+        # binary. Keying the root and its included modules separately split a
+        # single process into several groups, so key clashes between them were
+        # never compared (#449 review). Group by the first path component under
+        # `tests/`, which is the root's stem either way.
+        index = parts.index("tests")
+        crate = "/".join(parts[:index])
+        if index + 1 < len(parts):
+            root = Path(parts[index + 1]).stem
+            return f"bin:{crate}/tests/{root}"
+        return f"bin:{crate}/tests"
     return f"lib:{_crate_of(path)}"
 
 

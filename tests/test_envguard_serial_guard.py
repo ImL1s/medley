@@ -1206,5 +1206,52 @@ class HelperChainsPropagate(unittest.TestCase):
         found = guard.scan_source(src)
         self.assertEqual(sorted(f.name for f in found), ["one", "two"])
 
+
+class HelperLockNeedsARealAcquisition(unittest.TestCase):
+    """#449: `_protected_spans` required an acquisition; the helper path did not."""
+
+    def _src(self, binding):
+        return textwrap.dedent(
+            f"""\
+            fn prepare() {{
+                {binding}
+                unsafe {{ std::env::set_var("HOME", "/tmp") }};
+            }}
+
+            #[test]
+            fn t() {{
+                prepare();
+            }}
+            """
+        )
+
+    def test_an_env_lock_shaped_identifier_is_not_an_acquisition(self):
+        found = guard.scan_source(self._src("let cfg = read_env_lock_setting();"))
+        self.assertEqual([f.name for f in found], ["t"])
+
+    def test_a_real_acquisition_still_counts(self):
+        self.assertEqual(
+            guard.scan_source(self._src("let _l = ENV_TEST_LOCK.lock().unwrap();")), []
+        )
+
+
+class IntegrationRootAndItsModulesAreOneBinary(unittest.TestCase):
+    """#449: `tests/root.rs` and `tests/root/child.rs` share a process."""
+
+    def test_root_and_included_module_share_a_group(self):
+        root = guard._process_group(Path("crates/codegen/x/tests/root.rs"))
+        child = guard._process_group(Path("crates/codegen/x/tests/root/child.rs"))
+        self.assertEqual(root, child)
+
+    def test_two_different_roots_do_not_share_a_group(self):
+        a = guard._process_group(Path("crates/codegen/x/tests/alpha.rs"))
+        b = guard._process_group(Path("crates/codegen/x/tests/beta.rs"))
+        self.assertNotEqual(a, b)
+
+    def test_a_tests_module_under_src_is_still_the_lib_binary(self):
+        self.assertTrue(
+            guard._process_group(Path("crates/codegen/x/src/app/tests/e2e.rs")).startswith("lib:")
+        )
+
 if __name__ == "__main__":
     unittest.main()
