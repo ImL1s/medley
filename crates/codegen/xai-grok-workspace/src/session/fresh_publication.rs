@@ -539,8 +539,75 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 }
 
 /// True when a public session directory exists without a valid `summary.json`.
+///
+/// This is the *invariant* predicate -- "a failed publication left nothing
+/// behind" -- not the claim-side occupancy predicate. Reusing it to decide
+/// what may be moved aside would quarantine a directory whose `summary.json`
+/// is present but unparseable, which the read side counts as persisted. Use
+/// [`quarantine_incomplete_public_session`] for that question.
 pub fn marker_free_public_dir_without_summary(path: &Path) -> bool {
     path.is_dir() && !path.join(UNPUBLISHED_SESSION_MARKER).exists() && !valid_public_summary(path)
+}
+
+/// Move a public session directory that has no `summary.json` aside, freeing
+/// the session id it holds. Reports whether an occupant was moved.
+///
+/// Caller must hold the exclusive session-ID lease.
+///
+/// Walks the publication parent without following links. A
+/// `sessions/<encoded-cwd>` symlink must fail closed before any rename so an
+/// outside occupant cannot be moved (#340 / Codex P1).
+///
+/// The predicate is "no regular, non-symlink `summary.json`" -- `open_child_file`
+/// follows no links and opens regular files only, so it is the exact complement
+/// of the test the read side applies when it decides a directory holds a
+/// persisted session. That equivalence is the point: #412 was two checks
+/// disagreeing about what occupies a session id, and a directory this function
+/// declines to move is exactly a directory the read side reports as persisted.
+///
+/// This is the single implementation. It is called both by the publication
+/// path that already had it (#340) and by the fresh-claim gate that did not
+/// (#412) -- a fork behaviour duplicated across two copies of a type is how
+/// the gap opened in the first place (#383).
+pub fn quarantine_incomplete_public_session(
+    root_dir: &Path,
+    encoded_cwd: &OsStr,
+    session_id: &str,
+) -> io::Result<bool> {
+    let parent = ensure_publication_parent(root_dir, encoded_cwd)?;
+    parent.revalidate()?;
+
+    // Anything that does not open as a real, link-free directory is not an
+    // incomplete session directory, so there is nothing here to move aside --
+    // and following or renaming it is the hazard #340 closed. Reporting "not
+    // moved" rather than an error is safe in both directions: every caller
+    // re-checks occupancy afterwards and refuses by name, so a swallowed
+    // failure can never turn into a go-ahead, and a symlink occupant surfaces
+    // as an actionable refusal instead of an opaque `ELOOP`.
+    let Ok(occupant) = parent
+        .parent_anchor()
+        .open_child_dir(OsStr::new(session_id))
+    else {
+        return Ok(false);
+    };
+    match occupant.open_child_file(OsStr::new(SUMMARY_FILE)) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    parent.revalidate()?;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let quarantine_name = format!("{session_id}.incomplete-{stamp}");
+    parent.parent_anchor().rename_child_dir_no_replace(
+        OsStr::new(session_id),
+        parent.parent_anchor(),
+        OsStr::new(&quarantine_name),
+    )?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -747,6 +814,141 @@ mod tests {
             b"fresh-canary"
         );
         assert!(!outside.path().join(SESSION_ID).exists());
+    }
+
+    /// `sessions/<parent>/<session-id>/` holding `child`, no `summary.json`.
+    fn seed_summary_less_public_occupant(root: &Path, parent: &str, child: &str) -> PathBuf {
+        let occupant = root.join("sessions").join(parent).join(SESSION_ID);
+        std::fs::create_dir_all(&occupant).unwrap();
+        std::fs::write(occupant.join(child), b"occupant-payload").unwrap();
+        occupant
+    }
+
+    /// The single `<id>.incomplete-<nanos>` sibling of a quarantined occupant.
+    fn quarantined_sibling(public_parent: &Path) -> PathBuf {
+        let prefix = format!("{SESSION_ID}.incomplete-");
+        let mut found: Vec<PathBuf> = std::fs::read_dir(public_parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one quarantined occupant");
+        found.pop().unwrap()
+    }
+
+    #[test]
+    fn quarantine_frees_a_summary_less_public_session_id() {
+        let root = tempfile::tempdir().unwrap();
+        let occupant = seed_summary_less_public_occupant(root.path(), PARENT, "updates.jsonl");
+
+        let moved =
+            quarantine_incomplete_public_session(root.path(), OsStr::new(PARENT), SESSION_ID)
+                .unwrap();
+
+        assert!(moved);
+        assert!(!occupant.exists(), "the session id is free again");
+        let quarantined = quarantined_sibling(&root.path().join("sessions").join(PARENT));
+        assert_eq!(
+            std::fs::read(quarantined.join("updates.jsonl")).unwrap(),
+            b"occupant-payload",
+            "quarantine moves the occupant aside, it does not destroy it"
+        );
+    }
+
+    #[test]
+    fn quarantine_leaves_a_public_session_that_has_a_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let occupant = seed_summary_less_public_occupant(root.path(), PARENT, "updates.jsonl");
+        write_summary(&occupant);
+
+        let moved =
+            quarantine_incomplete_public_session(root.path(), OsStr::new(PARENT), SESSION_ID)
+                .unwrap();
+
+        assert!(!moved);
+        assert!(occupant.join(SUMMARY_FILE).is_file());
+        assert_eq!(
+            std::fs::read_dir(root.path().join("sessions").join(PARENT))
+                .unwrap()
+                .count(),
+            1,
+            "a persisted session is never moved aside"
+        );
+    }
+
+    #[test]
+    fn quarantine_of_an_absent_session_id_moves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("sessions").join(PARENT)).unwrap();
+
+        assert!(
+            !quarantine_incomplete_public_session(root.path(), OsStr::new(PARENT), SESSION_ID)
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_never_moves_a_symlinked_occupant_or_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("canary"), b"outside-untouched-412").unwrap();
+        let public_parent = root.path().join("sessions").join(PARENT);
+        std::fs::create_dir_all(&public_parent).unwrap();
+        let occupant = public_parent.join(SESSION_ID);
+        symlink(outside.path(), &occupant).unwrap();
+
+        let moved =
+            quarantine_incomplete_public_session(root.path(), OsStr::new(PARENT), SESSION_ID)
+                .unwrap();
+
+        assert!(!moved, "a symlink occupant is never renamed");
+        assert!(
+            occupant
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("canary")).unwrap(),
+            b"outside-untouched-412"
+        );
+        assert_eq!(
+            std::fs::read_dir(&public_parent).unwrap().count(),
+            1,
+            "nothing was created or moved beside the symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_fails_closed_on_a_symlinked_publication_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join(SESSION_ID)).unwrap();
+        std::fs::write(outside.path().join("canary"), b"outside-untouched-412").unwrap();
+        std::fs::create_dir_all(root.path().join("sessions")).unwrap();
+        symlink(outside.path(), root.path().join("sessions").join(PARENT)).unwrap();
+
+        assert!(
+            quarantine_incomplete_public_session(root.path(), OsStr::new(PARENT), SESSION_ID)
+                .is_err(),
+            "a symlinked cwd parent must fail closed before any rename"
+        );
+        assert!(outside.path().join(SESSION_ID).is_dir());
+        assert_eq!(
+            std::fs::read(outside.path().join("canary")).unwrap(),
+            b"outside-untouched-412"
+        );
     }
 
     #[cfg(unix)]
