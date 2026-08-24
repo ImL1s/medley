@@ -124,19 +124,22 @@ pub(crate) fn compose_typed_provider_failure(
 /// something this module ever wrote.
 ///
 /// A canonical headline can still be forged exactly, and the detail half
-/// arrives verbatim from its producer either way, so it is put through
-/// **every** gate the normal path applies to a detail, in the same order:
-/// [`resolve_embedded_json`] and [`clean_detail`] (which end
-/// [`extract_error_detail`]), then [`finish_detail`], which is the tail of
-/// [`format_request_failure`] itself — the [`is_server_fault`] and
-/// [`is_headline_echo`] filters plus the canned-copy fallback. Applying only
-/// the first two let a 5xx body ("upstream exploded", internal IPs, pod
-/// traces) reach the user on this rail while the normal rail replaced it, and
-/// let a self-echoing detail render as `Rate limited (429) — Rate limited
-/// (429)`.
+/// arrives verbatim from its producer either way, so this rail hands it to
+/// **the same two functions [`format_request_failure`] uses**, in the same
+/// order: [`extract_error_detail`] then [`finish_detail`]. Not a copy of
+/// their steps — the functions themselves. Every previous round of this fix
+/// re-implemented a subset and the subset drifted: first the carrier strips
+/// and the second [`resolve_embedded_json`] pass were missing (so
+/// `{"error":"see {\"secret\":\"x\"}"}` kept its nested payload, and a
+/// `Model:`/`Auth:` dump survived whole), then [`is_server_fault`] and
+/// [`is_headline_echo`] were missing (so a 5xx body reached the user and a
+/// self-echo rendered as `Rate limited (429) — Rate limited (429)`).
+/// Calling both outright is what makes the claim above true by construction
+/// rather than by review.
 ///
-/// All of it is a no-op on genuine banner text, which has already been
-/// through the same gates at production: its detail cannot start with `{`,
+/// It is a no-op on genuine banner text, which production already put
+/// through the same two functions: such a detail carries no carrier prefix,
+/// no `from http…` clause and no `Model:` dump, cannot start with `{`,
 /// cannot restate its own headline, and cannot be a 5xx body.
 fn split_existing_banner(raw: &str) -> Option<FormattedRequestFailure> {
     let (headline, detail) = raw.split_once(" \u{2014} ")?;
@@ -148,10 +151,8 @@ fn split_existing_banner(raw: &str) -> Option<FormattedRequestFailure> {
     if headline != class.headline {
         return None;
     }
-    let detail = detail.trim();
-    let detail = resolve_embedded_json(detail).unwrap_or_else(|| detail.to_string());
     let detail = finish_detail(
-        clean_detail(&detail),
+        extract_error_detail(detail),
         Some(status),
         WireErrorType::Other,
         &class,
@@ -647,6 +648,20 @@ fn strip_from_url_clause(s: &str) -> String {
 /// `[0]` and `[1, 2]` are valid JSON *and* ordinary prose ("index [0] out of
 /// range"), so keying on brackets would eat real reasons. `{0}` and `{x}`
 /// are not valid JSON, which is what makes braces safe to key on.
+///
+/// The boundary that governs is *strictly valid JSON*, not *object-shaped*.
+/// `{'secret': 'payload'}` (a gateway echoing Python's `str(dict)`),
+/// `{"a":1,}` and `{"secret":"pay\nload"}` are all rejected here and reach
+/// the user on the normal path with no forgery involved. That is chosen, not
+/// missed: tightening to "looks like an object" is what would drop the real
+/// reasons the `{'a','b'}` case pins.
+///
+/// Leftmost-outermost, not innermost-first. A single left-to-right pass with
+/// a stack would be linear, but popping the innermost span first breaks
+/// envelope reading: `{"error":{"code":"x"},"message":"real"}` pops
+/// `{"code":"x"}`, which parses and names no `error`/`message`, so the drop
+/// path fires and the real message is lost. Bounding the input instead keeps
+/// the outermost-first order that envelope extraction depends on.
 fn find_json_object(s: &str) -> Option<(usize, usize)> {
     let bytes = s.as_bytes();
     for start in 0..bytes.len() {
@@ -700,20 +715,50 @@ fn find_json_object(s: &str) -> Option<(usize, usize)> {
 /// Returns `None` when no balanced object parses, so the caller leaves `s`
 /// alone and the noise filter judges it.
 fn resolve_embedded_json(s: &str) -> Option<String> {
+    if s.len() > MAX_JSON_SCAN {
+        // Too big to scan — so drop from the first `{` without reading it,
+        // the same conservative direction an unreadable payload takes below.
+        // Simply declining to scan is not safe: an oversized `Invalid
+        // parameter {…}` keeps a detail that does not start with `{`, so
+        // `is_noise_detail` passes it and `sanitize_user_error` ships its
+        // first 180 characters — `Invalid parameter {"secret":"pppp…` — which
+        // is the leak this function exists to prevent.
+        let start = s.find('{')?;
+        return Some(trim_dangling_separator(&s[..start]));
+    }
     let (start, end) = find_json_object(s)?;
     if let Some(extracted) = extract_from_json(&s[start..end]) {
         return Some(extracted);
     }
-    // Drop the separator the object hung off (`… parameter — {…}`), not the
-    // sentence punctuation before it.
-    Some(
-        s[..start]
-            .trim_end()
-            .trim_end_matches(['\u{2014}', '-', ':', ','])
-            .trim_end()
-            .to_string(),
-    )
+    Some(trim_dangling_separator(&s[..start]))
 }
+
+/// Drop the separator an excised object hung off (`… parameter — {…}`),
+/// leaving the sentence punctuation before it alone.
+fn trim_dangling_separator(s: &str) -> String {
+    s.trim_end()
+        .trim_end_matches(['\u{2014}', '-', ':', ','])
+        .trim_end()
+        .to_string()
+}
+
+/// Longest detail [`find_json_object`] will scan, in bytes.
+///
+/// The scan is quadratic in unmatched `{`: every one starts a candidate, and
+/// a candidate whose depth never returns to zero runs to end-of-string. The
+/// trigger is not adversarial — it is **truncation**, which is how a large
+/// error body ordinarily arrives, and a body cut before its closers leaves
+/// every enclosing `{` unmatched. Measured in a debug build: 2 KiB 5 ms,
+/// 4 KiB 15 ms, 8 KiB 41 ms, 17 KiB 168 ms, 34 KiB 670 ms, 68 KiB 2.7 s.
+///
+/// 4 KiB caps the retained worst case at ~15 ms while staying far above
+/// anything this module needs to read: the longest detail it can *render* is
+/// ~200 characters ([`crate::app::effects::sanitize_user_error`] truncates
+/// past that), and the largest envelope in this file's fixtures is a few
+/// hundred bytes. The bound is per call, so a body over it behind a carrier
+/// prefix still gets a second chance at the post-strip site in
+/// [`extract_error_detail`] if what remains is under it.
+const MAX_JSON_SCAN: usize = 4 * 1024;
 
 fn extract_from_json(s: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(s.trim()).ok()?;
@@ -821,6 +866,24 @@ fn is_noise_detail(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One code per `classify` arm, including the two ranged fallbacks.
+    /// Shared so the idempotence loop and the divergence sweep cannot drift.
+    const CANONICAL_HEADLINES: &[(u16, &str)] = &[
+        (400, "Bad request (400)"),
+        (422, "Bad request (422)"),
+        (403, "Request denied (403)"),
+        (404, "Not found (404)"),
+        (408, "Request timed out (408)"),
+        (504, "Request timed out (504)"),
+        (409, "Conflict (409)"),
+        (413, "Request too large (413)"),
+        (429, "Rate limited (429)"),
+        (502, "Service unavailable (502)"),
+        (503, "Service unavailable (503)"),
+        (401, "Request failed (401)"),
+        (500, "Server error (500)"),
+    ];
 
     #[test]
     fn formats_500_json_dump() {
@@ -1324,25 +1387,16 @@ mod tests {
     /// `issue244_typed_provider_failure_does_not_reformat_existing_banner`
     /// protects, widened to the whole set — a genuine banner is passed
     /// through unmodified, never re-classified.
+    ///
+    /// Idempotence only. This loop cannot say anything about `is_server_fault`
+    /// or `is_headline_echo`: its fixture is genuine formatter output, so at
+    /// 5xx the body was already replaced at production and asserting its
+    /// absence here detects nothing. That enforcement is covered by
+    /// `issue383_fast_path_applies_the_server_fault_and_echo_filters`, which
+    /// feeds a forged banner and does fail when the filters are removed.
     #[test]
     fn issue383_every_formatter_produced_headline_still_takes_the_fast_path() {
-        // One code per `classify` arm, including the two ranged fallbacks.
-        const HEADLINES: &[(u16, &str)] = &[
-            (400, "Bad request (400)"),
-            (422, "Bad request (422)"),
-            (403, "Request denied (403)"),
-            (404, "Not found (404)"),
-            (408, "Request timed out (408)"),
-            (504, "Request timed out (504)"),
-            (409, "Conflict (409)"),
-            (413, "Request too large (413)"),
-            (429, "Rate limited (429)"),
-            (502, "Service unavailable (502)"),
-            (503, "Service unavailable (503)"),
-            (401, "Request failed (401)"),
-            (500, "Server error (500)"),
-        ];
-        for (code, headline) in HEADLINES {
+        for (code, headline) in CANONICAL_HEADLINES {
             // Exactly what `format_request_failure` would have written.
             assert_eq!(
                 &classify(Some(*code), WireErrorType::Other).headline,
@@ -1364,21 +1418,6 @@ mod tests {
                 round_tripped.detail, genuine.detail,
                 "a genuine banner must round-trip unchanged"
             );
-            if *code >= 500 {
-                // Widened, not weakened: this rail used to pass a 5xx body
-                // through while the normal rail replaced it.
-                assert!(
-                    !round_tripped.detail.contains("provider said no"),
-                    "a 5xx body must not survive on either rail: {}",
-                    round_tripped.detail
-                );
-            } else {
-                assert!(
-                    round_tripped.detail.contains("provider said no"),
-                    "a client-error reason must survive: {}",
-                    round_tripped.detail
-                );
-            }
         }
     }
 
@@ -1535,6 +1574,173 @@ mod tests {
         assert_ne!(
             echo.detail, "Rate limited (429)",
             "the headline must not be repeated as its own detail"
+        );
+    }
+
+    /// Every canonical headline crossed with every nasty detail half, each
+    /// compared against `finish_detail(extract_error_detail(half), …)` — the
+    /// normal path's own tail. Green by construction now that
+    /// `split_existing_banner` calls those two functions rather than copying
+    /// their steps, which is exactly the point: this is the tripwire for a
+    /// future subset creeping back in. Three previous rounds each shipped a
+    /// subset that looked complete.
+    #[test]
+    fn issue383_fast_rail_never_diverges_from_the_normal_tail() {
+        const HALVES: &[&str] = &[
+            // Nested payload inside a JSON string — needs the second
+            // `resolve_embedded_json` pass the fast rail used to skip.
+            r#"{"error":"see {\"secret\":\"x\"}"}"#,
+            // Model/Auth catalog dump — needs the truncation branch.
+            "reason\n\n  Model: gpt-9\n  Auth: oauth\n  Version: 0.1.0",
+            "reason\n  Model:     gpt-9\n  Available: a, b",
+            // Carrier prefixes.
+            "API error (status 500): whatever",
+            "API error (status 400 Bad Request): invalid field `x`",
+            "failed after 3 retries: API error (status 503): {\"error\":\"overloaded\"}",
+            "Internal error: {\"message\":\"boom\",\"http_status\":400}",
+            "Provider request failed (HTTP 400). invalid field `x`",
+            "API error: Provider request failed (HTTP 400). nested carrier",
+            // URL clauses.
+            "Unauthorized (401) from https://internal.example.com/v1: real reason",
+            "error sending request for url (https://server.example.com/v1)",
+            r#"{"error":"fetch from https://example.com: connection refused"}"#,
+            // Objects the extractor can and cannot read.
+            r#"{"error":{"message":"model does not support tools"}}"#,
+            r#"{"error":{"code":"x"},"message":"real"}"#,
+            r#"{"key":"value"}"#,
+            "Invalid parameter {\"secret\":\"payload\"}.",
+            "Invalid parameter {x} {\"secret\":\"payload\"}",
+            // Brace prose that must survive.
+            "Supported values are: {'a','b'}",
+            "index [0] out of range",
+            // Noise the filter drops.
+            "Internal Server Error",
+            "unknown",
+            "JSON-RPC error -32000",
+            // Ordinary reasons, echoes, and whitespace.
+            "invalid field `reasoning.effort`",
+            "Bad request (400)",
+            "   padded reason   ",
+            "a — b — c",
+        ];
+
+        let mut divergences = Vec::new();
+        let mut compared = 0usize;
+        for (code, headline) in CANONICAL_HEADLINES {
+            for half in HALVES {
+                let raw = banner_message(headline, half);
+                let Some(fast) = compose_typed_provider_failure(Some(*code), None, &raw) else {
+                    divergences.push(format!("{headline:?} + {half:?}: fast rail declined"));
+                    continue;
+                };
+                let class = classify(Some(*code), WireErrorType::Other);
+                let want = finish_detail(
+                    extract_error_detail(half),
+                    Some(*code),
+                    WireErrorType::Other,
+                    &class,
+                );
+                compared += 1;
+                if fast.detail != want {
+                    divergences.push(format!(
+                        "{headline:?} + {half:?}\n     fast={:?}\n     norm={:?}",
+                        fast.detail, want
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            compared,
+            CANONICAL_HEADLINES.len() * HALVES.len(),
+            "every pair must reach the fast rail"
+        );
+        assert!(
+            divergences.is_empty(),
+            "{} divergence(s) of {compared} pairs:\n  {}",
+            divergences.len(),
+            divergences.join("\n  ")
+        );
+    }
+
+    /// The two shapes the fast rail used to keep whole because it skipped the
+    /// carrier strips and the second JSON pass.
+    #[test]
+    fn issue383_fast_rail_strips_carriers_and_nested_payloads() {
+        // A payload nested inside a JSON string: reading the envelope once
+        // uncovers a second object, which the normal path resolves again.
+        let nested = compose_typed_provider_failure(
+            Some(400),
+            None,
+            r#"Bad request (400) — {"error":"see {\"secret\":\"x\"}"}"#,
+        )
+        .expect("an already-formatted banner is typed");
+        assert_eq!(nested.detail, "see");
+        assert!(
+            !nested.message().contains("secret"),
+            "the nested payload must not survive: {}",
+            nested.message()
+        );
+
+        // A model/auth catalog dump behind a real reason.
+        let dump = compose_typed_provider_failure(
+            Some(400),
+            None,
+            "Bad request (400) \u{2014} reason\n\n  Model: gpt-9\n  Auth: oauth",
+        )
+        .expect("an already-formatted banner is typed");
+        assert_eq!(dump.detail, "reason");
+        assert!(
+            !dump.message().contains("Auth:"),
+            "the catalog dump must not survive: {}",
+            dump.message()
+        );
+
+        // A carrier prefix that used to ride through intact.
+        let carrier = compose_typed_provider_failure(
+            Some(400),
+            None,
+            "Bad request (400) \u{2014} API error (status 500): whatever",
+        )
+        .expect("an already-formatted banner is typed");
+        assert_eq!(carrier.detail, "whatever");
+    }
+
+    /// The scan is quadratic in unmatched `{`, and truncation — not an
+    /// attacker — is what produces them: a large body cut before its closers
+    /// leaves every enclosing brace open. Both ingresses are unbounded.
+    #[test]
+    fn issue383_truncated_body_does_not_stall_the_scan() {
+        // 68 KiB of unmatched opens took 2.7 s unbounded (debug).
+        let truncated = format!("Invalid parameter {}", "{\"a\":".repeat(14_000));
+        assert!(truncated.len() > 68 * 1024);
+        let started = std::time::Instant::now();
+        let formatted = format_request_failure(Some(400), None, &truncated);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a truncated body must not stall the banner: took {elapsed:?}"
+        );
+        // Over the bound the object is dropped unread rather than scanned —
+        // declining to scan would leave `Invalid parameter {"a":{"a":…` for
+        // `sanitize_user_error` to truncate and ship.
+        assert!(
+            !formatted.message().contains('{'),
+            "an unscanned payload must still be dropped: {}",
+            formatted.message()
+        );
+
+        // Same shape, with a payload that would leak under a bare fall-through.
+        let oversized = format!(
+            "Bad request (400) \u{2014} Invalid parameter {{\"secret\":\"{}\"}}",
+            "p".repeat(20_000)
+        );
+        let formatted = compose_typed_provider_failure(Some(400), None, &oversized)
+            .expect("an already-formatted banner is typed");
+        assert_eq!(formatted.detail, "Invalid parameter");
+        assert!(
+            !formatted.message().contains("secret"),
+            "an oversized payload must not survive: {}",
+            formatted.message()
         );
     }
 }
