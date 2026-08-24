@@ -931,6 +931,12 @@ fn classify_refresh_error(error: &TokenRequestError) -> Option<RefreshTokenFaile
 ///
 /// Tests that cannot pass a path into a production entry point should pin
 /// [`CodexAuthPathGuard`] (thread-local) instead of `GROK_AUTH_PATH` (#343).
+///
+/// The first-party xAI mirror is [`crate::auth::manager::resolved_xai_auth_path`]
+/// with [`crate::auth::manager::XaiAuthPathGuard`]. Both resolvers follow the
+/// same rule — thread-local pin, else `grok_home/auth.json` under `cfg(test)`,
+/// else the env in production — so neither can be redirected out from under the
+/// other by a fixture that only knows about one of them (#409).
 pub(crate) fn resolved_auth_path(grok_home: &Path) -> PathBuf {
     #[cfg(test)]
     if let Some(path) = AUTH_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {

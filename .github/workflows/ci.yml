@@ -712,10 +712,11 @@ jobs:
             keyless_local_server_catalog_emits_auth_scheme_none -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             keyless_local_mock_catalog_entry_is_ready_on_loopback -- --nocapture
-          # #132: the reader's dup must not be inherited by children. Named
-          # explicitly rather than by a `pty_session` prefix: the rest of that
-          # module is the hang this change fixes, and this one is the fd leak
-          # the fix introduced.
+          # #132: the reader's dup must not be inherited by children -- the fd
+          # leak the hang fix introduced. The rest of that module is enrolled by
+          # name in "Restricted subagent capability boundaries" (#417); an
+          # earlier version of this comment claimed it was not run at all, which
+          # a substring filter had already made untrue.
           run_nonzero -p xai-grok-shell --lib \
             dup_fd_is_not_inherited_by_exec_child -- --nocapture
           # #13: env-key normalization. In this step rather than the auth one
@@ -1017,6 +1018,12 @@ jobs:
             permission::manager:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             permission::prompter:: -- --nocapture
+          # `permission::resolution` decides which rules apply. Unfiltered, 19 of
+          # its tests failed on every machine with a real `~/.claude` (the user
+          # tier merges into the resolved set) and CI never said a word (#443).
+          # Other `permission::` submodules are still unenrolled — see #408.
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::resolution:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             permission::types:: -- --nocapture
           # Upstream moved these tests into an external `restore_fetch_tests.rs`
@@ -1209,8 +1216,18 @@ jobs:
             managed_config:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             sampling:: -- --nocapture
+          # libtest filters are substring matches, not prefixes, so a bare
+          # `session::` also selects `terminal::pty_session::tests::*` -- five
+          # PTY guards reached CI that way and nothing said so (#417). Skip
+          # them here and enrol the module by name below, so PTY coverage is a
+          # decision rather than a side effect of this filter's reach.
           run_nonzero -p xai-grok-shell --lib \
-            session:: -- --nocapture
+            session:: -- --nocapture --skip terminal::
+          # #132/#417: all six PTY guards, named. Process lifetime and fd
+          # inheritance are exactly the class where a silent coverage loss is
+          # expensive, and #408 means no other check would report it.
+          run_nonzero -p xai-grok-shell --lib \
+            terminal::pty_session::tests:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             util:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
@@ -1257,6 +1274,14 @@ jobs:
           run_nonzero -p xai-grok-pager --test settings_e2e -- --nocapture
           run_nonzero -p xai-grok-shell --test acp_session_setup_wire \
             acp_session_setup_conformance -- --nocapture
+          # #409: the only assertion that production honours `GROK_AUTH_PATH`.
+          # It has to be an integration target -- `cfg(test)` builds resolve
+          # through the thread-local pin instead, so no unit test can reach the
+          # env branch. No positional after `--test`: the target name is not a
+          # module path inside the binary, and `run_nonzero` fails a filter that
+          # matches zero tests (see `grok_home_paths` above).
+          run_nonzero -p xai-grok-shell --test test_auth_path_env_precedence \
+            -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
             resolve_failure_refuses_for_deny_carrying_devbox_extends -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
@@ -1627,6 +1652,8 @@ jobs:
             issue345_fork_rewrites_parent_compaction_transcript_hint -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue345_checkpoint_rebind_runs_on_deserialized_items -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue423_fork_preserves_authored_summary_text_verbatim -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             fork_rebinds_checkpoint_hint_without_touching_quoted_transcript_paths -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

@@ -144,6 +144,21 @@ In order, cheapest first:
   That catches callers which stopped *compiling*. It cannot catch the ones that
   still compile and now read the wrong thing — only the grep does.
 
+#409 later closed the other half of the same channel. `AuthManager::new` read
+`GROK_AUTH_PATH` unconditionally, so the env was shut out of the Codex resolver
+and still wired into the xAI one: setting it moved one manager, pinning
+`CodexAuthPathGuard` moved the other, and nothing said so. Both resolvers now
+follow one rule — thread-local pin, else `grok_home/auth.json` under
+`cfg(test)`, else the env in production. The two seams stay *separate*
+(`XaiAuthPathGuard` in `auth::manager`, `CodexAuthPathGuard` in
+`auth::openai_codex`) because fixtures construct an unredirected manager of the
+opposite kind on purpose; `codex_and_xai_auth_path_resolvers_agree_on_a_shared_home`
+pins both and fails if either drifts back onto the env. Under `cfg(test)`,
+`GROK_AUTH_PATH` no longer influences path resolution anywhere — it survives
+only in the `AuthManager::new` telemetry line, which reports the raw env value
+and does not feed resolution. Integration targets (`tests/*.rs`, which link the
+lib built without `cfg(test)`) are what still exercise the production branch.
+
 ### The neighbouring failure that is *not* this
 
 PR #383's other late CI failure looks identical from the outside and is not.

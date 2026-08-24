@@ -1374,8 +1374,8 @@ async fn copy_session_data_copies_compaction_segments_when_enabled() {
 /// Inherited `transcript_hint` text names the parent `session_dir/compaction`.
 /// After a production-style fork copy the child must point at its own copied
 /// archive so deleting the parent cannot break history (issue #345) — while
-/// the transcript, which is words a user or the model wrote, copies through
-/// untouched even when it quotes that same path.
+/// the transcript and `summary.json`, which are words a user or the model
+/// wrote, copy through untouched even when they quote that same path.
 #[tokio::test]
 async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
     use crate::extensions::notification::CompactionSegmentFile;
@@ -1427,6 +1427,9 @@ async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
         .await
         .unwrap();
 
+    // The dashboard one-liner worded exactly like the generated hint. #423
+    // inverted this: it is the model's own display text, so the fork copies
+    // it as authored instead of retargeting it.
     let mut source_summary = adapter.read_summary_sync(&source_info).unwrap();
     source_summary.last_turn_summary = Some(hint.clone());
     adapter
@@ -1482,13 +1485,13 @@ async fn issue345_fork_rewrites_parent_compaction_transcript_hint() {
         .last_turn_summary
         .as_deref()
         .expect("copied last_turn_summary");
-    assert!(
-        last.contains(&child_loc),
-        "copied summary must name the child compaction dir, got {last}"
+    assert_eq!(
+        last, hint,
+        "copied summary must keep the authored last_turn_summary verbatim"
     );
     assert!(
-        !last.contains(&parent_loc),
-        "copied summary must not keep the parent compaction dir, got {last}"
+        !last.contains(&child_loc),
+        "fork must not retarget the copied summary, got {last}"
     );
 
     let updates_blob = std::fs::read_to_string(adapter.updates_file(&target_info)).unwrap();
@@ -2882,5 +2885,111 @@ fn capped_line_reader_discards_overlong_lines_without_shifting_indexes() {
     assert_eq!(
         collect(b"aa\nbb", 4),
         vec![(0, b"aa".to_vec()), (1, b"bb".to_vec())]
+    );
+}
+
+/// `summary.json` carries authored display text, never a generated pointer:
+/// `session_summary` is the session title (an LLM one, a `/rename`, or the
+/// first ten words of the user's own opening message via
+/// `title_fallback_from_user_text`) and `last_turn_summary` is the model's
+/// per-turn dashboard one-liner. No writer of either produces a
+/// `transcript_hint` -- `build_compacted_history` is the only thing that
+/// appends one, and it never reaches a `Summary`. A fork must therefore copy
+/// both verbatim, including when the text quotes the parent's archive or
+/// reads exactly like a generated hint (issue #423).
+#[tokio::test]
+async fn issue423_fork_preserves_authored_summary_text_verbatim() {
+    use crate::extensions::notification::CompactionSegmentFile;
+    use xai_chat_state::{CompactionDetail, CompactionMode};
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source_info = Info {
+        id: acp::SessionId::new("issue423-parent"),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+    // Fork a genuinely compacted session: that is when the deleted rewrite
+    // had a source and target dir to substitute between.
+    adapter
+        .write_compaction_segment(
+            &source_info,
+            &CompactionSegmentFile {
+                items: vec![ConversationItem::user("pre-compact turn")],
+                summary: "segment for issue423".to_string(),
+                detail: CompactionDetail::Verbose,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let parent_loc = adapter
+        .session_dir(&source_info)
+        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+        .to_string_lossy()
+        .into_owned();
+
+    // A title quoting the parent archive one component deep: the deleted
+    // rewrite stopped only at a component *continuation*, so a trailing `/`
+    // did not protect this.
+    let title = format!("Why {parent_loc}/segment_000.md keeps growing");
+    // A per-turn summary worded as the generated hint itself -- the exact
+    // text the deleted rewrite was hunting for, here authored by the model.
+    let last_turn = CompactionMode::Segments(CompactionDetail::Verbose)
+        .transcript_hint(Some(parent_loc.as_str()))
+        .expect("segments hint needs a location");
+
+    let mut source_summary = adapter.read_summary_sync(&source_info).unwrap();
+    source_summary.session_summary = title.clone();
+    source_summary.last_turn_summary = Some(last_turn.clone());
+    adapter
+        .write_summary_sync(&source_info, &source_summary)
+        .unwrap();
+
+    let target_info = Info {
+        id: acp::SessionId::new("issue423-child"),
+        cwd: "/target/workspace".to_string(),
+    };
+    adapter
+        .copy_session_data_sync(
+            &source_info,
+            &target_info,
+            CopySessionOptions {
+                parent_session_id: Some(source_info.id.to_string()),
+                copy_compaction_segments: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let child_loc = adapter
+        .session_dir(&target_info)
+        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(
+        parent_loc, child_loc,
+        "fork must land in a new session dir, or this pins nothing"
+    );
+
+    let copied = adapter.read_summary_sync(&target_info).unwrap();
+    assert_eq!(
+        copied.session_summary, title,
+        "fork must copy the session title verbatim"
+    );
+    assert_eq!(
+        copied.last_turn_summary.as_deref(),
+        Some(last_turn.as_str()),
+        "fork must copy the per-turn summary verbatim"
+    );
+    // Total guard: no field of the copied summary was retargeted.
+    let raw = std::fs::read_to_string(adapter.summary_file(&target_info)).unwrap();
+    assert!(
+        !raw.contains(&child_loc),
+        "fork must not retarget any summary.json text, got {raw}"
     );
 }
