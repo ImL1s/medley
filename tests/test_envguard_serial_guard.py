@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import tempfile
 import textwrap
@@ -619,6 +620,58 @@ class KeyMapIsScopedPerBinary(unittest.TestCase):
         cands = guard.analyze_source(one, relpath=Path("crates/codegen/a/src/x.rs"))
         cands += guard.analyze_source(two, relpath=Path("crates/codegen/b/src/y.rs"))
         self.assertEqual(guard.judge(cands, guard.key_map(cands)), [])
+
+
+class RegexesAgreeWithTheTree(unittest.TestCase):
+    """Corpus from the repo, not from imagination.
+
+    Every off-by-one in this file — three of them — came from the same place:
+    a regex hand-written against imagined names, checked against hand-written
+    examples. Both sides come from one head, so a wrong mental model produces a
+    matching wrong test, which is why the regression test added for the first
+    instance did not stop the third being written in the same commit.
+
+    These enumerate the real identifiers by a DIFFERENT mechanism — tokenize,
+    then plain substring predicates — and assert the regex under test agrees on
+    each. The inputs are not chosen by whoever wrote the pattern.
+    """
+
+    TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+    @classmethod
+    def setUpClass(cls):
+        locks: set[str] = set()
+        guards: set[str] = set()
+        for path in guard.rust_files(REPO / "crates"):
+            for token in cls.TOKEN.findall(path.read_text(encoding="utf-8")):
+                if token.isupper() and "ENV" in token and token.endswith("_LOCK"):
+                    locks.add(token)
+                if "Env" in token and token.endswith("Guard"):
+                    guards.add(token)
+        cls.locks = sorted(locks)
+        cls.guards = sorted(guards)
+
+    def test_the_corpus_is_not_empty(self):
+        # A corpus scan that silently finds nothing passes every assertion
+        # below while checking nothing at all.
+        self.assertGreaterEqual(len(self.locks), 5, self.locks)
+        self.assertGreaterEqual(len(self.guards), 3, self.guards)
+
+    def test_env_lock_name_matches_every_env_lock_in_the_tree(self):
+        missed = [name for name in self.locks if not re.search(guard.ENV_LOCK_NAME, name)]
+        self.assertEqual(missed, [], f"ENV_LOCK_NAME misses real locks: {missed}")
+
+    def test_env_guard_name_matches_every_env_guard_type_in_the_tree(self):
+        missed = [n for n in self.guards if not guard.ENV_GUARD_NAME.search(f"{n}::set")]
+        self.assertEqual(missed, [], f"ENV_GUARD_NAME misses real guards: {missed}")
+
+    def test_env_lock_name_still_discriminates(self):
+        # The pattern must not have widened into "any lock".
+        for unrelated in ("PASTEBOARD_LOCK", "SAVE_LOCK", "DISMISS_LOCK", "HEAL_LOCK"):
+            self.assertIsNone(
+                re.search(guard.ENV_LOCK_NAME, unrelated),
+                f"{unrelated} is not an env lock",
+            )
 
 if __name__ == "__main__":
     unittest.main()
