@@ -7474,6 +7474,55 @@ mod fresh_session_claim_tests {
     const CHILD_RESULT_PREFIX: &str = "__GROK_SESSION_CLAIM_RESULT__=";
     const CHILD_FINISH_TIMEOUT: Duration = Duration::from_secs(15);
 
+    /// A deliberately generous ceiling for joining a worker thread that may be
+    /// parked on a session-id lease.
+    ///
+    /// It is not tuned to how long a healthy join takes -- once the publication
+    /// barrier is released that is microseconds. It is tuned so that host
+    /// pressure can never reach it: several cargo builds routinely run
+    /// concurrently on CI runners and on developer machines, and a tight bound
+    /// would make an overloaded runner and a genuine lease race print the same
+    /// red, which is its own filed defect (#428). 45s is far past anything
+    /// scheduling pressure alone produces, and still costs one test's wall clock
+    /// instead of a whole lane's when a thread genuinely never wakes (#416).
+    const BLOCKED_THREAD_JOIN_BUDGET: Duration = Duration::from_secs(45);
+
+    /// Joins `handle`, failing with a diagnosable message instead of hanging.
+    ///
+    /// `std::thread::JoinHandle::join` is unbounded, so a thread parked forever
+    /// on a session-id lease takes the whole CI lane's wall clock with it --
+    /// observed at over 3h30m against a 44m baseline, cancelled by hand, with no
+    /// `test result:` line ever printed (#416). Polling `is_finished` against a
+    /// deadline turns that silent outage into a red test with a message.
+    ///
+    /// Module-private so any sibling test that spawns a lease-waiting thread can
+    /// reuse it; today only the remote-pull test below spawns threads at all.
+    #[track_caller]
+    fn join_within<T>(handle: std::thread::JoinHandle<T>, what: &str) -> T {
+        let deadline = std::time::Instant::now() + BLOCKED_THREAD_JOIN_BUDGET;
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not finish within {BLOCKED_THREAD_JOIN_BUDGET:?}. Two causes \
+                 reach this line and the same job log tells them apart, so read it before \
+                 blaming either. (1) A lost session-id-lease race (#416): this test is the \
+                 ONLY straggler -- every sibling in the `session::` lane reports `ok` and \
+                 the lane's wall clock is near its baseline. (2) An overloaded runner: this \
+                 test has company -- several siblings in the same lane are also slow or \
+                 carry libtest's `has been running for over 60 seconds` notice, and the \
+                 lane's wall clock is well above baseline. The discriminating artifact is \
+                 the lane's per-test results, not this message."
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        match handle.join() {
+            Ok(value) => value,
+            // The thread bodies here are full of asserts; re-raise the original
+            // payload so their messages survive instead of being flattened.
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     fn test_session_dir(root: &Path, cwd: &str, session_id: &str) -> PathBuf {
         root.join("sessions")
             .join(crate::util::grok_home::encode_cwd_dirname(cwd))
@@ -9032,7 +9081,7 @@ mod fresh_session_claim_tests {
         *lock.lock().expect("publication barrier mutex") = true;
         ready.notify_one();
         for loader in loaders {
-            let published = loader.join().expect("remote miss loader");
+            let published = join_within(loader, "remote miss loader");
             assert!(!published.path().join("partial").exists());
         }
         let visible = reader_rx
@@ -9043,7 +9092,7 @@ mod fresh_session_claim_tests {
             visible.read_summary().unwrap().info.id.to_string(),
             SESSION_ID
         );
-        reader.join().expect("published reader thread");
+        join_within(reader, "published reader thread");
         assert_eq!(publishers.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!session_dir.join(UNPUBLISHED_SESSION_MARKER).exists());
         assert!(!session_dir.join("partial").exists());
