@@ -1024,5 +1024,93 @@ class SoleTestRegimeNeedsTheWholeBinary(unittest.TestCase):
         )
         self.assertEqual([f.name for f in found], ["only_local_test"])
 
+
+class GuardDefinitionNamesTheVariable(unittest.TestCase):
+    """#449: a setter's first argument may be a VALUE, not a variable name."""
+
+    def _src(self, locking):
+        field = "_lock: std::sync::MutexGuard<'static, ()>" if locking else "prev: Option<String>"
+        acquire = "let l = ENV_LOCK.lock().unwrap();" if locking else ""
+        init = "Self { _lock: l }" if locking else "Self { prev: None }"
+        return textwrap.dedent(
+            f"""\
+            const FIXED: &str = "HOME";
+            struct FixedEnvGuard {{ {field} }}
+            impl FixedEnvGuard {{
+                fn set(value: &str) -> Self {{
+                    {acquire}
+                    unsafe {{ std::env::set_var(FIXED, value) }};
+                    {init}
+                }}
+            }}
+            impl Drop for FixedEnvGuard {{
+                fn drop(&mut self) {{ unsafe {{ std::env::remove_var(FIXED) }} }}
+            }}
+
+            #[test]
+            #[serial_test::serial(a)]
+            fn one() {{ let _g = FixedEnvGuard::set("first"); }}
+
+            #[test]
+            #[serial_test::serial(b)]
+            fn two() {{ let _g = FixedEnvGuard::set("second"); }}
+            """
+        )
+
+    def test_the_guards_own_variable_is_recorded_not_the_value(self):
+        by_name = {c.name: c for c in guard.analyze_source(self._src(locking=False))}
+        self.assertEqual(by_name["one"].variables, ("HOME",))
+        self.assertEqual(by_name["two"].variables, ("HOME",))
+
+    def test_two_keys_on_that_variable_clash(self):
+        found = guard.scan_source(self._src(locking=False))
+        self.assertEqual(sorted(f.name for f in found), ["one", "two"])
+
+    def test_a_self_locking_fixed_guard_is_still_sound(self):
+        # Same shape, but the guard holds the lock, so the keys are irrelevant.
+        self.assertEqual(guard.scan_source(self._src(locking=True)), [])
+
+
+class SelfLockingGuardCallIsNotAnUnprotectedSite(unittest.TestCase):
+    """#449: the mirror of the self-locking HELPER exclusion, one level over."""
+
+    GUARD = textwrap.dedent(
+        """\
+        struct G { _lock: std::sync::MutexGuard<'static, ()> }
+        impl G {
+            fn set(k: &str) -> Self {
+                let l = ENV_TEST_LOCK.lock().unwrap();
+                unsafe { std::env::set_var(k, "1") };
+                Self { _lock: l }
+            }
+        }
+        impl Drop for G { fn drop(&mut self) { unsafe { std::env::remove_var("K") } } }
+
+        """
+    )
+
+    def test_an_unbound_self_locking_guard_call_is_not_a_violation(self):
+        src = self.GUARD + textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                G::set("HOME");
+            }
+            """
+        )
+        self.assertEqual(guard.scan_source(src), [])
+
+    def test_a_later_raw_mutation_still_needs_its_own_span(self):
+        src = self.GUARD + textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                G::set("HOME");
+                unsafe { std::env::set_var("OTHER", "2") };
+            }
+            """
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
 if __name__ == "__main__":
     unittest.main()

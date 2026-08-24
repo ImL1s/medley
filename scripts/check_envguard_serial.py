@@ -365,6 +365,7 @@ class EnvMutators:
     types: dict[str, bool]
     by_crate: dict[tuple[str, str], bool]
     funcs: dict[str, bool]
+    type_vars: dict[str, frozenset[str]]
     module_alias: dict[tuple[str, str], str]
     name_alias: dict[tuple[str, str], str]
 
@@ -508,8 +509,10 @@ def index_env_mutators(sources: list[tuple[Path, str]]) -> EnvMutators:
     """
 
     parsed: list[tuple[Path, str, list[tuple[str, int, int]]]] = []
+    sources_by_file: dict[str, str] = {}
     for rel, source in sources:
         code = _code_only(source)
+        sources_by_file[rel.as_posix()] = source
         parsed.append((rel, code, _impl_blocks(code)))
 
     has_drop: set[str] = set()
@@ -594,10 +597,26 @@ def index_env_mutators(sources: list[tuple[Path, str]]) -> EnvMutators:
                 name_alias[(crate, item)] = source
             else:
                 module_alias[(crate, item)] = source
+    # What variable does the guard mutate in its OWN body? A guard whose
+    # `set` takes only the new VALUE (`EnvVarGuard::set("42")` in
+    # `util/config/persist.rs`, which writes a fixed const) made the call's
+    # first argument look like a variable name, so two calls with different
+    # values read as two different variables (#449 review).
+    type_vars: dict[str, frozenset[str]] = {}
+    for rel, code, blocks in parsed:
+        raw = sources_by_file.get(rel.as_posix(), "")
+        consts = _string_consts(raw)
+        for name, start, end in blocks:
+            if name not in types:
+                continue
+            fixed = _env_variables(raw[start:end], consts)
+            if fixed:
+                type_vars[name] = type_vars.get(name, frozenset()) | frozenset(fixed)
     return EnvMutators(
         types=types,
         by_crate=by_crate,
         funcs={},
+        type_vars=type_vars,
         module_alias=module_alias,
         name_alias=name_alias,
     )
@@ -709,7 +728,12 @@ def _protected_spans(
 
 
 def _mutation_sites(
-    body: str, mutators: EnvMutators, helpers: dict[str, bool]
+    body: str,
+    mutators: EnvMutators,
+    helpers: dict[str, bool],
+    crate: str = "",
+    file: str = "",
+    name_paths: dict[str, tuple[str, ...]] | None = None,
 ) -> list[int]:
     """Offsets where this body mutates env and needs a protector of its own.
 
@@ -719,9 +743,23 @@ def _mutation_sites(
     unless it hands the guard back, which [`_protected_spans`] decides.
     """
 
+    name_paths = name_paths or {}
     sites = [m.start() for m in ENV_MUTATION.finditer(body)]
-    sites += [m.start() for m in TYPE_ASSOC_CALL.finditer(body) if m.group(1) in mutators.types]
-    sites += [m.start() for m in ENV_GUARD_NAME.finditer(body)]
+    # A self-locking guard's own construction runs under its own mutex, bound
+    # or not, so it does not need a caller span -- the same reasoning already
+    # applied to self-locking helpers, one level over (#449 review). A later
+    # RAW mutation is still a site and still needs its own span.
+    sites += [
+        m.start()
+        for m in TYPE_ASSOC_CALL.finditer(body)
+        if m.group(1) in mutators.types
+        and not mutators.self_locks(m.group(1), crate, file, name_paths.get(m.group(1), ()))
+    ]
+    sites += [
+        m.start()
+        for m in ENV_GUARD_NAME.finditer(body)
+        if not mutators.self_locks(m.group(1), crate, file, name_paths.get(m.group(1), ()))
+    ]
     sites += [
         m.start()
         for m in FREE_CALL.finditer(body)
@@ -807,6 +845,39 @@ def _env_variables(raw_body: str, consts: dict[str, str] | None = None) -> set[s
     return {resolved.get(v, v) for v in found if v}
 
 
+def _test_variables(
+    raw_body: str, code_body: str, mutators: EnvMutators, consts: dict[str, str]
+) -> set[str]:
+    """Variables this test mutates, preferring what a guard's DEFINITION says.
+
+    `EnvVarGuard::set("42")` in `util/config/persist.rs` passes a value, not a
+    key -- the guard writes a fixed const internally. Reading the call's first
+    argument recorded `42` as a variable, so two calls with different values
+    looked like two different variables and never had their keys compared
+    (#449 review). When the guard's own body names the variable, that wins;
+    when it mutates through a parameter instead, the call site is all there is.
+    """
+
+    found = _env_variables(raw_body, consts)
+    for used in set(TYPE_ASSOC_CALL.findall(code_body)):
+        fixed = mutators.type_vars.get(used)
+        if not fixed:
+            continue
+        found -= set(_env_variables(raw_body, consts)) - found  # keep raw finds
+        found = {v for v in found if v not in _call_args(raw_body, used)} | set(fixed)
+    return found
+
+
+def _call_args(raw_body: str, type_name: str) -> set[str]:
+    """First-argument tokens passed to `type_name::method(..)` in this body."""
+
+    pattern = re.compile(
+        re.escape(type_name)
+        + r"\s*::\s*[A-Za-z_][A-Za-z0-9_]*\s*\(\s*(?:\"(?P<lit>[^\"]*)\"|(?P<konst>[A-Z][A-Z0-9_]{2,}))"
+    )
+    return {m.group("lit") or m.group("konst") for m in pattern.finditer(raw_body)}
+
+
 def analyze_source(
     source: str,
     *,
@@ -856,7 +927,9 @@ def analyze_source(
             spans = _protected_spans(
                 body, mutators, helpers, crate, path.as_posix(), name_paths, returning
             )
-            sites = _mutation_sites(body, mutators, helpers)
+            sites = _mutation_sites(
+                body, mutators, helpers, crate, path.as_posix(), name_paths
+            )
             # No remaining sites means every mutation this test performs is
             # already covered where it happens (inside a self-locking helper),
             # so there is nothing left for a caller span to protect.
@@ -892,7 +965,9 @@ def analyze_source(
                 keyed=keys,
                 variables=tuple(
                     sorted(
-                        _env_variables(source[body_range[0] : body_range[1]], consts)
+                        _test_variables(
+                            source[body_range[0] : body_range[1]], body, mutators, consts
+                        )
                         | {
                             var
                             for call in FREE_CALL.findall(body)
