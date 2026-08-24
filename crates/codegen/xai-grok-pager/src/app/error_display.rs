@@ -92,11 +92,12 @@ pub(crate) fn compose_typed_provider_failure(
     error_type: Option<&str>,
     raw: &str,
 ) -> Option<FormattedRequestFailure> {
-    if let Some((headline, detail)) = split_existing_banner(raw) {
+    if let Some(formatted) = split_existing_banner(raw) {
+        // The caller's parsed status still wins for the reported field, as it
+        // always has; the banner's own status is the fallback.
         return Some(FormattedRequestFailure {
-            status: status.or_else(|| parse_http_status(headline)),
-            headline: headline.to_string(),
-            detail,
+            status: status.or(formatted.status),
+            ..formatted
         });
     }
     if !looks_like_typed_provider_failure(status, error_type, raw) {
@@ -123,25 +124,43 @@ pub(crate) fn compose_typed_provider_failure(
 /// something this module ever wrote.
 ///
 /// A canonical headline can still be forged exactly, and the detail half
-/// arrives verbatim from its producer either way, so it goes through the same
-/// two steps that end the normal path — [`resolve_embedded_json`] and
-/// [`clean_detail`]. Both are idempotent on genuine banner text, which has
-/// already been through them: a real detail cannot start with `{`
-/// ([`is_noise_detail`] rejects that at production) and cannot restate a
-/// reason phrase ([`is_headline_echo`] rejects that). An emptied detail
-/// leaves a headline-only banner, which [`banner_message`] already renders.
-fn split_existing_banner(raw: &str) -> Option<(&str, String)> {
+/// arrives verbatim from its producer either way, so it is put through
+/// **every** gate the normal path applies to a detail, in the same order:
+/// [`resolve_embedded_json`] and [`clean_detail`] (which end
+/// [`extract_error_detail`]), then [`finish_detail`], which is the tail of
+/// [`format_request_failure`] itself — the [`is_server_fault`] and
+/// [`is_headline_echo`] filters plus the canned-copy fallback. Applying only
+/// the first two let a 5xx body ("upstream exploded", internal IPs, pod
+/// traces) reach the user on this rail while the normal rail replaced it, and
+/// let a self-echoing detail render as `Rate limited (429) — Rate limited
+/// (429)`.
+///
+/// All of it is a no-op on genuine banner text, which has already been
+/// through the same gates at production: its detail cannot start with `{`,
+/// cannot restate its own headline, and cannot be a 5xx body.
+fn split_existing_banner(raw: &str) -> Option<FormattedRequestFailure> {
     let (headline, detail) = raw.split_once(" \u{2014} ")?;
     let headline = headline.trim();
     let status = parse_http_status(headline)?;
     // `classify` ignores the wire type once the status is known, so `Other`
     // reproduces exactly the headline any caller would have got.
-    if headline != classify(Some(status), WireErrorType::Other).headline {
+    let class = classify(Some(status), WireErrorType::Other);
+    if headline != class.headline {
         return None;
     }
     let detail = detail.trim();
     let detail = resolve_embedded_json(detail).unwrap_or_else(|| detail.to_string());
-    Some((headline, clean_detail(&detail).unwrap_or_default()))
+    let detail = finish_detail(
+        clean_detail(&detail),
+        Some(status),
+        WireErrorType::Other,
+        &class,
+    );
+    Some(FormattedRequestFailure {
+        status: Some(status),
+        headline: class.headline,
+        detail,
+    })
 }
 
 fn looks_like_typed_provider_failure(
@@ -188,15 +207,30 @@ pub(crate) fn format_request_failure(
     });
     let extracted = extract_error_detail(raw);
     let class = classify(status, wire);
-    let why = extracted
-        .filter(|d| !is_server_fault(status, wire) && !is_headline_echo(d, &class.headline))
-        .or_else(|| class.default_why.map(str::to_string));
-    let detail = compose_detail(why.as_deref(), class.action);
+    let detail = finish_detail(extracted, status, wire, &class);
     FormattedRequestFailure {
         status,
         headline: class.headline,
         detail,
     }
+}
+
+/// Turn a cleaned-up server reason into the banner's detail half.
+///
+/// The tail both rails share, so neither can gain a gate the other lacks:
+/// drop a reason we must not show ([`is_server_fault`] — 5xx bodies are
+/// internal detail; [`is_headline_echo`] — it just restates the headline),
+/// fall back to our own copy, then compose `why. action`.
+fn finish_detail(
+    extracted: Option<String>,
+    status: Option<u16>,
+    wire: WireErrorType,
+    class: &Classified,
+) -> String {
+    let why = extracted
+        .filter(|d| !is_server_fault(status, wire) && !is_headline_echo(d, &class.headline))
+        .or_else(|| class.default_why.map(str::to_string));
+    compose_detail(why.as_deref(), class.action)
 }
 
 struct Classified {
@@ -598,29 +632,82 @@ fn strip_from_url_clause(s: &str) -> String {
     s.to_string()
 }
 
+/// The first balanced `{…}` span that is itself valid JSON, as byte offsets.
+///
+/// Locating the object by *scanning* rather than by parsing the whole suffix
+/// from the first `{` is the difference between a check and a formality: a
+/// provider error sentence ends in a full stop as a matter of course, and
+/// `{"k":"v"}.` is not a JSON document, so a suffix parse says "no payload
+/// here" for the most ordinary shape there is. Every `{` is tried, so an
+/// earlier brace that is only prose (`{x}`) does not shadow a real payload
+/// after it. Braces inside JSON strings, and `\"` escapes, do not open or
+/// close a span.
+///
+/// Objects only, deliberately. A balanced `[…]` is not a payload marker:
+/// `[0]` and `[1, 2]` are valid JSON *and* ordinary prose ("index [0] out of
+/// range"), so keying on brackets would eat real reasons. `{0}` and `{x}`
+/// are not valid JSON, which is what makes braces safe to key on.
+fn find_json_object(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start] != b'{' {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (i, &b) in bytes.iter().enumerate().skip(start) {
+            if in_string {
+                match b {
+                    _ if escaped => escaped = false,
+                    b'\\' => escaped = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    // `depth` is at least 1: the loop starts on a `{`.
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = i + 1;
+                        if serde_json::from_str::<serde_json::Value>(&s[start..end]).is_ok() {
+                            return Some((start, end));
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// Resolve an embedded JSON object: the message it carries, or nothing.
 ///
 /// [`extract_from_json`] answers only the first half. When the object parses
 /// but names no `error` / `message` the payload is a machine envelope the
-/// banner has no reading of (`Invalid parameter — {"key":"value"}`), and
+/// banner has no reading of (`Invalid parameter {"key":"value"}.`), and
 /// showing it raw is exactly the unprocessed-provider-output leak this module
-/// exists to prevent — so the object is *dropped* and only the prose before
-/// it is kept. Text that merely contains a brace is not valid JSON and is
-/// left untouched for the noise filter to judge.
+/// exists to prevent — so the object and everything after it are dropped,
+/// keeping only the prose before. Text after an envelope is part of the same
+/// dump; on a redaction path that is the direction to err in.
 ///
-/// Returns `None` when there is nothing to resolve, so the caller leaves `s`
-/// alone.
+/// Returns `None` when no balanced object parses, so the caller leaves `s`
+/// alone and the noise filter judges it.
 fn resolve_embedded_json(s: &str) -> Option<String> {
-    let json_start = s.find('{')?;
-    let tail = s[json_start..].trim();
-    if let Some(extracted) = extract_from_json(tail) {
+    let (start, end) = find_json_object(s)?;
+    if let Some(extracted) = extract_from_json(&s[start..end]) {
         return Some(extracted);
     }
-    serde_json::from_str::<serde_json::Value>(tail).ok()?;
     // Drop the separator the object hung off (`… parameter — {…}`), not the
     // sentence punctuation before it.
     Some(
-        s[..json_start]
+        s[..start]
             .trim_end()
             .trim_end_matches(['\u{2014}', '-', ':', ','])
             .trim_end()
@@ -1262,15 +1349,36 @@ mod tests {
                 headline,
                 "the expectation itself must match the formatter"
             );
-            let detail = "provider said no";
-            let raw = banner_message(headline, detail);
-            let formatted = compose_typed_provider_failure(Some(*code), None, &raw)
-                .expect("an already-formatted banner is typed");
-            assert_eq!(formatted.headline, *headline);
+            // The fixture is real formatter output, not a hand-assembled
+            // string. Idempotence is the property under test, so the input has
+            // to be something this module can actually emit: a hand-written
+            // detail that omits the status's canned next step is not, and
+            // asserting on one would test a shape that never reaches this rail.
+            let genuine = format_request_failure(Some(*code), None, "provider said no");
+            assert_eq!(&genuine.headline, headline);
+            let round_tripped =
+                compose_typed_provider_failure(Some(*code), None, &genuine.message())
+                    .expect("an already-formatted banner is typed");
+            assert_eq!(round_tripped.headline, genuine.headline);
             assert_eq!(
-                formatted.detail, detail,
-                "a genuine banner must pass through unmodified"
+                round_tripped.detail, genuine.detail,
+                "a genuine banner must round-trip unchanged"
             );
+            if *code >= 500 {
+                // Widened, not weakened: this rail used to pass a 5xx body
+                // through while the normal rail replaced it.
+                assert!(
+                    !round_tripped.detail.contains("provider said no"),
+                    "a 5xx body must not survive on either rail: {}",
+                    round_tripped.detail
+                );
+            } else {
+                assert!(
+                    round_tripped.detail.contains("provider said no"),
+                    "a client-error reason must survive: {}",
+                    round_tripped.detail
+                );
+            }
         }
     }
 
@@ -1302,7 +1410,13 @@ mod tests {
             .expect("an already-formatted banner is typed");
         let msg = formatted.message();
         assert_eq!(formatted.headline, "Bad request (400)");
-        assert_eq!(formatted.detail, "");
+        // Expectation raised: the emptied detail used to leave a bare
+        // headline. Now that this rail also runs `finish_detail`, it falls
+        // back to our own copy, exactly as the normal path does.
+        assert_eq!(
+            formatted.detail,
+            format_request_failure(Some(400), None, "").detail
+        );
         assert!(
             !msg.contains('{') && !msg.contains("key"),
             "an exactly-forged headline must not carry its payload through: {msg}"
@@ -1333,6 +1447,94 @@ mod tests {
         assert_eq!(
             formatted.detail, "Supported values are: {'a','b'}",
             "prose containing a brace is not a payload and must survive"
+        );
+    }
+
+    /// A suffix parse from the first `{` is defeated by one trailing
+    /// character, and a full stop is how a provider sentence ordinarily ends
+    /// — so the check has to *locate* the object, not assume it runs to the
+    /// end of the string. An earlier brace that is only prose must not shadow
+    /// a real payload after it either.
+    #[test]
+    fn issue383_embedded_json_is_found_by_balanced_scan_not_suffix_parse() {
+        for raw in [
+            // Trailing full stop: the suffix is no longer one JSON value.
+            "Provider request failed (HTTP 400). Invalid parameter {\"secret\":\"payload\"}.",
+            // The first `{` is prose; the payload is the second object.
+            "Provider request failed (HTTP 400). Invalid parameter {x} {\"secret\":\"payload\"}",
+            // Braces inside a JSON string must not close the span early.
+            "Provider request failed (HTTP 400). Invalid parameter {\"secret\":\"pay}load\"}.",
+        ] {
+            let formatted = compose_typed_provider_failure(Some(400), Some("api"), raw)
+                .expect("a provider 400 must still compose as a typed failure");
+            let msg = formatted.message();
+            assert_eq!(formatted.headline, "Bad request (400)");
+            assert!(
+                !msg.contains("secret") && !msg.contains("payload"),
+                "the payload must be found wherever it sits: {msg}"
+            );
+        }
+
+        // The span itself, so a regression is legible without the banner.
+        assert_eq!(
+            find_json_object("a {\"k\":\"v\"}. b").map(|(s, e)| &"a {\"k\":\"v\"}. b"[s..e]),
+            Some("{\"k\":\"v\"}")
+        );
+        assert_eq!(find_json_object("no braces here"), None);
+        assert_eq!(find_json_object("prose {x} only"), None);
+        // Brackets are not a payload marker: `[0]` is valid JSON and prose.
+        let formatted = format_request_failure(
+            None,
+            Some("api"),
+            "API error (status 400): index [0] out of range",
+        );
+        assert_eq!(
+            formatted.detail, "index [0] out of range",
+            "bracket prose must survive; only objects are payloads"
+        );
+    }
+
+    /// The fast path skipped the last two of the normal path's four detail
+    /// gates. `is_server_fault` exists because 5xx bodies are internal detail
+    /// ("upstream exploded", internal IPs, pod traces); `is_headline_echo`
+    /// exists because a body that restates the headline says nothing twice.
+    #[test]
+    fn issue383_fast_path_applies_the_server_fault_and_echo_filters() {
+        let fast = compose_typed_provider_failure(
+            Some(500),
+            None,
+            "Server error (500) \u{2014} {\"error\":\"upstream exploded\"}",
+        )
+        .expect("an already-formatted banner is typed")
+        .message();
+        assert!(
+            !fast.contains("exploded"),
+            "a 5xx body is internal detail and must not reach the user: {fast}"
+        );
+        // The two rails must agree on the same payload — that is the property,
+        // not the exact copy.
+        let normal = format_request_failure(
+            None,
+            Some("api"),
+            r#"API error (status 500 Internal Server Error): {"error":"upstream exploded"}"#,
+        )
+        .message();
+        assert_eq!(fast, normal, "both rails must render a 5xx identically");
+
+        let echo = compose_typed_provider_failure(
+            Some(429),
+            None,
+            "Rate limited (429) \u{2014} Rate limited (429)",
+        )
+        .expect("an already-formatted banner is typed");
+        assert_eq!(
+            echo.message(),
+            format_request_failure(Some(429), None, "").message(),
+            "a detail that only restates the headline must fall back to our copy"
+        );
+        assert_ne!(
+            echo.detail, "Rate limited (429)",
+            "the headline must not be repeated as its own detail"
         );
     }
 }
