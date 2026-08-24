@@ -124,9 +124,22 @@ class FunctionSignatureCorpus(unittest.TestCase):
                 if not _is_test_attribute(line):
                     continue
                 cursor = index + 1
+                depth = 0
                 while cursor < len(lines):
                     candidate = lines[cursor].strip()
-                    if candidate.startswith("#[") or candidate.startswith("//") or not candidate:
+                    # A `#[cfg_attr(..)]` can span lines (real cases in
+                    # `config/watcher.rs`, `session/git.rs`); tracking bracket
+                    # depth walks past it instead of stopping on its first
+                    # continuation line and losing the test (#458 review).
+                    if depth > 0:
+                        depth += candidate.count("[") - candidate.count("]")
+                        cursor += 1
+                        continue
+                    if candidate.startswith("#["):
+                        depth = candidate.count("[") - candidate.count("]")
+                        cursor += 1
+                        continue
+                    if candidate.startswith("//") or not candidate:
                         cursor += 1
                         continue
                     break
@@ -184,9 +197,32 @@ def _files_by_crate() -> dict[str, list[str]]:
     return grouped
 
 
-# A name chosen so `selected`'s substring branch cannot fire: only the
-# module-path branch can make these resolve.
-SENTINEL_FN = "zz_no_substring_match_zz"
+TEST_FN = re.compile(
+    r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b[\s\S]{0,400}?\bfn\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _real_tests_by_crate() -> dict[str, list[tuple[str, str]]]:
+    """`(file, test fn)` for every real test, grouped by crate.
+
+    A sentinel function name cannot resolve a filter whose LAST segment is a
+    test function rather than a module — `selected` needs the real name to
+    match that shape, so a sentinel reports it unresolvable when the guard
+    handles it correctly (#458 review). Resolving against the actual population
+    is the same correction as taking the corpus from the tree in the first
+    place.
+    """
+
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for path in CRATES.rglob("*.rs"):
+        rel = path.relative_to(REPO).as_posix()
+        crate = guard.crate_of(rel)
+        if not crate:
+            continue
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        for match in TEST_FN.finditer(source):
+            grouped.setdefault(crate, []).append((rel, match.group(1)))
+    return grouped
 
 # Module filters that resolve to no file in their own crate, because the
 # component they name is an INLINE module and the guard derives module paths
@@ -222,19 +258,22 @@ class ModulePathApproximationCorpus(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.filters = _workflow_module_filters()
-        cls.by_crate = _files_by_crate()
+        cls.by_crate = _real_tests_by_crate()
         cls.unresolvable = {
             (crate, value)
             for crate, value in cls.filters
             if not any(
-                guard.selected(SENTINEL_FN, path, {value})
-                for path in cls.by_crate.get(crate, [])
+                guard.selected(fn, path, {value})
+                for path, fn in cls.by_crate.get(crate, [])
             )
         }
 
     def test_the_corpus_is_not_empty(self):
         self.assertGreater(len(self.filters), 50, len(self.filters))
         self.assertGreater(len(self.by_crate), 10, len(self.by_crate))
+        self.assertGreater(
+            sum(len(v) for v in self.by_crate.values()), 1000, "no real tests found"
+        )
 
     def test_the_corpus_includes_filters_without_a_trailing_separator(self):
         # The bug this class had: only trailing-`::` filters were collected.
@@ -265,7 +304,7 @@ class ModulePathApproximationCorpus(unittest.TestCase):
         # and the list should be emptied rather than left as folklore.
         self.assertFalse(
             guard.selected(
-                SENTINEL_FN,
+                "some_unrelated_test_name",
                 "crates/codegen/x/src/main.rs",
                 {"version_json_payload_tests::"},
             ),
