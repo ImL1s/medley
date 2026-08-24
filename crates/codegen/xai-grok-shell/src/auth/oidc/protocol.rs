@@ -1024,15 +1024,12 @@ mod tests {
     ///   - JWT without principal_type/_id: returns None
     #[test]
     fn peek_access_token_principal_matrix() {
-        ensure_crypto_provider();
         fn make_jwt(claims: serde_json::Value) -> String {
-            let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-            jsonwebtoken::encode(
-                &header,
-                &claims,
-                &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
-            )
-            .unwrap()
+            use base64::Engine;
+            let header =
+                base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"HS256"}"#);
+            let payload = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(claims.to_string());
+            format!("{header}.{payload}.mock-signature")
         }
         let team_jwt = make_jwt(serde_json::json!({
             "sub": "user-42",
@@ -1066,14 +1063,12 @@ mod tests {
     /// `peek_access_token_principal` returns `None`.
     #[test]
     fn peek_access_token_principal_id_does_not_require_type() {
-        ensure_crypto_provider();
         fn make_jwt(claims: serde_json::Value) -> String {
-            jsonwebtoken::encode(
-                &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-                &claims,
-                &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
-            )
-            .unwrap()
+            use base64::Engine;
+            let header =
+                base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"HS256"}"#);
+            let payload = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(claims.to_string());
+            format!("{header}.{payload}.mock-signature")
         }
         let id_only = make_jwt(serde_json::json!({ "principal_id": "team-abc", "sub": "u" }));
         assert_eq!(

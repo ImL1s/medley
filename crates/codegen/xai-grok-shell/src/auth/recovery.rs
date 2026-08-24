@@ -1118,23 +1118,20 @@ mod tests {
 
     // -- force_login_team_uuid pin enforced on the 401-recovery path -------
 
-    fn ensure_crypto_provider() {
-        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
-    }
-
     fn team_jwt(principal_id: &str) -> String {
-        ensure_crypto_provider();
-        jsonwebtoken::encode(
-            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-            &serde_json::json!({
+        use base64::Engine;
+        let header =
+            base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"HS256"}"#);
+        let payload = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
                 "sub": "user-1",
                 "principal_type": "Team",
                 "principal_id": principal_id,
                 "exp": 9999999999u64,
-            }),
-            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
-        )
-        .unwrap()
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.mock-signature")
     }
 
     /// A sibling writes a wrong-team token to disk; 401 recovery (relay path)

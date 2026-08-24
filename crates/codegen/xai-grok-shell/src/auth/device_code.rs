@@ -591,20 +591,20 @@ pub(crate) mod tests {
         assert!(auth_manager.current().is_some());
     }
 
-    /// jsonwebtoken needs a process-level CryptoProvider; tests that encode
-    /// JWTs can't rely on another test having installed it first.
-    fn ensure_crypto_provider() {
-        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
+    fn mock_jwt(claims: serde_json::Value) -> String {
+        use base64::Engine;
+        let header =
+            base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"HS256"}"#);
+        let payload = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(claims.to_string());
+        format!("{header}.{payload}.mock-signature")
     }
 
     #[test]
     fn build_auth_seeds_team_metadata_from_access_token() {
-        ensure_crypto_provider();
         let temp_dir = tempfile::tempdir().unwrap();
         let grok_home = temp_dir.path().join(".grok");
         std::fs::create_dir_all(&grok_home).unwrap();
         let auth_manager = auth_manager_with_grok_home(&grok_home, "http://127.0.0.1:9");
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
         let claims = serde_json::json!({
             "sub": "user-42",
             "iss": "https://auth.x.ai",
@@ -618,12 +618,7 @@ pub(crate) mod tests {
             "jti": "token-1",
         });
         let tokens = super::TokenOk {
-            access_token: jsonwebtoken::encode(
-                &header,
-                &claims,
-                &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
-            )
-            .unwrap(),
+            access_token: mock_jwt(claims),
             refresh_token: Some("refresh-token".to_owned()),
             expires_in: Some(900),
             scope: Some("offline_access grok-cli:access team:read".to_owned()),
@@ -651,7 +646,6 @@ pub(crate) mod tests {
     /// Team access token carrying `principal_id` (signature irrelevant — only
     /// the principal claims are peeked).
     fn team_access_token(principal_id: &str) -> super::TokenOk {
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
         let claims = serde_json::json!({
             "sub": "user-42",
             "exp": 9999999999u64,
@@ -659,12 +653,7 @@ pub(crate) mod tests {
             "principal_id": principal_id,
         });
         super::TokenOk {
-            access_token: jsonwebtoken::encode(
-                &header,
-                &claims,
-                &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
-            )
-            .unwrap(),
+            access_token: mock_jwt(claims),
             refresh_token: Some("refresh-token".to_owned()),
             expires_in: Some(900),
             scope: None,
@@ -675,7 +664,6 @@ pub(crate) mod tests {
     /// `build_auth` with `token_principal` must fail with `expected_err` and
     /// persist nothing.
     fn assert_build_auth_rejected(cfg: GrokComConfig, token_principal: &str, expected_err: &str) {
-        ensure_crypto_provider();
         let temp_dir = tempfile::tempdir().unwrap();
         let grok_home = temp_dir.path().join(".grok");
         std::fs::create_dir_all(&grok_home).unwrap();
@@ -708,7 +696,6 @@ pub(crate) mod tests {
     /// token is accepted.
     #[test]
     fn build_auth_does_not_enforce_legacy_oauth2_principal_id() {
-        ensure_crypto_provider();
         let cfg = GrokComConfig {
             oauth2: Some(crate::auth::OAuth2ProviderConfig {
                 issuer: "http://localhost:22255".into(),

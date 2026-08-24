@@ -383,12 +383,12 @@ async fn provider_expiry_source_precedence() {
         jwt_with_exp(chrono::Utc::now().timestamp() + 7200)
     }
     fn jwt_with_exp(exp: i64) -> String {
-        jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
-            &serde_json::json!({ "exp": exp }),
-            &jsonwebtoken::EncodingKey::from_secret(b"test"),
-        )
-        .unwrap()
+        use base64::Engine;
+        let header =
+            base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"HS256"}"#);
+        let payload = base64::prelude::BASE64_URL_SAFE_NO_PAD
+            .encode(serde_json::json!({ "exp": exp }).to_string());
+        format!("{header}.{payload}.mock-signature")
     }
     async fn mints_after_first(
         name: &str,
