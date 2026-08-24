@@ -1697,6 +1697,8 @@ jobs:
             list_sessions_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             list_sessions_recent_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            models_list_response_round_trips -- --nocapture
 
       # #166: these assert on colour, and used to inherit the ambient colour
       # level. Run them under both settings of NO_COLOR -- one pass alone would
