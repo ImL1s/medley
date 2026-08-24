@@ -46,15 +46,23 @@ impl SessionIdLock {
     }
 }
 
-fn session_claim_lock_stem(session_id: &str) -> String {
+/// The one derivation of a session id's lock-namespace stem (#406).
+///
+/// Every stack that addresses the `session-ids` namespace derives its leaf
+/// names from here. A second copy would let two families of operations believe
+/// they hold the same lease while naming different files — the condition #337
+/// was opened for.
+pub fn session_claim_lock_stem(session_id: &str) -> String {
     format!("{:x}", Sha256::digest(session_id.as_bytes()))
 }
 
-fn session_claim_lock_name(session_id: &str) -> String {
+/// Namespace-lease leaf name for `session_id`.
+pub fn session_claim_lock_name(session_id: &str) -> String {
     format!("{}.namespace.lock", session_claim_lock_stem(session_id))
 }
 
-fn session_mutation_lock_name(session_id: &str) -> String {
+/// Mutation-lease leaf name for `session_id`.
+pub fn session_mutation_lock_name(session_id: &str) -> String {
     format!("{}.mutation.lock", session_claim_lock_stem(session_id))
 }
 
@@ -158,32 +166,6 @@ pub fn try_acquire_session_id_read_lock_sync(
         },
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(error),
-    }
-}
-
-/// Acquire a source-shared and target-exclusive lease in one deterministic
-/// global order so A-to-B and B-to-A copies cannot deadlock.
-pub fn acquire_ordered_copy_locks_sync(
-    root_dir: &Path,
-    source_id: &str,
-    target_id: &str,
-) -> io::Result<(SessionIdLock, SessionIdLock)> {
-    if source_id == target_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "fork source and target session ids must differ",
-        ));
-    }
-    let source_name = session_claim_lock_name(source_id);
-    let target_name = session_claim_lock_name(target_id);
-    if source_name < target_name {
-        let source = acquire_session_id_read_lock_sync(root_dir, source_id)?;
-        let target = acquire_session_id_lock_sync(root_dir, target_id)?;
-        Ok((source, target))
-    } else {
-        let target = acquire_session_id_lock_sync(root_dir, target_id)?;
-        let source = acquire_session_id_read_lock_sync(root_dir, source_id)?;
-        Ok((source, target))
     }
 }
 
@@ -506,17 +488,5 @@ mod tests {
             b"preserve"
         );
         assert!(!outside.path().join("session-ids").exists());
-    }
-
-    #[test]
-    fn ordered_copy_locks_use_one_global_order() {
-        let temp = tempfile::tempdir().unwrap();
-        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        let (source, target) = acquire_ordered_copy_locks_sync(temp.path(), a, b).unwrap();
-        drop((source, target));
-        let (source, target) = acquire_ordered_copy_locks_sync(temp.path(), b, a).unwrap();
-        drop((source, target));
-        assert!(acquire_ordered_copy_locks_sync(temp.path(), a, a).is_err());
     }
 }
