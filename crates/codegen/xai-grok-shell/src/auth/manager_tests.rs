@@ -262,22 +262,20 @@ struct PermissionRepairFault(PathBuf);
 
 impl PermissionRepairFault {
     fn install(path: &Path) -> Self {
-        crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(path.to_owned());
+        crate::auth::storage::install_fault_path(
+            &crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS,
+            path,
+        );
         Self(path.to_owned())
     }
 }
 
 impl Drop for PermissionRepairFault {
     fn drop(&mut self) {
-        let mut faults = crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = faults.iter().rposition(|path| path == &self.0) {
-            faults.remove(index);
-        }
+        crate::auth::storage::remove_fault_path(
+            &crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS,
+            &self.0,
+        );
     }
 }
 
@@ -285,22 +283,20 @@ struct PostRenamePermissionFault(PathBuf);
 
 impl PostRenamePermissionFault {
     fn install(path: &Path) -> Self {
-        crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATHS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(path.to_owned());
+        crate::auth::storage::install_fault_path(
+            &crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATHS,
+            path,
+        );
         Self(path.to_owned())
     }
 }
 
 impl Drop for PostRenamePermissionFault {
     fn drop(&mut self) {
-        let mut faults = crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATHS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = faults.iter().rposition(|path| path == &self.0) {
-            faults.remove(index);
-        }
+        crate::auth::storage::remove_fault_path(
+            &crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATHS,
+            &self.0,
+        );
     }
 }
 
@@ -308,10 +304,10 @@ struct ParentSyncFault(PathBuf);
 
 impl ParentSyncFault {
     fn install(path: &Path) -> Self {
-        crate::auth::storage::PARENT_SYNC_FAULT_PATHS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(path.to_owned());
+        crate::auth::storage::install_fault_path(
+            &crate::auth::storage::PARENT_SYNC_FAULT_PATHS,
+            path,
+        );
         Self(path.to_owned())
     }
 }
@@ -320,32 +316,29 @@ struct StorageFullWriteFault(PathBuf);
 
 impl StorageFullWriteFault {
     fn install(path: &Path) -> Self {
-        *crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATH
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+        crate::auth::storage::install_fault_path(
+            &crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATHS,
+            path,
+        );
         Self(path.to_owned())
     }
 }
 
 impl Drop for StorageFullWriteFault {
     fn drop(&mut self) {
-        let mut fault = crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATH
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if fault.as_ref() == Some(&self.0) {
-            *fault = None;
-        }
+        crate::auth::storage::remove_fault_path(
+            &crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATHS,
+            &self.0,
+        );
     }
 }
 
 impl Drop for ParentSyncFault {
     fn drop(&mut self) {
-        let mut faults = crate::auth::storage::PARENT_SYNC_FAULT_PATHS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = faults.iter().rposition(|path| path == &self.0) {
-            faults.remove(index);
-        }
+        crate::auth::storage::remove_fault_path(
+            &crate::auth::storage::PARENT_SYNC_FAULT_PATHS,
+            &self.0,
+        );
     }
 }
 
@@ -2655,7 +2648,7 @@ async fn verdict_not_keyed_on_in_mem_bearer() {
 /// in-memory bearer to the fresh token (the "always update in-memory even if the
 /// disk write failed" invariant — without it a disk hiccup strands the session).
 /// The write is failed deterministically (root-safe) via the path-scoped
-/// `WRITE_FAULT_PATH` injection in `storage.rs`; the auth.json read (file
+/// `WRITE_FAULT_PATHS` injection in `storage.rs`; the auth.json read (file
 /// absent) and the file lock still succeed.
 #[tokio::test]
 async fn refresh_persist_failure_is_transient_but_swaps_in_memory() {
@@ -2672,19 +2665,20 @@ async fn refresh_persist_failure_is_transient_but_swaps_in_memory() {
     });
 
     // Fail every atomic write to THIS tempdir's auth.json (path-scoped, so
-    // parallel tests are unaffected). Cleared on drop.
-    struct FaultGuard;
+    // parallel tests are unaffected). Removes only its own entry on drop, so a
+    // concurrent installer of the same path keeps its fault armed (#435).
+    struct FaultGuard(PathBuf);
     impl Drop for FaultGuard {
         fn drop(&mut self) {
-            *crate::auth::storage::WRITE_FAULT_PATH
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = None;
+            crate::auth::storage::remove_fault_path(
+                &crate::auth::storage::WRITE_FAULT_PATHS,
+                &self.0,
+            );
         }
     }
-    let _fault = FaultGuard;
-    *crate::auth::storage::WRITE_FAULT_PATH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(dir.path().join("auth.json"));
+    let fault_path = dir.path().join("auth.json");
+    crate::auth::storage::install_fault_path(&crate::auth::storage::WRITE_FAULT_PATHS, &fault_path);
+    let _fault = FaultGuard(fault_path);
 
     mgr.set_refresher(Arc::new(CountingRefresher {
         call_count: Arc::new(AtomicU32::new(0)),
@@ -6968,20 +6962,27 @@ impl TokenRefresher for RejectedCodexRefresher {
     }
 }
 
+/// RAII guard over any fault seam.
+///
+/// #435: this took a `Mutex<Option<PathBuf>>`, assigned on install, and cleared
+/// unconditionally on drop -- so it both disarmed a concurrent installer and,
+/// on teardown, disarmed whichever installer happened to hold the slot. It now
+/// pushes its own entry and removes only that one.
 struct PathScopedWriteFault {
-    slot: &'static std::sync::Mutex<Option<PathBuf>>,
+    seam: &'static std::sync::Mutex<Vec<PathBuf>>,
+    path: PathBuf,
 }
 
 impl PathScopedWriteFault {
-    fn install(slot: &'static std::sync::Mutex<Option<PathBuf>>, path: PathBuf) -> Self {
-        *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(path);
-        Self { slot }
+    fn install(seam: &'static std::sync::Mutex<Vec<PathBuf>>, path: PathBuf) -> Self {
+        crate::auth::storage::install_fault_path(seam, &path);
+        Self { seam, path }
     }
 }
 
 impl Drop for PathScopedWriteFault {
     fn drop(&mut self) {
-        *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        crate::auth::storage::remove_fault_path(self.seam, &self.path);
     }
 }
 
@@ -7052,7 +7053,7 @@ async fn permanent_codex_rejection_enospc_keeps_prior_file_and_memory() {
     manager.hot_swap(tried.clone());
     manager.set_refresher(Arc::new(RejectedCodexRefresher(tried)));
     let _fault = PathScopedWriteFault::install(
-        &crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATH,
+        &crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATHS,
         path.clone(),
     );
 
@@ -7103,7 +7104,7 @@ async fn permanent_codex_rejection_post_rename_reconciles_to_published_file() {
     manager.hot_swap(tried.clone());
     manager.set_refresher(Arc::new(RejectedCodexRefresher(tried)));
     let _fault = PathScopedWriteFault::install(
-        &crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATH,
+        &crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATHS,
         path.clone(),
     );
 
@@ -7136,7 +7137,7 @@ async fn permanent_codex_rejection_parent_dir_sync_is_after_publication() {
     manager.hot_swap(tried.clone());
     manager.set_refresher(Arc::new(RejectedCodexRefresher(tried)));
     let _fault = PathScopedWriteFault::install(
-        &crate::auth::storage::PARENT_DIR_SYNC_FAULT_PATH,
+        &crate::auth::storage::PARENT_DIR_SYNC_FAULT_PATHS,
         path.clone(),
     );
 

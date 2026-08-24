@@ -314,6 +314,20 @@ jobs:
           run_nonzero -p xai-grok-shell --lib final_publication_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             symlinked_cwd_parent_without_touching_outside_tree -- --nocapture
+          # #412: a public session directory with no `summary.json` must not
+          # burn its session id. Two checks disagreed about what occupies one --
+          # the read side counted a regular `summary.json`, the creation gate
+          # counted any entry named `<id>` -- and nothing ever cleared the
+          # directory in between, so every retry of a pinned id failed forever.
+          # `quarantine_` selects the five guards on the single shared
+          # implementation that frees it; `public_occupant` selects the four on
+          # the fresh-claim gate that calls it, including the two occupants that
+          # must still be refused. Both filters are exact: nine tests, all of
+          # them these. The shell four were otherwise reached only through the
+          # broad `session::` filter below, which would take them with it if it
+          # were ever narrowed -- the unstated-enrollment shape #417 closed.
+          run_nonzero -p xai-grok-workspace --lib quarantine_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib public_occupant -- --nocapture
 
   compile-tests:
     name: Compile every test target
