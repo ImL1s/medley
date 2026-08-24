@@ -1164,7 +1164,11 @@ custom_unknown_key = 42
         ui.get("show_timestamps").and_then(|v| v.as_bool()),
         Some(false),
     );
-    assert_eq!(ui.get("simple_mode").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(
+        ui.get(crate::agent::config::UiConfig::READLINE_MODE_KEY)
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
     assert_eq!(
         ui.get("compact_mode").and_then(|v| v.as_bool()),
         Some(true),
