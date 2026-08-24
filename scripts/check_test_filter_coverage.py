@@ -162,7 +162,14 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
     return {c: dict(targets_dict) for c, targets_dict in per_crate.items()}
 
 
-def list_tests(crate: str, manifest_root: Path) -> list[str]:
+# Distinct from an empty listing, which is a legitimate "this crate has no lib
+# tests". Both used to collapse into `[]`, so a crate whose harness could not be
+# launched vanished from the report and the run still exited 0.
+NO_LIB_TARGET = object()
+LISTING_FAILED = object()
+
+
+def list_tests(crate: str, manifest_root: Path):
     """Test paths in the crate's **lib** target.
 
     Lib-scoped on purpose: `ci.yml`'s filters are overwhelmingly `--lib`, and a
@@ -178,9 +185,19 @@ def list_tests(crate: str, manifest_root: Path) -> list[str]:
         text=True,
     )
     if proc.returncode != 0:
-        print(f"warning: could not list tests for {crate}", file=sys.stderr)
+        # A crate with no lib target is an expected skip: this tool is
+        # lib-scoped (see the docstring), and such a crate's tests are reached
+        # by `--bins` / `--test` filters it deliberately does not model. Say so
+        # rather than warning, so it cannot be mistaken for the other branch.
+        if "no library targets found" in proc.stderr:
+            return NO_LIB_TARGET
+        # Anything else means the listing did not happen. Returning an empty
+        # list here would make the crate silently drop out of the comparison
+        # and the run still exit 0 -- a guard that cannot tell "nothing new"
+        # from "never checked" is the defect this whole check exists to catch.
+        print(f"error: could not list tests for {crate}", file=sys.stderr)
         print(proc.stderr[-2000:], file=sys.stderr)
-        return []
+        return LISTING_FAILED
     names = []
     for line in proc.stdout.splitlines():
         # libtest prints `some::path::test_name: test`
@@ -224,6 +241,7 @@ def main() -> int:
 
     all_uncovered: list[str] = []
     newly_uncovered: list[str] = []
+    unlistable: list[str] = []
 
     for crate in crates:
         target_filters = per_crate.get(crate)
@@ -234,14 +252,25 @@ def main() -> int:
         if args.list_from:
             f = args.list_from / f"{crate}.list"
             if not f.exists():
-                print(f"warning: no captured list for {crate}", file=sys.stderr)
+                # Same reasoning as a failed `--list`: a missing capture is not
+                # evidence of anything, so it must not pass silently.
+                print(f"error: no captured list for {crate}", file=sys.stderr)
+                unlistable.append(crate)
                 continue
             tests = [line[: -len(": test")].strip()
                      for line in f.read_text().splitlines() if line.endswith(": test")]
         else:
             tests = list_tests(crate, args.root)
 
+        if tests is NO_LIB_TARGET:
+            print(f"{crate}: no lib target -- skipped (this check is lib-scoped)")
+            continue
+        if tests is LISTING_FAILED:
+            unlistable.append(crate)
+            continue
+
         if not tests:
+            print(f"{crate}: 0 tests in the lib target")
             continue
 
         filters = target_filters.get("lib", set()) | target_filters.get("*", set())
@@ -259,6 +288,21 @@ def main() -> int:
         if not args.write_baseline:
             for t in (fresh if baseline else missing):
                 print(f"    {t}")
+
+    # Before any verdict: a crate we could not list was not checked, and a
+    # verdict that ignores it is a claim about tests nobody enumerated. This
+    # also guards --write-baseline, so a baseline can never be written from a
+    # partial sweep and then silently exempt whatever the sweep missed.
+    if unlistable:
+        print(
+            f"\nerror: could not list tests for {len(unlistable)} crate(s): "
+            + ", ".join(unlistable)
+            + "\n       This check did not run for them, which is not the same as"
+            " them passing.\n       Fix the listing (or add a deliberate skip) rather"
+            " than reading this run as green.",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.write_baseline:
         args.write_baseline.write_text(
