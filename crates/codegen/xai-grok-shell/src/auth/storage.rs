@@ -118,11 +118,7 @@ pub(super) static STRICT_READ_SWAP_AFTER_OPEN_PATHS: std::sync::Mutex<Vec<PathBu
 
 #[cfg(test)]
 fn maybe_swap_strict_read_target_after_open(auth_file: &Path) -> std::io::Result<()> {
-    let should_swap = STRICT_READ_SWAP_AFTER_OPEN_PATHS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .iter()
-        .any(|path| path == auth_file);
+    let should_swap = fault_path_armed(&STRICT_READ_SWAP_AFTER_OPEN_PATHS, auth_file);
     if !should_swap {
         return Ok(());
     }
@@ -174,22 +170,14 @@ fn ensure_auth_json_owner_only_for_file(auth_file: &Path, file: &File) -> std::i
     #[cfg(all(test, unix))]
     let injected_repair_failure = {
         use std::os::unix::fs::PermissionsExt;
-        PERMISSION_REPAIR_FAULT_PATHS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .any(|path| path == auth_file)
+        fault_path_armed(&PERMISSION_REPAIR_FAULT_PATHS, auth_file)
             && file
                 .metadata()
                 .map(|metadata| metadata.permissions().mode() & 0o777 != 0o600)
                 .unwrap_or(false)
     };
     #[cfg(all(test, not(unix)))]
-    let injected_repair_failure = PERMISSION_REPAIR_FAULT_PATHS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .iter()
-        .any(|path| path == auth_file);
+    let injected_repair_failure = fault_path_armed(&PERMISSION_REPAIR_FAULT_PATHS, auth_file);
     #[cfg(test)]
     if injected_repair_failure {
         return Err(std::io::Error::new(
@@ -545,14 +533,29 @@ fn write_store(file: File, auth_store: &AuthStore) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Test-only, path-scoped write fault: `write_auth_json_atomic` fails with
-/// `Unsupported` for exactly this `auth.json` path. Path-scoped so parallel
-/// tests in the same process do not sabotage each other.
+/// Test-only, path-scoped write faults: `write_auth_json_atomic` and the
+/// durability barriers below fail for exactly the `auth.json` paths installed
+/// here, so parallel tests in the same process do not sabotage each other.
+///
+/// Every seam is a `Vec` and every fixture goes through [`install_fault_path`]
+/// / [`remove_fault_path`], which push one entry and remove only that entry.
+/// That is what makes the promise above true for concurrent installers.
+///
+/// #435: two of these were `Mutex<Option<PathBuf>>` sitting directly under
+/// this comment, and `install` assigned rather than pushed — so a second
+/// installer silently disarmed the first. Three teardowns also cleared the
+/// slot unconditionally, disarming whoever held it rather than themselves.
+/// Either way the victim asserted on a fault that was no longer armed, which
+/// reads as a flaky assertion rather than as a disarmed injector.
+///
+/// Do not add a single-slot seam here. `every_fault_seam_supports_concurrent_installers`
+/// pins the property; the helpers are the only shape that keeps it.
 #[cfg(test)]
-pub(super) static WRITE_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+pub(super) static WRITE_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
-pub(super) static WRITE_STORAGE_FULL_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
+pub(super) static WRITE_STORAGE_FULL_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 pub(super) static POST_RENAME_PERMISSION_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
     std::sync::Mutex::new(Vec::new());
@@ -562,17 +565,43 @@ pub(super) static PARENT_SYNC_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
 #[cfg(test)]
 pub(super) static PARENT_SYNC_STORAGE_FULL_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
     std::sync::Mutex::new(Vec::new());
-// Single-slot counterparts of the two `*_PATHS` seams above. Both families are
-// live: stacking fixtures install into the `Vec` seams, while single-fixture
-// tests use `PathScopedWriteFault` against these. They are checked in addition
-// to — never instead of — the `Vec` seams, so neither guard can be bypassed by
-// the other being empty.
+/// Parent-directory sync failure with `PermissionDenied`, distinct from
+/// `PARENT_SYNC_FAULT_PATHS`'s `Error::other` at the same barrier.
 #[cfg(test)]
-pub(super) static POST_RENAME_PERMISSION_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
+pub(super) static PARENT_DIR_SYNC_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm a fault seam for `path`.
+///
+/// Pushes rather than assigns: concurrent installers must coexist, and an
+/// assignment silently disarms whoever held the seam (#435).
 #[cfg(test)]
-pub(super) static PARENT_DIR_SYNC_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
+pub(super) fn install_fault_path(seam: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
+    seam.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(path.to_owned());
+}
+
+/// Disarm one entry a fixture installed.
+///
+/// Removes a single match, never the whole seam, so a teardown cannot disarm
+/// a concurrent installer that armed the same path (#435).
+#[cfg(test)]
+pub(super) fn remove_fault_path(seam: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
+    let mut seam = seam.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(index) = seam.iter().position(|entry| entry == path) {
+        seam.remove(index);
+    }
+}
+
+/// Whether any installer has armed `seam` for `path`.
+#[cfg(test)]
+pub(super) fn fault_path_armed(seam: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) -> bool {
+    seam.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .any(|entry| entry == path)
+}
 
 /// Atomic write: tmp + replace in one operation.
 /// Unix uses `rename(2)` replacement semantics; Windows uses
@@ -600,26 +629,16 @@ fn write_auth_json_atomic_with_permission_check_classified(
 ) -> Result<(), DurableAuthWriteError> {
     let strict_write = prove_owner_only.is_some();
     #[cfg(test)]
-    if WRITE_STORAGE_FULL_FAULT_PATH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_deref()
-        == Some(auth_file)
-    {
+    if fault_path_armed(&WRITE_STORAGE_FULL_FAULT_PATHS, auth_file) {
         return Err(DurableAuthWriteError::before(std::io::Error::from(
             std::io::ErrorKind::StorageFull,
         )));
     }
     #[cfg(test)]
-    if WRITE_FAULT_PATH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_deref()
-        == Some(auth_file)
-    {
+    if fault_path_armed(&WRITE_FAULT_PATHS, auth_file) {
         return Err(DurableAuthWriteError::before(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "injected write fault (WRITE_FAULT_PATH)",
+            "injected write fault (WRITE_FAULT_PATHS)",
         )));
     }
     let (tmp, strict_file) = if prove_owner_only.is_some() {
@@ -667,32 +686,17 @@ fn write_auth_json_atomic_with_permission_check_classified(
 /// parent-sync helper is intentionally a no-op there.
 pub(super) fn sync_auth_parent_directory(auth_file: &Path) -> std::io::Result<()> {
     #[cfg(test)]
-    if PARENT_SYNC_STORAGE_FULL_FAULT_PATHS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .iter()
-        .any(|path| path == auth_file)
-    {
+    if fault_path_armed(&PARENT_SYNC_STORAGE_FULL_FAULT_PATHS, auth_file) {
         return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
     }
     #[cfg(test)]
-    if PARENT_SYNC_FAULT_PATHS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .iter()
-        .any(|path| path == auth_file)
-    {
+    if fault_path_armed(&PARENT_SYNC_FAULT_PATHS, auth_file) {
         return Err(std::io::Error::other(
             "injected auth parent-directory sync failure",
         ));
     }
     #[cfg(test)]
-    if PARENT_DIR_SYNC_FAULT_PATH
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_deref()
-        == Some(auth_file)
-    {
+    if fault_path_armed(&PARENT_DIR_SYNC_FAULT_PATHS, auth_file) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "injected parent-directory sync failure",
@@ -777,26 +781,7 @@ fn replace_auth_file(tmp: &Path, auth_file: &Path) -> std::io::Result<()> {
 
 fn finalize_auth_file_permissions(auth_file: &Path, strict_write: bool) -> std::io::Result<()> {
     #[cfg(test)]
-    if strict_write
-        && POST_RENAME_PERMISSION_FAULT_PATHS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .any(|path| path == auth_file)
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "injected post-rename owner-only permission failure",
-        ));
-    }
-    #[cfg(test)]
-    if strict_write
-        && POST_RENAME_PERMISSION_FAULT_PATH
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_deref()
-            == Some(auth_file)
-    {
+    if strict_write && fault_path_armed(&POST_RENAME_PERMISSION_FAULT_PATHS, auth_file) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "injected post-rename owner-only permission failure",
@@ -991,22 +976,14 @@ mod write_fallback_tests {
 
     impl StrictReadSwapAfterOpenFault {
         fn install(path: &Path) -> Self {
-            STRICT_READ_SWAP_AFTER_OPEN_PATHS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(path.to_owned());
+            install_fault_path(&STRICT_READ_SWAP_AFTER_OPEN_PATHS, path);
             Self(path.to_owned())
         }
     }
 
     impl Drop for StrictReadSwapAfterOpenFault {
         fn drop(&mut self) {
-            let mut swaps = STRICT_READ_SWAP_AFTER_OPEN_PATHS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(index) = swaps.iter().rposition(|path| path == &self.0) {
-                swaps.remove(index);
-            }
+            remove_fault_path(&STRICT_READ_SWAP_AFTER_OPEN_PATHS, &self.0);
         }
     }
 
@@ -1014,22 +991,14 @@ mod write_fallback_tests {
 
     impl PostRenamePermissionFault {
         fn install(path: &Path) -> Self {
-            POST_RENAME_PERMISSION_FAULT_PATHS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(path.to_owned());
+            install_fault_path(&POST_RENAME_PERMISSION_FAULT_PATHS, path);
             Self(path.to_owned())
         }
     }
 
     impl Drop for PostRenamePermissionFault {
         fn drop(&mut self) {
-            let mut paths = POST_RENAME_PERMISSION_FAULT_PATHS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(index) = paths.iter().rposition(|path| path == &self.0) {
-                paths.remove(index);
-            }
+            remove_fault_path(&POST_RENAME_PERMISSION_FAULT_PATHS, &self.0);
         }
     }
 
@@ -1037,22 +1006,14 @@ mod write_fallback_tests {
 
     impl ParentSyncFault {
         fn install(path: &Path) -> Self {
-            PARENT_SYNC_FAULT_PATHS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(path.to_owned());
+            install_fault_path(&PARENT_SYNC_FAULT_PATHS, path);
             Self(path.to_owned())
         }
     }
 
     impl Drop for ParentSyncFault {
         fn drop(&mut self) {
-            let mut paths = PARENT_SYNC_FAULT_PATHS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(index) = paths.iter().rposition(|path| path == &self.0) {
-                paths.remove(index);
-            }
+            remove_fault_path(&PARENT_SYNC_FAULT_PATHS, &self.0);
         }
     }
 
@@ -1060,22 +1021,14 @@ mod write_fallback_tests {
 
     impl ParentSyncStorageFullFault {
         fn install(path: &Path) -> Self {
-            PARENT_SYNC_STORAGE_FULL_FAULT_PATHS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(path.to_owned());
+            install_fault_path(&PARENT_SYNC_STORAGE_FULL_FAULT_PATHS, path);
             Self(path.to_owned())
         }
     }
 
     impl Drop for ParentSyncStorageFullFault {
         fn drop(&mut self) {
-            let mut paths = PARENT_SYNC_STORAGE_FULL_FAULT_PATHS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(index) = paths.iter().rposition(|path| path == &self.0) {
-                paths.remove(index);
-            }
+            remove_fault_path(&PARENT_SYNC_STORAGE_FULL_FAULT_PATHS, &self.0);
         }
     }
 
@@ -1083,21 +1036,14 @@ mod write_fallback_tests {
 
     impl ParentDirSyncFault {
         fn install(path: &Path) -> Self {
-            *PARENT_DIR_SYNC_FAULT_PATH
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+            install_fault_path(&PARENT_DIR_SYNC_FAULT_PATHS, path);
             Self(path.to_owned())
         }
     }
 
     impl Drop for ParentDirSyncFault {
         fn drop(&mut self) {
-            let mut guard = PARENT_DIR_SYNC_FAULT_PATH
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if guard.as_deref() == Some(self.0.as_path()) {
-                *guard = None;
-            }
+            remove_fault_path(&PARENT_DIR_SYNC_FAULT_PATHS, &self.0);
         }
     }
 
@@ -1105,21 +1051,14 @@ mod write_fallback_tests {
 
     impl StorageFullFault {
         fn install(path: &Path) -> Self {
-            *WRITE_STORAGE_FULL_FAULT_PATH
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+            install_fault_path(&WRITE_STORAGE_FULL_FAULT_PATHS, path);
             Self(path.to_owned())
         }
     }
 
     impl Drop for StorageFullFault {
         fn drop(&mut self) {
-            let mut guard = WRITE_STORAGE_FULL_FAULT_PATH
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if guard.as_deref() == Some(self.0.as_path()) {
-                *guard = None;
-            }
+            remove_fault_path(&WRITE_STORAGE_FULL_FAULT_PATHS, &self.0);
         }
     }
 
@@ -1168,6 +1107,108 @@ mod write_fallback_tests {
     fn fake_truncate_then_fail(path: &Path, _: &AuthStore) -> std::io::Result<()> {
         crate::util::secure_file::open_secure_file(path)?; // truncates to 0 bytes
         Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+    }
+
+    /// #435: two fixtures arming the same seam must both stay armed.
+    ///
+    /// Two of these seams were `Mutex<Option<PathBuf>>` and `install` assigned
+    /// rather than pushed, so the second installer silently disarmed the first
+    /// and the victim's write succeeded where it asserted a failure. Three
+    /// teardowns also cleared the slot unconditionally, disarming whichever
+    /// installer held it. Both halves are asserted below, per seam.
+    ///
+    /// Deterministic: no second thread and no scheduling window. The race in
+    /// the field only decided *whether* the overwrite landed inside a victim's
+    /// install-to-assert window; the overwrite itself was unconditional, so it
+    /// is observable sequentially.
+    #[test]
+    fn every_fault_seam_supports_concurrent_installers() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = dir_a.path().join("auth.json");
+        let b = dir_b.path().join("auth.json");
+
+        for (name, seam) in [
+            (
+                "STRICT_READ_SWAP_AFTER_OPEN_PATHS",
+                &STRICT_READ_SWAP_AFTER_OPEN_PATHS,
+            ),
+            (
+                "PERMISSION_REPAIR_FAULT_PATHS",
+                &PERMISSION_REPAIR_FAULT_PATHS,
+            ),
+            ("WRITE_FAULT_PATHS", &WRITE_FAULT_PATHS),
+            (
+                "WRITE_STORAGE_FULL_FAULT_PATHS",
+                &WRITE_STORAGE_FULL_FAULT_PATHS,
+            ),
+            (
+                "POST_RENAME_PERMISSION_FAULT_PATHS",
+                &POST_RENAME_PERMISSION_FAULT_PATHS,
+            ),
+            ("PARENT_SYNC_FAULT_PATHS", &PARENT_SYNC_FAULT_PATHS),
+            (
+                "PARENT_SYNC_STORAGE_FULL_FAULT_PATHS",
+                &PARENT_SYNC_STORAGE_FULL_FAULT_PATHS,
+            ),
+            ("PARENT_DIR_SYNC_FAULT_PATHS", &PARENT_DIR_SYNC_FAULT_PATHS),
+        ] {
+            install_fault_path(seam, &a);
+            install_fault_path(seam, &b);
+            assert!(
+                fault_path_armed(seam, &a),
+                "{name}: the second install disarmed the first"
+            );
+            assert!(fault_path_armed(seam, &b), "{name}: second install lost");
+
+            remove_fault_path(seam, &b);
+            assert!(
+                fault_path_armed(seam, &a),
+                "{name}: one fixture's teardown disarmed another installer"
+            );
+            assert!(
+                !fault_path_armed(seam, &b),
+                "{name}: teardown left its own entry armed"
+            );
+
+            remove_fault_path(seam, &a);
+            assert!(!fault_path_armed(seam, &a), "{name}: seam not left clean");
+        }
+    }
+
+    /// The check sites must test membership, not "is this the one entry".
+    ///
+    /// Without this, a seam could be a `Vec` while the check still only
+    /// honoured a single element — which is #435 with extra steps.
+    #[test]
+    fn a_second_installer_still_faults_through_the_write_path() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = dir_a.path().join("auth.json");
+        let b = dir_b.path().join("auth.json");
+        let store = sample_store();
+
+        let _fault_a = StorageFullFault::install(&a);
+        let _fault_b = StorageFullFault::install(&b);
+
+        for (label, path) in [("first", &a), ("second", &b)] {
+            let error =
+                write_auth_json_atomic(path, &store).expect_err("both installers must still fault");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::StorageFull,
+                "{label} installer's fault did not fire"
+            );
+        }
+
+        drop(_fault_b);
+        let error = write_auth_json_atomic(&a, &store)
+            .expect_err("dropping one fixture must not disarm the other");
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert!(
+            write_auth_json_atomic(&b, &store).is_ok(),
+            "the dropped fixture must have disarmed its own path"
+        );
     }
 
     #[test]
