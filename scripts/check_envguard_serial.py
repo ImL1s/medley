@@ -451,6 +451,11 @@ def _env_lock_is_live(body: str) -> bool:
         released = re.search(r"\bdrop\s*\(\s*" + re.escape(name) + r"\s*\)", body)
         if released and released.start() <= last:
             continue  # let go before the last mutation
+        # Rust drops it at the enclosing block too. Scope tracking was added to
+        # `_protected_spans` and not here, so a helper locking inside a nested
+        # block and mutating again after it read as self-locking (#449 review).
+        if _enclosing_block_end(body, match.end()) <= last:
+            continue
         return True
     return False
 
@@ -636,6 +641,7 @@ def _file_helpers(
 
     impl_spans = [(s, e) for _n, s, e in _impl_blocks(code)]
     consts = _string_consts(source)
+    bodies: dict[str, tuple[str, bool]] = {}
     helpers: dict[str, bool] = {}
     helper_vars: dict[str, frozenset[str]] = {}
     returns_guard: dict[str, bool] = {}
@@ -651,8 +657,15 @@ def _file_helpers(
         # binding its result gives the CALLER nothing (#449 review). Only a
         # helper that hands the guard back can protect its caller.
         signature = code[match.end() : body_range[0]]
-        hands_back = "->" in signature
+        # `-> bool` / `-> Result<..>` / `-> ()` all have a `->`, and none of
+        # them hand the caller a lock. The RETURN TYPE has to be a guard
+        # (#449 review).
+        returned = signature.split("->", 1)[1] if "->" in signature else ""
+        hands_back = "MutexGuard" in returned or any(
+            t in returned for t in types
+        )
         body = code[body_range[0] : body_range[1]]
+        bodies[match.group("name")] = (body, hands_back)
         uses_guard = any(used in types for used in TYPE_ASSOC_CALL.findall(body))
         if not ENV_MUTATION.search(body) and not uses_guard:
             continue
@@ -663,6 +676,28 @@ def _file_helpers(
         helper_vars[name] = helper_vars.get(name, frozenset()) | frozenset(
             _env_variables(source[body_range[0] : body_range[1]], consts)
         )
+
+    # Two hops and longer: a helper that only DELEGATES to another helper has
+    # no `env::set_var` and no guard-type call of its own, so it was skipped
+    # and a test calling it never became a candidate at all (#449 review).
+    for _ in range(4):
+        grew = False
+        for name, (body, sig_returns) in bodies.items():
+            called = {c for c in FREE_CALL.findall(body) if c in helpers and c != name}
+            if not called:
+                continue
+            if name not in helpers:
+                helpers[name] = any(helpers[c] for c in called)
+                returns_guard[name] = sig_returns and any(
+                    returns_guard[c] for c in called
+                )
+                grew = True
+            inherited = frozenset().union(*(helper_vars.get(c, frozenset()) for c in called))
+            if not inherited <= helper_vars.get(name, frozenset()):
+                helper_vars[name] = helper_vars.get(name, frozenset()) | inherited
+                grew = True
+        if not grew:
+            break
     return helpers, helper_vars, returns_guard
 
 
