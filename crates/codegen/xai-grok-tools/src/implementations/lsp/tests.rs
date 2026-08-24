@@ -23,15 +23,30 @@ use mock_servers::*;
 const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Poll until `ready`, or fail saying what was being waited for.
-async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+async fn wait_until(what: &str, ready: impl FnMut() -> bool) {
+    wait_until_within(what, WAIT_TIMEOUT, ready).await;
+}
+
+/// The same, for a caller that must not shorten a budget it inherited.
+///
+/// Replacing a wait is not licence to give it less time than the wait it
+/// replaced: a test that waited 30s for a verdict and now waits 15s for the
+/// fact behind it has traded one load-sensitive failure for another (#428).
+/// The budget belongs to what is being waited for, not to the helper that
+/// happens to poll it.
+async fn wait_until_within(
+    what: &str,
+    budget: std::time::Duration,
+    mut ready: impl FnMut() -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + budget;
     while tokio::time::Instant::now() < deadline {
         if ready() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("timed out waiting for {what}");
+    panic!("timed out after {budget:?} waiting for {what}");
 }
 
 /// A file is held for this long in tests that are about letting go of one.
@@ -113,11 +128,16 @@ async fn gave_up_draining(
                 .versions()
                 .into_iter()
                 .map(|(uri, sent)| {
-                    let answered = match client.diagnostics.covers(&uri) {
-                        Some(covers) => format!("v{covers}"),
-                        None => "never".to_string(),
+                    // One read, not two. `covers()` and `items()` take the
+                    // store lock separately, and the main loop writes to it
+                    // without the manager lock — so an answer landing between
+                    // the two would be reported as `answered=never` beside its
+                    // own item count, which is precisely the contradiction this
+                    // message exists to rule out.
+                    let (answered, items) = match client.diagnostics.answer(&uri) {
+                        Some(held) => (format!("v{}", held.covers), held.items.len()),
+                        None => ("never".to_string(), 0),
                     };
-                    let items = client.diagnostics.items(&uri).len();
                     format!("{uri} sent=v{sent} answered={answered} items={items}")
                 })
                 .collect();
@@ -1735,9 +1755,16 @@ async fn a_server_that_publishes_is_not_second_guessed_with_a_pull() {
     // not the summary that push eventually produces. Waiting on the fact keeps
     // the two apart: this wait names what it was waiting for when it expires,
     // and cannot be mistaken for the channel having been chosen wrongly (#428).
-    wait_until("the server's first publish", || {
-        mgr.clients["mock-ts"].diagnostics.server_publishes()
-    })
+    //
+    // The budget is the one the `drain_until_reported` this replaced already
+    // had. It is not a new allowance to make anything green — the same publish,
+    // reached over the same pipe from the same spawned server, must not get
+    // less time merely because the test now watches for it one step earlier.
+    wait_until_within(
+        "the server's first publish",
+        WAIT_TIMEOUT + WAIT_TIMEOUT,
+        || mgr.clients["mock-ts"].diagnostics.server_publishes(),
+    )
     .await;
 
     // The wait above established the first of the two facts the rule combines.
