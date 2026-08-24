@@ -7,10 +7,35 @@ other thread touches the environment. The crate-wide regime is unkeyed
 `#[serial(heap_profile_monitor)]` only serializes tests that share that key,
 so it does not compose with the rest of the env-mutating suite (#319).
 
-This first slice is a direct mention scan of `#[test]` / `#[tokio::test]`
-bodies under `crates/codegen/xai-grok-shell/src/**/*.rs`. Transitive helper
-callers are a later PR. Known stragglers live in
-`tests/ci/envguard-serial-allowlist.txt`; new hits and stale entries both fail.
+Guards are found by DEFINITION, not by name: a type or helper is an env
+mutator because its own body mutates env. Matching the literal `EnvGuard::`
+saw neither `EnvVarGuard::` nor `TestEnvGuard::` and was silent about 170
+env-mutating tests in this very crate (#446).
+
+A finding is cleared by any of five regimes: unkeyed `#[serial]`; an env lock
+whose guard is bound and alive across every mutation; a guard type or helper
+that owns the lock itself; the sole test in its own integration binary; or a
+keyed `#[serial(k)]` whose variable is consistently keyed across the binary.
+
+WHAT THIS DOES NOT CHECK, so that a green tick is not read as more than it is:
+
+    Two tests can each be sound under a DIFFERENT regime and still race each
+    other. Unkeyed `#[serial]` and a crate's own env mutex are unrelated locks,
+    so a test holding one has no exclusion against a test holding the other.
+    This checker judges each test against its own regime and does not compare
+    regimes across tests. Measured at the time of writing: 68 tests in this
+    crate mutate a variable that another test mutates under an incompatible
+    regime (25 unkeyed-serial, 43 lock-covered) -- `util/config/hints.rs` is
+    the clearest pair, where some tests take `CONTEXTUAL_HINTS_ENV_LOCK` and
+    others use `#[serial]`, both touching `ENV_CONTEXTUAL_HINTS`.
+    Tracked in #459. Until it closes, a pass here means "each test is
+    serialised against its own regime", not "no two env-mutating tests race".
+
+Scan scope is one crate: `crates/codegen/xai-grok-shell/src/**/*.rs` unless
+`--scan-root` says otherwise. Known stragglers live in
+`tests/ci/envguard-serial-allowlist.txt`; new hits and stale entries both fail,
+while an entry naming a file outside the scan root is reported as exactly that
+rather than as stale.
 
 Usage:
     python3 scripts/check_envguard_serial.py
