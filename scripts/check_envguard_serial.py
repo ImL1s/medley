@@ -563,11 +563,21 @@ def index_env_mutators(sources: list[tuple[Path, str]]) -> EnvMutators:
     )
 
 
-def _file_helpers(source: str, code: str, types: dict[str, bool]) -> dict[str, bool]:
-    """Same-file non-test fns that mutate env, and whether they self-lock."""
+def _file_helpers(
+    source: str, code: str, types: dict[str, bool]
+) -> tuple[dict[str, bool], dict[str, frozenset[str]]]:
+    """Same-file non-test fns that mutate env: do they self-lock, and what do
+    they touch?
+
+    The variables matter as much as the lock. A keyed test that reaches its
+    mutation through `set_home()` has an EMPTY variable set if you only read
+    the test body, so key consistency has nothing to compare and approves it
+    (#449 review).
+    """
 
     impl_spans = [(s, e) for _n, s, e in _impl_blocks(code)]
     helpers: dict[str, bool] = {}
+    helper_vars: dict[str, frozenset[str]] = {}
     for match in FN_DEF.finditer(code):
         if any(start <= match.start() < end for start, end in impl_spans):
             continue  # an inherent method, reached through its type instead
@@ -582,7 +592,59 @@ def _file_helpers(source: str, code: str, types: dict[str, bool]) -> dict[str, b
             continue
         name = match.group("name")
         helpers[name] = helpers.get(name, False) or _env_lock_is_live(body)
-    return helpers
+        helper_vars[name] = helper_vars.get(name, frozenset()) | frozenset(
+            _env_variables(source[body_range[0] : body_range[1]])
+        )
+    return helpers, helper_vars
+
+
+LET_BINDING = re.compile(
+    r"let\s+(?P<bind>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]*)?=\s*(?P<rhs>[^;]*);"
+)
+
+
+def _protected_spans(
+    body: str,
+    mutators: EnvMutators,
+    helpers: dict[str, bool],
+    crate: str,
+    file: str,
+    name_paths: dict[str, tuple[str, ...]],
+) -> list[tuple[int, int]]:
+    """`(from, until)` offsets over which serialisation actually holds.
+
+    A protector is a BOUND value that owns the lock: an env-lock guard, a
+    self-locking guard type, or a self-locking helper's return. `let _ = ...`
+    and an unbound temporary both drop at the statement's semicolon and protect
+    nothing, and an explicit `drop(x)` ends the span.
+    """
+
+    spans: list[tuple[int, int]] = []
+    for match in LET_BINDING.finditer(body):
+        bind, rhs = match.group("bind"), match.group("rhs")
+        if bind == "_":
+            continue
+        holds = bool(re.search(ENV_LOCK_NAME, rhs)) or any(
+            mutators.self_locks(t, crate, file, name_paths.get(t, ()))
+            for t in TYPE_ASSOC_CALL.findall(rhs)
+        ) or any(helpers.get(f) for f in FREE_CALL.findall(rhs))
+        if not holds:
+            continue
+        released = re.search(r"\bdrop\s*\(\s*" + re.escape(bind) + r"\s*\)", body)
+        spans.append((match.start(), released.start() if released else len(body)))
+    return spans
+
+
+def _mutation_sites(
+    body: str, mutators: EnvMutators, helpers: dict[str, bool]
+) -> list[int]:
+    """Offsets where this body mutates process env."""
+
+    sites = [m.start() for m in ENV_MUTATION.finditer(body)]
+    sites += [m.start() for m in TYPE_ASSOC_CALL.finditer(body) if m.group(1) in mutators.types]
+    sites += [m.start() for m in ENV_GUARD_NAME.finditer(body)]
+    sites += [m.start() for m in FREE_CALL.finditer(body) if m.group(1) in helpers]
+    return sorted(set(sites))
 
 
 def _env_mutation_reason(
@@ -657,7 +719,7 @@ def analyze_source(
     code = _code_only(source)
     if mutators is None:
         mutators = index_env_mutators([(path, source)])
-    helpers = _file_helpers(source, code, mutators.types)
+    helpers, helper_vars = _file_helpers(source, code, mutators.types)
     name_paths = _name_paths(code)
     test_count = 0
     raw: list[tuple[re.Match[str], list[str], tuple[int, int]]] = []
@@ -683,21 +745,24 @@ def analyze_source(
         regime = "none"
         if "unkeyed" in kinds:
             regime = "unkeyed-serial"
-        elif _env_lock_is_live(body):
-            # A crate-wide lock held for the test's lifetime is the same
-            # guarantee as unkeyed `#[serial]`.
-            regime = "env-lock-in-body"
-        elif any(
-            mutators.self_locks(
-                name, crate, path.as_posix(), name_paths.get(name, ())
+        else:
+            # Positional, not presence-based. "Is a lock mentioned anywhere in
+            # this body?" says yes to a lock taken AFTER the mutation, to an
+            # unbound guard temporary that drops at its own semicolon, and to a
+            # helper that releases on return — each leaving a real mutation
+            # unprotected (#449 review). Every mutation must fall inside a span
+            # where a bound protector is still alive.
+            spans = _protected_spans(
+                body, mutators, helpers, crate, path.as_posix(), name_paths
             )
-            or helpers.get(name)
-            for name in vouchers
-        ):
-            regime = "guard-or-helper-locks"
-        elif _is_integration_target(path) and test_count == 1:
-            # Nothing shares its process, so there is no sibling to corrupt.
-            regime = "sole-test-in-binary"
+            sites = _mutation_sites(body, mutators, helpers)
+            if sites and all(
+                any(start <= site < end for start, end in spans) for site in sites
+            ):
+                regime = "lock-covers-every-mutation"
+            elif _is_integration_target(path) and test_count == 1:
+                # Nothing shares its process, so there is no sibling to corrupt.
+                regime = "sole-test-in-binary"
         sound = regime != "none"
         keys = tuple(
             (m.group("args") or "").strip()
@@ -711,7 +776,16 @@ def analyze_source(
                 name=match.group("name"),
                 mention=mention,
                 keyed=keys,
-                variables=tuple(sorted(_env_variables(source[body_range[0] : body_range[1]]))),
+                variables=tuple(
+                    sorted(
+                        _env_variables(source[body_range[0] : body_range[1]])
+                        | {
+                            var
+                            for call in FREE_CALL.findall(body)
+                            for var in helper_vars.get(call, ())
+                        }
+                    )
+                ),
                 sound=sound,
                 regime=regime,
                 group=_process_group(path),
@@ -762,6 +836,23 @@ def judge(candidates: list[Candidate], keys: dict[tuple[str, str], set[str]]) ->
     findings: list[Finding] = []
     for cand in candidates:
         if cand.sound:
+            continue
+        if cand.keyed and not cand.variables:
+            # Keyed serialisation is only sound if the key is consistent for
+            # the variable, and we could not determine which variable this
+            # touches. Unknown is not the same as safe.
+            findings.append(
+                Finding(
+                    path=cand.path,
+                    line=cand.line,
+                    name=cand.name,
+                    reason=(
+                        f"{cand.mention} with keyed #[serial({cand.keyed[0]})], but the "
+                        "mutated variable could not be determined, so key "
+                        "consistency cannot be checked"
+                    ),
+                )
+            )
             continue
         if cand.keyed:
             clashes = sorted(

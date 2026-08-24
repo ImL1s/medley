@@ -673,5 +673,137 @@ class RegexesAgreeWithTheTree(unittest.TestCase):
                 f"{unrelated} is not an env lock",
             )
 
+
+_GUARD_DEF = textwrap.dedent(
+    """\
+    struct EnvVarGuard { _lock: std::sync::MutexGuard<'static, ()> }
+    impl EnvVarGuard {
+        fn set(k: &str, v: &str) -> Self {
+            let l = SOME_LOCK.lock().unwrap();
+            unsafe { std::env::set_var(k, v) };
+            Self { _lock: l }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) { unsafe { std::env::remove_var("K") } }
+    }
+
+    """
+)
+
+
+class ProtectionIsPositional(unittest.TestCase):
+    """#449 round 2: a lock that exists is not a lock that covers."""
+
+    def test_lock_acquired_after_the_mutation_does_not_protect_it(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                unsafe { std::env::set_var("HOME", "/tmp") };
+                let _lock = ENV_TEST_LOCK.lock().unwrap();
+            }
+            """
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
+    def test_lock_acquired_before_the_mutation_does_protect_it(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                let _lock = ENV_TEST_LOCK.lock().unwrap();
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual(guard.scan_source(src), [])
+
+    def test_unbound_guard_temporary_does_not_cover_a_later_mutation(self):
+        # `EnvVarGuard::set(..);` drops at that semicolon, so the raw mutation
+        # on the next line runs with no lock held.
+        src = _GUARD_DEF + textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                EnvVarGuard::set("A", "1");
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
+    def test_bound_self_locking_guard_covers_the_rest_of_the_body(self):
+        src = _GUARD_DEF + textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                let _g = EnvVarGuard::set("A", "1");
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual(guard.scan_source(src), [])
+
+    def test_dropping_the_guard_ends_its_protection(self):
+        src = _GUARD_DEF + textwrap.dedent(
+            """\
+            #[test]
+            fn t() {
+                let g = EnvVarGuard::set("A", "1");
+                drop(g);
+                unsafe { std::env::set_var("HOME", "/tmp") };
+            }
+            """
+        )
+        self.assertEqual([f.name for f in guard.scan_source(src)], ["t"])
+
+
+class HelperVariablesArePropagated(unittest.TestCase):
+    """#449 round 2: the variable may be mutated inside the helper."""
+
+    SRC = textwrap.dedent(
+        """\
+        fn set_home(v: &str) {
+            unsafe { std::env::set_var("HOME", v) };
+        }
+
+        #[test]
+        #[serial_test::serial(a)]
+        fn keyed_a() { set_home("/a"); }
+
+        #[test]
+        #[serial_test::serial(b)]
+        fn keyed_b() { set_home("/b"); }
+        """
+    )
+
+    def test_two_keys_reaching_one_variable_through_a_helper_clash(self):
+        found = guard.scan_source(self.SRC)
+        self.assertEqual(sorted(f.name for f in found), ["keyed_a", "keyed_b"])
+        self.assertIn("HOME", found[0].reason)
+
+    def test_helper_variables_reach_the_candidate(self):
+        cands = guard.analyze_source(self.SRC)
+        by_name = {c.name: c for c in cands}
+        self.assertIn("HOME", by_name["keyed_a"].variables)
+
+
+class UnknownVariableIsNotSafe(unittest.TestCase):
+    def test_keyed_test_with_undeterminable_variable_is_reported(self):
+        src = textwrap.dedent(
+            """\
+            #[test]
+            #[serial_test::serial(some_key)]
+            fn t() {
+                let name = compute_name();
+                unsafe { std::env::set_var(name, "1") };
+            }
+            """
+        )
+        found = guard.scan_source(src)
+        self.assertEqual([f.name for f in found], ["t"])
+        self.assertIn("could not be determined", found[0].reason)
+
 if __name__ == "__main__":
     unittest.main()
