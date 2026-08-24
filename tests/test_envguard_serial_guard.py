@@ -105,10 +105,73 @@ class ScanSource(unittest.TestCase):
     def test_unkeyed_serial_is_ok(self):
         self.assertEqual(guard.scan_source(SERIAL_OK), [])
 
-    def test_keyed_serial_is_insufficient(self):
-        found = guard.scan_source(KEYED_SERIAL)
-        self.assertEqual([item.name for item in found], ["keyed_serial_is_not_crate_wide"])
-        self.assertIn("keyed", found[0].reason)
+    def test_keyed_serial_alone_is_sound_when_the_key_is_consistent(self):
+        # Contract change (#446), deliberate: "keyed serial is insufficient"
+        # was a global verdict, and it is not one. A keyed `#[serial]`
+        # serialises every test sharing that key, so it is sound exactly when
+        # every test mutating the variable agrees on one key for it. Measured,
+        # `xai-grok-sandbox`'s 12 keyed tests all share `bwrap_env` and cannot
+        # race each other; calling them violations was noise. The insufficient
+        # case is a key CLASH, pinned in the test below.
+        self.assertEqual(guard.scan_source(KEYED_SERIAL), [])
+
+    def test_keyed_serial_is_a_violation_when_one_var_has_two_keys(self):
+        source = textwrap.dedent(
+            """\
+            #[test]
+            #[serial_test::serial(home_a)]
+            fn one_key() {
+                unsafe { std::env::set_var("HOME", "/tmp/a") };
+            }
+
+            #[test]
+            #[serial_test::serial(home_b)]
+            fn other_key() {
+                unsafe { std::env::set_var("HOME", "/tmp/b") };
+            }
+            """
+        )
+        found = guard.scan_source(source)
+        self.assertEqual(
+            sorted(item.name for item in found), ["one_key", "other_key"]
+        )
+        self.assertIn("HOME", found[0].reason)
+
+    def test_keyed_serial_clashing_with_an_unkeyed_mutation_is_a_violation(self):
+        source = textwrap.dedent(
+            """\
+            #[test]
+            #[serial_test::serial(home_a)]
+            fn keyed_one() {
+                unsafe { std::env::set_var("HOME", "/tmp/a") };
+            }
+
+            #[test]
+            fn not_serialised_at_all() {
+                unsafe { std::env::set_var("HOME", "/tmp/b") };
+            }
+            """
+        )
+        found = guard.scan_source(source)
+        self.assertEqual(
+            sorted(item.name for item in found), ["keyed_one", "not_serialised_at_all"]
+        )
+
+    def test_sole_test_in_its_own_integration_binary_is_sound(self):
+        # No in-process sibling to corrupt. Detected from the path shape:
+        # `…/<crate>/tests/<file>.rs` is its own binary.
+        found = guard.scan_source(
+            VIOLATION, relpath=Path("crates/codegen/x/tests/only_one.rs")
+        )
+        self.assertEqual(found, [])
+
+    def test_tests_module_under_src_is_not_an_integration_binary(self):
+        # `src/app/dispatch/tests/cta_e2e.rs` shares the lib's process; the
+        # path contains "tests" but it is a module, not a target.
+        found = guard.scan_source(
+            VIOLATION, relpath=Path("crates/codegen/x/src/app/tests/cta_e2e.rs")
+        )
+        self.assertEqual([item.name for item in found], ["mutates_env_without_serial"])
 
     def test_helper_is_not_a_test(self):
         self.assertEqual(guard.scan_source(HELPER_ONLY), [])
@@ -199,7 +262,11 @@ class RepositoryScan(unittest.TestCase):
     def test_repository_allowlist_is_exact(self):
         findings = guard.scan_tree(SHELL_SRC, repo=REPO)
         allowlist = guard.load_allowlist(ALLOWLIST_PATH)
-        new, stale, _ = guard.evaluate(findings, allowlist)
+        # Pass the scanned scope, as `main` does: without it every allowlist
+        # entry from an unscanned crate reads as stale, which is the #446 bug.
+        new, stale, _ = guard.evaluate(
+            findings, allowlist, scan_rel=SHELL_SRC.relative_to(REPO).as_posix()
+        )
         self.assertEqual(
             (new, stale),
             ([], []),

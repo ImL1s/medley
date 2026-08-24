@@ -62,6 +62,12 @@ FREE_CALL = re.compile(r"(?<![:.\w])([a-z_][a-z0-9_]*)\s*\(")
 # and note the leading `*`, not `+`: requiring one character before `Env` is
 # the bug that hid `EnvVarGuard` from the old matcher in the first place.
 ENV_GUARD_NAME = re.compile(r"\b([A-Za-z0-9_]*Env[A-Za-z0-9_]*Guard)\s*::")
+# First argument of an env mutation: the variable being touched. Either a
+# string literal or a SCREAMING_CASE const naming it.
+ENV_VAR_ARG = re.compile(
+    r"(?:env\s*::\s*(?:set_var|remove_var)|[A-Za-z_][A-Za-z0-9_]*\s*::\s*(?:set|unset|remove|isolate))\s*\(\s*"
+    r"(?:\"(?P<lit>[^\"]*)\"|(?P<konst>[A-Z][A-Z0-9_]{2,}))"
+)
 IMPL_HEAD = re.compile(r"\bimpl\b[^{;]*\{")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -411,25 +417,60 @@ def _env_mutation_reason(
     return None
 
 
-def scan_source(
+@dataclass(frozen=True)
+class Candidate:
+    """A test that mutates process env, with what it needs to be judged."""
+
+    path: Path
+    line: int
+    name: str
+    mention: str
+    keyed: tuple[str, ...]
+    variables: tuple[str, ...]
+    sound: bool
+
+
+def _is_integration_target(path: Path) -> bool:
+    """`crates/<group>/<crate>/tests/<file>.rs` — its own test binary.
+
+    Only a file directly under the crate's `tests/` dir is a target; a
+    `tests/` MODULE under `src/` (`src/app/dispatch/tests/cta_e2e.rs`) shares
+    the lib's process and must not be mistaken for one.
+    """
+
+    parts = path.parts
+    return "src" not in parts and len(parts) >= 2 and parts[-2] == "tests"
+
+
+def _env_variables(raw_body: str) -> set[str]:
+    """Names of the env vars a test mutates.
+
+    Read from the RAW body: `_code_only` masks string literals, which is
+    where the names are. Bare SCREAMING_CASE consts count too — a crate that
+    names its key (`ENV_AUTO_COMPACT_THRESHOLD_PERCENT`) is the common case.
+    """
+
+    found: set[str] = set()
+    for match in ENV_VAR_ARG.finditer(raw_body):
+        found.add(match.group("lit") or match.group("konst"))
+    return {v for v in found if v}
+
+
+def analyze_source(
     source: str,
     *,
     relpath: Path | None = None,
     mutators: EnvMutators | None = None,
-) -> list[Finding]:
-    """Return test functions that mutate process env with no serialisation.
-
-    ``mutators`` defaults to an index built from this source alone, so a
-    single-snippet caller (the unit tests) behaves the same as a tree scan
-    whose guard types happen to be defined in the same file.
-    """
+) -> list[Candidate]:
+    """Every env-mutating test in ``source``, pre-judged for the local regimes."""
 
     path = relpath or Path("<input>")
     code = _code_only(source)
     if mutators is None:
         mutators = index_env_mutators([(path, source)])
     helpers = _file_helpers(source, code, mutators.types)
-    findings: list[Finding] = []
+    test_count = 0
+    raw: list[tuple[re.Match[str], list[str], tuple[int, int]]] = []
     for match in FN_DEF.finditer(code):
         attrs = _preceding_attributes(source, code, match.start())
         if not any(_is_test_attr(attr) for attr in attrs):
@@ -437,35 +478,107 @@ def scan_source(
         body_range = _fn_body(source, match.end())
         if body_range is None:
             continue
+        test_count += 1
+        raw.append((match, attrs, body_range))
+
+    out: list[Candidate] = []
+    for match, attrs, body_range in raw:
         body = code[body_range[0] : body_range[1]]
         found = _env_mutation_reason(body, mutators, helpers)
         if found is None:
             continue
         mention, vouchers = found
         kinds = [kind for attr in attrs if (kind := _serial_kind(attr))]
-        if "unkeyed" in kinds:
-            continue
+        sound = "unkeyed" in kinds
         # A crate-wide lock held for the test's lifetime is the same guarantee
         # as unkeyed `#[serial]`, whether the test takes it itself, the guard
-        # type takes it in its constructor, or a same-file helper does (#446).
-        if LOCK_ACQUIRE.search(body):
-            continue
-        if any(mutators.self_locks(name) or helpers.get(name) for name in vouchers):
-            continue
-        reason = (
-            f"{mention} without unkeyed #[serial_test::serial]"
-            if "keyed" not in kinds
-            else f"{mention} with keyed #[serial(...)], which is not crate-wide"
+        # type takes it in its constructor, or a same-file helper does.
+        sound = sound or bool(LOCK_ACQUIRE.search(body))
+        sound = sound or any(
+            mutators.self_locks(name) or helpers.get(name) for name in vouchers
         )
-        findings.append(
-            Finding(
+        # Sole test in its own integration binary: nothing shares its process,
+        # so there is no sibling for it to corrupt. A regime, not an exemption.
+        sound = sound or (_is_integration_target(path) and test_count == 1)
+        keys = tuple(
+            (m.group("args") or "").strip()
+            for attr in attrs
+            if (m := SERIAL_ATTR.fullmatch(attr.strip())) and (m.group("args") or "").strip()
+        )
+        out.append(
+            Candidate(
                 path=path,
                 line=_line(source, match.start()),
                 name=match.group("name"),
-                reason=reason,
+                mention=mention,
+                keyed=keys,
+                variables=tuple(sorted(_env_variables(source[body_range[0] : body_range[1]]))),
+                sound=sound,
             )
         )
+    return out
+
+
+def key_map(candidates: list[Candidate]) -> dict[str, set[str]]:
+    """variable -> the set of serial keys under which it is mutated.
+
+    `<unkeyed>` marks a mutation with no key at all. A variable appearing
+    under two entries is one no keyed `#[serial]` can protect.
+    """
+
+    mapping: dict[str, set[str]] = {}
+    for cand in candidates:
+        if cand.sound:
+            continue
+        label = set(cand.keyed) or {"<unkeyed>"}
+        for var in cand.variables:
+            mapping.setdefault(var, set()).update(label)
+    return mapping
+
+
+def judge(candidates: list[Candidate], keys: dict[str, set[str]]) -> list[Finding]:
+    """Apply the key-consistency regime and emit findings.
+
+    "Is a keyed `#[serial]` sufficient?" is not a global verdict, it is a
+    property: a keyed serial is sound exactly when every test mutating a given
+    variable agrees on one key for it. `xai-grok-sandbox`'s tests all share
+    `bwrap_env` and are sound; `#[serial(GROK_HOME)]` and `#[serial(HOME)]`
+    both perturb home resolution under different keys and are not.
+    """
+
+    findings: list[Finding] = []
+    for cand in candidates:
+        if cand.sound:
+            continue
+        if cand.keyed:
+            clashes = sorted(
+                var for var in cand.variables if len(keys.get(var, set())) > 1
+            )
+            if not clashes:
+                continue
+            reason = (
+                f"{cand.mention} with keyed #[serial({cand.keyed[0]})], but "
+                f"{clashes[0]} is also mutated under "
+                f"{sorted(keys[clashes[0]] - {cand.keyed[0]})[0]}"
+            )
+        else:
+            reason = f"{cand.mention} without unkeyed #[serial_test::serial]"
+        findings.append(
+            Finding(path=cand.path, line=cand.line, name=cand.name, reason=reason)
+        )
     return findings
+
+
+def scan_source(
+    source: str,
+    *,
+    relpath: Path | None = None,
+    mutators: EnvMutators | None = None,
+) -> list[Finding]:
+    """Findings for one source, judged against its own key usage."""
+
+    candidates = analyze_source(source, relpath=relpath, mutators=mutators)
+    return judge(candidates, key_map(candidates))
 
 
 def rust_files(scan_root: Path) -> list[Path]:
@@ -487,12 +600,15 @@ def scan_tree(scan_root: Path, *, repo: Path, index_root: Path | None = None) ->
     mutators = index_env_mutators(
         [(p.relative_to(repo), p.read_text(encoding="utf-8")) for p in rust_files(index_dir)]
     )
-    found: list[Finding] = []
+    # Two passes: key consistency is a property of the whole scanned set, not
+    # of one file — a variable is only safely keyed if EVERY test touching it
+    # agrees on the key, and the disagreeing test is usually elsewhere.
+    candidates: list[Candidate] = []
     for path in rust_files(scan_root):
         rel = path.relative_to(repo)
         text = path.read_text(encoding="utf-8")
-        found.extend(scan_source(text, relpath=rel, mutators=mutators))
-    return found
+        candidates.extend(analyze_source(text, relpath=rel, mutators=mutators))
+    return judge(candidates, key_map(candidates))
 
 
 def load_allowlist(path: Path) -> list[str]:
