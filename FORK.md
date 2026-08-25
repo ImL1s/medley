@@ -121,8 +121,12 @@ of a removed `#[cfg]`.
   files (`xai-grok-pager`, `-pager-bin`, `xai-grok-shell`, `-shell-base`); the
   fork declares it in **none**, and adds
   `unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("local-workspace"))'] }`
-  at `Cargo.toml:399` so the compiler stays quiet about **219**
-  now-permanently-false gates. Quarantined by `7b512227`.
+  at `Cargo.toml:399` so the compiler stays quiet about the **several hundred**
+  now-permanently-false gates across the tree. Quarantined by `7b512227`.
+  (Counting them is itself a trap: `cfg(feature = "local-workspace")` matches
+  far fewer than the `all(..)` / `any(..)` forms that also enable on it, and a
+  grep wide enough to catch those also catches `not(feature = ..)` gates, which
+  are permanently *true*. Grep for the mechanism, not for a number.)
   **Why:** `gateway_bridge` — the module the gated code imports — exists in
   **neither** tree, so upstream's own Cargo build cannot enable it either.
   **At conflict time:** take ours; do not restore the declarations.
