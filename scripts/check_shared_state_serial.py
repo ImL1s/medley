@@ -160,6 +160,29 @@ WHAT THIS DOES NOT CHECK, so a green tick is not read as more than it is:
     against the KEY its own registered item requires; it does not compare
     keys across items.
 
+    `Self::name(...)` resolves to the calling function's OWN enclosing
+    `impl` type -- but only when it has one. `Self` inside a TRAIT
+    definition's own default method body (`trait Foo { fn helper() {
+    Self::other(); } }`, not an `impl` block) has no enclosing type this
+    checker tracks, and is not resolved; sound (skipped, not
+    misattributed), not tight.
+
+    `self::`/`super::` resolve one level only. `self::sub::name(...)` and
+    `super::super::name(...)` (or deeper) are not walked -- the single
+    most common real shape (one level, from an inline `mod tests { use
+    super::*; ... }` or a top-level sibling file) is, both tried and
+    unioned since a file-based module model cannot tell which one applies
+    without knowing where a `mod` block is nested, but a chain of two or
+    more relative segments is not attempted.
+
+    An `impl` for a non-path type (`impl Trait for &Foo { .. }`, `impl
+    Trait for dyn Foo { .. }`, `impl Trait for (A, B) { .. }`) has no
+    single identifier this checker extracts as "the type," and the whole
+    block is skipped -- its methods are simply not indexed under any type
+    name, so a `Type::method(...)` call into one of them does not resolve
+    (though an unqualified same-file call still would, same as any other
+    function).
+
 Scan scope is one crate: `crates/codegen/xai-grok-shell/src/**/*.rs` unless
 `--scan-root` says otherwise -- the same default and the same "one crate"
 assumption `check_envguard_serial.py` documents, for the same reason
@@ -339,12 +362,15 @@ def _skip_generic_params(source: str, open_index: int) -> int:
 
     Deliberately a SEPARATE function from `_balanced_end`, not an addition
     of `<`/`>` to its `pairs` dict: `<`/`>` are also Rust's comparison
-    operators, and `_balanced_end` is called from contexts (`_impl_blocks`,
-    general balanced-brace scanning) where a stray comparison inside an
-    ordinary expression must not be misread as opening a generic. This is
-    called only from `_fn_body`, at a position already known to be a
-    function name's immediate next character -- a bare `<` there cannot
-    legally be anything but a generic parameter list opener.
+    operators, and `_balanced_end` is called from contexts (general
+    balanced-brace scanning) where a stray comparison inside an ordinary
+    expression must not be misread as opening a generic. Every current
+    caller (`_fn_body` at a function name's immediate next character,
+    `_impl_type_name` walking an `impl` head's own type-path segments,
+    `_strip_turbofish` at a literal `::<`) is a position already known by
+    its own caller's structure to be a generic-list opener specifically,
+    never an ordinary comparison -- that constraint travels with each call
+    site, not with this function.
 
     Guards one real ambiguity: a `->` arrow inside a trait-bound generic
     (`fn f<T: Fn() -> U>(..)`) contains a `>` that is not a close. Anything
@@ -383,6 +409,36 @@ def _skip_generic_params(source: str, open_index: int) -> int:
         else:
             index += 1
     return index
+
+
+def _strip_turbofish(source: str) -> str:
+    """Remove every `::<...>` turbofish (respecting nested generics via
+    `_skip_generic_params`, so `bump::<Vec<u8>>()` strips to `bump()`, not
+    something truncated at the inner `>`).
+
+    `FREE_CALL`/`QUALIFIED_CALL`/`TYPE_ASSOC_CALL` all require `(`
+    immediately (whitespace aside) after the called name; an explicit
+    turbofish sits between the two and broke all three. Stripping it
+    first, once, is simpler than teaching each regex its own optional
+    `(?:::<[^<>]*>)?` -- which would still need `_skip_generic_params`-grade
+    nesting awareness to be correct, at three call sites instead of one.
+
+    Only ever called on an already `_code_only`-masked body (see
+    `FnInfo.body`'s own doc), so a `::<` appearing inside what was once a
+    string or comment cannot occur here -- masking already replaced that
+    content before this runs.
+    """
+
+    out: list[str] = []
+    index = 0
+    n = len(source)
+    while index < n:
+        if source[index : index + 3] == "::<":
+            index = _skip_generic_params(source, index + 2)
+            continue
+        out.append(source[index])
+        index += 1
+    return "".join(out)
 
 
 def _code_only(source: str) -> str:
@@ -485,16 +541,83 @@ def _fn_body(source: str, name_end: int) -> tuple[int, int] | None:
     return None
 
 
+def _impl_type_name(head: str) -> str | None:
+    """The type an `impl` head (`match.group(0)` from `IMPL_HEAD`, ending in
+    `{`) is FOR: the identifier after `for` in a trait impl, or the
+    inherent type otherwise.
+
+    The earlier version of this function took `IDENT.findall(head)[-1]` --
+    the LAST identifier anywhere in the head -- which happens to equal the
+    right answer for `impl Type {` and `impl Trait for Type {` (the type
+    name really is the last identifier there), but is wrong the moment any
+    generic parameter or argument follows it: `impl<T> Box<T> {` ends in
+    the generic parameter `T`, not `Box`. This version walks the head
+    structurally instead, skipping `<...>` lists (via
+    `_skip_generic_params`, so nested generics like `Box<Vec<T>>` do not
+    end the walk early) wherever they appear, rather than trusting
+    position alone.
+
+    Named residuals, not attempted: a non-path impl type (`impl Trait for
+    &Foo {`, `impl Trait for dyn Foo {`, `impl Trait for (A, B) {`) returns
+    `None` and the whole block is skipped -- sound (nothing is
+    misattributed), just not tight for those shapes.
+    """
+
+    match = re.match(r"\s*impl\b", head)
+    if match is None:
+        return None
+    index = match.end()
+    n = len(head)
+
+    def skip_ws(i: int) -> int:
+        while i < n and head[i].isspace():
+            i += 1
+        return i
+
+    def read_type_path(i: int) -> tuple[str | None, int]:
+        """One `Path::To::Type<generics>` expression -- returns its LAST
+        segment's identifier (the type/trait's own name, generic
+        parameters/arguments of that segment skipped) and the index just
+        past it."""
+        name = None
+        while True:
+            i = skip_ws(i)
+            m = IDENT.match(head, i)
+            if m is None:
+                break
+            name = m.group(0)
+            i = skip_ws(m.end())
+            if i < n and head[i] == "<":
+                i = skip_ws(_skip_generic_params(head, i))
+            if head[i : i + 2] == "::":
+                i += 2
+                continue
+            break
+        return name, i
+
+    index = skip_ws(index)
+    if index < n and head[index] == "<":
+        index = skip_ws(_skip_generic_params(head, index))
+    first_name, index = read_type_path(index)
+    index = skip_ws(index)
+    if head[index : index + 3] == "for" and not (
+        index + 3 < n and (head[index + 3].isalnum() or head[index + 3] == "_")
+    ):
+        second_name, _index = read_type_path(index + 3)
+        return second_name
+    return first_name
+
+
 def _impl_blocks(code: str) -> list[tuple[str, int, int]]:
     """`(type name, start, end)` for each `impl … { … }`, block-scoped."""
 
     blocks: list[tuple[str, int, int]] = []
     for match in IMPL_HEAD.finditer(code):
-        idents = IDENT.findall(match.group(0))
-        if not idents:
+        type_name = _impl_type_name(match.group(0))
+        if type_name is None:
             continue
         open_index = match.end() - 1
-        blocks.append((idents[-1], open_index, _balanced_end(code, open_index)))
+        blocks.append((type_name, open_index, _balanced_end(code, open_index)))
     return blocks
 
 
@@ -595,7 +718,7 @@ class FnInfo:
     name: str
     file: Path
     type_name: str | None  # set for an `impl Type { fn name }` method
-    body: str  # code-only
+    body: str  # code-only, turbofish-stripped -- see `_strip_turbofish`
     start: int
     keys: frozenset[str]  # Stage-1 direct touch, possibly empty
     is_test: bool
@@ -621,7 +744,7 @@ def index_functions(
             if body_span is None:
                 continue
             body_start, body_end = body_span
-            body_code = code[body_start:body_end]
+            body_code = _strip_turbofish(code[body_start:body_end])
             keys = frozenset(
                 item.key for item in registry if _body_touches(body_code, item.identifiers)
             )
@@ -742,6 +865,7 @@ def _resolve_calls(
 ) -> frozenset[str]:
     gained: set[str] = set()
     file_index = by_file.get(fn.file, {})
+    caller_module = _module_path(fn.file)
     for m in FREE_CALL.finditer(fn.body):
         j = file_index.get(m.group(1))
         if j is not None and j != self_index:
@@ -752,13 +876,47 @@ def _resolve_calls(
             j = by_module.get(segs[1:], {}).get(m.group(2))
             if j is not None and j != self_index:
                 gained.update(keys_of[j])
+        elif segs == ("self",):
+            # `self::name(` -- this checker's unit of "module" is the
+            # file, so "the current module" and "the current file" are the
+            # same lookup `file_index` already is.
+            j = file_index.get(m.group(2))
+            if j is not None and j != self_index:
+                gained.update(keys_of[j])
+        elif segs == ("super",) and caller_module is not None:
+            # `super::name(` has TWO real shapes in this tree and they
+            # resolve to DIFFERENT modules, so both are tried and unioned
+            # rather than picking one: (a) from inside an inline `mod
+            # tests { use super::*; ... }` block, `super` means "this same
+            # file, one level up in NESTING" -- which, since nesting is
+            # invisible to a file-based `_module_path`, is just this same
+            # file again (`file_index`); (b) from top-level code in a
+            # child file, `super` means "the parent directory's module"
+            # (`by_module` on `caller_module` with its last segment
+            # dropped). A single-segment fix that only tried (b) would
+            # resolve (a) to the wrong, one-level-too-high module and miss
+            # the shape tests actually use most.
+            j = file_index.get(m.group(2))
+            if j is not None and j != self_index:
+                gained.update(keys_of[j])
+            if caller_module:
+                j = by_module.get(caller_module[:-1], {}).get(m.group(2))
+                if j is not None and j != self_index:
+                    gained.update(keys_of[j])
         leaf = segs[-1] if segs else None
-        if leaf and leaf != "crate":
+        if leaf and leaf not in ("crate", "self", "super"):
             j = by_leaf.get(leaf, {}).get(m.group(2))
             if j is not None and j != self_index:
                 gained.update(keys_of[j])
     for m in TYPE_ASSOC_CALL.finditer(fn.body):
-        j = by_type.get(m.group(1), {}).get(m.group(2))
+        # `Self::name(` resolves against the CALLING function's own
+        # enclosing impl type, not a literal lookup on the string "Self"
+        # (which is never a real registered type name -- `by_type` is
+        # keyed by concrete type names from `_impl_blocks`).
+        type_name = fn.type_name if m.group(1) == "Self" else m.group(1)
+        if type_name is None:
+            continue
+        j = by_type.get(type_name, {}).get(m.group(2))
         if j is not None and j != self_index:
             gained.update(keys_of[j])
     return frozenset(gained)
@@ -783,8 +941,17 @@ def analyze(
         by_file.setdefault(fn.file, {})[fn.name] = i
         module = _module_path(fn.file)
         if module is not None:
+            # `module` is a valid module path even when empty (`()` is the
+            # crate root itself, from a function declared directly in
+            # `src/lib.rs`/`src/main.rs` -- reachable as `crate::name()`,
+            # so `by_module` indexing still applies). `module[-1]` has no
+            # meaning for that case, though: no sibling ever calls a
+            # crate-root function as `lib::name()`/`main::name()`, so
+            # `by_leaf` is simply not populated for it, guarded here
+            # instead of raising `IndexError` on the empty tuple.
             by_module.setdefault(module, {})[fn.name] = i
-            by_leaf.setdefault(module[-1], {})[fn.name] = i
+            if module:
+                by_leaf.setdefault(module[-1], {})[fn.name] = i
         if fn.type_name is not None:
             by_type.setdefault(fn.type_name, {})[fn.name] = i
 

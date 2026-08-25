@@ -506,6 +506,398 @@ class TypeAssociatedResolution(unittest.TestCase):
         findings = guard.scan_source(text)
         self.assertEqual(findings, [])
 
+    def test_self_qualified_call_resolves_to_the_enclosing_impl_type(self):
+        """Codex, round 3 of #501/#496: `Self::bump()` matched
+        `TYPE_ASSOC_CALL` syntactically but resolved by a literal lookup on
+        the string `"Self"`, which is never a real registered type name --
+        the call silently never resolved. `Self` must resolve to the
+        calling function's OWN enclosing impl type."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct Snapshot(u64);
+
+            impl Snapshot {
+                fn wrapper() -> Self {
+                    Self::bump()
+                }
+
+                fn bump() -> Self {
+                    Snapshot(COUNTER.fetch_add(1, Ordering::SeqCst))
+                }
+            }
+
+            #[test]
+            fn calls_wrapper_which_calls_self_bump_untagged() {
+                let _s = Snapshot::wrapper();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_wrapper_which_calls_self_bump_untagged"})
+
+    def test_generic_impl_indexes_under_the_concrete_type_not_the_generic_param(self):
+        """Codex, round 3: `impl<T> Box<T> { fn bump() }` indexed the
+        method under the trailing generic parameter `T` (the last
+        identifier `IDENT.findall` saw in the impl head), not the actual
+        type `Box` -- so `Box::<u64>::bump()` (or even plain
+        `Box::bump()`) never matched any registered type."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct Box<T> {
+                value: T,
+            }
+
+            impl<T> Box<T> {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn calls_generic_impl_method_untagged() {
+                Box::<u64>::bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_generic_impl_method_untagged"})
+
+    def test_generic_trait_impl_indexes_the_implementing_type_after_for(self):
+        """The harder shape the same fix must not regress: a generic
+        TRAIT impl (`impl<T> Trait<T> for Box<T>`), where the type of
+        interest is the one after `for`, not the trait name, and both
+        carry their own generic arguments to skip past."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct Box<T> {
+                value: T,
+            }
+
+            trait Bumper<T> {
+                fn bump();
+            }
+
+            impl<T> Bumper<T> for Box<T> {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn calls_generic_trait_impl_method_untagged() {
+                Box::<u64>::bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_generic_trait_impl_method_untagged"})
+
+    def test_impl_for_reference_type_is_a_named_residual_not_a_crash(self):
+        """`impl Trait for &Foo { .. }` -- a non-path impl type this
+        design does not parse. Must be skipped cleanly (no crash, no
+        misattribution), not resolved."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct Foo;
+            trait Bumper {
+                fn bump();
+            }
+
+            impl Bumper for &Foo {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn calls_ref_impl_method_untagged() {
+                Foo.bump();
+            }
+            """
+        )
+        # Not asserting the derived set here -- only that analysis does not
+        # raise. `Foo.bump()` is an instance-method call anyway (the
+        # already-named `.changed()`-shaped gap above), so this fixture
+        # would not resolve even with a working impl-type parser; it exists
+        # to pin "skips cleanly" against the non-path `for &Foo` shape.
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, set())
+
+
+class RelativeQualifierResolution(unittest.TestCase):
+    """Codex, round 3 of #501/#496: `self::`/`super::` matched
+    `QUALIFIED_CALL` syntactically but resolved as an ordinary module leaf
+    -- `by_leaf.get("self", ...)` / `by_leaf.get("super", ...)` -- which no
+    real module is ever named, so both common relative-call forms silently
+    never resolved."""
+
+    def test_self_path_call_resolves_same_file(self):
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn calls_self_qualified_untagged() {
+                self::bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_self_qualified_untagged"})
+
+    def test_super_path_call_resolves_from_an_inline_test_module(self):
+        """The dominant real shape (heap_profile/monitor.rs's own
+        `mod tests { use super::*; ... }`): the test's OWN file is
+        `_module_path`'s unit of resolution, so `super::` from inside an
+        inline `mod tests` block must resolve against the SAME file the
+        toucher lives in, not one directory up. A fix that only widens
+        `caller_module[:-1]` (the top-level-sibling case below) would
+        resolve this to the wrong, one-level-too-high module and still
+        miss the shape tests actually use."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            mod tests {
+                use super::*;
+
+                #[test]
+                fn calls_super_qualified_from_inline_mod_untagged() {
+                    super::bump();
+                }
+            }
+            """
+        )
+        names = derived_names([(Path("crates/codegen/demo/src/inner.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_super_qualified_from_inline_mod_untagged"})
+
+    def test_super_path_call_resolves_from_a_top_level_sibling_file(self):
+        """The other real shape (heap_profile/monitor.rs's own top-level
+        `super::dump_to_path(..)`, called from CODE, not from `mod tests`):
+        a file one directory down calling something in its PARENT
+        directory's module via `super::`."""
+
+        parent_file = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            pub(crate) fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        child_file = src(
+            """\
+            #[test]
+            fn calls_super_qualified_from_child_dir_untagged() {
+                super::bump();
+            }
+            """
+        )
+        sources = [
+            (Path("crates/codegen/demo/src/parent.rs"), parent_file),
+            (Path("crates/codegen/demo/src/parent/child.rs"), child_file),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_super_qualified_from_child_dir_untagged"})
+
+    def test_multi_segment_relative_qualifier_is_a_named_residual_not_a_crash(self):
+        """`super::super::bump()` (two levels) is NOT resolved -- named in
+        the module docstring as a residual alongside the single-segment
+        fix, not silently either resolved-by-accident or crashed on."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            mod inner {
+                mod tests {
+                    #[test]
+                    fn calls_double_super_untagged() {
+                        super::super::bump();
+                    }
+                }
+            }
+            """
+        )
+        names = derived_names(
+            [(Path("crates/codegen/demo/src/parent/child.rs"), text)], "demo_key"
+        )
+        self.assertEqual(names, set())
+
+
+class TurbofishCallResolution(unittest.TestCase):
+    """Codex, round 3: `bump::<u64>()` requires `(` immediately after the
+    identifier for `FREE_CALL` (and the equivalent for `QUALIFIED_CALL` /
+    `TYPE_ASSOC_CALL`); an explicit turbofish sits between the name and the
+    `(` and broke every one of them."""
+
+    def test_turbofish_free_call_is_still_resolved(self):
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn bump<T>() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn calls_turbofish_untagged() {
+                bump::<u64>();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_turbofish_untagged"})
+
+    def test_turbofish_with_nested_generic_argument_is_still_resolved(self):
+        """The one real ambiguity a naive `::<[^>]*>` strip would get
+        wrong: a nested generic (`Vec<u8>`) inside the turbofish has its
+        own `>` that is not the turbofish's own close."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn bump<T>() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn calls_nested_turbofish_untagged() {
+                bump::<Vec<u8>>();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_nested_turbofish_untagged"})
+
+    def test_type_associated_turbofish_call_is_still_resolved(self):
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct Box<T> {
+                value: T,
+            }
+
+            impl<T> Box<T> {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn calls_type_assoc_turbofish_untagged() {
+                Box::<u64>::bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_type_assoc_turbofish_untagged"})
+
+
+class CrateRootFiles(unittest.TestCase):
+    """Codex, round 3, P2: a registered toucher declared directly in
+    `src/lib.rs` or `src/main.rs` crashed the whole checker.
+    `_module_path` correctly returns `()` (the crate root IS a real,
+    meaningful module -- reachable via `crate::name()`), but the indexing
+    loop then did `module[-1]` unconditionally to populate `by_leaf`,
+    raising `IndexError` on the empty tuple. Only `by_leaf` has no
+    meaningful value for the crate root (no sibling ever calls a
+    crate-root function as `lib::name()` or `main::name()`); `by_module`
+    indexing must still happen."""
+
+    def test_function_in_crate_root_file_does_not_crash_the_indexer(self):
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            pub fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn calls_crate_root_fn_untagged() {
+                bump();
+            }
+            """
+        )
+        # Must not raise. The path has a real `src` component so it
+        # reaches `_module_path`'s crate-root branch -- unlike this file's
+        # other fixtures' bare `Path("f.rs")`, which has no `src`
+        # component and never exercises this code path at all.
+        names = derived_names([(Path("crates/codegen/demo/src/lib.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_crate_root_fn_untagged"})
+
+    def test_crate_qualified_call_to_a_crate_root_function_still_resolves(self):
+        """`by_module` indexing for the crate root (module path `()`)
+        must still happen even though `by_leaf` is skipped -- a sibling
+        file calling `crate::bump()` is the realistic way a crate-root
+        function is reached from elsewhere."""
+
+        root_file = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            pub fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        test_file = src(
+            """\
+            #[test]
+            fn calls_crate_qualified_root_fn_untagged() {
+                crate::bump();
+            }
+            """
+        )
+        sources = [
+            (Path("crates/codegen/demo/src/lib.rs"), root_file),
+            (Path("crates/codegen/demo/src/caller.rs"), test_file),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_crate_qualified_root_fn_untagged"})
+
 
 SERIAL_KEY_SHAPES = src(
     """\
