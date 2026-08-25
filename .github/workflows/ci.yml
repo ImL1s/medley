@@ -1450,6 +1450,12 @@ jobs:
           # matches zero tests (see `grok_home_paths` above).
           run_nonzero -p xai-grok-shell --test test_auth_path_env_precedence \
             -- --nocapture
+          # #434: the write-side counterpart to #409 above -- store_api_key /
+          # clear_api_key must honour `GROK_AUTH_PATH` too, not just
+          # `AuthManager`'s read. Same reason for being an integration target
+          # with no positional after `--test`.
+          run_nonzero -p xai-grok-shell --test test_auth_path_write_side \
+            -- --nocapture
           # #482: the standalone hub binary's own GROK_AUTH_PATH precedence.
           # Same reason as the target above -- integration target, no
           # positional after `--test`.
