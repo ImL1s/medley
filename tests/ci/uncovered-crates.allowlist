@@ -14,9 +14,11 @@
 # in `origin/main..providers` that is neither a merge nor an upstream sync
 # touches the crate's directory, on the date given. Where that is not true the
 # entry says what the fork wrote, because "upstream crate, upstream's tests"
-# is the reading a bare name invites and it is wrong for ten of these -- seven
-# of them carrying #33 credential-redaction work, the fork's sharpest
-# divergence.
+# is the reading a bare name invites, and at the 2026-08-25 migration it was
+# wrong for about a quarter of this list -- most of those carrying #33
+# credential-redaction work, the fork's sharpest divergence. That proportion
+# is a fact about the migration, not a running count: this header is rewritten
+# verbatim by --write-allowlist, so a number here could not stay true.
 #
 # Shrinking this list is good. Growing it means a new crate's tests run nowhere.
 # First burn-down targets: xai-grok-secrets and xai-chat-state.

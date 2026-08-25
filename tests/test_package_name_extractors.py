@@ -77,10 +77,7 @@ _TOLERATED_FORMS = (
 # visible line in a diff someone reviews, rather than a thing that quietly
 # appears. Adding to this list is allowed; the tolerance assertion below then
 # applies to the new copy too, which is the point.
-_EXPECTED_CARRIERS = {
-    "toml_package_name.py",
-    "check_unlinted_crates.py",
-}
+_EXPECTED_CARRIERS = {"toml_package_name.py"}
 
 
 def _string_constants(path: Path) -> list[str]:

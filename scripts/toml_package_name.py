@@ -45,6 +45,26 @@ NAME_LINE = re.compile(
     r"""^\s*["']?name["']?\s*=\s*["']([^"']+)["']\s*(?:#.*)?$""", re.MULTILINE
 )
 
+# A table header, with the same trailing-comment tolerance: `[package]`,
+# `[[bin]]`, and either of those followed by `# anything`. Group 1 is the
+# header without the comment.
+#
+# Recognising the header matters in both directions, and the second is the
+# one that bites. `[package] # metadata` not being recognised means the
+# `[package]` table is never entered -- a missing name, which downstream
+# becomes the directory basename. But `[features] # x` not being recognised
+# means the `[package]` table is never *left*, and then a `name = ` under a
+# later table is returned as the package name: a confident wrong answer.
+#
+# Both spellings are valid TOML. Neither appears in this tree today (measured
+# 2026-08-25, 0 of 81 members), which is the same "latent, not live" the rest
+# of #494 is about.
+#
+# `[^\[\]]*` cannot express a `]` inside a quoted table key (`["a]b"]`).
+# No Cargo manifest table is spelled that way, and the section tracking this
+# replaced could not express it either.
+TABLE_HEADER = re.compile(r"^(\[\[?[^\[\]]*\]\]?)\s*(?:#.*)?$")
+
 
 def name_in_block(text: str) -> str | None:
     """The first `name = "..."` in `text`, or None if there is none.
@@ -67,14 +87,19 @@ def package_name(toml_text: str) -> str | None:
     else), and a whole-file search returns whichever comes first in the file.
     Any other table header ends the search: reaching one means `[package]`
     had no `name`, which is not something to keep looking for elsewhere.
+
+    Headers are matched through `TABLE_HEADER`, so a trailing comment on one
+    does not hide it -- see there for why the miss is worse on the ending
+    side than on the opening side.
     """
     in_package = False
     for line in toml_text.splitlines():
         stripped = line.strip()
-        if stripped == "[package]":
-            in_package = True
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
+        header = TABLE_HEADER.match(stripped)
+        if header:
+            if header.group(1) == "[package]":
+                in_package = True
+                continue
             if in_package:
                 return None
             continue
