@@ -143,10 +143,18 @@ In order, cheapest first:
   `cargo check --lib` and clippy on `--lib` never compile.
 - `cargo test --workspace --no-run` compiles those targets without running them.
   That catches callers which stopped *compiling*. It cannot catch the ones that
-  still compile and now read the wrong thing — only the grep does. It also does
-  **not** compile targets whose `required-features` are unmet: cargo skips those
-  silently, so `--workspace` is not the completeness guarantee its name suggests
-  (#474). Pass the feature, or the target is not in the check.
+  still compile and now read the wrong thing — only the grep does. **And it does
+  not compile everything.** Two silent omissions, both measured (#474):
+  - Targets whose `required-features` are unmet are skipped with no error and no
+    warning. All six `[[test]]` targets in `xai-grok-shell` are gated on
+    `test-support`; pass the feature, or they are not in the check.
+  - `[[bench]]` targets are not built at all without `--benches`, feature or no
+    feature. `cargo test -p xai-grok-shell --tests --benches --features
+    test-support --no-run` yields 51 executables; drop `--benches` and three
+    disappear from the output without comment.
+
+  So `--workspace` is not the completeness guarantee its name suggests, and the
+  failure mode is an empty space in a list nobody counts.
 
 #409 later closed the other half of the same channel. `AuthManager::new` read
 `GROK_AUTH_PATH` unconditionally, so the env was shut out of the Codex resolver
