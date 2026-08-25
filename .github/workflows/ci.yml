@@ -1366,6 +1366,11 @@ jobs:
           # matches zero tests (see `grok_home_paths` above).
           run_nonzero -p xai-grok-shell --test test_auth_path_env_precedence \
             -- --nocapture
+          # #482: the standalone hub binary's own GROK_AUTH_PATH precedence.
+          # Same reason as the target above -- integration target, no
+          # positional after `--test`.
+          run_nonzero -p xai-grok-workspace --test test_hub_auth_path_precedence \
+            -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
             resolve_failure_refuses_for_deny_carrying_devbox_extends -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
