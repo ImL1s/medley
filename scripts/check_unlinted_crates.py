@@ -202,6 +202,26 @@ def linted_invocation_tokens(workflow_text: str) -> LintedInvocationTokens:
     `--deny warnings`) reads as "not linted". That direction is deliberate:
     the guard then demands an allowlist entry, which is a visible diff someone
     reviews, rather than quietly accepting an invocation it did not understand.
+
+    The same direction disqualifies any line carrying a `;`, `&`, or `|`
+    after `-D warnings`' text is matched: those are the shell operators that
+    can mask or discard `cargo clippy`'s exit status (`|| true`, `|| :`,
+    `; true`, `&& true`) or hide it behind a pipe (`| tee`, `2>&1 | tee`) --
+    the same blind spot as a commented-out line (#439 follow-up), just via
+    a live command whose failure never reaches the shell's own exit code.
+    A whitelist of exact patterns would miss spellings it does not
+    enumerate; disqualifying the operators themselves does not need to. This
+    also makes a per-step `set -o pipefail` correlation unnecessary: a piped
+    invocation is disqualified regardless of whether pipefail is on. The one
+    cost is `2>&1` alone (no pipe) also disqualifies, since it contains `&`
+    -- accepted deliberately, in the same direction as everything else here.
+
+    `set +e` and a step's `continue-on-error: true` can have the same
+    effect but are not on this line -- the first is shell state carried from
+    elsewhere in the same step, the second is a YAML key on the step, not
+    the command. Both would need step-boundary parsing this script
+    deliberately does not do (see the module docstring); they are not
+    checked here.
     """
     commentless = _strip_shell_comments(workflow_text)
     joined = re.sub(r"\\\s*\n\s*", " ", commentless)
@@ -211,6 +231,8 @@ def linted_invocation_tokens(workflow_text: str) -> LintedInvocationTokens:
         if "cargo clippy" not in line:
             continue
         if "--all-targets" not in line or "-D warnings" not in line:
+            continue
+        if any(op in line for op in (";", "&", "|")):
             continue
         for raw in _MANIFEST.findall(line):
             parent = Path(raw.strip().strip("'\"")).parent.name
@@ -316,6 +338,27 @@ def write_allowlist(path: Path, unlinted: set[str]) -> None:
     path.write_text(body, encoding="utf-8")
 
 
+def _implausible_corpus_error(crate_count: int, root: Path) -> str | None:
+    """`None` if `crate_count` clears `_MIN_PLAUSIBLE_CRATES`, else the error text.
+
+    An empty or implausibly small corpus means the manifest parse broke, not
+    that the workspace shrank -- without this, a broken parse reports "no
+    crates, no gaps, ok", the exact green that proves the opposite of what it
+    claims. Every path that acts on `evaluate()`'s crate count, not only the
+    one that prints a verdict, must check this before acting: `--write-allowlist`
+    used to check only on the report path, so a degraded corpus could be
+    written over the tracked allowlist as fact, silently erasing the
+    exemptions for every crate the parse failed to see (#439 follow-up).
+    """
+    if crate_count >= _MIN_PLAUSIBLE_CRATES:
+        return None
+    return (
+        f"error: found only {crate_count} workspace crates under {root}; "
+        f"expected at least {_MIN_PLAUSIBLE_CRATES}. The `[workspace] "
+        f"members` parse is broken, not the workspace."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--workflow", required=True, type=Path)
@@ -333,6 +376,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.write_allowlist is not None:
         report = evaluate(root=args.root, workflow_text=workflow_text, allowlisted={})
+        error = _implausible_corpus_error(len(report.crates), args.root)
+        if error is not None:
+            print(error, file=sys.stderr)
+            return 1
         write_allowlist(args.write_allowlist, set(report.new_gaps))
         print(f"wrote {len(report.new_gaps)} entries to {args.write_allowlist}")
         return 0
@@ -347,16 +394,9 @@ def main(argv: list[str] | None = None) -> int:
         root=args.root, workflow_text=workflow_text, allowlisted=allowlisted
     )
 
-    # An empty or implausibly small corpus means the manifest parse broke. Without
-    # this the guard reports "no crates, no gaps, ok" -- a green that proves the
-    # opposite of what it claims.
-    if len(report.crates) < _MIN_PLAUSIBLE_CRATES:
-        print(
-            f"error: found only {len(report.crates)} workspace crates under "
-            f"{args.root}; expected at least {_MIN_PLAUSIBLE_CRATES}. The "
-            f"`[workspace] members` parse is broken, not the workspace.",
-            file=sys.stderr,
-        )
+    error = _implausible_corpus_error(len(report.crates), args.root)
+    if error is not None:
+        print(error, file=sys.stderr)
         return 1
 
     sys.stdout.write(format_report(report))

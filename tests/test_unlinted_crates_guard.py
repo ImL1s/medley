@@ -154,6 +154,54 @@ class LintedTokens(unittest.TestCase):
         )
         self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
 
+    def test_ignores_an_invocation_that_masks_its_exit_status_with_or_true(self):
+        # `|| true` makes the shell report success no matter what clippy
+        # found -- the same blind spot as commenting the line out, just via
+        # a live command whose failure never reaches the exit code
+        # (#439 follow-up).
+        text = _workflow(CLIPPY.format(d="xai-grok-shell") + " || true")
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_ignores_an_invocation_that_masks_its_exit_status_with_or_colon(self):
+        text = _workflow(CLIPPY.format(d="xai-grok-shell") + " || :")
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_ignores_an_invocation_followed_by_a_semicolon_true(self):
+        text = _workflow(CLIPPY.format(d="xai-grok-shell") + "; true")
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_ignores_an_invocation_chained_with_and_true(self):
+        text = _workflow(CLIPPY.format(d="xai-grok-shell") + " && true")
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_ignores_an_invocation_piped_to_another_command(self):
+        # A pipe hides clippy's exit status behind the pipeline's last
+        # command unless `pipefail` is on -- this must not count regardless
+        # of whether it is, so no per-step `set -o pipefail` tracking is
+        # needed (see linted_invocation_tokens()'s docstring).
+        text = _workflow(CLIPPY.format(d="xai-grok-shell") + " | tee clippy.log")
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_ignores_an_invocation_with_a_redirected_stderr(self):
+        # `2>&1` contains `&` and is deliberately disqualified too, even
+        # though it does not itself mask an exit status -- the module
+        # docstring names this as an accepted, deliberate cost of matching
+        # the operator rather than an enumerated pattern list.
+        text = _workflow(CLIPPY.format(d="xai-grok-shell") + " 2>&1")
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_a_masked_invocation_with_a_trailing_comment_is_still_ignored(self):
+        # Composition: comment-stripping runs first and does not resurrect
+        # an operator-disqualified line.
+        text = _workflow(CLIPPY.format(d="xai-grok-shell") + " || true  # keep")
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_an_unmasked_invocation_with_a_trailing_comment_still_counts(self):
+        # Composition, the other direction: a trailing comment alone must
+        # not disqualify an otherwise-clean, unmasked invocation.
+        text = _workflow(CLIPPY.format(d="xai-grok-shell") + "  # keep")
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
 
 class PackageName(unittest.TestCase):
     def test_double_quoted_name(self):
@@ -449,6 +497,77 @@ class MainExitCodes(unittest.TestCase):
                 ]
             )
             self.assertEqual(code, 1)
+
+
+class WriteAllowlist(unittest.TestCase):
+    """`--write-allowlist` must clear the same plausibility floor as a report.
+
+    Pre-fix, this branch checked `--allowlist`/report-only: `--write-allowlist`
+    never read the floor, so a degraded corpus was written as the new
+    baseline allowlist, exit 0, silently erasing every exemption for a crate
+    the parse failed to see (#439 follow-up).
+    """
+
+    def test_writes_the_unlinted_set_when_the_corpus_is_healthy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filler = {f"f{i}": f"filler-{i}" for i in range(20)}
+            _workspace(
+                root, {"alpha": "alpha-crate", "beta": "beta-crate", **filler}
+            )
+            workflow = root / "ci.yml"
+            _write(workflow, _workflow(CLIPPY.format(d="alpha")))
+            target = root / "allow"
+            code = main(
+                [
+                    "--workflow", str(workflow),
+                    "--root", str(root),
+                    "--write-allowlist", str(target),
+                ]
+            )
+            self.assertEqual(code, 0)
+            written = load_allowlist(target)
+            self.assertEqual(set(written), {"beta-crate", *(f"filler-{i}" for i in range(20))})
+
+    def test_refuses_when_the_corpus_is_implausibly_small_and_writes_nothing(self):
+        # No `members` list at all -- the same broken-manifest shape as
+        # MainExitCodes.test_an_implausibly_small_corpus_fails_instead_of_reporting_ok.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root / "Cargo.toml", '[workspace]\nresolver = "2"\n')
+            workflow = root / "ci.yml"
+            _write(workflow, _workflow(CLIPPY.format(d="alpha")))
+            target = root / "allow"
+            code = main(
+                [
+                    "--workflow", str(workflow),
+                    "--root", str(root),
+                    "--write-allowlist", str(target),
+                ]
+            )
+            self.assertEqual(code, 1)
+            self.assertFalse(target.exists())
+
+    def test_refuses_without_truncating_an_existing_target(self):
+        # The sharper pin: a refusal that truncates the file before erroring
+        # is not a fix. The target must be byte-identical after the refusal.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root / "Cargo.toml", '[workspace]\nresolver = "2"\n')
+            workflow = root / "ci.yml"
+            _write(workflow, _workflow(CLIPPY.format(d="alpha")))
+            target = root / "allow"
+            sentinel = "existing-crate = deliberately not linted, see #1\n"
+            _write(target, sentinel)
+            code = main(
+                [
+                    "--workflow", str(workflow),
+                    "--root", str(root),
+                    "--write-allowlist", str(target),
+                ]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(target.read_text(encoding="utf-8"), sentinel)
 
 
 class RealTree(unittest.TestCase):
