@@ -84,6 +84,23 @@ def table_key(line: str) -> tuple[str, bool] | None:
     removed. A dotted key (`package.metadata`) is returned whole, because it
     names a *different* table and the caller must not mistake it for its
     parent.
+
+    Contract, stated because it is deliberately narrower than TOML: whatever
+    is left after removing the quotes is compared byte for byte. Escape
+    sequences in a basic (double-quoted) key are **not** decoded, so a header
+    spelled with `\\u0061` in place of an `a` -- which TOML says still names
+    the same table -- reads here as some other table. Decoding them is parser
+    work, this is not a parser (see the module docstring), and the spelling
+    appears in 0 of this workspace's 83 manifests. The one caller for which
+    that miss is a change, `check_test_filter_coverage.workspace_members()`,
+    is fail-closed on it: the fallback name reaches `cargo test -p`, the
+    listing fails, and the run exits 2 saying it did not check that crate. A
+    gap that announces itself is a limit worth accepting; a wrong answer
+    would not be. `tests/test_package_name_extractors.py` pins the divergence
+    against `tomllib` by name, so it stays a decision and not a surprise.
+
+    Half of that is simply correct, incidentally: a literal (single-quoted)
+    key never has escapes processed in TOML, so there is nothing to decode.
     """
     m = _TABLE_HEADER.match(line.strip())
     if m is None:
@@ -92,6 +109,35 @@ def table_key(line: str) -> tuple[str, bool] | None:
     if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
         key = key[1:-1]
     return key, m.group("open") == "[["
+
+
+_MULTILINE_DELIMS = ('"""', "'" * 3)
+
+
+def multiline_opener(stripped: str) -> str | None:
+    """The multiline-string delimiter this line leaves open, or None.
+
+    Checked in **value position only**, after splitting on the first `=`. A
+    plain substring test would misfire on a single-line value that merely
+    contains three escaped quotes in a row, which opens nothing.
+
+    A string opened and closed on the same line opens nothing either, so that
+    returns None too.
+
+    Approximate on purpose, and the approximation is named: an *escaped*
+    delimiter inside an already-open multiline string is read here as the
+    closer. Telling those apart needs escape processing, which is the parser
+    work this module does not do; it appears in 0 of this workspace's 83
+    manifests, and the differential test names it.
+    """
+    _, sep, value = stripped.partition("=")
+    if not sep:
+        return None
+    value = value.strip()
+    for delim in _MULTILINE_DELIMS:
+        if value.startswith(delim):
+            return None if delim in value[len(delim) :] else delim
+    return None
 
 
 def name_in_block(text: str) -> str | None:
@@ -121,8 +167,26 @@ def package_name(toml_text: str) -> str | None:
     directions, and why the closing one is the worse of them.
     """
     in_package = False
+    open_string: str | None = None
     for line in toml_text.splitlines():
         stripped = line.strip()
+
+        # Inside a multiline string, nothing on the line is syntax. Skipping
+        # only the header branch would not be enough: a `name = "..."` written
+        # inside a `description` was returned AS the package name -- measured,
+        # a manifest whose description contained one answered `sneaky` where
+        # the real `[package] name` was `real`. A confident wrong answer is
+        # the failure this whole guard family exists to prevent, so both
+        # branches are skipped here.
+        if open_string is not None:
+            if open_string in stripped:
+                open_string = None
+            continue
+        opener = multiline_opener(stripped)
+        if opener is not None:
+            open_string = opener
+            continue
+
         header = table_key(stripped)
         if header is not None:
             key, is_array = header

@@ -42,6 +42,7 @@ from __future__ import annotations
 import ast
 import re
 import sys
+import tomllib
 import unittest
 import warnings
 from pathlib import Path
@@ -277,6 +278,132 @@ class SharedReaderTableScoping(unittest.TestCase):
 
     def test_a_virtual_manifest_has_no_package_name(self):
         self.assertIsNone(package_name("[workspace]\nmembers = []\n"))
+
+
+# Spellings where this reader deliberately disagrees with `tomllib`, each with
+# the reason it is a decision rather than a bug. Both are gaps (None), never
+# wrong answers, and both are fail-closed in the one caller where the miss is
+# a change in behaviour -- see `table_key`'s contract note.
+#
+# This list IS the recorded contract. Adding to it is allowed and is a visible
+# diff someone reviews; what must not happen is a divergence nobody wrote down.
+_KNOWN_DIVERGENCES = {
+    '["pack\\u0061ge"]\nname = "foo"\n': (
+        "escape sequences in a basic quoted key are not decoded -- parser "
+        "work this module does not do; 0 of 83 manifests use it"
+    ),
+    '[package]\nname = """foo"""\n': (
+        "a multiline string as the *name* value; NAME_LINE requires a "
+        "single-delimiter value, so this reads as no name at all"
+    ),
+}
+
+
+class DifferentialAgainstTomllib(unittest.TestCase):
+    """`package_name()` against the reference parser, on real and made-up input.
+
+    Four review rounds on this PR each turned up one more valid TOML spelling
+    the reader mishandled. Answering them one at a time is a losing game, so
+    the question gets asked once, mechanically: does this reader agree with
+    `tomllib` -- and where it does not, is that written down?
+
+    Production stays parser-free by design (`ci.yml` runs `python3` with no
+    `actions/setup-python` step, so `tomllib` cannot be assumed at runtime).
+    The TEST may assume it, and imports it at module scope rather than
+    skipping when absent: a skipped differential is a green that checked
+    nothing, and that is the one failure this repo keeps paying for.
+    """
+
+    # Every spelling those four rounds turned up, plus the plain one.
+    # `tomllib` supplies the expected answer, so nothing here encodes my own
+    # belief about what the right answer is.
+    CORPUS = (
+        '[package]\nname = "foo"\n',
+        '[package]\nname = "foo" # explanation\n',
+        '[package]\n"name" = "foo"\n',
+        "[package]\n'name' = 'foo'\n",
+        '[package] # metadata\nname = "foo"\n',
+        '["package"]\nname = "foo"\n',
+        "['package']\nname = \"foo\"\n",
+        '[ package ]\nname = "foo"\n',
+        '[" package "]\nname = "foo"\n',
+        '[package.metadata]\nname = "foo"\n',
+        '[[bin]]\nname = "b"\n[package]\nname = "foo"\n',
+        '[package]\nversion = "1"\n[features]\nname = "wrong"\n',
+        '[package]\ndescription = """\nname = "sneaky"\n"""\nname = "real"\n',
+        '[package]\ndescription = """\n[features]\n"""\nname = "actual"\n',
+        "[package]\ndescription = '''\n[features]\n'''\nname = \"lit\"\n",
+        '[package]\ndescription = """one line"""\nname = "same"\n',
+        '[package]\nname = "first"\ndescription = """\n[x]\n"""\n',
+        "[workspace]\nmembers = []\n",
+        *_KNOWN_DIVERGENCES,
+    )
+
+    @staticmethod
+    def _reference(text):
+        return tomllib.loads(text).get("package", {}).get("name")
+
+    def test_the_corpus_parses_as_real_toml(self):
+        # Every case must be valid TOML, or the comparison below is against
+        # nothing. A malformed corpus would let `tomllib` raise and leave the
+        # author quietly assuming agreement.
+        for text in self.CORPUS:
+            with self.subTest(text=text):
+                tomllib.loads(text)
+
+    def test_the_corpus_covers_both_answers(self):
+        # A corpus where the reference says None everywhere would be satisfied
+        # by a reader that always returns None.
+        answers = {self._reference(t) for t in self.CORPUS}
+        self.assertIn(None, answers)
+        self.assertTrue(answers - {None}, answers)
+
+    def test_agrees_with_tomllib_except_where_recorded(self):
+        unexpected = []
+        for text in self.CORPUS:
+            ours, ref = package_name(text), self._reference(text)
+            if ours == ref:
+                continue
+            if text in _KNOWN_DIVERGENCES:
+                # A recorded divergence must stay a gap. If one ever becomes a
+                # non-None wrong answer that is a different defect, and this
+                # exemption does not cover it.
+                self.assertIsNone(
+                    ours, f"recorded divergence became a wrong answer: {text!r}"
+                )
+                continue
+            unexpected.append(f"{text!r}: ours={ours!r} tomllib={ref!r}")
+        self.assertEqual(unexpected, [], "\n".join(unexpected))
+
+    def test_every_recorded_divergence_still_diverges(self):
+        # A stale exemption hides a regression the way a stale allowlist entry
+        # does: once a fix makes one of these agree, the entry has to go, or it
+        # silently exempts whatever breaks here next.
+        for text, reason in _KNOWN_DIVERGENCES.items():
+            with self.subTest(reason=reason):
+                self.assertNotEqual(
+                    package_name(text),
+                    self._reference(text),
+                    f"no longer diverges; drop it from _KNOWN_DIVERGENCES: {text!r}",
+                )
+
+    def test_agrees_with_tomllib_on_every_real_manifest(self):
+        manifests = [
+            m
+            for m in sorted(REPO.rglob("Cargo.toml"))
+            if "/target/" not in str(m) and "/.git/" not in str(m)
+        ]
+        self.assertGreater(len(manifests), 20, "manifest sweep found almost nothing")
+        mismatched = []
+        for manifest in manifests:
+            text = manifest.read_text(encoding="utf-8", errors="replace")
+            try:
+                ref = self._reference(text)
+            except tomllib.TOMLDecodeError:
+                continue
+            if package_name(text) != ref:
+                mismatched.append(f"{manifest}: {package_name(text)!r} != {ref!r}")
+        self.assertEqual(mismatched, [], "\n".join(mismatched))
 
 
 if __name__ == "__main__":
