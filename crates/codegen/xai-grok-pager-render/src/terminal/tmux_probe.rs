@@ -622,6 +622,22 @@ mod tests {
     /// immediately, and the only real-time dependency left is "SIGTERM
     /// reaps a `sleep` descendant," which needs low milliseconds, not
     /// hundreds.
+    ///
+    /// On its own this test cannot distinguish a caller passing a *fresh*
+    /// grace from one passing a *borrowed* remainder of `timeout`: its
+    /// descendant stays in the group and dies to the leading `SIGTERM`
+    /// well inside either window, so a caller-side regression that
+    /// resurrected the exact bug #490 removed would still leave this test
+    /// green. That is a real, separately-caught gap, not a rhetorical
+    /// one — a mutation at the `run_tmux_bounded` call site that swaps
+    /// `POST_EXIT_CLEANUP_GRACE` for
+    /// `deadline.saturating_duration_since(Instant::now())` reds only the
+    /// sibling test below (`run_tmux_bounded_uses_a_fresh_grace_not_the_
+    /// remaining_main_deadline`), never this one — confirmed by running
+    /// that exact mutation against this file. That sibling test is what
+    /// actually proves freshness at the caller level; this one only
+    /// proves the drain survives a descendant outliving the leader at
+    /// all.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(tmux_probe_path)]
@@ -699,6 +715,21 @@ mod tests {
     /// descendant has already escaped the group" a fact the leader waits
     /// on rather than a timing assumption.
     ///
+    /// That wait has no fixed iteration cap. A cap chosen independently of
+    /// the real timeout budget is exactly the failure mode Codex's review
+    /// of #501 flagged: pick it too small and heavy scheduling contention
+    /// exhausts it before the marker appears, letting the leader proceed
+    /// as though the handshake completed and producing a false failure
+    /// that looks like a real regression. The main wait loop's own 1.5s
+    /// `timeout` is already the sole bound this whole file trusts for "how
+    /// long is too long," so this loop defers to it instead of guessing a
+    /// second, smaller one: if `/usr/bin/perl` is ever unusable, the
+    /// leader spins until that outer deadline reaps it via
+    /// `terminate_tmux_tree`, and `run_tmux_bounded` returns `"tmux query
+    /// timed out after 1.5s"` — textually distinct from the drain
+    /// timeout below, so a run that hits this degenerate path fails loud
+    /// and diagnosably instead of silently validating nothing.
+    ///
     /// A grace fresh off `POST_EXIT_CLEANUP_GRACE` (300ms) elapses well
     /// before the descendant's fixed 800ms self-close, so a correct
     /// `run_tmux_bounded` must report the drain timeout. A grace borrowed
@@ -727,8 +758,7 @@ mod tests {
              ( /usr/bin/perl -e 'use POSIX qw(setsid); setsid(); \
              open(my $fh, \">\", \"{marker}\") or die $!; close $fh; \
              select(undef, undef, undef, 0.8);' ) &\n\
-             i=0\n\
-             while [ ! -f \"{marker}\" ] && [ $i -lt 20000 ]; do i=$((i+1)); done\n\
+             while [ ! -f \"{marker}\" ]; do :; done\n\
              printf 'tmux 3.4\\n'\n\
              exit 0\n",
             marker = ready_marker.display(),
@@ -769,6 +799,34 @@ mod tests {
         );
     }
 
+    /// #499 enrolled this whole module on the CI hot path, and #501's
+    /// review of a *different* test in that same enrolled set (Codex,
+    /// `.github/workflows/ci.yml:1189`) pointed out this test carries the
+    /// same wall-clock-upper-bound defect this file's other tests were
+    /// just rewritten to avoid: `terminate_owned_group`'s empty-group
+    /// short-circuit returns before any `std::thread::sleep`, so under
+    /// real contention a descheduled test thread could push `elapsed`
+    /// past a tight bound even though the code took the fast path.
+    ///
+    /// Widened from `GROUP_EXIT_GRACE / 2` (50ms) to `GROUP_EXIT_GRACE`
+    /// itself (100ms). The mutation this test exists to catch — the
+    /// short-circuit failing to fire, falling through to the deadline
+    /// loop — makes `elapsed` at least `GROUP_EXIT_GRACE` by construction
+    /// (the loop does not return until its own deadline, computed from
+    /// that same constant, is reached), so the red direction is
+    /// guaranteed regardless of load: scheduling delay can only push a
+    /// broken short-circuit's `elapsed` later, never under the bound.
+    /// Only the green-side margin changes — a correct short-circuit now
+    /// needs more than 100ms of descheduling across three adjacent
+    /// in-thread statements to false-fail, instead of more than 50ms.
+    ///
+    /// Named rather than hidden: this is still an upper bound, and an
+    /// upper bound is never fully immune to scheduling — only less
+    /// exposed. Making it provably immune would need instrumenting
+    /// `terminate_owned_group` itself (a call-count or injected clock) to
+    /// observe "did the poll loop's sleep ever run" directly instead of
+    /// inferring it from wall time, which is more machinery than this
+    /// specific test has earned.
     #[cfg(unix)]
     #[test]
     fn empty_group_teardown_does_not_wait_out_the_grace() {
@@ -777,7 +835,7 @@ mod tests {
         terminate_owned_group(&group);
         let elapsed = started.elapsed();
         assert!(
-            elapsed < GROUP_EXIT_GRACE / 2,
+            elapsed < GROUP_EXIT_GRACE,
             "an empty group must not wait out the grace, took {elapsed:?}"
         );
     }
