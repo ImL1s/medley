@@ -1411,6 +1411,75 @@ jobs:
           # cross-crate caller while every one of them still compiles.
           run_nonzero -p xai-grok-config --lib \
             state_home:: -- --nocapture
+          # `env_alias` is the MEDLEY_*-first / GROK_*-fallback precedence
+          # core (#426) every other crate's alias tests route through --
+          # exactly the kind of shared primitive a sync is most likely to
+          # touch without anyone noticing downstream. 11 tests, all new.
+          run_nonzero -p xai-grok-config --lib \
+            env_alias:: -- --nocapture
+          # `xai-grok-config-types` had no filter at all, so every test in it
+          # ran nowhere. `BoolFlag`'s `.env_alias()` opt-in (#426) is a choke
+          # point ~49 other flags flow through unaliased -- the one place a
+          # sync could accidentally widen the alias to a flag nobody
+          # intended. 3 tests, all new. Named `flags::` (the file-derived
+          # module), not the inline `env_alias_tests` submodule inside it --
+          # #171's guard derives modules from the file path only, so a
+          # filter assuming an inline `mod` name it can't see would read as
+          # "correct" at runtime and still fail the guard.
+          run_nonzero -p xai-grok-config-types --lib \
+            flags:: -- --nocapture
+          # `xai-grok-plugin-marketplace` had no filter at all either.
+          # `GROK_MARKETPLACE_REQUIRE_SHA`'s MEDLEY_* alias (#426) is a
+          # tighten-only security policy knob; a sync silently dropping the
+          # alias precedence would only be caught here. 2 tests, all new.
+          run_nonzero -p xai-grok-plugin-marketplace --lib \
+            marketplace_require_sha -- --nocapture
+          # `xai-grok-pager-bin` (bin target): #426's disable-autoupdater
+          # MEDLEY_*-first read, split into its own function specifically so
+          # it's testable apart from the always-closed self-update gate in
+          # this test binary. 2 tests, all new.
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            disabled_by_env -- --nocapture
+          # #426's MEDLEY_*-first scroll settings (appearance/cache.rs) and
+          # default-selected-permission (appearance/permission_cursor.rs)
+          # tests both live under `appearance/`, so the file-derived module
+          # prefix covers both in one line (the inline `env_alias_tests`
+          # submodule name they share is invisible to #171's file-path-only
+          # guard, same reason as `flags::` above). 10 tests, all new.
+          run_nonzero -p xai-grok-pager-render --lib \
+            appearance:: -- --nocapture
+          # #426's MEDLEY_*-first telemetry-mode and apply_env_overrides
+          # tests in `config.rs`. Named precisely rather than by module path
+          # -- `config::tests::` also matches `external::config::tests::*`,
+          # which `external::` above already covers, so a module-path filter
+          # here would just duplicate that coverage under a different name.
+          run_nonzero -p xai-grok-telemetry --lib \
+            env_telemetry_mode_alias -- --nocapture
+          run_nonzero -p xai-grok-telemetry --lib \
+            apply_env_overrides_ -- --nocapture
+          # `debug_log.rs`'s own module, no existing filter reaches it. Whole
+          # module (not just #426's 2 new tests) so future debug_log.rs
+          # additions are covered too, matching this crate's other
+          # module-level filters above. File-derived prefix only (no
+          # trailing `::tests::` -- the inline `mod tests` name is invisible
+          # to #171's file-path-only guard, same reason as `flags::` above).
+          run_nonzero -p xai-grok-telemetry --lib \
+            debug_log:: -- --nocapture
+          # `folder_trust.rs`'s whole module -- #426's 2 new MEDLEY_*-first
+          # tests plus the pre-existing coverage, same shape as
+          # `restore_fetch::` / `workspace_ops::` below.
+          run_nonzero -p xai-grok-workspace --lib \
+            folder_trust:: -- --nocapture
+          # `session::tool_config`'s whole module. None of the existing
+          # `session::*` filters above are a substring of
+          # `session::tool_config::tests::*` (they're scoped to
+          # session::{anchored,fresh_publication,git,id_lock,publication_parent}),
+          # so #426's 4 new web_fetch/web_search MEDLEY_*-first tests here
+          # ran nowhere until now. File-derived prefix only (no trailing
+          # `::tests::` -- invisible to #171's file-path-only guard, same
+          # reason as `flags::` above).
+          run_nonzero -p xai-grok-workspace --lib \
+            session::tool_config:: -- --nocapture
           # Same `#[path]` move as `restore_fetch::` above, and stopped one
           # segment short for the same reason: the file is `fs_size_tests.rs`,
           # the module is `fs_size::tests`, and only `fs_size::` is a substring
