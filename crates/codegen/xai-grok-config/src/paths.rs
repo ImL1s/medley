@@ -64,6 +64,35 @@ pub fn user_grok_home() -> Option<PathBuf> {
     crate::state_dir::resolve_user().is_some().then(grok_home)
 }
 
+/// Resolve the xAI `auth.json` path: `$GROK_AUTH_PATH` if it names one,
+/// else `grok_home.join("auth.json")` (#482).
+///
+/// **Always honours the environment** — this is the pure resolution rule,
+/// with no test-isolation wrapper around it. That is deliberate, not an
+/// oversight: `cfg(test)` is evaluated per crate compilation, true only when
+/// *this* crate is itself built as a test target. Whenever `xai-grok-config`
+/// is pulled in as an ordinary (non-test) dependency of another crate's test
+/// binary — which is the normal case — `cfg(test)` here would be `false`
+/// regardless of what the calling crate's own tests are doing. A
+/// `cfg(test)`-gated branch placed in *this* function would therefore look
+/// like test isolation while silently never firing for any caller outside
+/// this crate's own test suite, reintroducing the exact process-global
+/// `GROK_AUTH_PATH` hazard #409 closed.
+///
+/// So the isolation has to live with the caller, in the caller's own
+/// `cfg(test)`. `xai-grok-shell::auth::manager::resolved_xai_auth_path` is
+/// the wrapper: under `cfg(test)` it checks a thread-local pin first, else
+/// resolves to `grok_home.join("auth.json")` unconditionally; only in a
+/// non-test build does it fall through to this function. Call this
+/// function directly only from a context that either doesn't need that
+/// isolation (an independent binary, e.g. `xai-workspace-server`) or
+/// supplies its own equivalent.
+pub fn resolved_xai_auth_path(grok_home: &std::path::Path) -> PathBuf {
+    std::env::var("GROK_AUTH_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| grok_home.join("auth.json"))
+}
+
 /// Canonical grok application path: `$GROK_HOME/bin/grok` (Unix) or `grok.exe` (Windows).
 pub fn grok_application() -> PathBuf {
     grok_application_in(&grok_home())

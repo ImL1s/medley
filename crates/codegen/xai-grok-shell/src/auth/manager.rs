@@ -503,6 +503,16 @@ enum LockOutcome {
 ///
 /// Tests that cannot pass a path into a production entry point should pin
 /// [`XaiAuthPathGuard`] instead of `GROK_AUTH_PATH` (#343).
+///
+/// The pure env-vs-default rule now lives in
+/// [`xai_grok_config::resolved_xai_auth_path`] (#482), moved there so
+/// `xai-grok-workspace`'s standalone hub binary — which cannot depend on
+/// this crate; the dependency points the other way — can reach it too. This
+/// function stays the `cfg(test)`-aware wrapper around it: the thread-local
+/// pin and the `cfg(test)` default-path branch below cannot move with it,
+/// because `cfg(test)` is only ever true when *this* crate compiles as a
+/// test target, not when `xai-grok-config` does as an ordinary dependency
+/// of it (see the moved function's own doc comment for why that matters).
 pub(crate) fn resolved_xai_auth_path(grok_home: &Path) -> PathBuf {
     #[cfg(test)]
     if let Some(path) = XAI_AUTH_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
@@ -513,9 +523,7 @@ pub(crate) fn resolved_xai_auth_path(grok_home: &Path) -> PathBuf {
     if cfg!(test) {
         grok_home.join("auth.json")
     } else {
-        std::env::var("GROK_AUTH_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| grok_home.join("auth.json"))
+        xai_grok_config::resolved_xai_auth_path(grok_home)
     }
 }
 
