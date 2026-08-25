@@ -22,6 +22,16 @@ concurrency:
   # PRs and manual runs should still drop superseded attempts.
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
+# #510: every `Swatinem/rust-cache` step below saves only on `providers`
+# pushes (`save-if: github.event_name == 'push'`); PR runs restore but never
+# save. GitHub's actions-cache API falls back to the base branch's cache for
+# a PR run with no cache of its own, but the repo has a flat 10 GB budget
+# shared by every branch that writes. At ~1.8 GB per shared-key and several
+# PRs open at once, PR-run writes were evicting the one cache every PR could
+# have fallen back to, so PR runs built cold even when re-pushed minutes
+# apart. A single writer (`providers`) keeps that fallback cache alive
+# through PR traffic instead of racing it for space.
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -293,6 +303,7 @@ jobs:
         with:
           shared-key: providers-windows-session-publication
           cache-targets: true
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Native ACL and no-replace publication contracts
         shell: pwsh
@@ -347,6 +358,7 @@ jobs:
         with:
           shared-key: providers-macos-session-publication
           cache-targets: true
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Anchored publication contracts
         run: |
@@ -424,6 +436,7 @@ jobs:
         with:
           shared-key: providers-compile-tests
           cache-targets: true
+          save-if: ${{ github.event_name == 'push' }}
 
       # #254: thirteen pager integration targets (and any other crate's tests)
       # are never named by a hot-path filter. Compiling them without running
@@ -489,6 +502,7 @@ jobs:
         with:
           shared-key: providers-lint
           cache-targets: true
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Clippy sampler / shell / tools / pager / pager-bin (all targets)
         run: |
@@ -560,6 +574,7 @@ jobs:
         with:
           shared-key: providers-test
           cache-targets: true
+          save-if: ${{ github.event_name == 'push' }}
 
       # #343: temp-store fixtures must bind to their requested path even when
       # the caller already has an ambient auth override. Run both fixture-heavy
