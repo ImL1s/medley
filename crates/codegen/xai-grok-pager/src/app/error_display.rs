@@ -738,13 +738,42 @@ fn resolve_embedded_json(s: &str) -> Option<String> {
         // first 180 characters — `Invalid parameter {"secret":"pppp…` — which
         // is the leak this function exists to prevent.
         let start = s.find('{')?;
-        return Some(trim_dangling_separator(&s[..start]));
+        return Some(drop_json_tail(&s[..start]));
     }
     let (start, end) = find_json_object(s)?;
     if let Some(extracted) = extract_from_json(&s[start..end]) {
         return Some(extracted);
     }
-    Some(trim_dangling_separator(&s[..start]))
+    Some(drop_json_tail(&s[..start]))
+}
+
+/// The prose left behind once an unreadable object is excised, with any
+/// carrier prefix stripped and then its dangling separator trimmed.
+///
+/// Carrier strips run *first*, on the untrimmed prefix — order matters
+/// (#431). `strip_api_error_prefix` anchors on the trailing `"): "` that
+/// sits right where the object used to be; running [`trim_dangling_separator`]
+/// first eats that colon before the carrier can be recognized, so the
+/// carrier itself — not the sanitized empty detail — is what came out of
+/// this function and reached the user as the reason. Applying the same three
+/// strips [`extract_error_detail`] runs on the full message (provider-failed,
+/// api-error, provider-failed again for the nested-carrier case) means a
+/// bare carrier collapses to `""` here, which `clean_detail` turns into
+/// `None` so the banner falls back to its own copy — the guarantee
+/// [`strip_provider_request_failed_prefix`]'s doc already states for its own
+/// shape now holds for `strip_api_error_prefix`'s too.
+fn drop_json_tail(prefix: &str) -> String {
+    let mut out = prefix.to_string();
+    if let Some(rest) = strip_provider_request_failed_prefix(&out) {
+        out = rest;
+    }
+    if let Some(rest) = strip_api_error_prefix(&out) {
+        out = rest;
+    }
+    if let Some(rest) = strip_provider_request_failed_prefix(&out) {
+        out = rest;
+    }
+    trim_dangling_separator(&out)
 }
 
 /// Drop the separator an excised object hung off (`… parameter — {…}`),
@@ -1512,6 +1541,47 @@ mod tests {
             formatted.detail, "Supported values are: {'a','b'}",
             "prose containing a brace is not a payload and must survive"
         );
+    }
+
+    /// A carrier prefix immediately followed by the object it introduces —
+    /// no prose between them — used to end up *as* the reason: the
+    /// dangling-separator trim ate the `": "` that `strip_api_error_prefix`
+    /// anchors on, so the carrier survived where the strip should have run
+    /// (#431). Every carrier shape must fall back to the canned copy here,
+    /// the same as the with-prose case above.
+    #[test]
+    fn issue431_carrier_immediately_before_brace_falls_back_to_canned_copy() {
+        let canned_400 = format_request_failure(Some(400), None, "").detail;
+
+        for raw in [
+            "API error (status 400 Bad Request): {\"key\":\"value\"}",
+            "API error (status 400 Bad Request): {\"code\":123,\"trace\":\"abc\"}",
+            "Provider request failed (HTTP 400). {\"key\":\"value\"}",
+        ] {
+            let formatted = format_request_failure(None, Some("api"), raw);
+            assert_eq!(formatted.headline, "Bad request (400)", "{raw}");
+            assert_eq!(
+                formatted.detail, canned_400,
+                "the carrier must not stand in for the reason: {raw}"
+            );
+            let lower = formatted.detail.to_ascii_lowercase();
+            assert!(
+                !lower.contains("api error") && !lower.contains("provider request failed"),
+                "carrier jargon must never reach the user: {raw} -> {}",
+                formatted.detail
+            );
+        }
+
+        // Same bug, amplified: an oversized envelope behind a carrier used
+        // to lose the real reason *and* show the jargon. The real reason is
+        // still lost past MAX_JSON_SCAN (documented, conservative), but the
+        // carrier must not fill in for it either.
+        let oversized = format!(
+            "API error (status 400 Bad Request): {{\"error\":{{\"message\":\"real reason\",\"param\":\"{}\"}}}}",
+            "p".repeat(5 * 1024)
+        );
+        let formatted = format_request_failure(None, Some("api"), &oversized);
+        assert_eq!(formatted.detail, canned_400);
     }
 
     /// A suffix parse from the first `{` is defeated by one trailing
