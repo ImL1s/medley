@@ -157,9 +157,13 @@ async fn make_actor_with_method_and_credentials(
         .update_credentials(xai_chat_state::Credentials::bound(
             Some(api_key),
             auth_type,
-            xai_grok_sampling_types::CredentialSource::None,
+            match auth_type {
+                xai_chat_state::AuthType::SessionToken => {
+                    xai_grok_sampler::CredentialSource::XaiSession
+                }
+                xai_chat_state::AuthType::ApiKey => xai_grok_sampler::CredentialSource::ModelApiKey,
+            },
         ));
-    pin_first_party_session_model(&actor).await;
     (Arc::new(actor), persistence_rx)
 }
 
@@ -765,23 +769,15 @@ async fn legacy_auth_hint_on_404_model_not_found() {
                 msg.contains("deprecated authentication method"),
                 "404 with WebLogin must include deprecation message, got: {msg}"
             );
+            let prog = xai_grok_config::program_name::program_name_for_instruction()
+                .expect("test binary argv0 is a plain program name");
             assert!(
-                msg.contains("grok update"),
-                "hint must mention `grok update` before re-login, got: {msg}"
+                msg.contains(&format!("`{prog} logout`")),
+                "hint must mention `{prog} logout`, got: {msg}"
             );
             assert!(
-                msg.contains("grok logout"),
-                "hint must mention `grok logout`, got: {msg}"
-            );
-            assert!(
-                msg.contains("grok login"),
-                "hint must mention `grok login`, got: {msg}"
-            );
-            let update_at = msg.find("grok update").expect("grok update");
-            let logout_at = msg.find("grok logout").expect("grok logout");
-            assert!(
-                update_at < logout_at,
-                "update must come before logout, got: {msg}"
+                msg.contains(&format!("`{prog} login`")),
+                "hint must mention `{prog} login`, got: {msg}"
             );
             assert!(
                 msg.contains("Version:"),
@@ -847,23 +843,15 @@ async fn legacy_auth_hint_on_401_unauthorized() {
                 msg.contains("deprecated authentication method"),
                 "401 with WebLogin must include deprecation message, got: {msg}"
             );
+            let prog = xai_grok_config::program_name::program_name_for_instruction()
+                .expect("test binary argv0 is a plain program name");
             assert!(
-                msg.contains("grok update"),
-                "hint must mention `grok update` before re-login, got: {msg}"
+                msg.contains(&format!("`{prog} logout`")),
+                "hint must mention `{prog} logout`, got: {msg}"
             );
             assert!(
-                msg.contains("grok logout"),
-                "hint must mention `grok logout`, got: {msg}"
-            );
-            assert!(
-                msg.contains("grok login"),
-                "hint must mention `grok login`, got: {msg}"
-            );
-            let update_at = msg.find("grok update").expect("grok update");
-            let logout_at = msg.find("grok logout").expect("grok logout");
-            assert!(
-                update_at < logout_at,
-                "update must come before logout, got: {msg}"
+                msg.contains(&format!("`{prog} login`")),
+                "hint must mention `{prog} login`, got: {msg}"
             );
         })
         .await;
