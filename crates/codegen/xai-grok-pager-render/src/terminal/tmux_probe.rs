@@ -485,83 +485,58 @@ mod tests {
     /// The other half of the property above, made deterministic instead of
     /// a second race against signal/escalation timing — which a PR whose
     /// entire subject is removing scheduling races should not introduce.
-    /// An earlier draft reused the SIGTERM-ignoring fixture above with a
-    /// too-small `grace`; that still depends on trap-install timing *and*
-    /// on the SIGKILL teardown and drain thread being scheduled in a
-    /// specific order relative to a 5ms deadline, both real races at low
-    /// probability.
     ///
-    /// This holder is instead spawned in its own process group via
-    /// `detach_std_command` and deliberately **never attached** to `group`
-    /// (the one `post_exit_cleanup_and_drain` is called with). `terminate_
-    /// owned_group` only ever signals the group it owns
-    /// (`ProcessGroup::terminate`/`kill` operate on `self`'s leader alone,
-    /// see `killpg_unix`), so an unattached holder cannot be reached by it
-    /// at all — its pipe provably never closes on its own, with no signal
-    /// delivery, no trap timing, and no escalation to race. That also
-    /// states the actual invariant more precisely: `grace` bounds the
-    /// drain wait even when nothing ever closes the pipe, not merely when
-    /// closing it happens to take too long.
+    /// Two earlier drafts of this test both raced real time. The first
+    /// reused the SIGTERM-ignoring fixture above with a too-small `grace`,
+    /// depending on trap-install timing *and* on SIGKILL teardown and
+    /// drain-thread scheduling landing in a specific order relative to a
+    /// 5ms deadline. The second replaced that with an external `sh -c
+    /// 'sleep 1000'` holder deliberately never attached to `group`, and
+    /// proved the timeout by asserting `elapsed < 200ms` — an upper bound
+    /// on the *test's own* wall-clock time, which Codex's review of #501
+    /// correctly flagged: a descheduled test thread can exceed any fixed
+    /// ceiling even when the implementation under test is entirely
+    /// correct, reintroducing exactly the class of flakiness this PR
+    /// removes everywhere else.
     ///
-    /// Cleanup tracks the holder in its OWN second `ProcessGroup` (attached
-    /// at spawn, never passed to `post_exit_cleanup_and_drain`) and kills
-    /// that group, not the leader `Child` alone. On the Ubuntu `/bin/sh`
-    /// this crate's CI runs on, `sh -c 'sleep 1000'` does not exec into
-    /// `sleep` — the shell stays as a distinct leader with `sleep` as a
-    /// separate child in the same group — so `Child::kill()` on the leader
-    /// alone reparents and orphans the `sleep`, which then holds the pipe
-    /// descriptors for its own full 1000s (#501 review). `group.kill()`
-    /// SIGKILLs the whole group in one call, same as every other teardown
-    /// in this file.
-    #[cfg(unix)]
+    /// This version spawns no process at all and asserts no elapsed time.
+    /// The "pipe" is a bare channel the test controls directly: the stdout
+    /// side only receives a value after a real delay chosen to land inside
+    /// any plausible "grace ignored, some larger fixed window used
+    /// instead" mutation (in particular, reusing [`POST_EXIT_CLEANUP_GRACE`]
+    /// itself) and outside the correct, much smaller `grace` under test. A
+    /// `thread::sleep` is a guaranteed *minimum*, never an upper bound —
+    /// scheduler jitter can only push the send *later*, which only widens
+    /// the pass margin, never narrows it. The property under test becomes a
+    /// pure outcome (did the deadline or the send win the race), not a
+    /// duration, so there is nothing left for ambient load to flake.
+    ///
+    /// One thing this test still does *not* catch: a `grace` silently
+    /// dropped (collapsed to ~0). That path is `Err` too, indistinguishable
+    /// from correct behaviour here — it stays the sibling positive test's
+    /// job (`post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline`).
     #[test]
-    fn post_exit_grace_bounds_the_drain_when_nothing_closes_the_pipe() {
+    fn post_exit_grace_bounds_the_drain_when_the_pipe_closes_only_after_the_grace() {
         let group = xai_tty_utils::ProcessGroup::new().expect("group");
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg("sleep 1000")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        xai_tty_utils::detach_std_command(&mut cmd);
-        // Deliberately not attached to `group` -- see the doc comment above.
-        #[allow(clippy::disallowed_methods)] // test fixture; killed directly below, not via `group`
-        let mut holder = cmd.spawn().expect("spawn holder");
-        // A SEPARATE group, for cleanup only -- `group` above must stay
-        // empty for the property under test.
-        let mut holder_group = xai_tty_utils::ProcessGroup::new().expect("holder group");
-        holder_group.attach_std(&holder).expect("attach holder");
-        let stdout = holder.stdout.take().expect("stdout piped");
-        let stderr = holder.stderr.take().expect("stderr piped");
-        let stdout_rx = spawn_pipe_drain(stdout, "stdout");
-        let stderr_rx = spawn_pipe_drain(stderr, "stderr");
 
-        let too_small = Duration::from_millis(5);
-        let started = std::time::Instant::now();
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        std::thread::spawn(move || {
+            // A guaranteed minimum, not an upper bound -- see the doc
+            // comment above.
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = stdout_tx.send(Ok(b"too late\n".to_vec()));
+        });
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        stderr_tx
+            .send(Ok(Vec::new()))
+            .expect("stderr channel has capacity for an immediate send");
+
+        let too_small = Duration::from_millis(20);
         let result = post_exit_cleanup_and_drain(&group, stdout_rx, stderr_rx, too_small);
-        let elapsed = started.elapsed();
-
-        // Kill the whole holder group, not just its leader -- see the doc
-        // comment above.
-        let _ = holder_group.kill();
-        let _ = holder.wait();
 
         assert!(
             result.is_err(),
-            "grace must bound the drain wait even when nothing ever closes the pipe: {result:?}"
-        );
-        // Bounds *how quickly* it fails, not just that it eventually does --
-        // a pipe that never closes would still (eventually) produce `Err`
-        // even from an implementation that silently ignored `too_small` and
-        // fell back to some larger hardcoded bound instead. This is the half
-        // of the pair that would actually catch that: the sibling test
-        // above cannot, because a larger-than-needed grace still comfortably
-        // clears its escalation and stays green.
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "must fail in the requested grace's own ballpark, not after some \
-             larger hardcoded wait the parameter was ignored in favour of: \
-             took {elapsed:?} for a 5ms grace"
+            "grace must bound the drain wait even when the pipe closes well after it: {result:?}"
         );
         assert!(
             result
@@ -694,6 +669,104 @@ mod tests {
             .expect("a pipe-holding descendant must not turn a clean exit into a drain error");
         assert!(output.status_success, "expected successful status");
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "tmux 3.4");
+    }
+
+    /// Sibling to the end-to-end test above, restoring the coverage Codex's
+    /// review of #501 found missing from it: that `run_tmux_bounded` passes
+    /// [`post_exit_cleanup_and_drain`] a *fresh* [`POST_EXIT_CLEANUP_GRACE`],
+    /// not a remainder borrowed from its own much larger `timeout`. The test
+    /// above cannot tell these apart — its leader now exits at once, so
+    /// nearly the whole 1.5s `timeout` is still unused budget by the time
+    /// cleanup runs, and its descendant dies to the group's own `SIGTERM`
+    /// well inside either a fresh or a borrowed window.
+    ///
+    /// This test's descendant instead must *outlive* the group's `SIGTERM`
+    /// entirely, so the two windows can be told apart. It calls its own
+    /// `setsid()` the moment it starts, moving itself to a brand-new
+    /// process group — the one escape `ProcessGroup`'s own doc comment
+    /// names as unreachable by `killpg` — then holds the piped stdout open
+    /// for a fixed lifetime and exits on its own; nothing outside the fake
+    /// `tmux` script can reach it to kill it early, so no manual teardown
+    /// is needed.
+    ///
+    /// Between spawning that descendant and exiting, the leader busy-polls
+    /// a marker file the descendant creates immediately after `setsid()`
+    /// succeeds. Without that handshake there is a real race: the main
+    /// wait loop polls for the leader's exit every 15ms, so on a loaded
+    /// machine the group's `SIGTERM` could in principle fire before the
+    /// descendant has finished detaching, killing it early and collapsing
+    /// the very distinction this test depends on. The marker makes "the
+    /// descendant has already escaped the group" a fact the leader waits
+    /// on rather than a timing assumption.
+    ///
+    /// A grace fresh off `POST_EXIT_CLEANUP_GRACE` (300ms) elapses well
+    /// before the descendant's fixed 800ms self-close, so a correct
+    /// `run_tmux_bounded` must report the drain timeout. A grace borrowed
+    /// from the ~1.5s `timeout` instead — almost entirely unused, since the
+    /// leader exits at once — comfortably outlasts that 800ms close, and
+    /// what should have been `Err` becomes `Ok`: exactly the caller-side
+    /// regression this test exists to catch.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(tmux_probe_path)]
+    fn run_tmux_bounded_uses_a_fresh_grace_not_the_remaining_main_deadline() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tmux = bin.join("tmux");
+        // Large relative to `POST_EXIT_CLEANUP_GRACE` (300ms) so a fresh
+        // grace times out well before it, and large relative to nothing in
+        // particular otherwise -- what matters is that it sits comfortably
+        // under the ~1.5s a *borrowed* remainder would grant.
+        let timeout = Duration::from_millis(1500);
+        let ready_marker = temp.path().join("descendant-ready");
+        let script = format!(
+            "#!/bin/sh\n\
+             ( /usr/bin/perl -e 'use POSIX qw(setsid); setsid(); \
+             open(my $fh, \">\", \"{marker}\") or die $!; close $fh; \
+             select(undef, undef, undef, 0.8);' ) &\n\
+             i=0\n\
+             while [ ! -f \"{marker}\" ] && [ $i -lt 20000 ]; do i=$((i+1)); done\n\
+             printf 'tmux 3.4\\n'\n\
+             exit 0\n",
+            marker = ready_marker.display(),
+        );
+        std::fs::write(&tmux, script).unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let previous_path = std::env::var_os("PATH");
+        let mut path = OsString::from(bin.as_os_str());
+        path.push(":");
+        if let Some(existing) = &previous_path {
+            path.push(existing);
+        }
+        // SAFETY: serialized on `tmux_probe_path`; restored before return.
+        unsafe {
+            std::env::set_var("PATH", &path);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_tmux_bounded(TmuxCommand::Version, timeout)
+        }));
+        match previous_path {
+            Some(value) => unsafe {
+                std::env::set_var("PATH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("PATH");
+            },
+        }
+        let output = result.expect("probe must not panic");
+        let error = output.expect_err(
+            "a descendant outside the group that outlives a fresh grace must surface as a \
+             drain timeout, not a success -- a success here means the grace was borrowed from \
+             the main deadline instead of freshly computed",
+        );
+        assert!(
+            error.contains("did not close before the query deadline"),
+            "must fail as a drain timeout specifically, not some other error: {error}"
+        );
     }
 
     #[cfg(unix)]
