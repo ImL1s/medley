@@ -23,15 +23,30 @@ use mock_servers::*;
 const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Poll until `ready`, or fail saying what was being waited for.
-async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+async fn wait_until(what: &str, ready: impl FnMut() -> bool) {
+    wait_until_within(what, WAIT_TIMEOUT, ready).await;
+}
+
+/// The same, for a caller that must not shorten a budget it inherited.
+///
+/// Replacing a wait is not licence to give it less time than the wait it
+/// replaced: a test that waited 30s for a verdict and now waits 15s for the
+/// fact behind it has traded one load-sensitive failure for another (#428).
+/// The budget belongs to what is being waited for, not to the helper that
+/// happens to poll it.
+async fn wait_until_within(
+    what: &str,
+    budget: std::time::Duration,
+    mut ready: impl FnMut() -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + budget;
     while tokio::time::Instant::now() < deadline {
         if ready() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("timed out waiting for {what}");
+    panic!("timed out after {budget:?} waiting for {what}");
 }
 
 /// A file is held for this long in tests that are about letting go of one.
@@ -55,18 +70,108 @@ fn brief_policy() -> super::pending::PendingPolicy {
 /// answers, then says its answer was premature, is answered again on the drain
 /// after the one that heard it — and which drain lands where is a race with the
 /// mock's own scheduling, not something worth pinning down.
+///
+/// The budget is a hang guard, not the verdict (#428). What it waits for is a
+/// verdict from a mock server running in its own process, reached over a pipe,
+/// and nothing deterministic stands in for it: the only event that says the
+/// answer has arrived *is* the answer. So the budget stays, and what it prints
+/// when it runs out has to earn its keep instead. Reaching this line used to
+/// say one sentence about three different states, which made an overloaded
+/// runner and a genuine regression in what answered read identically. The
+/// manager's state at the moment we give up tells them apart, so that is what
+/// the panic carries.
 async fn drain_until_reported(mgr: &tokio::sync::Mutex<LspManager>, needle: &str) -> String {
     let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT + WAIT_TIMEOUT;
+    // Kept rather than dropped: a summary that arrived and said something else
+    // is the loudest evidence there is that the wrong thing answered, and
+    // filtering it away in place was what left only "nothing came" to report.
+    let mut discarded: Vec<String> = Vec::new();
     while tokio::time::Instant::now() < deadline {
-        if let Some(summary) = drain_lsp_diagnostics(mgr, std::time::Duration::from_millis(500))
-            .await
-            .filter(|summary| summary.text.contains(needle))
+        if let Some(summary) =
+            drain_lsp_diagnostics(mgr, std::time::Duration::from_millis(500)).await
         {
-            return summary.text;
+            if summary.text.contains(needle) {
+                return summary.text;
+            }
+            discarded.push(summary.text);
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("no summary mentioning {needle:?} within the deadline");
+    panic!("{}", gave_up_draining(mgr, needle, &discarded).await);
+}
+
+/// Why [`drain_until_reported`] gave up, in the terms that separate a wait that
+/// expired from a verdict that was wrong.
+///
+/// The discriminator is each open document's `sent` version against the verdict
+/// the store holds for it, because that is the one piece of state nothing
+/// reclaims. The pending set is **not** usable for this: `VERDICT_TTL` is the
+/// same 30s as this budget, and `PendingEdits::take_answered` drops a file that
+/// has waited that long *without* recording an answer — so on the very run this
+/// message exists to explain, `pending` reaches zero with nobody having said a
+/// word.
+///
+/// Written once here rather than at each call site, so every test that waits on
+/// a summary reports its give-up the same way.
+async fn gave_up_draining(
+    mgr: &tokio::sync::Mutex<LspManager>,
+    needle: &str,
+    discarded: &[String],
+) -> String {
+    let lsp = mgr.lock().await;
+    let mut servers: Vec<String> = lsp
+        .clients
+        .iter()
+        .map(|(name, client)| {
+            let mut docs: Vec<String> = client
+                .documents
+                .versions()
+                .into_iter()
+                .map(|(uri, sent)| {
+                    // One read, not two. `covers()` and `items()` take the
+                    // store lock separately, and the main loop writes to it
+                    // without the manager lock — so an answer landing between
+                    // the two would be reported as `answered=never` beside its
+                    // own item count, which is precisely the contradiction this
+                    // message exists to rule out.
+                    let (answered, items) = match client.diagnostics.answer(&uri) {
+                        Some(held) => (format!("v{}", held.covers), held.items.len()),
+                        None => ("never".to_string(), 0),
+                    };
+                    format!("{uri} sent=v{sent} answered={answered} items={items}")
+                })
+                .collect();
+            docs.sort_unstable();
+            format!(
+                "{name}: publishes={} pull={:?} docs=[{}]",
+                client.diagnostics.server_publishes(),
+                client.pull.support(),
+                docs.join("; ")
+            )
+        })
+        .collect();
+    servers.sort_unstable();
+    format!(
+        "no summary mentioning {needle:?} within {budget:?}. Three states reach \
+         this line and each document's `sent` version against the verdict held \
+         for it tells them apart. Read those, not `pending`: `VERDICT_TTL` is \
+         the same 30s as this budget, so a file nobody answered may already \
+         have been dropped from the pending set unanswered. (1) SOMETHING \
+         ANSWERED IT IN SILENCE: a document is answered at or past its sent \
+         version with items=0. An empty verdict settles a file without \
+         producing a line to show, so it leaves exactly this trace and no \
+         summary — which is what an answer from a source that should not have \
+         been consulted looks like from here. (2) A DIFFERENT VERDICT ARRIVED: \
+         drained is not empty. Something answered, just not with what was \
+         expected; the text below is what it said. (3) NOTHING ARRIVED: every \
+         document is answered=never, or answered below its sent version. Nobody \
+         gave a verdict on the text we sent, and on a loaded host that is this \
+         wait expiring rather than a verdict about anything. \
+         servers=[{servers}] pending={pending} drained={discarded:?}",
+        budget = WAIT_TIMEOUT + WAIT_TIMEOUT,
+        servers = servers.join(", "),
+        pending = lsp.pending_count(),
+    )
 }
 
 fn mock_server_config(script_path: &Path) -> LspServerConfig {
@@ -1640,21 +1745,53 @@ async fn a_pushed_verdict_on_the_previous_revision_does_not_settle_the_edit() {
 async fn a_server_that_publishes_is_not_second_guessed_with_a_pull() {
     let (_dir, script_path) = write_push_and_pull_server();
     let workspace = tempfile::tempdir().unwrap();
-    let mgr = tokio::sync::Mutex::new(single_server_manager(&script_path, &workspace).await);
+    let mut mgr = single_server_manager(&script_path, &workspace).await;
 
     let file = workspace.path().join("checked.rs.ts");
     std::fs::write(&file, "const y = 1;\n").unwrap();
-    mgr.lock()
-        .await
-        .notify_file_changed(&file, "const y = 1;\n");
+    mgr.notify_file_changed(&file, "const y = 1;\n");
 
+    // What settles the channel is the server's first push reaching the store,
+    // not the summary that push eventually produces. Waiting on the fact keeps
+    // the two apart: this wait names what it was waiting for when it expires,
+    // and cannot be mistaken for the channel having been chosen wrongly (#428).
+    //
+    // The budget is the one the `drain_until_reported` this replaced already
+    // had. It is not a new allowance to make anything green — the same publish,
+    // reached over the same pipe from the same spawned server, must not get
+    // less time merely because the test now watches for it one step earlier.
+    wait_until_within(
+        "the server's first publish",
+        WAIT_TIMEOUT + WAIT_TIMEOUT,
+        || mgr.clients["mock-ts"].diagnostics.server_publishes(),
+    )
+    .await;
+
+    // The wait above established the first of the two facts the rule combines.
+    // This is the other, and the load-bearing one: the server never refused a
+    // pull, so declining to ask it is a choice rather than an inability. That
+    // the choice follows from the pair is pinned with no server, no drain and
+    // no clock in `pull::tests`.
+    //
+    // The mock's `pulls=` count is deliberately not asserted on. A pull sent
+    // before the first publish is legitimate — the client cannot yet know what
+    // kind of server this is, which is why the mock has a `pending_pull` branch
+    // at all — and the confirming re-ask inside that same episode lands up to
+    // `CONFIRM_DELAY` after the publish. The raw count is racy in a correct
+    // implementation too, so asserting on it would trade this defect for a
+    // worse one.
+    assert_eq!(
+        mgr.clients["mock-ts"].pull.support(),
+        super::pull::PullSupport::Asking,
+        "not rejected"
+    );
+
+    let mgr = tokio::sync::Mutex::new(mgr);
     let summary = drain_until_reported(&mgr, "the check that only the push channel runs").await;
     assert!(
         summary.contains("the check that only the push channel runs"),
         "{summary}"
     );
-    let before = mgr.lock().await.clients["mock-ts"].pull.support();
-    assert_eq!(before, super::pull::PullSupport::Asking, "not rejected");
     // And from here on it is not asked at all — its own reports are the truth.
     for round in 0..3 {
         let text = format!("const y = {round};\n");

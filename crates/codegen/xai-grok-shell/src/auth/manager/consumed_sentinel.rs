@@ -218,7 +218,7 @@ fn sentinel_path(auth_json_path: &Path) -> PathBuf {
     auth_json_path.with_file_name("auth.json.rt-sentinel")
 }
 
-/// Test-only, path-scoped write fault (mirrors `storage::WRITE_FAULT_PATH`):
+/// Test-only, path-scoped write fault (mirrors `storage::WRITE_FAULT_PATHS`):
 /// `write_sentinel_file` fails with `Unsupported` for exactly this path.
 #[cfg(test)]
 pub(crate) static SENTINEL_WRITE_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =

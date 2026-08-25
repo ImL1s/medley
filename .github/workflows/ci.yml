@@ -314,6 +314,20 @@ jobs:
           run_nonzero -p xai-grok-shell --lib final_publication_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             symlinked_cwd_parent_without_touching_outside_tree -- --nocapture
+          # #412: a public session directory with no `summary.json` must not
+          # burn its session id. Two checks disagreed about what occupies one --
+          # the read side counted a regular `summary.json`, the creation gate
+          # counted any entry named `<id>` -- and nothing ever cleared the
+          # directory in between, so every retry of a pinned id failed forever.
+          # `quarantine_` selects the five guards on the single shared
+          # implementation that frees it; `public_occupant` selects the four on
+          # the fresh-claim gate that calls it, including the two occupants that
+          # must still be refused. Both filters are exact: nine tests, all of
+          # them these. The shell four were otherwise reached only through the
+          # broad `session::` filter below, which would take them with it if it
+          # were ever narrowed -- the unstated-enrollment shape #417 closed.
+          run_nonzero -p xai-grok-workspace --lib quarantine_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib public_occupant -- --nocapture
 
   compile-tests:
     name: Compile every test target
@@ -388,6 +402,24 @@ jobs:
   test:
     name: Tests (providers hot path)
     runs-on: ubuntu-latest
+    # `providers` itself sets no timeout here (defaults to GitHub's 360m job
+    # ceiling), and that has already cost a real 6-hour hang: run 32627453611
+    # (2026-08-23) ran the Tests job to exactly 360m before GitHub force-killed
+    # it (`cancelled`) -- the #416 failure shape this repo has hit before, an
+    # unbounded wait reading from outside as "still running" for hours. No cap
+    # is not safe merely because it has not bitten a sync run yet.
+    #
+    # 150m is not an arbitrary bump: across ~20 recent successful `providers`
+    # push runs, this job's own duration clusters in two bands, ~55-65m and a
+    # recurring (not rare) ~110-118m band -- seven separate runs landed in
+    # 110-118m, with 32749926276 the observed max at 118m24s. 150m gives ~27%
+    # headroom over that measured max while staying far short of the 360m
+    # default that let the hung run above burn six hours undetected. This
+    # branch's own ci.yml additionally unions in more hot-path coverage than
+    # those historical runs exercised (see the xai-grok-workspace-{client,
+    # daemon}/xai-hooks-plugins-types/xai-ratatui-inline filters below), so a
+    # genuinely passing run here may land above the historical 118m baseline
+    # -- widen this further only with a fresh measured max, not by feel.
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -1007,7 +1039,45 @@ jobs:
           run_nonzero -p xai-computer-hub-sdk --lib \
             server:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
-            '' -- --nocapture
+            permission::auto_mode:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::manager:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::prompter:: -- --nocapture
+          # `permission::resolution` decides which rules apply. Unfiltered, 19 of
+          # its tests failed on every machine with a real `~/.claude` (the user
+          # tier merges into the resolved set) and CI never said a word (#443).
+          # Other `permission::` submodules are still unenrolled — see #408.
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::resolution:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::types:: -- --nocapture
+          # Upstream moved these tests into an external `restore_fetch_tests.rs`
+          # via `#[path = "restore_fetch_tests.rs"] mod tests;` — the *file* was
+          # renamed, the module path was not, and a filter naming the file
+          # matched nothing. `run_nonzero` is what noticed.
+          #
+          # It stops at `restore_fetch::` rather than `restore_fetch::tests::`
+          # so that both readers agree. Cargo selects the same tests either way,
+          # but the #171 guard approximates a module path by turning `::` into
+          # `/` and looking for it in the file path, which cannot see through
+          # `#[path]`: it would look for `restore_fetch/tests` in a file called
+          # `restore_fetch_tests.rs` and report every test here as running
+          # nowhere. `restore_fetch::` is a substring of both.
+          run_nonzero -p xai-grok-workspace --lib \
+            restore_fetch:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            session::git:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            workspace_ops:: -- --nocapture
+          # #384 sync: upstream's `xai-workspace-server` bin target and the
+          # `xai-grok-workspace-client` / `xai-grok-workspace-daemon` /
+          # `xai-hooks-plugins-types` / `xai-ratatui-inline` crates had no
+          # hot-path coverage on `providers` (workspace-daemon is new from this
+          # sync; the others pre-date it but were never enrolled). Blanket ''
+          # here, not named filters, on purpose: unlike the permission::/
+          # restore_fetch:: submodules above, nothing yet documents which of
+          # these tests matter enough to name individually.
           run_nonzero -p xai-grok-workspace --bin \
             xai-workspace-server -- --nocapture
           run_nonzero -p xai-grok-workspace-client --lib \

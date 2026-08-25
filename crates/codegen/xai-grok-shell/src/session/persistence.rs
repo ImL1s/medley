@@ -4964,12 +4964,22 @@ fn finalize_fresh_publication_in_root_sync(
     staged_publication_for_test(root_dir, info).finalize()
 }
 
-fn public_session_id_namespace_present(sessions_root: &Path, session_id: &str) -> io::Result<bool> {
+/// Encoded-cwd directory names under `sessions_root` that hold an entry named
+/// `session_id`, in `read_dir` order.
+///
+/// One enumeration, so the sweep in [`claim_public_session_id_namespace`] can
+/// neither visit a directory the occupancy check would not count nor miss one
+/// it would. #412 came from two such answers being derived separately.
+fn public_cwd_dirs_holding_session_id(
+    sessions_root: &Path,
+    session_id: &str,
+) -> io::Result<Vec<OsString>> {
     let cwd_entries = match std::fs::read_dir(sessions_root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
+    let mut holders = Vec::new();
     for cwd_entry in cwd_entries {
         let cwd_entry = cwd_entry?;
         let cwd_type = cwd_entry.file_type()?;
@@ -4977,10 +4987,57 @@ fn public_session_id_namespace_present(sessions_root: &Path, session_id: &str) -
             continue;
         }
         if std::fs::symlink_metadata(cwd_entry.path().join(session_id)).is_ok() {
-            return Ok(true);
+            holders.push(cwd_entry.file_name());
         }
     }
-    Ok(false)
+    Ok(holders)
+}
+
+fn public_session_id_namespace_present(sessions_root: &Path, session_id: &str) -> io::Result<bool> {
+    Ok(!public_cwd_dirs_holding_session_id(sessions_root, session_id)?.is_empty())
+}
+
+/// Free `session_id` of every occupant the read side does not count as a
+/// persisted session, then report the occupants that remain.
+///
+/// #412: the occupancy check counted *any* entry named `<id>` under *any* cwd,
+/// while the read side (`RelocationView`'s candidate scan) counted only a
+/// directory holding a regular `summary.json`. A directory in between answered
+/// "not persisted, go ahead and create" to one and "already exists, refuse" to
+/// the other, and nothing in the product ever cleared it -- the id stayed
+/// burned until someone removed the directory by hand. Clearing it here, under
+/// the exclusive id lease and before the question is asked, is what stops the
+/// two answers from disagreeing.
+///
+/// The sweep spans every cwd because the occupancy check does: a summary-less
+/// occupant under a *different* cwd burns the id just as permanently as one
+/// under the cwd being claimed.
+///
+/// What survives is deliberate. A symlink, a regular file, or anything else
+/// that is not a summary-less directory stays exactly where it is and still
+/// refuses the claim: moving an entry that may point outside the tree is the
+/// hazard #340 closed. The caller reports those by path, so the refusal says
+/// what to remove instead of misdirecting.
+///
+/// Caller must hold the exclusive session-ID lease.
+fn claim_public_session_id_namespace(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<Vec<PathBuf>> {
+    let sessions_root = root_dir.join("sessions");
+    for encoded_cwd in public_cwd_dirs_holding_session_id(&sessions_root, session_id)? {
+        xai_grok_workspace::session::fresh_publication::quarantine_incomplete_public_session(
+            root_dir,
+            &encoded_cwd,
+            session_id,
+        )?;
+    }
+    Ok(
+        public_cwd_dirs_holding_session_id(&sessions_root, session_id)?
+            .into_iter()
+            .map(|encoded_cwd| sessions_root.join(encoded_cwd).join(session_id))
+            .collect(),
+    )
 }
 
 fn claim_fresh_session_sync(
@@ -4993,10 +5050,13 @@ fn claim_fresh_session_sync(
 
     reclaim_abandoned_session_stages(&staging_root_anchor, session_id)?;
 
-    if public_session_id_namespace_present(&root_dir.join("sessions"), session_id)? {
+    if let Some(occupant) = claim_public_session_id_namespace(root_dir, session_id)?.first() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("a persisted session with id {session_id} already exists"),
+            format!(
+                "a persisted session with id {session_id} already exists at {}",
+                occupant.display()
+            ),
         ));
     }
 
@@ -7711,6 +7771,207 @@ mod fresh_session_claim_tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// `sessions/<encoded cwd>/<id>/` holding one file and no `summary.json`.
+    ///
+    /// This is what `cleanup_stale_sessions_inner` leaves behind when its
+    /// per-file pass removes a stale `summary.json` but a newer sibling makes
+    /// the closing `remove_dir` fail -- no crash required (#412).
+    fn seed_summary_less_public_occupant(root: &Path, cwd: &str, session_id: &str) -> PathBuf {
+        let occupant = test_session_dir(root, cwd, session_id);
+        std::fs::create_dir_all(&occupant).expect("seed summary-less occupant");
+        std::fs::write(occupant.join("updates.jsonl"), b"occupant-payload")
+            .expect("seed occupant payload");
+        occupant
+    }
+
+    /// The single `<id>.incomplete-<nanos>` sibling left by a quarantine.
+    fn quarantined_sibling(public_parent: &Path, session_id: &str) -> PathBuf {
+        let prefix = format!("{session_id}.incomplete-");
+        let mut found: Vec<PathBuf> = std::fs::read_dir(public_parent)
+            .expect("read public parent")
+            .map(|entry| entry.expect("read public entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one quarantined occupant");
+        found.pop().expect("quarantined occupant")
+    }
+
+    /// #412, same cwd. The whole firing path in one test: the pre-check reads
+    /// the occupant as "not persisted, go ahead", so the creation gate must not
+    /// read the same directory as "already exists, refuse". Before the fix that
+    /// disagreement burned the id permanently -- `rm -rf` was the only recovery.
+    #[test]
+    fn summary_less_public_occupant_under_the_claimed_cwd_does_not_burn_the_session_id() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000412";
+        const CWD: &str = "/repo/publication/summary-less-same-cwd";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        seed_summary_less_public_occupant(root.path(), CWD, SESSION_ID);
+
+        assert!(
+            find_persisted_session_dir_by_id_in_root_result(
+                SESSION_ID,
+                &root.path().join("sessions"),
+            )
+            .expect("pre-check the requested session id")
+            .is_none(),
+            "the occupant holds no summary, so the read side reports no session"
+        );
+
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("a summary-less occupant must not burn the session id");
+        write_valid_staged_summary(&claim, &test_info(SESSION_ID, CWD));
+        claim
+            .publication
+            .finalize()
+            .expect("publish over the freed session id");
+
+        assert!(session_dir.join("summary.json").is_file());
+        let quarantined =
+            quarantined_sibling(session_dir.parent().expect("published parent"), SESSION_ID);
+        assert_eq!(
+            std::fs::read(quarantined.join("updates.jsonl")).expect("quarantined payload"),
+            b"occupant-payload",
+            "the occupant is moved aside, never destroyed"
+        );
+        claim.disarm();
+    }
+
+    /// #412, different cwd. The occupancy check spans every cwd, so an occupant
+    /// filed under one cwd burns the id for a claim under any other. A fix that
+    /// only cleared the cwd being claimed would pass the test above and leave
+    /// this one red.
+    #[test]
+    fn summary_less_public_occupant_under_another_cwd_does_not_burn_the_session_id() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000413";
+        const CLAIMED_CWD: &str = "/repo/publication/summary-less-claimed";
+        const OTHER_CWD: &str = "/repo/publication/summary-less-elsewhere";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CLAIMED_CWD, SESSION_ID);
+        let occupant = seed_summary_less_public_occupant(root.path(), OTHER_CWD, SESSION_ID);
+
+        assert!(
+            find_persisted_session_dir_by_id_in_root_result(
+                SESSION_ID,
+                &root.path().join("sessions"),
+            )
+            .expect("pre-check the requested session id")
+            .is_none(),
+            "the occupant holds no summary, so the read side reports no session"
+        );
+
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("an occupant under another cwd must not burn the session id");
+        write_valid_staged_summary(&claim, &test_info(SESSION_ID, CLAIMED_CWD));
+        claim
+            .publication
+            .finalize()
+            .expect("publish over the freed session id");
+
+        assert!(session_dir.join("summary.json").is_file());
+        assert!(
+            !occupant.exists(),
+            "the other cwd's occupant is cleared too"
+        );
+        let quarantined =
+            quarantined_sibling(occupant.parent().expect("occupant parent"), SESSION_ID);
+        assert_eq!(
+            std::fs::read(quarantined.join("updates.jsonl")).expect("quarantined payload"),
+            b"occupant-payload",
+            "the occupant is moved aside, never destroyed"
+        );
+        claim.disarm();
+    }
+
+    /// The other half of #412's contract: clearing the namespace must not clear
+    /// a directory the read side counts as a persisted session. A predicate
+    /// looser than "no regular `summary.json`" would move this one aside.
+    #[test]
+    fn public_occupant_with_a_summary_still_refuses_the_fresh_claim() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000414";
+        const CLAIMED_CWD: &str = "/repo/publication/persisted-claimed";
+        const OTHER_CWD: &str = "/repo/publication/persisted-elsewhere";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CLAIMED_CWD, SESSION_ID);
+        let occupant = seed_summary_less_public_occupant(root.path(), OTHER_CWD, SESSION_ID);
+        std::fs::write(
+            occupant.join("summary.json"),
+            serde_json::to_vec_pretty(
+                &Summary::new(&test_info(SESSION_ID, OTHER_CWD), default_model_id())
+                    .expect("occupant summary"),
+            )
+            .expect("serialize occupant summary"),
+        )
+        .expect("write occupant summary");
+
+        let error = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir)
+            .expect_err("a persisted session still owns its id");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            error.to_string().contains(&occupant.display().to_string()),
+            "the refusal must name the occupant to act on: {error}"
+        );
+        assert!(
+            occupant.join("updates.jsonl").is_file(),
+            "a persisted session is never moved aside"
+        );
+        assert_eq!(
+            std::fs::read_dir(occupant.parent().expect("occupant parent"))
+                .expect("read occupant parent")
+                .count(),
+            1,
+            "nothing was quarantined beside the persisted session"
+        );
+    }
+
+    /// A symlink named `<id>` is not a session directory this fork may move:
+    /// renaming it is exactly the outside-tree hazard #340 closed. It keeps
+    /// refusing the claim -- but now by naming itself, instead of reporting a
+    /// persisted session the read side has just denied.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_public_occupant_is_left_in_place_and_refuses_the_fresh_claim() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000415";
+        const CLAIMED_CWD: &str = "/repo/publication/symlink-claimed";
+        const OTHER_CWD: &str = "/repo/publication/symlink-elsewhere";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let outside = tempfile::tempdir().expect("outside tree");
+        std::fs::write(outside.path().join("canary"), b"outside-untouched-412")
+            .expect("seed canary");
+        let session_dir = test_session_dir(root.path(), CLAIMED_CWD, SESSION_ID);
+        let occupant = test_session_dir(root.path(), OTHER_CWD, SESSION_ID);
+        std::fs::create_dir_all(occupant.parent().expect("occupant parent"))
+            .expect("create occupant parent");
+        std::os::unix::fs::symlink(outside.path(), &occupant).expect("symlink occupant");
+
+        let error = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir)
+            .expect_err("a symlink occupant fails closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            error.to_string().contains(&occupant.display().to_string()),
+            "the refusal must name the occupant to act on: {error}"
+        );
+        assert!(
+            occupant
+                .symlink_metadata()
+                .expect("occupant metadata")
+                .file_type()
+                .is_symlink(),
+            "the symlink is left exactly where it was"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("canary")).expect("canary"),
+            b"outside-untouched-412"
+        );
+        assert!(!outside.path().join("summary.json").exists());
     }
 
     #[test]

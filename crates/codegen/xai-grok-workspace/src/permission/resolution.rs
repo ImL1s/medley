@@ -1395,6 +1395,24 @@ mod tests {
     // aliased here so the existing `EnvVarGuard::set/unset` call sites are unchanged.
     use crate::TestEnvGuard as EnvVarGuard;
 
+    /// Isolate the USER tier of Claude settings discovery.
+    ///
+    /// A tempdir cwd isolates only the PROJECT tier. `find_claude_settings_paths`
+    /// also returns `dirs::home_dir()/.claude/settings{,.local}.json`, so on any
+    /// machine that runs Claude Code the developer's real rules merge into every
+    /// resolved set and rule-count assertions read the machine, not the fixture
+    /// (#443). `dirs::home_dir()` reads `$HOME` on unix, so pointing `$HOME` at an
+    /// empty tempdir under the crate env lock removes that tier.
+    ///
+    /// Returns `(env, home)`. `env` is first, so it restores `$HOME` and releases
+    /// the lock BEFORE the tempdir is removed; bind BOTH for the test's lifetime:
+    /// `let (_env, _home) = isolated_home();`.
+    fn isolated_home() -> (crate::LockedTestEnv, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::LockedTestEnv::lock().set("HOME", home.path());
+        (env, home)
+    }
+
     /// Only `Deny` rules on read-capable tools (Read/Grep/Any) become grep
     /// excludes — write-only denies and non-deny actions are left out.
     #[test]
@@ -1706,6 +1724,7 @@ mod tests {
     /// but load returns None for each.
     #[test]
     fn discovery_with_no_settings_files() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
 
@@ -1753,6 +1772,7 @@ mod tests {
 
     #[test]
     fn default_mode_accept_edits_produces_allow_edit_rule() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -1776,6 +1796,7 @@ mod tests {
 
     #[test]
     fn default_mode_accept_edits_no_permissions_still_produces_rule() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -1796,6 +1817,7 @@ mod tests {
 
     #[test]
     fn claude_only_returns_claude_settings_source() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -1816,6 +1838,7 @@ mod tests {
 
     #[test]
     fn no_claude_settings_returns_none() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         assert!(
             resolve_claude_settings_inner(tmp.path(), true, None, UserDefaultModeLoad::Apply)
@@ -1825,6 +1848,7 @@ mod tests {
 
     #[test]
     fn default_mode_accept_edits_explicit_deny_takes_priority() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -2663,6 +2687,7 @@ mod tests {
 
     #[test]
     fn merge_permissions_across_project_and_global_settings() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
 
@@ -2719,6 +2744,7 @@ mod tests {
 
     #[test]
     fn merge_deny_from_project_with_allow_from_parent() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
@@ -2767,6 +2793,7 @@ mod tests {
 
     #[test]
     fn default_mode_from_specific_file_wins() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
@@ -2813,6 +2840,7 @@ mod tests {
 
     #[test]
     fn default_mode_inherited_from_parent_when_not_set() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
@@ -3043,6 +3071,7 @@ allow = ["Bash(evil *)"]
 
     #[test]
     fn bypass_permissions_produces_catch_all_allow() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -3071,6 +3100,7 @@ allow = ["Bash(evil *)"]
 
     #[test]
     fn bypass_permissions_with_explicit_deny_still_has_deny() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -3094,6 +3124,7 @@ allow = ["Bash(evil *)"]
 
     #[test]
     fn bypass_permissions_overrides_accept_edits_cross_file() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
@@ -3165,6 +3196,7 @@ allow = ["Bash(evil *)"]
     /// recorded as a skip for inspect.
     #[test]
     fn bypass_permissions_blocked_by_policy_pin() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -3194,6 +3226,7 @@ allow = ["Bash(evil *)"]
     /// keeps provenance and reaches inspect instead of an early `None`.
     #[test]
     fn bypass_permissions_blocked_pin_only_file_still_resolves() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -3221,6 +3254,7 @@ allow = ["Bash(evil *)"]
     /// keeps its synthetic Allow Edit rule.
     #[test]
     fn accept_edits_unaffected_by_policy_pin() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -3924,8 +3958,12 @@ allow = ["Bash(evil *)"]
         );
     }
 
-    #[tokio::test]
-    async fn managed_default_mode_dont_ask_outranks_user_accept_edits() {
+    /// Sync + `block_on` so [`isolated_home`]'s lock is not held across `.await`
+    /// (clippy `await_holding_lock`), the same shape as
+    /// `untrusted_project_config_toml_permissions_are_not_honored`.
+    #[test]
+    fn managed_default_mode_dont_ask_outranks_user_accept_edits() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -3944,12 +3982,16 @@ allow = ["Bash(evil *)"]
             ..Default::default()
         };
 
-        let resolved = resolve_permissions_with_provenance_inner(
-            tmp.path(),
-            inputs_with_managed(None, &managed),
-        )
-        .await
-        .expect("resolution");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let resolved = rt
+            .block_on(resolve_permissions_with_provenance_inner(
+                tmp.path(),
+                inputs_with_managed(None, &managed),
+            ))
+            .expect("resolution");
         assert_eq!(resolved.config.prompt_policy, PromptPolicy::Deny);
         assert!(
             !resolved.config.rules.iter().any(|r| {
@@ -4013,8 +4055,12 @@ allow = ["Bash(evil *)"]
         }));
     }
 
-    #[tokio::test]
-    async fn managed_bypass_under_pin_records_skip_without_catchall() {
+    /// Sync + `block_on` so [`isolated_home`]'s lock is not held across `.await`
+    /// (clippy `await_holding_lock`), the same shape as
+    /// `untrusted_project_config_toml_permissions_are_not_honored`.
+    #[test]
+    fn managed_bypass_under_pin_records_skip_without_catchall() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let managed = ManagedSettings {
             default_mode: Some(DefaultPermissionMode::BypassPermissions),
@@ -4024,12 +4070,16 @@ allow = ["Bash(evil *)"]
             },
             ..Default::default()
         };
-        let resolved = resolve_permissions_with_provenance_inner(
-            tmp.path(),
-            inputs_with_managed(Some("pin-reason"), &managed),
-        )
-        .await
-        .expect("blocked bypass still resolves for inspect");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let resolved = rt
+            .block_on(resolve_permissions_with_provenance_inner(
+                tmp.path(),
+                inputs_with_managed(Some("pin-reason"), &managed),
+            ))
+            .expect("blocked bypass still resolves for inspect");
         assert!(
             !resolved
                 .config
@@ -4144,6 +4194,7 @@ allow = ["Bash(evil *)"]
 
     #[test]
     fn default_mode_known_values_no_warnings() {
+        let (_env, _home) = isolated_home();
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
