@@ -268,14 +268,46 @@ class NamedTokensCorpus(unittest.TestCase):
     def test_the_corpus_is_not_empty(self):
         self.assertGreater(len(self.oracle_crates), 20, len(self.oracle_crates))
 
-    def test_every_oracle_crate_is_a_named_token(self):
-        # The oracle only ever names a crate by its Cargo package name
-        # (`-p`/`--manifest-path` resolved to the manifest's own `name`),
-        # whereas `named_tokens()` also collects bare directory basenames
-        # from `--manifest-path` -- a strict superset, not an exact match.
-        # So the assertion is containment, not equality.
-        missed = self.oracle_crates - self.tokens
-        self.assertEqual(missed, set(), missed)
+    def test_named_tokens_and_the_oracle_agree_on_every_crate(self):
+        # Was one-way (`oracle_crates - tokens`), on the theory that
+        # `named_tokens()` reads `--manifest-path` as a strict superset of
+        # the oracle's package names. Measured instead of assumed: both
+        # sides resolve `--manifest-path` to `Path(...).parent.name` --
+        # `check_test_filter_coverage._crate_from_manifest` does the exact
+        # same basename read `named_tokens()` does -- so there is no
+        # namespace this regex sees that the oracle does not, and nothing
+        # justified the missing direction.
+        #
+        # That missing direction is not academic: `_TEST_INVOCATION` is a
+        # bare `re.search`, so a *commented-out* `# cargo test -p phantom
+        # --lib` still reads as a real invocation and lands in `tokens`.
+        # The old one-way check only ever asked "did `named_tokens()` miss
+        # something the oracle has" and had nothing to say about
+        # `named_tokens()` inventing a crate the oracle does not -- exactly
+        # the direction that lets `check_uncovered_crates.py`'s production
+        # `evaluate()` credit a crate whose tests run nowhere (Codex, #508
+        # review). `test_a_commented_out_invocation_is_still_a_named_token`
+        # below proves this direction has teeth, using that exact example.
+        self.assertEqual(self.tokens, self.oracle_crates)
+
+    def test_a_commented_out_invocation_is_still_a_named_token(self):
+        # The counter-example from the Codex review verbatim, not a
+        # constructed stand-in: proves the divergence this class's main
+        # assertion now has to catch is real, not hypothetical. A one-way
+        # `oracle_crates - tokens` check would pass on this input --
+        # `phantom` is missing from `oracle_crates`, so it is never on the
+        # side that check subtracts from -- while the two-way equality
+        # above would fail on it immediately.
+        wf = "# cargo test -p phantom --lib\ncargo test -p real --lib\n"
+        tokens = named_tokens(wf)
+        oracle = {
+            crate
+            for crate, targets in _parse_workflow_oracle(wf).items()
+            if any(targets.values())
+        }
+        self.assertEqual(tokens, {"phantom", "real"})
+        self.assertEqual(oracle, {"real"})
+        self.assertNotEqual(tokens, oracle)
 
 
 class SrcHasTests(unittest.TestCase):
