@@ -422,6 +422,18 @@ jobs:
             --workflow .github/workflows/ci.yml \
             --baseline tests/ci/unenrolled-tests.baseline
 
+      # #474: six xai-grok-shell tests and one bench -- the memory/OOM
+      # regression suite -- are gated behind `required-features =
+      # ["test-support"]`. `--workspace` above uses default features only, so
+      # it silently skips them: no error, no warning, nothing in the output.
+      # Additive to the step above, not a replacement -- the default-feature
+      # pass still runs on its own, so a target that only breaks with
+      # test-support off stays covered too. `--tests --benches` selects both;
+      # neither alone reaches all seven (`--benches` alone skips the
+      # `[[test]]` targets, and plain `--no-run` skips `[[bench]]`).
+      - name: cargo test -p xai-grok-shell --features test-support --no-run
+        run: cargo test -p xai-grok-shell --tests --benches --features test-support --no-run
+
   lint:
     name: Clippy (hot path)
     runs-on: ubuntu-latest
@@ -458,6 +470,11 @@ jobs:
           # that is how `.err().expect()` lived green in CI since 5c8144e.
           cargo clippy --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --all-targets -- -D warnings
+          # #474: same shape as the PI line below -- six tests and a bench
+          # (the memory/OOM regression suite) gated behind `required-features
+          # = ["test-support"]` never reach the plain --all-targets line
+          # above. Additive, not a replacement.
+          cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --all-targets --features test-support -- -D warnings
           # Include the opt-in PI backend so its test-only environment lock is linted too.
           cargo clippy --manifest-path crates/codegen/xai-grok-tools/Cargo.toml --all-targets --features pi -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --all-targets -- -D warnings
