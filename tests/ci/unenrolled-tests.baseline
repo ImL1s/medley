@@ -3868,13 +3868,6 @@ xai-grok-pager-render::terminal::test::tmux_beats_zellij_when_both_set
 xai-grok-pager-render::terminal::test::tmux_meta_empty_outside_tmux
 xai-grok-pager-render::terminal::test::tmux_meta_populated
 xai-grok-pager-render::terminal::test::zellij_version_is_never_the_terminal_version
-xai-grok-pager-render::terminal::tmux_probe::tests::command_protocol_uses_exact_argv_and_pager_env
-xai-grok-pager-render::terminal::tmux_probe::tests::empty_group_teardown_does_not_wait_out_the_grace
-xai-grok-pager-render::terminal::tmux_probe::tests::group_that_ignores_sigterm_waits_the_grace_and_is_killed
-xai-grok-pager-render::terminal::tmux_probe::tests::nonzero_and_execution_failure_remain_fail_open_facts
-xai-grok-pager-render::terminal::tmux_probe::tests::successful_near_deadline_exit_still_returns_captured_output
-xai-grok-pager-render::terminal::tmux_probe::tests::support_query_accepts_both_known_spellings_only
-xai-grok-pager-render::terminal::tmux_probe::tests::value_and_control_queries_use_the_injected_runner
 xai-grok-pager-render::terminal::xtversion::tests::gate_allows_unknown_and_allowlisted_brands
 xai-grok-pager-render::terminal::xtversion::tests::sanitize_empty_is_none
 xai-grok-pager-render::terminal::xtversion::tests::sanitize_plain_payload

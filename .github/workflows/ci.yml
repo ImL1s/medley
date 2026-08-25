@@ -1196,6 +1196,13 @@ jobs:
             cache_ -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             terminal::tmux:: -- --nocapture
+          # #499: libtest filters are substring matches, and `tmux::` is not a
+          # substring of `tmux_probe::` -- so the filter above never reached the
+          # seven tests in `terminal::tmux_probe`, which ran nowhere in CI. Its own
+          # line rather than widening the one above to `terminal::tmux`: only a
+          # dedicated invocation lets `run_nonzero` fail if this module is emptied.
+          run_nonzero -p xai-grok-pager-render --lib \
+            terminal::tmux_probe:: -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             theme:: -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
