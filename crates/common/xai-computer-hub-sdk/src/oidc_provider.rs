@@ -671,7 +671,20 @@ mod tests {
         let rendered = format!("{error}");
         assert_eq!(rendered, "OIDC discovery request failed");
         assert_no_secret_fragments(&rendered, SECRET_SENTINEL);
-        assert_no_secret_fragments(&capture.rendered(), SECRET_SENTINEL);
+        // #470: establish the capture is measuring `try_refresh`'s own log
+        // call before trusting its absence check — an empty (or wrongly
+        // scoped) capture satisfies `assert_no_secret_fragments` trivially.
+        // `try_refresh`'s only tracing call is the `issuer_configured` info
+        // event below; `do_refresh` (the actual HTTP work) logs nothing, so
+        // this is the one marker the capture could ever carry, and it is
+        // never secret-derived.
+        let captured = capture.rendered();
+        assert!(
+            captured.contains("refreshing OIDC token"),
+            "capture must observe try_refresh's own log event \
+             (dropped guard too early, or subscriber not wired?): {captured}"
+        );
+        assert_no_secret_fragments(&captured, SECRET_SENTINEL);
     }
 
     #[tokio::test]

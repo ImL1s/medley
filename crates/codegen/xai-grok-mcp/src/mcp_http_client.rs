@@ -532,6 +532,22 @@ mod tests {
         }
 
         let rendered = capture.rendered_events.lock().join("\n");
+        // #470: establish the capture observed the reconnect log site before
+        // trusting the absence check below. Both fields are logged by every
+        // branch at the throttle call site (never the secret), so either one
+        // proves the site ran; asserting both pins down that the capture
+        // isn't picking up some other event that merely happens to be
+        // non-empty.
+        assert!(
+            rendered.contains("server_configured=true"),
+            "capture must observe the reconnect log's server_configured marker \
+             (dropped guard too early, or subscriber not wired?): {rendered}"
+        );
+        assert!(
+            rendered.contains("uri_configured=true"),
+            "capture must observe the reconnect log's uri_configured marker \
+             (dropped guard too early, or subscriber not wired?): {rendered}"
+        );
         assert!(!rendered.contains(SENTINEL));
         for window in SENTINEL.as_bytes().windows(8) {
             let fragment = std::str::from_utf8(window).unwrap();
