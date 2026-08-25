@@ -75,6 +75,27 @@ WHAT THIS DOES NOT CHECK, so that a green tick is not read as more than it is:
     guard's own fixed name, exactly as the finding describes -- it is that no
     scan-root test currently has this shape.
 
+    `self_locks()`'s file-precision override (tier 1, populated by the
+    "genuinely defined here, checked, and clean" pass in
+    `index_env_mutators`) only clears a call resolved to a struct DEFINED IN
+    THE SAME FILE as the call site. It was added because `xai-grok-shell/
+    tests/test_heap_profile_monitor.rs` -- a SEPARATE integration binary --
+    declares a `Harness` that owns an `EnvGuard`, and `_crate_of` gives it
+    the SAME crate string ("xai-grok-shell") as the lib's own src/ tree, so
+    tier 3's crate-wide fallback let it vouch against an unrelated `Harness`
+    in `session/acp_session_tests/turn_end_reporting_tests.rs` that touches
+    no env at all -- 20 tests flagged for a struct that never mutates
+    anything (#449/#384 review, Finding 4). A type used from a DIFFERENT
+    file within the SAME test binary (no local definition to check against)
+    still falls through to the coarser crate/global tiers and is unaffected.
+    And because tier 1 answers `True` (self-locks) rather than a third
+    "not a mutator at all" state, `_protected_spans` would also treat a
+    `let h = Harness::build()` binding as HOLDING a lock for the rest of its
+    block -- for a genuinely non-mutating struct there is no real lock, so a
+    later, otherwise-unrelated raw `env::set_var` in the same test body
+    would read as protected by it. No test in this tree exercises that
+    combination today (the file this fixes has no raw env mutation at all).
+
 Scan scope is one crate: `crates/codegen/xai-grok-shell/src/**/*.rs` unless
 `--scan-root` says otherwise. Known stragglers live in
 `tests/ci/envguard-serial-allowlist.txt`; new hits and stale entries both fail,
@@ -725,6 +746,54 @@ def index_env_mutators(sources: list[tuple[Path, str]]) -> EnvMutators:
                 grew = True
         if not grew:
             break
+
+    # A name in `types` can be borrowed from an unrelated same-named struct
+    # in a DIFFERENT file: `xai-grok-shell/tests/test_heap_profile_monitor.rs`
+    # declares a `Harness` that owns an `EnvGuard`, and an UNRELATED `Harness`
+    # test harness in `session/acp_session_tests/turn_end_reporting_tests.rs`
+    # -- which touches no env at all -- shares its bare name and its
+    # `_crate_of` string (both resolve to "xai-grok-shell", even though a
+    # `tests/*.rs` file is a SEPARATE integration binary from the lib's own
+    # test binary). Every call to the innocent one inherited the guilty one's
+    # verdict, flagging all 20 tests in that file (#449/#384 review).
+    #
+    # A struct genuinely DEFINED in a file, whose own impl block(s) HERE show
+    # neither a raw mutation nor ownership of a known guard, is not the guard
+    # some OTHER file happens to share a name with. Record that verdict so
+    # tier 1 of `self_locks()` (file precision, checked before the coarser
+    # crate/global fallback) wins with the right answer instead of the wrong
+    # one. This can only clear a call resolved to THIS file's OWN definition;
+    # a type used from a DIFFERENT file in the same test binary is unaffected
+    # (module docstring, "WHAT THIS DOES NOT CHECK").
+    for rel, code, blocks in parsed:
+        local_structs = structs_by_file.get(rel.as_posix(), {})
+        if not local_structs:
+            continue
+        block_text_by_name: dict[str, list[str]] = {}
+        for name, start, end in blocks:
+            block_text_by_name.setdefault(name, []).append(code[start:end])
+        for name in local_structs:
+            key = (rel.as_posix(), name)
+            if key in by_file or name not in types:
+                continue
+            combined = "\n".join(block_text_by_name.get(name, []))
+            mutates_here = bool(ENV_MUTATION.search(combined))
+            fields = local_structs[name]
+            # Mirrors the wrapper-extension gate above exactly, not a bare
+            # substring scan: `types` holds a real one-letter name ("R"),
+            # and a fields text as ordinary as `Rc<RecordingLifecycle>` or
+            # `Arc<SessionActor>` contains "R" many times over with nothing
+            # to do with owning a guard. The impl block has to actually CALL
+            # a known guard type's method, not merely mention its name.
+            owns_here = "MutexGuard" in fields or (
+                any(used in types for used in TYPE_ASSOC_CALL.findall(combined))
+                and any(t in fields for t in types if t != name)
+            )
+            if mutates_here or owns_here:
+                continue
+            by_file[key] = True
+    by_crate.update({k: v for k, v in by_file.items() if k[1] in types})
+
     module_alias: dict[tuple[str, str], str] = {}
     name_alias: dict[tuple[str, str], str] = {}
     for rel, code, _blocks in parsed:

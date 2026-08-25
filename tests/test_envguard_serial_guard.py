@@ -532,6 +532,82 @@ class SameNameDifferentGuards(unittest.TestCase):
         )
 
 
+class InnocentSameNameStructDoesNotInheritAGuiltyVerdict(unittest.TestCase):
+    """#449/#384 review, Finding 4: same CRATE, not same guard shape.
+
+    `SameNameDifferentGuards` above covers two guards in DIFFERENT crates
+    that disagree about locking -- already resolved per-crate. This is a
+    narrower case tier 3 of `self_locks()` (the bare same-crate fallback)
+    did not resolve: an ORDINARY struct that shares a name with a real guard
+    defined elsewhere in the SAME crate string. In the real tree, a
+    `Harness` test harness in `xai-grok-shell/src/session/acp_session_tests/
+    turn_end_reporting_tests.rs` touches no env at all, but
+    `xai-grok-shell/tests/test_heap_profile_monitor.rs` -- a SEPARATE
+    integration binary that nonetheless shares `_crate_of`'s "xai-grok-shell"
+    string with the lib's own src/ tree -- declares a `Harness` that owns an
+    `EnvGuard`. Every call to the innocent one inherited the guilty one's
+    "does not self-lock" verdict, flagging 20 unrelated tests (#384's first
+    upstream sync).
+    """
+
+    def test_ordinary_struct_is_not_flagged_by_a_guard_of_the_same_name(self):
+        guilty = _guard_src("Harness", locks=False, test_name="uses_the_real_guard")
+        innocent = textwrap.dedent(
+            """\
+            struct Harness {
+                value: u32,
+            }
+            impl Harness {
+                fn build() -> Self {
+                    Self { value: 0 }
+                }
+            }
+
+            #[test]
+            fn innocent_test() {
+                let _h = Harness::build();
+            }
+            """
+        )
+        mutators = guard.index_env_mutators(
+            [
+                (Path("crates/codegen/samecrate/src/guilty.rs"), guilty),
+                (Path("crates/codegen/samecrate/src/innocent.rs"), innocent),
+            ]
+        )
+        self.assertFalse(
+            mutators.self_locks(
+                "Harness", "samecrate", "crates/codegen/samecrate/src/guilty.rs"
+            )
+        )
+        self.assertTrue(
+            mutators.self_locks(
+                "Harness", "samecrate", "crates/codegen/samecrate/src/innocent.rs"
+            )
+        )
+        # The guilty file's own test is still reported...
+        self.assertEqual(
+            [
+                f.name
+                for f in guard.scan_source(
+                    guilty,
+                    relpath=Path("crates/codegen/samecrate/src/guilty.rs"),
+                    mutators=mutators,
+                )
+            ],
+            ["uses_the_real_guard"],
+        )
+        # ...and the innocent one, which touches no env at all, is not.
+        self.assertEqual(
+            guard.scan_source(
+                innocent,
+                relpath=Path("crates/codegen/samecrate/src/innocent.rs"),
+                mutators=mutators,
+            ),
+            [],
+        )
+
+
 class LockMustBeLive(unittest.TestCase):
     """Finding 2: the token appearing is not the guard being held."""
 
