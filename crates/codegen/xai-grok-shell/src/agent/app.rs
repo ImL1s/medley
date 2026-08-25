@@ -338,8 +338,26 @@ pub async fn run_headless(
     crate::http::set_process_client_mode_headless();
     use crate::agent::relay::spawn_relay_connection_with_callback;
     use tokio_util::sync::CancellationToken;
-    const HEADLESS_NO_SESSION: &str = "Headless mode requires a grok.com session. \
-        Run `grok login` to sign in, or use `grok agent stdio` for API-key access.";
+
+    // Headless's only transport is the relay (no IPC fallback), so a session is
+    // required. Was a `const`, which cannot call `with_login_instruction` to
+    // pick the right verb for the invoked name (#117).
+    fn headless_no_session() -> String {
+        crate::auth::with_login_instruction(
+            |prog| {
+                format!(
+                    "Headless mode requires a grok.com session. \
+                     Run `{prog} login` to sign in, or use `{prog} agent stdio` for API-key access."
+                )
+            },
+            // Names the subcommand but not the binary: `agent stdio` is
+            // actionable on its own, and the binary name is the part we must
+            // not guess at.
+            "Headless mode requires a grok.com session. \
+             Sign in, or use the `agent stdio` subcommand for API-key access.",
+        )
+    }
+
     xai_file_utils::queue::cleanup_orphaned_uploads(
         &grok_home::grok_home(),
         xai_file_utils::queue::DEFAULT_MAX_AGE,
@@ -366,7 +384,7 @@ pub async fn run_headless(
             ctx.auth_provider_command.as_deref(),
         ) && crate::auth::try_ensure_fresh_auth(ctx).await.is_none()
         {
-            anyhow::bail!("{HEADLESS_NO_SESSION}");
+            anyhow::bail!("{}", headless_no_session());
         }
         run_auth_flow(
             &auth_manager,
@@ -408,7 +426,7 @@ pub async fn run_headless(
     let Some(relay_config) =
         relay_config_for_session(Some(&auth), &agent_config, &shared_auth_manager)
     else {
-        anyhow::bail!("{HEADLESS_NO_SESSION}");
+        anyhow::bail!("{}", headless_no_session());
     };
     let grok_code_url = format!("{}/build", ctx.grok_ws_origin);
     let on_first_connect: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
