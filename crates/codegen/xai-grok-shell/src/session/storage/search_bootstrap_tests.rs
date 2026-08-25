@@ -357,10 +357,12 @@ async fn test_concurrent_gates_single_flight() {
     {
         Ok(()) => {}
         Err(_) => panic!(
-            "gate(s) never observed peer contention within {PEER_SEEN_HANG_GUARD:?} — a \
-             first claim attempt must have gone through despite the seeded peer claim \
-             still being held, which points at claim exclusivity itself rather than a \
-             slow runner. a_total={} b_total={} marker_present={} claim_held={:?}",
+            "gate(s) never observed peer contention within {PEER_SEEN_HANG_GUARD:?} — likely \
+             a first claim attempt going through despite the seeded peer claim still being \
+             held (claim exclusivity itself, not a slow runner), but read the state below \
+             rather than trust this framing: a gate that snuck through has total > 0 and \
+             probably already wrote the marker; a merely unscheduled one has neither. \
+             a_total={} b_total={} marker_present={} claim_held={:?}",
             progress_a.total.load(Ordering::Relaxed),
             progress_b.total.load(Ordering::Relaxed),
             read_marker(&search_db_path(tmp.path())).is_some(),
