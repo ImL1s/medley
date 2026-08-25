@@ -1,3 +1,23 @@
 # EnvGuard / std::env::{set_var,remove_var} tests that lack unkeyed
 # #[serial_test::serial]. Empty means crate-wide isolation is enrolled (#319).
 # New violations fail CI; do not re-add names to paper over them.
+#
+# An entry belongs here ONLY when no regime can distinguish the test from the
+# hazard without becoming fuzzy, and the reason fits on one line. Everything a
+# rule can decide is a rule instead: unkeyed #[serial], a lock held for the
+# test's lifetime (in the body, in the guard's constructor, or in a same-file
+# helper), a sole test in its own integration binary, and a keyed #[serial]
+# whose variable is consistently keyed. See scripts/check_envguard_serial.py.
+#
+# The three below mutate process env because env mutation IS their subject:
+# they assert that xai-grok-hooks' `with_env_var` restores the prior value on
+# return, on panic, and on an explicit unset. A regime that exempted them
+# would have to mean "a test that tests an env guard", which silently exempts
+# anything anyone later puts in such a file (#446).
+#
+# These files are outside the current scan root (xai-grok-shell), so this run
+# reports them as such rather than as stale — that distinction is the point.
+# They are pre-registered here so widening the scan does not re-litigate them.
+crates/codegen/xai-grok-hooks/src/test_support.rs::restores_previous_unset_state_on_normal_return
+crates/codegen/xai-grok-hooks/src/test_support.rs::restores_after_panic
+crates/codegen/xai-grok-hooks/src/test_support.rs::allows_explicit_unset

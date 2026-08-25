@@ -5183,7 +5183,7 @@ pub(crate) mod tests {
             !handle.shared.sessions.read().is_reserved(id),
             "Drop must release the reservation after a callback panic"
         );
-        handle
+        let _ = handle
             .reserve_new_local_session(id)
             .expect("identity must be reusable immediately after a callback panic");
     }
@@ -5203,7 +5203,7 @@ pub(crate) mod tests {
         assert!(matches!(err, WorkspaceError::Finalize(_)));
         assert!(handle.session(id).is_none());
         assert!(!handle.shared.sessions.read().is_reserved(id));
-        handle
+        let _ = handle
             .reserve_new_local_session(id)
             .expect("identity reusable after callback error");
     }

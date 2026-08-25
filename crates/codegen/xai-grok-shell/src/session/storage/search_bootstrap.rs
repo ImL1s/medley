@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 
 use super::StorageAdapter;
@@ -134,7 +134,15 @@ pub(super) async fn bootstrap_with_lease(
     storage: &dyn StorageAdapter,
     progress: &Arc<BootstrapProgress>,
 ) -> io::Result<BootstrapOutcome> {
-    bootstrap_with_lease_inner(root_dir, storage, progress, &TIMING, BootstrapRole::Launch).await
+    bootstrap_with_lease_inner(
+        root_dir,
+        storage,
+        progress,
+        &TIMING,
+        BootstrapRole::Launch,
+        None,
+    )
+    .await
 }
 
 /// Single claim attempt: rebuilds when the lease is free and no completed
@@ -146,7 +154,15 @@ pub(super) async fn try_bootstrap_with_lease(
     storage: &dyn StorageAdapter,
     progress: &Arc<BootstrapProgress>,
 ) -> io::Result<BootstrapOutcome> {
-    bootstrap_with_lease_inner(root_dir, storage, progress, &TIMING, BootstrapRole::Recheck).await
+    bootstrap_with_lease_inner(
+        root_dir,
+        storage,
+        progress,
+        &TIMING,
+        BootstrapRole::Recheck,
+        None,
+    )
+    .await
 }
 
 /// What the caller owes after the gate returns.
@@ -166,12 +182,24 @@ enum BootstrapRole {
     Recheck,
 }
 
+/// Fired the instant this gate's own claim attempt fails and it therefore
+/// *knows* a peer is contending — i.e. exactly when `peer_seen` below
+/// latches from `false` to `true`. `None` on every production call path
+/// (one `if` per iteration there); `test_concurrent_gates_single_flight`
+/// (#440) passes a real one so it can drive that precondition directly
+/// instead of sleeping past a guessed duration and hoping scheduling
+/// cooperated (issue #440's own finding: the guarantee this gate provides
+/// is conditional on having observed contention before it can claim, and a
+/// deadline-based fixture cannot force that condition, only make it likely).
+type PeerSeenHook = Option<Arc<Notify>>;
+
 async fn bootstrap_with_lease_inner(
     root_dir: &Path,
     storage: &dyn StorageAdapter,
     progress: &Arc<BootstrapProgress>,
     timing: &BootstrapTiming,
     role: BootstrapRole,
+    peer_seen_hook: PeerSeenHook,
 ) -> io::Result<BootstrapOutcome> {
     let db_path = search_db_path(root_dir);
     let token = ClaimToken::new();
@@ -218,7 +246,12 @@ async fn bootstrap_with_lease_inner(
             release_bootstrap_claim(&db_path, &token).await;
             return result;
         }
-        peer_seen = true;
+        if !peer_seen {
+            peer_seen = true;
+            if let Some(hook) = &peer_seen_hook {
+                hook.notify_one();
+            }
+        }
 
         if Instant::now() >= deadline {
             // Debug on the recheck path, which runs per search while a

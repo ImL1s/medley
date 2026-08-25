@@ -508,10 +508,10 @@ fn fetch_timeout_kills_process_group_with_grandchild() {
     let grandchild: u32 = {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Ok(contents) = std::fs::read_to_string(&pidfile) {
-                if let Ok(pid) = contents.trim().parse() {
-                    break pid;
-                }
+            if let Ok(contents) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = contents.trim().parse()
+            {
+                break pid;
             }
             assert!(
                 Instant::now() < deadline,
@@ -521,11 +521,41 @@ fn fetch_timeout_kills_process_group_with_grandchild() {
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    assert!(!pid_alive(leader), "leader {leader} must not remain live");
+    // #473: `killpg` delivers a signal asynchronously — the targets still
+    // have to be scheduled, receive it, and exit — so checking liveness
+    // once, immediately, races the kill rather than observing its outcome.
+    // Poll each pid until it reports dead or a bounded deadline passes.
+    // 2s matches this same file's `FETCH_TERM_GRACE`/`FETCH_KILL_WAIT` (the
+    // production budget `escalate_and_reap` itself uses to tear this exact
+    // group down) and the pidfile poll a few lines above. The leader
+    // assertion gets the identical treatment even though it currently
+    // survives on its own — `wait_success` already reaped it synchronously
+    // inside `shutdown()` before this point — so a future change to that
+    // reaping path can't silently reintroduce the same gap here unnoticed.
     assert!(
-        !pid_alive(grandchild),
-        "grandchild {grandchild} must be killed via killpg"
+        wait_until_dead(leader, Duration::from_secs(2)),
+        "leader {leader} still alive 2s after killpg; must not remain live"
     );
+    assert!(
+        wait_until_dead(grandchild, Duration::from_secs(2)),
+        "grandchild {grandchild} still alive 2s after killpg; must be killed via killpg"
+    );
+}
+
+/// Poll `pid_alive(pid)` until it reports dead or `timeout` elapses.
+/// Returns `true` once dead, `false` if the deadline passed first — the
+/// caller asserts on the result so each liveness check gets its own
+/// distinguishable failure message instead of a shared one baked in here.
+#[cfg(unix)]
+fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while pid_alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
 }
 
 #[cfg(target_os = "linux")]
@@ -655,9 +685,13 @@ fn fetch_timeout_sigkills_term_immune_grandchild() {
         .expect_err("timeout");
     assert!(err.to_string().contains("timed out"), "got: {err}");
     assert!(start.elapsed() < Duration::from_secs(5));
+    // #473 (same defect, out of the issue's named scope but identical
+    // shape): checking liveness immediately after a kill races the signal
+    // instead of observing its outcome. Same bounded-poll treatment as
+    // `fetch_timeout_kills_process_group_with_grandchild`.
     assert!(
-        !pid_alive(leader),
-        "TERM-ignoring leader {leader} must die on SIGKILL"
+        wait_until_dead(leader, Duration::from_secs(2)),
+        "TERM-ignoring leader {leader} still alive 2s after SIGKILL; must die on SIGKILL"
     );
     let grandchild: u32 = std::fs::read_to_string(&pidfile)
         .expect("pidfile")
@@ -665,8 +699,8 @@ fn fetch_timeout_sigkills_term_immune_grandchild() {
         .parse()
         .expect("pid");
     assert!(
-        !pid_alive(grandchild),
-        "grandchild {grandchild} must not remain live"
+        wait_until_dead(grandchild, Duration::from_secs(2)),
+        "grandchild {grandchild} still alive 2s after SIGKILL; must not remain live"
     );
 }
 
