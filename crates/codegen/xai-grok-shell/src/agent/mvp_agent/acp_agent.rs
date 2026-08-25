@@ -1231,7 +1231,58 @@ impl acp::Agent for MvpAgent {
             id: session_id.clone(),
             cwd: cwd.as_str().to_owned(),
         };
-        let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
+        // #418: a chat-kind session used to take `custom_model_id` verbatim
+        // through `chat_initial_model`, bypassing every eligibility, auth,
+        // and readiness check `prepare_new_session_model_plan` runs for a
+        // build-kind session. Run the same three gates here — via
+        // `chat_custom_model_outcome`, not the full build-kind plan, which
+        // this session kind does not need (no harness, no sampling config,
+        // no publication gate) — and feed a rejection into the same
+        // `disallowed_custom` / `auth_hidden_custom` / `unreadiness_custom`
+        // triple the build path already reports through, so both kinds
+        // surface the identical `ModelAutoSwitched` notification below.
+        let mut chat_disallowed_custom = None;
+        let mut chat_auth_hidden_custom = None;
+        let mut chat_unreadiness_custom = None;
+        let chat_eligible_model_id = custom_model_id.filter(|_| is_chat_kind).and_then(
+            |requested| match self.chat_custom_model_outcome(requested) {
+                ChatCustomModelOutcome::Eligible => Some(requested.to_owned()),
+                ChatCustomModelOutcome::NotFound => {
+                    tracing::warn!(
+                        requested_model = requested,
+                        "chat session/new _meta.modelId not found in catalog; falling back to current default model"
+                    );
+                    None
+                }
+                ChatCustomModelOutcome::Disallowed => {
+                    tracing::warn!(
+                        requested_model = requested,
+                        "chat session/new _meta.modelId not allowed by allowed_models; falling back to current default model"
+                    );
+                    chat_disallowed_custom = Some(requested.to_owned());
+                    None
+                }
+                ChatCustomModelOutcome::AuthHidden => {
+                    tracing::warn!(
+                        requested_model = requested,
+                        "chat session/new _meta.modelId is unavailable for the current authentication mode; falling back to current default model"
+                    );
+                    chat_auth_hidden_custom = Some(requested.to_owned());
+                    None
+                }
+                ChatCustomModelOutcome::Unready(reason) => {
+                    tracing::warn!(
+                        requested_model = requested,
+                        %reason,
+                        "chat session/new _meta.modelId is not ready; falling back to current default model"
+                    );
+                    chat_unreadiness_custom = Some((requested.to_owned(), reason));
+                    None
+                }
+            },
+        );
+        let session_initial_model =
+            chat_initial_model(is_chat_kind, chat_eligible_model_id.as_deref());
         let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
         let prepared_model_plan = if is_chat_kind {
             None
@@ -1246,13 +1297,16 @@ impl acp::Agent for MvpAgent {
             .and_then(|plan| plan.model_agent_type.clone());
         let disallowed_custom = prepared_model_plan
             .as_ref()
-            .and_then(|plan| plan.disallowed_custom.clone());
+            .and_then(|plan| plan.disallowed_custom.clone())
+            .or(chat_disallowed_custom);
         let auth_hidden_custom = prepared_model_plan
             .as_ref()
-            .and_then(|plan| plan.auth_hidden_custom.clone());
+            .and_then(|plan| plan.auth_hidden_custom.clone())
+            .or(chat_auth_hidden_custom);
         let unreadiness_custom = prepared_model_plan
             .as_ref()
-            .and_then(|plan| plan.unreadiness_custom.clone());
+            .and_then(|plan| plan.unreadiness_custom.clone())
+            .or(chat_unreadiness_custom);
         let publication_gate = prepared_model_plan
             .as_ref()
             .map(|_| crate::session::SessionPublicationGate::pending());

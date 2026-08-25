@@ -335,6 +335,35 @@ pub(crate) struct PreparedNewSessionModelPlan {
     pub unreadiness_custom: Option<(String, String)>,
 }
 
+/// Outcome of checking a chat-kind session's requested `_meta.modelId`
+/// against the same three catalog gates a build-kind `/new` plan enforces in
+/// [`MvpAgent::prepare_new_session_model_plan`] (#418): a chat-kind session
+/// used to take `custom_model_id` verbatim through [`chat_initial_model`],
+/// never running eligibility, auth-visibility, or readiness checks at all.
+///
+/// This intentionally is *not* a second [`PreparedNewSessionModelPlan`]: a
+/// chat session has no harness to validate against `model_agent_type` and
+/// needs neither a `sampling_config` nor a `publication_gate` from that
+/// plan, so building one just to read three booleans off it would pull in
+/// build-kind machinery a chat session does not use. See
+/// [`MvpAgent::chat_custom_model_outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChatCustomModelOutcome {
+    /// Selectable, visible for the current auth mode, and ready.
+    Eligible,
+    /// Not present in the catalog under this id at all. Mirrors the
+    /// build-kind "requested model not found" case: fall back silently, no
+    /// user-facing auto-switch notification (there is nothing to report
+    /// switching away from).
+    NotFound,
+    /// Present but not `user_selectable`.
+    Disallowed,
+    /// `user_selectable` but not visible under the current auth mode.
+    AuthHidden,
+    /// Selectable and visible, but not ready. Carries the readiness reason.
+    Unready(String),
+}
+
 /// Result of actor construction. Loads and chat sessions are already published;
 /// auth-sealed build `/new` sessions stay wholly provisional until the outer
 /// response has been assembled and calls the synchronous commit path.

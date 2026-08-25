@@ -2619,6 +2619,44 @@ impl MvpAgent {
         config
     }
 
+    /// Classify a chat-kind session's requested `_meta.modelId` against the
+    /// same three catalog gates [`Self::prepare_new_session_model_plan`]
+    /// enforces for build-kind sessions (#418): `user_selectable`,
+    /// `visible_for_auth`, and [`crate::agent::config::model_readiness`].
+    ///
+    /// This reads one live catalog snapshot and does not seal it against the
+    /// auth generation the way the build-kind plan's retry loop does — a
+    /// chat session's spawn a few lines later already resolves its own
+    /// fallback model id independently (`current_model_id()`), so there is
+    /// no publication step here to protect against a stale read. The window
+    /// is the same one that already existed for a chat session with no
+    /// `custom_model_id` at all.
+    pub(super) fn chat_custom_model_outcome(&self, requested: &str) -> ChatCustomModelOutcome {
+        let authority = self.models_manager.session_model_authority(None);
+        let requested_id = acp::ModelId::new(requested);
+        let Some(identity) =
+            crate::agent::models::resolve_catalog_identity(&authority.catalog, &requested_id)
+        else {
+            return ChatCustomModelOutcome::NotFound;
+        };
+        let Some(model) = authority.catalog.get(identity.model_id.as_str()) else {
+            return ChatCustomModelOutcome::NotFound;
+        };
+        if !model.info.user_selectable {
+            return ChatCustomModelOutcome::Disallowed;
+        }
+        if !model.info.visible_for_auth(authority.is_session_auth) {
+            return ChatCustomModelOutcome::AuthHidden;
+        }
+        let (ready, reason) = crate::agent::config::model_readiness(model);
+        if !ready {
+            return ChatCustomModelOutcome::Unready(
+                reason.unwrap_or_else(|| "model is not ready".to_owned()),
+            );
+        }
+        ChatCustomModelOutcome::Eligible
+    }
+
     /// Prepare every model-dependent input for a build-kind `/new` from one
     /// immutable catalog entry, then validate the auth generation at the
     /// commit boundary. A failed seal means auth changed while the plan was
