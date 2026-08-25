@@ -1207,6 +1207,60 @@ class HelperChainsPropagate(unittest.TestCase):
         self.assertEqual(sorted(f.name for f in found), ["one", "two"])
 
 
+class CrossFileHelperCallIsSeen(unittest.TestCase):
+    """#449 review, Finding 1: `_file_helpers` only ever reads the current
+    file, so a same-file wrapper that delegates through a QUALIFIED call
+    (`crate::a::b::fn()`) to a mutator defined in ANOTHER file produced no
+    candidate at all — the real-tree shape is `session/worktree.rs`'s
+    `init_git_repo` calling `crate::test_support::ensure_hermetic_git_on_path`.
+    `scan_source` (single string, no scan root) cannot exercise this; it needs
+    `scan_tree` over a real multi-file directory.
+    """
+
+    def _tree(self, test_attrs: str) -> Path:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        src = Path(tmpdir.name) / "crates" / "codegen" / "xai-grok-shell" / "src"
+        (src / "other_module").mkdir(parents=True)
+        (src / "other_module" / "mod.rs").write_text(
+            textwrap.dedent(
+                """\
+                pub(crate) fn mutate() {
+                    unsafe { std::env::set_var("HOME", "/tmp") };
+                }
+                """
+            ),
+            encoding="utf-8",
+        )
+        (src / "caller.rs").write_text(
+            textwrap.dedent(
+                f"""\
+                fn local_wrapper() {{
+                    crate::other_module::mutate();
+                }}
+
+                {test_attrs}
+                fn t() {{
+                    local_wrapper();
+                }}
+                """
+            ),
+            encoding="utf-8",
+        )
+        return src
+
+    def test_unprotected_cross_file_delegation_is_a_violation(self):
+        src = self._tree("#[test]")
+        findings = guard.scan_tree(src, repo=src.parents[3])
+        self.assertEqual([f.name for f in findings], ["t"])
+        self.assertIn("local_wrapper", findings[0].reason)
+
+    def test_unkeyed_serial_clears_the_same_delegation(self):
+        src = self._tree("#[test]\n                #[serial_test::serial]")
+        findings = guard.scan_tree(src, repo=src.parents[3])
+        self.assertEqual(findings, [])
+
+
 class HelperLockNeedsARealAcquisition(unittest.TestCase):
     """#449: `_protected_spans` required an acquisition; the helper path did not."""
 

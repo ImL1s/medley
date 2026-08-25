@@ -31,6 +31,30 @@ WHAT THIS DOES NOT CHECK, so that a green tick is not read as more than it is:
     Tracked in #459. Until it closes, a pass here means "each test is
     serialised against its own regime", not "no two env-mutating tests race".
 
+    A qualified helper call is resolved ONE hop, and only in the shape
+    `crate::a::b::fn()` reached through a SAME-FILE wrapper (`_file_helpers`'
+    inclusion check, #449 review, Finding 1) -- the shape the real tree has
+    (`session/worktree.rs`'s `init_git_repo` calling
+    `crate::test_support::ensure_hermetic_git_on_path`). Two gaps remain
+    un-widened because this tree currently has no member of either: a TEST
+    calling a `crate::`-qualified mutator directly, with no same-file wrapper
+    in between, is not resolved (`_env_mutation_reason` and `_mutation_sites`
+    still read only `FREE_CALL`, i.e. unqualified names); and a chain longer
+    than one hop (the wrapper's OWN target delegating again, through a THIRD
+    file) is not followed.
+
+    An imported or aliased mutator -- `use std::env::set_var;` followed by a
+    bare `set_var(...)`, or `use std::env as x;` followed by `x::set_var(...)`
+    -- is not recognised; `ENV_MUTATION` only matches `env::set_var` /
+    `std::env::set_var` written out at the call site (#449 review, Finding 2).
+    Measured at the time of writing: separate greps in the scan root for
+    `use std::env::set_var`, `use std::env::remove_var`, a braced
+    `use std::env::{set_var, ...}`, `use std::env as`, and a bare `set_var(` /
+    `remove_var(` not preceded by `env::` all return zero matches, so this is
+    a real, currently-empty class rather than a live hole. A future `use` of
+    either shape would pass unseen until this regex is widened to know the
+    file's aliases.
+
 Scan scope is one crate: `crates/codegen/xai-grok-shell/src/**/*.rs` unless
 `--scan-root` says otherwise. Known stragglers live in
 `tests/ci/envguard-serial-allowlist.txt`; new hits and stale entries both fail,
@@ -82,6 +106,29 @@ TYPE_ASSOC_CALL = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_]*)\s*::\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:::\s*<[^>]*>\s*)?\("
 )
 FREE_CALL = re.compile(r"(?<![:.\w])([a-z_][a-z0-9_]*)\s*\(")
+# `crate::a::b::fn_name(` — the one shape `FREE_CALL` structurally cannot
+# match (its lookbehind excludes anything after `::`) and `TYPE_ASSOC_CALL`
+# mis-splits (it captures the segment before the LAST `::`, treating a module
+# as if it were a type). A test delegating through such a call to a helper
+# defined in ANOTHER file produced no candidate at all: `_file_helpers` only
+# ever reads the current file, so `session/worktree.rs` calling
+# `crate::test_support::ensure_hermetic_git_on_path()` (which mutates `PATH`
+# and `GIT_EXEC_PATH`) was invisible on both ends (#449 review, Finding 1).
+# Deliberately `crate::`-only: that is the one prefix this checker can resolve
+# without following `use` imports, and it is exactly the shape the finding
+# named.
+CRATE_QUALIFIED_CALL = re.compile(
+    r"\bcrate\s*::\s*((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)([a-z_][a-z0-9_]*)\s*\("
+)
+
+
+def _mod_path_of(segments: str) -> tuple[str, ...]:
+    """`"test_support::"` (a `CRATE_QUALIFIED_CALL` module-path capture,
+    trailing `::` included) -> `("test_support",)`."""
+
+    return tuple(s.strip() for s in segments.split("::") if s.strip())
+
+
 # Name fallback for a guard whose definition this run never read. Kept
 # deliberately narrow (an "…Env…Guard" type is an env guard and little else)
 # and note the leading `*`, not `+`: requiring one character before `Env` is
@@ -472,6 +519,55 @@ def _crate_of(path: Path) -> str:
     return parts[2] if len(parts) > 2 else str(path)
 
 
+def _module_path(rel: Path) -> tuple[str, ...] | None:
+    """`crate::a::b` module path for a file at `.../src/a/b.rs` or
+    `.../src/a/b/mod.rs` — the layout convention this repo uses throughout
+    (`test_support/mod.rs`, `session/worktree.rs`, ...).
+
+    A file whose module lives somewhere else via `#[path = "..."]` resolves
+    wrong here; there is no cheaper way to know that without a real parser,
+    and the checker has no such case in its own scan root today (grep finds
+    none). `None` for a file with no `src` component at all.
+    """
+
+    parts = rel.parts
+    if "src" not in parts:
+        return None
+    segs = list(parts[parts.index("src") + 1 :])
+    if not segs:
+        return None
+    segs[-1] = Path(segs[-1]).stem
+    if segs[-1] in ("mod", "lib", "main"):
+        segs = segs[:-1]
+    return tuple(segs)
+
+
+def _index_qualified_helpers(
+    files: list[tuple[Path, str, str]], types: dict[str, bool]
+) -> dict[tuple[str, tuple[str, ...]], frozenset[str]]:
+    """`(crate, module path) -> {fn names that mutate env in that file}`.
+
+    One hop only: built from each file's OWN `_file_helpers` pass (no
+    `qualified` argument, so it only sees that file's local mutations), then
+    used to resolve a `crate::a::b::fn()` call FROM another file. A helper
+    that itself delegates cross-file to a THIRD file is not covered — that
+    would need a second pass — and is left as a known gap (see the module
+    docstring's "WHAT THIS DOES NOT CHECK").
+    """
+
+    out: dict[tuple[str, tuple[str, ...]], frozenset[str]] = {}
+    for rel, source, code in files:
+        module = _module_path(rel)
+        if module is None:
+            continue
+        helpers, _vars, _returns = _file_helpers(source, code, types)
+        if not helpers:
+            continue
+        key = (_crate_of(rel), module)
+        out[key] = out.get(key, frozenset()) | frozenset(helpers)
+    return out
+
+
 def _process_group(path: Path) -> str:
     """Which test BINARY this file's tests run in.
 
@@ -646,7 +742,12 @@ def index_env_mutators(sources: list[tuple[Path, str]]) -> EnvMutators:
 
 
 def _file_helpers(
-    source: str, code: str, types: dict[str, bool]
+    source: str,
+    code: str,
+    types: dict[str, bool],
+    *,
+    crate: str = "",
+    qualified: dict[tuple[str, tuple[str, ...]], frozenset[str]] | None = None,
 ) -> tuple[dict[str, bool], dict[str, frozenset[str]], dict[str, bool]]:
     """Same-file non-test fns that mutate env: do they self-lock, and what do
     they touch?
@@ -655,6 +756,11 @@ def _file_helpers(
     mutation through `set_home()` has an EMPTY variable set if you only read
     the test body, so key consistency has nothing to compare and approves it
     (#449 review).
+
+    ``qualified`` (from [`_index_qualified_helpers`]) resolves a
+    `crate::a::b::fn()` call to a cross-file mutator; omitted, this reads only
+    the current file, which is what building that index itself needs (#449
+    review, Finding 1).
     """
 
     impl_spans = [(s, e) for _n, s, e in _impl_blocks(code)]
@@ -685,7 +791,14 @@ def _file_helpers(
         body = code[body_range[0] : body_range[1]]
         bodies[match.group("name")] = (body, hands_back)
         uses_guard = any(used in types for used in TYPE_ASSOC_CALL.findall(body))
-        if not ENV_MUTATION.search(body) and not uses_guard:
+        # A qualified call this file cannot see the definition of but the
+        # cross-file index resolved to a known mutator (Finding 1: e.g.
+        # `crate::test_support::ensure_hermetic_git_on_path()`).
+        uses_cross_file = qualified is not None and any(
+            fname in qualified.get((crate, _mod_path_of(mods)), frozenset())
+            for mods, fname in CRATE_QUALIFIED_CALL.findall(body)
+        )
+        if not ENV_MUTATION.search(body) and not uses_guard and not uses_cross_file:
             continue
         name = match.group("name")
         locks = _env_lock_is_live(body)
@@ -936,14 +1049,25 @@ def analyze_source(
     *,
     relpath: Path | None = None,
     mutators: EnvMutators | None = None,
+    qualified_index: dict[tuple[str, tuple[str, ...]], frozenset[str]] | None = None,
 ) -> list[Candidate]:
-    """Every env-mutating test in ``source``, pre-judged for the local regimes."""
+    """Every env-mutating test in ``source``, pre-judged for the local regimes.
+
+    ``qualified_index`` is [`_index_qualified_helpers`]'s scan-root-wide map,
+    letting a `crate::a::b::fn()` call in ``source`` resolve to a mutator
+    defined in another file (#449 review, Finding 1). Omitted for a
+    single-source call (no scan root to index), which is exactly today's
+    behaviour.
+    """
 
     path = relpath or Path("<input>")
     code = _code_only(source)
     if mutators is None:
         mutators = index_env_mutators([(path, source)])
-    helpers, helper_vars, returning = _file_helpers(source, code, mutators.types)
+    crate = _crate_of(path)
+    helpers, helper_vars, returning = _file_helpers(
+        source, code, mutators.types, crate=crate, qualified=qualified_index
+    )
     name_paths = _name_paths(code)
     consts = _string_consts(source)
     test_count = 0
@@ -966,7 +1090,6 @@ def analyze_source(
             continue
         mention, vouchers = found
         kinds = [kind for attr in attrs if (kind := _serial_kind(attr))]
-        crate = _crate_of(path)
         regime = "none"
         if "unkeyed" in kinds:
             regime = "unkeyed-serial"
@@ -1168,14 +1291,26 @@ def scan_tree(scan_root: Path, *, repo: Path, index_root: Path | None = None) ->
     mutators = index_env_mutators(
         [(p.relative_to(repo), p.read_text(encoding="utf-8")) for p in rust_files(index_dir)]
     )
+    # `crate::a::b::fn()` only ever names something in the SAME crate, and
+    # the scan root is one crate by convention (module docstring), so this
+    # index is built from the scan root alone rather than the wider
+    # `index_dir` above — no cross-crate case exists for it to miss.
+    scan_files = [
+        (p.relative_to(repo), p.read_text(encoding="utf-8")) for p in rust_files(scan_root)
+    ]
+    qualified_index = _index_qualified_helpers(
+        [(rel, source, _code_only(source)) for rel, source in scan_files], mutators.types
+    )
     # Two passes: key consistency is a property of the whole scanned set, not
     # of one file — a variable is only safely keyed if EVERY test touching it
     # agrees on the key, and the disagreeing test is usually elsewhere.
     candidates: list[Candidate] = []
-    for path in rust_files(scan_root):
-        rel = path.relative_to(repo)
-        text = path.read_text(encoding="utf-8")
-        candidates.extend(analyze_source(text, relpath=rel, mutators=mutators))
+    for rel, text in scan_files:
+        candidates.extend(
+            analyze_source(
+                text, relpath=rel, mutators=mutators, qualified_index=qualified_index
+            )
+        )
     return judge(candidates, key_map(candidates))
 
 
