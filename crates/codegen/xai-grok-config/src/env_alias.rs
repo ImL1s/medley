@@ -182,6 +182,7 @@ fn clear_legacy_hits_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn os(s: &str) -> &OsStr {
         OsStr::new(s)
@@ -195,7 +196,13 @@ mod tests {
         );
     }
 
+    // Reaches `LEGACY_HITS` (via `record_legacy_hit`, since `medley` is unset
+    // here so `resolve_os_in` falls through to the grok branch that records
+    // the hit) — serialized against every other test in this file that does,
+    // named rather than unkeyed so it doesn't also serialize against this
+    // crate's unrelated env-mutating tests elsewhere.
     #[test]
+    #[serial(legacy_hits)]
     fn grok_used_when_medley_unset() {
         assert_eq!(
             resolve_os_in(None, Some(os("g")), "GROK_X"),
@@ -203,7 +210,10 @@ mod tests {
         );
     }
 
+    // Reaches `LEGACY_HITS` — blank `medley` still falls through to the grok
+    // branch that records the hit.
     #[test]
+    #[serial(legacy_hits)]
     fn blank_medley_falls_through_to_grok() {
         assert_eq!(
             resolve_os_in(Some(os("   ")), Some(os("g")), "GROK_X"),
@@ -246,7 +256,10 @@ mod tests {
         }
     }
 
+    // Reaches `LEGACY_HITS` directly: clears it, records through it
+    // (`resolve_from_map`), and reads it (`legacy_notice`).
     #[test]
+    #[serial(legacy_hits)]
     fn resolve_from_map_prefers_medley_and_records_legacy_hit_on_grok() {
         clear_legacy_hits_for_test();
         let mut env = HashMap::new();
@@ -276,13 +289,17 @@ mod tests {
         );
     }
 
+    // Reaches `LEGACY_HITS` directly (clear + read).
     #[test]
+    #[serial(legacy_hits)]
     fn legacy_notice_is_none_when_nothing_has_fired() {
         clear_legacy_hits_for_test();
         assert_eq!(legacy_notice(), None);
     }
 
+    // Reaches `LEGACY_HITS` directly (clear + record x3 + read).
     #[test]
+    #[serial(legacy_hits)]
     fn legacy_notice_names_multiple_distinct_vars_sorted_and_deduped() {
         clear_legacy_hits_for_test();
         record_legacy_hit("GROK_WORKFLOWS");
@@ -297,7 +314,9 @@ mod tests {
         );
     }
 
+    // Reaches `LEGACY_HITS` directly (clear + record + read).
     #[test]
+    #[serial(legacy_hits)]
     fn legacy_notice_never_promises_removal() {
         clear_legacy_hits_for_test();
         record_legacy_hit("GROK_X");
