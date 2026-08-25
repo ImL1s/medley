@@ -113,18 +113,32 @@ async fn test_agent_from_config(
     use xai_grok_tools::registry::types::SessionContext;
     let builder = crate::tools::bridge::ToolBridge::get_builder();
     let fs: std::sync::Arc<dyn AsyncFileSystem> = std::sync::Arc::new(LocalFs);
+    // Per-agent temp dir so `resources_state.json` cannot load a leftover
+    // `/tmp/resources_state.json` from other processes (that file can seed
+    // `ReportedTaskCompletions` and fail auto-wake "must not report" asserts).
+    //
+    // A raw path rather than `tempfile::tempdir()` on purpose: the `TempDir`
+    // guard would delete the directory at the end of *this* function, while the
+    // `SessionContext` built from it outlives the call. Named uniquely so it
+    // still cannot collide; the leftover is a bounded per-run directory rather
+    // than the shared `/tmp` file this fix is about.
+    let session_dir = std::env::temp_dir().join(format!("grok-test-{}", uuid::Uuid::new_v4()));
+    // `expect`, not `let _`: a swallowed failure here leaves the test running
+    // against a `state_path` under a directory that does not exist, and it
+    // dies somewhere far away from the cause.
+    std::fs::create_dir_all(&session_dir).expect("per-test session dir");
     let ctx = SessionContext {
         backend,
         fs,
         cwd: std::path::PathBuf::from("/tmp"),
-        session_folder: std::env::temp_dir().join("grok-test"),
+        session_folder: session_dir.clone(),
         session_env: std::sync::Arc::new(std::collections::HashMap::new()),
         notification_handle: ToolNotificationHandle::noop(),
         owner_session_id: None,
         subagent: None,
         parent_scheduler_handle: None,
         skills: vec![],
-        state_path: std::path::PathBuf::from("/tmp/tool_state.json"),
+        state_path: session_dir.join("tool_state.json"),
         memory_backend: None,
         web_search_config: Default::default(),
         web_fetch_config: Default::default(),
@@ -272,7 +286,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         is_chat_kind: false,
         state,
         notifications: NotificationSender {
-            persistence_is_noop: true,
+            persistence_is_noop: false,
             gateway: GatewaySender::new(gateway_tx),
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,

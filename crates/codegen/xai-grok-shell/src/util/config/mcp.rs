@@ -55,6 +55,9 @@ pub struct Config {
 
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // This aggregate sits above several independently evolving config
+        // types. Do not recursively trust their Debug implementations: nested
+        // sections may gain URL, header, command, or credential-shaped fields.
         f.debug_struct("Config")
             .field("cli_section", &"configured")
             .field("models_section", &"configured")
@@ -70,7 +73,10 @@ impl std::fmt::Debug for Config {
             .field("diagnostics_section", &"configured")
             .field("session_section", &"configured")
             .field("ask_user_question_section", &"configured")
-            .field("privacy_section", &"configured")
+            .field(
+                "privacy_banner_ack_present",
+                &self.privacy.privacy_banner_acked.is_some(),
+            )
             .finish()
     }
 }
@@ -1153,10 +1159,21 @@ fn deserialize_mcp_server_config(
     Ok((config, unknown_fields))
 }
 
+/// Where the MCP guide actually lives for this install.
+///
+/// Resolved, not written literally: state moved to `~/.medley`, `MEDLEY_HOME`
+/// can point anywhere, and an install that kept an existing `~/.grok` stays
+/// there. A hardcoded path in a "see this file" pointer sends the reader to a
+/// directory the program is not writing to.
+fn mcp_guide_path() -> String {
+    xai_grok_config::display_user_grok_path("docs/user-guide/07-mcp-servers.md")
+}
+
 /// Turn a failed `[mcp_servers.<name>]` entry into an actionable problem. The
 /// transport-less case is steered to `disabled_mcp_servers`, Grok's real
 /// disable mechanism.
 fn diagnose_invalid_entry(name: &str, value: &TomlValue, error: &str) -> McpServerConfigProblem {
+    let guide = mcp_guide_path();
     let has_command = value.get("command").is_some();
     let has_url = value.get("url").is_some();
     let message = if !has_command && !has_url {
@@ -1164,12 +1181,12 @@ fn diagnose_invalid_entry(name: &str, value: &TomlValue, error: &str) -> McpServ
             "`mcp_servers.{name}` has no transport. To run it, set `command = \"...\"` or \
              `url = \"...\"`. To turn it off, add \"{name}\" to `disabled_mcp_servers` instead of \
              leaving an entry with no transport. \
-             See ~/.grok/docs/user-guide/07-mcp-servers.md"
+             See {guide}"
         )
     } else {
         format!(
             "`mcp_servers.{name}` has an invalid transport: {error}. \
-             See ~/.grok/docs/user-guide/07-mcp-servers.md"
+             See {guide}"
         )
     };
     McpServerConfigProblem {
@@ -1190,6 +1207,7 @@ pub(crate) struct ParsedMcpServers {
 pub(crate) fn parse_mcp_servers_with_problems(root: &TomlValue) -> ParsedMcpServers {
     let mut servers = IndexMap::new();
     let mut problems = Vec::new();
+    let guide = mcp_guide_path();
 
     let entries = match root {
         TomlValue::Table(table) => match table.get("mcp_servers") {
@@ -1209,7 +1227,7 @@ pub(crate) fn parse_mcp_servers_with_problems(root: &TomlValue) -> ParsedMcpServ
                         severity: McpServerProblemSeverity::Warning,
                         message: format!(
                             "`mcp_servers.{name}` has an unrecognized field `{field}`; it is \
-                             ignored. See ~/.grok/docs/user-guide/07-mcp-servers.md"
+                             ignored. See {guide}"
                         ),
                     });
                 }
@@ -1223,7 +1241,7 @@ pub(crate) fn parse_mcp_servers_with_problems(root: &TomlValue) -> ParsedMcpServ
                         message: format!(
                             "`mcp_servers.{name}` is enabled but its `{field}` is blank. \
                              Set a value, or add \"{name}\" to `disabled_mcp_servers` to turn it \
-                             off. See ~/.grok/docs/user-guide/07-mcp-servers.md"
+                             off. See {guide}"
                         ),
                     });
                     continue;
@@ -1938,6 +1956,47 @@ pub(crate) fn session_registry_local_override(root: Option<&TomlValue>) -> Optio
 mod tests {
     use super::*;
     use toml::Value as TomlValue;
+
+    #[test]
+    fn config_debug_reports_management_key_presence_without_exposing_fragments() {
+        const URL_SECRET: &str = "GB002URL-A7s5D3f1G9h7J6k4L2m8";
+        const MANAGEMENT_SECRET: &str = "GB002MGT-Q7w5E3r1T9y7Z6x4C2v8";
+        let secret_url =
+            format!("https://user:{URL_SECRET}@registry.example.test/npm?token={URL_SECRET}");
+        let config = Config {
+            cli: crate::agent::config::CliConfig {
+                npm_registry: Some(secret_url),
+                channel: Some(URL_SECRET.to_owned()),
+                ..crate::agent::config::CliConfig::default()
+            },
+            management_api_key: Some(MANAGEMENT_SECRET.to_owned()),
+            privacy: PrivacyConfig {
+                privacy_banner_acked: Some(URL_SECRET.to_owned()),
+            },
+            ..Config::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("management_api_key_present: true"),
+            "{debug}"
+        );
+        assert!(debug.contains("cli_section: \"configured\""), "{debug}");
+        assert!(
+            debug.contains("privacy_banner_ack_present: true"),
+            "{debug}"
+        );
+        for secret in [URL_SECRET, MANAGEMENT_SECRET] {
+            assert!(!debug.contains(secret), "{debug}");
+            for window in secret.as_bytes().windows(8) {
+                let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+                assert!(
+                    !debug.contains(fragment),
+                    "leaked fragment {fragment:?}: {debug}"
+                );
+            }
+        }
+    }
 
     /// Env beats config.toml; unrecognized env defers; both absent defers to remote.
     #[test]

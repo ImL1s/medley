@@ -162,7 +162,7 @@ async fn create_test_actor_with_memory_and_events(
         is_chat_kind: false,
         state,
         notifications: NotificationSender {
-            persistence_is_noop: true,
+            persistence_is_noop: false,
             gateway: GatewaySender::new(gateway_tx),
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,

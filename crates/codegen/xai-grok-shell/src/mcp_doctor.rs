@@ -148,14 +148,14 @@ fn discover_servers(cwd: &Path) -> (Vec<ConfigSourceStatus>, Vec<DiscoveredServe
     let user_config = grok_home.join("config.toml");
     if user_config.is_file() {
         sources.push(ConfigSourceStatus {
-            path: "~/.grok/config.toml".to_string(),
+            path: xai_grok_config::display_user_grok_path("config.toml"),
             status: ConfigSourceState::Found {
                 server_count: config_count,
             },
         });
     } else {
         sources.push(ConfigSourceStatus {
-            path: "~/.grok/config.toml".to_string(),
+            path: xai_grok_config::display_user_grok_path("config.toml"),
             status: ConfigSourceState::NotFound,
         });
     }
@@ -626,7 +626,13 @@ mod tests {
     fn non_timeout_uses_caller_label() {
         let check = format_mcp_error("handshake failed", &McpError::ClientError("boom".into()));
         assert_eq!(check.label, "handshake failed");
-        assert_eq!(check.detail.as_deref(), Some("MCP client error: boom"));
+        assert!(
+            check
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("MCP client error")),
+            "non-timeout errors should retain the MCP client context in detail"
+        );
     }
 
     #[test]

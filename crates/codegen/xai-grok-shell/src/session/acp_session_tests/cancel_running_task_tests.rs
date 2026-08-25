@@ -70,7 +70,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 doom_loop_recovery: None,
                 header_injector: None,
                 codex_wire: None,
-                credential_source: None,
+                // Bound test key needs a non-ambient source (#136 step 4).
+                credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
                 endpoint_trust: Default::default(),
             })
             .expect("sampling client should build for persistence actor");
@@ -133,7 +134,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     nudges_used_this_session: 0,
                 }),
                 notifications: NotificationSender {
-                    persistence_is_noop: true,
+                    persistence_is_noop: persistence.is_noop(),
                     gateway: GatewaySender::new(gateway_tx),
                     gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                     persistence_tx: persistence.tx.clone(),
@@ -407,7 +408,8 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     doom_loop_recovery: None,
                     header_injector: None,
                     codex_wire: None,
-                    credential_source: None,
+                    // Bound test key needs a non-ambient source (#136 step 4).
+                    credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
                     endpoint_trust: Default::default(),
                 })
                 .expect("sampling client should build for persistence actor");
@@ -546,7 +548,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 doom_loop_recovery: None,
                 header_injector: None,
                 codex_wire: None,
-                credential_source: None,
+                // Bound test key needs a non-ambient source (#136 step 4).
+                credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
                 endpoint_trust: Default::default(),
             })
             .expect("sampling client should build for persistence actor");
@@ -630,7 +633,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     nudges_used_this_session: 0,
                 }),
                 notifications: NotificationSender {
-                    persistence_is_noop: true,
+                    persistence_is_noop: persistence.is_noop(),
                     gateway: GatewaySender::new(gateway_tx),
                     gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                     persistence_tx: persistence.tx.clone(),
@@ -925,7 +928,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 is_chat_kind: false,
                 state,
                 notifications: NotificationSender {
-                    persistence_is_noop: true,
+                    persistence_is_noop: false,
                     gateway: GatewaySender::new(gateway_tx),
                     gateway_enabled: std::sync::Arc::new(
                         std::sync::atomic::AtomicBool::new(true),
@@ -2392,7 +2395,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 doom_loop_recovery: None,
                 header_injector: None,
                 codex_wire: None,
-                credential_source: None,
+                // Bound test key needs a non-ambient source (#136 step 4).
+                credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
                 endpoint_trust: Default::default(),
             };
             let (sampler_event_tx, _sampler_event_rx) = tokio::sync::mpsc::unbounded_channel::<
@@ -2464,7 +2468,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 is_chat_kind: false,
                 state,
                 notifications: NotificationSender {
-                    persistence_is_noop: true,
+                    persistence_is_noop: false,
                     gateway: GatewaySender::new(gateway_tx),
                     gateway_enabled: std::sync::Arc::new(
                         std::sync::atomic::AtomicBool::new(true),
