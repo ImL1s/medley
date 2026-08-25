@@ -492,8 +492,9 @@ mod tests {
     /// probability.
     ///
     /// This holder is instead spawned in its own process group via
-    /// `detach_std_command` and deliberately **never attached** to `group`.
-    /// `terminate_owned_group` only ever signals the group it owns
+    /// `detach_std_command` and deliberately **never attached** to `group`
+    /// (the one `post_exit_cleanup_and_drain` is called with). `terminate_
+    /// owned_group` only ever signals the group it owns
     /// (`ProcessGroup::terminate`/`kill` operate on `self`'s leader alone,
     /// see `killpg_unix`), so an unattached holder cannot be reached by it
     /// at all — its pipe provably never closes on its own, with no signal
@@ -501,6 +502,17 @@ mod tests {
     /// states the actual invariant more precisely: `grace` bounds the
     /// drain wait even when nothing ever closes the pipe, not merely when
     /// closing it happens to take too long.
+    ///
+    /// Cleanup tracks the holder in its OWN second `ProcessGroup` (attached
+    /// at spawn, never passed to `post_exit_cleanup_and_drain`) and kills
+    /// that group, not the leader `Child` alone. On the Ubuntu `/bin/sh`
+    /// this crate's CI runs on, `sh -c 'sleep 1000'` does not exec into
+    /// `sleep` — the shell stays as a distinct leader with `sleep` as a
+    /// separate child in the same group — so `Child::kill()` on the leader
+    /// alone reparents and orphans the `sleep`, which then holds the pipe
+    /// descriptors for its own full 1000s (#501 review). `group.kill()`
+    /// SIGKILLs the whole group in one call, same as every other teardown
+    /// in this file.
     #[cfg(unix)]
     #[test]
     fn post_exit_grace_bounds_the_drain_when_nothing_closes_the_pipe() {
@@ -515,6 +527,10 @@ mod tests {
         // Deliberately not attached to `group` -- see the doc comment above.
         #[allow(clippy::disallowed_methods)] // test fixture; killed directly below, not via `group`
         let mut holder = cmd.spawn().expect("spawn holder");
+        // A SEPARATE group, for cleanup only -- `group` above must stay
+        // empty for the property under test.
+        let mut holder_group = xai_tty_utils::ProcessGroup::new().expect("holder group");
+        holder_group.attach_std(&holder).expect("attach holder");
         let stdout = holder.stdout.take().expect("stdout piped");
         let stderr = holder.stderr.take().expect("stderr piped");
         let stdout_rx = spawn_pipe_drain(stdout, "stdout");
@@ -525,7 +541,9 @@ mod tests {
         let result = post_exit_cleanup_and_drain(&group, stdout_rx, stderr_rx, too_small);
         let elapsed = started.elapsed();
 
-        let _ = holder.kill();
+        // Kill the whole holder group, not just its leader -- see the doc
+        // comment above.
+        let _ = holder_group.kill();
         let _ = holder.wait();
 
         assert!(
