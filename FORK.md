@@ -106,6 +106,48 @@ On every sync PR, review upstream diffs that touch:
 
 Prefer keeping fork intent on auth hotspots (`AuthScheme::None`, `local.none`, no ambient xAI credential leak) rather than blindly taking upstream.
 
+### Quarantined upstream features — take *ours*, and know what would change that
+
+Two upstream features are deliberately switched off in a way that reads, at
+conflict time, exactly like the fork having lost something. Both resolutions
+are **keep ours**. Neither was written down before #485, and the 2026-08-04
+sync survived them on memory rather than record.
+
+The tell for both is a **bare block wrapping a whole function body**, or a
+`check-cfg` entry naming a feature no `[features]` table declares — the residue
+of a removed `#[cfg]`.
+
+- **`local-workspace`** — upstream declares the feature in four `Cargo.toml`
+  files (`xai-grok-pager`, `-pager-bin`, `xai-grok-shell`, `-shell-base`); the
+  fork declares it in **none**, and adds
+  `unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("local-workspace"))'] }`
+  at `Cargo.toml:399` so the compiler stays quiet about **219**
+  now-permanently-false gates. Quarantined by `7b512227`.
+  **Why:** `gateway_bridge` — the module the gated code imports — exists in
+  **neither** tree, so upstream's own Cargo build cannot enable it either.
+  **At conflict time:** take ours; do not restore the declarations.
+  **What would change it:** upstream shipping `gateway_bridge` in the public
+  extraction.
+
+- **chat-kind sessions** — `reject_chat_kind_without_feature`
+  (`xai-grok-shell/src/agent/mvp_agent/mod.rs:433`) rejects every
+  `kind: "chat"` request unconditionally, with no `cfg` variant anywhere, and is
+  `?`-propagated from the first line of `new_session` (`acp_agent.rs:1110`),
+  `load_session` (`:1675`) and `attach_session` (`session_setup.rs:255`).
+  `is_chat_kind` has exactly one non-test binding (`acp_agent.rs:1202`), after
+  the gate.
+  **Why:** this is a build-only binary; the chat product is grok.com's.
+  **At conflict time:** take ours.
+  **What would change it:** this fork wanting a chat-enabled binary.
+
+Both mean several hundred lines of synced upstream code that **nothing
+executes**. That is not harmless: #384 found `session_token_auth_gate`'s
+production check *and its own guard test* reverted together by an auto-merge, in
+a file that never appeared in the conflict list — nothing went red because the
+test travelled with the code. Unexecuted code has strictly less protection than
+that, so these two paths are where a sync can quietly take upstream's side
+wholesale. Read their diffs on every sync even though no test will complain.
+
 ## Conflicts git does not report
 
 A textual conflict is not the only kind, and it is not the expensive kind. On
