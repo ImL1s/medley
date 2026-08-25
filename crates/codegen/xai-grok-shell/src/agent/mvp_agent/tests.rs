@@ -9011,115 +9011,121 @@ fn chat_initial_model_matrix() {
     }
 }
 /// #418: a chat-kind session used to take `custom_model_id` verbatim,
-/// bypassing every eligibility, auth-visibility, and readiness check the
-/// build-kind `/new` plan (`prepare_new_session_model_plan`) runs. This
-/// drives `chat_custom_model_outcome` — the chat path's half of the fix —
-/// with a `custom_model_id` in each of the three rejection shapes plus a
-/// not-found and an eligible id, and asserts it agrees with what
-/// `prepare_new_session_model_plan` (the build path) decides for the exact
-/// same catalog entry.
-#[tokio::test(flavor = "current_thread")]
-async fn chat_custom_model_outcome_matrix() {
-    use crate::agent::config::EndpointsConfig;
-
-    let agent = build_minimal_agent_for_tests();
-
-    let mut disallowed = ModelEntry::fallback("chat-418-disallowed", &EndpointsConfig::default());
-    disallowed.info.user_selectable = false;
-    agent
-        .models_manager
-        .insert_test_entry("chat-418-disallowed", disallowed);
-
-    let mut auth_hidden = ModelEntry::fallback("chat-418-auth-hidden", &EndpointsConfig::default());
-    auth_hidden.info.hidden = true;
-    agent
-        .models_manager
-        .insert_test_entry("chat-418-auth-hidden", auth_hidden);
-
-    let mut unready = ModelEntry::fallback("chat-418-unready", &EndpointsConfig::default());
-    unready.config_validation_errors.push("forced unready for #418 test".to_owned());
-    agent
-        .models_manager
-        .insert_test_entry("chat-418-unready", unready);
-
-    let eligible = ModelEntry::fallback("chat-418-eligible", &EndpointsConfig::default());
-    agent
-        .models_manager
-        .insert_test_entry("chat-418-eligible", eligible);
-
-    let cases: &[(&str, &str, ChatCustomModelOutcome)] = &[
+/// never checking it against anything. `chat_custom_model_outcome` is the
+/// fix — a pure membership check against an already-fetched `/rest/modes`
+/// snapshot (`acp::SessionModelState`), not the build catalog. Matrix over
+/// present / absent / empty-catalog, mirroring `chat_new_session_model_state_matrix`
+/// right below, which builds the same kind of fixture for the sibling
+/// (display-only) membership check.
+#[test]
+fn chat_custom_model_outcome_matrix() {
+    fn state_with(available: &[&str]) -> acp::SessionModelState {
+        acp::SessionModelState::new(
+            acp::ModelId::new("current-placeholder".to_owned()),
+            available
+                .iter()
+                .map(|id| {
+                    acp::ModelInfo::new(acp::ModelId::new((*id).to_owned()), (*id).to_owned())
+                })
+                .collect(),
+        )
+    }
+    let cases: &[(&str, acp::SessionModelState, &str, ChatCustomModelOutcome)] = &[
         (
-            "disallowed",
-            "chat-418-disallowed",
-            ChatCustomModelOutcome::Disallowed,
+            "present",
+            state_with(&["auto", "fast"]),
+            "fast",
+            ChatCustomModelOutcome::Eligible,
         ),
         (
-            "auth_hidden",
-            "chat-418-auth-hidden",
-            ChatCustomModelOutcome::AuthHidden,
+            "absent",
+            state_with(&["auto", "fast"]),
+            "grok-4.5",
+            ChatCustomModelOutcome::Unavailable,
         ),
         (
-            "unready",
-            "chat-418-unready",
-            ChatCustomModelOutcome::Unready("forced unready for #418 test".to_owned()),
-        ),
-        (
-            "not_found",
-            "chat-418-does-not-exist",
-            ChatCustomModelOutcome::NotFound,
-        ),
-        (
-            "eligible",
-            "chat-418-eligible",
+            // Fetch failure / unauthenticated / no modes yet: nothing to
+            // reject against, so this fails open, matching
+            // `chat_new_session_model_state`'s own philosophy for its
+            // unrelated (display-only) membership check.
+            "empty_catalog_fails_open",
+            state_with(&[]),
+            "anything",
             ChatCustomModelOutcome::Eligible,
         ),
     ];
-    for (label, requested, expected) in cases {
-        // The chat path (#418's fix): must not silently accept a rejected id.
+    for (label, state, requested, expected) in cases {
         assert_eq!(
-            agent.chat_custom_model_outcome(requested),
+            chat_custom_model_outcome(state, requested),
             *expected,
-            "[{label}] chat path"
+            "[{label}]"
         );
-
-        // The build path already did this correctly (this is what #418 says
-        // chat sessions were missing) -- assert the two paths agree on
-        // every one of these ids from the same catalog.
-        let plan = agent
-            .prepare_new_session_model_plan(Some(requested), None)
-            .expect("fallback model always resolves in the minimal test catalog");
-        match expected {
-            ChatCustomModelOutcome::Disallowed => assert_eq!(
-                plan.disallowed_custom.as_deref(),
-                Some(*requested),
-                "[{label}] build path must also flag this id as disallowed"
-            ),
-            ChatCustomModelOutcome::AuthHidden => assert_eq!(
-                plan.auth_hidden_custom.as_deref(),
-                Some(*requested),
-                "[{label}] build path must also flag this id as auth-hidden"
-            ),
-            ChatCustomModelOutcome::Unready(reason) => assert_eq!(
-                plan.unreadiness_custom.as_ref().map(|(id, r)| (id.as_str(), r.as_str())),
-                Some((*requested, reason.as_str())),
-                "[{label}] build path must also flag this id as unready"
-            ),
-            ChatCustomModelOutcome::NotFound => {
-                assert!(
-                    plan.disallowed_custom.is_none()
-                        && plan.auth_hidden_custom.is_none()
-                        && plan.unreadiness_custom.is_none(),
-                    "[{label}] build path must not report a rejection for an id absent from the catalog"
-                );
-            }
-            ChatCustomModelOutcome::Eligible => {
-                assert_eq!(
-                    plan.catalog_identity.model_id, *requested,
-                    "[{label}] build path must select the requested id when it is eligible"
-                );
-            }
-        }
     }
+}
+
+/// #418 review finding: the first version of this fix classified a chat-kind
+/// `custom_model_id` against `ModelsManager` (the *build* catalog) instead
+/// of the chat-product `/rest/modes` catalog. Chat and build catalogs are
+/// independent — a mode real in one need not exist in the other — so that
+/// version would have rejected a legitimate chat mode absent from the build
+/// catalog as `NotFound` and silently discarded it.
+///
+/// This pins the fix: an id present only in the chat catalog comes back
+/// `Eligible` from `chat_custom_model_outcome`, while the *build* path
+/// (`prepare_new_session_model_plan`, run against a build catalog that does
+/// not contain this id at all) does not resolve to it — proving the two
+/// checks now correctly consult different authorities instead of agreeing
+/// on the wrong one.
+#[tokio::test(flavor = "current_thread")]
+async fn chat_custom_model_outcome_uses_chat_catalog_not_build_catalog() {
+    const CHAT_ONLY_MODE: &str = "fast";
+
+    let agent = build_minimal_agent_for_tests();
+    let build_default = agent.models_manager.current_model_id();
+    assert_ne!(
+        build_default.0.as_ref(),
+        CHAT_ONLY_MODE,
+        "precondition: the test catalog's default model must not already be named \"fast\""
+    );
+    // Precondition: the minimal test agent's build catalog genuinely does
+    // not contain this id (nothing in this test ever inserts it there).
+    assert!(
+        !agent.models_manager.models().contains_key(CHAT_ONLY_MODE),
+        "precondition: the build catalog must not contain the chat-only mode"
+    );
+
+    let chat_state = acp::SessionModelState::new(
+        acp::ModelId::new(CHAT_ONLY_MODE.to_owned()),
+        vec![acp::ModelInfo::new(
+            acp::ModelId::new(CHAT_ONLY_MODE.to_owned()),
+            "Fast".to_owned(),
+        )],
+    );
+
+    // The chat path: eligible, because it consults the chat catalog.
+    assert_eq!(
+        chat_custom_model_outcome(&chat_state, CHAT_ONLY_MODE),
+        ChatCustomModelOutcome::Eligible,
+        "a mode present in the chat catalog must be Eligible"
+    );
+
+    // The build path: does NOT resolve to this id, because it isn't in the
+    // build catalog. It silently falls back to the current default (a plain
+    // warn log, same as the build path's other "not found" cases) rather
+    // than reporting a rejection reason.
+    let plan = agent
+        .prepare_new_session_model_plan(Some(CHAT_ONLY_MODE), None)
+        .expect("fallback model always resolves in the minimal test catalog");
+    assert_ne!(
+        plan.catalog_identity.model_id, CHAT_ONLY_MODE,
+        "the build path must not resolve a chat-only mode id from its own catalog"
+    );
+    assert!(
+        plan.disallowed_custom.is_none()
+            && plan.auth_hidden_custom.is_none()
+            && plan.unreadiness_custom.is_none(),
+        "an id absent from the build catalog is \"not found\", not a rejection"
+    );
 }
 
 #[test]

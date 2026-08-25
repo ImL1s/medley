@@ -336,32 +336,55 @@ pub(crate) struct PreparedNewSessionModelPlan {
 }
 
 /// Outcome of checking a chat-kind session's requested `_meta.modelId`
-/// against the same three catalog gates a build-kind `/new` plan enforces in
-/// [`MvpAgent::prepare_new_session_model_plan`] (#418): a chat-kind session
-/// used to take `custom_model_id` verbatim through [`chat_initial_model`],
-/// never running eligibility, auth-visibility, or readiness checks at all.
+/// against **the catalog that actually backs a chat session's model list**
+/// (#418, corrected after review of the first version of this fix — see
+/// below).
 ///
-/// This intentionally is *not* a second [`PreparedNewSessionModelPlan`]: a
-/// chat session has no harness to validate against `model_agent_type` and
-/// needs neither a `sampling_config` nor a `publication_gate` from that
-/// plan, so building one just to read three booleans off it would pull in
-/// build-kind machinery a chat session does not use. See
-/// [`MvpAgent::chat_custom_model_outcome`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Chat and build sessions read two different catalogs. The chat-product
+/// catalog is `/rest/modes`, cached by
+/// [`crate::agent::chat_modes::ChatModesManager`] — that module's own doc
+/// comment calls it "the chat analogue of [`ModelsManager`]" and its
+/// `model_state()` doc says it serves "never the build catalog". The build
+/// catalog is [`ModelsManager`] (`self.models_manager`). A build-only model
+/// id (an internal routing key) need not appear in `/rest/modes`; a
+/// chat-only mode id (e.g. a grok.com picker mode) need not appear in the
+/// build catalog. **The first version of this check consulted
+/// `ModelsManager` for a chat-kind request — the wrong catalog — and would
+/// have rejected a legitimate chat mode absent from the build catalog as
+/// `NotFound`, discarding it in favor of the build default.** This version
+/// is classified from an already-fetched
+/// [`agent_client_protocol::SessionModelState`] sourced from
+/// `ChatModesManager::model_state()`, not from `ModelsManager`.
+///
+/// This also is *not* a second [`PreparedNewSessionModelPlan`]: a chat
+/// session has no harness to validate against `model_agent_type` and needs
+/// neither a `sampling_config` nor a `publication_gate` from that plan, so
+/// running the whole build-kind plan for chat would pull in machinery it
+/// does not use.
+///
+/// Unlike [`MvpAgent::prepare_new_session_model_plan`], there is no
+/// `Disallowed` / `AuthHidden` / `Unready` here. The build catalog exposes
+/// those as three separate `ModelEntry` fields; `/rest/modes` exposes only
+/// one signal, `Mode::is_available()`, already applied server-side by
+/// `chat_modes::modes_to_model_state`'s `available_models` filter. An id
+/// absent from that list could be unknown, a mode the user currently cannot
+/// use, or a stale id from an out-of-date client — those are not
+/// distinguishable from a [`agent_client_protocol::SessionModelState`]
+/// alone, so chat only has one bit: is the id in the set the user's own
+/// `/rest/modes` fetch returned. See [`chat_custom_model_outcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatCustomModelOutcome {
-    /// Selectable, visible for the current auth mode, and ready.
+    /// Present in the fetched `/rest/modes` `available_models` set (or the
+    /// set is empty — an empty catalog carries no information to reject
+    /// against, so this fails open the same way
+    /// [`chat_new_session_model_state`] already does for its own,
+    /// display-only membership check).
     Eligible,
-    /// Not present in the catalog under this id at all. Mirrors the
+    /// Absent from a non-empty `available_models` set. Mirrors the
     /// build-kind "requested model not found" case: fall back silently, no
-    /// user-facing auto-switch notification (there is nothing to report
-    /// switching away from).
-    NotFound,
-    /// Present but not `user_selectable`.
-    Disallowed,
-    /// `user_selectable` but not visible under the current auth mode.
-    AuthHidden,
-    /// Selectable and visible, but not ready. Carries the readiness reason.
-    Unready(String),
+    /// user-facing auto-switch notification (there is nothing named to
+    /// report switching away from).
+    Unavailable,
 }
 
 /// Result of actor construction. Loads and chat sessions are already published;
@@ -494,6 +517,36 @@ fn chat_new_session_model_state(
     }
     state.current_model_id = acp::ModelId::new(requested);
     state
+}
+
+/// Classify a chat-kind session's requested `_meta.modelId` against an
+/// already-fetched chat-product catalog snapshot (#418). See
+/// [`ChatCustomModelOutcome`] for why this is a one-bit membership check
+/// against `/rest/modes` rather than the build path's three-way
+/// eligibility/auth/readiness check against `ModelsManager`.
+///
+/// Note this asks the same membership question
+/// [`chat_new_session_model_state`] already asks for its own, unrelated
+/// purpose (whether to log a picker-mismatch warning) — that function
+/// always honors the request regardless of the answer, because it only
+/// affects what `SessionModelState.current_model_id` *reports*. This
+/// function's answer instead decides what model the session actor is
+/// actually spawned with, so an `Unavailable` id must not fall through to
+/// it.
+fn chat_custom_model_outcome(
+    chat_model_state: &acp::SessionModelState,
+    requested: &str,
+) -> ChatCustomModelOutcome {
+    if chat_model_state.available_models.is_empty()
+        || chat_model_state
+            .available_models
+            .iter()
+            .any(|m| m.model_id.0.as_ref() == requested)
+    {
+        ChatCustomModelOutcome::Eligible
+    } else {
+        ChatCustomModelOutcome::Unavailable
+    }
 }
 /// `session/new` / `session/load` `_meta` key carrying per-session plugin roots.
 pub(crate) const SESSION_PLUGIN_DIRS_META_KEY: &str = "pluginDirs";

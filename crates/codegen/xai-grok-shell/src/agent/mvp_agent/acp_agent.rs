@@ -1232,55 +1232,39 @@ impl acp::Agent for MvpAgent {
             cwd: cwd.as_str().to_owned(),
         };
         // #418: a chat-kind session used to take `custom_model_id` verbatim
-        // through `chat_initial_model`, bypassing every eligibility, auth,
-        // and readiness check `prepare_new_session_model_plan` runs for a
-        // build-kind session. Run the same three gates here — via
-        // `chat_custom_model_outcome`, not the full build-kind plan, which
-        // this session kind does not need (no harness, no sampling config,
-        // no publication gate) — and feed a rejection into the same
-        // `disallowed_custom` / `auth_hidden_custom` / `unreadiness_custom`
-        // triple the build path already reports through, so both kinds
-        // surface the identical `ModelAutoSwitched` notification below.
-        let mut chat_disallowed_custom = None;
-        let mut chat_auth_hidden_custom = None;
-        let mut chat_unreadiness_custom = None;
-        let chat_eligible_model_id = custom_model_id.filter(|_| is_chat_kind).and_then(
-            |requested| match self.chat_custom_model_outcome(requested) {
-                ChatCustomModelOutcome::Eligible => Some(requested.to_owned()),
-                ChatCustomModelOutcome::NotFound => {
-                    tracing::warn!(
-                        requested_model = requested,
-                        "chat session/new _meta.modelId not found in catalog; falling back to current default model"
-                    );
-                    None
+        // through `chat_initial_model`, never checking it against anything.
+        // Fetch the chat-product catalog once here — `self.chat_modes`,
+        // *not* `self.models_manager` (the build catalog; see
+        // `ChatCustomModelOutcome`'s doc for why an earlier version of this
+        // fix checked the wrong one) — and reuse this same snapshot below
+        // for the `models` field the response reports, instead of the
+        // second `self.chat_modes.model_state()` fetch that used to sit
+        // there alone.
+        let chat_model_state = if is_chat_kind {
+            Some(self.chat_modes.model_state().await)
+        } else {
+            None
+        };
+        let chat_eligible_model_id = if is_chat_kind {
+            custom_model_id.and_then(|requested| {
+                let state = chat_model_state
+                    .as_ref()
+                    .expect("chat_model_state is fetched whenever is_chat_kind");
+                match chat_custom_model_outcome(state, requested) {
+                    ChatCustomModelOutcome::Eligible => Some(requested.to_owned()),
+                    ChatCustomModelOutcome::Unavailable => {
+                        tracing::warn!(
+                            requested_model = requested,
+                            "chat session/new _meta.modelId not in the /rest/modes catalog; \
+                             falling back to current default model"
+                        );
+                        None
+                    }
                 }
-                ChatCustomModelOutcome::Disallowed => {
-                    tracing::warn!(
-                        requested_model = requested,
-                        "chat session/new _meta.modelId not allowed by allowed_models; falling back to current default model"
-                    );
-                    chat_disallowed_custom = Some(requested.to_owned());
-                    None
-                }
-                ChatCustomModelOutcome::AuthHidden => {
-                    tracing::warn!(
-                        requested_model = requested,
-                        "chat session/new _meta.modelId is unavailable for the current authentication mode; falling back to current default model"
-                    );
-                    chat_auth_hidden_custom = Some(requested.to_owned());
-                    None
-                }
-                ChatCustomModelOutcome::Unready(reason) => {
-                    tracing::warn!(
-                        requested_model = requested,
-                        %reason,
-                        "chat session/new _meta.modelId is not ready; falling back to current default model"
-                    );
-                    chat_unreadiness_custom = Some((requested.to_owned(), reason));
-                    None
-                }
-            },
-        );
+            })
+        } else {
+            None
+        };
         let session_initial_model =
             chat_initial_model(is_chat_kind, chat_eligible_model_id.as_deref());
         let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
@@ -1297,16 +1281,13 @@ impl acp::Agent for MvpAgent {
             .and_then(|plan| plan.model_agent_type.clone());
         let disallowed_custom = prepared_model_plan
             .as_ref()
-            .and_then(|plan| plan.disallowed_custom.clone())
-            .or(chat_disallowed_custom);
+            .and_then(|plan| plan.disallowed_custom.clone());
         let auth_hidden_custom = prepared_model_plan
             .as_ref()
-            .and_then(|plan| plan.auth_hidden_custom.clone())
-            .or(chat_auth_hidden_custom);
+            .and_then(|plan| plan.auth_hidden_custom.clone());
         let unreadiness_custom = prepared_model_plan
             .as_ref()
-            .and_then(|plan| plan.unreadiness_custom.clone())
-            .or(chat_unreadiness_custom);
+            .and_then(|plan| plan.unreadiness_custom.clone());
         let publication_gate = prepared_model_plan
             .as_ref()
             .map(|_| crate::session::SessionPublicationGate::pending());
@@ -1543,7 +1524,10 @@ impl acp::Agent for MvpAgent {
         let (models, model_presentation) = if is_chat_kind {
             (
                 chat_new_session_model_state(
-                    self.chat_modes.model_state().await,
+                    // Reuses the snapshot fetched above for the eligibility
+                    // check (#418) rather than fetching `/rest/modes` twice.
+                    chat_model_state
+                        .expect("chat_model_state is fetched whenever is_chat_kind"),
                     session_initial_model
                         .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
                 ),
