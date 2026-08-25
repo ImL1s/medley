@@ -18,6 +18,79 @@ impl Drop for ProcessRemoteFetchOff {
     }
 }
 
+/// Pin the process state directory to `home` for this test, and prove the pin
+/// took (#420).
+///
+/// `grok_home()` caches its answer in a process-wide `OnceLock`, so the
+/// `MEDLEY_HOME` / `GROK_HOME` env guards a test sets are no-ops once any
+/// earlier test in the binary has resolved the home. A test relying on them
+/// alone reads and writes the *developer's* live state directory: it passes
+/// alone (it wins the cache), passes on a fresh CI container (nothing is there
+/// yet), and fails on any machine that has run it before, because its own
+/// fixture session ids are already persisted from the previous run.
+///
+/// The `assert_eq!` is the guarantee, not decoration: if a future change makes
+/// the pin stop reaching `grok_home()`, this fails here — naming the directory
+/// that actually resolved — rather than surfacing much later as a duplicate-id
+/// rejection or a hook-wait timeout.
+#[must_use]
+fn pin_fixture_state_home(home: &std::path::Path) -> xai_grok_config::state_home::StateHomeGuard {
+    let guard = xai_grok_config::state_home::StateHomeGuard::pin(home);
+    assert_eq!(
+        xai_grok_config::grok_home(),
+        home,
+        "the fixture state directory must be the one grok_home() resolves"
+    );
+    guard
+}
+
+/// Assert the pinned state directory holds no session under `session_id` yet.
+///
+/// Fixed session-id fixtures are safe only while each test owns its own state
+/// directory. This makes a lost isolation fail at the reuse, naming the id and
+/// the directory, instead of intermittently somewhere downstream (#420).
+fn assert_fixture_session_id_unused(session_id: &str) {
+    let existing = crate::session::persistence::find_any_session_dir_by_id_result(session_id)
+        .expect("scan the pinned state directory for the fixture session id");
+    assert!(
+        existing.is_none(),
+        "fixture session id {session_id} is already persisted under {} — this \
+         test is not running against an isolated state directory",
+        xai_grok_config::grok_home().display()
+    );
+}
+
+/// Wait for a `/new` boundary hook, but let the request itself win the race.
+///
+/// `new_session` rejects a duplicate session id *before* it reaches any of
+/// these boundaries, so a bare `timeout(.., hook.wait_until_entered())` reports
+/// `Elapsed(())` — which names neither what it waited for nor why it never
+/// arrived. Joining the request task in the same select turns that into the
+/// rejection that actually happened (#420 acceptance 3).
+async fn await_new_session_boundary(
+    request_task: &mut tokio::task::JoinHandle<Result<acp::NewSessionResponse, acp::Error>>,
+    hook: impl std::future::Future<Output = ()>,
+    boundary: &str,
+) {
+    tokio::select! {
+        () = hook => {}
+        joined = &mut *request_task => {
+            let outcome = match joined {
+                Ok(Ok(_)) => "it returned successfully".to_owned(),
+                Ok(Err(error)) => format!("it was rejected: {error:?}"),
+                Err(join_error) => format!("its task ended: {join_error}"),
+            };
+            panic!("session/new never reached {boundary}: {outcome}");
+        }
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            panic!(
+                "timed out after 10s waiting for session/new to reach {boundary}; \
+                 the request was still in flight"
+            );
+        }
+    }
+}
+
 /// Build an unsigned JWT with a `tier` claim (header.payload.sig base64url).
 fn jwt_with_tier(tier: u64) -> String {
     use base64::Engine;
@@ -6872,6 +6945,8 @@ fn new_session_publishes_one_complete_staged_tree() {
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        let _state_home = pin_fixture_state_home(grok_home.path());
+        assert_fixture_session_id_unused(SESSION_ID);
         let _remote_fetch = ProcessRemoteFetchOff::install();
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
@@ -7000,6 +7075,8 @@ fn new_session_api_key_auth_rejects_ready_session_only_explicit_model() {
         const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000101";
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        let _state_home = pin_fixture_state_home(grok_home.path());
+        assert_fixture_session_id_unused(SESSION_ID);
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let tmp = tempfile::tempdir().expect("auth visibility fixture");
@@ -7123,6 +7200,8 @@ fn new_session_api_key_auth_skips_ready_session_only_profile_pin() {
         const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000102";
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        let _state_home = pin_fixture_state_home(grok_home.path());
+        assert_fixture_session_id_unused(SESSION_ID);
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let tmp = tempfile::tempdir().expect("profile auth visibility fixture");
@@ -7639,6 +7718,8 @@ fn cancelling_after_actor_init_before_publish_ack_cleans_state_and_allows_retry(
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        let _state_home = pin_fixture_state_home(grok_home.path());
+        assert_fixture_session_id_unused(SESSION_ID);
         let _remote_fetch = ProcessRemoteFetchOff::install();
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
@@ -7724,23 +7805,23 @@ fn cancelling_after_actor_init_before_publish_ack_cleans_state_and_allows_retry(
             .cloned(),
         );
         let request_agent = agent.clone();
-        let request_task = tokio::task::spawn_local(async move {
+        let mut request_task = tokio::task::spawn_local(async move {
             <MvpAgent as acp::Agent>::new_session(&request_agent, request).await
         });
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+        await_new_session_boundary(
+            &mut request_task,
             actor_init_hook.wait_until_entered(),
+            "the actor-init boundary",
         )
-        .await
-        .expect("session thread must reach the actor-init boundary");
+        .await;
         actor_init_hook.release();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+        await_new_session_boundary(
+            &mut request_task,
             publish_ack_hook.wait_until_entered(),
+            "publish acknowledgement after actor initialization",
         )
-        .await
-        .expect("session/new must finish actor initialization and reach publish acknowledgement");
+        .await;
         assert!(
             gc_sentinel.is_dir(),
             "provisional actor construction must not run shared-memory GC"
@@ -7928,6 +8009,8 @@ fn new_session_actor_spawn_failure_cleans_provisional_state_and_allows_same_id_r
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        let _state_home = pin_fixture_state_home(grok_home.path());
+        assert_fixture_session_id_unused(SESSION_ID);
         let _remote_fetch = ProcessRemoteFetchOff::install();
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
@@ -7998,16 +8081,16 @@ fn new_session_actor_spawn_failure_cleans_provisional_state_and_allows_same_id_r
             .cloned(),
         );
         let request_agent = agent.clone();
-        let request_task = tokio::task::spawn_local(async move {
+        let mut request_task = tokio::task::spawn_local(async move {
             <MvpAgent as acp::Agent>::new_session(&request_agent, request).await
         });
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+        await_new_session_boundary(
+            &mut request_task,
             failure_hook.wait_until_entered(),
+            "the injected actor failure",
         )
-        .await
-        .expect("session thread must reach the injected actor failure");
+        .await;
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             failure_hook.wait_until_thread_exited(),
@@ -12382,6 +12465,7 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex_in_process(
         std::fs::create_dir_all(&state_home).expect("create isolated state home");
         let _medley_home = EnvGuard::set("MEDLEY_HOME", &state_home);
         let _grok_home = EnvGuard::set("GROK_HOME", &state_home);
+        let _state_home = pin_fixture_state_home(&state_home);
         let auth_path = tmp.path().join("auth.json");
         let codex_auth = GrokAuth {
             key: "live-codex-token".to_owned(),

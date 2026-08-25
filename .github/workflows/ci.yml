@@ -1405,6 +1405,12 @@ jobs:
             display:: -- --nocapture
           run_nonzero -p xai-grok-config --lib \
             validation:: -- --nocapture
+          # #420: the state-directory pin these tests use to stop reading the
+          # developer's live home. It is consulted unconditionally (not
+          # `cfg(test)`), so a change that breaks it breaks isolation for every
+          # cross-crate caller while every one of them still compiles.
+          run_nonzero -p xai-grok-config --lib \
+            state_home:: -- --nocapture
           # Same `#[path]` move as `restore_fetch::` above, and stopped one
           # segment short for the same reason: the file is `fs_size_tests.rs`,
           # the module is `fs_size::tests`, and only `fs_size::` is a substring
