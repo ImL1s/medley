@@ -205,8 +205,8 @@ class FunctionSignatureCorpus(unittest.TestCase):
             self.assertIsNone(guard._FN.match(not_a_fn), not_a_fn)
 
 
-def _workflow_module_filters() -> list[tuple[str, str]]:
-    """`(crate, filter)` for every module-path filter, from the GUARD's parser.
+def _workflow_module_filters() -> list[tuple[str, str, str]]:
+    """`(crate, target, filter)` for every module-path filter, from the GUARD's parser.
 
     Re-deriving the filter list with a second regex was itself a proxy: mine
     captured only filters ending in `::`, so `agent::models` and friends were
@@ -303,17 +303,26 @@ def _real_tests_by_crate() -> dict[str, list[tuple[str, str]]]:
 # from file paths. Each is a filter that works in Cargo and that the guard
 # would report as selecting nothing -- #460. This list is a ratchet: it must
 # not grow, and it shrinks to empty when #460 is fixed.
+#
+# Keyed on (crate, target, value), TARGET included. Collapsing to (crate,
+# value) let an allowlisted filter reused against a different, genuinely
+# broken target be absorbed by the entry a DIFFERENT target earned -- a new
+# breakage would reuse an existing key and `test_no_new_unresolvable_module_filter`
+# would report nothing new. Proven by construction, not by count: today every
+# (crate, value) here maps to exactly one target ("lib"), so this widening is
+# a re-expression of the same seven entries, not new coverage (#458 review).
 KNOWN_UNRESOLVABLE = {
-    ("xai-grok-shell", "auth::manager::tests::"),
-    ("xai-grok-shell", "auth::openai_codex::tests::"),
+    ("xai-grok-shell", "lib", "auth::manager::tests::"),
+    ("xai-grok-shell", "lib", "auth::openai_codex::tests::"),
     (
         "xai-grok-shell",
+        "lib",
         "auth::openai_codex::tests::full_login_flow_persists_provider_scoped_codex_credential",
     ),
-    ("xai-grok-shell", "leader::lock::tests::reclaim"),
-    ("xai-grok-shell", "terminal::pty_session::tests::"),
-    ("xai-grok-shell", "terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child"),
-    ("xai-grok-subagent-resolution", "resume::tests"),
+    ("xai-grok-shell", "lib", "leader::lock::tests::reclaim"),
+    ("xai-grok-shell", "lib", "terminal::pty_session::tests::"),
+    ("xai-grok-shell", "lib", "terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child"),
+    ("xai-grok-subagent-resolution", "lib", "resume::tests"),
 }
 
 
@@ -334,7 +343,14 @@ class ModulePathApproximationCorpus(unittest.TestCase):
         cls.filters = _workflow_module_filters()
         cls.by_crate = _real_tests_by_crate()
         cls.unresolvable = {
-            (crate, value)
+            # TARGET stays in the key. Dropping it here would let a filter
+            # reused against a second, genuinely broken target collapse onto
+            # the (crate, value) an unrelated target already earned its way
+            # into KNOWN_UNRESOLVABLE with -- proven by construction (#458
+            # review): injecting a synthetic (crate, "new_target", value)
+            # triple that reuses an allowlisted value left this test green
+            # under the old (crate, value) key.
+            (crate, target, value)
             for crate, target, value in cls.filters
             if not any(
                 guard.selected(fn, path, {value})
