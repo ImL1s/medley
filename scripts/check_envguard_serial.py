@@ -55,6 +55,26 @@ WHAT THIS DOES NOT CHECK, so that a green tick is not read as more than it is:
     either shape would pass unseen until this regex is widened to know the
     file's aliases.
 
+    `_test_variables`' fixed-variable subtraction (`found = {v for v in found
+    if v not in _call_args(raw_body, used)} | set(fixed)`) removes a name by
+    VALUE, not by attribution to the guard call: if a fixed-variable guard's
+    argument string happens to equal the name of a variable ALSO mutated by a
+    genuinely separate call in the same body (a raw `env::set_var`/
+    `remove_var`, or a different guard), that separate mutation's variable is
+    silently dropped from what the test is recorded as touching (#449 review,
+    Finding 3). Measured at the time of writing: every fixed-variable guard
+    type in the tree (`EarlyInvalidationGuard`, `EnvVarGuard`,
+    `FailClosedEnvGuard`, `FakeBinGuard`, `Fixture`, `GrokHomeFixture`,
+    `Harness`, `MarkerGuard`, `PagerLeaderCluster`, `R`, `Restore` --
+    `mutators.type_vars`) was checked at its 53 call sites in the scan root's
+    test bodies for whether its call argument collides with a variable
+    contributed by any OTHER call in the same body; zero do. A synthetic probe
+    reproducing the exact shape (`FixedEnvGuard::set("HOME")` alongside a raw
+    `env::set_var("HOME", ...)`) confirms the checker is not blind to a case
+    that exists -- `variables` on that candidate comes back as only the
+    guard's own fixed name, exactly as the finding describes -- it is that no
+    scan-root test currently has this shape.
+
 Scan scope is one crate: `crates/codegen/xai-grok-shell/src/**/*.rs` unless
 `--scan-root` says otherwise. Known stragglers live in
 `tests/ci/envguard-serial-allowlist.txt`; new hits and stale entries both fail,
