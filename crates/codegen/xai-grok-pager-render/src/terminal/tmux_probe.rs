@@ -733,10 +733,14 @@ mod tests {
     /// A grace fresh off `POST_EXIT_CLEANUP_GRACE` (300ms) elapses well
     /// before the descendant's fixed 800ms self-close, so a correct
     /// `run_tmux_bounded` must report the drain timeout. A grace borrowed
-    /// from the ~1.5s `timeout` instead — almost entirely unused, since the
-    /// leader exits at once — comfortably outlasts that 800ms close, and
-    /// what should have been `Err` becomes `Ok`: exactly the caller-side
-    /// regression this test exists to catch.
+    /// from `timeout` instead — almost entirely unused, since the leader
+    /// exits at once — comfortably outlasts that 800ms close, and what
+    /// should have been `Err` becomes `Ok`: exactly the caller-side
+    /// regression this test exists to catch. `timeout`'s own value (and
+    /// why it is not simply "a bit more than 800ms") is explained where
+    /// it is set, below -- Codex's review of an earlier version of this
+    /// test found that margin was not as independent of contention as it
+    /// looked.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(tmux_probe_path)]
@@ -747,11 +751,30 @@ mod tests {
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let tmux = bin.join("tmux");
-        // Large relative to `POST_EXIT_CLEANUP_GRACE` (300ms) so a fresh
-        // grace times out well before it, and large relative to nothing in
-        // particular otherwise -- what matters is that it sits comfortably
-        // under the ~1.5s a *borrowed* remainder would grant.
-        let timeout = Duration::from_millis(1500);
+        // `timeout` and the descendant's own 800ms self-close (below) are
+        // NOT independent quantities under load -- both are functions of
+        // `D`, how long perl startup + `setsid()` + the marker handshake
+        // actually take on a contended host, and they move in the SAME
+        // direction as `D` grows. The borrowed-remainder mutation's
+        // window is `timeout - D` (the fixed absolute deadline computed
+        // once at spawn, minus however much of it `D` already spent); the
+        // descendant's absolute close time is `D + 800ms` (its sleep
+        // starts right after the marker write, which is what `D` mostly
+        // consists of). The mutation stops being caught once `D + 800ms
+        // >= timeout`, i.e. once `D >= timeout - 800ms` -- Codex's review
+        // of this test measured that crossing directly: at `timeout =
+        // 1500ms` a `D` of ~700ms (plausible on a loaded host; this
+        // file's own tests have been observed under load averages of
+        // 90-120 on a 16-core box earlier in this PR's own history) was
+        // enough to make the mutation silently pass undetected. Fixed by
+        // widening `timeout` alone, generously, so the margin (`timeout -
+        // 800ms`) some multi-second `D` would be needed to close --
+        // several times larger than any perl-startup delay this session
+        // has actually observed, including under that same load. The
+        // fresh-grace direction was never at risk: its own window is `D +
+        // 300ms` against the descendant's `D + 800ms`, a `D`-independent
+        // 500ms gap regardless of how large `timeout` is.
+        let timeout = Duration::from_millis(5000);
         let ready_marker = temp.path().join("descendant-ready");
         let script = format!(
             "#!/bin/sh\n\
