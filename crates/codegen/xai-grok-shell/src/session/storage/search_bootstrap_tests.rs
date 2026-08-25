@@ -4,7 +4,7 @@
 use super::*;
 use crate::session::info::Info;
 use crate::session::storage::jsonl::JsonlStorageAdapter;
-use crate::session::storage::search_fts::META_KEY_SCHEMA_VERSION;
+use crate::session::storage::search_fts::{META_KEY_SCHEMA_VERSION, SessionDoc};
 use agent_client_protocol as acp;
 use serial_test::serial;
 
@@ -424,4 +424,329 @@ async fn test_concurrent_gates_single_flight() {
         progress_a.total.load(Ordering::Relaxed),
         progress_b.total.load(Ordering::Relaxed),
     );
+}
+
+// #477: the lease-takeover overlap path (a stale/crashed claimant's reindex
+// body running concurrently with its successor's) rests on three properties
+// stated in `reindex_all`'s own comments, none of which #440/#476 exercise:
+//
+//   1. `upsert_doc` is an UPSERT keyed by `session_id` -- concurrent writers
+//      cannot corrupt a row, only race harmlessly to redundant writes.
+//   2. `claim_lost` gives a displaced claimant an early exit before it does
+//      any (redundant, but wasted) per-session work.
+//   3. the completion marker and orphan-prune writes are fenced on claim
+//      ownership -- a stale claimant can never assert "done" or delete rows
+//      a successor already wrote.
+//
+// Each gets its own deterministic test below, each paired with a positive
+// control so a broken implementation that does *nothing* cannot pass
+// vacuously. `test_upsert_doc_converges_under_every_interleaving_of_two_streams`
+// is the property-shaped one -- it tests idempotence rather than assuming it.
+
+/// All `C(a_len + b_len, a_len)` ways to riffle-merge two streams of lengths
+/// `a_len` and `b_len` while preserving each stream's own internal order --
+/// `true` at index `i` means "the i-th write in this interleaving comes from
+/// stream A", `false` means stream B. This is the general shape of "two
+/// concurrent reindex bodies each issuing their own ordered writes against
+/// the same key, in every possible relative order the two could race in."
+fn interleavings(a_len: usize, b_len: usize) -> Vec<Vec<bool>> {
+    if a_len == 0 {
+        return vec![vec![false; b_len]];
+    }
+    if b_len == 0 {
+        return vec![vec![true; a_len]];
+    }
+    let mut result = Vec::new();
+    for mut seq in interleavings(a_len - 1, b_len) {
+        seq.insert(0, true);
+        result.push(seq);
+    }
+    for mut seq in interleavings(a_len, b_len - 1) {
+        seq.insert(0, false);
+        result.push(seq);
+    }
+    result
+}
+
+#[test]
+fn test_interleavings_generates_the_expected_count_and_shape() {
+    // Self-check on the generator itself: C(6,3) = 20, and every sequence
+    // must contain exactly 3 `true`s (stream A never gains or loses writes
+    // just because of *when* they were interleaved with B's).
+    let all = interleavings(3, 3);
+    assert_eq!(all.len(), 20);
+    for seq in &all {
+        assert_eq!(seq.len(), 6);
+        assert_eq!(seq.iter().filter(|&&is_a| is_a).count(), 3);
+    }
+    // No two sequences are identical -- otherwise this wouldn't be 20
+    // *distinct* orderings.
+    let mut sorted = all.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 20);
+}
+
+fn stream_doc(session_id: &str, stream: &str, revision: usize) -> SessionDoc {
+    SessionDoc {
+        session_id: session_id.to_string(),
+        cwd: "/ws".to_string(),
+        updated_at_unix: revision as i64,
+        title: format!("{stream}-rev{revision}"),
+        content: format!("content from {stream} revision {revision}"),
+        // Nothing inside `upsert_doc` validates this as a real content hash
+        // -- using it as a plain revision label makes the read-back after
+        // each interleaving unambiguous about exactly which write survived.
+        content_hash: format!("{stream}-rev{revision}"),
+    }
+}
+
+/// Property #1: `upsert_doc` converges to whichever write is *last in a
+/// given interleaving*, for every one of the 20 possible ways two 3-write
+/// streams targeting the same `session_id` can race. This is the property
+/// the whole "overlap is harmless" argument rests on -- not a specific
+/// scenario, but the general claim that write order, not write *origin*,
+/// determines the final row.
+#[test]
+fn test_upsert_doc_converges_under_every_interleaving_of_two_streams() {
+    const SESSION_ID: &str = "s1";
+    for pattern in interleavings(3, 3) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("session_search.sqlite");
+        let index = SessionSearchIndex::open_or_create(&db_path).unwrap();
+
+        let mut a_rev = 0usize;
+        let mut b_rev = 0usize;
+        let mut last_label = String::new();
+        for is_a in &pattern {
+            let doc = if *is_a {
+                a_rev += 1;
+                stream_doc(SESSION_ID, "A", a_rev)
+            } else {
+                b_rev += 1;
+                stream_doc(SESSION_ID, "B", b_rev)
+            };
+            last_label = doc.content_hash.clone();
+            index.upsert_doc(&doc).unwrap();
+        }
+
+        let ids = index.all_indexed_session_ids().unwrap();
+        assert_eq!(
+            ids,
+            vec![SESSION_ID.to_string()],
+            "pattern {pattern:?}: two overlapping writers must converge on \
+             one row per session_id, never a duplicate"
+        );
+        let hash = index.get_content_hash(SESSION_ID).unwrap();
+        assert_eq!(
+            hash.as_deref(),
+            Some(last_label.as_str()),
+            "pattern {pattern:?}: the surviving row must be whichever write \
+             was last in this interleaving, regardless of which stream it \
+             came from"
+        );
+    }
+}
+
+/// Companion to the single-key exhaustive test: two independent
+/// `session_id`s interleaved with each other must not let one key's write
+/// order affect the other's outcome -- `session_id` is genuinely the
+/// isolation boundary, not merely "usually" the isolation boundary.
+#[test]
+fn test_upsert_doc_interleaving_does_not_cross_contaminate_other_keys() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("session_search.sqlite");
+    let index = SessionSearchIndex::open_or_create(&db_path).unwrap();
+
+    // s1: B's single write lands after A's two -- B should win.
+    index.upsert_doc(&stream_doc("s1", "A", 1)).unwrap();
+    index.upsert_doc(&stream_doc("s1", "A", 2)).unwrap();
+    index.upsert_doc(&stream_doc("s1", "B", 1)).unwrap();
+    // s2: the opposite order -- A's single write lands after B's two.
+    index.upsert_doc(&stream_doc("s2", "B", 1)).unwrap();
+    index.upsert_doc(&stream_doc("s2", "B", 2)).unwrap();
+    index.upsert_doc(&stream_doc("s2", "A", 1)).unwrap();
+
+    let mut ids = index.all_indexed_session_ids().unwrap();
+    ids.sort();
+    assert_eq!(ids, vec!["s1".to_string(), "s2".to_string()]);
+    assert_eq!(
+        index.get_content_hash("s1").unwrap().as_deref(),
+        Some("B-rev1"),
+        "s1's write order must decide s1's outcome independently of s2's"
+    );
+    assert_eq!(
+        index.get_content_hash("s2").unwrap().as_deref(),
+        Some("A-rev1"),
+        "s2's write order must decide s2's outcome independently of s1's"
+    );
+}
+
+/// Property #2: `reindex_all` checks `claim_lost` once per session, before
+/// doing any of that session's (redundant, but wasted) read/upsert work.
+/// Driven directly through `reindex_all`'s own `claim_lost` parameter --
+/// deterministic, not a timing race — matching #440/#476's move away from
+/// deadline-based interleaving toward driving the actual precondition.
+#[tokio::test]
+async fn test_claim_lost_flag_skips_every_session_write() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let storage = JsonlStorageAdapter::with_root(root.clone());
+    for id in ["s1", "s2", "s3"] {
+        let info = Info {
+            id: acp::SessionId::new(id),
+            cwd: "/ws".to_string(),
+        };
+        storage
+            .init_session(&info, acp::ModelId::new("test"))
+            .await
+            .unwrap();
+    }
+
+    let token = ClaimToken::new();
+    let now = chrono::Utc::now().timestamp();
+    let db_path = search_db_path(&root);
+    with_search_index(&db_path, |index| {
+        index.try_claim_bootstrap(now, TEST_TIMING.lease, token.as_str())
+    })
+    .unwrap();
+
+    let progress = Arc::new(BootstrapProgress::default());
+    // Set from the start: the deterministic equivalent of "the refresher
+    // already observed the takeover before this claimant's per-session loop
+    // began" -- the earliest and strongest form of the race, and the one
+    // most likely to be hit if the early-exit check were ever removed.
+    let claim_lost = Arc::new(AtomicBool::new(true));
+    reindex_all(&root, &storage, &progress, &token, Arc::clone(&claim_lost))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        progress.indexed.load(Ordering::Relaxed),
+        0,
+        "a displaced claimant must not index any session"
+    );
+    let indexed_ids = with_search_index(&db_path, |index| index.all_indexed_session_ids()).unwrap();
+    assert!(
+        indexed_ids.is_empty(),
+        "no row must have been written by a displaced claimant, got {indexed_ids:?}"
+    );
+    assert_eq!(
+        read_marker(&db_path),
+        None,
+        "a displaced claimant must not write the completion marker"
+    );
+}
+
+/// Control for the test above: with `claim_lost` false, the *same* sessions
+/// must actually get indexed and the marker written. Without this pairing,
+/// the previous test would pass just as well against a `reindex_all` that
+/// never indexes anything regardless of `claim_lost` -- proving nothing
+/// about the flag specifically.
+#[tokio::test]
+async fn test_claim_lost_false_control_indexes_normally() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let storage = JsonlStorageAdapter::with_root(root.clone());
+    for id in ["s1", "s2", "s3"] {
+        let info = Info {
+            id: acp::SessionId::new(id),
+            cwd: "/ws".to_string(),
+        };
+        storage
+            .init_session(&info, acp::ModelId::new("test"))
+            .await
+            .unwrap();
+    }
+
+    let token = ClaimToken::new();
+    let now = chrono::Utc::now().timestamp();
+    let db_path = search_db_path(&root);
+    with_search_index(&db_path, |index| {
+        index.try_claim_bootstrap(now, TEST_TIMING.lease, token.as_str())
+    })
+    .unwrap();
+
+    let progress = Arc::new(BootstrapProgress::default());
+    let claim_lost = Arc::new(AtomicBool::new(false));
+    reindex_all(&root, &storage, &progress, &token, Arc::clone(&claim_lost))
+        .await
+        .unwrap();
+
+    assert_eq!(progress.indexed.load(Ordering::Relaxed), 3);
+    let mut indexed_ids =
+        with_search_index(&db_path, |index| index.all_indexed_session_ids()).unwrap();
+    indexed_ids.sort();
+    assert_eq!(
+        indexed_ids,
+        vec!["s1".to_string(), "s2".to_string(), "s3".to_string()]
+    );
+    assert!(read_marker(&db_path).is_some());
+}
+
+/// Property #3: the completion marker and the orphan prune are fenced on
+/// claim ownership -- both refuse to write once the claim row names a
+/// different token, and both succeed for whoever the claim row actually
+/// names. Exercised directly against the SQL fencing (`set_meta_if_claim_owner`,
+/// `prune_missing_if_claim_owner`), which is the exact boundary the safety
+/// argument depends on, with a positive control on each half so neither
+/// assertion could pass against a function that just always returns
+/// `false`/never prunes.
+#[test]
+fn test_marker_and_prune_writes_are_fenced_on_claim_ownership() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("session_search.sqlite");
+    let index = SessionSearchIndex::open_or_create(&db_path).unwrap();
+    let now = chrono::Utc::now().timestamp();
+
+    // The successor holds the claim now; "stale" is the displaced claimant
+    // that has not yet noticed (the exact race #477 is about).
+    index
+        .try_claim_bootstrap(now, TEST_TIMING.lease, "successor")
+        .unwrap();
+
+    let wrote = index
+        .set_meta_if_claim_owner(META_KEY_LAST_BOOTSTRAP, "999", "stale")
+        .unwrap();
+    assert!(
+        !wrote,
+        "a stale claimant must not be able to write the completion marker"
+    );
+    assert_eq!(index.get_meta(META_KEY_LAST_BOOTSTRAP).unwrap(), None);
+
+    // Positive control: the actual owner's write succeeds.
+    let wrote = index
+        .set_meta_if_claim_owner(META_KEY_LAST_BOOTSTRAP, "999", "successor")
+        .unwrap();
+    assert!(wrote);
+    assert_eq!(
+        index.get_meta(META_KEY_LAST_BOOTSTRAP).unwrap(),
+        Some("999".to_string())
+    );
+
+    // A row the successor already indexed since the stale claimant's
+    // startup snapshot -- from the stale claimant's point of view this
+    // session_id is an orphan (not in its `expected_ids`) and it must not
+    // be allowed to delete it.
+    index
+        .upsert_doc(&stream_doc("keep-me", "successor", 1))
+        .unwrap();
+    let empty_keep: HashSet<String> = HashSet::new();
+
+    let pruned = index
+        .prune_missing_if_claim_owner(now, "stale", &empty_keep)
+        .unwrap();
+    assert!(!pruned, "a stale claimant must not be able to prune");
+    assert_eq!(
+        index.all_indexed_session_ids().unwrap(),
+        vec!["keep-me".to_string()],
+        "the successor's row must survive a stale claimant's prune attempt"
+    );
+
+    // Positive control: the actual owner's prune succeeds.
+    let pruned = index
+        .prune_missing_if_claim_owner(now, "successor", &empty_keep)
+        .unwrap();
+    assert!(pruned);
+    assert!(index.all_indexed_session_ids().unwrap().is_empty());
 }
