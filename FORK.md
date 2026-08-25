@@ -135,11 +135,15 @@ of a removed `#[cfg]`.
 
 - **chat-kind sessions** — `reject_chat_kind_without_feature`
   (`xai-grok-shell/src/agent/mvp_agent/mod.rs:433`) rejects every
-  `kind: "chat"` request unconditionally, with no `cfg` variant anywhere, and is
-  `?`-propagated from the first line of `new_session` (`acp_agent.rs:1110`),
-  `load_session` (`:1675`) and `attach_session` (`session_setup.rs:255`).
-  `is_chat_kind` has exactly one non-test binding (`acp_agent.rs:1202`), after
-  the gate.
+  `kind: "chat"` request unconditionally, with no `cfg` variant anywhere. It is
+  literally the first line of `new_session` (`acp_agent.rs:1110`). On the other
+  two paths it is `?`-propagated one line *after* `begin_session_load`, which is
+  itself fallible — `load_session` (`:1674`/`:1675`) and `attach_session`
+  (`session_setup.rs:254`/`:255`) — so a chat request there can surface a
+  load-claim error instead of the chat rejection. The gate is early on every
+  path and nothing chat-specific runs ahead of it, but "first line" is true of
+  `new_session` alone. `is_chat_kind` has exactly one non-test binding
+  (`acp_agent.rs:1202`), after the gate.
   **Why:** this is a build-only binary; the chat product is grok.com's.
   **At conflict time:** take ours.
   **What would change it:** this fork wanting a chat-enabled binary.
