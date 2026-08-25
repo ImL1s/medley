@@ -68,33 +68,6 @@ class PackageName(unittest.TestCase):
     def test_virtual_manifest_has_no_package(self):
         self.assertIsNone(package_name("[workspace]\nmembers = []\n"))
 
-    def test_a_comment_on_the_package_header_does_not_hide_the_table(self):
-        # `[package] # metadata` is valid TOML. An exact `== "[package]"`
-        # never enters the table, and the name goes missing -- which
-        # `check_test_filter_coverage.workspace_members()` turns into the
-        # directory basename, a wrong package name rather than no name.
-        self.assertEqual(
-            package_name('[package] # metadata\nname = "foo"\n'), "foo"
-        )
-
-    def test_a_comment_on_a_later_header_still_ends_the_package_table(self):
-        # The worse direction of the same miss: an unrecognised header does
-        # not *close* `[package]` either, so a `name` belonging to a later
-        # table is returned as the package name. A confident wrong answer,
-        # not a missing one.
-        self.assertIsNone(
-            package_name(
-                '[package]\nversion = "1"\n[features] # x\nname = "wrong"\n'
-            )
-        )
-
-    def test_a_bare_bin_table_still_ends_it(self):
-        # The uncommented form must keep working: this is the case the
-        # section scoping exists for.
-        self.assertIsNone(
-            package_name('[package]\nversion = "1"\n[[bin]]\nname = "b"\n')
-        )
-
 
 class NamedTokens(unittest.TestCase):
     def test_extracts_p_from_run_nonzero_and_manifest_path_from_cargo_test(self):

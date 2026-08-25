@@ -41,12 +41,16 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 import unittest
 import warnings
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
+
+sys.path.insert(0, str(SCRIPTS))
+from toml_package_name import package_name  # noqa: E402
 
 # The spelling every real manifest in this tree uses today. An extractor must
 # read this one, or it is not an extractor.
@@ -212,6 +216,67 @@ class Sweep(unittest.TestCase):
             "a scripts/*.py file gained or lost a package-name extractor; "
             "update _EXPECTED_CARRIERS deliberately",
         )
+
+
+class SharedReaderTableScoping(unittest.TestCase):
+    """`package_name()`'s section walk, which the regex sweep above cannot see.
+
+    The sweep judges patterns. This judges the thing built on top of them:
+    which table a `name` line is read as belonging to. Both halves of the
+    module have to agree about what a key looks like -- round 2 of this PR's
+    review gave the header a comment tolerance the value side already had,
+    and round 3 found the header still lacked the quoting tolerance the value
+    side also already had. Same defect, one layer down, twice.
+    """
+
+    def test_the_plain_spelling_every_manifest_here_uses(self):
+        self.assertEqual(package_name('[package]\nname = "foo"\n'), "foo")
+
+    def test_spellings_that_are_still_the_package_table(self):
+        for header in (
+            "[package] # metadata",
+            '["package"]',
+            "['package']",
+            "[ package ]",
+            '[ "package" ] # metadata',
+        ):
+            with self.subTest(header=header):
+                self.assertEqual(
+                    package_name(f'{header}\nname = "foo"\n'), "foo", header
+                )
+
+    def test_spellings_that_are_a_different_table(self):
+        # Each of these must NOT be read as `[package]`. `[" package "]` is
+        # the case that keeps the normalisation honest: whitespace outside
+        # the quotes is insignificant, whitespace inside them is part of the
+        # key, so a reader that strips both would answer `foo` here and be
+        # wrong.
+        for header in ('[" package "]', "[package.metadata]", "[[package]]"):
+            with self.subTest(header=header):
+                self.assertIsNone(package_name(f'{header}\nname = "foo"\n'), header)
+
+    def test_an_unrecognised_header_would_not_close_the_table(self):
+        # The worse direction, and the one the round-2 report did not name: a
+        # header that is not recognised does not END `[package]` either, so a
+        # `name` under a later table comes back AS the package name. A
+        # confident wrong answer rather than a gap.
+        for later in ("[features] # x", '["features"]', "[ features ]", "[[bin]]"):
+            with self.subTest(later=later):
+                self.assertIsNone(
+                    package_name(f'[package]\nversion = "1"\n{later}\nname = "w"\n'),
+                    later,
+                )
+
+    def test_a_bin_table_before_package_does_not_win(self):
+        # Why the walk is section-scoped at all: the whole-file search it
+        # replaced returned whichever `name` came first in the file, and this
+        # workspace really does rename bin targets.
+        self.assertEqual(
+            package_name('[[bin]]\nname = "b"\n[package]\nname = "foo"\n'), "foo"
+        )
+
+    def test_a_virtual_manifest_has_no_package_name(self):
+        self.assertIsNone(package_name("[workspace]\nmembers = []\n"))
 
 
 if __name__ == "__main__":

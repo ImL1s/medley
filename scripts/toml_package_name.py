@@ -45,25 +45,53 @@ NAME_LINE = re.compile(
     r"""^\s*["']?name["']?\s*=\s*["']([^"']+)["']\s*(?:#.*)?$""", re.MULTILINE
 )
 
-# A table header, with the same trailing-comment tolerance: `[package]`,
-# `[[bin]]`, and either of those followed by `# anything`. Group 1 is the
-# header without the comment.
+# A table header line. Group `key` is the raw key between the brackets, with
+# insignificant whitespace already outside the capture; `open` says whether
+# this is an array-of-tables (`[[bin]]`).
 #
-# Recognising the header matters in both directions, and the second is the
-# one that bites. `[package] # metadata` not being recognised means the
-# `[package]` table is never entered -- a missing name, which downstream
-# becomes the directory basename. But `[features] # x` not being recognised
-# means the `[package]` table is never *left*, and then a `name = ` under a
-# later table is returned as the package name: a confident wrong answer.
+# Everything TOML lets you vary here has to be varied here, because the
+# comparison this feeds decides which table a `name` belongs to, and a header
+# that is not recognised is wrong in two directions at once:
 #
-# Both spellings are valid TOML. Neither appears in this tree today (measured
-# 2026-08-25, 0 of 81 members), which is the same "latent, not live" the rest
-# of #494 is about.
+#   [package] # metadata   the table is never ENTERED -- name goes missing,
+#                          and `workspace_members()` then answers with the
+#                          directory basename, a wrong package name
+#   [features] # x         the table is never LEFT -- a `name` under a later
+#                          table is returned AS the package name
 #
-# `[^\[\]]*` cannot express a `]` inside a quoted table key (`["a]b"]`).
-# No Cargo manifest table is spelled that way, and the section tracking this
-# replaced could not express it either.
-TABLE_HEADER = re.compile(r"^(\[\[?[^\[\]]*\]\]?)\s*(?:#.*)?$")
+# The second is the one that hurts: a confident wrong answer, not a gap.
+#
+# Both of these are the same class of miss as the value side's, so both sides
+# tolerate the same things: a trailing comment, a quoted key, and -- unlike
+# the value side -- whitespace padding, which is insignificant in a header
+# (`[ package ]` is the `package` table) but NOT inside quotes
+# (`[" package "]` is a different table, whose key really does have spaces).
+# That asymmetry is why the padding is stripped outside the quotes only.
+#
+# This is not a TOML validator and does not try to be: an unbalanced
+# `[[package]` is not valid TOML, and whatever it is read as, it is not the
+# `[package]` table.
+_TABLE_HEADER = re.compile(
+    r"^(?P<open>\[\[?)\s*(?P<key>[^\[\]]*?)\s*\]\]?\s*(?:#.*)?$"
+)
+
+
+def table_key(line: str) -> tuple[str, bool] | None:
+    """`(key, is_array_of_tables)` for a table-header line, else None.
+
+    The key is normalised the way TOML says to read it: padding outside any
+    quotes is dropped, and one matching pair of surrounding quotes is
+    removed. A dotted key (`package.metadata`) is returned whole, because it
+    names a *different* table and the caller must not mistake it for its
+    parent.
+    """
+    m = _TABLE_HEADER.match(line.strip())
+    if m is None:
+        return None
+    key = m.group("key")
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
+        key = key[1:-1]
+    return key, m.group("open") == "[["
 
 
 def name_in_block(text: str) -> str | None:
@@ -88,16 +116,17 @@ def package_name(toml_text: str) -> str | None:
     Any other table header ends the search: reaching one means `[package]`
     had no `name`, which is not something to keep looking for elsewhere.
 
-    Headers are matched through `TABLE_HEADER`, so a trailing comment on one
-    does not hide it -- see there for why the miss is worse on the ending
-    side than on the opening side.
+    Headers are read through `table_key()`, which normalises the spellings
+    TOML allows -- see there for why an unrecognised header is wrong in two
+    directions, and why the closing one is the worse of them.
     """
     in_package = False
     for line in toml_text.splitlines():
         stripped = line.strip()
-        header = TABLE_HEADER.match(stripped)
-        if header:
-            if header.group(1) == "[package]":
+        header = table_key(stripped)
+        if header is not None:
+            key, is_array = header
+            if key == "package" and not is_array:
                 in_package = True
                 continue
             if in_package:
