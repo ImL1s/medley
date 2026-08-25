@@ -9386,6 +9386,129 @@ fn chat_session_spawn_options_matches_thin_profile() {
     );
     assert!(opts.is_chat_kind);
 }
+
+#[test]
+fn chat_session_requires_visible_routing_failure_matrix() {
+    let cases: &[(&str, bool, bool, bool)] = &[
+        ("chat_unresolved_must_fail_visibly", true, false, true),
+        ("chat_resolved_may_proceed", true, true, false),
+        ("build_unresolved_is_exempt", false, false, false),
+        ("build_resolved_is_exempt", false, true, false),
+    ];
+    for (label, is_chat_kind, resolved_in_build_catalog, expected) in cases {
+        assert_eq!(
+            super::agent_ops::chat_session_requires_visible_routing_failure(
+                *is_chat_kind,
+                *resolved_in_build_catalog,
+            ),
+            *expected,
+            "[{label}]"
+        );
+    }
+}
+
+/// #489, step 1 of the issue's own acceptance criteria: **confirm
+/// empirically** which model a chat-only id's completions actually use,
+/// before trusting the static trace that motivated this issue.
+///
+/// This cannot drive a chat session through the real ACP entrypoint —
+/// `new_session`/`load_session` call `reject_chat_kind_without_feature` as
+/// their first line, and it unconditionally rejects `kind: "chat"` in every
+/// build (no `cfg` gate exists; verified by grepping every reference to
+/// that function). So this calls the exact two functions
+/// `spawn_and_register_session`'s fallback calls, in the same order, on a
+/// real (non-mocked) agent: `resolve_catalog_identity` against the build
+/// catalog, then `resolve_sampling_config_for_model` for the same id.
+///
+/// This test pins the **pre-#489-fix** substitution behavior of those two
+/// functions themselves (neither is touched by this issue's fix, which
+/// instead adds a guard in `spawn_and_register_session` before it would
+/// reach this fallback) — it is not a regression guard for the fix; that is
+/// `spawn_and_register_session_refuses_to_silently_substitute_a_chat_model`
+/// below. It exists so the claim this issue is built on is executed and
+/// observed, not just read from source.
+#[tokio::test(flavor = "current_thread")]
+async fn resolve_sampling_config_for_model_silently_substitutes_an_unresolvable_chat_id() {
+    const BUILD_DEFAULT: &str = "build-489-default";
+    const CHAT_ONLY_MODE: &str = "fast-489-chat-only";
+
+    let agent = build_agent_with_model_for_tests(BUILD_DEFAULT, "grok-build");
+    let catalog = agent.models_manager.models();
+
+    // Empirical precondition: the chat-only id genuinely has no build
+    // catalog route (this is the structural fact #489 is about).
+    let chat_id = acp::ModelId::new(CHAT_ONLY_MODE);
+    assert!(
+        crate::agent::models::resolve_catalog_identity(&catalog, &chat_id).is_none(),
+        "precondition: the chat-only id must not resolve in the build catalog"
+    );
+
+    // Empirical observation: calling the real, unmocked function the
+    // fallback path calls does NOT error and does NOT preserve the
+    // requested id -- it silently returns the build default's route.
+    let sampling = agent.resolve_sampling_config_for_model(&chat_id, None);
+    assert_ne!(
+        sampling.model, CHAT_ONLY_MODE,
+        "empirical: completions do not route to the requested chat-only id"
+    );
+    assert_eq!(
+        sampling.model, BUILD_DEFAULT,
+        "empirical: completions silently route to the build default instead"
+    );
+}
+
+/// #489's actual regression guard: `spawn_and_register_session` (not its
+/// inner fallback functions, which stay infallible and untouched -- see
+/// `ModelsManager::sampling_config`'s doc) must refuse to spawn a chat-kind
+/// session on a model id that has no build-catalog route, rather than
+/// silently substituting the build default the way it did before this fix.
+///
+/// Drives the real spawn function directly, for the same reason the
+/// empirical test above does: the ACP entrypoint that would normally reach
+/// it is unconditionally closed for `kind: "chat"`. The guard this test
+/// exercises returns before any actor thread is spawned (before the
+/// `spawn_result` await further down the same function), so this needs no
+/// `LocalSet` / actor-lifecycle scaffolding -- only the fields
+/// `chat_session_spawn_options` and the resolution block up to the guard
+/// actually read.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_and_register_session_refuses_to_silently_substitute_a_chat_model() {
+    const BUILD_DEFAULT: &str = "build-489-spawn-default";
+    const CHAT_ONLY_MODE: &str = "fast-489-spawn-chat-only";
+
+    let agent = build_agent_with_model_for_tests(BUILD_DEFAULT, "grok-build");
+    let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1);
+    let sid = acp::SessionId::new(std::sync::Arc::from(
+        "00000000-0000-0000-0000-000000000489",
+    ));
+    let cwd = xai_grok_paths::AbsPathBuf::new(std::env::temp_dir()).expect("temp cwd");
+    let spec = chat_session_spawn_options(
+        SessionInfo { id: sid, cwd: cwd.as_str().to_owned() },
+        cwd,
+        None,
+        None,
+        acp::ModelId::new(CHAT_ONLY_MODE),
+        false,
+    );
+
+    let result = agent.spawn_and_register_session(&init, spec).await;
+
+    // `SpawnedSession` (the `Ok` type) has no `Debug` impl, so `expect_err`
+    // / `unwrap_err` (both bound on `T: Debug`) are unavailable here.
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!(
+            "a chat-kind spawn on a build-catalog-absent id must fail visibly, \
+             not silently substitute the build default"
+        ),
+    };
+    let message = format!("{err:?}");
+    assert!(
+        message.contains(CHAT_ONLY_MODE),
+        "the visible failure should name the id it could not route: {message}"
+    );
+}
+
 /// `remove_session` releases the workspace binding and drains the
 /// per-session side maps. Test agents default to `workspace_ops = None`,
 /// so no other test reaches the release.

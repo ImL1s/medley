@@ -148,6 +148,35 @@ fn summary_config_or_primary(
         resolved.unwrap_or_else(|| primary.clone())
     }
 }
+/// Whether spawning must refuse to silently substitute the build default
+/// for a session model id that did not resolve against the build catalog
+/// (#489).
+///
+/// A chat-kind session whose reported "current" model is a chat-only mode
+/// (e.g. grok.com's `"fast"`) has no route in `ModelsManager`'s catalog by
+/// design — that catalog only understands build models. Before this guard,
+/// [`MvpAgent::spawn_and_register_session`]'s fallback silently called
+/// [`MvpAgent::resolve_sampling_config_for_model`], which is deliberately
+/// infallible (see [`crate::agent::models::ModelsManager::sampling_config`]),
+/// so the session was committed on the build default while the client had
+/// already been told the requested chat-only id was current — a silent,
+/// unreported model swap.
+///
+/// Build-kind sessions do **not** get this guard. An unresolvable id there
+/// already surfaces through `disallowed_custom` / `auth_hidden_custom` /
+/// `unreadiness_custom`, computed earlier by
+/// [`MvpAgent::prepare_new_session_model_plan`] against the *same* build
+/// catalog this function checks — so by the time a build-kind spawn reaches
+/// here, an intentionally-mismatched id has already been reported to the
+/// client and replaced with a *known-good* fallback chosen by that plan.
+/// This guard would be redundant there, not protective — the real fix for
+/// the build path already exists and runs earlier.
+pub(super) fn chat_session_requires_visible_routing_failure(
+    is_chat_kind: bool,
+    resolved_in_build_catalog: bool,
+) -> bool {
+    is_chat_kind && !resolved_in_build_catalog
+}
 fn catalog_identity_for_sampling(
     model_id: &acp::ModelId,
     sampling: &SamplingConfig,
@@ -5731,6 +5760,19 @@ impl MvpAgent {
                             .as_ref()
                             .is_some_and(|identity| entry.info().model == identity.route)
                     });
+                // #489: a chat-kind session whose model id has no route in
+                // this (build) catalog must not silently spawn on the build
+                // default — the client was already told this id is current.
+                // See `chat_session_requires_visible_routing_failure`'s doc
+                // for why build-kind sessions are exempt.
+                if chat_session_requires_visible_routing_failure(is_chat_kind, model.is_some()) {
+                    return Err(acp::Error::invalid_params().data(format!(
+                        "chat session model \"{}\" has no local sampling route; \
+                         chat-kind sessions cannot silently substitute a different \
+                         model than the one reported as current",
+                        session_model_id.0
+                    )));
+                }
                 let sampling = model
                     .map(|model| {
                         self.prepare_sampling_config_for_model(model, origin_client.clone())
