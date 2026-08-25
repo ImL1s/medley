@@ -24,19 +24,23 @@ const _: () = assert!(TEST_TIMING.refresh.as_millis() < TEST_TIMING.lease.as_mil
 const _: () = assert!(TEST_TIMING.poll.as_millis() < TEST_TIMING.peer_wait.as_millis());
 
 /// Timing for the contended-gates test, which parks both gates on a seeded
-/// peer claim: the peer wait has to outlast `PEER_CLAIM_HOLD` by a wide
-/// margin or a gate gives up waiting instead of contending.
+/// peer claim until each has *deterministically* signalled that it observed
+/// contention (see `test_concurrent_gates_single_flight`'s `peer_seen_hook`
+/// wiring) — the peer wait only needs to comfortably outlast that
+/// handshake, not a guessed hold duration.
 const CONTENDED_TIMING: BootstrapTiming = BootstrapTiming {
     lease: TEST_TIMING.lease,
     refresh: TEST_TIMING.refresh,
     peer_wait: Duration::from_secs(30),
     poll: TEST_TIMING.poll,
 };
-/// How long the seeded peer claim is held: long enough that both gates have
-/// certainly made their first claim attempt and latched `peer_seen`.
-/// Holding longer only costs wall time, never correctness.
-const PEER_CLAIM_HOLD: Duration = Duration::from_millis(250);
-const _: () = assert!(PEER_CLAIM_HOLD.as_millis() * 10 < CONTENDED_TIMING.peer_wait.as_millis());
+/// Hang guard for `peer_seen_hook.notified()` below: on a correctly
+/// functioning claim (mutual exclusion actually holding), both gates'
+/// *first* claim attempt fails near-instantly while the seeded peer claim
+/// is held, so this bound is never close to binding — it exists only to
+/// turn "the claim mechanism silently let a first attempt through" into a
+/// clean, distinguishable failure instead of a hung test. See #440.
+const PEER_SEEN_HANG_GUARD: Duration = Duration::from_secs(10);
 
 fn stamp_marker(db_path: &Path, value: &str) {
     with_search_index(db_path, |index| {
@@ -62,6 +66,7 @@ async fn test_claimant_reindexes_even_when_marker_exists() {
         &Arc::new(BootstrapProgress::default()),
         &TEST_TIMING,
         BootstrapRole::Launch,
+        None,
     )
     .await
     .unwrap();
@@ -118,6 +123,7 @@ async fn test_waiter_adopts_peer_marker_without_reindexing() {
         &Arc::new(BootstrapProgress::default()),
         &TEST_TIMING,
         BootstrapRole::Launch,
+        None,
     )
     .await
     .unwrap();
@@ -196,6 +202,7 @@ async fn test_waiter_gives_up_after_peer_wait() {
         &Arc::new(BootstrapProgress::default()),
         &TEST_TIMING,
         BootstrapRole::Launch,
+        None,
     )
     .await
     .unwrap();
@@ -275,6 +282,16 @@ async fn test_concurrent_gates_single_flight() {
     // existing marker — reindexes too. Once both gates have latched
     // `peer_seen`, the loser's post-claim marker check adopts the winner's
     // work however fast the winner finished.
+    //
+    // #440: "both have observed contention" used to be established by
+    // sleeping `PEER_CLAIM_HOLD` and hoping the scheduler cooperated inside
+    // it — measured 9/12, 0/12 and 7/12 failures at 250/2500/250ms on a
+    // loaded runner, with production `search_bootstrap` bytes identical
+    // across all three arms, i.e. the fixture, not the gate. Each gate now
+    // carries its own `Notify`, fired by `bootstrap_with_lease_inner` the
+    // instant its `peer_seen` latches (see `PeerSeenHook`), and the peer
+    // claim is released only once *both* have actually signalled — the
+    // real precondition, driven directly, not guessed at.
     let claim_now = chrono::Utc::now().timestamp();
     with_search_index(&search_db_path(&root), |index| {
         index.try_claim_bootstrap(claim_now, CONTENDED_TIMING.lease, "peer")
@@ -289,6 +306,14 @@ async fn test_concurrent_gates_single_flight() {
     let root_b = root;
     let pa = Arc::clone(&progress_a);
     let pb = Arc::clone(&progress_b);
+    let peer_seen_a = Arc::new(Notify::new());
+    let peer_seen_b = Arc::new(Notify::new());
+    let hook_a = Arc::clone(&peer_seen_a);
+    let hook_b = Arc::clone(&peer_seen_b);
+    // Not load-bearing for correctness any more (the Notify handshake below
+    // is what the assertion actually depends on) — kept only so both gates
+    // are scheduled at roughly the same time instead of one starting a
+    // whole poll interval ahead of the other.
     let start = Arc::new(tokio::sync::Barrier::new(2));
     let start_a = Arc::clone(&start);
     let start_b = Arc::clone(&start);
@@ -300,6 +325,7 @@ async fn test_concurrent_gates_single_flight() {
             &pa,
             &CONTENDED_TIMING,
             BootstrapRole::Launch,
+            Some(hook_a),
         )
         .await
     });
@@ -311,11 +337,38 @@ async fn test_concurrent_gates_single_flight() {
             &pb,
             &CONTENDED_TIMING,
             BootstrapRole::Launch,
+            Some(hook_b),
         )
         .await
     });
-    // Both gates are now spinning on the seeded claim; hand it over.
-    tokio::time::sleep(PEER_CLAIM_HOLD).await;
+    // Both gates are now spinning on the seeded claim. Wait for each to
+    // report — via the hook above, not a clock — that its first claim
+    // attempt has already failed against it, then hand the claim over. The
+    // bound here is a hang guard, not a duration to tune: on a correct
+    // implementation both gates fail near-instantly (the peer claim is
+    // trivially still held), so this only ever fires when a first claim
+    // attempt slipped through despite the seed, which is a claim-exclusivity
+    // defect worth reporting distinctly from a timeout.
+    match tokio::time::timeout(PEER_SEEN_HANG_GUARD, async {
+        peer_seen_a.notified().await;
+        peer_seen_b.notified().await;
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => panic!(
+            "gate(s) never observed peer contention within {PEER_SEEN_HANG_GUARD:?} — likely \
+             a first claim attempt going through despite the seeded peer claim still being \
+             held (claim exclusivity itself, not a slow runner), but read the state below \
+             rather than trust this framing: a gate that snuck through has total > 0 and \
+             probably already wrote the marker; a merely unscheduled one has neither. \
+             a_total={} b_total={} marker_present={} claim_held={:?}",
+            progress_a.total.load(Ordering::Relaxed),
+            progress_b.total.load(Ordering::Relaxed),
+            read_marker(&search_db_path(tmp.path())).is_some(),
+            has_bootstrap_claim(&search_db_path(tmp.path())),
+        ),
+    }
     with_search_index(&search_db_path(tmp.path()), |index| {
         index.release_bootstrap_claim("peer")
     })
