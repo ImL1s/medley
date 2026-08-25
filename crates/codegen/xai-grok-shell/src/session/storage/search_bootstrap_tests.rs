@@ -503,10 +503,19 @@ fn stream_doc(session_id: &str, stream: &str, revision: usize) -> SessionDoc {
 
 /// Property #1: `upsert_doc` converges to whichever write is *last in a
 /// given interleaving*, for every one of the 20 possible ways two 3-write
-/// streams targeting the same `session_id` can race. This is the property
-/// the whole "overlap is harmless" argument rests on -- not a specific
-/// scenario, but the general claim that write order, not write *origin*,
-/// determines the final row.
+/// streams targeting the same `session_id` can race, and the row is never
+/// duplicated or left partially written regardless of arrival order.
+///
+/// This is a storage-layer property of `upsert_doc` alone -- it is
+/// necessary but **not sufficient** to show overlap is harmless
+/// end-to-end. `upsert_doc` has no ownership or recency fence: last
+/// write always wins by *arrival order*, not by content freshness, so a
+/// stale claimant's write that arrives after a successor's can silently
+/// overwrite it (#515). That gap is out of scope for this test, which
+/// only asserts the SQL-layer convergence; it is pinned on its own,
+/// deliberately as a green characterization rather than a red assertion
+/// of a property nothing currently guarantees, by the test directly
+/// below this one.
 #[test]
 fn test_upsert_doc_converges_under_every_interleaving_of_two_streams() {
     const SESSION_ID: &str = "s1";
@@ -546,6 +555,42 @@ fn test_upsert_doc_converges_under_every_interleaving_of_two_streams() {
              came from"
         );
     }
+}
+
+/// Characterizes a known gap (#515), found via Codex review of this file:
+/// `upsert_doc` has no ownership or recency fence, so whichever write
+/// physically arrives last always wins -- even when it carries staler
+/// content than the row it overwrites. This models `reindex_all`'s own
+/// documented scenario ("these upserts are idempotent, not fenced"): a
+/// stale claimant that already passed its one early `claim_lost` check,
+/// then finishes its slower read+write *after* a successor already wrote
+/// fresher content for the same `session_id`.
+///
+/// This test is **green today because it pins the actual, imperfect
+/// behavior**, not the desired one -- it is not a claim that this is
+/// safe. If `upsert_doc` (or a caller) grows ownership/recency fencing,
+/// this assertion should flip deliberately; do not delete it to make a
+/// future change pass, since deleting it re-loses the coverage that
+/// caught this gap in the first place.
+#[test]
+fn test_upsert_doc_has_no_fence_against_a_later_stale_write() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("session_search.sqlite");
+    let index = SessionSearchIndex::open_or_create(&db_path).unwrap();
+
+    // The successor writes fresher content for this session first...
+    index.upsert_doc(&stream_doc("s1", "SUCCESSOR", 1)).unwrap();
+    // ...then a stale claimant's write, carrying older content it read
+    // before losing the claim, arrives after.
+    index.upsert_doc(&stream_doc("s1", "STALE", 1)).unwrap();
+
+    let hash = index.get_content_hash("s1").unwrap();
+    assert_eq!(
+        hash.as_deref(),
+        Some("STALE-rev1"),
+        "known gap (#515): upsert_doc has no ownership/recency fence, so \
+         a later write always wins even when it is the staler one"
+    );
 }
 
 /// Companion to the single-key exhaustive test: two independent
