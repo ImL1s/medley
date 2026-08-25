@@ -414,7 +414,10 @@ fn git_derived_workspace_key(cwd: &Path) -> PathBuf {
 
 /// Whether `path` resolves to the user's home directory.
 pub fn is_home_dir(path: &Path) -> bool {
-    let Some(home) = dirs::home_dir() else {
+    // `resolved_home_dir`, not a bare `dirs::home_dir()` (#493) -- lets a
+    // test redirect this via `HomeDirGuard` without the `std::env::set_var`
+    // UB the tests used to carry.
+    let Some(home) = crate::home_dir::resolved_home_dir() else {
         return false;
     };
     canonicalize_or_owned(path) == canonicalize_or_owned(&home)

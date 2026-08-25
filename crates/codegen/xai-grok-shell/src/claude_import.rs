@@ -337,9 +337,11 @@ pub fn scan_importable_settings(cwd: &Path) -> ImportPlan {
     let mut plan = ImportPlan::default();
 
     let all_paths = find_claude_settings_paths(cwd);
-    // Use dirs::home_dir() to match the resolution in config.rs and
-    // claude_import_state.rs (consistent across platforms).
-    let home = dirs::home_dir();
+    // `resolved_home_dir`, not a bare `dirs::home_dir()` (#493), to match
+    // the resolution in config.rs and claude_import_state.rs (consistent
+    // across platforms) while letting tests redirect it without the
+    // `std::env::set_var` UB a spawned-thread reader could race.
+    let home = xai_grok_workspace::home_dir::resolved_home_dir();
 
     for path in &all_paths {
         let Some(settings) = load_claude_settings(path) else {
@@ -418,7 +420,8 @@ fn scan_claude_path_dirs(cwd: &Path, plan: &mut ImportPlan) {
     let mut global_added: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
 
-    if let Some(home) = dirs::home_dir() {
+    // `resolved_home_dir`, not a bare `dirs::home_dir()` (#493).
+    if let Some(home) = xai_grok_workspace::home_dir::resolved_home_dir() {
         for (kind, sub) in [(PathKind::Skill, "skills"), (PathKind::Rule, "rules")] {
             let dir = home.join(".claude").join(sub);
             if dir.is_dir() {
@@ -1640,7 +1643,15 @@ mod tests {
         // depending on whatever the developer's real `~/.claude` happens to
         // contain (the #443 failure mode).
         let home = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set("HOME", home.path());
+        // `HomeDirGuard`, not `EnvGuard::set("HOME", ...)` (#493): a
+        // thread-local pin instead of a process-env mutation, since the
+        // async test below (`gate_resolve_permissions_with_provenance_...`)
+        // spins a tokio runtime whose worker/blocking-pool threads could
+        // race a concurrent `std::env::set_var`/`getenv` -- UB that
+        // `#[serial_test::serial]` cannot prevent (it serialises test
+        // bodies, not threads the code under test spawns). See
+        // `xai_grok_workspace::home_dir`'s doc comment.
+        let _home = xai_grok_workspace::home_dir::HomeDirGuard::pin(home.path());
         let dir = tempfile::tempdir().unwrap();
         let env = xai_grok_workspace::permission::claude_settings::load_claude_env_with_project(
             dir.path(),
@@ -2111,7 +2122,15 @@ extra_rule_dirs = ["/c/rules"]
         // `~/.claude.json` today, but that ordering is an implementation
         // detail. Isolating `$HOME` keeps `is_empty()` true independent of it.
         let home = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set("HOME", home.path());
+        // `HomeDirGuard`, not `EnvGuard::set("HOME", ...)` (#493): a
+        // thread-local pin instead of a process-env mutation, since the
+        // async test below (`gate_resolve_permissions_with_provenance_...`)
+        // spins a tokio runtime whose worker/blocking-pool threads could
+        // race a concurrent `std::env::set_var`/`getenv` -- UB that
+        // `#[serial_test::serial]` cannot prevent (it serialises test
+        // bodies, not threads the code under test spawns). See
+        // `xai_grok_workspace::home_dir`'s doc comment.
+        let _home = xai_grok_workspace::home_dir::HomeDirGuard::pin(home.path());
         let dir = tempfile::tempdir().unwrap();
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
         let servers = crate::util::config::load_claude_json_mcp_servers(dir.path(), &compat);
@@ -2136,7 +2155,15 @@ extra_rule_dirs = ["/c/rules"]
         // if the marker check ever moved or weakened. This does NOT isolate
         // `~/.grok/config.toml`; see the note below.
         let home = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set("HOME", home.path());
+        // `HomeDirGuard`, not `EnvGuard::set("HOME", ...)` (#493): a
+        // thread-local pin instead of a process-env mutation, since the
+        // async test below (`gate_resolve_permissions_with_provenance_...`)
+        // spins a tokio runtime whose worker/blocking-pool threads could
+        // race a concurrent `std::env::set_var`/`getenv` -- UB that
+        // `#[serial_test::serial]` cannot prevent (it serialises test
+        // bodies, not threads the code under test spawns). See
+        // `xai_grok_workspace::home_dir`'s doc comment.
+        let _home = xai_grok_workspace::home_dir::HomeDirGuard::pin(home.path());
         let dir = tempfile::tempdir().unwrap();
         // Drop a Claude permissions file in the tempdir; with the marker set
         // the gate should skip reading it.

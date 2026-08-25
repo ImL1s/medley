@@ -1058,6 +1058,20 @@ jobs:
           # #354: workspace proxy-header injection is first-party only.
           run_nonzero -p xai-grok-workspace --lib \
             build_proxy_headers_ -- --nocapture
+          # #493: HomeDirGuard is the pin/restore RAII underneath every
+          # HOME-isolated test that used to mutate process env; a broken pin
+          # or drop-restore would silently widen back to the set_var UB.
+          # `home_dir::`, not `home_dir::tests::`: scripts/check_new_tests_are_
+          # filtered.py infers module paths from file location only, so it
+          # cannot see the inline `#[cfg(test)] mod tests { .. }` inside
+          # home_dir.rs and would report the narrower filter as uncovered
+          # despite it working (verified: `cargo test -p xai-grok-workspace
+          # --lib home_dir::tests:: -- --nocapture` selects exactly these two
+          # tests). The bare module prefix is what the checker's inference
+          # can actually confirm, and it selects the identical two tests via
+          # the same substring match.
+          run_nonzero -p xai-grok-workspace --lib \
+            home_dir:: -- --nocapture
           run_nonzero -p xai-computer-hub-sdk --lib \
             unavailable_handlers_are_absent_from_publish_and_dispatch -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \

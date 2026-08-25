@@ -709,6 +709,16 @@ mod tests {
     // Used only by the consume-side regression test below; imported here (not at
     // module scope) so the non-test build doesn't carry an unused import.
     use xai_grok_workspace::folder_trust::repo_configs_present;
+    // Replaces `EnvGuard::set("HOME", ...)` at the three sites below (#493):
+    // that mutated process env, which is unsound whenever the test spawns a
+    // thread that reads it concurrently (tokio workers, `spawn_blocking`'s
+    // pool, `notify`) -- `#[serial_test::serial]` only serialises test
+    // *bodies*, not threads the code under test spawns itself. This pins a
+    // thread-local instead, so there is no `set_var`/`remove_var` call for
+    // any such thread to race. See `xai_grok_workspace::home_dir`'s doc
+    // comment for the full reasoning, including why the guard isn't
+    // `#[cfg(test)]`-gated in the crate that defines it.
+    use xai_grok_workspace::home_dir::HomeDirGuard;
 
     /// A `git init`'d temp dir so `find_mcp_json_files` / `find_project_configs`
     /// (which discover the enclosing repo and walk to its root) are bounded to
@@ -977,7 +987,7 @@ mod tests {
         // home; GROK_HOME-isolated store; GROK_FOLDER_TRUST unset so the
         // default-on flag applies.
         let home = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set("HOME", home.path());
+        let _home = HomeDirGuard::pin(home.path());
         let grok_home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set("GROK_HOME", grok_home.path());
         let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
@@ -1050,7 +1060,7 @@ mod tests {
         // GROK_FOLDER_TRUST unset so the default-on feature flag applies.
         use xai_grok_workspace::permission::claude_settings::load_claude_env_with_project;
         let home = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set("HOME", home.path());
+        let _home = HomeDirGuard::pin(home.path());
         let grok_home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set("GROK_HOME", grok_home.path());
         let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
@@ -1098,7 +1108,7 @@ mod tests {
         // below; GROK_HOME-isolated so the trust store is empty.
         use xai_grok_workspace::permission::claude_settings::load_claude_env_with_project;
         let home = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set("HOME", home.path());
+        let _home = HomeDirGuard::pin(home.path());
         let grok_home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set("GROK_HOME", grok_home.path());
         let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");

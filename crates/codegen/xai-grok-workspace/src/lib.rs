@@ -21,6 +21,7 @@ pub mod folder_trust;
 pub mod foreign_sessions;
 pub mod fs_notify;
 pub mod handle;
+pub mod home_dir;
 pub mod hub;
 pub mod hub_auth;
 pub mod hub_channel;
