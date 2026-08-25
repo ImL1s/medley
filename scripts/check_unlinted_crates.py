@@ -42,7 +42,7 @@ from pathlib import Path
 
 _MEMBERS_BLOCK = re.compile(r"^members\s*=\s*\[(.*?)^\]", re.MULTILINE | re.DOTALL)
 _QUOTED = re.compile(r"""["']([^"']+)["']""")
-_PACKAGE_NAME = re.compile(r"""^name\s*=\s*["']([^"']+)["']\s*(?:#.*)?$""")
+_PACKAGE_NAME = re.compile(r"""^["']?name["']?\s*=\s*["']([^"']+)["']\s*(?:#.*)?$""")
 _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
 _P_FLAG = re.compile(r"(?:^|[\s\\])(?:-p|--package)\s+([A-Za-z0-9][A-Za-z0-9_-]*)")
 

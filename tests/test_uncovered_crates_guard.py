@@ -19,12 +19,15 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 from check_uncovered_crates import (  # noqa: E402
+    AllowlistError,
     evaluate,
     load_allowlist,
     main,
     named_tokens,
     package_name,
+    read_reasons,
     src_has_tests,
+    write_allowlist,
 )
 
 
@@ -146,7 +149,7 @@ class Evaluate(unittest.TestCase):
             report = evaluate(
                 root=root,
                 workflow_text="run_nonzero -p covered --lib foo\n",
-                allowlisted=set(),
+                allowlisted={},
             )
         self.assertEqual(report.has_tests, frozenset({"covered", "gap", "prod-mc-proxy"}))
         self.assertEqual(report.named, frozenset({"covered"}))
@@ -159,7 +162,11 @@ class Evaluate(unittest.TestCase):
             report = evaluate(
                 root=root,
                 workflow_text="run_nonzero -p covered --lib foo\n",
-                allowlisted={"gap", "prod-mc-proxy", "covered"},
+                allowlisted={
+                    "gap": "why",
+                    "prod-mc-proxy": "why",
+                    "covered": "why",
+                },
             )
         self.assertFalse(report.new_gaps)
         self.assertEqual(report.stale, frozenset({"covered"}))
@@ -174,7 +181,7 @@ class Evaluate(unittest.TestCase):
                     "run_nonzero -p covered --lib foo\n"
                     "run_nonzero -p gap --lib foo\n"
                 ),
-                allowlisted=set(),
+                allowlisted={},
             )
         self.assertFalse(report.new_gaps)
         self.assertIn("prod-mc-proxy", report.has_tests)
@@ -193,7 +200,7 @@ class Evaluate(unittest.TestCase):
                     "cargo clippy --manifest-path crates/codegen/tools/Cargo.toml "
                     "--all-targets -- -D warnings\n"
                 ),
-                allowlisted=set(),
+                allowlisted={},
             )
             self.assertEqual(clippy_only.new_gaps, frozenset({"tools"}))
 
@@ -204,26 +211,93 @@ class Evaluate(unittest.TestCase):
                     "--all-targets -- -D warnings\n"
                     "run_nonzero -p tools --lib some_test -- --nocapture\n"
                 ),
-                allowlisted=set(),
+                allowlisted={},
             )
             self.assertFalse(with_test_lane.new_gaps)
 
 
 class AllowlistFile(unittest.TestCase):
-    def test_skips_comments_and_blanks(self):
+    """The allowlist records *what* was decided, not only that someone did.
+
+    Names only, which this file used to be, cannot distinguish "upstream
+    crate, its tests are upstream's" from "added in a hurry during a sync to
+    get CI green" -- and one of those is fine while the other is not (#504).
+    """
+
+    def _write(self, tmp: str, body: str) -> Path:
+        path = Path(tmp) / "allowlist"
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    def test_skips_comments_and_blanks_and_keeps_the_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                tmp,
+                """\
+                # First burn-down targets: xai-grok-secrets and xai-chat-state.
+
+                gap = upstream-only; no fork commits
+                # ignored
+                """,
+            )
+            self.assertEqual(load_allowlist(path), {"gap": "upstream-only; no fork commits"})
+
+    def test_a_bare_name_is_an_error(self):
+        # The exact shape of every line this file held before #504.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "gap\n")
+            with self.assertRaises(AllowlistError) as caught:
+                load_allowlist(path)
+            self.assertIn("expected `<crate> = <reason>`", str(caught.exception))
+
+    def test_an_empty_reason_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "gap =   \n")
+            with self.assertRaises(AllowlistError) as caught:
+                load_allowlist(path)
+            self.assertIn("has no reason", str(caught.exception))
+
+    def test_a_reason_may_contain_an_equals_sign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "gap = covered by --features x=y elsewhere\n")
+            self.assertEqual(
+                load_allowlist(path), {"gap": "covered by --features x=y elsewhere"}
+            )
+
+    def test_write_allowlist_carries_existing_reasons_forward(self):
+        # A `--write-allowlist` run that re-bootstrapped every line would
+        # erase the justifications through the tool that maintains the file:
+        # the #504 defect returning by the write path instead of the read one.
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "allowlist"
-            path.write_text(
-                "# First burn-down targets: xai-grok-secrets and xai-chat-state.\n"
-                "\n"
-                "gap\n"
-                "# ignored\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(load_allowlist(path), {"gap"})
+            write_allowlist(path, {"kept", "fresh"}, {"kept": "upstream-only, measured"})
+            loaded = load_allowlist(path)
+            self.assertEqual(loaded["kept"], "upstream-only, measured")
+            self.assertEqual(loaded["fresh"], "tests run in no ci.yml lane; not yet triaged")
+
+    def test_read_reasons_is_lenient_where_load_allowlist_is_strict(self):
+        # `--write-allowlist` has to be able to read the file it repairs,
+        # including the names-only format it replaces. The verifying path
+        # must not gain the same tolerance, or the requirement is decorative.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "bare\nwith = a reason\n")
+            self.assertEqual(read_reasons(path), {"with": "a reason"})
+            with self.assertRaises(AllowlistError):
+                load_allowlist(path)
 
 
 class Main(unittest.TestCase):
+    @staticmethod
+    def _real_argv(allowlist: Path) -> list[str]:
+        return [
+            "--workflow",
+            str(REPO / ".github" / "workflows" / "ci.yml"),
+            "--root",
+            str(REPO),
+            "--allowlist",
+            str(allowlist),
+        ]
+
     def test_exits_1_on_a_new_gap(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -248,19 +322,64 @@ class Main(unittest.TestCase):
             )
 
     def test_checked_in_allowlist_matches_the_repo(self):
-        self.assertEqual(
-            main(
-                [
-                    "--workflow",
-                    str(REPO / ".github" / "workflows" / "ci.yml"),
-                    "--root",
-                    str(REPO),
-                    "--allowlist",
-                    str(REPO / "tests" / "ci" / "uncovered-crates.allowlist"),
-                ]
+        self.assertEqual(main(self._real_argv(_REAL_ALLOWLIST)), 0)
+
+
+_REAL_ALLOWLIST = REPO / "tests" / "ci" / "uncovered-crates.allowlist"
+
+
+class CheckedInAllowlist(unittest.TestCase):
+    """The real file, against the real tree (#504).
+
+    The assertions below run on today's actual entries rather than on a fixed
+    synthetic corpus, because a corpus of stable values agrees with itself
+    whatever the file says. Here the file and the tree can disagree, and the
+    tests are what makes the disagreement audible.
+    """
+
+    def test_every_entry_carries_a_reason(self):
+        entries = load_allowlist(_REAL_ALLOWLIST)
+        self.assertTrue(entries)
+        missing = sorted(name for name, reason in entries.items() if not reason.strip())
+        self.assertEqual(missing, [], f"allowlist entries with no reason: {missing}")
+
+    def test_dropping_an_entry_is_not_silent(self):
+        # The migration to `<name> = <reason>` had to preserve all 38 names.
+        # Nothing has to trust that it did: an entry that goes missing turns
+        # its crate back into a new gap, which is red. This runs that, so the
+        # count is load-bearing rather than a claim in a commit message.
+        entries = load_allowlist(_REAL_ALLOWLIST)
+        report = evaluate(
+            root=REPO,
+            workflow_text=(REPO / ".github" / "workflows" / "ci.yml").read_text(
+                encoding="utf-8"
             ),
-            0,
+            allowlisted=entries,
         )
+        dropped = sorted(set(entries) & report.has_tests)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            trimmed = Path(tmp) / "allowlist"
+            trimmed.write_text(
+                "".join(
+                    f"{name} = {reason}\n"
+                    for name, reason in sorted(entries.items())
+                    if name != dropped
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(main(Main._real_argv(trimmed)), 1)
+
+    def test_a_bare_name_in_the_real_file_fails_the_run(self):
+        # The pre-#504 spelling of a real line, in the real file's place: the
+        # guard must exit non-zero rather than treat the entry as exempt.
+        entries = load_allowlist(_REAL_ALLOWLIST)
+        with tempfile.TemporaryDirectory() as tmp:
+            regressed = Path(tmp) / "allowlist"
+            lines = []
+            for i, (name, reason) in enumerate(sorted(entries.items())):
+                lines.append(f"{name}\n" if i == 0 else f"{name} = {reason}\n")
+            regressed.write_text("".join(lines), encoding="utf-8")
+            self.assertEqual(main(Main._real_argv(regressed)), 2)
 
 
 if __name__ == "__main__":
