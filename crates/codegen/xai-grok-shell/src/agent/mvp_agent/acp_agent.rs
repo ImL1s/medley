@@ -1233,6 +1233,24 @@ impl acp::Agent for MvpAgent {
         };
         let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
         let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
+        // Codex review finding on #505 (this PR), agent_ops.rs:5768: a
+        // chat-kind session with no explicit `custom_model_id` fell back to
+        // the *build* catalog's current model here, while the client is
+        // told below (via `chat_new_session_model_state`) that the *chat*
+        // catalog's own default is current — the same silent
+        // reported-vs-actual mismatch this PR's spawn-time guard exists to
+        // catch (`chat_session_requires_visible_routing_failure`), just
+        // reached through the far more common no-explicit-id path instead
+        // of an explicit-but-unroutable id. Fetch the chat catalog once,
+        // early, for chat-kind sessions, and use its own default as the
+        // fallback instead of the build catalog's, so the existing guard
+        // judges the id that will actually be reported. Reused again at
+        // its later ("models" field) use site instead of fetching twice.
+        let chat_model_state = if is_chat_kind {
+            Some(self.chat_modes.model_state().await)
+        } else {
+            None
+        };
         let prepared_model_plan = if is_chat_kind {
             None
         } else {
@@ -1259,7 +1277,11 @@ impl acp::Agent for MvpAgent {
         let fallback_model_id = prepared_model_plan
             .as_ref()
             .map(|plan| plan.session_model_id.clone())
-            .unwrap_or_else(|| self.models_manager.current_model_id());
+            .unwrap_or_else(|| {
+                chat_session_fallback_model_id(chat_model_state.as_ref(), || {
+                    self.models_manager.current_model_id()
+                })
+            });
         // An exact model-declared harness is a prerequisite, not a best-effort
         // hint. Stock non-strict harnesses intentionally allow an explicit
         // agent profile (including its own ready model pin) to keep its prompt
@@ -1489,7 +1511,11 @@ impl acp::Agent for MvpAgent {
         let (models, model_presentation) = if is_chat_kind {
             (
                 chat_new_session_model_state(
-                    self.chat_modes.model_state().await,
+                    // Reuses the snapshot fetched above for the
+                    // chat-catalog-aware fallback (#489 follow-up) rather
+                    // than fetching `/rest/modes` twice.
+                    chat_model_state
+                        .expect("chat_model_state is fetched whenever is_chat_kind"),
                     session_initial_model
                         .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
                 ),

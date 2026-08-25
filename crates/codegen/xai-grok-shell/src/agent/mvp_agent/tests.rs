@@ -9407,6 +9407,89 @@ fn chat_session_requires_visible_routing_failure_matrix() {
     }
 }
 
+/// #489 follow-up: Codex review on PR #505 (`agent_ops.rs:5768`) found that
+/// a chat-kind session with **no** explicit `custom_model_id` fell back to
+/// the build catalog's current model, while the client is told the *chat*
+/// catalog's own default is current a few lines later -- the same silent
+/// mismatch the spawn-time guard exists to catch, reached through the far
+/// more common no-explicit-id path. `chat_session_fallback_model_id` is the
+/// fix: pins that a chat-kind fallback uses the chat catalog's own default,
+/// and a build-kind fallback is untouched (still the build default).
+#[test]
+fn chat_session_fallback_model_id_matrix() {
+    fn state_with_current(id: &str) -> acp::SessionModelState {
+        acp::SessionModelState::new(acp::ModelId::new(id.to_owned()), Vec::new())
+    }
+    // label, chat_model_state, expected
+    let chat_case_label = "chat_kind_uses_the_chat_catalogs_own_default";
+    let chat_state = state_with_current("chat-catalog-default");
+    let resolved = chat_session_fallback_model_id(Some(&chat_state), || {
+        acp::ModelId::new("build-catalog-default")
+    });
+    assert_eq!(
+        resolved.0.as_ref(),
+        "chat-catalog-default",
+        "[{chat_case_label}]"
+    );
+
+    let build_case_label = "build_kind_is_unaffected_still_the_build_default";
+    let resolved = chat_session_fallback_model_id(None, || {
+        acp::ModelId::new("build-catalog-default")
+    });
+    assert_eq!(
+        resolved.0.as_ref(),
+        "build-catalog-default",
+        "[{build_case_label}]"
+    );
+}
+
+/// #489 follow-up: composes the two decisions above the way `session/new`
+/// actually does -- resolve the fallback with
+/// `chat_session_fallback_model_id`, then judge it with
+/// `chat_session_requires_visible_routing_failure` -- and shows the
+/// previously-silent no-explicit-id case now fails visibly, same as the
+/// explicit-id case #489 already covered.
+///
+/// Same-tree red/green for this composition: with the fallback still
+/// computed as the (wrong, pre-fix) build default, `resolved_in_build_catalog`
+/// is trivially `true` (a build id resolves in the build catalog by
+/// construction) and the guard stays quiet -- reproducing the exact bug.
+/// Composed with the fix, the fallback is the chat catalog's own default,
+/// `resolved_in_build_catalog` is `false` (chat and build ids are different
+/// namespaces), and the guard now fires.
+#[test]
+fn chat_session_default_path_now_fails_visibly_like_the_explicit_id_path() {
+    let chat_state = acp::SessionModelState::new(
+        acp::ModelId::new("chat-catalog-default"),
+        Vec::new(),
+    );
+    let build_default = || acp::ModelId::new("build-catalog-default");
+
+    // Pre-fix shape: the wrong (build-catalog) fallback trivially "resolves"
+    // in the build catalog, so the guard never fires -- this is the bug.
+    let pre_fix_fallback = build_default();
+    let pre_fix_resolved_in_build_catalog = pre_fix_fallback.0.as_ref() == "build-catalog-default";
+    assert!(
+        !super::agent_ops::chat_session_requires_visible_routing_failure(
+            true,
+            pre_fix_resolved_in_build_catalog,
+        ),
+        "pre-fix: the guard must stay silent given the old (wrong) fallback -- reproduces the bug"
+    );
+
+    // Post-fix: the correct (chat-catalog) fallback does not resolve in the
+    // build catalog (different namespace), so the guard now fires.
+    let fixed_fallback = chat_session_fallback_model_id(Some(&chat_state), build_default);
+    let fixed_resolved_in_build_catalog = fixed_fallback.0.as_ref() == "build-catalog-default";
+    assert!(
+        super::agent_ops::chat_session_requires_visible_routing_failure(
+            true,
+            fixed_resolved_in_build_catalog,
+        ),
+        "post-fix: the guard must now fire for the no-explicit-id default path"
+    );
+}
+
 /// #489, step 1 of the issue's own acceptance criteria: **confirm
 /// empirically** which model a chat-only id's completions actually use,
 /// before trusting the static trace that motivated this issue.
