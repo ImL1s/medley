@@ -8,6 +8,7 @@ counted as a test when its attribute was already there, and a module-path
 filter that cannot match a bare function name.
 """
 
+import re
 import subprocess
 import sys
 import textwrap
@@ -24,7 +25,12 @@ from check_new_tests_are_filtered import (  # noqa: E402
     target_of,
     targets_of,
 )
-from check_test_filter_coverage import _parse_workflow, parse_workflow, uncovered  # noqa: E402
+from check_test_filter_coverage import (  # noqa: E402
+    _parse_workflow,
+    parse_workflow,
+    uncovered,
+    workspace_members,
+)
 
 
 class ParseWorkflowFeatures(unittest.TestCase):
@@ -131,6 +137,183 @@ class ParseWorkflow(unittest.TestCase):
             res = parse_workflow(wf)
         self.assertEqual(res, {})
         self.assertIn("warning: ignoring filter token '$filter'", f.getvalue())
+
+
+class ParseWorkflowRealCorpus(unittest.TestCase):
+    """`parse_workflow()` must recognise every crate a real `run_nonzero`/
+    `cargo test` line in `ci.yml` names (#455).
+
+    Enumerated independently of `_parse_workflow()`: a plain per-token scan
+    (`str.split()`) over each physical, backslash-joined line -- not the
+    guard's own `shlex`-based flag walk. `--manifest-path` resolves to a
+    crate name via directory basename here, not by reading the manifest as
+    production does; measured against the real workflow this never diverges
+    (no invocation below names one of the handful of members whose package
+    name differs from its directory's last component), so the simpler
+    resolution is safe for this corpus without importing production's own.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (REPO / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        joined: list[str] = []
+        pending = ""
+        for raw in cls.text.splitlines():
+            rstripped = raw.rstrip()
+            if rstripped.endswith("\\"):
+                pending += rstripped[:-1] + " "
+                continue
+            joined.append(pending + raw)
+            pending = ""
+        crates: set[str] = set()
+        for line in joined:
+            if "run_nonzero" not in line and "cargo test" not in line:
+                continue
+            tokens = line.split()
+            for i, tok in enumerate(tokens):
+                if tok in ("-p", "--package") and i + 1 < len(tokens):
+                    crates.add(tokens[i + 1])
+                if tok == "--manifest-path" and i + 1 < len(tokens):
+                    path = tokens[i + 1].strip("'\"")
+                    if "/" in path:
+                        crates.add(path.rsplit("/", 2)[-2])
+        cls.real_crates = crates
+
+    def test_the_corpus_is_not_empty(self):
+        self.assertGreater(len(self.real_crates), 20, self.real_crates)
+
+    def test_every_real_invocation_crate_is_recognised(self):
+        parsed = parse_workflow(self.text)
+        missed = sorted(self.real_crates - set(parsed))
+        self.assertEqual(missed, [], f"parse_workflow() misses real crates: {missed}")
+
+    def test_the_pattern_still_discriminates(self):
+        # A `cargo clippy` line naming a crate must contribute nothing --
+        # only `run_nonzero` / `cargo test` invoke the test binary.
+        wf = "cargo clippy -p someone --all-targets -- -D warnings\n"
+        self.assertEqual(parse_workflow(wf), {})
+
+    def test_a_narrowed_pattern_would_fail_this_corpus(self):
+        # Proof the corpus can fail: a plausible narrowing that only
+        # recognises `run_nonzero`, dropping `cargo test` support, misses
+        # any real `cargo test -p`/`cargo test --manifest-path` line -- and
+        # this tree has both forms (`_RUNNER` in the guard covers both).
+        narrowed = re.compile(r"^\s*run_nonzero\b")
+        joined = re.sub(r"\\\s*\n\s*", " ", self.text)
+        missed = [
+            line
+            for line in joined.splitlines()
+            if "cargo test" in line
+            and ("-p " in line or "--package " in line or "--manifest-path" in line)
+            and not narrowed.match(line.strip())
+        ]
+        self.assertTrue(missed, "corpus cannot distinguish a run_nonzero-only pattern")
+
+
+class WorkspaceMembersRealCorpus(unittest.TestCase):
+    """`workspace_members()`'s inline `name = "..."` regex is a third,
+    independent copy of the same identifier-classifying pattern found in
+    `check_unlinted_crates.py` and `check_uncovered_crates.py` (#455).
+
+    Enumerated independently: a hand-rolled `[package]`-section tracker,
+    not the guard's own whole-file `re.search`.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        root = REPO
+        text = (root / "Cargo.toml").read_text(encoding="utf-8")
+        block = re.search(r"^members\s*=\s*\[(.*?)^\]", text, re.MULTILINE | re.DOTALL)
+        members = re.findall(r'"([^"]+)"', block.group(1)) if block else []
+        names: dict[str, str] = {}
+        for member in members:
+            manifest = root / member / "Cargo.toml"
+            if not manifest.is_file():
+                continue
+            in_package = False
+            for line in manifest.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped == "[package]":
+                    in_package = True
+                    continue
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    in_package = False
+                    continue
+                if not in_package or "=" not in stripped:
+                    continue
+                key = stripped.split("=", 1)[0].strip().strip("'\"")
+                if key == "name":
+                    value = stripped.split("=", 1)[1].strip()
+                    m = re.match(r'^"([^"]+)"', value)
+                    if m:
+                        names[member] = m.group(1)
+                    break
+        cls.ground_truth = names
+
+    def test_the_real_corpus_is_not_empty(self):
+        self.assertGreater(len(self.ground_truth), 20, self.ground_truth)
+
+    def test_matches_the_independently_read_ground_truth_today(self):
+        # Not a tautology: `self.ground_truth` is read by this test's own
+        # scanner, not by `workspace_members()`. Measured to agree exactly
+        # with production today (81/81) -- this pins that fact so a future
+        # divergence is caught rather than assumed away.
+        self.assertEqual(workspace_members(REPO), set(self.ground_truth.values()))
+
+    def test_a_trailing_comment_is_already_tolerated(self):
+        # Unlike its two siblings, this regex carries no `$` end anchor, so
+        # a trailing comment does not stop it from matching -- verified
+        # here rather than assumed, since the other two copies of this
+        # pattern (`check_unlinted_crates.py`, `check_uncovered_crates.py`)
+        # both need `(?:#.*)?` explicitly for the same case.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["m"]\n', encoding="utf-8"
+            )
+            (root / "m").mkdir()
+            (root / "m" / "Cargo.toml").write_text(
+                '[package]\nname = "foo" # comment\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(workspace_members(root), {"foo"})
+
+    def test_a_single_quoted_value_is_a_known_unfixed_gap_see_issue_494(self):
+        # Double-quote only in the value; unlike the trailing-comment case
+        # above, there is no anchor to blame here -- the value's quote
+        # class is checked, and `'foo'` never matches `"([^"]+)"`. The
+        # regex misses the line entirely and falls back to the directory
+        # basename -- "m", not the real package name "foo". See #494.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["m"]\n', encoding="utf-8"
+            )
+            (root / "m").mkdir()
+            (root / "m" / "Cargo.toml").write_text(
+                "[package]\nname = 'foo'\nversion = \"0.1.0\"\n", encoding="utf-8"
+            )
+            self.assertEqual(workspace_members(root), {"m"})
+
+    def test_a_quoted_key_is_a_known_unfixed_gap_see_issue_494(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["m"]\n', encoding="utf-8"
+            )
+            (root / "m").mkdir()
+            (root / "m" / "Cargo.toml").write_text(
+                '[package]\n"name" = "foo"\nversion = "0.1.0"\n', encoding="utf-8"
+            )
+            self.assertEqual(workspace_members(root), {"m"})
 
 
 class AddedTests(unittest.TestCase):
