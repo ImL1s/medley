@@ -29,7 +29,7 @@ mod tests {
             ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent,
         };
 
-        let auth = load_prod_auth().expect("No auth.json — run `grok login`");
+        let auth = load_prod_auth().expect("No auth.json — run `grok login`"); // auth-instruction-guard: exempt — #[ignore] dev smoke test, developer-facing
         let am = Arc::new(crate::auth::AuthManager::new(
             &crate::util::grok_home::grok_home(),
             crate::auth::GrokComConfig::default(),
