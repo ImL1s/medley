@@ -8,7 +8,6 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use agent_client_protocol as acp;
 use tempfile::TempDir;
 
 use xai_grok_shell::session::storage::{
