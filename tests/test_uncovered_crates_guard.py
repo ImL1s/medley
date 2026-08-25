@@ -31,6 +31,9 @@ from check_uncovered_crates import (  # noqa: E402
     src_has_tests,
     write_allowlist,
 )
+from check_unlinted_crates import package_name as _unlinted_package_name  # noqa: E402
+from check_test_filter_coverage import parse_workflow as _parse_workflow_oracle  # noqa: E402
+from toml_package_name import package_name as _toml_package_name  # noqa: E402
 
 
 def _write(path: Path, body: str) -> None:
@@ -106,6 +109,173 @@ class NamedTokens(unittest.TestCase):
         # continuation line is where the statement actually ends.
         wf = "run_nonzero -p continued --lib \\\n  some_test_name -- --nocapture\n"
         self.assertEqual(named_tokens(wf), {"continued"})
+
+
+def _naive_package_name(toml_text: str) -> str | None:
+    """`[package]` name via plain string ops -- deliberately not `toml_package_name`.
+
+    Only the value-line extraction is reimplemented; the `[section]` walk
+    above it is shared structure, not the pattern under test (#455). This is
+    what makes the corpus below non-circular: `toml_package_name.package_name`
+    cannot pass by construction, because nothing here is built from it.
+    """
+    in_package = False
+    for line in toml_text.splitlines():
+        stripped = line.strip()
+        if stripped == "[package]":
+            in_package = True
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_package:
+                return None
+            continue
+        if not in_package:
+            continue
+        key, sep, rest = stripped.partition("=")
+        if key.strip() != "name" or not sep:
+            continue
+        rest = rest.strip()
+        if not rest or rest[0] not in ('"', "'"):
+            continue
+        quote = rest[0]
+        end = rest.find(quote, 1)
+        if end == -1:
+            continue
+        value, remainder = rest[1:end], rest[end + 1 :].strip()
+        if remainder and not remainder.startswith("#"):
+            continue  # trailing junk that is not a comment: not valid TOML
+        return value
+    return None
+
+
+def _real_manifests() -> dict[Path, str]:
+    """Every real `Cargo.toml` under `_CRATE_ROOTS`, naively-extracted name.
+
+    Enumerated from the SAME roots `iter_crates()` walks, but the value on
+    each is read by `_naive_package_name`, not `toml_package_name` -- so this
+    corpus is not the thing it is testing.
+    """
+    found: dict[Path, str] = {}
+    for base in _CRATE_ROOTS:
+        base_dir = REPO / base
+        if not base_dir.is_dir():
+            continue
+        for manifest in sorted(base_dir.rglob("Cargo.toml")):
+            text = manifest.read_text(encoding="utf-8", errors="ignore")
+            name = _naive_package_name(text)
+            if name is not None:
+                found[manifest] = name
+    return found
+
+
+class PackageNameCorpus(unittest.TestCase):
+    """`toml_package_name.package_name` against every real manifest.
+
+    #506 moved the tolerant reader into `scripts/toml_package_name.py` so
+    the sibling guards cannot drift. These tests pin that (1) the shared
+    function still matches a naive walk of the tree, (2) both scripts still
+    *re-export that function* rather than growing a private copy, and (3)
+    the trailing-comment form #464 fixed is still recognised. A private copy
+    would make (2) fail even if (1) happened to agree on today's manifests.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.manifests = _real_manifests()
+
+    def test_the_corpus_is_not_empty(self):
+        # ~78 real manifests under crates/ + prod/ at the time this was
+        # written; a scan that silently finds nothing would pass every
+        # assertion below while checking nothing at all.
+        self.assertGreater(len(self.manifests), 50, len(self.manifests))
+
+    def test_every_real_manifest_name_is_read_correctly(self):
+        missed = {
+            str(path): (expected, _toml_package_name(path.read_text(encoding="utf-8")))
+            for path, expected in self.manifests.items()
+            if _toml_package_name(path.read_text(encoding="utf-8")) != expected
+        }
+        self.assertEqual(missed, {}, missed)
+
+    def test_a_trailing_comment_form_is_recognised(self):
+        # Constructed rather than pulled from the tree: no real manifest is
+        # spelled this way today (measured), which is the corpus's own limit.
+        text = '[package]\nname = "foo" # renamed pending #999\nversion = "0.1.0"\n'
+        self.assertEqual(_toml_package_name(text), "foo")
+
+    def test_a_trailing_comment_with_no_space_is_recognised(self):
+        text = '[package]\nname = "foo"# no space\n'
+        self.assertEqual(_toml_package_name(text), "foo")
+
+    def test_the_pattern_still_discriminates(self):
+        # Trailing text that is not a `#` comment is not valid TOML and must
+        # not be accepted just because the line starts with a quoted name.
+        self.assertIsNone(_toml_package_name('[package]\nname = "foo" extra\n'))
+        self.assertIsNone(_toml_package_name("[workspace]\nmembers = []\n"))
+
+    def test_both_scripts_reexport_the_shared_reader(self):
+        # The #506 envelope: if a sibling grows a private copy again, this
+        # fails even when the copy still agrees on today's manifests.
+        self.assertIs(package_name, _toml_package_name)
+        self.assertIs(_unlinted_package_name, _toml_package_name)
+
+    def test_agrees_with_the_sibling_script_on_every_real_manifest(self):
+        disagreements = {
+            str(path): (
+                _toml_package_name(text),
+                package_name(text),
+                _unlinted_package_name(text),
+            )
+            for path, _ in self.manifests.items()
+            for text in [path.read_text(encoding="utf-8")]
+            if not (
+                _toml_package_name(text)
+                == package_name(text)
+                == _unlinted_package_name(text)
+            )
+        }
+        self.assertEqual(disagreements, {}, disagreements)
+
+    def test_agrees_with_the_sibling_script_on_the_trailing_comment_form(self):
+        text = '[package]\nname = "foo" # renamed pending #999\n'
+        self.assertEqual(_toml_package_name(text), _unlinted_package_name(text))
+        self.assertEqual(_toml_package_name(text), package_name(text))
+
+
+class NamedTokensCorpus(unittest.TestCase):
+    """`named_tokens()` against real `ci.yml`, enumerated by a different parser.
+
+    `check_test_filter_coverage.parse_workflow()` is `shlex`-based structure
+    parsing (#455's own scope excludes it as a corpus target in its own
+    right), but it already extracts `-p` / `--package` / `--manifest-path`
+    crate identity from the same `run_nonzero` / `cargo test` lines this
+    regex does, independently and via a different mechanism. That makes it a
+    legitimate oracle for THIS regex's identifiers, even though it is not
+    itself corpus-tested here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        workflow_text = (REPO / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        cls.tokens = named_tokens(workflow_text)
+        cls.oracle_crates: set[str] = set()
+        for crate, targets in _parse_workflow_oracle(workflow_text).items():
+            if any(targets.values()):
+                cls.oracle_crates.add(crate)
+
+    def test_the_corpus_is_not_empty(self):
+        self.assertGreater(len(self.oracle_crates), 20, len(self.oracle_crates))
+
+    def test_every_oracle_crate_is_a_named_token(self):
+        # The oracle only ever names a crate by its Cargo package name
+        # (`-p`/`--manifest-path` resolved to the manifest's own `name`),
+        # whereas `named_tokens()` also collects bare directory basenames
+        # from `--manifest-path` -- a strict superset, not an exact match.
+        # So the assertion is containment, not equality.
+        missed = self.oracle_crates - self.tokens
+        self.assertEqual(missed, set(), missed)
 
 
 class SrcHasTests(unittest.TestCase):

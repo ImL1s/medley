@@ -13,6 +13,8 @@ commit -- so nothing below touches the repository's own tree.
 
 from __future__ import annotations
 
+import re
+import shlex
 import sys
 import tempfile
 import textwrap
@@ -201,6 +203,69 @@ class LintedTokens(unittest.TestCase):
         # not disqualify an otherwise-clean, unmasked invocation.
         text = _workflow(CLIPPY.format(d="xai-grok-shell") + "  # keep")
         self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+
+def _independent_linted_crates(workflow_text: str) -> set[str]:
+    """Real deny-level `cargo clippy --manifest-path X` directories, found by
+    `shlex`-tokenizing each line -- deliberately not
+    `linted_invocation_tokens()`'s regex/substring checks.
+
+    Every discrimination case above (`|| true`, `;`, pipes, unknown
+    spellings, comments) already has a hand-written test in `LintedTokens`;
+    what that class cannot show is whether the pattern is right about the
+    real file, since its own fixtures chose the examples (#455). This is
+    the other leg: comment-stripping and operator-disqualifying are done
+    here with plain string ops and `shlex`, not the production regex, and
+    "does this token look like `-D warnings`" is answered by checking two
+    separate shlex tokens rather than a literal substring match.
+    """
+    lines: list[str] = []
+    for raw in workflow_text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("#"):
+            continue
+        lines.append(raw.split("#", 1)[0] if "#" in raw else raw)
+    joined = re.sub(r"\\\s*\n\s*", " ", "\n".join(lines))
+    found: set[str] = set()
+    for line in joined.splitlines():
+        if "cargo clippy" not in line:
+            continue
+        if any(op in line for op in (";", "&", "|")):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            continue
+        if "--all-targets" not in tokens:
+            continue
+        if not ("-D" in tokens and "warnings" in tokens):
+            continue
+        for i, tok in enumerate(tokens):
+            if tok == "--manifest-path" and i + 1 < len(tokens):
+                found.add(Path(tokens[i + 1]).parent.name)
+    return found
+
+
+class LintedTokensCorpus(unittest.TestCase):
+    """`linted_invocation_tokens()` against the real `ci.yml`, enumerated by
+    `_independent_linted_crates` rather than the pattern under test.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow_text = (REPO / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        cls.oracle = _independent_linted_crates(cls.workflow_text)
+        cls.real = set(linted_invocation_tokens(cls.workflow_text).manifest_dirs)
+
+    def test_the_corpus_is_not_empty(self):
+        # A silent-empty scan would pass the agreement check below by
+        # vacuously agreeing with nothing.
+        self.assertGreater(len(self.oracle), 3, self.oracle)
+
+    def test_agrees_with_an_independently_tokenized_reading_of_the_real_workflow(self):
+        self.assertEqual(self.real, self.oracle)
 
 
 class PackageName(unittest.TestCase):
