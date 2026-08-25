@@ -176,6 +176,7 @@ pub(super) fn heal_unusable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn has_corrupt_sibling(dir: &Path) -> bool {
@@ -211,7 +212,14 @@ mod tests {
         has_corrupt_sibling(tmp.path())
     }
 
+    /// #475: the `Ok(false)` arm below bumps `CACHE_EPOCH`, a process-global
+    /// counter `search_bootstrap.rs::reindex_all` reads to decide whether
+    /// *its own* cache was healed mid-run. That reader has no way to tell
+    /// this test's unrelated heal from its own, so both sides of the
+    /// coupling carry the same `#[serial(search_cache_epoch)]` tag — see
+    /// `search_bootstrap_tests.rs::test_claimant_reindexes_even_when_marker_exists`.
     #[test]
+    #[serial(search_cache_epoch)]
     fn heal_quarantines_only_on_confirmed_corruption() {
         assert!(!quarantined_after(|_| Ok(true)), "healthy: no quarantine");
         assert!(
