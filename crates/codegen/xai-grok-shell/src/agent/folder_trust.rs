@@ -1044,11 +1044,15 @@ mod tests {
         // `load_claude_env_with_project(cwd, project_scope_allowed(cwd))`: an
         // untrusted clone's repo-tree env (which would feed BASH_ENV /
         // GIT_SSH_COMMAND / … to every subprocess) is dropped; a store-trusted
-        // folder merges it. GROK_HOME-isolated so the trust store is empty;
+        // folder merges it. HOME-isolated (#447) so the always-loaded user-tier
+        // `~/.claude` env can't merge in an ambient key that collides with the
+        // gated key below; GROK_HOME-isolated so the trust store is empty;
         // GROK_FOLDER_TRUST unset so the default-on feature flag applies.
         use xai_grok_workspace::permission::claude_settings::load_claude_env_with_project;
         let home = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::set("GROK_HOME", home.path());
+        let _home = EnvGuard::set("HOME", home.path());
+        let grok_home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("GROK_HOME", grok_home.path());
         let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
         let tmp = repo_tmp();
         let claude = tmp.path().join(".claude");
@@ -1089,10 +1093,14 @@ mod tests {
         // a SUBDIR — the ONLY repo config — launched from that subdir must flip the
         // folder untrusted AND have its env dropped. The env loader walks
         // cwd→repo-root, so detection MUST walk too (a git-root-only probe missed
-        // this). GROK_HOME-isolated so the trust store is empty.
+        // this). HOME-isolated (#447) so the always-loaded user-tier `~/.claude`
+        // env can't merge in an ambient key that collides with the gated key
+        // below; GROK_HOME-isolated so the trust store is empty.
         use xai_grok_workspace::permission::claude_settings::load_claude_env_with_project;
         let home = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::set("GROK_HOME", home.path());
+        let _home = EnvGuard::set("HOME", home.path());
+        let grok_home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("GROK_HOME", grok_home.path());
         let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
         let tmp = repo_tmp();
         let subdir = tmp.path().join("sub");

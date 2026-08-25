@@ -1423,6 +1423,7 @@ mod tests {
     // serially. They each set the cache to true / false via the test helper,
     // then call the gated function and assert on its early-return behavior.
     use serial_test::serial;
+    use xai_grok_test_support::EnvGuard;
 
     /// RAII guard that resets the marker cache when dropped, so tests don't
     /// leak state into one another.
@@ -1630,6 +1631,16 @@ mod tests {
         // shell-side MARKER_CACHE; the env override is the cross-crate hatch
         // (same pattern as `gate_resolve_permissions_with_provenance_*`).
         unsafe { std::env::set_var("_GROK_CLAUDE_MARKER_OVERRIDE", "1") };
+        // HOME-isolated (#447): the marker short-circuits `load_claude_env_
+        // with_project` before it reaches `dirs::home_dir()` today, so this
+        // guard is a no-op against the real leak right now — but that
+        // short-circuit ordering is an implementation detail, not a
+        // guarantee. Isolating `$HOME` means `is_empty()` stays true even if
+        // the short-circuit ever moves past discovery, instead of silently
+        // depending on whatever the developer's real `~/.claude` happens to
+        // contain (the #443 failure mode).
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", home.path());
         let dir = tempfile::tempdir().unwrap();
         let env = xai_grok_workspace::permission::claude_settings::load_claude_env_with_project(
             dir.path(),
@@ -2094,6 +2105,13 @@ extra_rule_dirs = ["/c/rules"]
     fn gate_load_claude_json_mcp_servers_returns_empty_when_marker_set() {
         let _g = MarkerGuard;
         refresh_marker_cache(true);
+        // HOME-isolated (#447, same shape as `gate_load_claude_env_returns_
+        // empty_when_marker_set`): `load_claude_json_mcp_servers` short-
+        // circuits on the marker before it reaches `dirs::home_dir()` /
+        // `~/.claude.json` today, but that ordering is an implementation
+        // detail. Isolating `$HOME` keeps `is_empty()` true independent of it.
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", home.path());
         let dir = tempfile::tempdir().unwrap();
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
         let servers = crate::util::config::load_claude_json_mcp_servers(dir.path(), &compat);
@@ -2111,6 +2129,14 @@ extra_rule_dirs = ["/c/rules"]
         // Also set the env-var override so the workspace-resident marker
         // reader (which can't see the shell-side cache) honours the gate.
         unsafe { std::env::set_var("_GROK_CLAUDE_MARKER_OVERRIDE", "1") };
+        // HOME-isolated (#447): the marker already skips the `.claude` tier's
+        // `dirs::home_dir()` read today, but the provenance filter below only
+        // checks `path == tempdir_claude` — a rule sourced from the real
+        // `~/.claude/settings.json` would be silently tolerated, not caught,
+        // if the marker check ever moved or weakened. This does NOT isolate
+        // `~/.grok/config.toml`; see the note below.
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", home.path());
         let dir = tempfile::tempdir().unwrap();
         // Drop a Claude permissions file in the tempdir; with the marker set
         // the gate should skip reading it.
@@ -2124,10 +2150,12 @@ extra_rule_dirs = ["/c/rules"]
 
         // Note: `resolve_permissions_with_provenance` ALSO reads requirements,
         // managed settings, and the developer's real `~/.grok/config.toml`.
-        // We can't isolate `grok_home()` because it's `OnceLock`-cached.
-        // Instead, assert on rule *provenance*: no rule should originate from
-        // our tempdir's `.claude/settings.json`. The dev's real ~/.grok
-        // config rules (if any) are out of scope for this test.
+        // We can't isolate `grok_home()` because it's `OnceLock`-cached — no
+        // per-test env guard can change what it already resolved to earlier
+        // in this test binary's process. Instead, assert on rule
+        // *provenance*: no rule should originate from our tempdir's
+        // `.claude/settings.json`. The dev's real ~/.grok config rules (if
+        // any) are out of scope for this test.
         let resolved =
             xai_grok_workspace::permission::resolution::resolve_permissions_with_provenance(
                 dir.path(),
