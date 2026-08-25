@@ -10,8 +10,11 @@ example, so a wrong model produces a matching wrong test.
 Every corpus here is enumerated from the tree by a mechanism that is NOT the
 pattern under test, so the inputs are not chosen by whoever wrote the regex:
 
-* test attributes — bracket-scan `#[...]`, strip arguments, split on `::`, and
-  keep the ones whose final segment is exactly `test`;
+* test attributes — bracket-scan `#[...]`, and to classify a line, strip its
+  arguments and split on `::` to see whether the final segment is exactly
+  `test`. What gets stored in the corpus is the attribute's real text,
+  arguments and all -- classification strips them to decide keep/discard,
+  it does not throw them away (#458 review);
 * function signatures — the first code line after such an attribute;
 * module paths — actual `mod` declarations parsed from source, versus the
   guard's approximation from FILE paths. Those are genuinely different sources,
@@ -74,11 +77,16 @@ class TestAttributeCorpus(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Keyed on the real attribute text, arguments and all -- reconstructing
+        # just the path (`tokio::test`) tests a form that is not actually in
+        # the tree and would hide a pattern that only matches a test attribute
+        # with no arguments, which is 1,032 of the real instances here (#458
+        # review).
         forms: Counter[str] = Counter()
         for path in _rust_files():
             for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
                 if _is_test_attribute(line):
-                    forms[line.strip().rstrip("]")[2:].split("(")[0].strip()] += 1
+                    forms[line.strip()] += 1
         cls.forms = forms
 
     def test_the_corpus_is_not_empty(self):
@@ -87,7 +95,7 @@ class TestAttributeCorpus(unittest.TestCase):
         self.assertGreater(sum(self.forms.values()), 1000, dict(self.forms))
 
     def test_every_attribute_form_in_the_tree_is_recognised(self):
-        missed = [f for f in self.forms if not guard._TEST_ATTR.match(f"+    #[{f}]")]
+        missed = [f for f in self.forms if not guard._TEST_ATTR.match(f"+    {f}")]
         self.assertEqual(
             missed, [], f"_TEST_ATTR misses test attributes that exist here: {missed}"
         )
@@ -102,13 +110,20 @@ class TestAttributeCorpus(unittest.TestCase):
 
     def test_a_narrowed_pattern_would_fail_this_corpus(self):
         # Proof the corpus can fail: these two patterns are unchanged since
-        # #171, so there is no historical version to run against. A plausible
-        # narrowing stands in for one.
-        narrowed = re.compile(r"^\+\s*#\[test\b")
-        missed = [f for f in self.forms if not narrowed.match(f"+    #[{f}]")]
-        self.assertTrue(
-            missed, "corpus cannot distinguish a narrower pattern, so it proves nothing"
-        )
+        # #171, so there is no historical version to run against. Plausible
+        # narrowings stand in for one -- dropping `tokio::` support, and
+        # requiring the attribute to end immediately after `test` (the shape
+        # that let a path-normalized corpus pass while missing every
+        # argumented form, #458 review).
+        for narrowed in (
+            re.compile(r"^\+\s*#\[test\b"),
+            re.compile(r"^\+\s*#\[(?:tokio::)?test\]"),
+        ):
+            missed = [f for f in self.forms if not narrowed.match(f"+    {f}")]
+            self.assertTrue(
+                missed,
+                f"corpus cannot distinguish {narrowed.pattern!r}, so it proves nothing",
+            )
 
 
 class FunctionSignatureCorpus(unittest.TestCase):
