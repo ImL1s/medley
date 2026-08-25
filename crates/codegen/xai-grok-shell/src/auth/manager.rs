@@ -504,6 +504,7 @@ enum LockOutcome {
 /// Tests that cannot pass a path into a production entry point should pin
 /// [`XaiAuthPathGuard`] instead of `GROK_AUTH_PATH` (#343).
 ///
+<<<<<<< HEAD
 /// The pure env-vs-default rule now lives in
 /// [`xai_grok_config::resolved_xai_auth_path`] (#482), moved there so
 /// `xai-grok-workspace`'s standalone hub binary — which cannot depend on
@@ -513,7 +514,13 @@ enum LockOutcome {
 /// because `cfg(test)` is only ever true when *this* crate compiles as a
 /// test target, not when `xai-grok-config` does as an ordinary dependency
 /// of it (see the moved function's own doc comment for why that matters).
-pub(crate) fn resolved_xai_auth_path(grok_home: &Path) -> PathBuf {
+///
+/// `pub`, not `pub(crate)` (#434 / #481): `xai-grok-pager` must call this
+/// wrapper rather than `xai_grok_config::resolved_xai_auth_path` directly,
+/// so a `GROK_AUTH_PATH` operator setting hashes the same file `AuthManager`
+/// reads. A second, crate-local `grok_home.join("auth.json")` is how #434
+/// happened.
+pub fn resolved_xai_auth_path(grok_home: &Path) -> PathBuf {
     #[cfg(test)]
     if let Some(path) = XAI_AUTH_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return path;

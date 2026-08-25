@@ -4222,8 +4222,13 @@ pub(crate) fn execute(
                                 return None;
                             }
                             let grok_home = xai_grok_shell::util::grok_home::grok_home();
+                            // `resolved_xai_auth_path`, not a bare
+                            // `grok_home.join("auth.json")` (#434) — otherwise
+                            // this read disagrees with `AuthManager` (and
+                            // every other in-crate reader/writer) whenever
+                            // `GROK_AUTH_PATH` is set.
                             let store = xai_grok_shell::auth::read_auth_json(
-                                    &grok_home.join("auth.json"),
+                                    &xai_grok_shell::auth::resolved_xai_auth_path(&grok_home),
                                 )
                                 .ok()?;
                             let scope = xai_grok_shell::auth::GrokComConfig::default()

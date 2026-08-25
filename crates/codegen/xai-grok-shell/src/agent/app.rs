@@ -1553,9 +1553,13 @@ pub async fn run_leader(
             }
             let auth_scope = agent_config.grok_com_config.auth_scope();
             // Gated on user_grok_home() so a cwd-relative .grok/auth.json is never
-            // read as the user auth store when no home resolves.
+            // read as the user auth store when no home resolves. The path itself
+            // resolves through `resolved_xai_auth_path`, not a bare
+            // `g.join("auth.json")` (#434), so a `GROK_AUTH_PATH` operator
+            // setting hashes the same file the hot-reload watcher/reloader below
+            // and `AuthManager` itself read.
             let initial_auth_key_hash = xai_grok_config::user_grok_home()
-                .map(|g| g.join("auth.json"))
+                .map(|g| crate::auth::resolved_xai_auth_path(&g))
                 .and_then(|auth_path| crate::auth::read_auth_json(&auth_path).ok())
                 .and_then(|store| {
                     crate::auth::lookup_auth(&store, &auth_scope)
