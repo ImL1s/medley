@@ -51,6 +51,42 @@ _BARE_FLAGS = {"--lib", "--all-targets", "--no-run", "--release", "--all-feature
 _warned_shell_tokens: set[tuple[str, str]] = set()
 
 
+def workspace_members(root: Path) -> set[str]:
+    """Crate names from the root manifest's `[workspace] members`.
+
+    The sweep cannot be derived from the workflow's own `cargo test` lines: a
+    crate whose last test lane is deleted then vanishes from the report, which
+    is the guard going quiet about exactly the change that made all of its tests
+    stop running. Nor from the baseline, which has no entry for a crate that is
+    fully covered -- `xai-grok-auth`, `xai-grok-pager-bin` and `xai-proto-build`
+    are all at 100% and would drop out of both sides (#408 review).
+    """
+    text = (root / "Cargo.toml").read_text()
+    block = re.search(r"^members\s*=\s*\[(.*?)\]", text, re.S | re.M)
+    if not block:
+        return set()
+    names = set()
+    for m in re.finditer(r'"([^"]+)"', block.group(1)):
+        rel = m.group(1)
+        if "*" in rel:
+            continue
+        # The package name is what `-p` takes, and it is NOT reliably the last
+        # path component: `prod/mc/cli-chat-proxy-types` is the package
+        # `prod-mc-cli-chat-proxy-types`. Deriving it from the path is right for
+        # 76 of these 81 and silently wrong for the rest, which surfaced as
+        # `did not match any packages` -- caught only because a failed listing
+        # is fatal (#408 review). Read the manifest.
+        manifest = root / rel / "Cargo.toml"
+        try:
+            decl = re.search(
+                r'^\s*name\s*=\s*"([^"]+)"', manifest.read_text(), re.M
+            )
+        except OSError:
+            decl = None
+        names.add(decl.group(1) if decl else Path(rel).name)
+    return names
+
+
 def _crate_from_manifest(path: str) -> str:
     """`crates/codegen/xai-grok-sampler/Cargo.toml` -> `xai-grok-sampler`."""
     return Path(path).parent.name
@@ -66,14 +102,19 @@ def _strip_env_assignments_prefix(line: str) -> str:
         stripped = m.group(1).lstrip()
 
 
-def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
-    """Map crate -> target -> set of filter strings used against it.
+def _parse_workflow(text: str):
+    """Map crate -> target -> filters, and the same keyed by lane `--features`.
 
     Joins YAML line continuations first: `ci.yml` wraps long invocations with a
     trailing backslash, and the filter is usually on the continuation line.
     """
     joined = re.sub(r"\\\s*\n\s*", " ", text)
     per_crate: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    # Same filters, keyed additionally by the lane's `--features`, so coverage
+    # can be judged against the build a filter actually ran in (#408 review).
+    by_features: dict[str, dict[frozenset, dict[str, set[str]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(set))
+    )
 
     for line in joined.splitlines():
         m = _RUNNER.match(_strip_env_assignments_prefix(line))
@@ -81,6 +122,12 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
             continue
         # Drop anything after the `--` separator: those are libtest args
         # (`--nocapture`, `--skip <pat>`), not filters.
+        # `--exact` changes libtest's selection from substring to equality, so a
+        # lane carrying it must be judged by equality too -- otherwise a test
+        # whose path merely *contains* the filter is reported covered by a lane
+        # that will not run it (#408 review).
+        tail = m.group(1).split(" -- ")[1] if " -- " in m.group(1) else ""
+        exact = "--exact" in tail.split()
         args_text = m.group(1).split(" -- ")[0]
         try:
             args = shlex.split(args_text)
@@ -90,6 +137,7 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
         crate: str | None = None
         filters: list[str] = []
         targets: list[str] = []
+        features: list[str] = []
         has_original_filters = False
         i = 0
         while i < len(args):
@@ -107,6 +155,11 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
                         targets.append(f"bin:{val}")
                     elif a == "--example":
                         targets.append(f"example:{val}")
+                    elif a == "--features":
+                        # A lane's feature set decides which tests even exist in
+                        # its build, so a filter cannot be credited with covering
+                        # a test that is `#[cfg(feature = ...)]`-ed out of it.
+                        features.extend(v for v in val.replace(",", " ").split() if v)
                 i += 2
                 continue
             if a == "--lib":
@@ -146,9 +199,14 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
         if not targets:
             targets = ["*"]
 
+        feat = frozenset(features)
+        # An exact filter is recorded with a sentinel prefix so the matcher can
+        # tell the two selection semantics apart without a parallel structure.
+        marked = [(EXACT_PREFIX + f if exact else f) for f in filters]
         if filters:
             for t in targets:
                 per_crate[crate][t].update(filters)
+                by_features[crate][feat][t].update(marked)
         elif not has_original_filters:
             # No positional filter and no target restriction: the crate's lib
             # tests run unfiltered, so everything in it is covered. The
@@ -157,12 +215,46 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
             # Ans: Yes, because an unfiltered target-scoped cargo test runs all tests within that target, covering all of them.
             for t in targets:
                 per_crate[crate][t].add("")
+                by_features[crate][feat][t].add("")
 
     # Convert defaultdicts to regular dicts for a clean return shape
-    return {c: dict(targets_dict) for c, targets_dict in per_crate.items()}
+    flat = {c: dict(targets_dict) for c, targets_dict in per_crate.items()}
+    nested = {
+        c: {f: dict(t) for f, t in feats.items()} for c, feats in by_features.items()
+    }
+    return flat, nested
 
 
-def list_tests(crate: str, manifest_root: Path) -> list[str]:
+def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
+    """Crate -> target -> filters, ignoring which `--features` each lane used.
+
+    Kept as the module's public shape because `tests/test_new_test_filter_guard.py`
+    pins it. The feature-keyed view is a strictly finer grouping of the same
+    parse, so it gets its own name rather than changing this one's contract --
+    breaking eleven tests to accommodate a refactor is the wrong direction.
+    """
+    return _parse_workflow(text)[0]
+
+
+# Marks a filter that came from a lane carrying `--exact`, where libtest matches
+# by equality rather than substring.
+EXACT_PREFIX = "\0exact\0"
+
+
+def _selects(filter_: str, test: str) -> bool:
+    if filter_.startswith(EXACT_PREFIX):
+        return filter_[len(EXACT_PREFIX):] == test
+    return filter_ in test
+
+
+# Distinct from an empty listing, which is a legitimate "this crate has no lib
+# tests". Both used to collapse into `[]`, so a crate whose harness could not be
+# launched vanished from the report and the run still exited 0.
+NO_LIB_TARGET = object()
+LISTING_FAILED = object()
+
+
+def list_tests(crate: str, manifest_root: Path, features: frozenset = frozenset()):
     """Test paths in the crate's **lib** target.
 
     Lib-scoped on purpose: `ci.yml`'s filters are overwhelmingly `--lib`, and a
@@ -171,16 +263,30 @@ def list_tests(crate: str, manifest_root: Path) -> list[str]:
     tests as uncovered when they are simply a different surface. Keeping both
     sides lib-only makes "uncovered" mean one thing.
     """
+    cmd = ["cargo", "test", "-p", crate, "--lib"]
+    if features:
+        cmd += ["--features", ",".join(sorted(features))]
     proc = subprocess.run(
-        ["cargo", "test", "-p", crate, "--lib", "--", "--list"],
+        cmd + ["--", "--list"],
         cwd=manifest_root,
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
-        print(f"warning: could not list tests for {crate}", file=sys.stderr)
+        # A crate with no lib target is an expected skip: this tool is
+        # lib-scoped (see the docstring), and such a crate's tests are reached
+        # by `--bins` / `--test` filters it deliberately does not model. Say so
+        # rather than warning, so it cannot be mistaken for the other branch.
+        if "no library targets found" in proc.stderr:
+            return NO_LIB_TARGET
+        # Anything else means the listing did not happen. Returning an empty
+        # list here would make the crate silently drop out of the comparison
+        # and the run still exit 0 -- a guard that cannot tell "nothing new"
+        # from "never checked" is the defect this whole check exists to catch.
+        label = f"{crate}" + (f" --features {','.join(sorted(features))}" if features else "")
+        print(f"error: could not list tests for {label}", file=sys.stderr)
         print(proc.stderr[-2000:], file=sys.stderr)
-        return []
+        return LISTING_FAILED
     names = []
     for line in proc.stdout.splitlines():
         # libtest prints `some::path::test_name: test`
@@ -207,12 +313,16 @@ def main() -> int:
                     help="write the current uncovered set to this file and exit 0")
     args = ap.parse_args()
 
-    per_crate = parse_workflow(args.workflow.read_text())
+    per_crate, by_features = _parse_workflow(args.workflow.read_text())
     if not per_crate:
         print("error: no cargo test invocations found -- has ci.yml's shape changed?", file=sys.stderr)
         return 2
 
-    crates = args.crate or sorted(per_crate)
+    # Sweep the workflow's crates UNION the baseline's. Deriving the sweep only
+    # from surviving `cargo test` lines means deleting a crate's last lane also
+    # deletes it from this report -- the guard would go quiet about exactly the
+    # change that made every one of its tests stop running (#408 review).
+    baseline_crates: set[str] = set()
 
     baseline: set[str] = set()
     if args.baseline and args.baseline.exists():
@@ -221,31 +331,126 @@ def main() -> int:
             for line in args.baseline.read_text().splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         }
+        baseline_crates = {e.split("::", 1)[0] for e in baseline if "::" in e}
+
+    members = workspace_members(args.root)
+    if not args.crate and len(members) < 20:
+        # A manifest this tool cannot parse must read as red, not as "no crates,
+        # no gaps, ok" -- the failure mode this whole check exists to catch.
+        print(
+            f"error: only {len(members)} workspace member(s) parsed from "
+            f"{args.root / 'Cargo.toml'}; refusing to sweep from a corpus that "
+            "small.",
+            file=sys.stderr,
+        )
+        return 2
+    crates = args.crate or sorted(set(per_crate) | baseline_crates | members)
 
     all_uncovered: list[str] = []
     newly_uncovered: list[str] = []
+    unlistable: list[str] = []
+    stale_covered: list[str] = []   # exempt, but a filter now selects them
+    stale_absent: list[str] = []    # exempt, but the test no longer exists
 
     for crate in crates:
-        target_filters = per_crate.get(crate)
-        if target_filters is None:
-            print(f"{crate}: no filter in the workflow at all -- every test in it runs nowhere")
-            continue
+        lanes = by_features.get(crate, {})
+
+        # Every feature set any lane builds this crate with, plus default
+        # features. A test gated behind `--features X` exists only in the
+        # X build, so listing with defaults alone reports it as absent and the
+        # crate as fully covered (#408 review: xai-grok-auth read 6/6 while 10
+        # `retry_middleware` tests behind `--features middleware` ran nowhere).
+        feature_sets = {frozenset()} | set(lanes)
+
+        if args.list_from and any(lanes):
+            # A captured `<crate>.list` has no feature dimension, so every test
+            # in it lands under default features while a `--features` lane's
+            # filters are judged against that lane's own listing. The verdict
+            # would be wrong in both directions, so refuse instead (#408 review).
+            if any(f for f in lanes if f):
+                print(
+                    f"error: {crate} has a --features lane; captured listings "
+                    "cannot express feature sets. Re-run without --list-from.",
+                    file=sys.stderr,
+                )
+                unlistable.append(crate)
+                continue
 
         if args.list_from:
             f = args.list_from / f"{crate}.list"
             if not f.exists():
-                print(f"warning: no captured list for {crate}", file=sys.stderr)
+                # Same reasoning as a failed `--list`: a missing capture is not
+                # evidence of anything, so it must not pass silently.
+                print(f"error: no captured list for {crate}", file=sys.stderr)
+                unlistable.append(crate)
                 continue
-            tests = [line[: -len(": test")].strip()
-                     for line in f.read_text().splitlines() if line.endswith(": test")]
+            captured = [line[: -len(": test")].strip()
+                        for line in f.read_text().splitlines() if line.endswith(": test")]
+            listings = {frozenset(): captured}
         else:
-            tests = list_tests(crate, args.root)
+            listings = {}
+            failed = False
+            for feat in sorted(feature_sets, key=lambda fs: sorted(fs)):
+                got = list_tests(crate, args.root, feat)
+                if got is NO_LIB_TARGET:
+                    listings = NO_LIB_TARGET
+                    break
+                if got is LISTING_FAILED:
+                    failed = True
+                    break
+                listings[feat] = got
+            if failed:
+                unlistable.append(crate)
+                continue
 
-        if not tests:
+        if listings is NO_LIB_TARGET:
+            print(f"{crate}: no lib target -- skipped (this check is lib-scoped)")
             continue
 
-        filters = target_filters.get("lib", set()) | target_filters.get("*", set())
-        missing = uncovered(tests, filters)
+        tests = sorted({t for names in listings.values() for t in names})
+        if not tests:
+            print(f"{crate}: 0 tests in the lib target")
+            continue
+
+        # A lane covers a test only if the test EXISTS in that lane's build and
+        # one of its filters matches. Crediting a default-feature filter with a
+        # feature-gated test is how the gap above stayed invisible.
+        def _is_covered(test: str) -> bool:
+            for feat, target_filters in lanes.items():
+                if test not in listings.get(feat, ()):
+                    continue
+                fs = target_filters.get("lib", set()) | target_filters.get("*", set())
+                if any(_selects(f, test) for f in fs):
+                    return True
+            return False
+
+        filters = {
+            f
+            for target_filters in lanes.values()
+            for f in target_filters.get("lib", set()) | target_filters.get("*", set())
+        }
+        if not lanes:
+            # Named loudly rather than silently skipped, which is the vanishing
+            # this sweep was widened to prevent. But its tests are NOT folded
+            # into this baseline: "no lane names this crate at all" is exactly
+            # `check_uncovered_crates.py`'s verdict (#280), and it has its own
+            # allowlist. Two guards owning one fact means two places to grant an
+            # exemption and one of them will drift.
+            print(
+                f"{crate}: no filter in the workflow at all -- deferring to "
+                "check_uncovered_crates.py (#280)"
+            )
+            continue
+        missing = [t for t in tests if not _is_covered(t)]
+
+        # Baseline hygiene, both directions (#408 review). An entry that a
+        # filter now selects must be deleted, or re-narrowing that filter later
+        # silently re-exempts the test and the ratchet only ever loosens.
+        crate_baseline = {e for e in baseline if e.startswith(f"{crate}::")}
+        present = {f"{crate}::{t}" for t in tests}
+        missing_keys = {f"{crate}::{t}" for t in missing}
+        stale_covered.extend(sorted(crate_baseline & present - missing_keys))
+        stale_absent.extend(sorted(crate_baseline - present))
         fresh = [t for t in missing if f"{crate}::{t}" not in baseline]
         pct = 100.0 * (len(tests) - len(missing)) / len(tests)
         print(f"{crate}: {len(tests) - len(missing)}/{len(tests)} selected by a filter "
@@ -259,6 +464,50 @@ def main() -> int:
         if not args.write_baseline:
             for t in (fresh if baseline else missing):
                 print(f"    {t}")
+
+    # Before any verdict: a crate we could not list was not checked, and a
+    # verdict that ignores it is a claim about tests nobody enumerated. This
+    # also guards --write-baseline, so a baseline can never be written from a
+    # partial sweep and then silently exempt whatever the sweep missed.
+    if unlistable:
+        print(
+            f"\nerror: could not list tests for {len(unlistable)} crate(s): "
+            + ", ".join(unlistable)
+            + "\n       This check did not run for them, which is not the same as"
+            " them passing.\n       Fix the listing (or add a deliberate skip) rather"
+            " than reading this run as green.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # A stale exemption is a loosened ratchet, so it fails like a new one.
+    # `--write-baseline` regenerates from the current sweep, which prunes both
+    # kinds, so the fix is mechanical once the change is deliberate.
+    if stale_covered and not args.write_baseline:
+        print(
+            f"\nerror: {len(stale_covered)} baseline entr(ies) are now selected by a "
+            "filter and must be removed:",
+            file=sys.stderr,
+        )
+        for e in stale_covered[:50]:
+            print(f"    {e}", file=sys.stderr)
+        if len(stale_covered) > 50:
+            print(f"    ... and {len(stale_covered) - 50} more", file=sys.stderr)
+        print(
+            "       Leaving them exempt lets a later narrowing of that filter "
+            "un-cover the test\n       without this check noticing.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Deliberately NOT fatal: a test that no longer exists is not a regression,
+    # and failing on it would turn every rename into a red build. Reported so
+    # the baseline can be pruned, and re-generating is what prunes it.
+    if stale_absent and not args.write_baseline:
+        print(
+            f"\nnote: {len(stale_absent)} baseline entr(ies) name tests that no longer "
+            "exist; regenerate to prune."
+        )
 
     if args.write_baseline:
         args.write_baseline.write_text(

@@ -20,6 +20,14 @@ lenient: a filter like `slash::commands::model::` selects by module path, which
 this cannot see from the diff alone, so module-path filters are also checked
 against the file's path.
 
+What this deliberately does NOT cover (issue #408): a test that already
+existed before `--base`. Reading the diff is what buys the two properties
+above, and it costs exactly this one. The complement is
+`check_test_filter_coverage.py`, which compares a per-crate `--list` against
+the same filter set and is wired into the `compile-tests` job against
+`tests/ci/unenrolled-tests.baseline`. If you are here asking "is this class
+handled?", the answer is yes but not by this script.
+
 Usage:
     check_new_tests_are_filtered.py --workflow .github/workflows/ci.yml --base origin/providers
 """

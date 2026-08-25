@@ -2873,6 +2873,21 @@ mod tests {
 
             drop(guard);
             let captured = output.lock().expect("capture lock").clone();
+            // #465: establish the capture is measuring something before
+            // trusting its absence checks — an empty (or wrongly-scoped)
+            // capture would satisfy `assert_no_secret_fragments` trivially.
+            // Both markers are fixture-chosen literals the secret never
+            // touches, so correct redaction never removes them.
+            assert!(
+                captured.contains("chat/completions"),
+                "capture must observe log_request_headers's endpoint marker \
+                 (dropped guard too early, or subscriber not wired?): {captured}"
+            );
+            assert!(
+                captured.contains("request-id"),
+                "capture must observe request_span's request_id marker \
+                 (dropped guard too early, or subscriber not wired?): {captured}"
+            );
             assert_no_secret_fragments(&captured, secret);
             assert_no_secret_fragments(&rendered_client, secret);
         }
@@ -2914,6 +2929,24 @@ mod tests {
 
         drop(guard);
         let captured = output.lock().expect("capture lock").clone();
+        // #465: same reasoning as `sampler_request_logs_never_emit_credential_
+        // bytes` — prove the capture saw the two log sites this path actually
+        // exercises before trusting its absence checks. `"test-model"` comes
+        // from `chat_completion`'s pre-send event (payload.model, never the
+        // secret); `"HTTP request failed"` is `request_transport_error`'s
+        // message, the exact site sanitizing the failed transport's URL/query.
+        // Neither is credential-derived, so correct redaction never removes
+        // them.
+        assert!(
+            captured.contains("test-model"),
+            "capture must observe chat_completion's pre-send model_id marker \
+             (dropped guard too early, or subscriber not wired?): {captured}"
+        );
+        assert!(
+            captured.contains("HTTP request failed"),
+            "capture must observe request_transport_error's log site \
+             (dropped guard too early, or subscriber not wired?): {captured}"
+        );
         assert_no_secret_fragments(&captured, secret);
         assert_no_secret_fragments(&display, secret);
         assert_no_secret_fragments(&debug, secret);

@@ -24,7 +24,42 @@ from check_new_tests_are_filtered import (  # noqa: E402
     target_of,
     targets_of,
 )
-from check_test_filter_coverage import parse_workflow, uncovered  # noqa: E402
+from check_test_filter_coverage import _parse_workflow, parse_workflow, uncovered  # noqa: E402
+
+
+class ParseWorkflowFeatures(unittest.TestCase):
+    """A lane's `--features` decides which tests exist in its build (#408).
+
+    Crediting a default-feature filter with a `#[cfg(feature = ...)]` test is
+    how `xai-grok-auth` read 6/6 covered while ten `retry_middleware` tests
+    behind `--features middleware` ran in no lane at all.
+    """
+
+    def test_features_key_the_lane_and_default_is_the_empty_set(self):
+        wf = (
+            "          run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture\n"
+            "          run_nonzero -p xai-grok-auth --lib bearer_fragment:: -- --nocapture\n"
+        )
+        _flat, nested = _parse_workflow(wf)
+        self.assertEqual(
+            nested["xai-grok-auth"],
+            {
+                frozenset({"middleware"}): {"lib": {"credential"}},
+                frozenset(): {"lib": {"bearer_fragment::"}},
+            },
+        )
+
+    def test_comma_separated_features_split_into_one_set(self):
+        wf = "          run_nonzero -p c --features a,b --lib f -- --nocapture\n"
+        _flat, nested = _parse_workflow(wf)
+        self.assertEqual(list(nested["c"]), [frozenset({"a", "b"})])
+
+    def test_public_parse_workflow_keeps_its_flat_shape(self):
+        """The feature view is additive; the pinned contract must not move."""
+        wf = "          run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture\n"
+        self.assertEqual(
+            parse_workflow(wf), {"xai-grok-auth": {"lib": {"credential"}}}
+        )
 
 
 class ParseWorkflow(unittest.TestCase):

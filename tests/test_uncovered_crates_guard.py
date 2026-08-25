@@ -67,17 +67,40 @@ class PackageName(unittest.TestCase):
 
 
 class NamedTokens(unittest.TestCase):
-    def test_extracts_p_and_manifest_path(self):
+    def test_extracts_p_from_run_nonzero_and_manifest_path_from_cargo_test(self):
         wf = textwrap.dedent(
             """\
             run_nonzero -p covered --lib foo -- --nocapture
-            cargo clippy --manifest-path crates/codegen/also-named/Cargo.toml
+            cargo test --manifest-path crates/codegen/also-covered/Cargo.toml --lib
             """
         )
-        self.assertEqual(named_tokens(wf), {"covered", "also-named"})
+        self.assertEqual(named_tokens(wf), {"covered", "also-covered"})
 
     def test_package_long_flag(self):
         self.assertEqual(named_tokens("cargo test --package boxed --lib\n"), {"boxed"})
+
+    def test_clippy_or_build_mention_does_not_count_as_named(self):
+        # #437: a crate's tests can be deleted in full while a `cargo clippy`
+        # or `cargo build` step still names its manifest path. Crediting that
+        # mention made this checker call the crate "covered" with nothing
+        # left to run its tests -- the hole neither this guard nor
+        # `check_test_filter_coverage.py`'s #280 hand-off caught. Only a line
+        # that actually invokes the test binary may name a crate.
+        wf = textwrap.dedent(
+            """\
+            run_nonzero -p covered --lib foo -- --nocapture
+            cargo clippy --manifest-path crates/codegen/clippy-only/Cargo.toml --all-targets -- -D warnings
+            cargo build --manifest-path crates/codegen/build-only/Cargo.toml -p build-only
+            """
+        )
+        self.assertEqual(named_tokens(wf), {"covered"})
+
+    def test_joins_line_continuations_before_matching(self):
+        # `ci.yml` wraps long `run_nonzero` invocations with a trailing
+        # backslash; the `-p` flag is on the first line but the test-name
+        # continuation line is where the statement actually ends.
+        wf = "run_nonzero -p continued --lib \\\n  some_test_name -- --nocapture\n"
+        self.assertEqual(named_tokens(wf), {"continued"})
 
 
 class SrcHasTests(unittest.TestCase):
@@ -155,6 +178,35 @@ class Evaluate(unittest.TestCase):
             )
         self.assertFalse(report.new_gaps)
         self.assertIn("prod-mc-proxy", report.has_tests)
+
+    def test_clippy_only_mention_is_a_new_gap_not_coverage(self):
+        # #437 in miniature: a crate whose only `ci.yml` mention is a
+        # `cargo clippy --manifest-path` is a new gap, because clippy proves
+        # nothing about whether the crate's tests run. A single `run_nonzero
+        # -p` lane for the same crate restores coverage.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _crate(root, "crates/codegen/tools", "tools", "#[test]\nfn t() {}\n")
+            clippy_only = evaluate(
+                root=root,
+                workflow_text=(
+                    "cargo clippy --manifest-path crates/codegen/tools/Cargo.toml "
+                    "--all-targets -- -D warnings\n"
+                ),
+                allowlisted=set(),
+            )
+            self.assertEqual(clippy_only.new_gaps, frozenset({"tools"}))
+
+            with_test_lane = evaluate(
+                root=root,
+                workflow_text=(
+                    "cargo clippy --manifest-path crates/codegen/tools/Cargo.toml "
+                    "--all-targets -- -D warnings\n"
+                    "run_nonzero -p tools --lib some_test -- --nocapture\n"
+                ),
+                allowlisted=set(),
+            )
+            self.assertFalse(with_test_lane.new_gaps)
 
 
 class AllowlistFile(unittest.TestCase):

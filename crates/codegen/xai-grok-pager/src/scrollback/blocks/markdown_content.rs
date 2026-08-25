@@ -19,7 +19,7 @@ use super::quote_bar::{QuoteBarStrip, quote_bar_style_for};
 
 pub(crate) const MARKDOWN_BODY_RANGE: u16 = 0;
 use crate::syntax::get_syntect;
-use crate::theme::{Theme, ThemeKind, cache as theme_cache, md_style};
+use crate::theme::{PaletteFingerprint, Theme, md_style};
 use xai_grok_markdown::StreamingMarkdownRenderer;
 
 /// Mutable rendering state behind a single `RefCell`.
@@ -30,10 +30,11 @@ use xai_grok_markdown::StreamingMarkdownRenderer;
 #[derive(Debug, Clone)]
 struct RenderState {
     renderer: StreamingMarkdownRenderer,
-    /// Cached word-wrap result keyed on `(width, generation, theme)`.
+    /// Cached word-wrap result keyed on `(width, generation, palette)`.
     cache_width: usize,
     cache_generation: u64,
-    cache_theme: ThemeKind,
+    /// Full palette identity — kind + terminal-native lock + ColorLevel (#453).
+    cache_palette: PaletteFingerprint,
     /// The blockquote-bar style `cache_lines` were painted with, captured from
     /// the same theme read that built the renderer's `MarkdownStyle`. Bar
     /// detection compares against this rather than re-reading the global, so
@@ -121,7 +122,7 @@ impl MarkdownContent {
     ) -> Self {
         // One snapshot: the renderer's style and the bar style the detector
         // compares against must come from the same read (#430).
-        let cache_theme = theme_cache::current_kind();
+        let cache_palette = PaletteFingerprint::current();
         let theme = Theme::current();
         let mut renderer = StreamingMarkdownRenderer::new(md_style::style_for(&theme), true);
         renderer.set_max_table_width(max_table_width);
@@ -138,7 +139,7 @@ impl MarkdownContent {
                 renderer,
                 cache_width: 0,
                 cache_generation: 0,
-                cache_theme,
+                cache_palette,
                 cache_bar_style: quote_bar_style_for(&theme),
                 cache_lines: Vec::new(),
                 cache_joiners: Vec::new(),
@@ -152,14 +153,14 @@ impl MarkdownContent {
 
     /// Create empty for streaming.
     pub fn streaming() -> Self {
-        let cache_theme = theme_cache::current_kind();
+        let cache_palette = PaletteFingerprint::current();
         let theme = Theme::current();
         Self {
             state: RefCell::new(RenderState {
                 renderer: StreamingMarkdownRenderer::new(md_style::style_for(&theme), true),
                 cache_width: 0,
                 cache_generation: 0,
-                cache_theme,
+                cache_palette,
                 cache_bar_style: quote_bar_style_for(&theme),
                 cache_lines: Vec::new(),
                 cache_joiners: Vec::new(),
@@ -332,18 +333,19 @@ impl MarkdownContent {
     /// This turns streaming from O(N^2) total wrapping to ~O(N).
     fn ensure_wrapped(&self, width: usize) {
         let mut state = self.state.borrow_mut();
-        let current_theme = theme_cache::current_kind();
+        let current_palette = PaletteFingerprint::current();
 
-        // If the theme changed, update the renderer's style so the re-render
-        // below picks up the new colors. Resetting cache_generation forces
-        // the cache to rebuild even if width and content haven't changed.
-        if state.cache_theme != current_theme {
+        // If the rendered palette changed (theme kind, terminal-native lock,
+        // or ColorLevel), update the renderer's style so the re-render below
+        // picks up the new colors. Resetting cache_generation forces the
+        // cache to rebuild even if width and content haven't changed (#453).
+        if state.cache_palette != current_palette {
             // One read for both: the style the spans get painted with and the
             // style bar detection compares them against (#430).
             let theme = Theme::current();
             state.renderer.set_style(md_style::style_for(&theme));
             state.cache_bar_style = quote_bar_style_for(&theme);
-            state.cache_theme = current_theme;
+            state.cache_palette = current_palette;
             state.cache_generation = u64::MAX; // force cache miss
             // set_style resets renderer frozen state, so our tracking is stale
             state.frozen_pre_wrap_count = 0;
@@ -483,6 +485,7 @@ impl MarkdownContent {
 mod tests {
     use super::*;
     use crate::scrollback::types::Selectable;
+    use crate::theme::{ThemeKind, cache as theme_cache};
 
     #[test]
     fn cache_hit_on_same_width() {
@@ -727,5 +730,150 @@ mod tests {
             frozen_count_after_first,
             state.frozen_wrapped_count,
         );
+    }
+
+    /// Collect every span style from a markdown `output()` snapshot.
+    fn collected_span_styles(out: &BlockOutput) -> Vec<Style> {
+        out.lines
+            .iter()
+            .flat_map(|line| line.content.spans.iter().map(|span| span.style))
+            .collect()
+    }
+
+    fn styles_carry_explicit_fg(styles: &[Style]) -> bool {
+        styles.iter().any(|style| style.fg.is_some())
+    }
+
+    /// After a palette-affecting lock toggle, the wrap cache must adopt the
+    /// new [`PaletteFingerprint`] and — when colors are visible — repaint
+    /// spans. Under `NO_COLOR` both palettes quantize to Reset, so styles
+    /// cannot witness the change; fingerprint adoption is the proof there.
+    fn assert_lock_toggle_invalidated_wrap_cache(
+        md: &MarkdownContent,
+        before_styles: &[Style],
+        fp_before: PaletteFingerprint,
+        source: &str,
+    ) {
+        let fp_after = PaletteFingerprint::current();
+        assert_ne!(
+            fp_before, fp_after,
+            "lock toggle must change the palette fingerprint even when ThemeKind is stable"
+        );
+        assert_eq!(
+            theme_cache::current_kind(),
+            ThemeKind::GrokNight,
+            "precondition: under GrokNight the ThemeKind-only key would miss this toggle"
+        );
+
+        let after = md.output(80);
+        let after_styles = collected_span_styles(&after);
+        assert_eq!(
+            md.state.borrow().cache_palette,
+            fp_after,
+            "wrap cache must adopt the post-toggle palette fingerprint"
+        );
+        assert_eq!(
+            md.state.borrow().cache_bar_style,
+            quote_bar_style_for(&Theme::current()),
+            "bar style must be refreshed from the post-toggle theme read"
+        );
+
+        let fresh = MarkdownContent::new(source);
+        let fresh_styles = collected_span_styles(&fresh.output(80));
+        assert_eq!(
+            after_styles, fresh_styles,
+            "re-wrapped cache must match a fresh render under the post-toggle palette"
+        );
+
+        if styles_carry_explicit_fg(before_styles) || styles_carry_explicit_fg(&after_styles) {
+            assert_ne!(
+                before_styles,
+                after_styles.as_slice(),
+                "terminal-native lock toggle must repaint cached markdown spans\n\
+                 before={before_styles:?}\nafter={after_styles:?}"
+            );
+        }
+    }
+
+    /// #453: engaging the terminal-native lock changes `Theme::current()`
+    /// (and caps `ColorLevel` to Basic) without changing
+    /// `theme_cache::current_kind()` under an ambient GrokNight theme. The
+    /// wrap cache must invalidate so already-rendered markdown picks up the
+    /// new palette — not keep the pre-lock styles until a width/content miss.
+    #[test]
+    fn wrap_cache_invalidates_when_terminal_native_lock_engages() {
+        let _guard = theme_cache::test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct LockReset;
+        impl Drop for LockReset {
+            fn drop(&mut self) {
+                theme_cache::set_terminal_native_lock(false);
+                theme_cache::reset_for_test();
+            }
+        }
+        let _reset = LockReset;
+        // Best-effort: if nothing has seeded ColorLevel yet, prefer a
+        // colorful process so the span-style witness below can fire.
+        let _ =
+            crate::theme::color_support::set(crate::theme::color_support::ColorLevel::TrueColor);
+        theme_cache::set_terminal_native_lock(false);
+        theme_cache::set(ThemeKind::GrokNight);
+
+        let source = "> muted quote with `inline code`";
+        let fp_before = PaletteFingerprint::current();
+        let md = MarkdownContent::new(source);
+        let before = md.output(80);
+        let before_styles = collected_span_styles(&before);
+        assert!(
+            !before_styles.is_empty(),
+            "precondition: rendered spans exist before the lock toggle"
+        );
+
+        let unlocked_level = crate::theme::color_support::detect();
+        theme_cache::set_terminal_native_lock(true);
+        let locked_level = crate::theme::color_support::detect();
+        if unlocked_level > crate::theme::color_support::ColorLevel::Basic {
+            assert_eq!(
+                locked_level,
+                crate::theme::color_support::ColorLevel::Basic,
+                "lock must cap ColorLevel to Basic (part of the rendered palette)"
+            );
+        }
+
+        assert_lock_toggle_invalidated_wrap_cache(&md, &before_styles, fp_before, source);
+    }
+
+    /// #453 reverse direction: clearing the lock must also invalidate.
+    #[test]
+    fn wrap_cache_invalidates_when_terminal_native_lock_clears() {
+        let _guard = theme_cache::test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct LockReset;
+        impl Drop for LockReset {
+            fn drop(&mut self) {
+                theme_cache::set_terminal_native_lock(false);
+                theme_cache::reset_for_test();
+            }
+        }
+        let _reset = LockReset;
+        let _ =
+            crate::theme::color_support::set(crate::theme::color_support::ColorLevel::TrueColor);
+        theme_cache::set_terminal_native_lock(true);
+        theme_cache::set(ThemeKind::GrokNight);
+
+        let source = "> muted quote with `inline code`";
+        let fp_before = PaletteFingerprint::current();
+        let md = MarkdownContent::new(source);
+        let before = md.output(80);
+        let before_styles = collected_span_styles(&before);
+        assert!(
+            !before_styles.is_empty(),
+            "precondition: rendered spans exist before the lock clear"
+        );
+
+        theme_cache::set_terminal_native_lock(false);
+        assert_lock_toggle_invalidated_wrap_cache(&md, &before_styles, fp_before, source);
     }
 }

@@ -7,9 +7,12 @@ see that: it only asks about newly added tests. This is the crate-level
 ratchet for that gap.
 
 Does not invoke cargo. A crate "has tests" when any `src/**/*.rs` line is a
-`#[test]` or `#[tokio::test]` attribute. It is "named" when `ci.yml` contains
-`-p <crate>`, `--package <crate>`, or `--manifest-path .../<crate>/Cargo.toml`
-(anywhere, including clippy — same generous count as #280).
+`#[test]` or `#[tokio::test]` attribute. It is "named" when a `run_nonzero` /
+`cargo test` line in `ci.yml` contains `-p <crate>`, `--package <crate>`, or
+`--manifest-path .../<crate>/Cargo.toml`. A `cargo clippy` or `cargo build`
+mention of the same manifest path does NOT count (#437): clippy proves
+nothing about whether the crate's tests run, and crediting it let every test
+lane for a crate be deleted while this checker kept calling it covered.
 
 Usage:
     check_uncovered_crates.py --workflow .github/workflows/ci.yml \\
@@ -29,6 +32,11 @@ _TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test\b", re.MULTILINE)
 _PACKAGE_NAME = re.compile(r"""^name\s*=\s*["']([^"']+)["']\s*$""")
 _P_FLAG = re.compile(r"(?:^|[\s\\])(?:-p|--package)\s+([A-Za-z0-9][A-Za-z0-9_-]*)")
 _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
+# A line actually invokes the test binary. Same test as
+# `check_test_filter_coverage.py`'s `_RUNNER`, kept separate rather than
+# imported: this script's contract is "reads ci.yml text, never invokes
+# cargo," and importing from a script that does invoke cargo would blur that.
+_TEST_INVOCATION = re.compile(r"\b(?:run_nonzero|cargo test)\b")
 
 _CRATE_ROOTS = ("crates", "prod")
 
@@ -108,13 +116,30 @@ def src_has_tests(crate_dir: Path) -> bool:
 
 
 def named_tokens(workflow_text: str) -> set[str]:
-    """Crate names `ci.yml` mentions via `-p` / `--package` / `--manifest-path`."""
-    names = set(_P_FLAG.findall(workflow_text))
-    for raw in _MANIFEST.findall(workflow_text):
-        path = raw.strip().strip("'\"")
-        parent = Path(path).parent.name
-        if parent:
-            names.add(parent)
+    """Crate names a `run_nonzero` / `cargo test` line names via `-p` /
+    `--package` / `--manifest-path`.
+
+    A `cargo clippy` or `cargo build` mention does NOT count (#437): every
+    test lane for a crate can be deleted while a clippy step still names its
+    manifest path, and that left this checker calling the crate "covered"
+    with nothing left to run its tests -- invisible to this ratchet, and
+    deferred right past by `check_test_filter_coverage.py`'s own `#280`
+    hand-off, so neither guard saw the hole. Joins line continuations first,
+    matching `check_test_filter_coverage.py`'s `_parse_workflow`: `ci.yml`
+    wraps long invocations with a trailing backslash, and the flag is
+    usually on the continuation line.
+    """
+    joined = re.sub(r"\\\s*\n\s*", " ", workflow_text)
+    names: set[str] = set()
+    for line in joined.splitlines():
+        if not _TEST_INVOCATION.search(line):
+            continue
+        names.update(_P_FLAG.findall(line))
+        for raw in _MANIFEST.findall(line):
+            path = raw.strip().strip("'\"")
+            parent = Path(path).parent.name
+            if parent:
+                names.add(parent)
     return names
 
 

@@ -4761,6 +4761,16 @@ mod tests {
         drain_mcp_stderr_reader("sentinel-server", &mut stderr).await;
 
         let logs = capture.0.lock().clone();
+        // #470: establish the capture observed the stderr-drain log site
+        // before trusting the absence check — `drain_mcp_stderr_reader`'s
+        // success path is the only tracing call this test's code path can
+        // reach, and it logs only a safe server name and byte count, never
+        // the drained bytes themselves.
+        assert!(
+            logs.contains("MCP stderr drain completed"),
+            "capture must observe drain_mcp_stderr_reader's log site \
+             (dropped guard too early, or subscriber not wired?): {logs}"
+        );
         assert_no_credential_fragments(&logs);
         let events = std::fs::read_to_string(tmp.path().join("events.jsonl"))
             .expect("decode event should be persisted");
