@@ -472,6 +472,22 @@ jobs:
           # crate still outside this list, so the next one cannot hide the
           # same way.
           cargo clippy --manifest-path crates/codegen/xai-grok-workspace/Cargo.toml --all-targets -- -D warnings
+          # #384 sync: `xai-grok-session-events` carries fork-authored
+          # credential-redaction fixes to src/log.rs (#33's territory --
+          # `eb08cd52` "resolve credential observability violations", folded
+          # into `4b46c0d4`'s "Redact OIDC raw response bodies from error
+          # formatting in logs") and had zero CI presence of any kind before
+          # this sync's `check_unlinted_crates.py` gap surfaced it. Enrolled
+          # here for lint; its test filter is added separately below since a
+          # regression in redaction logic is exactly what the tests, not
+          # clippy, would catch.
+          cargo clippy --manifest-path crates/codegen/xai-grok-session-events/Cargo.toml --all-targets -- -D warnings
+          # #384 sync: `xai-grok-workspace-daemon` carries a fork-authored fix
+          # (`d9f291d3`, waiting for process cmdline to be observable in
+          # spawn_predecessor). Its tests already run via the blanket filter
+          # added earlier in this sync's own workspace-crate coverage sweep;
+          # only lint was missing.
+          cargo clippy --manifest-path crates/codegen/xai-grok-workspace-daemon/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: Tests (providers hot path)
@@ -1188,6 +1204,15 @@ jobs:
           run_nonzero -p xai-hooks-plugins-types --lib \
             '' -- --nocapture
           run_nonzero -p xai-ratatui-inline --lib \
+            '' -- --nocapture
+          # #384 sync / #439 audit: `xai-grok-session-events` had no filter at
+          # all -- its 17 tests ran in no lane. This crate's `src/log.rs`
+          # carries fork-authored credential-redaction fixes (`eb08cd52`,
+          # folded into `4b46c0d4`), the fork's sharpest divergence from
+          # upstream (#33). A regression there is exactly what a test run
+          # would catch and a lint pass would not; enrolled alongside this
+          # job's clippy step, not instead of it.
+          run_nonzero -p xai-grok-session-events --lib \
             '' -- --nocapture
           # Session publication is intentionally side-effect free until the
           # final gate opens. Keep every deferred subsystem on the hot-path
