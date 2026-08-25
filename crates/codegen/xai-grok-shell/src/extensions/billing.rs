@@ -10,6 +10,88 @@ use serde::{Deserialize, Serialize};
 use super::{ExtResult, to_raw_response};
 use crate::agent::MvpAgent;
 
+#[derive(Clone, Copy)]
+enum BillingOperation {
+    Credits,
+    AutoTopup,
+}
+
+impl BillingOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Credits => "credits",
+            Self::AutoTopup => "auto_topup",
+        }
+    }
+
+    fn service_name(self) -> &'static str {
+        match self {
+            Self::Credits => "Billing",
+            Self::AutoTopup => "Auto top-up",
+        }
+    }
+}
+
+fn billing_failure_context(
+    operation: BillingOperation,
+    error_class: &'static str,
+    status: Option<u16>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation": operation.label(),
+        "error_class": error_class,
+        "status": status,
+    })
+}
+
+fn billing_failure(
+    operation: BillingOperation,
+    error_class: &'static str,
+    status: Option<u16>,
+) -> acp::Error {
+    tracing::warn!(
+        operation = operation.label(),
+        error_class,
+        status,
+        "billing request failed"
+    );
+    xai_grok_telemetry::unified_log::warn(
+        "billing: request failed",
+        None,
+        Some(billing_failure_context(operation, error_class, status)),
+    );
+    let message = match status {
+        Some(status) => format!(
+            "{} service returned HTTP {status}",
+            operation.service_name()
+        ),
+        None => format!("{} service request failed", operation.service_name()),
+    };
+    acp::Error::internal_error().data(message)
+}
+
+async fn send_billing_request(
+    request: reqwest::RequestBuilder,
+    operation: BillingOperation,
+) -> Result<reqwest::Response, acp::Error> {
+    let response = request
+        .send()
+        .await
+        .map_err(|_| billing_failure(operation, "request_transport_failed", None))?;
+    if !response.status().is_success() {
+        return Err(billing_failure(
+            operation,
+            "upstream_status",
+            Some(response.status().as_u16()),
+        ));
+    }
+    Ok(response)
+}
+
+fn billing_parse_failure(operation: BillingOperation) -> acp::Error {
+    billing_failure(operation, "invalid_response_json", None)
+}
+
 /// Billing period cycle identifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -201,7 +283,14 @@ async fn handle_get_billing(agent: &MvpAgent) -> ExtResult {
     let auth = super::auth_gate::require_xai_auth(
         &agent.auth_manager,
         "Authentication required to fetch billing data",
-        "Billing data requires auth with grok.com. Run `grok login` to authenticate.",
+        crate::auth::with_login_instruction(
+            |prog| {
+                format!(
+                    "Billing data requires auth with grok.com. Run `{prog} login` to authenticate."
+                )
+            },
+            "Billing data requires auth with grok.com. Sign in again to authenticate.",
+        ),
     )?;
 
     let proxy_base = agent.cli_chat_proxy_base_url();
@@ -210,63 +299,29 @@ async fn handle_get_billing(agent: &MvpAgent) -> ExtResult {
     // Credits balance / usage (new billing system) via the CLI proxy, which
     // forwards to the backend `GetGrokCreditsConfig`.
     let credits_url = format!("{}/billing?format=credits", base);
-    let credits_resp = crate::http::shared_client()
-        .get(&credits_url)
-        .header("Authorization", format!("Bearer {}", &auth.key))
-        .header(
-            "X-XAI-Token-Auth",
-            crate::auth::GrokComConfig::default().token_header,
-        )
-        .header("x-userid", &auth.user_id)
-        .header("x-grok-client-version", xai_grok_version::VERSION)
-        .header(
-            crate::http::CLIENT_MODE_HEADER,
-            crate::http::process_client_mode(),
-        )
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
+    let credits_resp = send_billing_request(
+        crate::http::shared_client()
+            .get(&credits_url)
+            .header("Authorization", format!("Bearer {}", &auth.key))
+            .header(
+                "X-XAI-Token-Auth",
+                crate::auth::GrokComConfig::default().token_header,
+            )
+            .header("x-userid", &auth.user_id)
+            .header("x-grok-client-version", xai_grok_version::VERSION)
+            .header(
+                crate::http::CLIENT_MODE_HEADER,
+                crate::http::process_client_mode(),
+            )
+            .timeout(std::time::Duration::from_secs(15)),
+        BillingOperation::Credits,
+    )
+    .await?;
+
+    let mut billing: BillingConfigResponse = credits_resp
+        .json()
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "billing: upstream request failed");
-            xai_grok_telemetry::unified_log::warn(
-                "billing: upstream request failed",
-                None,
-                Some(serde_json::json!({ "error": e.to_string() })),
-            );
-            acp::Error::internal_error().data(format!("Failed to fetch billing data: {e}"))
-        })?;
-
-    if !credits_resp.status().is_success() {
-        let status = credits_resp.status().as_u16();
-        let body = credits_resp.text().await.unwrap_or_default();
-        tracing::warn!(status, url = %credits_url, "billing: upstream error");
-
-        let detail = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
-            .unwrap_or_else(|| format!("HTTP {status}"));
-
-        xai_grok_telemetry::unified_log::warn(
-            "billing: upstream error",
-            None,
-            Some(serde_json::json!({
-                "status": status,
-                "detail": detail,
-            })),
-        );
-
-        return Err(acp::Error::internal_error().data(format!("Billing service error: {detail}")));
-    }
-
-    let mut billing: BillingConfigResponse = credits_resp.json().await.map_err(|e| {
-        tracing::error!(error = %e, "billing: failed to parse response");
-        xai_grok_telemetry::unified_log::warn(
-            "billing: failed to parse response",
-            None,
-            Some(serde_json::json!({ "error": e.to_string() })),
-        );
-        acp::Error::internal_error().data(format!("Failed to parse billing data: {e}"))
-    })?;
+        .map_err(|_| billing_parse_failure(BillingOperation::Credits))?;
 
     // Enrich with fields from remote settings.
     let rs = agent.cfg.borrow().remote_settings.clone();
@@ -292,7 +347,14 @@ async fn handle_get_auto_topup_rule(agent: &MvpAgent) -> ExtResult {
     let auth = super::auth_gate::require_xai_auth(
         &agent.auth_manager,
         "Authentication required to fetch auto top-up rule",
-        "Auto top-up data requires auth with grok.com. Run `grok login` to authenticate.",
+        crate::auth::with_login_instruction(
+            |prog| {
+                format!(
+                    "Auto top-up data requires auth with grok.com. Run `{prog} login` to authenticate."
+                )
+            },
+            "Auto top-up data requires auth with grok.com. Sign in again to authenticate.",
+        ),
     )?;
 
     let proxy_base = agent.cli_chat_proxy_base_url();
@@ -301,53 +363,157 @@ async fn handle_get_auto_topup_rule(agent: &MvpAgent) -> ExtResult {
     // Auto top-up rule via the CLI proxy, which forwards to the backend
     // `GetAutoTopupRule`.
     let url = format!("{}/auto-topup-rule", base);
-    let response = crate::http::shared_client()
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", &auth.key))
-        .header(
-            "X-XAI-Token-Auth",
-            crate::auth::GrokComConfig::default().token_header,
-        )
-        .header("x-userid", &auth.user_id)
-        .header("x-grok-client-version", xai_grok_version::VERSION)
-        .header(
-            crate::http::CLIENT_MODE_HEADER,
-            crate::http::process_client_mode(),
-        )
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
+    let response = send_billing_request(
+        crate::http::shared_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", &auth.key))
+            .header(
+                "X-XAI-Token-Auth",
+                crate::auth::GrokComConfig::default().token_header,
+            )
+            .header("x-userid", &auth.user_id)
+            .header("x-grok-client-version", xai_grok_version::VERSION)
+            .header(
+                crate::http::CLIENT_MODE_HEADER,
+                crate::http::process_client_mode(),
+            )
+            .timeout(std::time::Duration::from_secs(10)),
+        BillingOperation::AutoTopup,
+    )
+    .await?;
+
+    let value: GetAutoTopupRuleResponse = response
+        .json()
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "auto-topup: upstream request failed");
-            acp::Error::internal_error().data(format!("Failed to fetch auto top-up rule: {e}"))
-        })?;
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-        tracing::warn!(status, url = %url, "auto-topup: upstream error");
-
-        let detail = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
-            .unwrap_or_else(|| format!("HTTP {status}"));
-
-        return Err(
-            acp::Error::internal_error().data(format!("Auto top-up service error: {detail}"))
-        );
-    }
-
-    // Return the upstream response body verbatim (as a JSON value) so /usage
-    // can print the exact data from this request unformatted.
-    let body_text = response.text().await.unwrap_or_default();
-    let value: serde_json::Value =
-        serde_json::from_str(&body_text).unwrap_or(serde_json::json!({"raw": body_text}));
+        .map_err(|_| billing_parse_failure(BillingOperation::AutoTopup))?;
     to_raw_response(&value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<String>>>);
+
+    struct EventVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for EventVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut rendered = String::new();
+            event.record(&mut EventVisitor(&mut rendered));
+            self.0.lock().expect("log capture lock").push(rendered);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
+        assert!(
+            !rendered.contains(sentinel),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel window");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window {window:?}: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_status_error_hides_url_and_reflected_body() {
+        use axum::{Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let reflected = serde_json::json!({"error": sentinel});
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/billing",
+                    get(move || {
+                        let reflected = reflected.clone();
+                        async move { (axum::http::StatusCode::BAD_GATEWAY, axum::Json(reflected)) }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let url = format!("http://{sentinel}:password@{addr}/billing?token={sentinel}");
+
+        let error = send_billing_request(
+            reqwest::Client::new().get(url).bearer_auth(sentinel),
+            BillingOperation::Credits,
+        )
+        .await
+        .expect_err("reflected upstream error must fail");
+        let logs = capture.0.lock().expect("log capture lock").join("\n");
+        let support =
+            billing_failure_context(BillingOperation::Credits, "upstream_status", Some(502))
+                .to_string();
+        let rendered = format!(
+            "{error:?} {} {logs} {support}",
+            serde_json::to_string(&error).unwrap()
+        );
+
+        assert!(rendered.contains("upstream_status"));
+        assert!(rendered.contains("502"));
+        assert_sentinel_absent(&rendered, sentinel);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticated_transport_error_hides_url_and_credentials() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let url = format!("http://{sentinel}:password@127.0.0.1:1/billing?token={sentinel}");
+
+        let error = send_billing_request(
+            reqwest::Client::new().get(url).bearer_auth(sentinel),
+            BillingOperation::Credits,
+        )
+        .await
+        .expect_err("dead loopback port must fail");
+        let logs = capture.0.lock().expect("log capture lock").join("\n");
+        let rendered = format!(
+            "{error:?} {} {logs}",
+            serde_json::to_string(&error).unwrap()
+        );
+
+        assert!(rendered.contains("request_transport_failed"));
+        assert_sentinel_absent(&rendered, sentinel);
+    }
 
     #[test]
     fn auto_topup_disabled_rule_omits_enabled_field() {

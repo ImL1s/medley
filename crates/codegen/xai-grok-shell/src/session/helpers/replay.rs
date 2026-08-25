@@ -257,6 +257,14 @@ impl ReplayState {
                         self.handle_rewind_marker(*target_prompt_index);
                         return Ok(ReplayAction::Continue);
                     }
+                    // #44: abandoned attempt — drop in-progress agent text so
+                    // a retry does not concatenate into the reconstructed
+                    // conversation (same contract as ChatReducer).
+                    XaiSessionUpdate::AttemptDiscarded => {
+                        self.current_agent_text.clear();
+                        self.has_pending_agent = false;
+                        return Ok(ReplayAction::Continue);
+                    }
                     // Other xAI notifications are informational — skip them.
                     _ => {}
                 }
@@ -707,6 +715,50 @@ mod tests {
                 acp::TextContent::new(text.to_string()),
             ))),
         )))
+    }
+
+    fn make_attempt_discarded() -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("s1"),
+            update: XaiSessionUpdate::AttemptDiscarded,
+            meta: None,
+        }))
+    }
+
+    /// #44 F1: AttemptDiscarded must drop abandoned agent text so rewind
+    /// reconstruction does not concatenate both attempts.
+    #[test]
+    fn attempt_discarded_drops_abandoned_agent_text_on_replay() {
+        let tmp = TempDir::new().unwrap();
+        let updates = vec![
+            make_user_update_pi("s1", "hi", 0),
+            make_agent_update("s1", "hello"),
+            make_attempt_discarded(),
+            make_agent_update("s1", "hello"),
+        ];
+        let result = replay_updates(&updates, tmp.path(), 1);
+        let texts: Vec<_> = result
+            .conversation
+            .iter()
+            .map(ConversationItem::text_content)
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["hi", "hello"],
+            "discarded attempt text must not concatenate with retry; got {texts:?}"
+        );
+        let assistant: Vec<_> = result
+            .conversation
+            .iter()
+            .filter(|c| matches!(c, ConversationItem::Assistant(_)))
+            .map(ConversationItem::text_content)
+            .collect();
+        assert_eq!(assistant, vec!["hello"]);
+        assert_ne!(
+            assistant.join(""),
+            "hellohello",
+            "regression: both attempts still present"
+        );
     }
 
     fn make_host_turn_update(session_id: &str, text: &str, user: bool) -> SessionUpdate {

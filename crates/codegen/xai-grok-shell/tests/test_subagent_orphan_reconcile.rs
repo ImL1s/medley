@@ -51,7 +51,7 @@ fn locate_session_dir(home: &Path, id: &str) -> PathBuf {
 #[ignore] // requires pre-built binary
 async fn resume_reconciles_orphaned_running_subagent() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start()
+        let server = MockInferenceServer::start_keyless_local()
             .await
             .expect("start mock server");
         let workdir = git_workdir();

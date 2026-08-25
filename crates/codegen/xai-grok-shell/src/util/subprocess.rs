@@ -72,27 +72,22 @@ pub(crate) fn shell_c(script: &str) -> Command {
     cmd
 }
 
-/// Whether the command text may appear in spawn-failure/timeout logs.
-/// `Redacted` (the safe default) keeps it out for commands whose text may
-/// embed secrets; `Shown` includes it for diagnostics.
+/// Redacted command marker for spawn-failure/timeout logs. Command text may
+/// embed credentials, so this type deliberately has no raw-text variant.
 #[derive(Clone, Copy)]
-pub(crate) enum CommandLog<'a> {
+pub(crate) enum CommandLog {
     Redacted,
-    Shown(&'a str),
 }
 
-impl std::fmt::Display for CommandLog<'_> {
+impl std::fmt::Display for CommandLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Self::Shown(cmd) => f.write_str(cmd),
-            Self::Redacted => f.write_str("<redacted>"),
-        }
+        f.write_str("<redacted>")
     }
 }
 
 pub(crate) struct RunOptions<'a> {
     pub label: &'a str,
-    pub command_log: CommandLog<'a>,
+    pub command_log: CommandLog,
 }
 
 /// Why [`run_detached_with_timeout`] produced no `Output`. A nonzero exit is

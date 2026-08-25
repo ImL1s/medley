@@ -206,7 +206,7 @@ fn trusted_local_refresh_surfaces_new_agent_via_discovery() {
 #[ignore = "requires pre-built grok binary; run with --ignored"]
 #[serial]
 async fn headless_session_refreshes_trusted_local_plugin_and_writes_session_json() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
 
