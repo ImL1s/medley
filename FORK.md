@@ -243,8 +243,10 @@ Scope is the fork hot path (not full workspace):
   read as coverage before:
   - **Five crates of eighty-odd.** `xai-grok-workspace` and `xai-grok-config`
     are among those never linted, and both fail `-D warnings` on `providers`
-    today (#457). A crate having eight named test filters in the hot path says
-    nothing about whether clippy has ever looked at it.
+    today (#457). Test coverage and lint coverage are answered by different
+    lists: `xai-grok-workspace` is named by dozens of `run_nonzero` test
+    filters and by no clippy invocation at all, and neither list mentions the
+    other.
   - **Targets with `required-features` are skipped silently.** `--all-targets`
     omits them with no error and no warning, so all six `[[test]]` targets in
     `xai-grok-shell` — gated on `test-support`, and the memory/OOM regression
