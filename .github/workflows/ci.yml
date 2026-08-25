@@ -30,10 +30,30 @@ env:
   # compile the upstream debug-redaction fixtures.
   PROTOC: ${{ github.workspace }}/bin/protoc
 
+# Every job carries a job-level `timeout-minutes`. Without one a job runs
+# against GitHub's 360-minute default, which is not a backstop but a licence:
+# an unbounded wait anywhere in a 2900-test lane then costs six hours and, from
+# outside, looks exactly like a slow runner. That has happened three times
+# (#416) -- twice the platform ceiling expired at 360m15s, once a human
+# cancelled at 264m17s -- across all three of this workflow's triggers, which
+# is why the cap belongs on the job and not on any one step.
+#
+# Sizing rule: the smallest multiple of 15 that is at least 1.3x the job's
+# observed maximum *successful* duration, with a floor of 15 minutes so a job
+# whose real work is seconds still tolerates a cold cache or a slow runner.
+# A cap that fires on a healthy run is worse than no cap, because it teaches
+# people to re-run rather than to look.
+#
+# Envelopes measured 2026-08-25 from job-level started_at/completed_at over
+# GitHub's API, 3779 job records, 2026-07-24..08-25, all events, successful
+# runs only. Re-measure before tightening any of these.
+
 jobs:
   audit-publisher:
     name: Audit publisher tests
     runs-on: ubuntu-latest
+    # measured: n=410 green, median 2.3m, p95 4.8m, max 5.22m -> floor 15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -100,6 +120,8 @@ jobs:
   installer:
     name: Installer
     runs-on: ubuntu-latest
+    # measured: n=401 green, median 0.4m, p95 0.5m, max 0.55m -> floor 15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -163,6 +185,8 @@ jobs:
   sync-upstream:
     name: Sync upstream script
     runs-on: ubuntu-latest
+    # measured: n=359 green, median 0.2m, p95 0.2m, max 0.65m -> floor 15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -179,6 +203,8 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    # measured: n=419 green, median 0.5m, p95 0.6m, max 1.32m -> floor 15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -194,6 +220,8 @@ jobs:
   new-test-filters:
     name: New tests run somewhere
     runs-on: ubuntu-latest
+    # measured: n=364 green, median 0.2m, p95 0.2m, max 0.42m -> floor 15
+    timeout-minutes: 15
     steps:
       # Full history: the check needs a merge base to find what this branch added.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -358,6 +386,8 @@ jobs:
   compile-tests:
     name: Compile every test target
     runs-on: ubuntu-latest
+    # measured: n=180 green, median 23.4m, p95 85.3m, max 101.93m -> 1.3x = 132.5 -> 135
+    timeout-minutes: 135
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -437,6 +467,8 @@ jobs:
   lint:
     name: Clippy (hot path)
     runs-on: ubuntu-latest
+    # measured: n=328 green, median 13.6m, p95 26.3m, max 29.80m -> 1.3x = 38.7 -> 45
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -493,6 +525,14 @@ jobs:
   test:
     name: Tests (providers hot path)
     runs-on: ubuntu-latest
+    # This is #416's job. 180 clears the slowest green run on record
+    # (137m36s, run 30723642341) by 31%, and clears the PR-event green
+    # max (116.97m) by 54%; the median has been climbing (32.9m before
+    # 2026-08-10, 99.9m after), so a tighter 150 would leave only 9%.
+    # It is also half the platform default, which is what bounds the
+    # outage: all three recorded hangs ran past 264m.
+    # measured: n=202 green, median 65.7m, p95 116.4m, max 137.60m -> 1.3x = 178.9 -> 180
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
