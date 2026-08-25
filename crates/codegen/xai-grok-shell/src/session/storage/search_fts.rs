@@ -745,6 +745,7 @@ fn is_session_id_like(query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn test_doc(id: &str, title: &str, content: &str) -> SessionDoc {
@@ -1039,7 +1040,17 @@ mod tests {
         );
     }
 
+    /// #475/#492: `with_index` heals on open, which reaches
+    /// `search_recovery::heal_unusable` and bumps the process-global
+    /// `CACHE_EPOCH` -- a caller two levels up from the identifier itself, so
+    /// a grep for `CACHE_EPOCH` across the crate does not find this test.
+    /// Codex caught it in review of #492 (the PR that introduced this key):
+    /// under the default parallel harness this writer can race the newly
+    /// tagged bootstrap readers and cause them to withhold their completion
+    /// markers, reproducing the exact flake #475 exists to eliminate. Same
+    /// tag, same reason, as every other test in this group.
     #[test]
+    #[serial(search_cache_epoch)]
     fn test_malformed_db_file_is_quarantined_and_recreated() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("session_search.sqlite");
