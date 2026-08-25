@@ -444,6 +444,7 @@ async fn delete_session(root_dir: &Path, session_id: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::session::storage::search_content::test_summary;
+    use serial_test::serial;
 
     #[tokio::test]
     async fn test_execute_search_empty_query() {
@@ -932,7 +933,16 @@ mod tests {
         );
     }
 
+    /// #475: `execute_search` reads the process-global `CACHE_EPOCH`
+    /// (`search_recovery::CacheEpoch::now()`/`.changed()`) to decide whether
+    /// a heal happened mid-query. This test doesn't assert on that today
+    /// (only on `resp.results`), so a sibling's unrelated epoch bump can't
+    /// fail it — but the read is real, and a future tightened assertion
+    /// would reintroduce the exact coupling
+    /// `test_claimant_reindexes_even_when_marker_exists` hit. Tagging now
+    /// rather than waiting for that to happen.
     #[tokio::test]
+    #[serial(search_cache_epoch)]
     async fn test_execute_search_completes_on_fresh_db() {
         let tmp = tempfile::TempDir::new().unwrap();
         let req = SessionSearchRequest {
@@ -948,7 +958,15 @@ mod tests {
 
     /// End-to-end recheck healing: `RecheckBootstrap` on a marker-less index
     /// re-runs the full bootstrap, which rewrites the marker on completion.
+    ///
+    /// #475: reaches `reindex_all`, so it reads `CACHE_EPOCH` the same way
+    /// `test_claimant_reindexes_even_when_marker_exists`
+    /// (`search_bootstrap_tests.rs`) does, with the identical assertion
+    /// shape (marker written vs. not) — same tag, same reason. Measured, not
+    /// just reasoned: paired against `test_shared_index_reopens_after_epoch_change`
+    /// with this tag removed, 6/15 failed; tagged, 15/15 passed.
     #[tokio::test]
+    #[serial(search_cache_epoch)]
     async fn test_recheck_bootstrap_reruns_reindex_when_marker_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();

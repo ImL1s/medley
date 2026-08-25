@@ -6,6 +6,7 @@ use crate::session::info::Info;
 use crate::session::storage::jsonl::JsonlStorageAdapter;
 use crate::session::storage::search_fts::META_KEY_SCHEMA_VERSION;
 use agent_client_protocol as acp;
+use serial_test::serial;
 
 fn write_last_bootstrap_at(db_path: &Path) -> io::Result<()> {
     let now = chrono::Utc::now().timestamp();
@@ -53,7 +54,23 @@ fn read_marker(db_path: &Path) -> Option<String> {
     with_search_index(db_path, |index| index.get_meta(META_KEY_LAST_BOOTSTRAP)).unwrap()
 }
 
+/// #475: `reindex_all`'s `epoch.changed()` check (`search_bootstrap.rs`)
+/// reads `search_recovery::CACHE_EPOCH`, a *process-global* counter — not
+/// scoped to this test's own tmpdir'd db. In production that is correct:
+/// `SEARCH_INDEX_MANAGER` is a process-wide singleton (see `search.rs`'s own
+/// note on it), so exactly one cache ever exists and "the epoch changed" and
+/// "my cache's epoch changed" are the same fact. In this test binary they
+/// are not: `test_shared_index_reopens_after_epoch_change` below bumps the
+/// same global counter from its own, unrelated tmpdir. Paired with that test
+/// under the default parallel harness this failed 9/15; isolated, 0/10;
+/// serialized (`--test-threads=1`), 0/10 — confirming the coupling is the
+/// concurrent scheduling, not the assertion. `#[serial(search_cache_epoch)]`
+/// (same idiom as #319's EnvGuard tests and `heap_profile_monitor`'s named
+/// group) makes that scheduling impossible rather than merely unlikely: every
+/// test that can observe or move this counter carries the same tag, listed
+/// where the counter is defined (`search_recovery.rs`).
 #[tokio::test]
+#[serial(search_cache_epoch)]
 async fn test_claimant_reindexes_even_when_marker_exists() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = search_db_path(tmp.path());
@@ -210,7 +227,12 @@ async fn test_waiter_gives_up_after_peer_wait() {
     assert_eq!(read_marker(&db_path), None, "no reindex ran");
 }
 
+/// #475: bumps the process-global `search_recovery::CACHE_EPOCH` on every
+/// run (`reprobe` always answers "corrupt"). Carries the same
+/// `#[serial(search_cache_epoch)]` tag as every test that *reads* that
+/// counter — see `test_claimant_reindexes_even_when_marker_exists`.
 #[test]
+#[serial(search_cache_epoch)]
 fn test_shared_index_reopens_after_epoch_change() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = search_db_path(tmp.path());
@@ -259,7 +281,11 @@ fn test_clear_last_bootstrap_at() {
     assert_eq!(try_read_last_bootstrap_at(&db_path).unwrap(), None);
 }
 
+/// #475: the winning gate reaches `reindex_all`, so this reads
+/// `CACHE_EPOCH` the same as `test_claimant_reindexes_even_when_marker_exists`
+/// — same tag, same reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(search_cache_epoch)]
 async fn test_concurrent_gates_single_flight() {
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();
