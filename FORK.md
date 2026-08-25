@@ -298,10 +298,25 @@ Scope is the fork hot path (not full workspace):
     filters and by no clippy invocation at all, and neither list mentions the
     other.
   - **Targets with `required-features` are skipped silently.** `--all-targets`
-    omits them with no error and no warning, so all six `[[test]]` targets in
-    `xai-grok-shell` — gated on `test-support`, and the memory/OOM regression
-    suite — are neither linted nor compiled by any job (#474). The
-    `--features pi` above exists because somebody hit this once for one crate.
+    omits them with no error and no warning, so the six `[[test]]` targets in
+    `xai-grok-shell` gated on `test-support` — the memory/OOM regression suite
+    — are **not linted by any job** (#474). The `--features pi` above exists
+    because somebody hit this once for one crate.
+
+    They *are* compiled, but by accident rather than by any job asking for
+    them: `xai-grok-pager`'s `[dev-dependencies]` names
+    `xai-grok-shell = { features = ["test-support"] }`
+    (`crates/codegen/xai-grok-pager/Cargo.toml:168`), so cargo's workspace
+    feature unification turns the gate on for the whole
+    `cargo test --workspace --no-run` build. That is load-bearing and
+    undocumented: drop that one dev-dependency feature and six targets stop
+    being built with no error anywhere. It is also empirically confirmed —
+    `session_fork_replay_memory` is one of the six, and it is what reddened
+    #384's `Compile every test target`.
+
+    The sibling `[[bench]] fork_copy` carries the same gate and is **not**
+    covered either way: `--no-run` does not build benches without `--benches`,
+    and unification does not change that.
 - Targeted auth / readiness / model-picker tests (subagent None credential strip, session model-switch credential clear, pager unready hard-blocks)
 
 **Merge pull requests with `scripts/merge-pr.sh`, not `gh pr merge`** (issue #202):
