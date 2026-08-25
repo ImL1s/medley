@@ -93,8 +93,8 @@ suffix regardless of what qualifies it.
 This is a real design turn, not an ideal from the outset: an earlier
 one-hop-only version of this checker calibrated to 15/15 against
 `heap_profile_monitor` (a single-file, single-hop chain) but, dry-run tested
-against `search_cache_epoch`'s real shape (#492, not yet merged -- see
-below), missed 5 of 6 currently-tagged tests. `heal_quarantines_only_on_
+against `search_cache_epoch`'s real shape (#492, merged to `providers` since
+-- see below), missed 5 of 6 currently-tagged tests. `heal_quarantines_only_on_
 confirmed_corruption` alone needs TWO hops (test -> `quarantined_after` ->
 `heal_unusable`, all in `search_recovery.rs`); others route through several
 hops of production orchestration code the test never names directly. A
@@ -173,9 +173,11 @@ currently tagged `#[serial(heap_profile_monitor)]` in the tree (15/15
 match, no more, no fewer) -- so there is no "known straggler" for a first
 slice to defer. `search_cache_epoch` (CACHE_EPOCH, #475/#492) is NOT
 registered by this change, for two independent reasons: #492 (which
-introduces that key) had not merged to `providers` at the time this script
-was written, so its `SERIAL-GROUP` marker rides on that PR rather than
-being duplicated here ahead of it; and a dry run of this checker against
+introduces that key) has since merged to `providers`, but it did not add a
+`// SERIAL-GROUP: search_cache_epoch` marker -- there is nothing in the
+tree today for this checker to anchor a registry entry on, so adding one
+here would be introducing the marker unilaterally rather than the person
+who owns that key's shape doing so; and a dry run of this checker against
 #492's own diff (registering the marker in a scratch worktree, never
 committed) found the reachability closure derives 37 candidate members
 against the 7 a human actually tagged (6 by grep, a 7th added after this
