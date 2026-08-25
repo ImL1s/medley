@@ -76,6 +76,11 @@ pub use paths::{
 // the upstream merge base: an inserted name reflows it, so every upstream addition to the
 // same block then conflicts on sync. Keep this separate.
 pub use paths::pin_grok_home;
+// Same reason, same fix (#482): `resolved_xai_auth_path` is fork-only
+// (multi-provider `GROK_AUTH_PATH` credential-path override; upstream has no
+// such variable), so it stays off the alphabetised block above rather than
+// reflowing a hunk that must stay byte-identical to the merge base.
+pub use paths::resolved_xai_auth_path;
 pub use validation::{
     RequirementsError, RequirementsLayer, RequirementsLayerLoad, RequirementsSource,
     load_merged_requirements, requirements_layers, try_requirements_layers, validate_requirements,
