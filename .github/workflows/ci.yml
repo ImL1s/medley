@@ -63,6 +63,9 @@ jobs:
       - name: Test the uncovered-crate ratchet
         run: python3 -B -m unittest tests.test_uncovered_crates_guard -v
 
+      - name: Test the unlinted-crate ratchet
+        run: python3 -B -m unittest tests.test_unlinted_crates_guard -v
+
       - name: Test the PR-head CI receipt guard
         # This guard is a pre-merge local/orchestrator check; it does not run
         # as part of CI itself. CI only executes its Python unit tests.
@@ -211,6 +214,16 @@ jobs:
           python3 scripts/check_uncovered_crates.py \
             --workflow .github/workflows/ci.yml \
             --allowlist tests/ci/uncovered-crates.allowlist
+
+      # Lint-level complement of the same gap (issue #439). The clippy job
+      # names its crates one at a time and full-workspace clippy stays too
+      # slow, so this does not lint anything -- it only makes *not* linting a
+      # crate a recorded decision instead of an omission nobody can see.
+      - name: Every crate is linted by ci.yml or allowlisted
+        run: |
+          python3 scripts/check_unlinted_crates.py \
+            --workflow .github/workflows/ci.yml \
+            --allowlist tests/ci/unlinted-crates.allowlist
 
   windows-session-publication:
     name: Windows session publication
@@ -444,6 +457,16 @@ jobs:
           cargo clippy --manifest-path crates/codegen/xai-grok-tools/Cargo.toml --all-targets --features pi -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-pager-bin/Cargo.toml --all-targets -- -D warnings
+          # #439: this crate sat with three clippy errors while `providers`
+          # looked green, because nothing reported that it was not named here.
+          # Cost of enrolling it, measured locally on a warm cache: ~27s on an
+          # idle machine, ~55s with other cargo jobs running. Quote the second
+          # number when weighing #457's burn-down -- the first is the
+          # optimistic half and this job runs alongside others. The
+          # `check_unlinted_crates.py` step in the audit job records every
+          # crate still outside this list, so the next one cannot hide the
+          # same way.
+          cargo clippy --manifest-path crates/codegen/xai-grok-workspace/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: Tests (providers hot path)
