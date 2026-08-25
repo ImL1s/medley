@@ -9013,12 +9013,21 @@ fn chat_initial_model_matrix() {
 /// #418: a chat-kind session used to take `custom_model_id` verbatim,
 /// never checking it against anything. `chat_custom_model_outcome` is the
 /// fix — a pure membership check against an already-fetched `/rest/modes`
-/// snapshot (`acp::SessionModelState`), not the build catalog. Matrix over
-/// present / absent / empty-catalog, mirroring `chat_new_session_model_state_matrix`
-/// right below, which builds the same kind of fixture for the sibling
-/// (display-only) membership check.
+/// snapshot, tagged by [`crate::agent::chat_modes::ChatModelCatalog`] with
+/// whether it is a real answer. Matrix over present / absent, mirroring
+/// `chat_new_session_model_state_matrix` right below, which builds the same
+/// kind of fixture for the sibling (display-only) membership check --
+/// **plus** the review finding on #483: an *authoritative* empty catalog
+/// (every mode currently requires an upgrade) and *no* catalog at all
+/// (unauthenticated / fetch failure) both produce an empty
+/// `available_models`, but must not collapse into the same outcome. Both
+/// live in this one matrix, in the same tree, so a red/green on one cannot
+/// be satisfied by a change that breaks the other -- that is the whole
+/// point Codex's review made: a check whose scope is empty must not
+/// silently agree with a check that has real, empty scope.
 #[test]
 fn chat_custom_model_outcome_matrix() {
+    use crate::agent::chat_modes::ChatModelCatalog;
     fn state_with(available: &[&str]) -> acp::SessionModelState {
         acp::SessionModelState::new(
             acp::ModelId::new("current-placeholder".to_owned()),
@@ -9030,33 +9039,80 @@ fn chat_custom_model_outcome_matrix() {
                 .collect(),
         )
     }
-    let cases: &[(&str, acp::SessionModelState, &str, ChatCustomModelOutcome)] = &[
+    let cases: &[(&str, ChatModelCatalog, &str, ChatCustomModelOutcome)] = &[
         (
             "present",
-            state_with(&["auto", "fast"]),
+            ChatModelCatalog::Authoritative(state_with(&["auto", "fast"])),
             "fast",
             ChatCustomModelOutcome::Eligible,
         ),
         (
-            "absent",
-            state_with(&["auto", "fast"]),
+            "absent_from_a_non_empty_authoritative_catalog",
+            ChatModelCatalog::Authoritative(state_with(&["auto", "fast"])),
             "grok-4.5",
             ChatCustomModelOutcome::Unavailable,
         ),
         (
-            // Fetch failure / unauthenticated / no modes yet: nothing to
-            // reject against, so this fails open, matching
-            // `chat_new_session_model_state`'s own philosophy for its
-            // unrelated (display-only) membership check.
-            "empty_catalog_fails_open",
-            state_with(&[]),
+            // The server authoritatively says zero modes are currently
+            // available (e.g. every mode requires an upgrade) -- a real
+            // answer about this id, not missing information. Must be
+            // `Unavailable`, not `CatalogUnavailable`: this is exactly the
+            // case Codex's review on #483 found accepted as `Eligible` by
+            // an earlier version of this function, which read only whether
+            // `available_models` was empty and could not tell this apart
+            // from the next case below.
+            "authoritative_but_empty_is_unavailable_not_catalog_unavailable",
+            ChatModelCatalog::Authoritative(state_with(&[])),
             "anything",
-            ChatCustomModelOutcome::Eligible,
+            ChatCustomModelOutcome::Unavailable,
+        ),
+        (
+            // No real `/rest/modes` response exists at all (unauthenticated
+            // / fetch failure with nothing cached). There is nothing to
+            // reject the request against -- distinct from the case above,
+            // which has the exact same (empty) `available_models` but a
+            // real answer behind it. Whether to *trust* the request given
+            // this answer is `chat_custom_model_id_after_outcome`'s
+            // decision, pinned separately below.
+            "no_info_is_catalog_unavailable",
+            ChatModelCatalog::NoInfo(state_with(&[])),
+            "anything",
+            ChatCustomModelOutcome::CatalogUnavailable,
         ),
     ];
-    for (label, state, requested, expected) in cases {
+    for (label, catalog, requested, expected) in cases {
         assert_eq!(
-            chat_custom_model_outcome(state, requested),
+            chat_custom_model_outcome(catalog, requested),
+            *expected,
+            "[{label}]"
+        );
+    }
+}
+
+/// #483 review finding: pins the policy decision for each classification
+/// outcome, separated out of `chat_custom_model_outcome` on purpose (see
+/// that function's sibling `chat_custom_model_id_after_outcome`'s doc).
+/// This is the test that would have caught the empty-catalog bug: if
+/// `CatalogUnavailable` were still folded into `Eligible` at the
+/// classification layer, this matrix could not tell "trust it because the
+/// catalog says so" apart from "trust it because there is no catalog to
+/// say anything" -- they would be the same case. Asserting the *outcome*
+/// each variant maps to, one at a time, is what makes that distinction
+/// visible in a test.
+#[test]
+fn chat_custom_model_id_after_outcome_matrix() {
+    let cases: &[(&str, ChatCustomModelOutcome, Option<&str>)] = &[
+        ("eligible_uses_the_id", ChatCustomModelOutcome::Eligible, Some("fast")),
+        ("unavailable_falls_back", ChatCustomModelOutcome::Unavailable, None),
+        (
+            "catalog_unavailable_trusts_the_id",
+            ChatCustomModelOutcome::CatalogUnavailable,
+            Some("fast"),
+        ),
+    ];
+    for (label, outcome, expected) in cases {
+        assert_eq!(
+            chat_custom_model_id_after_outcome("fast", *outcome).as_deref(),
             *expected,
             "[{label}]"
         );
@@ -9094,17 +9150,19 @@ async fn chat_custom_model_outcome_uses_chat_catalog_not_build_catalog() {
         "precondition: the build catalog must not contain the chat-only mode"
     );
 
-    let chat_state = acp::SessionModelState::new(
-        acp::ModelId::new(CHAT_ONLY_MODE.to_owned()),
-        vec![acp::ModelInfo::new(
+    let chat_catalog = crate::agent::chat_modes::ChatModelCatalog::Authoritative(
+        acp::SessionModelState::new(
             acp::ModelId::new(CHAT_ONLY_MODE.to_owned()),
-            "Fast".to_owned(),
-        )],
+            vec![acp::ModelInfo::new(
+                acp::ModelId::new(CHAT_ONLY_MODE.to_owned()),
+                "Fast".to_owned(),
+            )],
+        ),
     );
 
     // The chat path: eligible, because it consults the chat catalog.
     assert_eq!(
-        chat_custom_model_outcome(&chat_state, CHAT_ONLY_MODE),
+        chat_custom_model_outcome(&chat_catalog, CHAT_ONLY_MODE),
         ChatCustomModelOutcome::Eligible,
         "a mode present in the chat catalog must be Eligible"
     );

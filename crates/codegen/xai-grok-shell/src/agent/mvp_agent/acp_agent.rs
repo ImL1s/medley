@@ -1236,31 +1236,29 @@ impl acp::Agent for MvpAgent {
         // Fetch the chat-product catalog once here — `self.chat_modes`,
         // *not* `self.models_manager` (the build catalog; see
         // `ChatCustomModelOutcome`'s doc for why an earlier version of this
-        // fix checked the wrong one) — and reuse this same snapshot below
-        // for the `models` field the response reports, instead of the
-        // second `self.chat_modes.model_state()` fetch that used to sit
-        // there alone.
-        let chat_model_state = if is_chat_kind {
-            Some(self.chat_modes.model_state().await)
+        // fix checked the wrong one) — via `model_state_with_authority`
+        // rather than `model_state`, so the eligibility check below can
+        // tell an authoritative empty catalog apart from no catalog at all
+        // (#483 review finding; see `ChatModelCatalog`'s doc). Reuse this
+        // same snapshot below for the `models` field the response reports
+        // (via `.into_state()`, which that display-only path does not need
+        // the authority tag for), instead of the second
+        // `self.chat_modes.model_state()` fetch that used to sit there
+        // alone.
+        let chat_catalog = if is_chat_kind {
+            Some(self.chat_modes.model_state_with_authority().await)
         } else {
             None
         };
         let chat_eligible_model_id = if is_chat_kind {
             custom_model_id.and_then(|requested| {
-                let state = chat_model_state
+                let catalog = chat_catalog
                     .as_ref()
-                    .expect("chat_model_state is fetched whenever is_chat_kind");
-                match chat_custom_model_outcome(state, requested) {
-                    ChatCustomModelOutcome::Eligible => Some(requested.to_owned()),
-                    ChatCustomModelOutcome::Unavailable => {
-                        tracing::warn!(
-                            requested_model = requested,
-                            "chat session/new _meta.modelId not in the /rest/modes catalog; \
-                             falling back to current default model"
-                        );
-                        None
-                    }
-                }
+                    .expect("chat_catalog is fetched whenever is_chat_kind");
+                chat_custom_model_id_after_outcome(
+                    requested,
+                    chat_custom_model_outcome(catalog, requested),
+                )
             })
         } else {
             None
@@ -1526,8 +1524,12 @@ impl acp::Agent for MvpAgent {
                 chat_new_session_model_state(
                     // Reuses the snapshot fetched above for the eligibility
                     // check (#418) rather than fetching `/rest/modes` twice.
-                    chat_model_state
-                        .expect("chat_model_state is fetched whenever is_chat_kind"),
+                    // This display-only path does not need the
+                    // authoritative/no-info distinction (#483), so it
+                    // drops the tag here.
+                    chat_catalog
+                        .expect("chat_catalog is fetched whenever is_chat_kind")
+                        .into_state(),
                     session_initial_model
                         .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
                 ),

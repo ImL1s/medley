@@ -367,24 +367,53 @@ pub(crate) struct PreparedNewSessionModelPlan {
 /// those as three separate `ModelEntry` fields; `/rest/modes` exposes only
 /// one signal, `Mode::is_available()`, already applied server-side by
 /// `chat_modes::modes_to_model_state`'s `available_models` filter. An id
-/// absent from that list could be unknown, a mode the user currently cannot
-/// use, or a stale id from an out-of-date client — those are not
-/// distinguishable from a [`agent_client_protocol::SessionModelState`]
-/// alone, so chat only has one bit: is the id in the set the user's own
-/// `/rest/modes` fetch returned. See [`chat_custom_model_outcome`].
+/// absent from a *non-empty* `available_models` set could be unknown, a
+/// mode the user currently cannot use, or a stale id from an out-of-date
+/// client — those are not distinguishable from a
+/// [`agent_client_protocol::SessionModelState`] alone, so chat only has one
+/// bit for that case: is the id in the set the user's own `/rest/modes`
+/// fetch returned.
+///
+/// **"Not in the catalog" and "there is no catalog to check against" are
+/// different facts and get different variants** — [`Self::Unavailable`]
+/// and [`Self::CatalogUnavailable`] respectively — rather than folding
+/// together. The first is a property of the *request*; the second is a
+/// property of the *service*, which the caller is better placed to react
+/// to than this classification is. Critically, that split is **not** the
+/// same thing as "is `available_models` empty": an *authoritative* empty
+/// set — every mode currently requires an upgrade, a real, reachable shape
+/// from `chat_modes::modes_to_model_state`'s filter, not a hypothetical —
+/// is `Unavailable`, because it is a genuine answer about every id, not
+/// missing information. Only [`crate::agent::chat_modes::ChatModelCatalog::NoInfo`]
+/// (no real `/rest/modes` response was ever obtained at all) is
+/// `CatalogUnavailable`. An earlier version of this function read only the
+/// raw `available_models` emptiness — which cannot make this distinction,
+/// since both cases produce an empty list — and returned `Eligible` for
+/// *any* empty catalog, authoritative or not, which is the review finding
+/// this fixed twice: first by giving emptiness its own variant, then by
+/// discovering that variant still needed the source-level authority tag to
+/// mean the right thing. See [`chat_custom_model_outcome`] for the
+/// classifier and the `session/new` call site for the policy chosen for
+/// `CatalogUnavailable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatCustomModelOutcome {
-    /// Present in the fetched `/rest/modes` `available_models` set (or the
-    /// set is empty — an empty catalog carries no information to reject
-    /// against, so this fails open the same way
-    /// [`chat_new_session_model_state`] already does for its own,
-    /// display-only membership check).
+    /// Present in a non-empty fetched `/rest/modes` `available_models` set.
     Eligible,
-    /// Absent from a non-empty `available_models` set. Mirrors the
+    /// Absent from an *authoritative* `available_models` set — including an
+    /// authoritative set that is itself empty (every mode currently
+    /// requires an upgrade is a real answer, not missing information; see
+    /// [`crate::agent::chat_modes::ChatModelCatalog`]). Mirrors the
     /// build-kind "requested model not found" case: fall back silently, no
     /// user-facing auto-switch notification (there is nothing named to
     /// report switching away from).
     Unavailable,
+    /// No authoritative `/rest/modes` response exists at all
+    /// (unauthenticated, a fetch failure with nothing cached, or a
+    /// degenerate empty response — see
+    /// [`crate::agent::chat_modes::ChatModelCatalog::NoInfo`]). Distinct
+    /// from `Unavailable`: this says nothing about the requested id
+    /// itself, only that there is nothing to check it against.
+    CatalogUnavailable,
 }
 
 /// Result of actor construction. Loads and chat sessions are already published;
@@ -534,18 +563,85 @@ fn chat_new_session_model_state(
 /// actually spawned with, so an `Unavailable` id must not fall through to
 /// it.
 fn chat_custom_model_outcome(
-    chat_model_state: &acp::SessionModelState,
+    chat_catalog: &crate::agent::chat_modes::ChatModelCatalog,
     requested: &str,
 ) -> ChatCustomModelOutcome {
-    if chat_model_state.available_models.is_empty()
-        || chat_model_state
-            .available_models
-            .iter()
-            .any(|m| m.model_id.0.as_ref() == requested)
+    use crate::agent::chat_modes::ChatModelCatalog;
+    let state = match chat_catalog {
+        // No real `/rest/modes` answer exists (#483 review finding): there
+        // is nothing to reject the request against, regardless of whether
+        // `available_models` happens to be empty.
+        ChatModelCatalog::NoInfo(_) => return ChatCustomModelOutcome::CatalogUnavailable,
+        ChatModelCatalog::Authoritative(state) => state,
+    };
+    // An authoritative, real response can still have zero
+    // `available_models` (every mode currently requires an upgrade) — that
+    // is a genuine "not available" answer for every id, not missing
+    // information, so it falls straight through to `Unavailable` below via
+    // the same membership check as any other id absent from a non-empty
+    // set would.
+    if state
+        .available_models
+        .iter()
+        .any(|m| m.model_id.0.as_ref() == requested)
     {
         ChatCustomModelOutcome::Eligible
     } else {
         ChatCustomModelOutcome::Unavailable
+    }
+}
+
+/// What a chat-kind `session/new` should use as its model id, given a
+/// classification of the request against the chat catalog.
+///
+/// This is the policy half of the #483 review finding, kept separate from
+/// [`chat_custom_model_outcome`]'s classification on purpose: the two
+/// questions ("is this id in the catalog?" and "what should we do about
+/// that answer?") were folded into one `Eligible` return before, which is
+/// exactly how an empty catalog silently made every requested id
+/// `Eligible`. Now the classifier only reports what it actually knows, and
+/// this function names each outcome's consequence explicitly:
+///
+/// - `Eligible`: use the requested id.
+/// - `Unavailable`: an *authoritative* catalog does not contain it — fall
+///   back (mirrors the build-kind "requested model not found" case: a
+///   plain log, no user-facing auto-switch notification, since there is
+///   nothing named to report switching away from). This includes an
+///   authoritative catalog that is itself empty (every mode currently
+///   requires an upgrade), which is a real answer, not missing
+///   information — see [`crate::agent::chat_modes::ChatModelCatalog`].
+/// - `CatalogUnavailable`: no real `/rest/modes` response exists at all
+///   (unauthenticated, a fetch failure with nothing cached, or a
+///   degenerate empty response). **Trust the request.** This mirrors
+///   [`chat_new_session_model_state`]'s own, separate, display-only
+///   membership check, which already fails open when it has no catalog to
+///   check against. Rejecting every request whenever no real answer is
+///   available would be exactly as blunt as accepting every request was
+///   before this fix — just wrong in the other direction — so this chooses
+///   the same "no information means nothing to reject against" policy the
+///   codebase already uses next to it, and states it once, by name.
+fn chat_custom_model_id_after_outcome(
+    requested: &str,
+    outcome: ChatCustomModelOutcome,
+) -> Option<String> {
+    match outcome {
+        ChatCustomModelOutcome::Eligible => Some(requested.to_owned()),
+        ChatCustomModelOutcome::Unavailable => {
+            tracing::warn!(
+                requested_model = requested,
+                "chat session/new _meta.modelId not in the /rest/modes catalog; \
+                 falling back to current default model"
+            );
+            None
+        }
+        ChatCustomModelOutcome::CatalogUnavailable => {
+            tracing::debug!(
+                requested_model = requested,
+                "chat session/new _meta.modelId: /rest/modes catalog is empty, \
+                 trusting the request (nothing to validate it against)"
+            );
+            Some(requested.to_owned())
+        }
     }
 }
 /// `session/new` / `session/load` `_meta` key carrying per-session plugin roots.

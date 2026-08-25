@@ -23,6 +23,46 @@ pub const GROK_CHAT_MODE_ENV: &str = "GROK_CHAT_MODE";
 pub fn process_chat_mode_enabled() -> bool {
     false
 }
+/// Whether a [`ChatModesManager::model_state_with_authority`] snapshot
+/// represents a real `/rest/modes` answer or the absence of one (#483
+/// review finding).
+///
+/// A raw [`acp::SessionModelState`] with `available_models.is_empty()` is
+/// ambiguous on its own: it could mean the server authoritatively reported
+/// zero currently-available modes (e.g. every mode requires an upgrade —
+/// [`modes_to_model_state`]'s filter genuinely produces this from a
+/// well-formed response, it is not hypothetical), or it could mean no real
+/// answer was ever obtained at all (unauthenticated, a fetch failure with
+/// nothing cached, auth changing mid-fetch, or a degenerate all-empty
+/// response). Those two facts warrant different handling — the first is
+/// "this id is not available", the second is "we cannot evaluate this id"
+/// — so this type keeps them apart instead of collapsing both into the
+/// same empty [`acp::SessionModelState`] the way returning one bare value
+/// would.
+#[derive(Debug, Clone)]
+pub(crate) enum ChatModelCatalog {
+    /// Built from a real `/rest/modes` response — fresh, or served from a
+    /// cache that itself came from a real response (including a stale one
+    /// while a background refresh is in flight). `available_models` may
+    /// still be empty; that is a real, authoritative answer in that case,
+    /// not missing information.
+    Authoritative(acp::SessionModelState),
+    /// No real `/rest/modes` response was ever obtained. `available_models`
+    /// is always empty here and the emptiness carries no information about
+    /// the user's actual chat modes.
+    NoInfo(acp::SessionModelState),
+}
+impl ChatModelCatalog {
+    /// Discard the authoritative/no-info distinction, keeping only the
+    /// state — for callers that only display it (see
+    /// [`ChatModesManager::model_state`]'s doc for why they don't need the
+    /// distinction).
+    pub(crate) fn into_state(self) -> acp::SessionModelState {
+        match self {
+            Self::Authoritative(state) | Self::NoInfo(state) => state,
+        }
+    }
+}
 #[derive(Clone)]
 struct CachedModes {
     /// Keyed by identity; a mismatch is a miss so one user's modes never leak to another.
@@ -59,9 +99,28 @@ impl ChatModesManager {
     }
     /// Chat model state for a `session/load` response. On missing auth or fetch
     /// failure, serves last-good cache else empty — never the build catalog.
+    ///
+    /// Discards the authoritative/no-info distinction [`Self::model_state_with_authority`]
+    /// carries — existing callers of this method only display the result, so
+    /// they don't need it. A caller that must tell "the server said zero
+    /// modes are available" apart from "we have no idea what's available"
+    /// (#483 review finding) needs that method instead.
     pub(crate) async fn model_state(&self) -> acp::SessionModelState {
+        self.model_state_with_authority().await.into_state()
+    }
+    /// Same as [`Self::model_state`], but keeps the fact of *how* the
+    /// returned state was produced instead of discarding it.
+    ///
+    /// A response with zero `available_models` is ambiguous by itself: it
+    /// could mean "the server authoritatively says every mode currently
+    /// requires an upgrade" (a real answer a caller may need to act on) or
+    /// "we have no server answer at all" (unauthenticated, a fetch failure
+    /// with nothing cached, or a malformed empty response) — a caller with
+    /// nothing to validate against. Every return point below is tagged with
+    /// which one it is; see [`ChatModelCatalog`].
+    pub(crate) async fn model_state_with_authority(&self) -> ChatModelCatalog {
         let Some(user_id) = self.current_user_id() else {
-            return empty_state();
+            return ChatModelCatalog::NoInfo(empty_state());
         };
         let locale = DEFAULT_LOCALE;
         {
@@ -71,12 +130,12 @@ impl ChatModesManager {
                 && c.locale == locale
             {
                 if c.fetched_at.elapsed() < CACHE_TTL {
-                    return modes_to_model_state(&c.response);
+                    return ChatModelCatalog::Authoritative(modes_to_model_state(&c.response));
                 }
                 let stale = c.response.clone();
                 drop(guard);
                 self.spawn_refresh(user_id, locale);
-                return modes_to_model_state(&stale);
+                return ChatModelCatalog::Authoritative(modes_to_model_state(&stale));
             }
         }
         let _flight = self.inner.fetch_lock.lock().await;
@@ -87,13 +146,13 @@ impl ChatModesManager {
                 && c.locale == locale
                 && c.fetched_at.elapsed() < CACHE_TTL
             {
-                return modes_to_model_state(&c.response);
+                return ChatModelCatalog::Authoritative(modes_to_model_state(&c.response));
             }
         }
         match self.fetch(locale).await {
             Ok(resp) if !resp.modes.is_empty() => {
                 if self.current_user_id().as_deref() != Some(user_id.as_str()) {
-                    return empty_state();
+                    return ChatModelCatalog::NoInfo(empty_state());
                 }
                 let mapped = modes_to_model_state(&resp);
                 if mapped.available_models.is_empty() {
@@ -103,15 +162,23 @@ impl ChatModesManager {
                     );
                 }
                 self.store(user_id, locale.to_owned(), resp);
-                mapped
+                ChatModelCatalog::Authoritative(mapped)
             }
-            Ok(_) => empty_state(),
+            // The server itself returned zero modes (not merely zero
+            // *available* ones) -- a degenerate response shape, not the
+            // well-formed "every mode requires upgrade" answer
+            // `Authoritative` with an empty `available_models` represents.
+            // Treated as no information rather than an authoritative
+            // rejection.
+            Ok(_) => ChatModelCatalog::NoInfo(empty_state()),
             Err(err) => {
                 tracing::warn!(error = %err, "chat modes fetch failed; serving cache/empty");
                 let guard = self.inner.cache.read();
                 match guard.as_ref() {
-                    Some(c) if c.user_id == user_id => modes_to_model_state(&c.response),
-                    _ => empty_state(),
+                    Some(c) if c.user_id == user_id => {
+                        ChatModelCatalog::Authoritative(modes_to_model_state(&c.response))
+                    }
+                    _ => ChatModelCatalog::NoInfo(empty_state()),
                 }
             }
         }
