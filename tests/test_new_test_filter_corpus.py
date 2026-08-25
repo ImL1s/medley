@@ -133,6 +133,13 @@ class FunctionSignatureCorpus(unittest.TestCase):
     def setUpClass(cls):
         shapes: Counter[str] = Counter()
         misses: list[str] = []
+        # A test attribute this walk cannot turn into a one-line signature --
+        # e.g. `fn` and the name on separate lines, which real rustfmt::skip
+        # code in this tree does to other constructs -- must not just vanish.
+        # An attribute that disappears here is indistinguishable from one
+        # that was checked and passed, which is the same absence-reads-as-
+        # success shape #461 catalogs elsewhere (#458 review).
+        unresolved: list[str] = []
         for path in _rust_files():
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
             for index, line in enumerate(lines):
@@ -158,16 +165,20 @@ class FunctionSignatureCorpus(unittest.TestCase):
                         cursor += 1
                         continue
                     break
+                location = f"{path.relative_to(REPO)}:{index + 1}"
                 if cursor >= len(lines):
+                    unresolved.append(f"{location} (ran off end of file)")
                     continue
                 signature = lines[cursor]
                 if not re.search(r"\bfn\s", signature):
+                    unresolved.append(f"{location} -> {signature.strip()!r}")
                     continue
                 shapes[re.sub(r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*.*", "fn <name>(..)", signature.strip())] += 1
                 if not guard._FN.match("+" + signature):
                     misses.append(signature.strip())
         cls.shapes = shapes
         cls.misses = misses
+        cls.unresolved = unresolved
 
     def test_the_corpus_is_not_empty(self):
         self.assertGreater(sum(self.shapes.values()), 1000, dict(self.shapes))
@@ -175,6 +186,18 @@ class FunctionSignatureCorpus(unittest.TestCase):
     def test_every_test_signature_in_the_tree_is_matched(self):
         self.assertEqual(
             self.misses[:10], [], f"_FN misses {len(self.misses)} real test signatures"
+        )
+
+    def test_every_test_attribute_resolves_to_a_signature(self):
+        # Complements the assertion above: that one only judges signatures
+        # this walk found. A test attribute it could not turn into a
+        # signature line at all never reaches `misses` -- or `shapes` -- so
+        # without this it reads as a pass it was never checked for (#458
+        # review).
+        self.assertEqual(
+            self.unresolved[:10],
+            [],
+            f"{len(self.unresolved)} test attribute(s) could not be resolved to a signature line",
         )
 
     def test_the_pattern_still_discriminates(self):
