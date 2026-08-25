@@ -336,7 +336,14 @@ class DifferentialAgainstTomllib(unittest.TestCase):
         '[package]\ndescription = """one line"""\nname = "same"\n',
         '[package]\nname = "first"\ndescription = """\n[x]\n"""\n',
         "[workspace]\nmembers = []\n",
-        *_KNOWN_DIVERGENCES,
+        # The two deliberate divergences are listed here EXPLICITLY, not
+        # splatted from `_KNOWN_DIVERGENCES`. Deriving them from the exemption
+        # list made the exemption unfalsifiable: deleting an entry deleted the
+        # case along with it, so the divergence vanished from the corpus
+        # instead of becoming an unrecorded one, and every test stayed green.
+        # Caught by mutating the exemption list and finding nothing went red.
+        '["pack\\u0061ge"]\nname = "foo"\n',
+        '[package]\nname = """foo"""\n',
     )
 
     @staticmethod
@@ -374,6 +381,12 @@ class DifferentialAgainstTomllib(unittest.TestCase):
                 continue
             unexpected.append(f"{text!r}: ours={ours!r} tomllib={ref!r}")
         self.assertEqual(unexpected, [], "\n".join(unexpected))
+
+    def test_every_recorded_divergence_is_in_the_corpus(self):
+        # Without this the two lists can drift apart and an exemption can name
+        # a case nothing runs -- an exemption for a test that does not exist.
+        missing = [t for t in _KNOWN_DIVERGENCES if t not in self.CORPUS]
+        self.assertEqual(missing, [], f"exempted but not in the corpus: {missing}")
 
     def test_every_recorded_divergence_still_diverges(self):
         # A stale exemption hides a regression the way a stale allowlist entry
