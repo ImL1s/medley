@@ -47,7 +47,13 @@ _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
 # cargo," and importing from a script that does invoke cargo would blur that.
 _TEST_INVOCATION = re.compile(r"\b(?:run_nonzero|cargo test)\b")
 
-_CRATE_ROOTS = ("crates", "prod")
+# `third_party` was missing until #495: four real workspace members live
+# there and were invisible to this guard's corpus, silently -- not as a
+# reported gap, since a crate this scan never walks cannot become one. Two
+# of them (dagre_rust, mermaid-to-svg) had real `src/` tests running in no
+# `ci.yml` lane, undetected because the guard could not see the directory
+# they were in, not because it saw them and cleared them.
+_CRATE_ROOTS = ("crates", "prod", "third_party")
 
 _ALLOWLIST_HEADER = """\
 # Crates with src/ tests that no ci.yml -p / --manifest-path names (issue #280).

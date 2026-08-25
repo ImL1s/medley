@@ -2552,3 +2552,28 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-proto-build --lib -- --nocapture
+
+      # #495: third_party/ vendored crates were in no test job at all -- the
+      # #280 coverage ratchet could not even see the directory they live in.
+      # mermaid-to-svg renders untrusted model output and dagre_rust is its
+      # layout-engine dependency; both were vendored specifically for a full
+      # audit surface over code this repo does not control upstream, and an
+      # audited-but-untested vendored crate is a weaker audit than that.
+      # Two invocations, not one -p/-p: a filter that can never match zero
+      # tests cannot detect one crate's suite silently disappearing under it.
+      - name: 'Vendored third-party layout-engine tests (issue #495)'
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p mermaid-to-svg --lib -- --nocapture
+          run_nonzero -p dagre_rust --lib -- --nocapture
