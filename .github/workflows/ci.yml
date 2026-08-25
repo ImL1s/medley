@@ -1078,6 +1078,24 @@ jobs:
             session::git:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             workspace_ops:: -- --nocapture
+          # #384 sync: this crate grew 1768 -> 2179 lib tests (+411, +23%)
+          # from the upstream sync, and the 8 named filters above (kept for
+          # their #171/#443 documentation and because `run_nonzero` fails
+          # a named filter that matches zero tests -- a rename/deletion
+          # tripwire a blanket can never trip) left 409 of those new tests
+          # selected by nothing at all. Blanket '' alongside them, not instead
+          # of them: completeness from the blanket, rename-detection plus
+          # history from the named ones. Confirmed via
+          # `scripts/check_new_tests_are_filtered.py`'s `selected()` --
+          # `if not f: return True` -- that a blanket is the complete fix here,
+          # not a narrower-than-it-looks match. This is compile-bound work the
+          # job already pays for (2975 lib tests ran in 60s in a recent
+          # providers run), so the added ~2179 tests cost roughly another 45s,
+          # not new minutes against the 150m budget above -- but that budget
+          # was derived before this coverage existed, so watch the next run's
+          # actual duration rather than trust the arithmetic indefinitely.
+          run_nonzero -p xai-grok-workspace --lib \
+            '' -- --nocapture
           # #384 sync: upstream's `xai-workspace-server` bin target and the
           # `xai-grok-workspace-client` / `xai-grok-workspace-daemon` /
           # `xai-hooks-plugins-types` / `xai-ratatui-inline` crates had no

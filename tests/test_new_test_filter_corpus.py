@@ -310,20 +310,34 @@ def _real_tests_by_crate() -> dict[str, list[tuple[str, str]]]:
 # breakage would reuse an existing key and `test_no_new_unresolvable_module_filter`
 # would report nothing new. Proven by construction, not by count: today every
 # (crate, value) here maps to exactly one target ("lib"), so this widening is
-# a re-expression of the same seven entries, not new coverage (#458 review).
+# a re-expression of the same entries, not new coverage (#458 review). Count
+# was seven at #458; #384 sync removed three that went stale for a reason
+# unrelated to (crate, value) vs (crate, target, value) -- see below.
 KNOWN_UNRESOLVABLE = {
     ("xai-grok-shell", "lib", "auth::manager::tests::"),
-    ("xai-grok-shell", "lib", "auth::openai_codex::tests::"),
     (
         "xai-grok-shell",
         "lib",
         "auth::openai_codex::tests::full_login_flow_persists_provider_scoped_codex_credential",
     ),
-    ("xai-grok-shell", "lib", "leader::lock::tests::reclaim"),
     ("xai-grok-shell", "lib", "terminal::pty_session::tests::"),
     ("xai-grok-shell", "lib", "terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child"),
-    ("xai-grok-subagent-resolution", "lib", "resume::tests"),
 }
+# #384 sync: removed three entries that went stale, not because the guard's
+# module-path approximation improved, but because the filters themselves are
+# no longer in `ci.yml` -- this was already true on the sync branch before any
+# of its three conflicts were resolved, unrelated to this PR's merge work:
+#   ("xai-grok-shell", "lib", "auth::openai_codex::tests::") -- gone, but a
+#     broader `auth::` filter (ci.yml) now subsumes it; no coverage lost.
+#   ("xai-grok-shell", "lib", "leader::lock::tests::reclaim") -- gone, but a
+#     broader `leader::` filter (ci.yml) now subsumes it; no coverage lost.
+#   ("xai-grok-subagent-resolution", "lib", "resume::tests") -- gone, and
+#     NOT subsumed: `xai-grok-subagent-resolution`'s only remaining ci.yml
+#     filter is `native_route::`, which does not select `resume`'s tests.
+#     This is a real, separate coverage gap, tracked apart from this cleanup
+#     since neither this corpus test nor `check_new_tests_are_filtered.py`
+#     was built to catch it -- the former only audits allowlist staleness,
+#     the latter only audits newly-added tests.
 
 
 class ModulePathApproximationCorpus(unittest.TestCase):

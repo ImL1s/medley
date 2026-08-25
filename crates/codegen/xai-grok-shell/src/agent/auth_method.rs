@@ -557,9 +557,10 @@ impl ModelReadiness {
 ///
 /// `NotByok` used to refresh unconditionally, on the reasoning that it "only
 /// ever routes to the session endpoint". That does not hold in this fork:
-/// Session method gate: a definite classification ignores the endpoint —
-/// NotByok always refreshes (only ever routes to the session endpoint),
-/// a genuine per-model Byok never does. Unknown refreshes only against first party.
+/// `NotByok` says the model declares no credential of its own, and says
+/// nothing about where its `base_url` points — a catalog model with an
+/// overridden endpoint is both `NotByok` and third-party. So it consults the
+/// endpoint too (#110).
 pub(crate) fn session_token_auth_gate(
     is_session_based_method: bool,
     model_byok: ModelByok,
@@ -567,7 +568,7 @@ pub(crate) fn session_token_auth_gate(
 ) -> bool {
     is_session_based_method
         && match model_byok {
-            ModelByok::NotByok => true,
+            ModelByok::NotByok => endpoint_is_first_party,
             ModelByok::Byok => false,
             ModelByok::Unknown => endpoint_is_first_party,
         }
@@ -740,12 +741,37 @@ mod tests {
 
     #[test]
     fn session_token_auth_gate_truth_table_in_agent() {
-        assert!(session_token_auth_gate(true, ModelByok::NotByok, false));
+        // #384 sync: the sync branch's version of this table asserted
+        // `NotByok` refreshes unconditionally (`assert!(...NotByok, false)`),
+        // pinning exactly the pre-#110 behaviour the fork fixed -- a catalog
+        // model with an overridden, non-first-party endpoint is still
+        // `NotByok`, and must not get a session bearer. Restored to match
+        // `session_token_auth_gate`'s #110 fix.
+        assert!(!session_token_auth_gate(true, ModelByok::NotByok, false));
         assert!(session_token_auth_gate(true, ModelByok::NotByok, true));
         assert!(!session_token_auth_gate(true, ModelByok::Byok, false));
         assert!(!session_token_auth_gate(true, ModelByok::Byok, true));
         assert!(!session_token_auth_gate(true, ModelByok::Unknown, false));
         assert!(session_token_auth_gate(true, ModelByok::Unknown, true));
+    }
+
+    /// #110: `NotByok` says the model declares no credential of its own. It
+    /// does NOT say where the model's `base_url` points -- a catalog model
+    /// with an overridden endpoint is `NotByok` and third-party at the same
+    /// time. So the endpoint has to be consulted on this arm too, exactly as
+    /// it already is for `Unknown`; otherwise the turn-time resolver attaches
+    /// a live session bearer to whatever host the config named.
+    /// Only the arm #110 changed, kept next to the function so someone editing
+    /// the gate meets it. The full matrix -- non-session methods, `Byok`,
+    /// `Unknown` -- lives in
+    /// `session::acp_session::auth_error_no_retry_tests::session_token_auth_gate_truth_table`.
+    #[test]
+    fn session_token_auth_gate_requires_first_party_for_not_byok() {
+        assert!(
+            !session_token_auth_gate(true, ModelByok::NotByok, false),
+            "a session resolver must not attach on a non-first-party endpoint"
+        );
+        assert!(session_token_auth_gate(true, ModelByok::NotByok, true));
     }
 
     /// When API-key credentials are advertiseable, fall through from a dead
