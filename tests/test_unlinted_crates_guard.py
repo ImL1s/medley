@@ -29,6 +29,7 @@ from check_unlinted_crates import (  # noqa: E402
     linted_tokens,
     load_allowlist,
     main,
+    package_name,
     workspace_member_dirs,
 )
 
@@ -92,6 +93,74 @@ class LintedTokens(unittest.TestCase):
         )
         self.assertEqual(linted_tokens(text), {"xai-grok-tools"})
 
+    def test_ignores_a_commented_out_invocation(self):
+        # A crate disabled by prefixing its `cargo clippy` line with `#` must
+        # not be counted as linted -- that recreates the exact blind spot
+        # this guard exists to close (#439 follow-up).
+        text = _workflow("# " + CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_ignores_an_indented_commented_out_invocation(self):
+        text = _workflow("    # " + CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_truncates_a_trailing_inline_comment_before_matching_flags(self):
+        # The flags only appear in prose after `#`; the command that actually
+        # runs carries neither, so it must not read as deny-level.
+        text = _workflow(
+            "cargo clippy --manifest-path crates/xai-grok-shell/Cargo.toml "
+            "# --all-targets -- -D warnings"
+        )
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_keeps_a_flag_carrying_command_with_a_trailing_comment(self):
+        # A trailing comment on an otherwise-complete, executed command must
+        # not stop it from counting.
+        text = _workflow(CLIPPY.format(d="xai-grok-shell") + "  # still runs")
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+    def test_a_comment_line_does_not_absorb_the_next_real_command(self):
+        # Comment-stripping must happen before the line-continuation join:
+        # a trailing `\` inside a comment does not continue it in bash, so a
+        # commented-out line must never swallow the command after it.
+        text = (
+            "      - run: |\n"
+            "          # cargo clippy --manifest-path crates/xai-grok-tools/Cargo.toml \\\n"
+            "          cargo clippy --manifest-path crates/xai-grok-shell/Cargo.toml --all-targets -- -D warnings\n"
+        )
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+
+class PackageName(unittest.TestCase):
+    def test_double_quoted_name(self):
+        self.assertEqual(package_name('[package]\nname = "foo"\n'), "foo")
+
+    def test_single_quoted_name(self):
+        self.assertEqual(package_name("[package]\nname = 'foo'\n"), "foo")
+
+    def test_tolerates_a_trailing_comment(self):
+        # Valid TOML -- `iter_crates` must not silently drop a crate spelled
+        # this way (#439 follow-up).
+        self.assertEqual(
+            package_name('[package]\nname = "foo" # renamed pending #999\n'), "foo"
+        )
+
+    def test_tolerates_a_trailing_comment_with_no_space(self):
+        self.assertEqual(package_name('[package]\nname = "foo"# no space\n'), "foo")
+
+    def test_tolerates_a_comment_containing_quotes(self):
+        self.assertEqual(
+            package_name('[package]\nname = "foo" # was "bar" before\n'), "foo"
+        )
+
+    def test_trailing_non_comment_text_is_not_a_name(self):
+        # Not valid TOML and not a comment either -- must not be silently
+        # accepted as a match just because it starts with a quoted name.
+        self.assertIsNone(package_name('[package]\nname = "foo" extra\n'))
+
+    def test_a_virtual_manifest_has_no_package_name(self):
+        self.assertIsNone(package_name('[workspace]\nmembers = ["a"]\n'))
+
 
 class Corpus(unittest.TestCase):
     def test_enumerates_from_the_workspace_manifest(self):
@@ -111,6 +180,18 @@ class Corpus(unittest.TestCase):
             _write(
                 root / "crates" / "stray" / "Cargo.toml",
                 '[package]\nname = "stray-crate"\nversion = "0.1.0"\n',
+            )
+            self.assertEqual([c.name for c in iter_crates(root)], ["alpha-crate"])
+
+    def test_a_crate_named_with_a_trailing_comment_is_still_iterated(self):
+        # Regression for #439 follow-up: `iter_crates` used to silently
+        # treat this as a virtual manifest with no package name and drop it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _workspace(root, {"alpha": "alpha-crate"})
+            _write(
+                root / "crates" / "alpha" / "Cargo.toml",
+                '[package]\nname = "alpha-crate" # renamed pending #999\nversion = "0.1.0"\n',
             )
             self.assertEqual([c.name for c in iter_crates(root)], ["alpha-crate"])
 
@@ -236,6 +317,48 @@ class MainExitCodes(unittest.TestCase):
                 ]
             )
             self.assertEqual(code, 0)
+
+    def test_a_new_crate_named_with_a_trailing_comment_surfaces_as_a_gap(self):
+        """Mirrors the #439 follow-up hole: a new, unlinted, unallowlisted
+        crate declared as `name = "..." # explanation` must not vanish from
+        the corpus. Pre-fix, `iter_crates` dropped it silently and the other
+        crates kept the corpus above the plausibility floor, so CI stayed
+        green without either linting or allowlisting it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filler = {f"f{i}": f"filler-{i}" for i in range(20)}
+            _workspace(
+                root,
+                {
+                    "alpha": "alpha-crate",
+                    "beta": "beta-crate",
+                    "probe": "probe-crate",
+                    **filler,
+                },
+            )
+            # Overwrite with the valid-TOML trailing-comment spelling the
+            # plain regex used to miss.
+            _write(
+                root / "crates" / "probe" / "Cargo.toml",
+                '[package]\nname = "probe-crate" # renamed pending #999\nversion = "0.1.0"\n',
+            )
+            workflow = root / "ci.yml"
+            _write(workflow, _workflow(CLIPPY.format(d="alpha")))
+            allowlist = root / "allow"
+            allow = "beta-crate = not triaged\n" + "".join(
+                f"filler-{i} = not triaged\n" for i in range(20)
+            )
+            _write(allowlist, allow)
+
+            code = main(
+                [
+                    "--workflow", str(workflow),
+                    "--root", str(root),
+                    "--allowlist", str(allowlist),
+                ]
+            )
+            self.assertEqual(code, 1)
 
     def test_an_implausibly_small_corpus_fails_instead_of_reporting_ok(self):
         """A broken manifest parse must not read as `no crates, no gaps, ok`."""

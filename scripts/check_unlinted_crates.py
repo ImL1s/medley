@@ -42,7 +42,7 @@ from pathlib import Path
 
 _MEMBERS_BLOCK = re.compile(r"^members\s*=\s*\[(.*?)^\]", re.MULTILINE | re.DOTALL)
 _QUOTED = re.compile(r"""["']([^"']+)["']""")
-_PACKAGE_NAME = re.compile(r"""^name\s*=\s*["']([^"']+)["']\s*$""")
+_PACKAGE_NAME = re.compile(r"""^name\s*=\s*["']([^"']+)["']\s*(?:#.*)?$""")
 _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
 _P_FLAG = re.compile(r"(?:^|[\s\\])(?:-p|--package)\s+([A-Za-z0-9][A-Za-z0-9_-]*)")
 
@@ -104,7 +104,20 @@ def workspace_member_dirs(root: Path) -> list[str]:
 
 
 def package_name(toml_text: str) -> str | None:
-    """`[package]` name, or None for a virtual manifest."""
+    """`[package]` name, or None for a virtual manifest.
+
+    `_PACKAGE_NAME` tolerates a trailing `# comment` after the quoted name
+    (valid TOML) so a crate spelled `name = "foo" # explanation` is not
+    silently dropped from the corpus (#439 follow-up) -- `iter_crates` would
+    otherwise treat it as a virtual manifest with no `[package]` name and
+    skip it, and nothing would report the omission because the remaining
+    crates keep the corpus above `_MIN_PLAUSIBLE_CRATES`.
+
+    This stays a regex rather than `tomllib` (stdlib since 3.11): `ci.yml`
+    invokes `python3` with no `actions/setup-python` step, so nothing in this
+    repo pins the runner's Python to >= 3.11, and the module docstring's "no
+    parser" design is deliberate -- see there for why.
+    """
     in_package = False
     for line in toml_text.splitlines():
         stripped = line.strip()
@@ -138,6 +151,30 @@ def iter_crates(root: Path) -> list[Crate]:
     return found
 
 
+def _strip_shell_comments(workflow_text: str) -> str:
+    """Drop bash comments from each physical line before anything else runs.
+
+    A `cargo clippy` invocation disabled by prefixing it with `#` must not be
+    counted as linting anything -- that is the exact blind spot this guard
+    exists to close, just moved one layer down (#439 follow-up). This has to
+    happen *before* the line-continuation join below: in bash, `#` comments
+    to the end of the physical line, and a trailing `\\` inside a comment does
+    not continue it, so joining first would let a commented-out line absorb
+    the next real command.
+
+    A full-line comment is dropped entirely; a trailing inline comment is
+    truncated so flag spellings that only appear in prose (e.g. describing
+    `--all-targets` in an explanatory comment) cannot be counted as though
+    the command carried them.
+    """
+    lines = []
+    for raw_line in workflow_text.splitlines():
+        if raw_line.strip().startswith("#"):
+            continue
+        lines.append(re.sub(r"#.*$", "", raw_line))
+    return "\n".join(lines)
+
+
 def linted_tokens(workflow_text: str) -> set[str]:
     """Crates a `cargo clippy` invocation lints at the job's promised strength.
 
@@ -149,7 +186,8 @@ def linted_tokens(workflow_text: str) -> set[str]:
     the guard then demands an allowlist entry, which is a visible diff someone
     reviews, rather than quietly accepting an invocation it did not understand.
     """
-    joined = re.sub(r"\\\s*\n\s*", " ", workflow_text)
+    commentless = _strip_shell_comments(workflow_text)
+    joined = re.sub(r"\\\s*\n\s*", " ", commentless)
     tokens: set[str] = set()
     for line in joined.splitlines():
         if "cargo clippy" not in line:
