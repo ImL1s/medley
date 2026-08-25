@@ -454,10 +454,20 @@ mod tests {
     /// pipe cannot close — so the drain thread cannot have anything
     /// buffered — until that escalation actually completes. That makes this
     /// test genuinely sensitive to `grace`'s value rather than trivially
-    /// true regardless of it: the sibling test right below asserts the
-    /// other direction, that a too-small `grace` legitimately fails, so
-    /// together they bound the function's behaviour instead of only
-    /// checking the side that was always going to pass.
+    /// true regardless of it: the sibling test below (a different fixture,
+    /// see its own doc comment for why) asserts the other direction, that
+    /// too small a `grace` legitimately fails, so together they bound the
+    /// function's behaviour instead of only checking the side that was
+    /// always going to pass.
+    ///
+    /// One residual, named rather than hidden: this fixture has its own
+    /// small timing dependency, installing the `SIGTERM` trap shortly after
+    /// exec (see the 250ms head start below). If a signal ever raced that
+    /// install under extreme load, the process would die to the *default*
+    /// SIGTERM instead of forcing the escalation, and this test would pass
+    /// without having exercised the property it names — a coverage gap
+    /// under pathological load, not a source of flakiness, since a fast
+    /// death still leaves `stdout`/`stderr` fully drained either way.
     #[cfg(unix)]
     #[test]
     fn post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline() {
@@ -472,21 +482,68 @@ mod tests {
         reap_after_escalation(&group, &mut child);
     }
 
-    /// The other half of the property above: a `grace` far smaller than
-    /// `GROUP_EXIT_GRACE` cannot survive the same escalation, so the drain
-    /// legitimately times out. Without this, a `post_exit_cleanup_and_drain`
-    /// that ignored `grace` entirely and always waited, say, a full second
-    /// would pass the sibling test above for the wrong reason.
+    /// The other half of the property above, made deterministic instead of
+    /// a second race against signal/escalation timing — which a PR whose
+    /// entire subject is removing scheduling races should not introduce.
+    /// An earlier draft reused the SIGTERM-ignoring fixture above with a
+    /// too-small `grace`; that still depends on trap-install timing *and*
+    /// on the SIGKILL teardown and drain thread being scheduled in a
+    /// specific order relative to a 5ms deadline, both real races at low
+    /// probability.
+    ///
+    /// This holder is instead spawned in its own process group via
+    /// `detach_std_command` and deliberately **never attached** to `group`.
+    /// `terminate_owned_group` only ever signals the group it owns
+    /// (`ProcessGroup::terminate`/`kill` operate on `self`'s leader alone,
+    /// see `killpg_unix`), so an unattached holder cannot be reached by it
+    /// at all — its pipe provably never closes on its own, with no signal
+    /// delivery, no trap timing, and no escalation to race. That also
+    /// states the actual invariant more precisely: `grace` bounds the
+    /// drain wait even when nothing ever closes the pipe, not merely when
+    /// closing it happens to take too long.
     #[cfg(unix)]
     #[test]
-    fn post_exit_grace_too_small_for_the_escalation_still_fails_the_drain() {
-        let (group, mut child, stdout_rx, stderr_rx) = spawn_sigterm_ignoring_pipe_holder();
+    fn post_exit_grace_bounds_the_drain_when_nothing_closes_the_pipe() {
+        let group = xai_tty_utils::ProcessGroup::new().expect("group");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 1000")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        xai_tty_utils::detach_std_command(&mut cmd);
+        // Deliberately not attached to `group` -- see the doc comment above.
+        #[allow(clippy::disallowed_methods)] // test fixture; killed directly below, not via `group`
+        let mut holder = cmd.spawn().expect("spawn holder");
+        let stdout = holder.stdout.take().expect("stdout piped");
+        let stderr = holder.stderr.take().expect("stderr piped");
+        let stdout_rx = spawn_pipe_drain(stdout, "stdout");
+        let stderr_rx = spawn_pipe_drain(stderr, "stderr");
 
         let too_small = Duration::from_millis(5);
+        let started = std::time::Instant::now();
         let result = post_exit_cleanup_and_drain(&group, stdout_rx, stderr_rx, too_small);
+        let elapsed = started.elapsed();
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+
         assert!(
             result.is_err(),
-            "a grace far below the SIGKILL escalation time must not silently succeed: {result:?}"
+            "grace must bound the drain wait even when nothing ever closes the pipe: {result:?}"
+        );
+        // Bounds *how quickly* it fails, not just that it eventually does --
+        // a pipe that never closes would still (eventually) produce `Err`
+        // even from an implementation that silently ignored `too_small` and
+        // fell back to some larger hardcoded bound instead. This is the half
+        // of the pair that would actually catch that: the sibling test
+        // above cannot, because a larger-than-needed grace still comfortably
+        // clears its escalation and stays green.
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "must fail in the requested grace's own ballpark, not after some \
+             larger hardcoded wait the parameter was ignored in favour of: \
+             took {elapsed:?} for a 5ms grace"
         );
         assert!(
             result
@@ -494,13 +551,11 @@ mod tests {
                 .contains("did not close before the query deadline"),
             "must fail as a drain timeout, not some other error"
         );
-
-        reap_after_escalation(&group, &mut child);
     }
 
-    /// Shared fixture for the two tests above: a process that prints,
-    /// installs a `SIGTERM` trap, and then blocks forever holding its own
-    /// piped stdout/stderr open.
+    /// Fixture for the positive test above: a process that prints, installs
+    /// a `SIGTERM` trap, and then blocks forever holding its own piped
+    /// stdout/stderr open.
     #[cfg(unix)]
     #[allow(clippy::type_complexity)] // test fixture; a named type would be single-use
     fn spawn_sigterm_ignoring_pipe_holder() -> (
