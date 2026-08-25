@@ -96,6 +96,15 @@ jobs:
       - name: Test the unlinted-crate ratchet
         run: python3 -B -m unittest tests.test_unlinted_crates_guard -v
 
+      # Four scripts in `scripts/` classified the same Cargo manifest `name`
+      # line, and the two fixes the oldest copy received never reached the
+      # others (#494). This does not count copies: it compiles and runs every
+      # regex literal in `scripts/*.py` and demands the full tolerance set
+      # from anything that behaves like a reader of that line, so a fifth copy
+      # cannot be added un-fixed however it is spelled.
+      - name: Every manifest-name regex tolerates the same TOML forms
+        run: python3 -B -m unittest tests.test_package_name_extractors -v
+
       - name: Test the PR-head CI receipt guard
         # This guard is a pre-merge local/orchestrator check; it does not run
         # as part of CI itself. CI only executes its Python unit tests.

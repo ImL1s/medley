@@ -34,6 +34,11 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+# Shared with the sibling guards so this copy cannot drift out of
+# tolerance again (#494); this script is the one whose miss produced a
+# wrong name rather than a missing one -- see `workspace_members`.
+from toml_package_name import package_name
+
 # `run_nonzero -p <crate> ... <filter> -- --nocapture`
 # and bare `cargo test --manifest-path <path> ... <filter> -- ...`
 _RUNNER = re.compile(r"^\s*(?:run_nonzero|cargo test)\s+(.*)$")
@@ -76,14 +81,21 @@ def workspace_members(root: Path) -> set[str]:
         # 76 of these 81 and silently wrong for the rest, which surfaced as
         # `did not match any packages` -- caught only because a failed listing
         # is fatal (#408 review). Read the manifest.
+        #
+        # `package_name` reads the `[package]` table specifically. The
+        # whole-file `re.search` this replaced would have returned a
+        # `[[bin]] name` declared above `[package]`; no member in this tree is
+        # ordered that way today, so the change is measured to move no name
+        # (81/81 unchanged), and it removes the ordering dependency (#494).
+        # The path fallback stays: a manifest that cannot be read or declares
+        # no `[package]` still has to contribute *something* to the sweep, and
+        # dropping it silently is the failure this guard exists to prevent.
         manifest = root / rel / "Cargo.toml"
         try:
-            decl = re.search(
-                r'^\s*name\s*=\s*"([^"]+)"', manifest.read_text(), re.M
-            )
+            declared = package_name(manifest.read_text())
         except OSError:
-            decl = None
-        names.add(decl.group(1) if decl else Path(rel).name)
+            declared = None
+        names.add(declared or Path(rel).name)
     return names
 
 

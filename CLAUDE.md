@@ -45,6 +45,10 @@ CI runs on `providers` only. `main` moving triggers nothing.
 
 **Inserting code above a `fn` steals its attributes.** Anchor on the attribute block (`    #[test]\n    fn name`), not on `fn name`. A stolen `#[test]` compiles fine and silently stops running; only clippy's `duplicated attribute` notices.
 
+**An exemption you cannot remove to produce a red is not an exemption, it is a comment.** An allowlist or known-divergence list must be *separate* from the corpus it exempts. Deriving the corpus from the exemptions (`CASES = (*explicit, *_EXEMPT)`) makes the list unfalsifiable in a way the standard check cannot see: deleting an entry deletes the case along with it, so the thing stops being tested instead of becoming unexempted, and everything stays green. This shape defeats "pull the exemption and watch it go red" — the very move you would use to test it. Keep the cases listed explicitly, exempt them by key, and assert every key is present in the corpus. Found in `tests/test_package_name_extractors.py` by mutating the list, not by reading it; reading it looks correct.
+
+**A cancelled CI job is not a slow one and not a passing one.** `ci.yml`'s concurrency group is keyed by SHA for `push` but by ref for `pull_request`, with `cancel-in-progress` on for the latter — so **every push to a PR branch kills the previous run's unfinished jobs**. The long ones (`Compile every test target`, `Tests (providers hot path)`) are what get killed. In a `gh pr checks` snapshot taken after the next push, `cancelled` and `pending` look identical, and neither is red. Four consecutive heads of #506 reported as healthy while `Compile every test target` had never once run to completion. Reconcile on the per-job `conclusion` (`gh api repos/OWNER/REPO/commits/<sha>/check-runs`), treat `cancelled` as *no evidence*, and let a head settle before pushing the next one.
+
 ## Credentials must never reach diagnostics
 
 This is the fork's sharpest divergence from upstream (#33), and every upstream sync collides with it — six conflicts in the 2026-08-04 sync alone.

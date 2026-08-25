@@ -40,9 +40,16 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# The tolerant `[package] name` reader, shared with the sibling guards.
+# This file had its own copy: the comment tolerance (#464) and the quoted
+# key (#486) were both fixed here and reached none of the other three,
+# which is the drift #494 collapses. Its table-header handling had the
+# same gap in the other direction -- `[package] # metadata` was never
+# entered and `[features] # x` never left.
+from toml_package_name import package_name
+
 _MEMBERS_BLOCK = re.compile(r"^members\s*=\s*\[(.*?)^\]", re.MULTILINE | re.DOTALL)
 _QUOTED = re.compile(r"""["']([^"']+)["']""")
-_PACKAGE_NAME = re.compile(r"""^name\s*=\s*["']([^"']+)["']\s*(?:#.*)?$""")
 _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
 _P_FLAG = re.compile(r"(?:^|[\s\\])(?:-p|--package)\s+([A-Za-z0-9][A-Za-z0-9_-]*)")
 
@@ -101,38 +108,6 @@ def workspace_member_dirs(root: Path) -> list[str]:
     if block is None:
         return []
     return _QUOTED.findall(block.group(1))
-
-
-def package_name(toml_text: str) -> str | None:
-    """`[package]` name, or None for a virtual manifest.
-
-    `_PACKAGE_NAME` tolerates a trailing `# comment` after the quoted name
-    (valid TOML) so a crate spelled `name = "foo" # explanation` is not
-    silently dropped from the corpus (#439 follow-up) -- `iter_crates` would
-    otherwise treat it as a virtual manifest with no `[package]` name and
-    skip it, and nothing would report the omission because the remaining
-    crates keep the corpus above `_MIN_PLAUSIBLE_CRATES`.
-
-    This stays a regex rather than `tomllib` (stdlib since 3.11): `ci.yml`
-    invokes `python3` with no `actions/setup-python` step, so nothing in this
-    repo pins the runner's Python to >= 3.11, and the module docstring's "no
-    parser" design is deliberate -- see there for why.
-    """
-    in_package = False
-    for line in toml_text.splitlines():
-        stripped = line.strip()
-        if stripped == "[package]":
-            in_package = True
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            if in_package:
-                return None
-            continue
-        if in_package:
-            m = _PACKAGE_NAME.match(stripped)
-            if m:
-                return m.group(1)
-    return None
 
 
 def iter_crates(root: Path) -> list[Crate]:

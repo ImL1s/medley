@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_test_filter_coverage import parse_workflow  # noqa: E402
+from toml_package_name import name_in_block  # noqa: E402
 
 _TEST_ATTR = re.compile(r"^\+\s*#\[(?:tokio::)?test\b")
 _FN = re.compile(r"^\+\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
@@ -111,19 +112,24 @@ def _bin_target_name(crate_dir: str, rel_path: str, fallback: str) -> str:
     # Minimal scan rather than a TOML parse: this runs in a job with no dependencies.
     for block in re.split(r"^\s*\[\[bin\]\]\s*$", text, flags=re.M)[1:]:
         block = re.split(r"^\s*\[", block, maxsplit=1, flags=re.M)[0]
-        name = re.search(r'^\s*name\s*=\s*"([^"]+)"', block, flags=re.M)
-        if not name:
+        # Shared with the sibling guards (#494). Not a `[package] name`, but
+        # the same line shape with the same tolerance gaps: a `[[bin]]` entry
+        # spelled `name = 'foo'` or `"name" = "foo"` used to fall through to
+        # `fallback` -- a confident wrong target name, not a missing one.
+        # (The `path` read below has not been given the same treatment.)
+        bin_name = name_in_block(block)
+        if bin_name is None:
             continue
         path_m = re.search(r'^\s*path\s*=\s*"([^"]+)"', block, flags=re.M)
         if path_m is None:
             # No `path`: cargo infers it from the name, so this entry only claims
             # `rel_path` if the inferred location matches.
-            inferred = {f"src/bin/{name.group(1)}.rs", "src/main.rs"}
+            inferred = {f"src/bin/{bin_name}.rs", "src/main.rs"}
             if want in inferred:
-                return name.group(1)
+                return bin_name
             continue
         if path_m.group(1).removeprefix("./") == want:
-            return name.group(1)
+            return bin_name
     return fallback
 
 
