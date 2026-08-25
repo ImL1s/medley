@@ -3601,15 +3601,15 @@ impl Drop for SessionIdLock {
         // Best-effort: a failed unlock here must not panic -- `Drop` also
         // runs during unwinding, where a panic would abort the process --
         // and the fds are about to close either way.
-        if let Some(namespace) = self.namespace.as_ref() {
-            if let Err(error) = FileExt::unlock(namespace) {
-                tracing::warn!(%error, "failed to unlock session-id namespace lease on drop");
-            }
+        if let Some(namespace) = self.namespace.as_ref()
+            && let Err(error) = FileExt::unlock(namespace)
+        {
+            tracing::warn!(%error, "failed to unlock session-id namespace lease on drop");
         }
-        if let Some(mutation) = self.mutation.as_ref() {
-            if let Err(error) = FileExt::unlock(mutation) {
-                tracing::warn!(%error, "failed to unlock session-id mutation lease on drop");
-            }
+        if let Some(mutation) = self.mutation.as_ref()
+            && let Err(error) = FileExt::unlock(mutation)
+        {
+            tracing::warn!(%error, "failed to unlock session-id mutation lease on drop");
         }
     }
 }
