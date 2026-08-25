@@ -16,10 +16,26 @@ the ratchet: it compiles and runs every string constant in `scripts/*.py` and
 demands the full tolerance set from anything that behaves like a reader of
 this line, so a fifth copy cannot be added un-fixed.
 
-No TOML parser: `ci.yml` invokes `python3` with no `actions/setup-python`
-step, so nothing in this repo pins the runner's Python to >= 3.11 and
-`tomllib` cannot be assumed. Each caller's own module docstring gives the
-rest of that reasoning.
+No TOML parser here, and that is a **choice rather than a constraint** --
+stated carefully, because the earlier wording of this paragraph claimed more
+than the facts support.
+
+What is true: `ci.yml` invokes `python3` with no `actions/setup-python` step,
+so nothing in this repo **pins** the runner's Python. What is also true, and
+measured: the runner image is `ubuntu-24.04`, whose Python is 3.12, so
+`tomllib` is in fact available today. Unpinned is not the same as absent, and
+this paragraph used to conflate them.
+
+So the reason production does not use `tomllib` is not that it cannot. It is
+that these are *guards*, and a guard that answers one way where it is
+authored and another way where it runs is the #171 failure exactly. Depending
+on an unpinned interpreter feature would reintroduce that axis for no gain:
+this reader is measured to agree with `tomllib` on 83 of 83 manifests in the
+tree, so the parser would buy correctness this workspace never asks for.
+
+The **test** may depend on `tomllib`, and does -- see
+`DifferentialAgainstTomllib`, which imports it unconditionally so that the
+day the assumption stops holding is a red build rather than a silent skip.
 """
 
 from __future__ import annotations

@@ -307,11 +307,18 @@ class DifferentialAgainstTomllib(unittest.TestCase):
     the question gets asked once, mechanically: does this reader agree with
     `tomllib` -- and where it does not, is that written down?
 
-    Production stays parser-free by design (`ci.yml` runs `python3` with no
-    `actions/setup-python` step, so `tomllib` cannot be assumed at runtime).
-    The TEST may assume it, and imports it at module scope rather than
-    skipping when absent: a skipped differential is a green that checked
-    nothing, and that is the one failure this repo keeps paying for.
+    Production stays parser-free by choice, not because `tomllib` is missing
+    -- the runner image is `ubuntu-24.04` and its Python is 3.12, so it is
+    there. See the module docstring in `scripts/toml_package_name.py` for why
+    a *guard* still should not depend on an unpinned interpreter feature.
+
+    A test may, and this one does: it imports `tomllib` at module scope rather
+    than skipping when absent. A skipped differential is a green that checked
+    nothing. The trade is deliberate and worth naming -- this couples the
+    `Audit publisher tests` job to a runner Python nothing in this repo pins,
+    so if that image ever drops below 3.11 the import fails and the job goes
+    red. Loud, and about the right thing; pinning the runner's Python instead
+    would add a network dependency to a job that currently has none.
     """
 
     # Every spelling those four rounds turned up, plus the plain one.
