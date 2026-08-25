@@ -1058,6 +1058,11 @@ jobs:
           # #354: workspace proxy-header injection is first-party only.
           run_nonzero -p xai-grok-workspace --lib \
             build_proxy_headers_ -- --nocapture
+          # #493: HomeDirGuard is the pin/restore RAII underneath every
+          # HOME-isolated test that used to mutate process env; a broken pin
+          # or drop-restore would silently widen back to the set_var UB.
+          run_nonzero -p xai-grok-workspace --lib \
+            home_dir::tests:: -- --nocapture
           run_nonzero -p xai-computer-hub-sdk --lib \
             unavailable_handlers_are_absent_from_publish_and_dispatch -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
