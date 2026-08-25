@@ -92,13 +92,8 @@ pub(crate) fn compose_typed_provider_failure(
     error_type: Option<&str>,
     raw: &str,
 ) -> Option<FormattedRequestFailure> {
-    if let Some(formatted) = split_existing_banner(raw) {
-        // The caller's parsed status still wins for the reported field, as it
-        // always has; the banner's own status is the fallback.
-        return Some(FormattedRequestFailure {
-            status: status.or(formatted.status),
-            ..formatted
-        });
+    if let Some(formatted) = split_existing_banner(status, raw) {
+        return Some(formatted);
     }
     if !looks_like_typed_provider_failure(status, error_type, raw) {
         return None;
@@ -155,24 +150,43 @@ pub(crate) fn compose_typed_provider_failure(
 /// Reordering the two anchored strips after the carrier strips would make
 /// this function genuinely idempotent and is the real fix; it changes shared
 /// behaviour, so it is tracked separately rather than folded into this P2.
-fn split_existing_banner(raw: &str) -> Option<FormattedRequestFailure> {
+///
+/// #429: this used to parse its own status from `headline` and gate
+/// [`finish_detail`] on *that*, while the caller separately overwrote the
+/// returned `status` field with `caller_status.or(that_same_parse)` — two
+/// reads of "the status" landing in two different places. A raw that
+/// forges an exact 4xx headline over a caller-reported 5xx made them
+/// disagree: the field said 500 (a server fault) while the gate was asked
+/// about 400, so the 5xx body it should have suppressed reached the user.
+/// `status` below is computed once, from `caller_status` — the trustworthy
+/// one, since it is the transport's own ACP `http_status` — and reused for
+/// both the gate and the returned field, so there is only one place left
+/// that could disagree with itself. `banner_status` stays local: it is only
+/// ever a question about the headline text ("is this the canonical
+/// headline for the status it itself claims"), not about what actually
+/// happened.
+fn split_existing_banner(caller_status: Option<u16>, raw: &str) -> Option<FormattedRequestFailure> {
     let (headline, detail) = raw.split_once(" \u{2014} ")?;
     let headline = headline.trim();
-    let status = parse_http_status(headline)?;
+    let banner_status = parse_http_status(headline)?;
     // `classify` ignores the wire type once the status is known, so `Other`
     // reproduces exactly the headline any caller would have got.
-    let class = classify(Some(status), WireErrorType::Other);
+    let class = classify(Some(banner_status), WireErrorType::Other);
     if headline != class.headline {
         return None;
     }
+    // The caller's status still wins, as it always has; the banner's own
+    // parsed status is only the fallback. Bound once here, then threaded
+    // into both the gate and the field below — never read a second time.
+    let status = caller_status.or(Some(banner_status));
     let detail = finish_detail(
         extract_error_detail(detail),
-        Some(status),
+        status,
         WireErrorType::Other,
         &class,
     );
     Some(FormattedRequestFailure {
-        status: Some(status),
+        status,
         headline: class.headline,
         detail,
     })
@@ -1325,6 +1339,67 @@ mod tests {
             .expect("already-formatted banner is typed");
         assert_eq!(formatted.headline, "Bad request (400)");
         assert_eq!(formatted.detail, "Invalid value for reasoning.effort");
+    }
+
+    /// #429: the fast rail used to gate [`finish_detail`] on the status
+    /// parsed out of the banner's own headline text, while
+    /// `compose_typed_provider_failure` separately reported the caller's
+    /// status in the returned field. An exactly-forged 4xx headline over a
+    /// caller-reported 5xx made the two disagree: the field said 500 (a
+    /// server fault the module promises never to show server text for) but
+    /// the suppression gate was asked about 400, so the 5xx body reached
+    /// the user anyway. This is issue #429's own worked example.
+    #[test]
+    fn issue429_suppression_gate_matches_the_reported_status_not_the_banner_text() {
+        let raw = "Bad request (400) \u{2014} upstream exploded at pod-42";
+        let formatted = compose_typed_provider_failure(Some(500), None, raw)
+            .expect("an exactly-forged 4xx banner over a caller 5xx is still typed");
+        assert_eq!(
+            formatted.status,
+            Some(500),
+            "the caller's transport status must win the reported field"
+        );
+        let msg = formatted.message();
+        assert!(
+            !msg.contains("upstream exploded") && !msg.contains("pod-42"),
+            "status field says 500 (a server fault) — its own gate must \
+             agree and suppress the server body, not the banner text's 400: {msg}"
+        );
+        // The banner still *renders* the 400 the text claimed (headline,
+        // action and default_why all come from `classify(Some(banner_status))`
+        // — only `status` and the suppression gate follow the transport), so
+        // the fallback copy shown is 400's own, not 500's.
+        assert_eq!(
+            formatted.detail, "The server rejected this request.",
+            "suppressed body must fall back to the banner's own default_why"
+        );
+        // The gate and the field must always be looking at the same value:
+        // suppression must track whatever `formatted.status` itself says,
+        // for every disagreeing pair, not just this one.
+        for (caller, banner_code, banner_headline) in [
+            (500u16, 400u16, "Bad request (400)"),
+            (503, 404, "Not found (404)"),
+            (429, 500, "Server error (500)"),
+        ] {
+            let raw = format!("{banner_headline} \u{2014} internal server detail xyz");
+            let formatted = compose_typed_provider_failure(Some(caller), None, &raw)
+                .expect("a canonical forged headline is still typed");
+            assert_eq!(formatted.status, Some(caller));
+            let is_fault = formatted.status.is_some_and(|s| s >= 500);
+            let banner_is_fault = banner_code >= 500;
+            let leaked = formatted.detail.contains("internal server detail");
+            assert_eq!(
+                leaked,
+                !is_fault,
+                "gate must follow the reported status ({}), not the banner's \
+                 own ({banner_code}): detail={:?}",
+                formatted.status.unwrap(),
+                formatted.detail
+            );
+            // Sanity: this triple is only interesting when the two actually
+            // disagree about fault-ness.
+            assert_ne!(is_fault, banner_is_fault);
+        }
     }
 
     #[test]
