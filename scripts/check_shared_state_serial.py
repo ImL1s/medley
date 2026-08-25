@@ -133,13 +133,26 @@ WHAT THIS DOES NOT CHECK, so a green tick is not read as more than it is:
     `search_recovery::heal_unusable(..)` only in its
     `Err(e) if is_unusable_db_error(&e)` arm, which a fresh-tmpdir test
     fixture essentially never takes -- but the transitive closure has no way
-    to know that, so it derives 36 candidate `search_cache_epoch` members
-    from that one file, not the 6 a human tagged in #492 by judging which
+    to know that, so it derives 37 candidate `search_cache_epoch` members
+    from that one file, against 7 a human tagged in #492 by judging which
     tests could actually OBSERVE a moved counter, not merely reach the call
     that moves it. This is sound (nothing is missed) but not tight (some
     flagged tests likely never execute the branch that matters), and it is
     exactly why `search_cache_epoch` is not registered by this change --
     see the section below.
+
+    That superset is not pure noise, though, and this is the strongest
+    argument for deriving membership rather than trusting a hand-written
+    list: `test_malformed_db_file_is_quarantined_and_recreated` (also in
+    `search_fts.rs`) is IN the 37-candidate dry run, reaching `CACHE_EPOCH`
+    through `with_index` -> `heal_unusable`, two hops, no direct mention of
+    the identifier anywhere in the test's own body. It was NOT among the
+    6 tests #492 originally tagged by grep -- a real member the grep could
+    not see, because it goes through a caller two levels up. Codex's review
+    of #492 found the same gap independently and #492 was corrected to tag
+    it, which is how it is now among the 7. The dry run had already found
+    it, in the noisier 36-candidate superset, before that review comment
+    existed.
 
     Two tests can each be individually sound and still race if they are
     governed by two DIFFERENT keys that are not the same lock (`#319`,
@@ -164,12 +177,14 @@ introduces that key) had not merged to `providers` at the time this script
 was written, so its `SERIAL-GROUP` marker rides on that PR rather than
 being duplicated here ahead of it; and a dry run of this checker against
 #492's own diff (registering the marker in a scratch worktree, never
-committed) found the reachability closure derives 36 candidate members
-against the 6 a human actually tagged, for the reachability-is-not-control-
-flow reason documented above. Registering that key for real is a decision
-for whoever lands it -- accept the wider serialisation, or decide this
-checker needs a scoping mechanism this design does not attempt -- not
-something to force through here by narrowing the resolver to fit one
+committed) found the reachability closure derives 37 candidate members
+against the 7 a human actually tagged (6 by grep, a 7th added after this
+same dry run's superset -- and, independently, Codex's review -- both
+named it), for the reachability-is-not-control-flow reason documented
+above. Registering that key for real is a decision for whoever lands it --
+accept the wider serialisation, or decide this checker needs a scoping
+mechanism this design does not attempt -- not something to force through
+here by narrowing the resolver to fit one
 item's shape.
 
 Usage:
@@ -315,6 +330,59 @@ def _balanced_end(source: str, open_index: int) -> int:
     return index
 
 
+def _skip_generic_params(source: str, open_index: int) -> int:
+    """Skip a `<...>` generic parameter list starting at `open_index`
+    (`source[open_index]` must be `<`), respecting nesting (`<A<B>>`) and
+    comments/strings.
+
+    Deliberately a SEPARATE function from `_balanced_end`, not an addition
+    of `<`/`>` to its `pairs` dict: `<`/`>` are also Rust's comparison
+    operators, and `_balanced_end` is called from contexts (`_impl_blocks`,
+    general balanced-brace scanning) where a stray comparison inside an
+    ordinary expression must not be misread as opening a generic. This is
+    called only from `_fn_body`, at a position already known to be a
+    function name's immediate next character -- a bare `<` there cannot
+    legally be anything but a generic parameter list opener.
+
+    Guards one real ambiguity: a `->` arrow inside a trait-bound generic
+    (`fn f<T: Fn() -> U>(..)`) contains a `>` that is not a close. Anything
+    subtler (a `<=`/`>=` inside a const-generic default expression, for
+    instance) is not attempted -- the codebase this was written for and
+    checked against has none, measured by this bug's own discovery: it
+    hid `with_index<R>` from every function index until fixed.
+    """
+
+    depth = 1
+    index = open_index + 1
+    while index < len(source) and depth:
+        comment_end = _skip_comment(source, index)
+        if comment_end is not None:
+            index = comment_end
+            continue
+        raw_end = _skip_raw_string(source, index)
+        if raw_end is not None:
+            index = raw_end
+            continue
+        char = source[index]
+        if char == '"':
+            index = _skip_quoted(source, index, char)
+        elif char == "'" and (char_end := _skip_char_literal(source, index)) is not None:
+            index = char_end
+        elif char == "<":
+            depth += 1
+            index += 1
+        elif char == ">":
+            if index > 0 and source[index - 1] == "-":
+                # `->`, not a generic close.
+                index += 1
+            else:
+                depth -= 1
+                index += 1
+        else:
+            index += 1
+    return index
+
+
 def _code_only(source: str) -> str:
     """Mask comments and literals while preserving offsets and newlines."""
 
@@ -397,7 +465,7 @@ def _fn_body(source: str, name_end: int) -> tuple[int, int] | None:
     while index < len(source) and source[index].isspace():
         index += 1
     if index < len(source) and source[index] == "<":
-        index = _balanced_end(source, index)
+        index = _skip_generic_params(source, index)
         while index < len(source) and source[index].isspace():
             index += 1
     if index >= len(source) or source[index] != "(":

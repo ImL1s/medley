@@ -307,6 +307,62 @@ class TransitiveClosure(unittest.TestCase):
         findings = guard.scan_source(text)
         self.assertEqual(findings, [])
 
+    def test_generic_fn_with_no_space_before_the_bracket_is_still_indexed(self):
+        """Regression for a real miss: `fn with_index<R>(` (no space before
+        `<`) was silently unparseable -- `_fn_body` tried to skip the
+        generic via `_balanced_end`, whose `pairs` dict does not include
+        `<`/`>`, so it returned the position unchanged and the following
+        `!= "("` check failed, dropping the WHOLE function from the index.
+        Found via a dry run against #492's real `with_index<R>`, which
+        made `test_malformed_db_file_is_quarantined_and_recreated`
+        undetectable -- exactly the test #496 exists to catch, hidden by a
+        parser bug rather than a resolution-depth limit."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            pub fn with_index<R>(op: impl Fn() -> R) -> R {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+                op()
+            }
+
+            #[test]
+            fn calls_generic_fn_untagged() {
+                with_index(|| 1);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_generic_fn_untagged"})
+
+    def test_generic_fn_with_trait_bound_arrow_does_not_confuse_the_depth_count(self):
+        """The one real ambiguity `_skip_generic_params` guards: a `->`
+        arrow inside a trait-bound generic contains a `>` that is not a
+        close. Without the guard, `Fn() -> R` inside `<F: Fn() -> R>` would
+        prematurely end the generic at its own `>`, then fail the
+        following `!= "("` check against the `R` that's left over."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            pub fn with_bound<F: Fn() -> u64>(op: F) -> u64 {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+                op()
+            }
+
+            #[test]
+            fn calls_bound_fn_untagged() {
+                with_bound(|| 1);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_bound_fn_untagged"})
+
 
 class CrateQualifiedResolution(unittest.TestCase):
     def test_crate_qualified_call_resolves_by_module_path(self):
