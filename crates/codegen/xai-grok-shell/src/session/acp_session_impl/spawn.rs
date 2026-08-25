@@ -3027,12 +3027,22 @@ pub(crate) async fn spawn_session_on_thread(
         .map(crate::session::SessionPublicationGate::register_session_thread);
     #[cfg(test)]
     let tracing_dispatch = tracing::dispatcher::get_default(Clone::clone);
+    // Same reason as the dispatcher above, for the state directory: a test that
+    // pins one must have this thread persist into it, not into the developer's
+    // real one. Without this the session tree splits across two homes -- the
+    // request thread writes the fixture, the actor writes `chat_history.jsonl`
+    // and `system_prompt.txt` next to the user's own sessions (#420).
+    #[cfg(test)]
+    let state_home_pin = xai_grok_config::state_home::pinned_state_home();
     let join_handle = std::thread::Builder::new()
         .name(thread_name)
         .stack_size(SESSION_THREAD_STACK_SIZE)
         .spawn(move || {
             #[cfg(test)]
             let _tracing_dispatch_guard = tracing::dispatcher::set_default(&tracing_dispatch);
+            #[cfg(test)]
+            let _state_home_guard =
+                state_home_pin.map(xai_grok_config::state_home::StateHomeGuard::pin);
             // Held for the entire OS-thread lifetime. Abort cleanup waits for
             // this lease before recursively deleting provisional storage.
             let _session_thread_lease = session_thread_lease;

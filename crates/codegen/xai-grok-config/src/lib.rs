@@ -28,6 +28,7 @@ pub mod program_name;
 pub mod shell;
 pub mod signed_policy;
 pub mod state_dir;
+pub mod state_home;
 mod validation;
 pub mod version_overrides;
 

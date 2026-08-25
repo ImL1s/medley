@@ -26,6 +26,12 @@ pub fn default_grok_home() -> PathBuf {
 /// for the precedence. [`pin_grok_home`] can fix the value up front, which the
 /// startup migration uses so the whole process agrees on one directory.
 pub fn grok_home() -> PathBuf {
+    // A test-only thread-local pin wins over the process-wide cache. Nothing in
+    // production sets one, so this is a single thread-local read on the way to
+    // the same answer; see `crate::state_home` for why it cannot be `cfg(test)`.
+    if let Some(pinned) = crate::state_home::pinned_state_home() {
+        return pinned;
+    }
     GROK_HOME
         .get_or_init(|| {
             let resolved = crate::state_dir::resolve();
