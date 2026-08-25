@@ -1,6 +1,8 @@
-//! Hub [`AuthProvider`] from `~/.grok/auth.json` for the standalone
+//! Hub [`AuthProvider`] from `auth.json` for the standalone
 //! `workspace_server` binary: loopback `ws://` uses a plain bearer, otherwise
 //! an auto-refreshing OIDC provider that persists rotated tokens to disk.
+//! The file is `--auth-config`, else `$GROK_AUTH_PATH`, else
+//! `grok_home/auth.json` — see [`default_auth_path`] and [`provider`] (#482).
 //!
 //! The in-leader `grok workspace` exposure does NOT use this path — it sources
 //! an in-memory provider from the leader's `AuthManager` (see
@@ -72,10 +74,22 @@ struct AuthEntry {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// `$GROK_AUTH_PATH` if the hub's own environment sets it, else
+/// `grok_home/auth.json` (#482). [`provider`]'s `--auth-config` argument, when
+/// passed, is resolved before this function is ever called and wins outright
+/// — this is only the fallback for "no explicit flag."
+///
+/// Every other medley binary already honours `GROK_AUTH_PATH`
+/// (`AuthManager`, `store_api_key`/`clear_api_key`, the hot-reload watcher —
+/// #409, #434); this hub binary was the one place that silently didn't. An
+/// env var that works everywhere except one place is a trap regardless of
+/// who starts that place: the operator who set it has no way to know which
+/// binaries are listening, and the failure was silent (a plausible wrong
+/// answer), not loud (an error).
 pub fn default_auth_path() -> anyhow::Result<PathBuf> {
     let grok = xai_grok_config::user_grok_home()
         .ok_or_else(|| anyhow::anyhow!("no user grok home (set $GROK_HOME or $HOME)"))?;
-    Ok(grok.join("auth.json"))
+    Ok(xai_grok_config::resolved_xai_auth_path(&grok))
 }
 
 /// `Run `<prog>` login first.` naming the invoked program, or a command-free
@@ -340,7 +354,8 @@ fn write_json_atomic(path: &Path, value: &serde_json::Value) -> anyhow::Result<(
 }
 
 /// Build a hub auth provider for `hub_url`. `auth_config` overrides
-/// the default credential path (`~/.grok/auth.json`).
+/// [`default_auth_path`] (`$GROK_AUTH_PATH`, else `grok_home/auth.json`) —
+/// explicit beats ambient (#482).
 pub fn provider(
     hub_url: &Url,
     auth_config: Option<&Path>,
