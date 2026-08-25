@@ -26,6 +26,33 @@ pub mod tokyonight;
 pub use color_support::quantize;
 pub use tokyonight::{Theme, pulse_brightness, wave_brightness};
 
+/// Inputs that determine the palette [`Theme::current`] returns.
+///
+/// Markdown wrap caches key on this fingerprint rather than [`ThemeKind`]
+/// alone: the terminal-native lock swaps in `terminal_default` (and caps
+/// [`color_support::ColorLevel`]) without changing what
+/// [`cache::current_kind`] reports under an ambient GrokNight theme (#453).
+/// Keeping every `Theme::current` input in one value means a future palette
+/// input cannot be added there without also landing in the cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteFingerprint {
+    kind: ThemeKind,
+    terminal_native: bool,
+    color_level: color_support::ColorLevel,
+}
+
+impl PaletteFingerprint {
+    /// Snapshot the process-global inputs [`Theme::current`] reads.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            kind: cache::current_kind(),
+            terminal_native: cache::terminal_native_locked(),
+            color_level: color_support::detect(),
+        }
+    }
+}
+
 /// Available theme variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThemeKind {
@@ -671,6 +698,55 @@ pub fn reset_cursor_color() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #453: the wrap-cache fingerprint must move when the terminal-native
+    /// lock engages, even though `current_kind()` stays GrokNight, and must
+    /// reflect the ColorLevel cap that lock applies.
+    #[test]
+    fn palette_fingerprint_tracks_terminal_native_lock_and_color_level_cap() {
+        let _guard = cache::test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        struct LockReset;
+        impl Drop for LockReset {
+            fn drop(&mut self) {
+                cache::set_terminal_native_lock(false);
+                cache::reset_for_test();
+            }
+        }
+        let _reset = LockReset;
+        let _ = color_support::set(color_support::ColorLevel::TrueColor);
+        cache::set_terminal_native_lock(false);
+        cache::set(ThemeKind::GrokNight);
+
+        let unlocked = PaletteFingerprint::current();
+        let unlocked_level = color_support::detect();
+        cache::set_terminal_native_lock(true);
+        let locked = PaletteFingerprint::current();
+
+        assert_ne!(
+            unlocked, locked,
+            "lock must change the palette fingerprint even when ThemeKind is stable"
+        );
+        assert_eq!(cache::current_kind(), ThemeKind::GrokNight);
+        if unlocked_level > color_support::ColorLevel::Basic {
+            assert_eq!(
+                color_support::detect(),
+                color_support::ColorLevel::Basic,
+                "fingerprint inputs include the lock's ColorLevel cap"
+            );
+            assert_ne!(
+                unlocked_level,
+                color_support::detect(),
+                "ColorLevel alone must be enough to distinguish the fingerprints"
+            );
+        }
+
+        cache::set_terminal_native_lock(false);
+        assert_eq!(
+            PaletteFingerprint::current(),
+            unlocked,
+            "clearing the lock restores the prior fingerprint"
+        );
+    }
 
     #[test]
     fn from_name_auto() {
