@@ -128,7 +128,8 @@ fn compute_settings_hash(paths: &[PathBuf]) -> String {
 /// `load_claude_json_mcp_servers_as_configs()` in `util/config.rs`.
 fn compute_global_hash() -> (String, Vec<PathBuf>) {
     let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
+    // `resolved_home_dir`, not a bare `dirs::home_dir()` (#493).
+    if let Some(home) = xai_grok_workspace::home_dir::resolved_home_dir() {
         paths.push(home.join(".claude").join("settings.json"));
         paths.push(home.join(".claude").join("settings.local.json"));
         paths.push(home.join(".claude.json"));
@@ -145,7 +146,8 @@ fn compute_project_hash(cwd: &Path) -> (String, Vec<PathBuf>) {
     // Use find_claude_settings_paths but filter to only project-level paths
     // (exclude global ~/.claude/ paths).
     let all_paths = find_claude_settings_paths(cwd);
-    let home = dirs::home_dir();
+    // `resolved_home_dir`, not a bare `dirs::home_dir()` (#493).
+    let home = xai_grok_workspace::home_dir::resolved_home_dir();
 
     let project_paths: Vec<PathBuf> = all_paths
         .into_iter()

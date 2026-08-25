@@ -172,6 +172,20 @@ mod tests {
     }
 
     /// Isolate HOME/GROK_HOME so ambient user MCP config cannot pad discovery.
+    ///
+    /// `EnvGuard::set("HOME", ...)` here is retained rather than converted to
+    /// `xai_grok_workspace::home_dir::HomeDirGuard` (#493): `set_var`/
+    /// `remove_var` are UB only when another thread reads the environment
+    /// concurrently, and every caller of this helper is a plain `#[test]`
+    /// (never `#[tokio::test]`/`async fn`) in a file with no async test at
+    /// all -- nothing in this module's test run spins a tokio runtime or a
+    /// `spawn_blocking` pool while the guard is live. `#[serial_test::serial]`
+    /// (present on every caller) then genuinely does what it looks like it
+    /// does: serialise this against every other crate-wide `#[serial]` test
+    /// body, with no spawned-thread reader on the other side of the race.
+    /// If this file ever grows an async test, this reasoning stops holding
+    /// and the guard should move to `HomeDirGuard` like `folder_trust.rs`
+    /// and `claude_import.rs` did.
     fn isolated_home() -> (
         tempfile::TempDir,
         xai_grok_test_support::EnvGuard,

@@ -18,7 +18,8 @@ const MAX_STATE_DB_GENERATION: u32 = 128;
 pub(super) fn scan(cwd: &Path, now: SystemTime) -> Vec<ForeignSessionSummary> {
     let Some(codex_home) = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        // `resolved_home_dir`, not a bare `dirs::home_dir()` (#493).
+        .or_else(|| crate::home_dir::resolved_home_dir().map(|home| home.join(".codex")))
     else {
         return Vec::new();
     };
@@ -32,7 +33,8 @@ pub(super) fn most_recent(
 ) -> RecentProbe<RecentCandidate> {
     let Some(codex_home) = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        // `resolved_home_dir`, not a bare `dirs::home_dir()` (#493).
+        .or_else(|| crate::home_dir::resolved_home_dir().map(|home| home.join(".codex")))
     else {
         return RecentProbe::Complete(None);
     };

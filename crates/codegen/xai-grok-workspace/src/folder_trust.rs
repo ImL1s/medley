@@ -467,7 +467,9 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
 /// [`claude_project_mcp_present`] (existence) and the shell's
 /// `project_scoped_mcp_names` (the names) derive from, so the two never drift.
 pub fn claude_project_mcp_names(cwd: &Path) -> Option<Vec<String>> {
-    let home = dirs::home_dir()?;
+    // `resolved_home_dir`, not a bare `dirs::home_dir()` (#493) -- see
+    // `crate::home_dir`'s doc comment.
+    let home = crate::home_dir::resolved_home_dir()?;
     let content = std::fs::read_to_string(home.join(".claude.json")).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
     let cwd_key = cwd.to_string_lossy();
