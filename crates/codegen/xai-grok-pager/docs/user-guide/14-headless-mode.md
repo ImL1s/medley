@@ -646,7 +646,7 @@ grok -p "..." --no-auto-update
 | Method                          | Scope     |
 | ------------------------------- | --------- |
 | `--no-auto-update`              | Session   |
-| `GROK_DISABLE_AUTOUPDATER=1`    | Process   |
+| `GROK_DISABLE_AUTOUPDATER=1` (or `MEDLEY_DISABLE_AUTOUPDATER=1`, checked first) | Process |
 | Non-TTY stderr (auto-detected)  | Automatic |
 | `[cli] auto_update = false`     | Persistent|
 

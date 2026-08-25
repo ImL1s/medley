@@ -144,9 +144,12 @@ impl WebFetchToolConfig {
             .cloned()
             .or_else(|| remote_domains.map(|d| d.to_vec()));
 
-        let allow_local = self
-            .allow_local
-            .or_else(|| xai_grok_config::env_bool("GROK_WEB_FETCH_ALLOW_LOCAL"));
+        let allow_local = self.allow_local.or_else(|| {
+            xai_grok_config::resolve_env_bool(
+                "MEDLEY_WEB_FETCH_ALLOW_LOCAL",
+                "GROK_WEB_FETCH_ALLOW_LOCAL",
+            )
+        });
 
         xai_grok_tools::implementations::grok_build::web_fetch::WebFetchParams {
             proxy_endpoint,
@@ -424,6 +427,7 @@ impl FileToolset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn file_toolset_default_is_standard() {
@@ -603,6 +607,46 @@ mod tests {
         );
         assert_eq!(params.allow_local, Some(true));
         assert!(params.allow_local());
+    }
+
+    /// `resolve_params`'s `allow_local` env fallback (#426): crate-wide
+    /// unkeyed `#[serial]`, matching every other env-mutating test in
+    /// `xai-grok-shell`.
+    #[test]
+    #[serial]
+    fn resolve_params_medley_web_fetch_allow_local_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_WEB_FETCH_ALLOW_LOCAL", "1");
+            std::env::set_var("GROK_WEB_FETCH_ALLOW_LOCAL", "0");
+        }
+        let local = WebFetchToolConfig::default();
+        let params = local.resolve_params(None, None, None);
+        unsafe {
+            std::env::remove_var("MEDLEY_WEB_FETCH_ALLOW_LOCAL");
+            std::env::remove_var("GROK_WEB_FETCH_ALLOW_LOCAL");
+        }
+        assert_eq!(
+            params.allow_local,
+            Some(true),
+            "MEDLEY_* must win over a conflicting GROK_*=0"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_params_grok_web_fetch_allow_local_still_works_when_medley_unset() {
+        unsafe {
+            std::env::remove_var("MEDLEY_WEB_FETCH_ALLOW_LOCAL");
+            std::env::set_var("GROK_WEB_FETCH_ALLOW_LOCAL", "1");
+        }
+        let local = WebFetchToolConfig::default();
+        let params = local.resolve_params(None, None, None);
+        unsafe { std::env::remove_var("GROK_WEB_FETCH_ALLOW_LOCAL") };
+        assert_eq!(
+            params.allow_local,
+            Some(true),
+            "GROK_* must still work when MEDLEY_* is unset"
+        );
     }
 
     #[test]

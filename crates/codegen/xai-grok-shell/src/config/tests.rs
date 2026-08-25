@@ -4549,3 +4549,66 @@ fn a_trusted_repo_still_cannot_declare_trusted_xai_origins() {
         "no project path can populate the declaration"
     );
 }
+
+// -- #426: MEDLEY_*-first precedence for ToolsConfig::respect_gitignore and
+// ModelOverrideConfig::web_search --------------------------------------------
+
+#[test]
+#[serial_test::serial]
+fn respect_gitignore_medley_wins_over_grok() {
+    with_env_var_opt("MEDLEY_RESPECT_GITIGNORE", Some("0"), || {
+        with_env_var_opt("GROK_RESPECT_GITIGNORE", Some("1"), || {
+            let config: toml::Value = toml::from_str("").unwrap();
+            let resolved = ToolsConfig::resolve(&config);
+            assert!(
+                !resolved.respect_gitignore,
+                "MEDLEY_RESPECT_GITIGNORE=0 must win over GROK_RESPECT_GITIGNORE=1"
+            );
+        });
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn respect_gitignore_grok_still_works_when_medley_unset() {
+    with_env_var_opt("MEDLEY_RESPECT_GITIGNORE", None, || {
+        with_env_var_opt("GROK_RESPECT_GITIGNORE", Some("1"), || {
+            let config: toml::Value = toml::from_str("").unwrap();
+            let resolved = ToolsConfig::resolve(&config);
+            assert!(
+                resolved.respect_gitignore,
+                "GROK_RESPECT_GITIGNORE must still work when MEDLEY_RESPECT_GITIGNORE is unset"
+            );
+        });
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn web_search_model_medley_wins_over_grok() {
+    with_env_var_opt("MEDLEY_WEB_SEARCH_MODEL", Some("medley-search-1"), || {
+        with_env_var_opt("GROK_WEB_SEARCH_MODEL", Some("grok-search-1"), || {
+            let config: toml::Value = toml::from_str("").unwrap();
+            let resolved = ModelOverrideConfig::resolve(None, None, &config, None);
+            assert_eq!(
+                resolved.web_search, "medley-search-1",
+                "MEDLEY_WEB_SEARCH_MODEL must win over a conflicting GROK_WEB_SEARCH_MODEL"
+            );
+        });
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn web_search_model_grok_still_works_when_medley_unset() {
+    with_env_var_opt("MEDLEY_WEB_SEARCH_MODEL", None, || {
+        with_env_var_opt("GROK_WEB_SEARCH_MODEL", Some("grok-search-1"), || {
+            let config: toml::Value = toml::from_str("").unwrap();
+            let resolved = ModelOverrideConfig::resolve(None, None, &config, None);
+            assert_eq!(
+                resolved.web_search, "grok-search-1",
+                "GROK_WEB_SEARCH_MODEL must still work when MEDLEY_WEB_SEARCH_MODEL is unset"
+            );
+        });
+    });
+}

@@ -2491,6 +2491,15 @@ fn run_after_cli_preflight(args: PagerArgs, prepared_serve: Option<PreparedServe
             "Found crashed sessions from a previous run"
         );
     }
+    // Last synchronous point before the async runtime (and, on the
+    // interactive path, raw mode / the alternate screen) takes over — stderr
+    // after that is invisible or corrupts the display. Some of #426's
+    // MEDLEY_*-aliased vars resolve later, lazily, inside the session (e.g.
+    // auth/OIDC on first login), so this notice only names what has fired by
+    // here — not necessarily every legacy var the session ends up using.
+    if let Some(notice) = xai_grok_config::legacy_notice() {
+        eprintln!("{notice}");
+    }
     let workers = cli_worker_threads();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers.get())
@@ -3017,9 +3026,18 @@ fn should_check_for_updates(no_auto_update_flag: bool) -> bool {
         cfg!(debug_assertions),
         no_auto_update_flag,
         xai_grok_update::self_update_refusal().is_some(),
-        std::env::var_os("GROK_DISABLE_AUTOUPDATER")
-            .is_some_and(|v| env_flag_enabled(&v.to_string_lossy())),
+        disabled_by_env(),
     )
+}
+
+/// `MEDLEY_DISABLE_AUTOUPDATER` / `GROK_DISABLE_AUTOUPDATER` (#426). Split
+/// out of [`should_check_for_updates`] so the alias precedence is testable on
+/// its own — the composed gate is dominated by the self-update-disabled
+/// short-circuit in every test build, so a test through
+/// `should_check_for_updates` alone can't observe this piece.
+fn disabled_by_env() -> bool {
+    xai_grok_config::resolve_env_var_os("MEDLEY_DISABLE_AUTOUPDATER", "GROK_DISABLE_AUTOUPDATER")
+        .is_some_and(|v| env_flag_enabled(&v.to_string_lossy()))
 }
 
 /// Pure policy behind [`should_check_for_updates`].
@@ -4191,6 +4209,37 @@ mod tests {
         assert!(
             !should_check_for_updates(false),
             "the central gate must be closed while self-update is disabled"
+        );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn disabled_by_env_medley_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_DISABLE_AUTOUPDATER", "1");
+            std::env::set_var("GROK_DISABLE_AUTOUPDATER", "0");
+        }
+        let result = disabled_by_env();
+        unsafe {
+            std::env::remove_var("MEDLEY_DISABLE_AUTOUPDATER");
+            std::env::remove_var("GROK_DISABLE_AUTOUPDATER");
+        }
+        assert!(
+            result,
+            "MEDLEY_DISABLE_AUTOUPDATER=1 must win over GROK_*=0"
+        );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn disabled_by_env_grok_still_works_when_medley_unset() {
+        unsafe {
+            std::env::remove_var("MEDLEY_DISABLE_AUTOUPDATER");
+            std::env::set_var("GROK_DISABLE_AUTOUPDATER", "1");
+        }
+        let result = disabled_by_env();
+        unsafe { std::env::remove_var("GROK_DISABLE_AUTOUPDATER") };
+        assert!(
+            result,
+            "GROK_DISABLE_AUTOUPDATER must still work when MEDLEY_* is unset"
         );
     }
     use clap::Parser as _;

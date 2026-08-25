@@ -158,15 +158,17 @@ thread_local! {
 pub fn load_default_selected_permission() -> DefaultSelectedPermission {
     CONFIG_LOADED.with(|loaded| {
         if !loaded.get() {
-            let resolved = std::env::var("GROK_DEFAULT_SELECTED_PERMISSION")
-                .ok()
-                .map(|s| DefaultSelectedPermission::from_config_value(&s))
-                .filter(|p| *p != DefaultSelectedPermission::AlwaysAllowAllSessions)
-                .or_else(|| {
-                    load_string_from_effective_config("default_selected_permission")
-                        .map(|s| DefaultSelectedPermission::from_config_value(&s))
-                })
-                .unwrap_or(DefaultSelectedPermission::AlwaysAllowAllSessions);
+            let resolved = xai_grok_config::resolve_env_var(
+                "MEDLEY_DEFAULT_SELECTED_PERMISSION",
+                "GROK_DEFAULT_SELECTED_PERMISSION",
+            )
+            .map(|s| DefaultSelectedPermission::from_config_value(&s))
+            .filter(|p| *p != DefaultSelectedPermission::AlwaysAllowAllSessions)
+            .or_else(|| {
+                load_string_from_effective_config("default_selected_permission")
+                    .map(|s| DefaultSelectedPermission::from_config_value(&s))
+            })
+            .unwrap_or(DefaultSelectedPermission::AlwaysAllowAllSessions);
             CONFIG_CURRENT.with(|c| c.set(resolved));
             loaded.set(true);
         }
@@ -353,6 +355,60 @@ mod tests {
             DefaultSelectedPermission::from_kind(&acp::PermissionOptionKind::RejectAlways),
             DefaultSelectedPermission::Reject
         );
+    }
+
+    /// `load_default_selected_permission()`'s env-read path: fresh thread
+    /// (the `CONFIG_LOADED` thread-local is sticky across `#[test]`s) and
+    /// serialized against each other (shared process env), matching
+    /// `appearance::cache`'s pattern for the same hazard.
+    mod env_alias_tests {
+        use super::*;
+
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("MEDLEY_DEFAULT_SELECTED_PERMISSION");
+                    std::env::remove_var("GROK_DEFAULT_SELECTED_PERMISSION");
+                }
+            }
+        }
+
+        #[test]
+        #[serial_test::serial(default_selected_permission_env)]
+        fn medley_wins_over_grok() {
+            let _guard = EnvGuard;
+            std::thread::spawn(|| {
+                unsafe {
+                    std::env::set_var("MEDLEY_DEFAULT_SELECTED_PERMISSION", "reject");
+                    std::env::set_var("GROK_DEFAULT_SELECTED_PERMISSION", "allow_once");
+                }
+                assert_eq!(
+                    load_default_selected_permission(),
+                    DefaultSelectedPermission::Reject
+                );
+            })
+            .join()
+            .unwrap();
+        }
+
+        #[test]
+        #[serial_test::serial(default_selected_permission_env)]
+        fn grok_still_works_when_medley_unset() {
+            let _guard = EnvGuard;
+            std::thread::spawn(|| {
+                unsafe {
+                    std::env::remove_var("MEDLEY_DEFAULT_SELECTED_PERMISSION");
+                    std::env::set_var("GROK_DEFAULT_SELECTED_PERMISSION", "allow_once");
+                }
+                assert_eq!(
+                    load_default_selected_permission(),
+                    DefaultSelectedPermission::AllowOnce
+                );
+            })
+            .join()
+            .unwrap();
+        }
     }
 
     #[test]

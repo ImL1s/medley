@@ -1065,6 +1065,34 @@ pub(crate) fn resolve_enabled(
         .default(default)
         .resolve()
 }
+/// [`resolve_enabled`] with `MEDLEY_*`-first precedence against `env_var`
+/// (#426). A sibling rather than a parameter on `resolve_enabled` itself: two
+/// of that function's four callers (`GROK_MANAGED_MCPS_ENABLED`,
+/// `GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED`) are internal managed-config
+/// plumbing, not in the fork's documented user-facing alias set, and must
+/// stay byte-identical to keep their call sites untouched.
+pub(crate) fn resolve_enabled_aliased(
+    cli_flag: Option<bool>,
+    medley_env_var: &str,
+    env_var: &str,
+    config_enabled: bool,
+    has_local_section: bool,
+    feature_flag_val: Option<bool>,
+    default: bool,
+) -> Resolved<bool> {
+    let config_val = if has_local_section {
+        Some(config_enabled)
+    } else {
+        None
+    };
+    BoolFlag::env(env_var)
+        .env_alias(medley_env_var)
+        .cli(cli_flag)
+        .config(config_val)
+        .feature_flag(feature_flag_val)
+        .default(default)
+        .resolve()
+}
 pub(crate) use xai_grok_telemetry::config::env_telemetry_mode;
 pub use xai_grok_telemetry::config::{TelemetryConfig, TelemetryMode};
 /// Plugin system configuration from `[plugins]` section in config.toml.
@@ -2864,7 +2892,10 @@ impl Config {
     }
     fn apply_env_overrides(&mut self) {
         self.telemetry.apply_env_overrides();
-        if let Some(mode) = env_telemetry_mode("GROK_TELEMETRY_ENABLED") {
+        if let Some(mode) = xai_grok_telemetry::config::env_telemetry_mode_alias(
+            "MEDLEY_TELEMETRY_ENABLED",
+            "GROK_TELEMETRY_ENABLED",
+        ) {
             self.features.telemetry = Some(mode);
         }
     }
@@ -2896,7 +2927,10 @@ impl Config {
         if let Some(mode) = self.requirements.telemetry.pinned() {
             return Resolved::new(mode, ConfigSource::Requirement);
         }
-        if let Some(mode) = env_telemetry_mode("GROK_TELEMETRY_ENABLED") {
+        if let Some(mode) = xai_grok_telemetry::config::env_telemetry_mode_alias(
+            "MEDLEY_TELEMETRY_ENABLED",
+            "GROK_TELEMETRY_ENABLED",
+        ) {
             return Resolved::new(mode, ConfigSource::Env);
         }
         if let Some(mode) = self.features.telemetry {
@@ -2924,6 +2958,7 @@ impl Config {
                 .and_then(|s| s.trace_upload_enabled)
         };
         BoolFlag::env("GROK_TELEMETRY_TRACE_UPLOAD")
+            .env_alias("MEDLEY_TELEMETRY_TRACE_UPLOAD")
             .requirement(self.requirements.trace_upload.pinned())
             .config(self.telemetry.trace_upload)
             .feature_flag(ff)
@@ -2973,8 +3008,14 @@ impl Config {
             "telemetry_source": telemetry.source.to_string(),
             "in_requirement_pin": req.pinned(),
             "in_requirement_src": req.source().map(|s| s.to_string()),
-            "in_env_trace_upload": std::env::var("GROK_TELEMETRY_TRACE_UPLOAD").ok(),
-            "in_env_telemetry_enabled": std::env::var("GROK_TELEMETRY_ENABLED").ok(),
+            "in_env_trace_upload": xai_grok_config::resolve_env_var(
+                "MEDLEY_TELEMETRY_TRACE_UPLOAD",
+                "GROK_TELEMETRY_TRACE_UPLOAD",
+            ),
+            "in_env_telemetry_enabled": xai_grok_config::resolve_env_var(
+                "MEDLEY_TELEMETRY_ENABLED",
+                "GROK_TELEMETRY_ENABLED",
+            ),
             "in_cfg_telemetry_trace_upload": self.telemetry.trace_upload,
             "in_cfg_features_telemetry": self.features.telemetry.map(|m| m.to_string()),
             "in_remote_trace_upload_enabled": self
@@ -2990,6 +3031,7 @@ impl Config {
             .as_ref()
             .and_then(|s| s.feedback_enabled);
         BoolFlag::env("GROK_FEEDBACK_ENABLED")
+            .env_alias("MEDLEY_FEEDBACK_ENABLED")
             .requirement(self.requirements.feedback.pinned())
             .config(self.features.feedback)
             .feature_flag(ff)
@@ -3090,6 +3132,7 @@ impl Config {
             .as_ref()
             .and_then(|s| s.web_fetch_enabled);
         BoolFlag::env("GROK_WEB_FETCH")
+            .env_alias("MEDLEY_WEB_FETCH")
             .requirement(self.requirements.web_fetch.pinned())
             .config(self.features.web_fetch)
             .feature_flag(ff)
@@ -3276,6 +3319,7 @@ impl Config {
             return Resolved::new(false, ConfigSource::Remote);
         }
         BoolFlag::env("GROK_WORKFLOWS")
+            .env_alias("MEDLEY_WORKFLOWS")
             .config(self.workflows.enabled)
             .feature_flag(ff)
             .default(true)
@@ -3838,7 +3882,11 @@ fn error_reporting_enabled_from_toml(root: &toml::Value) -> Option<bool> {
 /// `GROK_TELEMETRY_ENABLED` resolved through `TelemetryMode::parse` so the
 /// extended string forms (e.g. `"session_metrics"`) are accepted.
 fn grok_telemetry_env_enabled() -> Option<bool> {
-    env_telemetry_mode("GROK_TELEMETRY_ENABLED").map(|m| !m.is_disabled())
+    xai_grok_telemetry::config::env_telemetry_mode_alias(
+        "MEDLEY_TELEMETRY_ENABLED",
+        "GROK_TELEMETRY_ENABLED",
+    )
+    .map(|m| !m.is_disabled())
 }
 /// Load `~/.grok/requirements.toml` standalone so the admin pin can beat
 /// env vars. The merged config layer can't express that — last-merge-wins
@@ -3862,7 +3910,7 @@ pub(crate) fn read_requirements_toml() -> Option<toml::Value> {
 pub(crate) fn external_otel_master_switch_resolved() -> bool {
     external_otel_master_switch_from(
         xai_grok_config::load_merged_requirements().as_ref(),
-        env_bool("GROK_EXTERNAL_OTEL"),
+        xai_grok_config::resolve_env_bool("MEDLEY_EXTERNAL_OTEL", "GROK_EXTERNAL_OTEL"),
         crate::config::load_effective_config().ok().as_ref(),
     )
 }
@@ -14237,6 +14285,97 @@ reasoning_effort = "low"
     }
     #[test]
     #[serial]
+    fn resolve_feedback_medley_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_FEEDBACK_ENABLED", "false");
+            std::env::set_var("GROK_FEEDBACK_ENABLED", "true");
+        }
+        let cfg = Config::default();
+        let r = cfg.resolve_feedback();
+        unsafe {
+            std::env::remove_var("MEDLEY_FEEDBACK_ENABLED");
+            std::env::remove_var("GROK_FEEDBACK_ENABLED");
+        }
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(
+            !r.value,
+            "MEDLEY_FEEDBACK_ENABLED=false must win over GROK_FEEDBACK_ENABLED=true"
+        );
+    }
+    #[test]
+    #[serial]
+    fn resolve_web_fetch_medley_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_WEB_FETCH", "false");
+            std::env::set_var("GROK_WEB_FETCH", "true");
+        }
+        let cfg = Config::default();
+        let r = cfg.resolve_web_fetch();
+        unsafe {
+            std::env::remove_var("MEDLEY_WEB_FETCH");
+            std::env::remove_var("GROK_WEB_FETCH");
+        }
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(
+            !r.value,
+            "MEDLEY_WEB_FETCH=false must win over GROK_WEB_FETCH=true"
+        );
+    }
+    #[test]
+    #[serial]
+    fn resolve_web_fetch_grok_still_works_when_medley_unset() {
+        unsafe {
+            std::env::remove_var("MEDLEY_WEB_FETCH");
+            std::env::set_var("GROK_WEB_FETCH", "false");
+        }
+        let cfg = Config::default();
+        let r = cfg.resolve_web_fetch();
+        unsafe { std::env::remove_var("GROK_WEB_FETCH") };
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(
+            !r.value,
+            "GROK_WEB_FETCH must still work when MEDLEY_WEB_FETCH is unset"
+        );
+    }
+    #[test]
+    #[serial]
+    fn resolve_trace_upload_medley_wins_over_grok() {
+        unsafe {
+            std::env::remove_var("GROK_TELEMETRY_ENABLED");
+            std::env::set_var("MEDLEY_TELEMETRY_TRACE_UPLOAD", "false");
+            std::env::set_var("GROK_TELEMETRY_TRACE_UPLOAD", "true");
+        }
+        let cfg = Config::default();
+        let r = cfg.resolve_trace_upload();
+        unsafe {
+            std::env::remove_var("MEDLEY_TELEMETRY_TRACE_UPLOAD");
+            std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD");
+        }
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(
+            !r.value,
+            "MEDLEY_TELEMETRY_TRACE_UPLOAD=false must win over GROK_TELEMETRY_TRACE_UPLOAD=true"
+        );
+    }
+    #[test]
+    #[serial]
+    fn resolve_trace_upload_grok_still_works_when_medley_unset() {
+        unsafe {
+            std::env::remove_var("GROK_TELEMETRY_ENABLED");
+            std::env::remove_var("MEDLEY_TELEMETRY_TRACE_UPLOAD");
+            std::env::set_var("GROK_TELEMETRY_TRACE_UPLOAD", "false");
+        }
+        let cfg = Config::default();
+        let r = cfg.resolve_trace_upload();
+        unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(
+            !r.value,
+            "GROK_TELEMETRY_TRACE_UPLOAD must still work when MEDLEY_* is unset"
+        );
+    }
+    #[test]
+    #[serial]
     fn resolve_feedback_config_overrides_remote_settings() {
         unsafe { std::env::remove_var("GROK_FEEDBACK_ENABLED") };
         let mut cfg = Config::default();
@@ -14456,6 +14595,63 @@ reasoning_effort = "low"
             "env must be able to kill the default-on workflows"
         );
         unsafe { std::env::remove_var("GROK_WORKFLOWS") };
+    }
+    #[test]
+    #[serial]
+    fn resolve_workflows_medley_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_WORKFLOWS", "0");
+            std::env::set_var("GROK_WORKFLOWS", "1");
+        }
+        let cfg = Config::default();
+        let r = cfg.resolve_workflows();
+        unsafe {
+            std::env::remove_var("MEDLEY_WORKFLOWS");
+            std::env::remove_var("GROK_WORKFLOWS");
+        }
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(
+            !r.value,
+            "MEDLEY_WORKFLOWS=0 must win over GROK_WORKFLOWS=1"
+        );
+    }
+    /// `resolve_enabled_aliased` is the shared funnel behind the
+    /// `GROK_MEMORY`/`GROK_SUBAGENTS` call sites in `config/mod.rs` (#426);
+    /// takes both var names as parameters, avoiding the full Memory/Subagents
+    /// config-loading machinery. Unique per-test names alone don't exempt
+    /// this from the crate-wide unkeyed `#[serial]` policy (caught by
+    /// `scripts/check_envguard_serial.py`, which does not reason about name
+    /// uniqueness — it enforces the policy categorically).
+    #[test]
+    #[serial]
+    fn resolve_enabled_aliased_medley_wins_over_grok() {
+        const MEDLEY: &str = "MEDLEY_TEST_ENABLED_ALIASED_WINS";
+        const GROK: &str = "GROK_TEST_ENABLED_ALIASED_WINS";
+        unsafe {
+            std::env::set_var(MEDLEY, "0");
+            std::env::set_var(GROK, "1");
+        }
+        let r = resolve_enabled_aliased(None, MEDLEY, GROK, false, false, None, true);
+        unsafe {
+            std::env::remove_var(MEDLEY);
+            std::env::remove_var(GROK);
+        }
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(!r.value, "MEDLEY_* must win over a conflicting GROK_*");
+    }
+    #[test]
+    #[serial]
+    fn resolve_enabled_aliased_grok_still_works_when_medley_unset() {
+        const MEDLEY: &str = "MEDLEY_TEST_ENABLED_ALIASED_FALLBACK";
+        const GROK: &str = "GROK_TEST_ENABLED_ALIASED_FALLBACK";
+        unsafe {
+            std::env::remove_var(MEDLEY);
+            std::env::set_var(GROK, "1");
+        }
+        let r = resolve_enabled_aliased(None, MEDLEY, GROK, false, false, None, false);
+        unsafe { std::env::remove_var(GROK) };
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(r.value, "GROK_* must still work when MEDLEY_* is unset");
     }
     #[test]
     #[serial]
@@ -16107,6 +16303,41 @@ agent_type = "cursor"
         assert!(!cfg.gates.log_user_prompts, "requirement pin must win");
         assert!(!cfg.gates.log_tool_details, "requirement pin must win");
     }
+    /// `external_otel_master_switch_resolved()` is the live-env wrapper
+    /// (`external_otel_master_switch_from` above is the pure core, already
+    /// covered without touching env). This exercises the MEDLEY_*-first read
+    /// itself (#426).
+    #[test]
+    #[serial]
+    fn external_otel_master_switch_resolved_medley_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_EXTERNAL_OTEL", "0");
+            std::env::set_var("GROK_EXTERNAL_OTEL", "1");
+        }
+        let resolved = external_otel_master_switch_resolved();
+        unsafe {
+            std::env::remove_var("MEDLEY_EXTERNAL_OTEL");
+            std::env::remove_var("GROK_EXTERNAL_OTEL");
+        }
+        assert!(
+            !resolved,
+            "MEDLEY_EXTERNAL_OTEL=0 must win over GROK_EXTERNAL_OTEL=1"
+        );
+    }
+    #[test]
+    #[serial]
+    fn external_otel_master_switch_resolved_grok_still_works_when_medley_unset() {
+        unsafe {
+            std::env::remove_var("MEDLEY_EXTERNAL_OTEL");
+            std::env::set_var("GROK_EXTERNAL_OTEL", "1");
+        }
+        let resolved = external_otel_master_switch_resolved();
+        unsafe { std::env::remove_var("GROK_EXTERNAL_OTEL") };
+        assert!(
+            resolved,
+            "GROK_EXTERNAL_OTEL must still work when MEDLEY_EXTERNAL_OTEL is unset"
+        );
+    }
     /// Regression: an org enable via `[telemetry].otel_enabled`
     /// (managed config / requirements — no `GROK_EXTERNAL_OTEL` env var) must
     /// flip the master switch the *internal* pipeline keys off, so legacy
@@ -17092,6 +17323,24 @@ telemetry = "garbage"
         unsafe { std::env::set_var("DISABLE_TELEMETRY", "1") };
         assert!(is_telemetry_explicitly_disabled_sync());
         unsafe { std::env::remove_var("DISABLE_TELEMETRY") };
+    }
+    #[test]
+    #[serial]
+    fn is_telemetry_explicitly_disabled_sync_medley_telemetry_enabled_wins_over_grok() {
+        unsafe {
+            std::env::remove_var("DISABLE_TELEMETRY");
+            std::env::set_var("MEDLEY_TELEMETRY_ENABLED", "0");
+            std::env::set_var("GROK_TELEMETRY_ENABLED", "1");
+        }
+        let disabled = is_telemetry_explicitly_disabled_sync();
+        unsafe {
+            std::env::remove_var("MEDLEY_TELEMETRY_ENABLED");
+            std::env::remove_var("GROK_TELEMETRY_ENABLED");
+        }
+        assert!(
+            disabled,
+            "MEDLEY_TELEMETRY_ENABLED=0 must win over GROK_TELEMETRY_ENABLED=1"
+        );
     }
     #[test]
     fn version_overrides_apply_into_typed_config() {

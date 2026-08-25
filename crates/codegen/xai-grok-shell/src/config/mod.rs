@@ -195,12 +195,13 @@ impl MemoryConfig {
                 }
             }
         }
-        let resolved = crate::agent::config::resolve_enabled(
+        let resolved = crate::agent::config::resolve_enabled_aliased(
             if experimental_memory {
                 Some(true)
             } else {
                 None
             },
+            "MEDLEY_MEMORY",
             "GROK_MEMORY",
             result.enabled,
             config.get("memory").is_some(),
@@ -612,8 +613,9 @@ impl SubagentsConfig {
             .get("subagents")
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default();
-        let resolved = crate::agent::config::resolve_enabled(
+        let resolved = crate::agent::config::resolve_enabled_aliased(
             if cli_flag { Some(true) } else { None },
+            "MEDLEY_SUBAGENTS",
             "GROK_SUBAGENTS",
             result.enabled,
             config.get("subagents").is_some(),
@@ -864,7 +866,9 @@ impl ModelOverrideConfig {
                 prompt_suggestion = PromptSuggestModelPin::Pinned(v);
             }
         }
-        if let Ok(v) = std::env::var("GROK_WEB_SEARCH_MODEL") {
+        if let Some(v) =
+            xai_grok_config::resolve_env_var("MEDLEY_WEB_SEARCH_MODEL", "GROK_WEB_SEARCH_MODEL")
+        {
             let v = v.trim();
             if !v.is_empty() {
                 web_search = Some(v.to_owned());
@@ -1020,11 +1024,13 @@ impl ToolsConfig {
                     }
                 }),
         };
-        match std::env::var("GROK_RESPECT_GITIGNORE").as_deref() {
-            Ok("0") | Ok("false") => {
+        match xai_grok_config::resolve_env_var("MEDLEY_RESPECT_GITIGNORE", "GROK_RESPECT_GITIGNORE")
+            .as_deref()
+        {
+            Some("0") | Some("false") => {
                 result.respect_gitignore = false;
             }
-            Ok("1") | Ok("true") => {
+            Some("1") | Some("true") => {
                 result.respect_gitignore = true;
             }
             _ => {}

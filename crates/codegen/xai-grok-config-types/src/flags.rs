@@ -41,6 +41,10 @@ pub struct BoolFlag<'a> {
     requirement: Option<bool>,
     cli: Option<bool>,
     env_var: &'a str,
+    // `MEDLEY_*` alias checked ahead of `env_var`, for the documented
+    // user-facing set enumerated in #426. `None` for every flag not in that
+    // set — see `env_alias()` below.
+    medley_env_var: Option<&'a str>,
     config: Option<bool>,
     managed: Option<bool>,
     feature_flag: Option<bool>,
@@ -53,6 +57,7 @@ impl<'a> BoolFlag<'a> {
             requirement: None,
             cli: None,
             env_var,
+            medley_env_var: None,
             config: None,
             managed: None,
             feature_flag: None,
@@ -84,12 +89,21 @@ impl<'a> BoolFlag<'a> {
         self.default = v;
         self
     }
+    /// Opt this flag into `MEDLEY_*`-first precedence against its `GROK_*`
+    /// env var (#426). Only call this for a name in the fork's documented
+    /// user-facing alias set — every other `BoolFlag` caller must stay
+    /// `GROK_*`-only, so leave this unset for them.
+    pub fn env_alias(mut self, medley_env_var: &'a str) -> Self {
+        self.medley_env_var = Some(medley_env_var);
+        self
+    }
 
     pub fn resolve(self) -> Resolved<bool> {
         resolve_bool_flag(
             self.requirement,
             self.cli,
             self.env_var,
+            self.medley_env_var,
             self.config,
             self.managed,
             self.feature_flag,
@@ -102,6 +116,7 @@ fn resolve_bool_flag(
     requirement: Option<bool>,
     cli_arg: Option<bool>,
     env_var: &str,
+    medley_env_var: Option<&str>,
     config_val: Option<bool>,
     managed_val: Option<bool>,
     feature_flag_val: Option<bool>,
@@ -113,7 +128,11 @@ fn resolve_bool_flag(
     if let Some(val) = cli_arg {
         return Resolved::new(val, ConfigSource::Cli);
     }
-    if let Some(val) = env_bool(env_var) {
+    let env_val = match medley_env_var {
+        Some(medley) => xai_grok_config::resolve_env_bool(medley, env_var),
+        None => env_bool(env_var),
+    };
+    if let Some(val) = env_val {
         return Resolved::new(val, ConfigSource::Env);
     }
     if let Some(val) = config_val {
@@ -127,6 +146,90 @@ fn resolve_bool_flag(
     }
     Resolved::new(default, ConfigSource::Default)
 }
+
+#[cfg(test)]
+mod env_alias_tests {
+    use super::*;
+
+    /// Test-only var names, distinct from anything real code reads AND from
+    /// each other (cargo runs `#[test]` fns in the same binary concurrently
+    /// by default, and this crate has no `#[serial]` infrastructure) — a
+    /// shared pair across tests was tried first and flaked exactly this way.
+    struct EnvGuard {
+        medley: &'static str,
+        grok: &'static str,
+    }
+    impl EnvGuard {
+        fn set(
+            medley: &'static str,
+            grok: &'static str,
+            medley_val: Option<&str>,
+            grok_val: Option<&str>,
+        ) -> Self {
+            unsafe {
+                match medley_val {
+                    Some(v) => std::env::set_var(medley, v),
+                    None => std::env::remove_var(medley),
+                }
+                match grok_val {
+                    Some(v) => std::env::set_var(grok, v),
+                    None => std::env::remove_var(grok),
+                }
+            }
+            Self { medley, grok }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(self.medley);
+                std::env::remove_var(self.grok);
+            }
+        }
+    }
+
+    #[test]
+    fn env_alias_prefers_medley_over_grok() {
+        const MEDLEY_VAR: &str = "MEDLEY_TEST_BOOLFLAG_ALIAS_PREFERS_MEDLEY";
+        const GROK_VAR: &str = "GROK_TEST_BOOLFLAG_ALIAS_PREFERS_MEDLEY";
+        let _guard = EnvGuard::set(MEDLEY_VAR, GROK_VAR, Some("1"), Some("0"));
+        let resolved = BoolFlag::env(GROK_VAR).env_alias(MEDLEY_VAR).resolve();
+        assert!(
+            resolved.value,
+            "MEDLEY_* must win over a conflicting GROK_*"
+        );
+        assert_eq!(resolved.source, ConfigSource::Env);
+    }
+
+    #[test]
+    fn env_alias_falls_back_to_grok_when_medley_unset() {
+        const MEDLEY_VAR: &str = "MEDLEY_TEST_BOOLFLAG_ALIAS_FALLS_BACK";
+        const GROK_VAR: &str = "GROK_TEST_BOOLFLAG_ALIAS_FALLS_BACK";
+        let _guard = EnvGuard::set(MEDLEY_VAR, GROK_VAR, None, Some("1"));
+        let resolved = BoolFlag::env(GROK_VAR).env_alias(MEDLEY_VAR).resolve();
+        assert!(
+            resolved.value,
+            "GROK_* must still work when MEDLEY_* is unset"
+        );
+        assert_eq!(resolved.source, ConfigSource::Env);
+    }
+
+    #[test]
+    fn no_env_alias_is_unaffected_by_a_stray_medley_var() {
+        const MEDLEY_VAR: &str = "MEDLEY_TEST_BOOLFLAG_ALIAS_UNAFFECTED";
+        const GROK_VAR: &str = "GROK_TEST_BOOLFLAG_ALIAS_UNAFFECTED";
+        let _guard = EnvGuard::set(MEDLEY_VAR, GROK_VAR, Some("1"), Some("0"));
+        // Every `BoolFlag` caller that never opts in via `.env_alias(...)`
+        // must behave exactly as before: only GROK_VAR is consulted.
+        let resolved = BoolFlag::env(GROK_VAR).resolve();
+        assert!(
+            !resolved.value,
+            "an unaliased flag must ignore MEDLEY_VAR entirely"
+        );
+        assert_eq!(resolved.source, ConfigSource::Env);
+    }
+}
+
 /// Per-model configuration for the Layer-3 LazinessDetector.
 ///
 /// All fields default to the disabled state. Activation is a deliberate

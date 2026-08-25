@@ -385,7 +385,7 @@ Auto-compaction keeps your prompt history clean by summarizing or shrinking cont
 
 This value can be configured at multiple levels. Grok resolves the active threshold using the following six-tier precedence (highest priority first):
 
-1. **Environment Variable**: `GROK_AUTO_COMPACT_THRESHOLD_PERCENT` (sets the threshold per-process).
+1. **Environment Variable**: `MEDLEY_AUTO_COMPACT_THRESHOLD_PERCENT` (checked first) or `GROK_AUTO_COMPACT_THRESHOLD_PERCENT` (sets the threshold per-process).
 2. **Per-Model TOML Override**: `auto_compact_threshold_percent` in the model section, e.g. `[model.<id>] auto_compact_threshold_percent = 70`.
 3. **Session Global TOML**: `auto_compact_threshold_percent` in the global `[session]` section, e.g. `[session] auto_compact_threshold_percent = 80`.
 4. **Remote Settings Per-Model**: The default threshold set by the model provider’s catalog.
@@ -727,7 +727,7 @@ The `web_search` tool uses a separate model. Configure it with:
 web_search = "grok-4.5"
 ```
 
-Or via environment variable:
+Or via environment variable (`MEDLEY_WEB_SEARCH_MODEL` is checked first):
 
 ```bash
 export GROK_WEB_SEARCH_MODEL="grok-4.5"

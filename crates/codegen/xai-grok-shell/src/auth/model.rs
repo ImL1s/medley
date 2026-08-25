@@ -382,11 +382,13 @@ pub fn lookup_auth(map: &AuthStore, scope: &str) -> Option<GrokAuth> {
 /// Early-invalidation buffer. Override with `GROK_AUTH_EARLY_INVALIDATION_SECS`
 /// for testing (e.g. `=5` to shrink the buffer to 5 seconds).
 pub(super) fn early_invalidation() -> Duration {
-    std::env::var("GROK_AUTH_EARLY_INVALIDATION_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|s| Duration::seconds(s as i64))
-        .unwrap_or_else(|| Duration::seconds(DEFAULT_EARLY_INVALIDATION_SECS as i64))
+    xai_grok_config::resolve_env_var(
+        "MEDLEY_AUTH_EARLY_INVALIDATION_SECS",
+        "GROK_AUTH_EARLY_INVALIDATION_SECS",
+    )
+    .and_then(|v| v.parse::<u64>().ok())
+    .map(|s| Duration::seconds(s as i64))
+    .unwrap_or_else(|| Duration::seconds(DEFAULT_EARLY_INVALIDATION_SECS as i64))
 }
 
 pub(crate) fn is_expired(auth: &GrokAuth) -> bool {
@@ -408,6 +410,34 @@ pub(crate) fn is_expired_with_buffer(auth: &GrokAuth, buffer: Duration) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn early_invalidation_medley_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS", "11");
+            std::env::set_var("GROK_AUTH_EARLY_INVALIDATION_SECS", "22");
+        }
+        let buffer = early_invalidation();
+        unsafe {
+            std::env::remove_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS");
+            std::env::remove_var("GROK_AUTH_EARLY_INVALIDATION_SECS");
+        }
+        assert_eq!(buffer, Duration::seconds(11));
+    }
+
+    #[test]
+    #[serial]
+    fn early_invalidation_grok_still_works_when_medley_unset() {
+        unsafe {
+            std::env::remove_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS");
+            std::env::set_var("GROK_AUTH_EARLY_INVALIDATION_SECS", "22");
+        }
+        let buffer = early_invalidation();
+        unsafe { std::env::remove_var("GROK_AUTH_EARLY_INVALIDATION_SECS") };
+        assert_eq!(buffer, Duration::seconds(22));
+    }
 
     fn make_auth(mode: AuthMode) -> GrokAuth {
         GrokAuth {

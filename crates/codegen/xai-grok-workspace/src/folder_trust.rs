@@ -172,6 +172,7 @@ fn feature_enabled_for_build(remote: Option<&RemoteSettings>, is_local_build: bo
     let user = xai_grok_config::load_from_disk().ok();
     let managed = xai_grok_config::load_managed_config().ok();
     BoolFlag::env("GROK_FOLDER_TRUST")
+        .env_alias("MEDLEY_FOLDER_TRUST")
         .config(from_toml(user.as_ref()))
         .managed(from_toml(managed.as_ref()))
         .feature_flag(remote.and_then(|r| r.folder_trust_enabled))
@@ -994,6 +995,34 @@ mod tests {
     /// grant/revoke no-ops). Hold the returned guard for the test body.
     fn simulate_release_build() -> EnvVarGuard {
         EnvVarGuard::set(xai_grok_version::TEST_VERSION_ENV, Path::new("0.0.0-sim"))
+    }
+
+    #[test]
+    fn medley_folder_trust_wins_over_grok_folder_trust() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("GROK_HOME", home.path());
+        let _medley = EnvVarGuard::set("MEDLEY_FOLDER_TRUST", Path::new("1"));
+        let _grok = EnvVarGuard::set("GROK_FOLDER_TRUST", Path::new("0"));
+
+        assert!(
+            feature_enabled_for_build(None, false),
+            "MEDLEY_FOLDER_TRUST=1 must win over a conflicting GROK_FOLDER_TRUST=0"
+        );
+    }
+
+    #[test]
+    fn grok_folder_trust_still_works_when_medley_unset() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("GROK_HOME", home.path());
+        let _medley = EnvVarGuard::unset("MEDLEY_FOLDER_TRUST");
+        let _grok = EnvVarGuard::set("GROK_FOLDER_TRUST", Path::new("0"));
+
+        assert!(
+            !feature_enabled_for_build(None, false),
+            "GROK_FOLDER_TRUST must still work when MEDLEY_FOLDER_TRUST is unset"
+        );
     }
 
     #[test]
