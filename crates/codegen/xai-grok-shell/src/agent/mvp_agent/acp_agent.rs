@@ -2760,7 +2760,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    &crate::auth::with_login_instruction(
+                    crate::auth::with_login_instruction(
                         |prog| format!("Run `{prog} login` to authenticate."),
                         "Sign in again to authenticate.",
                     ),
@@ -2795,7 +2795,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    &crate::auth::with_login_instruction(
+                    crate::auth::with_login_instruction(
                         |prog| format!("Run `{prog} login` to authenticate."),
                         "Sign in again to authenticate.",
                     ),
@@ -2823,7 +2823,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    &crate::auth::with_login_instruction(
+                    crate::auth::with_login_instruction(
                         |prog| format!("Run `{prog} login` to authenticate."),
                         "Sign in again to authenticate.",
                     ),
@@ -2883,7 +2883,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    &crate::auth::with_login_instruction(
+                    crate::auth::with_login_instruction(
                         |prog| format!("Run `{prog} login` to authenticate."),
                         "Sign in again to authenticate.",
                     ),
@@ -2946,7 +2946,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    &crate::auth::with_login_instruction(
+                    crate::auth::with_login_instruction(
                         |prog| format!("Run `{prog} login` to authenticate."),
                         "Sign in again to authenticate.",
                     ),

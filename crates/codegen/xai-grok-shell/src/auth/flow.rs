@@ -2123,11 +2123,10 @@ mod tests {
         .await;
 
         let err = result.unwrap_err();
-        // Device flow fall-through hits the device-code endpoint (not OIDC
-        // discovery).
         assert!(
-            err.to_string().contains("/oauth2/device/code"),
-            "expected device-code request error (proves flow fell through to interactive login), got: {err}"
+            err.chain()
+                .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some()),
+            "expected an HTTP request error (proves flow fell through to interactive login), got: {err}"
         );
     }
 

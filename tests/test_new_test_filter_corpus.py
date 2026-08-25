@@ -311,7 +311,7 @@ def _real_tests_by_crate() -> dict[str, list[tuple[str, str]]]:
 # would report nothing new. Proven by construction, not by count: today every
 # (crate, value) here maps to exactly one target ("lib"), so this widening is
 # a re-expression of the same entries, not new coverage (#458 review). Count
-# was seven at #458; #384 sync removed three that went stale for a reason
+# was seven at #458; #384 sync removed two that went stale for a reason
 # unrelated to (crate, value) vs (crate, target, value) -- see below.
 KNOWN_UNRESOLVABLE = {
     ("xai-grok-shell", "lib", "auth::manager::tests::"),
@@ -322,8 +322,9 @@ KNOWN_UNRESOLVABLE = {
     ),
     ("xai-grok-shell", "lib", "terminal::pty_session::tests::"),
     ("xai-grok-shell", "lib", "terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child"),
+    ("xai-grok-subagent-resolution", "lib", "resume::tests"),
 }
-# #384 sync: removed three entries that went stale, not because the guard's
+# #384 sync: removed two entries that went stale, not because the guard's
 # module-path approximation improved, but because the filters themselves are
 # no longer in `ci.yml` -- this was already true on the sync branch before any
 # of its three conflicts were resolved, unrelated to this PR's merge work:
@@ -331,13 +332,16 @@ KNOWN_UNRESOLVABLE = {
 #     broader `auth::` filter (ci.yml) now subsumes it; no coverage lost.
 #   ("xai-grok-shell", "lib", "leader::lock::tests::reclaim") -- gone, but a
 #     broader `leader::` filter (ci.yml) now subsumes it; no coverage lost.
-#   ("xai-grok-subagent-resolution", "lib", "resume::tests") -- gone, and
-#     NOT subsumed: `xai-grok-subagent-resolution`'s only remaining ci.yml
-#     filter is `native_route::`, which does not select `resume`'s tests.
-#     This is a real, separate coverage gap, tracked apart from this cleanup
-#     since neither this corpus test nor `check_new_tests_are_filtered.py`
-#     was built to catch it -- the former only audits allowlist staleness,
-#     the latter only audits newly-added tests.
+#
+# A third entry, ("xai-grok-subagent-resolution", "lib", "resume::tests"),
+# was *also* dropped by the same merge along with its own ci.yml filter --
+# not subsumed by anything (the crate's other filter, `native_route::`, does
+# not select `resume`'s tests). That is a paired removal, not a staleness
+# fix: dropping only the KNOWN_UNRESOLVABLE tuple while the filter still
+# existed would have left `resume::tests` running uncounted by this ratchet;
+# dropping only the filter (as the merge did) drops the coverage outright and
+# would make restoring just this tuple fail `test_no_new_unresolvable_module_filter`
+# for lack of a matching filter. Restored both here, together.
 
 
 class ModulePathApproximationCorpus(unittest.TestCase):
