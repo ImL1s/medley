@@ -83,13 +83,18 @@ jobs:
       - name: Guard user-guide links against install extraction
         run: python3 -B -m unittest tests.test_user_guide_link_guard -v
 
-      # Direct-mention scan: EnvGuard / std::env::{set_var,remove_var} in
-      # xai-grok-shell unit tests must carry unkeyed #[serial] (#319).
-      # Known stragglers are allowlisted; new hits and stale entries fail.
+      # Env-mutating xai-grok-shell unit tests must be serialised (#319).
+      # Guards are found by DEFINITION, not by name — the old `EnvGuard::`
+      # match saw neither `EnvVarGuard::` nor `TestEnvGuard::` and was silent
+      # about 170 env-mutating tests in this very crate (#446).
+      #
+      # The step name says which crate on purpose. Reported repo-wide, a green
+      # tick here would claim far more than it checks; scanning the rest of the
+      # workspace is a separate change with findings of its own to answer for.
       - name: Test the EnvGuard serial guard
         run: python3 -B -m unittest tests.test_envguard_serial_guard -v
 
-      - name: Enforce EnvGuard tests are unkeyed #[serial]
+      - name: Enforce env-mutating tests are serialised (xai-grok-shell only)
         run: python3 -B scripts/check_envguard_serial.py
 
   installer:

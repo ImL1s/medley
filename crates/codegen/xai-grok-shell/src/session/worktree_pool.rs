@@ -1898,6 +1898,7 @@ pool_size = 3
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn test_pool_fill_creates_worktrees() {
         let (_dir, repo_path) = create_temp_git_repo(5);
         let repo_path = dunce::canonicalize(&repo_path).expect("canonicalize repo path");
@@ -1932,6 +1933,7 @@ pool_size = 3
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn test_pool_fill_replenishes_after_acquire() {
         let (_dir, repo_path) = create_temp_git_repo(5);
         let repo_path = dunce::canonicalize(&repo_path).expect("canonicalize repo path");
@@ -1972,6 +1974,7 @@ pool_size = 3
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn test_pool_release_and_reacquire() {
         let (_dir, repo_path) = create_temp_git_repo(10);
         let repo_path = dunce::canonicalize(&repo_path).expect("canonicalize repo path");
@@ -2020,6 +2023,7 @@ pool_size = 3
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn test_pool_multi_instance_isolation() {
         let (_dir, repo_path) = create_temp_git_repo(5);
 
@@ -2056,6 +2060,7 @@ pool_size = 3
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn test_cleanup_stale_only_removes_dead_instances() {
         let (_dir, repo_path) = create_temp_git_repo(3);
 
@@ -2173,6 +2178,7 @@ pool_size = 3
     }
 
     #[test]
+    #[serial]
     fn test_is_worktree_adoptable_valid() {
         let (_dir, repo_path) = create_temp_git_repo(3);
         let repo_path = dunce::canonicalize(&repo_path).unwrap();
@@ -2222,6 +2228,7 @@ pool_size = 3
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn test_adopt_orphan_worktrees_basic() {
         let (_dir, repo_path) = create_temp_git_repo(5);
         let repo_path = dunce::canonicalize(&repo_path).unwrap();
@@ -2291,6 +2298,7 @@ pool_size = 3
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn test_adopt_rejects_cross_repo_worktree() {
         // Create two separate repos.
         let (_dir_a, repo_a) = create_temp_git_repo(3);
@@ -2328,6 +2336,7 @@ pool_size = 3
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     #[ignore = "flaky: worktree adoption count is timing-dependent on CI"]
     async fn test_adopt_respects_hard_cap_limit() {
         let (_dir, repo_path) = create_temp_git_repo(3);
