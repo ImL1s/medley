@@ -143,7 +143,10 @@ In order, cheapest first:
   `cargo check --lib` and clippy on `--lib` never compile.
 - `cargo test --workspace --no-run` compiles those targets without running them.
   That catches callers which stopped *compiling*. It cannot catch the ones that
-  still compile and now read the wrong thing — only the grep does.
+  still compile and now read the wrong thing — only the grep does. It also does
+  **not** compile targets whose `required-features` are unmet: cargo skips those
+  silently, so `--workspace` is not the completeness guarantee its name suggests
+  (#474). Pass the feature, or the target is not in the check.
 
 #409 later closed the other half of the same channel. `AuthManager::new` read
 `GROK_AUTH_PATH` unconditionally, so the env was shut out of the Codex resolver
@@ -226,7 +229,19 @@ Triggers:
 Scope is the fork hot path (not full workspace):
 
 - `cargo fmt --all -- --check`
-- `clippy --lib -D warnings` on `xai-grok-sampler`, `xai-grok-shell`, `xai-grok-pager` (lib only; avoids unrelated upstream bench/test lints)
+- `clippy --all-targets -D warnings` on `xai-grok-sampler`, `xai-grok-shell`,
+  `xai-grok-tools` (with `--features pi`), `xai-grok-pager`, and
+  `xai-grok-pager-bin`. Two things this does **not** cover, both of which have
+  read as coverage before:
+  - **Five crates of eighty-odd.** `xai-grok-workspace` and `xai-grok-config`
+    are among those never linted, and both fail `-D warnings` on `providers`
+    today (#457). A crate having eight named test filters in the hot path says
+    nothing about whether clippy has ever looked at it.
+  - **Targets with `required-features` are skipped silently.** `--all-targets`
+    omits them with no error and no warning, so all six `[[test]]` targets in
+    `xai-grok-shell` — gated on `test-support`, and the memory/OOM regression
+    suite — are neither linted nor compiled by any job (#474). The
+    `--features pi` above exists because somebody hit this once for one crate.
 - Targeted auth / readiness / model-picker tests (subagent None credential strip, session model-switch credential clear, pager unready hard-blocks)
 
 **Merge pull requests with `scripts/merge-pr.sh`, not `gh pr merge`** (issue #202):
