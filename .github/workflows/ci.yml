@@ -136,6 +136,18 @@ jobs:
       - name: Enforce env-mutating tests are serialised (xai-grok-shell only)
         run: python3 -B scripts/check_envguard_serial.py
 
+      # #496: named `#[serial(key)]` groups are a convention with no
+      # enforcement -- forgetting the tag on a toucher doesn't fail that
+      # test, it makes a DIFFERENT test fail later, intermittently, under
+      # load (#475's own shape). Membership is derived from a
+      # `// SERIAL-GROUP: <key>` marker anchored on the shared `static`
+      # itself, not remembered in a list a person has to update.
+      - name: Test the shared-state serial guard
+        run: python3 -B -m unittest tests.test_shared_state_serial_guard -v
+
+      - name: Enforce named serial groups have derived membership (xai-grok-shell only)
+        run: python3 -B scripts/check_shared_state_serial.py
+
   installer:
     name: Installer
     runs-on: ubuntu-latest

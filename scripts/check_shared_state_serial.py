@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+"""Fail when a test touches a registered shared item without its serial key.
+
+## The problem (#496)
+
+`#[serial(key)]` groups are a convention with no enforcement. A test that
+touches shared state and forgets the tag runs concurrently with the group
+and nothing objects -- the group still passes, because the untagged test is
+simply not IN it. The failure mode is worse than it sounds: the untagged
+toucher does not fail. It makes SOMETHING ELSE fail, later, intermittently,
+under load, and the person diagnosing it is reading the innocent test that
+broke, not the one that raced it. That is exactly the shape #475 took:
+`test_claimant_reindexes_even_when_marker_exists` failed 9 of 15 times when
+paired with an epoch-bumping sibling, and 0 of 10 in isolation.
+
+This repo already solved the analogous problem once, for env mutation
+(`check_envguard_serial.py`, #319/#446): guards are found by DEFINITION, not
+by name. The transferable idea is the SAME here -- which tests touch a given
+shared item is answerable from the item's own identifier, not from a list a
+person has to remember to update -- but the shape of "touching" is different
+enough (an arbitrary named `static`, not a well-known `env::set_var` call
+with a string-literal variable name as its first argument) that this is a
+SIBLING script, not a generalisation of that one. Decided, not left open:
+      - `check_envguard_serial.py`'s env-specific machinery (five
+        alternative regimes, lock-liveness tracking, env-var-argument
+        extraction) does not transfer -- a shared static has exactly one
+        sound regime, an exact keyed `#[serial(key)]`, not "any lock".
+      - Its pure SYNTAX primitives (comment/string masking, attribute
+        collection, `#[test]` detection, balanced-brace body extraction)
+        are generic Rust-scanning code, not env-specific, and are
+        duplicated below rather than imported. Importing internals from a
+        CI-critical sibling script would couple two independently-owned
+        checkers' internals together for a few hundred lines of stable
+        code; a copy that drifts is a smaller risk than a shared internal
+        API neither script's own tests would catch changing under it.
+
+## What "registered" means, and why an annotation on the static itself
+
+Every process-global is NOT in scope -- most are read-only after
+initialisation, or a `OnceLock`/`Lazy` that is genuinely safe under
+concurrent test execution. Scope is opt-in, anchored at the declaration:
+
+    // SERIAL-GROUP: heap_profile_monitor
+    static TEST_RESIDENT: AtomicU64 = AtomicU64::new(0);
+    static TEST_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+    ...
+
+A `// SERIAL-GROUP: <key>` comment claims every contiguous `static` (or
+`static mut`) declaration immediately below it -- skipping only blank lines,
+further comments, and attributes -- as one registry item keyed by `<key>`.
+There is deliberately no separate identifier list to keep in sync: the
+static block IS its own definition, so nothing can name a static the marker
+does not also cover, or vice versa, without the block boundary itself
+changing. A marker that claims zero statics (typo'd placement, or the block
+it pointed at was deleted or moved) is a hard error naming the marker's own
+location -- not a silent no-op -- because a registry item nobody can find
+touchers for is indistinguishable from one that has none, and this guard's
+entire premise is not assuming that.
+
+**Registering a new global is still a manual step, and that is deliberate**
+(see #496's own design question: "should adding a new global require
+registering it"). Introducing a new process-global mutable `static` is rare
+and visible in review; forgetting a per-test attribute happens every time
+someone adds a test. Moving the manual step from the frequent event to the
+rare one is the fix, not eliminating manual steps altogether -- membership
+of TESTS in a registered item's group is what must be derived, and is.
+
+## How a toucher is found, and its two stages
+
+Stage 1, DIRECT: a function is a toucher of key `K` if `K`'s registered
+identifier appears as a whole word in that function's own code-only body
+(comments and string/char literals masked, same masking
+`check_envguard_serial.py` uses).
+
+Stage 2, TRANSITIVE: a `#[test]` / `#[tokio::test]` function is a member of
+`K`'s group if it is itself a Stage-1 toucher, or REACHES one through calls,
+however many hops that takes. Every function's key set starts at its Stage-1
+keys and is repeatedly grown by re-scanning every function for call-shaped
+references into a function that already holds keys, unioning them in, until
+a full pass adds nothing. Keys only ever get ADDED, never removed, over a
+finite universe of keys and functions, so this is monotonic on a finite
+lattice and provably terminates (`_MAX_ROUNDS` is a generous safety bound on
+top of that, not the termination argument). Three call shapes propagate a
+hop: a bare `name(` resolved within the SAME FILE; a `path::to::name(`
+resolved by full module path when `path` starts with `crate`, and ALSO by
+its last segment alone against every file's own module leaf (its filename
+stem) either way -- the shape a sibling module is actually called by in
+this tree, with no `crate::` prefix at all; and a `Type::assoc_fn(`
+resolved crate-wide against `impl Type { .. }` blocks, so a call written
+`some_mod::Type::assoc_fn(...)` still resolves on the `Type::assoc_fn(`
+suffix regardless of what qualifies it.
+
+This is a real design turn, not an ideal from the outset: an earlier
+one-hop-only version of this checker calibrated to 15/15 against
+`heap_profile_monitor` (a single-file, single-hop chain) but, dry-run tested
+against `search_cache_epoch`'s real shape (#492, not yet merged -- see
+below), missed 5 of 6 currently-tagged tests. `heal_quarantines_only_on_
+confirmed_corruption` alone needs TWO hops (test -> `quarantined_after` ->
+`heal_unusable`, all in `search_recovery.rs`); others route through several
+hops of production orchestration code the test never names directly. A
+fixed hop count tuned to fit one item's deepest chain is wrong again at the
+next item -- so there is no fixed count, only the fixpoint.
+
+WHAT THIS DOES NOT CHECK, so a green tick is not read as more than it is:
+
+    A function pointer passed as a VALUE -- not called -- is not a call and
+    is not followed. `heap_profile_monitor`'s own test module wires
+    `test_dump` / `test_stats` / `test_set_active` / `test_rss` into a
+    `HeapProfileMonitor` via `.with_test_hooks(test_dump, ...)`; those names
+    appear as bare arguments, never as `test_dump(...)`. Chasing bare
+    mentions was tried during design and measured to be WRONG, not just
+    imprecise: it marks `monitor()` (and everything that calls it,
+    including `session_id_is_sticky_and_rejects_non_uuid` and seven other
+    currently-untagged tests in that same file) as touchers, when none of
+    them ever actually run the hooks -- only `.poll_tick()` does, and the
+    tests that call it are exactly the ones already tagged. A false
+    positive here would have meant recommending a tag on a fine test.
+
+    A method call on an arbitrary receiver (`epoch.changed()`) is not
+    resolved -- there is no cheap way to know a bare variable's type
+    without a real type checker, and neither does `check_envguard_serial.py`
+    for the equivalent shape. `Type::assoc_fn(...)` (an explicit,
+    syntactic type name) IS resolved; an instance method is not. Measured
+    not to block the `search_cache_epoch` dry run below: every chain that
+    needed to cross this had an associated-fn call (`CacheEpoch::now()`) on
+    the same path as the unresolved instance call (`.changed()`), so the
+    chain still connects on the call the checker CAN see.
+
+    Reachability is not control flow: a function that calls a toucher only
+    on an ERROR-recovery branch is indistinguishable, to a textual scan,
+    from one that calls it unconditionally. Measured, not hypothetical:
+    `search_fts.rs::SessionSearchIndex::open_or_create` calls
+    `search_recovery::heal_unusable(..)` only in its
+    `Err(e) if is_unusable_db_error(&e)` arm, which a fresh-tmpdir test
+    fixture essentially never takes -- but the transitive closure has no way
+    to know that, so it derives 36 candidate `search_cache_epoch` members
+    from that one file, not the 6 a human tagged in #492 by judging which
+    tests could actually OBSERVE a moved counter, not merely reach the call
+    that moves it. This is sound (nothing is missed) but not tight (some
+    flagged tests likely never execute the branch that matters), and it is
+    exactly why `search_cache_epoch` is not registered by this change --
+    see the section below.
+
+    Two tests can each be individually sound and still race if they are
+    governed by two DIFFERENT keys that are not the same lock (`#319`,
+    `#459`'s equivalent finding for env). This checker judges a test
+    against the KEY its own registered item requires; it does not compare
+    keys across items.
+
+Scan scope is one crate: `crates/codegen/xai-grok-shell/src/**/*.rs` unless
+`--scan-root` says otherwise -- the same default and the same "one crate"
+assumption `check_envguard_serial.py` documents, for the same reason
+(`crate::`-qualified resolution only ever names something in the same
+crate).
+
+There is deliberately no allowlist file, unlike the env checker: this guard
+ships with its full registry (`heap_profile_monitor`) already at zero
+findings, verified by calibrating derived membership against every test
+currently tagged `#[serial(heap_profile_monitor)]` in the tree (15/15
+match, no more, no fewer) -- so there is no "known straggler" for a first
+slice to defer. `search_cache_epoch` (CACHE_EPOCH, #475/#492) is NOT
+registered by this change, for two independent reasons: #492 (which
+introduces that key) had not merged to `providers` at the time this script
+was written, so its `SERIAL-GROUP` marker rides on that PR rather than
+being duplicated here ahead of it; and a dry run of this checker against
+#492's own diff (registering the marker in a scratch worktree, never
+committed) found the reachability closure derives 36 candidate members
+against the 6 a human actually tagged, for the reachability-is-not-control-
+flow reason documented above. Registering that key for real is a decision
+for whoever lands it -- accept the wider serialisation, or decide this
+checker needs a scoping mechanism this design does not attempt -- not
+something to force through here by narrowing the resolver to fit one
+item's shape.
+
+Usage:
+    python3 scripts/check_shared_state_serial.py
+    python3 scripts/check_shared_state_serial.py --dump
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+DEFAULT_SCAN_ROOT = Path("crates/codegen/xai-grok-shell/src")
+
+# --- pure Rust-syntax primitives -------------------------------------------
+# Duplicated from `check_envguard_serial.py` rather than imported -- see the
+# module docstring's "Decided, not left open" section for why.
+
+RAW_STRING_START = re.compile(r'r(#+)?"')
+CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'\n])'")
+FN_DEF = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+)
+TEST_ATTR = re.compile(
+    r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b",
+    re.DOTALL,
+)
+SERIAL_ATTR = re.compile(
+    r"#\s*\[\s*(?:serial_test\s*::\s*)?serial\s*(?:\((?P<args>.*)\))?\s*\]",
+    re.DOTALL,
+)
+IMPL_HEAD = re.compile(r"\bimpl\b[^{;]*\{")
+IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+FREE_CALL = re.compile(r"(?<![:.\w])([a-z_][a-z0-9_]*)\s*\(")
+# Any `path::to::name(` call, `crate`-rooted or not. Resolved two ways (see
+# `_resolve_calls`): a `crate`-rooted path by its FULL module path, and every
+# path (rooted or not) by its LAST segment alone against a file's own module
+# leaf -- the shape a sibling module is actually called by in this tree
+# (`search_recovery::heal_unusable(`, no `crate::` prefix at all).
+QUALIFIED_CALL = re.compile(
+    r"\b((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)([a-z_][a-z0-9_]*)\s*\("
+)
+TYPE_ASSOC_CALL = re.compile(
+    r"\b([A-Z][A-Za-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>\s*)?\("
+)
+
+# --- the registry: `// SERIAL-GROUP: <key>` anchors a `static` block -------
+
+REGISTRY_MARKER = re.compile(
+    r"^[ \t]*//[ \t]*SERIAL-GROUP:[ \t]*(?P<key>[a-z][a-z0-9_]*)[ \t]*$", re.M
+)
+STATIC_DECL = re.compile(
+    r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?static[ \t]+(?:mut[ \t]+)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*:"
+)
+# A line the block-scan may pass THROUGH without ending the block: blank, a
+# comment (plain or doc), or an attribute. Not a static decl itself.
+SKIPPABLE_LINE = re.compile(r"^[ \t]*($|//|#\[)")
+
+
+def _skip_quoted(source: str, index: int, quote: str) -> int:
+    index += 1
+    while index < len(source):
+        if source[index] == "\\":
+            index += 2
+        elif source[index] == quote:
+            return index + 1
+        else:
+            index += 1
+    return len(source)
+
+
+def _skip_char_literal(source: str, index: int) -> int | None:
+    match = CHAR_LITERAL.match(source, index)
+    return match.end() if match else None
+
+
+def _skip_raw_string(source: str, index: int) -> int | None:
+    if source[index : index + 1] != "r":
+        return None
+    match = RAW_STRING_START.match(source, index)
+    if not match:
+        return None
+    hashes = match.group(1) or ""
+    end = source.find('"' + hashes, match.end())
+    return len(source) if end < 0 else end + 1 + len(hashes)
+
+
+def _skip_comment(source: str, index: int) -> int | None:
+    if source[index : index + 1] != "/":
+        return None
+    if source.startswith("//", index):
+        end = source.find("\n", index + 2)
+        return len(source) if end < 0 else end
+    if source.startswith("/*", index):
+        depth = 1
+        cursor = index + 2
+        while cursor < len(source) and depth:
+            if source.startswith("/*", cursor):
+                depth += 1
+                cursor += 2
+            elif source.startswith("*/", cursor):
+                depth -= 1
+                cursor += 2
+            else:
+                cursor += 1
+        return cursor
+    return None
+
+
+def _balanced_end(source: str, open_index: int) -> int:
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    opener = source[open_index]
+    if opener not in pairs:
+        return open_index
+    stack = [pairs[opener]]
+    index = open_index + 1
+    while index < len(source) and stack:
+        comment_end = _skip_comment(source, index)
+        if comment_end is not None:
+            index = comment_end
+            continue
+        raw_end = _skip_raw_string(source, index)
+        if raw_end is not None:
+            index = raw_end
+            continue
+        char = source[index]
+        if char == '"':
+            index = _skip_quoted(source, index, char)
+        elif char == "'" and (char_end := _skip_char_literal(source, index)) is not None:
+            index = char_end
+        elif char in pairs:
+            stack.append(pairs[char])
+            index += 1
+        elif char == stack[-1]:
+            stack.pop()
+            index += 1
+        else:
+            index += 1
+    return index
+
+
+def _code_only(source: str) -> str:
+    """Mask comments and literals while preserving offsets and newlines."""
+
+    result = list(source)
+    index = 0
+    while index < len(source):
+        end = _skip_comment(source, index)
+        if end is None:
+            end = _skip_raw_string(source, index)
+        if end is None and source[index] == '"':
+            end = _skip_quoted(source, index, source[index])
+        if end is None and source[index] == "'":
+            end = _skip_char_literal(source, index)
+        if end is None:
+            index += 1
+            continue
+        for masked in range(index, end):
+            if result[masked] != "\n":
+                result[masked] = " "
+        index = end
+    return "".join(result)
+
+
+def _line(source: str, offset: int) -> int:
+    return source.count("\n", 0, offset) + 1
+
+
+def _preceding_attributes(source: str, code: str, position: int) -> list[str]:
+    """Collect `#[attr]` blocks immediately before ``position``."""
+
+    attrs: list[str] = []
+    index = position
+    while index > 0:
+        index -= 1
+        if code[index].isspace():
+            continue
+        if code[index] != "]":
+            break
+        end = index + 1
+        depth = 1
+        cursor = index - 1
+        while cursor >= 0 and depth:
+            if code[cursor] == "]":
+                depth += 1
+                cursor -= 1
+            elif code[cursor] == "[":
+                depth -= 1
+                cursor -= 1
+            else:
+                cursor -= 1
+        hash_index = cursor
+        while hash_index >= 0 and code[hash_index].isspace():
+            hash_index -= 1
+        if hash_index < 0 or code[hash_index] != "#":
+            break
+        attrs.append(source[hash_index:end])
+        index = hash_index
+    attrs.reverse()
+    return attrs
+
+
+def _is_test_attr(attr: str) -> bool:
+    return TEST_ATTR.match(attr.strip()) is not None
+
+
+def _serial_keys(attr: str) -> tuple[str, ...] | None:
+    """`None` = not a `#[serial]` attribute. `()` = unkeyed. Else the keys."""
+
+    match = SERIAL_ATTR.fullmatch(attr.strip())
+    if match is None:
+        return None
+    args = (match.group("args") or "").strip()
+    if not args:
+        return ()
+    return tuple(a.strip().strip('"').strip("'") for a in args.split(",") if a.strip())
+
+
+def _fn_body(source: str, name_end: int) -> tuple[int, int] | None:
+    index = name_end
+    while index < len(source) and source[index].isspace():
+        index += 1
+    if index < len(source) and source[index] == "<":
+        index = _balanced_end(source, index)
+        while index < len(source) and source[index].isspace():
+            index += 1
+    if index >= len(source) or source[index] != "(":
+        return None
+    index = _balanced_end(source, index)
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+            continue
+        if source[index] == "{":
+            return index, _balanced_end(source, index)
+        if source[index] == ";":
+            return None
+        index += 1
+    return None
+
+
+def _impl_blocks(code: str) -> list[tuple[str, int, int]]:
+    """`(type name, start, end)` for each `impl … { … }`, block-scoped."""
+
+    blocks: list[tuple[str, int, int]] = []
+    for match in IMPL_HEAD.finditer(code):
+        idents = IDENT.findall(match.group(0))
+        if not idents:
+            continue
+        open_index = match.end() - 1
+        blocks.append((idents[-1], open_index, _balanced_end(code, open_index)))
+    return blocks
+
+
+def _crate_of(path: Path) -> str:
+    parts = path.parts
+    return parts[2] if len(parts) > 2 else str(path)
+
+
+def _module_path(rel: Path) -> tuple[str, ...] | None:
+    """`crate::a::b` module path for `.../src/a/b.rs` or `.../src/a/b/mod.rs`."""
+
+    parts = rel.parts
+    if "src" not in parts:
+        return None
+    segs = list(parts[parts.index("src") + 1 :])
+    if not segs:
+        return None
+    segs[-1] = Path(segs[-1]).stem
+    if segs[-1] in ("mod", "lib", "main"):
+        segs = segs[:-1]
+    return tuple(segs)
+
+
+def _is_integration_target(path: Path) -> bool:
+    parts = path.parts
+    return "src" not in parts and len(parts) >= 2 and parts[-2] == "tests"
+
+
+def _process_group(path: Path) -> str:
+    parts = path.parts
+    if "tests" in parts and "src" not in parts:
+        index = parts.index("tests")
+        crate = "/".join(parts[:index])
+        if index + 1 < len(parts):
+            root = Path(parts[index + 1]).stem
+            return f"bin:{crate}/tests/{root}"
+        return f"bin:{crate}/tests"
+    return f"lib:{_crate_of(path)}"
+
+
+def rust_files(scan_root: Path) -> list[Path]:
+    return sorted(path for path in scan_root.rglob("*.rs") if path.is_file())
+
+
+# --- registry discovery ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SharedItem:
+    key: str
+    file: Path
+    identifiers: tuple[str, ...]
+    line: int
+
+
+def find_registry(sources: list[tuple[Path, str]]) -> tuple[list[SharedItem], list[str]]:
+    """Every `SERIAL-GROUP` marker, and its claimed `static` block.
+
+    A marker that claims no `static` at all is an error naming the marker's
+    own location, not a silently-empty registry item -- see the module
+    docstring's "hard error" paragraph.
+    """
+
+    items: list[SharedItem] = []
+    errors: list[str] = []
+    for rel, raw in sources:
+        for match in REGISTRY_MARKER.finditer(raw):
+            key = match.group("key")
+            line = _line(raw, match.start())
+            rest = raw[match.end() :].splitlines(keepends=True)
+            identifiers: list[str] = []
+            for line_text in rest:
+                decl = STATIC_DECL.match(line_text)
+                if decl:
+                    identifiers.append(decl.group("name"))
+                    continue
+                if SKIPPABLE_LINE.match(line_text):
+                    continue
+                break
+            if not identifiers:
+                errors.append(
+                    f"{rel.as_posix()}:{line}: SERIAL-GROUP({key}) names no "
+                    "`static` declaration directly below it -- moved, "
+                    "deleted, or misplaced marker"
+                )
+                continue
+            items.append(
+                SharedItem(key=key, file=rel, identifiers=tuple(identifiers), line=line)
+            )
+    return items, errors
+
+
+# --- toucher indexing (Stage 1: direct reference) ----------------------------
+
+
+@dataclass(frozen=True)
+class FnInfo:
+    name: str
+    file: Path
+    type_name: str | None  # set for an `impl Type { fn name }` method
+    body: str  # code-only
+    start: int
+    keys: frozenset[str]  # Stage-1 direct touch, possibly empty
+    is_test: bool
+    serial_held: frozenset[str]  # keys held by any #[serial(..)] on this fn
+    has_unkeyed_serial: bool
+    attrs_line: int
+
+
+def _body_touches(code_only_body: str, identifiers: tuple[str, ...]) -> bool:
+    return any(re.search(rf"\b{re.escape(ident)}\b", code_only_body) for ident in identifiers)
+
+
+def index_functions(
+    sources: list[tuple[Path, str]], registry: list[SharedItem]
+) -> list[FnInfo]:
+    out: list[FnInfo] = []
+    for rel, raw in sources:
+        code = _code_only(raw)
+        impls = _impl_blocks(code)
+        for match in FN_DEF.finditer(code):
+            name = match.group("name")
+            body_span = _fn_body(raw, match.end())
+            if body_span is None:
+                continue
+            body_start, body_end = body_span
+            body_code = code[body_start:body_end]
+            keys = frozenset(
+                item.key for item in registry if _body_touches(body_code, item.identifiers)
+            )
+            type_name = None
+            for tname, istart, iend in impls:
+                if istart <= match.start() < iend:
+                    type_name = tname
+                    break
+            attrs = _preceding_attributes(raw, code, match.start())
+            is_test = any(_is_test_attr(a) for a in attrs)
+            serial_held: set[str] = set()
+            has_unkeyed = False
+            for a in attrs:
+                parsed = _serial_keys(a)
+                if parsed is None:
+                    continue
+                if not parsed:
+                    has_unkeyed = True
+                else:
+                    serial_held.update(parsed)
+            out.append(
+                FnInfo(
+                    name=name,
+                    file=rel,
+                    type_name=type_name,
+                    body=body_code,
+                    start=body_start,
+                    keys=keys,
+                    is_test=is_test,
+                    serial_held=frozenset(serial_held),
+                    has_unkeyed_serial=has_unkeyed,
+                    attrs_line=_line(raw, match.start()),
+                )
+            )
+    return out
+
+
+# --- membership: a monotonic fixpoint over the call graph -------------------
+#
+# Not "one hop": measured against the real motivating case (#475/#492,
+# `search_cache_epoch`, dry-run calibrated below) and found to need more.
+# `heal_quarantines_only_on_confirmed_corruption` reaches `CACHE_EPOCH` through
+# TWO same-file calls (test -> `quarantined_after` -> `heal_unusable`);
+# `test_claimant_reindexes_even_when_marker_exists` reaches it through several
+# hops of production orchestration code the test never names directly. A fixed
+# hop count is either too shallow for that (misses real touchers -- silently,
+# which is the one failure mode this guard exists to not have) or an arbitrary
+# number chosen to fit today's deepest chain and wrong again at the next one.
+#
+# Instead: every function starts with its Stage-1 (direct-reference) keys,
+# and a fixed point is computed by repeatedly re-scanning every function's
+# body for CALLS into a function that already has keys, unioning those keys
+# in. Because keys only ever get ADDED (never removed) and the key universe
+# is finite, this is monotonic on a finite lattice and provably terminates;
+# `_MAX_ROUNDS` below is a generous safety bound, not the actual termination
+# argument. A call not shaped like one of the four resolved forms below
+# breaks the chain at that point -- silently, same as it would for
+# `check_envguard_serial.py`'s own one-hop resolution -- see WHAT THIS DOES
+# NOT CHECK in the module docstring.
+#
+# Four call shapes are resolved, all requiring `name(` -- never a bare
+# mention without a call, per the module docstring's measured false-positive
+# finding:
+#   1. `name(`                    -- same file only (unambiguous without
+#                                     import resolution)
+#   2. `crate::a::b::name(`       -- resolved by full module path
+#   3. `some_mod::name(`          -- resolved by the LAST path segment
+#                                     against every file's own module leaf
+#                                     (its filename stem) -- the shape a
+#                                     sibling module is actually called by
+#                                     in this tree (`search_recovery::
+#                                     heal_unusable(`), and deliberately
+#                                     imprecise: a leaf name is not scoped
+#                                     to which `use` brought it in, so a
+#                                     crate with two same-named file stems
+#                                     would over-resolve. Measured: none in
+#                                     `xai-grok-shell` do (`rust_files`
+#                                     over the scan root, grouped by stem).
+#   4. `Type::assoc_fn(`          -- resolved crate-wide by type name against
+#                                     every `impl Type { .. }` block, so a
+#                                     call written as `mod_path::Type::fn()`
+#                                     resolves on the `Type::fn(` suffix
+#                                     alone, regardless of the qualifying
+#                                     path in front of it. An INSTANCE method
+#                                     call (`value.method()`) is a fifth
+#                                     shape this does not attempt: knowing
+#                                     `value`'s type without a real type
+#                                     checker is not cheap, and neither
+#                                     sibling script does it. Measured not to
+#                                     block the dry run below: every chain
+#                                     that needed to cross this had an
+#                                     associated-fn call (`CacheEpoch::now()`)
+#                                     on the same path as the unresolved
+#                                     instance call (`.changed()`), so the
+#                                     other call in the chain still connects.
+
+_MAX_ROUNDS = 64
+
+
+@dataclass(frozen=True)
+class Finding:
+    path: Path
+    line: int
+    name: str
+    key: str
+    reason: str
+
+
+def _resolve_calls(
+    fn: FnInfo,
+    *,
+    by_file: dict[Path, dict[str, int]],
+    by_module: dict[tuple[str, ...], dict[str, int]],
+    by_leaf: dict[str, dict[str, int]],
+    by_type: dict[str, dict[str, int]],
+    keys_of: list[frozenset[str]],
+    self_index: int,
+) -> frozenset[str]:
+    gained: set[str] = set()
+    file_index = by_file.get(fn.file, {})
+    for m in FREE_CALL.finditer(fn.body):
+        j = file_index.get(m.group(1))
+        if j is not None and j != self_index:
+            gained.update(keys_of[j])
+    for m in QUALIFIED_CALL.finditer(fn.body):
+        segs = tuple(s.strip() for s in m.group(1).split("::") if s.strip())
+        if segs and segs[0] == "crate":
+            j = by_module.get(segs[1:], {}).get(m.group(2))
+            if j is not None and j != self_index:
+                gained.update(keys_of[j])
+        leaf = segs[-1] if segs else None
+        if leaf and leaf != "crate":
+            j = by_leaf.get(leaf, {}).get(m.group(2))
+            if j is not None and j != self_index:
+                gained.update(keys_of[j])
+    for m in TYPE_ASSOC_CALL.finditer(fn.body):
+        j = by_type.get(m.group(1), {}).get(m.group(2))
+        if j is not None and j != self_index:
+            gained.update(keys_of[j])
+    return frozenset(gained)
+
+
+def analyze(
+    sources: list[tuple[Path, str]], *, scan_root: Path
+) -> tuple[list[Finding], list[str], dict[str, list[tuple[Path, int, str]]]]:
+    """Findings, registry errors, and derived membership (for `--dump`)."""
+
+    registry, errors = find_registry(sources)
+    if errors:
+        return [], errors, {}
+
+    functions = index_functions(sources, registry)
+
+    by_file: dict[Path, dict[str, int]] = {}
+    by_module: dict[tuple[str, ...], dict[str, int]] = {}
+    by_leaf: dict[str, dict[str, int]] = {}
+    by_type: dict[str, dict[str, int]] = {}
+    for i, fn in enumerate(functions):
+        by_file.setdefault(fn.file, {})[fn.name] = i
+        module = _module_path(fn.file)
+        if module is not None:
+            by_module.setdefault(module, {})[fn.name] = i
+            by_leaf.setdefault(module[-1], {})[fn.name] = i
+        if fn.type_name is not None:
+            by_type.setdefault(fn.type_name, {})[fn.name] = i
+
+    keys_of: list[frozenset[str]] = [fn.keys for fn in functions]
+    for _round in range(_MAX_ROUNDS):
+        changed = False
+        for i, fn in enumerate(functions):
+            gained = _resolve_calls(
+                fn,
+                by_file=by_file,
+                by_module=by_module,
+                by_leaf=by_leaf,
+                by_type=by_type,
+                keys_of=keys_of,
+                self_index=i,
+            )
+            if not gained:
+                continue
+            new_total = keys_of[i] | gained
+            if new_total != keys_of[i]:
+                keys_of[i] = new_total
+                changed = True
+        if not changed:
+            break
+
+    membership: dict[str, list[tuple[Path, int, str]]] = {item.key: [] for item in registry}
+    for i, fn in enumerate(functions):
+        if not fn.is_test:
+            continue
+        for key in sorted(keys_of[i]):
+            membership[key].append((fn.file, fn.attrs_line, fn.name))
+
+    # Only now do we know, per key, how many distinct process groups its
+    # members span -- a lone member in its own process group cannot race
+    # anything else in that process (mirrors `check_envguard_serial.py`'s
+    # "sole test in its own integration binary" regime, generalised to "sole
+    # test in its own process").
+    members_by_process: dict[tuple[str, str], list[tuple[Path, int, str]]] = {}
+    for key, members in membership.items():
+        for path, line, name in members:
+            members_by_process.setdefault((key, _process_group(path)), []).append(
+                (path, line, name)
+            )
+
+    findings: list[Finding] = []
+    for i, fn in enumerate(functions):
+        if not fn.is_test:
+            continue
+        for key in sorted(keys_of[i]):
+            group = _process_group(fn.file)
+            if len(members_by_process.get((key, group), [])) <= 1:
+                continue  # sole member in its process: nothing to race
+            if key in fn.serial_held:
+                continue
+            if fn.has_unkeyed_serial:
+                reason = (
+                    f"carries unkeyed #[serial], which is a DIFFERENT lock from "
+                    f"#[serial({key})] (#319/#459) and does not exclude this "
+                    f"item's group"
+                )
+            elif fn.serial_held:
+                held = ", ".join(sorted(fn.serial_held))
+                reason = f"tagged #[serial({held})], missing '{key}'"
+            else:
+                reason = f"touches the '{key}' shared item, no #[serial({key})]"
+            findings.append(
+                Finding(path=fn.file, line=fn.attrs_line, name=fn.name, key=key, reason=reason)
+            )
+
+    return findings, [], membership
+
+
+def scan_tree(scan_root: Path, *, repo: Path) -> tuple[list[Finding], list[str], dict]:
+    sources = [
+        (p.relative_to(repo), p.read_text(encoding="utf-8")) for p in rust_files(scan_root)
+    ]
+    return analyze(sources, scan_root=scan_root)
+
+
+def scan_source(source: str, *, path: str = "fixture.rs") -> list[Finding]:
+    """Single-file convenience for tests: registry marker and touchers both
+    live in one string. Cross-file resolution needs `analyze` directly with
+    multiple `(Path, str)` entries instead."""
+
+    findings, errors, _membership = analyze([(Path(path), source)], scan_root=Path("."))
+    if errors:
+        raise AssertionError(f"registry error(s) in fixture: {errors}")
+    return findings
+
+
+def format_report(
+    findings: list[Finding], errors: list[str], *, scan_rel: str | None = None
+) -> str:
+    scope = f" [scanned: {scan_rel}]" if scan_rel else ""
+    lines = [f"shared-state-serial{scope}: {len(findings)} violation(s), {len(errors)} registry error(s)"]
+    if errors:
+        lines.append("")
+        lines.append("Registry errors (a SERIAL-GROUP marker names no static below it):")
+        for e in errors:
+            lines.append(f"  {e}")
+    if findings:
+        lines.append("")
+        lines.append("Tests touching a registered shared item without its serial key:")
+        for f in sorted(findings, key=lambda x: (str(x.path), x.line, x.name)):
+            lines.append(f"  {f.path}:{f.line}: {f.name}: {f.reason}")
+        lines.append("")
+        lines.append(
+            "Add the matching `#[serial(<key>)]` from the item's SERIAL-GROUP "
+            "marker, or -- if the reference is spurious -- check whether this "
+            "checker's call-graph resolution over-reached (see the module "
+            "docstring's WHAT THIS DOES NOT CHECK)."
+        )
+    return "\n".join(lines)
+
+
+def format_dump(
+    registry_sources: list[tuple[Path, str]], membership: dict[str, list[tuple[Path, int, str]]]
+) -> str:
+    registry, _errors = find_registry(registry_sources)
+    lines = []
+    for item in registry:
+        lines.append(f"{item.key} ({item.file.as_posix()}:{item.line}):")
+        lines.append(f"  identifiers: {', '.join(item.identifiers)}")
+        members = sorted(set(membership.get(item.key, [])))
+        lines.append(f"  {len(members)} derived member test(s):")
+        for path, line, name in members:
+            lines.append(f"    {path.as_posix()}:{line}: {name}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _repo_from_script() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def main(argv: list[str] | None = None) -> int:
+    repo = _repo_from_script()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--repo", type=Path, default=repo)
+    ap.add_argument("--scan-root", type=Path, default=None)
+    ap.add_argument(
+        "--dump", action="store_true", help="print the derived registry and membership, exit 0"
+    )
+    args = ap.parse_args(argv)
+
+    root = args.repo.resolve()
+    scan_root = (args.scan_root or (root / DEFAULT_SCAN_ROOT)).resolve()
+    sources = [
+        (p.relative_to(root), p.read_text(encoding="utf-8")) for p in rust_files(scan_root)
+    ]
+
+    if args.dump:
+        _findings, _errors, membership = analyze(sources, scan_root=scan_root)
+        sys.stdout.write(format_dump(sources, membership))
+        return 0
+
+    findings, errors, _membership = analyze(sources, scan_root=scan_root)
+    try:
+        scan_rel = scan_root.relative_to(root).as_posix()
+    except ValueError:
+        scan_rel = None
+    print(format_report(findings, errors, scan_rel=scan_rel))
+    if findings or errors:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

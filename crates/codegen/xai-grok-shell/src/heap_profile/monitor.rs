@@ -680,6 +680,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
+    // SERIAL-GROUP: heap_profile_monitor
+    // #496: this comment and the contiguous `static` block below it are the
+    // registry entry `scripts/check_shared_state_serial.py` derives test
+    // membership from -- see that script's module docstring. Adding a ninth
+    // shared static here without extending the block, or moving one of
+    // these above the marker, is exactly the drift this exists to catch:
+    // the block itself is the definition, so there is nothing else to keep
+    // in sync.
     static TEST_RESIDENT: AtomicU64 = AtomicU64::new(0);
     static TEST_ALLOCATED: AtomicU64 = AtomicU64::new(0);
     static TEST_DUMP_FAIL: AtomicBool = AtomicBool::new(false);
