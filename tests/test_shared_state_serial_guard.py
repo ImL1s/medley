@@ -729,10 +729,17 @@ class RelativeQualifierResolution(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_super_qualified_from_child_dir_untagged"})
 
-    def test_multi_segment_relative_qualifier_is_a_named_residual_not_a_crash(self):
-        """`super::super::bump()` (two levels) is NOT resolved -- named in
-        the module docstring as a residual alongside the single-segment
-        fix, not silently either resolved-by-accident or crashed on."""
+    def test_double_super_from_doubly_nested_inline_mod_resolves(self):
+        """Measured, not assumed: an earlier version of this checker only
+        handled a single leading `super`/`self`, on the theory that deeper
+        chains were rare enough to name as a residual instead of fixing.
+        A real-tree count found otherwise -- `super::super::name(...)`
+        (two `super`s, no trailing module) occurs 15 times in
+        `xai-grok-shell`. This fixture is that shape: two levels of
+        INLINE nesting (`mod inner { mod tests { ... } }`), where
+        `super::super` correctly means "back to the top of this same
+        file" -- which is exactly where `bump` lives, so this resolves
+        via the ascent=0 (same-file) case the general algorithm tries."""
 
         text = src(
             """\
@@ -756,7 +763,46 @@ class RelativeQualifierResolution(unittest.TestCase):
         names = derived_names(
             [(Path("crates/codegen/demo/src/parent/child.rs"), text)], "demo_key"
         )
-        self.assertEqual(names, set())
+        self.assertEqual(names, {"calls_double_super_untagged"})
+
+    def test_super_then_a_named_sibling_module_resolves(self):
+        """The single most common real relative-qualifier shape in this
+        crate: `super::sibling_mod::name(...)` -- a leading `super` (go up
+        one level) followed by a NAMED module (not another `super`), then
+        the call. Measured at 129 occurrences in `xai-grok-shell`
+        (`super::persist::update_config(...)`,
+        `super::campaigns::persist_models_default(...)`, and similar). The
+        earlier single-segment-only fix (bare `super::name(...)`, nothing
+        after it) did not cover this at all."""
+
+        parent_file = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            """
+        )
+        sibling_file = src(
+            """\
+            pub(super) fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        child_file = src(
+            """\
+            #[test]
+            fn calls_super_then_sibling_module_untagged() {
+                super::sibling::bump();
+            }
+            """
+        )
+        sources = [
+            (Path("crates/codegen/demo/src/parent.rs"), parent_file),
+            (Path("crates/codegen/demo/src/parent/sibling.rs"), sibling_file),
+            (Path("crates/codegen/demo/src/parent/child.rs"), child_file),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_super_then_sibling_module_untagged"})
 
 
 class TurbofishCallResolution(unittest.TestCase):

@@ -165,15 +165,28 @@ WHAT THIS DOES NOT CHECK, so a green tick is not read as more than it is:
     definition's own default method body (`trait Foo { fn helper() {
     Self::other(); } }`, not an `impl` block) has no enclosing type this
     checker tracks, and is not resolved; sound (skipped, not
-    misattributed), not tight.
+    misattributed), not tight. Measured, per this checker's own standard
+    for what stays a documented boundary rather than a fix: this crate's
+    four traits (`AsyncTerminalRunner`, `FacetProvider`, `StorageAdapter`,
+    `SessionNotificationSender`) declare zero default method bodies
+    between them, so `Self::` inside one is not a shape that currently
+    occurs here -- if that changes, this residual needs revisiting, not
+    just re-citing.
 
-    `self::`/`super::` resolve one level only. `self::sub::name(...)` and
-    `super::super::name(...)` (or deeper) are not walked -- the single
-    most common real shape (one level, from an inline `mod tests { use
-    super::*; ... }` or a top-level sibling file) is, both tried and
-    unioned since a file-based module model cannot tell which one applies
-    without knowing where a `mod` block is nested, but a chain of two or
-    more relative segments is not attempted.
+    `self::[...]name(...)` / `super::[...]name(...)` -- an arbitrary
+    chain of leading `self`/`super` segments, optionally followed by a
+    named module path -- ARE walked, not left as a residual: measured at
+    129 occurrences for `super::sibling_mod::name(...)` (a `super` then a
+    named module) and 15 for `super::super::name(...)` (two `super`s, no
+    trailing module) in this crate, both real enough that an earlier,
+    single-segment-only version of this fix would have silently missed
+    the majority of relative-qualifier calls in the tree. Since a
+    file-based module model cannot tell whether a `super` crossed a REAL
+    directory boundary or just an INLINE `mod tests { use super::*; ...
+    }` block (both are invisible the same way to `_module_path`), every
+    ascent from 0 (every `super` was inline nesting) up to the full
+    count (every `super` was a real parent) is tried and unioned, sound
+    over tight in the same way the rest of this checker is.
 
     An `impl` for a non-path type (`impl Trait for &Foo { .. }`, `impl
     Trait for dyn Foo { .. }`, `impl Trait for (A, B) { .. }`) has no
@@ -181,7 +194,8 @@ WHAT THIS DOES NOT CHECK, so a green tick is not read as more than it is:
     block is skipped -- its methods are simply not indexed under any type
     name, so a `Type::method(...)` call into one of them does not resolve
     (though an unqualified same-file call still would, same as any other
-    function).
+    function). Measured: zero occurrences of any of those three shapes in
+    this crate today.
 
 Scan scope is one crate: `crates/codegen/xai-grok-shell/src/**/*.rs` unless
 `--scan-root` says otherwise -- the same default and the same "one crate"
@@ -876,33 +890,58 @@ def _resolve_calls(
             j = by_module.get(segs[1:], {}).get(m.group(2))
             if j is not None and j != self_index:
                 gained.update(keys_of[j])
-        elif segs == ("self",):
-            # `self::name(` -- this checker's unit of "module" is the
-            # file, so "the current module" and "the current file" are the
-            # same lookup `file_index` already is.
-            j = file_index.get(m.group(2))
-            if j is not None and j != self_index:
-                gained.update(keys_of[j])
-        elif segs == ("super",) and caller_module is not None:
-            # `super::name(` has TWO real shapes in this tree and they
-            # resolve to DIFFERENT modules, so both are tried and unioned
-            # rather than picking one: (a) from inside an inline `mod
-            # tests { use super::*; ... }` block, `super` means "this same
-            # file, one level up in NESTING" -- which, since nesting is
-            # invisible to a file-based `_module_path`, is just this same
-            # file again (`file_index`); (b) from top-level code in a
-            # child file, `super` means "the parent directory's module"
-            # (`by_module` on `caller_module` with its last segment
-            # dropped). A single-segment fix that only tried (b) would
-            # resolve (a) to the wrong, one-level-too-high module and miss
-            # the shape tests actually use most.
-            j = file_index.get(m.group(2))
-            if j is not None and j != self_index:
-                gained.update(keys_of[j])
-            if caller_module:
-                j = by_module.get(caller_module[:-1], {}).get(m.group(2))
+        elif segs and segs[0] in ("self", "super"):
+            # `self::[...]name(` / `super::[...]name(`, with zero or more
+            # ADDITIONAL segments after the relative prefix -- measured,
+            # not assumed: `super::sibling_mod::name(...)` (a leading
+            # `super` then a NAMED sibling module) occurs 129 times in
+            # this crate, `super::super::name(...)` (two `super`s, no
+            # trailing module) 15 times. A fix that only handled a bare
+            # `self`/`super` with nothing after it, however many levels,
+            # would silently miss both of those real shapes.
+            #
+            # Each leading `self` contributes 0 levels of ascent (stays
+            # at "the current module"); each leading `super` contributes
+            # 1. Whatever segments remain after that prefix (`sibling_mod`
+            # above) are a module path relative to the ascended module.
+            ascend = 0
+            index = 0
+            while index < len(segs) and segs[index] in ("self", "super"):
+                if segs[index] == "super":
+                    ascend += 1
+                index += 1
+            trailing = segs[index:]
+            if ascend == 0 and not trailing:
+                # `self::name(` alone: "the current module" is exactly
+                # "the current file" under this checker's file-based
+                # model, the same lookup a bare unqualified call already
+                # uses -- and, unlike every other case below, this one
+                # needs no `_module_path` at all, so it still works for a
+                # file with no `src` component (this checker's own test
+                # fixtures, and in principle any Rust file laid out
+                # differently than this repo's own crates are).
+                j = file_index.get(m.group(2))
                 if j is not None and j != self_index:
                     gained.update(keys_of[j])
+            elif caller_module is not None:
+                # Ambiguity this checker cannot resolve, named rather than
+                # guessed at: a `super` prefix's ascent count conflates
+                # two things a file-based module model cannot tell apart
+                # -- nesting INSIDE the same file (an inline `mod tests {
+                # use super::*; ... }` block, invisible to
+                # `_module_path`) and a REAL parent-directory module
+                # (visible). Sound over tight: try every ascent from 0
+                # (every `super` was inline nesting, so this stays at the
+                # same file) up to `ascend` (every `super` was a real
+                # parent), and union all of them, rather than picking one
+                # and risking a silent miss on the other.
+                for levels in range(ascend + 1):
+                    if levels > len(caller_module):
+                        break
+                    base = caller_module[: len(caller_module) - levels]
+                    j = by_module.get(base + trailing, {}).get(m.group(2))
+                    if j is not None and j != self_index:
+                        gained.update(keys_of[j])
         leaf = segs[-1] if segs else None
         if leaf and leaf not in ("crate", "self", "super"):
             j = by_leaf.get(leaf, {}).get(m.group(2))
