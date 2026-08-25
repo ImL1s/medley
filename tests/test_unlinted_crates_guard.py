@@ -26,6 +26,7 @@ from check_unlinted_crates import (  # noqa: E402
     AllowlistError,
     evaluate,
     iter_crates,
+    linted_invocation_tokens,
     linted_tokens,
     load_allowlist,
     main,
@@ -118,6 +119,29 @@ class LintedTokens(unittest.TestCase):
         # not stop it from counting.
         text = _workflow(CLIPPY.format(d="xai-grok-shell") + "  # still runs")
         self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+    def test_keeps_manifest_dirs_and_package_names_apart(self):
+        # `-p`/`--package` and `--manifest-path` are different namespaces.
+        # linted_invocation_tokens() must not merge them -- evaluate() relies
+        # on that separation to avoid crediting a crate for an invocation
+        # that names the *other* namespace's identically-spelled token
+        # (#439 follow-up).
+        text = _workflow(
+            CLIPPY.format(d="xai-grok-shell"),
+            "cargo clippy -p xai-grok-tools --all-targets -- -D warnings",
+        )
+        tokens = linted_invocation_tokens(text)
+        self.assertEqual(tokens.manifest_dirs, frozenset({"xai-grok-shell"}))
+        self.assertEqual(tokens.package_names, frozenset({"xai-grok-tools"}))
+
+    def test_linted_tokens_is_still_the_union_of_both_kinds(self):
+        # Back-compat contract: linted_tokens() itself is unchanged, it is
+        # only no longer what evaluate() uses to decide what is linted.
+        text = _workflow(
+            CLIPPY.format(d="xai-grok-shell"),
+            "cargo clippy -p xai-grok-tools --all-targets -- -D warnings",
+        )
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell", "xai-grok-tools"})
 
     def test_a_comment_line_does_not_absorb_the_next_real_command(self):
         # Comment-stripping must happen before the line-continuation join:
@@ -272,6 +296,54 @@ class Evaluate(unittest.TestCase):
                 allowlisted={"deleted-crate": "left behind by a rename"},
             )
             self.assertEqual(report.unknown, frozenset({"deleted-crate"}))
+            self.assertFalse(report.ok)
+
+    def _collision_root(self, tmp: str) -> Path:
+        # Crate "shared": directory `crates/shared`, package `alpha`.
+        # Crate "other": directory `crates/other`, package `shared`.
+        # The package name of one equals the directory name of the other.
+        root = Path(tmp)
+        _workspace(root, {"shared": "alpha", "other": "shared"})
+        return root
+
+    def test_a_package_flag_does_not_credit_a_crate_whose_directory_shares_its_spelling(
+        self,
+    ):
+        # `-p shared` lints the package named `shared` (crate "other"). It
+        # must not also credit crate "shared" (package `alpha`) just because
+        # its *directory* happens to be spelled `shared` (#439 follow-up).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._collision_root(tmp)
+            report = evaluate(
+                root=root,
+                workflow_text=_workflow(
+                    "cargo clippy -p shared --all-targets -- -D warnings"
+                ),
+                allowlisted={},
+            )
+            self.assertEqual(report.linted, frozenset({"shared"}))
+            self.assertEqual(report.new_gaps, frozenset({"alpha"}))
+            self.assertFalse(report.ok)
+
+    def test_a_manifest_path_does_not_credit_a_crate_whose_package_shares_its_directorys_spelling(
+        self,
+    ):
+        # `--manifest-path crates/shared` lints the crate in directory
+        # `shared` (package `alpha`). It must not also credit the crate
+        # whose *package name* happens to be spelled `shared` (crate
+        # "other") just because that spelling matches (#439 follow-up).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._collision_root(tmp)
+            report = evaluate(
+                root=root,
+                workflow_text=_workflow(
+                    "cargo clippy --manifest-path crates/shared/Cargo.toml "
+                    "--all-targets -- -D warnings"
+                ),
+                allowlisted={},
+            )
+            self.assertEqual(report.linted, frozenset({"alpha"}))
+            self.assertEqual(report.new_gaps, frozenset({"shared"}))
             self.assertFalse(report.ok)
 
 

@@ -175,8 +175,25 @@ def _strip_shell_comments(workflow_text: str) -> str:
     return "\n".join(lines)
 
 
-def linted_tokens(workflow_text: str) -> set[str]:
-    """Crates a `cargo clippy` invocation lints at the job's promised strength.
+@dataclass(frozen=True)
+class LintedInvocationTokens:
+    """Tokens a deny-level `cargo clippy` invocation names, kept apart by kind.
+
+    `-p`/`--package` names a *package*; `--manifest-path` names a *directory*.
+    Those are different namespaces that can collide -- a crate's package name
+    can equal a different crate's directory basename, or vice versa. Folding
+    both into one set (as `linted_tokens()` below still does, for its own
+    tested contract) would let that collision cross-credit the wrong crate as
+    linted; `evaluate()` matches each kind only against its own namespace to
+    close that (#439 follow-up).
+    """
+
+    manifest_dirs: frozenset[str]
+    package_names: frozenset[str]
+
+
+def linted_invocation_tokens(workflow_text: str) -> LintedInvocationTokens:
+    """Extract `--manifest-path` directories and `-p`/`--package` names separately.
 
     Both `--all-targets` and `-D warnings` are required; see the module
     docstring for why a weaker invocation must not count.
@@ -188,7 +205,8 @@ def linted_tokens(workflow_text: str) -> set[str]:
     """
     commentless = _strip_shell_comments(workflow_text)
     joined = re.sub(r"\\\s*\n\s*", " ", commentless)
-    tokens: set[str] = set()
+    manifest_dirs: set[str] = set()
+    package_names: set[str] = set()
     for line in joined.splitlines():
         if "cargo clippy" not in line:
             continue
@@ -197,9 +215,25 @@ def linted_tokens(workflow_text: str) -> set[str]:
         for raw in _MANIFEST.findall(line):
             parent = Path(raw.strip().strip("'\"")).parent.name
             if parent:
-                tokens.add(parent)
-        tokens.update(_P_FLAG.findall(line))
-    return tokens
+                manifest_dirs.add(parent)
+        package_names.update(_P_FLAG.findall(line))
+    return LintedInvocationTokens(
+        manifest_dirs=frozenset(manifest_dirs), package_names=frozenset(package_names)
+    )
+
+
+def linted_tokens(workflow_text: str) -> set[str]:
+    """Every crate- or directory-shaped token a deny-level invocation names.
+
+    This is the union of `linted_invocation_tokens()`'s two kinds, with their
+    provenance erased. `evaluate()` does not use this -- it needs to know
+    which namespace each token came from, precisely to avoid the collision
+    described on `LintedInvocationTokens`. This stays a separate, tested
+    function because "what does this invocation mention, of any kind" is
+    still a useful question on its own.
+    """
+    kinds = linted_invocation_tokens(workflow_text)
+    return set(kinds.manifest_dirs) | set(kinds.package_names)
 
 
 def load_allowlist(path: Path) -> dict[str, str]:
@@ -232,9 +266,17 @@ def evaluate(
 ) -> Report:
     crates = iter_crates(root)
     names = frozenset(c.name for c in crates)
-    tokens = linted_tokens(workflow_text)
+    tokens = linted_invocation_tokens(workflow_text)
 
-    linted = {c.name for c in crates if c.name in tokens or c.dir_name in tokens}
+    # `-p`/`--package` only ever names a package; `--manifest-path` only ever
+    # names a directory. Checking a crate's name against the manifest-path
+    # set (or its directory against the package-name set) would credit it
+    # for an invocation that was never about it (#439 follow-up).
+    linted = {
+        c.name
+        for c in crates
+        if c.name in tokens.package_names or c.dir_name in tokens.manifest_dirs
+    }
     allow = frozenset(allowlisted)
     return Report(
         crates=tuple(sorted(names)),
