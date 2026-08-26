@@ -413,6 +413,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     #[serial(early_invalidation)]
     fn early_invalidation_medley_wins_over_grok() {
         let _lock = crate::auth::credential_provider::EARLY_INVALIDATION_TEST_LOCK
@@ -431,6 +432,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[serial(early_invalidation)]
     fn early_invalidation_grok_still_works_when_medley_unset() {
         let _lock = crate::auth::credential_provider::EARLY_INVALIDATION_TEST_LOCK

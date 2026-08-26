@@ -473,6 +473,7 @@ fn os_path(v: &OsStr) -> PathBuf {
 // naming, so resolution only decides routing-dir vs single-file-path. Takes
 // `OsStr` so non-UTF-8 paths round-trip; only the bool-vs-path discrimination
 // needs UTF-8 (a non-UTF-8 value can't be a bool keyword, so it's a path).
+#[cfg(test)]
 fn resolve_debug_target_inner(
     grok_log_file: Option<&OsStr>,
     grok_debug_log: Option<&OsStr>,
