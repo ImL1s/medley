@@ -585,7 +585,8 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !ready_path.exists() {
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
+                let _ = group.kill();
+                let _ = child.wait();
                 let _ = std::fs::remove_file(&ready_path);
                 panic!("fixture never signalled that its SIGTERM trap was installed");
             }
