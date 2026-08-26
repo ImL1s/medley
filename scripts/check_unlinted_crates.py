@@ -233,8 +233,17 @@ def linted_invocation_tokens(workflow_text: str) -> LintedInvocationTokens:
 
 
 def _is_cargo_clippy_argv(tokens: list[str]) -> bool:
-    """True when `cargo clippy` is the invoked command, not a substring."""
+    """True when `cargo clippy` is the invoked command, not a substring.
+
+    A single-line GitHub Actions `run:` is valid workflow syntax
+    (`- run: cargo clippy ...`). After `shlex.split` the YAML tokens `-`
+    and `run:` sit in front of `cargo`; skipping them is what keeps a
+    real deny-level invocation from looking like `echo cargo clippy`
+    (#508 review).
+    """
     i = 0
+    while i < len(tokens) and tokens[i] in ("-", "run:"):
+        i += 1
     while i < len(tokens) and _ENV_ASSIGNMENT.match(tokens[i]):
         i += 1
     return i + 1 < len(tokens) and tokens[i] == "cargo" and tokens[i + 1] == "clippy"

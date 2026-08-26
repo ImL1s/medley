@@ -211,6 +211,13 @@ class LintedTokens(unittest.TestCase):
         text = _workflow("echo " + CLIPPY.format(d="xai-grok-shell"))
         self.assertEqual(linted_tokens(text), set())
 
+    def test_counts_an_inline_yaml_run_invocation(self):
+        # Single-line `run:` is valid GHA; shlex then sees `-` and `run:`
+        # before `cargo`. Skipping those YAML tokens is what keeps this
+        # a real deny-level invocation (#508 review).
+        text = "      - run: " + CLIPPY.format(d="xai-grok-shell") + "\n"
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
     def test_counts_a_package_flag_invocation(self):
         text = _workflow(
             "cargo clippy -p xai-grok-shell --all-targets -- -D warnings"
@@ -255,6 +262,8 @@ def _independent_linted_crates(workflow_text: str) -> set[str]:
         except ValueError:
             continue
         i = 0
+        while i < len(tokens) and tokens[i] in ("-", "run:"):
+            i += 1
         while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[i]):
             i += 1
         if i + 1 >= len(tokens) or tokens[i] != "cargo" or tokens[i + 1] != "clippy":
@@ -286,6 +295,10 @@ class IndependentLintedOracle(unittest.TestCase):
 
     def test_counts_a_manifest_path(self):
         text = _workflow(CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+    def test_counts_an_inline_yaml_run_invocation(self):
+        text = "      - run: " + CLIPPY.format(d="xai-grok-shell") + "\n"
         self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
 
 
