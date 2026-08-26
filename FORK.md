@@ -292,11 +292,16 @@ Scope is the fork hot path (not full workspace):
   `xai-grok-pager-bin`. Two things this does **not** cover, both of which have
   read as coverage before:
   - **Five crates of eighty-odd.** `xai-grok-workspace` and `xai-grok-config`
-    are among those never linted, and both fail `-D warnings` on `providers`
-    today (#457). Test coverage and lint coverage are answered by different
-    lists: `xai-grok-workspace` is named by dozens of `run_nonzero` test
-    filters and by no clippy invocation at all, and neither list mentions the
-    other.
+    are not named by any clippy `--manifest-path` of their own, and both fail
+    `-D warnings` on `providers` today when linted `--all-targets` (#457).
+    They *are* still reached as ordinary library dependencies of
+    `xai-grok-shell`'s clippy invocation, which omits `--no-deps`: Cargo
+    therefore runs clippy on their `lib` target (not tests/benches) under
+    `-D warnings`. That is not the same as being on the named list, and it
+    is not `--all-targets` coverage. Test coverage and lint coverage are
+    answered by different lists: `xai-grok-workspace` is named by dozens of
+    `run_nonzero` test filters and by no clippy `--manifest-path` of its
+    own, and neither list mentions the other.
   - **Targets with `required-features` are skipped silently.** `--all-targets`
     omits them with no error and no warning, so the six `[[test]]` targets in
     `xai-grok-shell` gated on `test-support` — the memory/OOM regression suite
