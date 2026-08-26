@@ -128,6 +128,34 @@ class RegistryDiscovery(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(items[0].identifiers, ("B", "C"))
 
+    def test_block_comment_between_statics_does_not_end_the_block(self):
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static A: AtomicU64 = AtomicU64::new(0);
+            /* a note between the two claimed statics */
+            static B: AtomicU64 = AtomicU64::new(0);
+            """
+        )
+        items, errors = guard.find_registry([(Path("f.rs"), text)])
+        self.assertEqual(errors, [])
+        self.assertEqual(items[0].identifiers, ("A", "B"))
+
+    def test_multiline_block_comment_between_statics_does_not_end_the_block(self):
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static A: AtomicU64 = AtomicU64::new(0);
+            /*
+             * still the same group
+             */
+            static B: AtomicU64 = AtomicU64::new(0);
+            """
+        )
+        items, errors = guard.find_registry([(Path("f.rs"), text)])
+        self.assertEqual(errors, [])
+        self.assertEqual(items[0].identifiers, ("A", "B"))
+
     def test_marker_inside_a_raw_string_is_not_a_registry_entry(self):
         text = src(
             '''\
@@ -520,6 +548,44 @@ class TypeAssociatedResolution(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_qualified_type_assoc_untagged"})
+
+    def test_ufcs_trait_call_resolves_like_type_assoc(self):
+        """`<Type as Trait>::method(` does not match QUALIFIED_CALL or
+        TYPE_ASSOC_CALL; without a dedicated pattern the call never
+        derived a key (#516 review)."""
+
+        impl_file = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            pub(super) struct Snapshot(u64);
+
+            impl Snapshot {
+                pub(super) fn now() -> Self {
+                    Self(COUNTER.load(Ordering::SeqCst))
+                }
+            }
+            """
+        )
+        test_file = src(
+            """\
+            trait Probe {
+                fn now() -> Self;
+            }
+
+            #[test]
+            fn calls_ufcs_trait_untagged() {
+                let _s = <inner::Snapshot as Probe>::now();
+            }
+            """
+        )
+        sources = [
+            (Path("crates/codegen/demo/src/inner.rs"), impl_file),
+            (Path("crates/codegen/demo/src/caller.rs"), test_file),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_ufcs_trait_untagged"})
 
     def test_instance_method_call_is_not_resolved(self):
         """Named, measured gap: `.changed()`-shaped instance calls are not

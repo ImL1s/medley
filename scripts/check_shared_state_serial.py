@@ -272,6 +272,19 @@ QUALIFIED_CALL = re.compile(
 TYPE_ASSOC_CALL = re.compile(
     r"\b([A-Z][A-Za-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>\s*)?\("
 )
+# `<Type as Trait>::method(` -- QUALIFIED_CALL cannot cross `as Trait>`.
+# Resolves the same way as TYPE_ASSOC_CALL: last segment of the type path
+# against `by_type` (#516 review).
+UFCS_CALL = re.compile(
+    r"<\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*([A-Z][A-Za-z0-9_]*)"
+    r"(?:\s*<[^>]*>)?"
+    r"\s+as\s+"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:\s*<[^>]*>)?"
+    r"\s*>\s*::\s*"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+    r"\s*\("
+)
 
 # --- the registry: `// SERIAL-GROUP: <key>` anchors a `static` block -------
 
@@ -285,6 +298,10 @@ STATIC_DECL = re.compile(
 # A line the block-scan may pass THROUGH without ending the block: blank, a
 # comment (plain or doc), or an attribute. Not a static decl itself.
 SKIPPABLE_LINE = re.compile(r"^[ \t]*($|//|#\[)")
+# A `/* ... */` opener at column 0 of the remaining line. The registry walk
+# then consumes through the closer, including when it spans lines -- a
+# block comment between two statics must not end the group (#516 review).
+_BLOCK_COMMENT_OPEN = re.compile(r"^[ \t]*/\*")
 
 
 def _skip_quoted(source: str, index: int, quote: str) -> int:
@@ -754,6 +771,25 @@ def _consume_static_decl(lines: list[str], start: int) -> tuple[str | None, int]
     return decl.group("name"), i
 
 
+def _skip_registry_filler(lines: list[str], start: int) -> int | None:
+    """Advance past one blank/comment/attr line, or a `/* ... */` comment.
+
+    Returns the next index, or `None` if `lines[start]` ends the block.
+    """
+    if start >= len(lines):
+        return None
+    if SKIPPABLE_LINE.match(lines[start]):
+        return start + 1
+    if not _BLOCK_COMMENT_OPEN.match(lines[start]):
+        return None
+    i = start
+    while i < len(lines) and "*/" not in lines[i]:
+        i += 1
+    if i < len(lines):
+        return i + 1
+    return len(lines)
+
+
 def find_registry(sources: list[tuple[Path, str]]) -> tuple[list[SharedItem], list[str]]:
     """Every `SERIAL-GROUP` marker, and its claimed `static` block.
 
@@ -778,8 +814,9 @@ def find_registry(sources: list[tuple[Path, str]]) -> tuple[list[SharedItem], li
                     identifiers.append(name)
                     i = next_i
                     continue
-                if SKIPPABLE_LINE.match(rest[i]):
-                    i += 1
+                skip_to = _skip_registry_filler(rest, i)
+                if skip_to is not None:
+                    i = skip_to
                     continue
                 break
             if not identifiers:
@@ -1027,6 +1064,10 @@ def _resolve_calls(
         if type_name is None:
             continue
         j = by_type.get(type_name, {}).get(m.group(2))
+        if j is not None and j != self_index:
+            gained.update(keys_of[j])
+    for m in UFCS_CALL.finditer(fn.body):
+        j = by_type.get(m.group(1), {}).get(m.group(2))
         if j is not None and j != self_index:
             gained.update(keys_of[j])
     return frozenset(gained)
