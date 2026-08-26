@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -28,6 +30,18 @@ use crate::session::persistence::Summary;
 const BOOTSTRAP_MAX_CONCURRENT: usize = 4;
 const BOOTSTRAP_PER_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const BOOTSTRAP_MAX_FILE_SIZE: u64 = 30 * 1024 * 1024;
+
+fn session_claim_is_lost(claim_lost: &AtomicBool, progress: &BootstrapProgress) -> bool {
+    #[cfg(test)]
+    if let Ok(guard) = progress.session_claim_check.lock()
+        && let Some(check) = guard.as_ref()
+    {
+        return check();
+    }
+    #[cfg(not(test))]
+    let _ = progress;
+    claim_lost.load(Ordering::Acquire)
+}
 
 /// Bootstrap coordination timing, injectable so tests run in milliseconds.
 struct BootstrapTiming {
@@ -64,6 +78,11 @@ pub(super) struct BootstrapProgress {
     pub skipped: AtomicU64,
     pub unchanged: AtomicU64,
     pub bytes_read: AtomicU64,
+    /// Test-only: replaces the per-session `claim_lost` load so a test can
+    /// flip the flag after at least one session has entered that check
+    /// (#498 review). Production always reads `claim_lost` directly.
+    #[cfg(test)]
+    pub(super) session_claim_check: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
 }
 
 impl BootstrapProgress {
@@ -533,7 +552,7 @@ async fn reindex_all(
 
             // A successor owns the index. These upserts are idempotent,
             // not fenced; stopping just avoids contending with it.
-            if claim_lost.load(Ordering::Acquire) {
+            if session_claim_is_lost(&claim_lost, &progress) {
                 return;
             }
 
