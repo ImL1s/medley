@@ -20,7 +20,9 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from check_uncovered_crates import (  # noqa: E402
     AllowlistError,
+    _CRATE_ROOTS,
     evaluate,
+    iter_crates,
     load_allowlist,
     main,
     named_tokens,
@@ -284,6 +286,33 @@ class AllowlistFile(unittest.TestCase):
             self.assertEqual(read_reasons(path), {"with": "a reason"})
             with self.assertRaises(AllowlistError):
                 load_allowlist(path)
+
+
+class ThirdPartyRoots(unittest.TestCase):
+    """#495: `_CRATE_ROOTS` used to omit `third_party/` entirely, so four
+    real workspace members -- including two with real `src/` tests running
+    in no `ci.yml` lane -- were invisible to this guard's corpus rather than
+    reported as gaps.
+    """
+
+    def test_third_party_is_a_crate_root(self):
+        self.assertIn("third_party", _CRATE_ROOTS)
+
+    def test_dagre_rust_and_mermaid_to_svg_are_now_visible_with_tests(self):
+        crates = {c.name: c for c in iter_crates(REPO)}
+        self.assertIn("dagre_rust", crates)
+        self.assertIn("mermaid-to-svg", crates)
+        self.assertTrue(src_has_tests(crates["dagre_rust"].manifest.parent))
+        self.assertTrue(src_has_tests(crates["mermaid-to-svg"].manifest.parent))
+
+    def test_third_party_crates_without_tests_are_visible_but_not_gaps(self):
+        # graphlib_rust and ordered_hashmap have no src/ tests -- confirming
+        # this keeps the fix honest: the corpus grew, not just the allowlist.
+        crates = {c.name: c for c in iter_crates(REPO)}
+        self.assertIn("graphlib_rust", crates)
+        self.assertIn("ordered_hashmap", crates)
+        self.assertFalse(src_has_tests(crates["graphlib_rust"].manifest.parent))
+        self.assertFalse(src_has_tests(crates["ordered_hashmap"].manifest.parent))
 
 
 class Main(unittest.TestCase):
