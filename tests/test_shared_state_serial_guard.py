@@ -112,6 +112,48 @@ class RegistryDiscovery(unittest.TestCase):
         self.assertEqual(items, [])
         self.assertEqual(len(errors), 1)
 
+    def test_multiline_static_initializer_does_not_end_the_block(self):
+        # rustfmt wraps `= make();` onto the next line. That continuation is
+        # neither STATIC_DECL nor SKIPPABLE_LINE; treating it as the block
+        # boundary would drop every later static (#516 review).
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static B: T =
+                make();
+            static C: T = make();
+            """
+        )
+        items, errors = guard.find_registry([(Path("f.rs"), text)])
+        self.assertEqual(errors, [])
+        self.assertEqual(items[0].identifiers, ("B", "C"))
+
+    def test_marker_inside_a_raw_string_is_not_a_registry_entry(self):
+        text = src(
+            '''\
+            const SRC: &str = r#"
+            // SERIAL-GROUP: fake_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            "#;
+            '''
+        )
+        items, errors = guard.find_registry([(Path("f.rs"), text)])
+        self.assertEqual(errors, [])
+        self.assertEqual(items, [])
+
+    def test_marker_inside_a_block_comment_is_not_a_registry_entry(self):
+        text = src(
+            """\
+            /*
+            // SERIAL-GROUP: fake_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            */
+            """
+        )
+        items, errors = guard.find_registry([(Path("f.rs"), text)])
+        self.assertEqual(errors, [])
+        self.assertEqual(items, [])
+
     def test_second_group_after_unrelated_code_is_separate(self):
         text = src(
             """\

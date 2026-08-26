@@ -687,6 +687,73 @@ class SharedItem:
     line: int
 
 
+def _keep_only_line_comments(source: str) -> str:
+    """Blank strings and block comments; keep `//` line comments and newlines.
+
+    `REGISTRY_MARKER` is line-anchored, so a raw string or `/* */` that
+    contains an exact `// SERIAL-GROUP:` line would otherwise register as
+    a real group (#516 review). Length and newlines are preserved so
+    `_line()` offsets still match the original source.
+    """
+    chars = list(source)
+    i = 0
+    n = len(source)
+
+    def blank(start: int, end: int) -> None:
+        for j in range(start, min(end, n)):
+            if chars[j] != "\n":
+                chars[j] = " "
+
+    while i < n:
+        raw_end = _skip_raw_string(source, i)
+        if raw_end is not None:
+            blank(i, raw_end)
+            i = raw_end
+            continue
+        if source[i] == '"':
+            end = _skip_quoted(source, i, '"')
+            blank(i, end)
+            i = end
+            continue
+        char_end = _skip_char_literal(source, i)
+        if char_end is not None:
+            blank(i, char_end)
+            i = char_end
+            continue
+        if source.startswith("/*", i):
+            end = _skip_comment(source, i) or n
+            blank(i, end)
+            i = end
+            continue
+        if source.startswith("//", i):
+            end = source.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        i += 1
+    return "".join(chars)
+
+
+def _consume_static_decl(lines: list[str], start: int) -> tuple[str | None, int]:
+    """Read one `static NAME: ...;` possibly split across rustfmt lines.
+
+    Returns `(name, index_after_decl)`. `name` is None when `lines[start]`
+    is not a static declaration.
+    """
+    if start >= len(lines):
+        return None, start
+    decl = STATIC_DECL.match(lines[start])
+    if not decl:
+        return None, start
+    i = start
+    while i < len(lines) and ";" not in lines[i]:
+        i += 1
+    if i < len(lines):
+        i += 1
+    else:
+        i = start + 1
+    return decl.group("name"), i
+
+
 def find_registry(sources: list[tuple[Path, str]]) -> tuple[list[SharedItem], list[str]]:
     """Every `SERIAL-GROUP` marker, and its claimed `static` block.
 
@@ -698,17 +765,21 @@ def find_registry(sources: list[tuple[Path, str]]) -> tuple[list[SharedItem], li
     items: list[SharedItem] = []
     errors: list[str] = []
     for rel, raw in sources:
-        for match in REGISTRY_MARKER.finditer(raw):
+        searchable = _keep_only_line_comments(raw)
+        for match in REGISTRY_MARKER.finditer(searchable):
             key = match.group("key")
             line = _line(raw, match.start())
             rest = raw[match.end() :].splitlines(keepends=True)
             identifiers: list[str] = []
-            for line_text in rest:
-                decl = STATIC_DECL.match(line_text)
-                if decl:
-                    identifiers.append(decl.group("name"))
+            i = 0
+            while i < len(rest):
+                name, next_i = _consume_static_decl(rest, i)
+                if name is not None:
+                    identifiers.append(name)
+                    i = next_i
                     continue
-                if SKIPPABLE_LINE.match(line_text):
+                if SKIPPABLE_LINE.match(rest[i]):
+                    i += 1
                     continue
                 break
             if not identifiers:
