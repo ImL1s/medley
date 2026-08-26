@@ -301,8 +301,10 @@ Scope is the fork hot path (not full workspace):
     crates are recorded by `check_unlinted_crates.py`; triaging them is
     #457. Test coverage and lint coverage are answered by different lists:
     `xai-grok-workspace` is named by dozens of `run_nonzero` test filters
-    *and* by a clippy `--manifest-path` of its own; `xai-grok-config` is
-    named by neither in the same way.
+    *and* by a clippy `--manifest-path` of its own. `xai-grok-config` is
+    named by the test list (`display::`, `validation::`, `state_home::`)
+    but still has no clippy `--manifest-path` of its own — only that
+    transitive `lib` reach from shell.
   - **`required-features` targets used to be skipped silently.**
     `--all-targets` omits them with no error and no warning, so the six
     `[[test]]` targets in `xai-grok-shell` gated on `test-support` — the
