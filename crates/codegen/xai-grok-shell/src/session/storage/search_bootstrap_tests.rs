@@ -526,7 +526,7 @@ fn test_upsert_doc_converges_under_every_interleaving_of_two_streams() {
 
         let mut a_rev = 0usize;
         let mut b_rev = 0usize;
-        let mut last_label = String::new();
+        let mut last = stream_doc(SESSION_ID, "A", 1);
         for is_a in &pattern {
             let doc = if *is_a {
                 a_rev += 1;
@@ -535,7 +535,7 @@ fn test_upsert_doc_converges_under_every_interleaving_of_two_streams() {
                 b_rev += 1;
                 stream_doc(SESSION_ID, "B", b_rev)
             };
-            last_label = doc.content_hash.clone();
+            last = doc.clone();
             index.upsert_doc(&doc).unwrap();
         }
 
@@ -546,13 +546,11 @@ fn test_upsert_doc_converges_under_every_interleaving_of_two_streams() {
             "pattern {pattern:?}: two overlapping writers must converge on \
              one row per session_id, never a duplicate"
         );
-        let hash = index.get_content_hash(SESSION_ID).unwrap();
         assert_eq!(
-            hash.as_deref(),
-            Some(last_label.as_str()),
-            "pattern {pattern:?}: the surviving row must be whichever write \
-             was last in this interleaving, regardless of which stream it \
-             came from"
+            index.get_doc(SESSION_ID).unwrap().as_ref(),
+            Some(&last),
+            "pattern {pattern:?}: every stored column must match the last \
+             write, not just content_hash"
         );
     }
 }
@@ -683,12 +681,84 @@ async fn test_claim_lost_flag_skips_every_session_write() {
     );
 }
 
+/// #498 review: `claim_lost` true from the start cannot tell a per-session
+/// check from a single check hoisted to `reindex_all` entry. Flip the flag
+/// only after the first session has entered that check, then require later
+/// sessions to observe the takeover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(search_cache_epoch)]
+async fn test_claim_lost_flag_is_checked_again_after_reindex_starts() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let storage = JsonlStorageAdapter::with_root(root.clone());
+    for id in ["s1", "s2", "s3"] {
+        let info = Info {
+            id: acp::SessionId::new(id),
+            cwd: "/ws".to_string(),
+        };
+        storage
+            .init_session(&info, acp::ModelId::new("test"))
+            .await
+            .unwrap();
+    }
+
+    let token = ClaimToken::new();
+    let now = chrono::Utc::now().timestamp();
+    let db_path = search_db_path(&root);
+    with_search_index(&db_path, |index| {
+        index.try_claim_bootstrap(now, TEST_TIMING.lease, token.as_str())
+    })
+    .unwrap();
+
+    let progress = Arc::new(BootstrapProgress::default());
+    let claim_lost = Arc::new(AtomicBool::new(false));
+    let first = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let released = Arc::new(AtomicBool::new(false));
+    let lost_for_hook = Arc::clone(&claim_lost);
+    let first_for_hook = Arc::clone(&first);
+    let started_for_hook = Arc::clone(&started);
+    let released_for_hook = Arc::clone(&released);
+    *progress.session_claim_check.lock().expect("hook mutex") = Some(Arc::new(move || {
+        if !first_for_hook.swap(true, Ordering::SeqCst) {
+            started_for_hook.notify_one();
+            return false;
+        }
+        while !released_for_hook.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        lost_for_hook.load(Ordering::Acquire)
+    }));
+
+    let progress_task = Arc::clone(&progress);
+    let lost_task = Arc::clone(&claim_lost);
+    let root_task = root.clone();
+    let join = tokio::spawn(async move {
+        reindex_all(&root_task, &storage, &progress_task, &token, lost_task).await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("per-session claim_lost check never ran");
+    claim_lost.store(true, Ordering::Release);
+    released.store(true, Ordering::Release);
+
+    join.await.unwrap().unwrap();
+    assert!(
+        progress.indexed.load(Ordering::Relaxed) < 3,
+        "a takeover after the first per-session check must stop later sessions, \
+         got indexed={}",
+        progress.indexed.load(Ordering::Relaxed)
+    );
+}
+
 /// Control for the test above: with `claim_lost` false, the *same* sessions
 /// must actually get indexed and the marker written. Without this pairing,
 /// the previous test would pass just as well against a `reindex_all` that
 /// never indexes anything regardless of `claim_lost` -- proving nothing
 /// about the flag specifically.
 #[tokio::test]
+#[serial(search_cache_epoch)]
 async fn test_claim_lost_false_control_indexes_normally() {
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();

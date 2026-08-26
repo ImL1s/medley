@@ -51,7 +51,7 @@ fn claim_stamp(now_unix: i64, token: &str) -> String {
 }
 
 /// A document to be indexed for session search.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDoc {
     pub session_id: String,
     pub cwd: String,
@@ -331,6 +331,31 @@ impl SessionSearchIndex {
                 "SELECT content_hash FROM session_docs WHERE session_id = ?1",
                 params![session_id],
                 |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Read every stored column for a session document, if any.
+    ///
+    /// `get_content_hash` is the production skip-check; tests that claim
+    /// `upsert_doc` writes a complete row must read the rest of the
+    /// columns too (#498 review).
+    pub fn get_doc(&self, session_id: &str) -> Result<Option<SessionDoc>, rusqlite::Error> {
+        self.db
+            .query_row(
+                "SELECT session_id, cwd, updated_at, title, content, content_hash
+                 FROM session_docs WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(SessionDoc {
+                        session_id: row.get(0)?,
+                        cwd: row.get(1)?,
+                        updated_at_unix: row.get(2)?,
+                        title: row.get(3)?,
+                        content: row.get(4)?,
+                        content_hash: row.get(5)?,
+                    })
+                },
             )
             .optional()
     }
