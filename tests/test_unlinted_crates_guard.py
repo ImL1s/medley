@@ -34,6 +34,7 @@ from check_unlinted_crates import (  # noqa: E402
     main,
     package_name,
     workspace_member_dirs,
+    _workflow_shell_line,
 )
 
 CLIPPY = "cargo clippy --manifest-path crates/{d}/Cargo.toml --all-targets -- -D warnings"
@@ -218,6 +219,17 @@ class LintedTokens(unittest.TestCase):
         text = "      - run: " + CLIPPY.format(d="xai-grok-shell") + "\n"
         self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
 
+    def test_counts_a_quoted_inline_yaml_run_invocation(self):
+        # GHA strips YAML quotes before the shell sees the value. `shlex`
+        # on the raw line would treat `'cargo clippy ...'` as one token
+        # (#508 review).
+        text = "      - run: '" + CLIPPY.format(d="xai-grok-shell") + "'\n"
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+    def test_counts_a_double_quoted_inline_yaml_run_invocation(self):
+        text = '      - run: "' + CLIPPY.format(d="xai-grok-shell") + '"\n'
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
     def test_counts_a_package_flag_invocation(self):
         text = _workflow(
             "cargo clippy -p xai-grok-shell --all-targets -- -D warnings"
@@ -257,8 +269,9 @@ def _independent_linted_crates(workflow_text: str) -> set[str]:
     for line in joined.splitlines():
         if any(op in line for op in (";", "&", "|")):
             continue
+        shell = _workflow_shell_line(line)
         try:
-            tokens = shlex.split(line)
+            tokens = shlex.split(shell)
         except ValueError:
             continue
         i = 0
@@ -299,6 +312,10 @@ class IndependentLintedOracle(unittest.TestCase):
 
     def test_counts_an_inline_yaml_run_invocation(self):
         text = "      - run: " + CLIPPY.format(d="xai-grok-shell") + "\n"
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+    def test_counts_a_quoted_inline_yaml_run_invocation(self):
+        text = "      - run: '" + CLIPPY.format(d="xai-grok-shell") + "'\n"
         self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
 
 

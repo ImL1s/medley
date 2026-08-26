@@ -54,6 +54,7 @@ _QUOTED = re.compile(r"""["']([^"']+)["']""")
 _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
 _P_FLAG = re.compile(r"(?:^|[\s\\])(?:-p|--package)\s+([A-Za-z0-9][A-Za-z0-9_-]*)")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_YAML_RUN = re.compile(r"^-\s+run:\s+(.*)$")
 
 # A crate the workspace declares but whose manifest cannot be read is a bug in
 # this script or a broken tree, never a silent pass.
@@ -202,34 +203,62 @@ def linted_invocation_tokens(workflow_text: str) -> LintedInvocationTokens:
 
     `"cargo clippy" in line` is not enough: `echo cargo clippy ...`
     contains those words and never lints. After comment-stripping and
-    continuation-joining, the line is `shlex`-split and `cargo`/`clippy`
-    must occupy the command position (after optional `NAME=value`
-    assignments). A diagnostic print of the command must not count as a
-    deny-level invocation (#508 review).
+    continuation-joining, a single-line GitHub Actions `- run:` is reduced
+    to the command GitHub actually execs (YAML quoting stripped -- a quoted
+    `'cargo clippy ...'` is one YAML scalar whose quotes never reach argv)
+    and then `shlex`-split so `cargo`/`clippy` occupy the command position
+    (after optional `NAME=value` assignments). A diagnostic print of the
+    command must not count as a deny-level invocation (#508 review).
     """
     commentless = _strip_shell_comments(workflow_text)
     joined = re.sub(r"\\\s*\n\s*", " ", commentless)
     manifest_dirs: set[str] = set()
     package_names: set[str] = set()
     for line in joined.splitlines():
-        if "--all-targets" not in line or "-D warnings" not in line:
+        shell = _workflow_shell_line(line)
+        if "--all-targets" not in shell or "-D warnings" not in shell:
             continue
-        if any(op in line for op in (";", "&", "|")):
+        if any(op in shell for op in (";", "&", "|")):
             continue
         try:
-            tokens = shlex.split(line)
+            tokens = shlex.split(shell)
         except ValueError:
             continue
         if not _is_cargo_clippy_argv(tokens):
             continue
-        for raw in _MANIFEST.findall(line):
+        for raw in _MANIFEST.findall(shell):
             parent = Path(raw.strip().strip("'\"")).parent.name
             if parent:
                 manifest_dirs.add(parent)
-        package_names.update(_P_FLAG.findall(line))
+        package_names.update(_P_FLAG.findall(shell))
     return LintedInvocationTokens(
         manifest_dirs=frozenset(manifest_dirs), package_names=frozenset(package_names)
     )
+
+
+def _unquote_yaml_flow_scalar(value: str) -> str:
+    """Strip YAML quoting Actions applies before the shell sees `run:`.
+
+    A quoted `- run: 'cargo clippy ...'` is one YAML scalar. `shlex.split`
+    on the raw line then yields a single token for the whole command, so
+    `cargo` never occupies the command position and a real deny-level
+    invocation is missed (#508 review).
+    """
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        inner = value[1:-1]
+        return inner.replace(r"\\", "\0").replace(r"\"", '"').replace("\0", "\\")
+    return value
+
+
+def _workflow_shell_line(line: str) -> str:
+    """The command a GHA `- run:` scalar actually execs, else the line as-is."""
+    match = _YAML_RUN.match(line.lstrip())
+    if match:
+        return _unquote_yaml_flow_scalar(match.group(1))
+    return line
 
 
 def _is_cargo_clippy_argv(tokens: list[str]) -> bool:
