@@ -460,14 +460,10 @@ mod tests {
     /// function's behaviour instead of only checking the side that was
     /// always going to pass.
     ///
-    /// One residual, named rather than hidden: this fixture has its own
-    /// small timing dependency, installing the `SIGTERM` trap shortly after
-    /// exec (see the 250ms head start below). If a signal ever raced that
-    /// install under extreme load, the process would die to the *default*
-    /// SIGTERM instead of forcing the escalation, and this test would pass
-    /// without having exercised the property it names — a coverage gap
-    /// under pathological load, not a source of flakiness, since a fast
-    /// death still leaves `stdout`/`stderr` fully drained either way.
+    /// The fixture waits for an explicit readiness handshake (a file the
+    /// child creates after installing its SIGTERM trap) rather than a
+    /// fixed head start, so a loaded runner cannot SIGTERM the child
+    /// before the trap exists (#501 review).
     #[cfg(unix)]
     #[test]
     fn post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline() {
@@ -558,9 +554,19 @@ mod tests {
         std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
     ) {
         let mut group = xai_tty_utils::ProcessGroup::new().expect("group");
+        let ready_path = std::env::temp_dir().join(format!(
+            "medley-tmux-probe-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&ready_path);
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-            .arg("printf 'ok\\n'; trap '' TERM; sleep 1000")
+            .arg("trap '' TERM; printf 'ok\\n'; : > \"$READY_FILE\"; sleep 1000")
+            .env("READY_FILE", &ready_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -572,11 +578,20 @@ mod tests {
         let stderr = child.stderr.take().expect("stderr piped");
         let stdout_rx = spawn_pipe_drain(stdout, "stdout");
         let stderr_rx = spawn_pipe_drain(stderr, "stderr");
-        // The shell installs its trap shortly after exec; signal before that
-        // and it dies to the default SIGTERM instead of exercising the
-        // escalation these tests need (same reasoning and margin as
-        // `group_that_ignores_sigterm_waits_the_grace_and_is_killed`).
-        std::thread::sleep(Duration::from_millis(250));
+        // Handshake, not a head start: the child creates READY_FILE only
+        // after the SIGTERM trap is installed. Waiting for that file is
+        // what keeps SIGTERM from racing the default disposition under a
+        // loaded Ubuntu runner (#501 review).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = std::fs::remove_file(&ready_path);
+                panic!("fixture never signalled that its SIGTERM trap was installed");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_file(&ready_path);
         (group, child, stdout_rx, stderr_rx)
     }
 
