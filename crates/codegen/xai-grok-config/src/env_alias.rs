@@ -109,8 +109,26 @@ pub fn resolve_env_var(medley_name: &str, grok_name: &str) -> Option<String> {
 
 /// [`resolve_env_var`], parsed the same way [`crate::env_bool`] parses a raw
 /// value (same accepted spellings as [`parse_bool_str`]).
+///
+/// A nonblank but unparseable legacy value (`GROK_TELEMETRY_ENABLED=maybe`)
+/// is not a hit: nothing was honored, so the notice must not claim it was
+/// (#491 review).
 pub fn resolve_env_bool(medley_name: &str, grok_name: &str) -> Option<bool> {
-    resolve_env_var(medley_name, grok_name).and_then(|v| parse_bool_str(&v))
+    resolve_bool_in(
+        nonempty(std::env::var_os(medley_name).as_deref()).and_then(OsStr::to_str),
+        nonempty(std::env::var_os(grok_name).as_deref()).and_then(OsStr::to_str),
+        grok_name,
+    )
+}
+
+fn resolve_bool_in(medley: Option<&str>, grok: Option<&str>, grok_name: &str) -> Option<bool> {
+    if let Some(v) = medley.filter(|s| !s.trim().is_empty()) {
+        return parse_bool_str(v);
+    }
+    let v = grok.filter(|s| !s.trim().is_empty())?;
+    let parsed = parse_bool_str(v)?;
+    record_legacy_hit(grok_name);
+    Some(parsed)
 }
 
 /// [`resolve_env_var`] against an already-collected environment snapshot (a
@@ -254,6 +272,36 @@ mod tests {
         ] {
             assert_eq!(parse_bool_str(raw), expected, "input {raw:?}");
         }
+    }
+
+    #[test]
+    #[serial(legacy_hits)]
+    fn invalid_legacy_bool_is_not_recorded_as_a_hit() {
+        clear_legacy_hits_for_test();
+        assert_eq!(
+            resolve_bool_in(None, Some("maybe"), "GROK_TELEMETRY_ENABLED"),
+            None
+        );
+        assert_eq!(
+            legacy_notice(),
+            None,
+            "an unparseable GROK_* bool must not claim to have been honored"
+        );
+    }
+
+    #[test]
+    #[serial(legacy_hits)]
+    fn valid_legacy_bool_is_recorded_as_a_hit() {
+        clear_legacy_hits_for_test();
+        assert_eq!(
+            resolve_bool_in(None, Some("1"), "GROK_TELEMETRY_ENABLED"),
+            Some(true)
+        );
+        assert!(
+            legacy_notice()
+                .as_deref()
+                .is_some_and(|n| n.contains("GROK_TELEMETRY_ENABLED")),
+        );
     }
 
     // Reaches `LEGACY_HITS` directly: clears it, records through it

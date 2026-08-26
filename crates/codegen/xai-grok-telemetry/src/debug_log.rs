@@ -28,6 +28,7 @@ use xai_grok_config::grok_home;
 /// Which env var requested a single-file debug log (drives filter and diagnostics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DebugSource {
+    MedleyLogFile,
     GrokLogFile,
     GrokDebugLog,
 }
@@ -35,6 +36,7 @@ pub(crate) enum DebugSource {
 impl DebugSource {
     fn label(self) -> &'static str {
         match self {
+            Self::MedleyLogFile => "MEDLEY_LOG_FILE",
             Self::GrokLogFile => "GROK_LOG_FILE",
             Self::GrokDebugLog => "GROK_DEBUG_LOG",
         }
@@ -393,7 +395,7 @@ where
         }
         Some(DebugTarget::SingleFile { path, src }) => {
             let filter = match src {
-                DebugSource::GrokLogFile => default_file_filter(),
+                DebugSource::MedleyLogFile | DebugSource::GrokLogFile => default_file_filter(),
                 DebugSource::GrokDebugLog => firehose_filter(),
             };
             match build_file_layer::<S>(&path, filter) {
@@ -429,12 +431,25 @@ pub(crate) enum DebugTarget {
 ///
 /// Read via `OsStr` (not `str`) so a non-UTF-8 path isn't silently dropped.
 pub(crate) fn resolve_debug_target() -> Option<DebugTarget> {
-    let grok_log_file = xai_grok_config::resolve_env_var_os("MEDLEY_LOG_FILE", "GROK_LOG_FILE");
+    let medley_log_file = std::env::var_os("MEDLEY_LOG_FILE");
+    let grok_log_file = std::env::var_os("GROK_LOG_FILE");
     let grok_debug_log = std::env::var_os("GROK_DEBUG_LOG");
-    resolve_debug_target_inner(
-        grok_log_file.as_deref(),
+    let (log_file, src) = match (
+        medley_log_file.as_deref().filter(|v| !is_blank(v)),
+        grok_log_file.as_deref().filter(|v| !is_blank(v)),
+    ) {
+        (Some(v), _) => (Some(v), DebugSource::MedleyLogFile),
+        (None, Some(v)) => {
+            xai_grok_config::note_legacy_hit("GROK_LOG_FILE");
+            (Some(v), DebugSource::GrokLogFile)
+        }
+        (None, None) => (None, DebugSource::GrokLogFile),
+    };
+    resolve_debug_target_from(
+        log_file,
         grok_debug_log.as_deref(),
         &grok_home().join("debug"),
+        src,
     )
 }
 
@@ -463,12 +478,26 @@ fn resolve_debug_target_inner(
     grok_debug_log: Option<&OsStr>,
     debug_dir: &Path,
 ) -> Option<DebugTarget> {
+    resolve_debug_target_from(
+        grok_log_file,
+        grok_debug_log,
+        debug_dir,
+        DebugSource::GrokLogFile,
+    )
+}
+
+fn resolve_debug_target_from(
+    grok_log_file: Option<&OsStr>,
+    grok_debug_log: Option<&OsStr>,
+    debug_dir: &Path,
+    log_file_src: DebugSource,
+) -> Option<DebugTarget> {
     if let Some(raw) = grok_log_file
         && !is_blank(raw)
     {
         return Some(DebugTarget::SingleFile {
             path: os_path(raw),
-            src: DebugSource::GrokLogFile,
+            src: log_file_src,
         });
     }
     let raw = grok_debug_log?;
@@ -561,8 +590,9 @@ mod tests {
             std::env::remove_var("GROK_LOG_FILE");
         }
         match target {
-            Some(DebugTarget::SingleFile { path, .. }) => {
+            Some(DebugTarget::SingleFile { path, src }) => {
                 assert_eq!(path, std::path::PathBuf::from("/tmp/medley-wins.log"));
+                assert_eq!(src, DebugSource::MedleyLogFile);
             }
             other => panic!("expected a SingleFile target, got {other:?}"),
         }
@@ -579,8 +609,9 @@ mod tests {
         let target = resolve_debug_target();
         unsafe { std::env::remove_var("GROK_LOG_FILE") };
         match target {
-            Some(DebugTarget::SingleFile { path, .. }) => {
+            Some(DebugTarget::SingleFile { path, src }) => {
                 assert_eq!(path, std::path::PathBuf::from("/tmp/grok-still-works.log"));
+                assert_eq!(src, DebugSource::GrokLogFile);
             }
             other => panic!("expected a SingleFile target, got {other:?}"),
         }

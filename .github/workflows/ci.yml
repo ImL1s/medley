@@ -1418,7 +1418,7 @@ jobs:
           # `env_alias` is the MEDLEY_*-first / GROK_*-fallback precedence
           # core (#426) every other crate's alias tests route through --
           # exactly the kind of shared primitive a sync is most likely to
-          # touch without anyone noticing downstream. 11 tests, all new.
+          # touch without anyone noticing downstream. 13 tests, all new.
           run_nonzero -p xai-grok-config --lib \
             env_alias:: -- --nocapture
           # `xai-grok-config-types` had no filter at all, so every test in it
