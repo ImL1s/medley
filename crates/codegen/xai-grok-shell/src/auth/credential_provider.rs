@@ -531,6 +531,13 @@ pub fn build_default_otel_layer_config() -> xai_grok_telemetry::otel_layer::Otel
         exporter,
     }
 }
+
+/// Shared with `model.rs` early-invalidation tests so they cannot mutate
+/// `GROK_AUTH_EARLY_INVALIDATION_SECS` / `MEDLEY_AUTH_EARLY_INVALIDATION_SECS`
+/// while these tests pin the production default (#491 review).
+#[cfg(test)]
+pub(crate) static EARLY_INVALIDATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,11 +545,7 @@ mod tests {
     use crate::auth::GrokComConfig;
     use crate::auth::manager::AuthManager;
     use chrono::{Duration as ChronoDuration, Utc};
-    use std::sync::Mutex;
     use xai_grok_auth::AuthCredentialProvider;
-    /// Serializes tests that pin `GROK_AUTH_EARLY_INVALIDATION_SECS`, since
-    /// env vars are process-global and parallel tests would race.
-    static EARLY_INVALIDATION_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn storage_operations_map_to_exact_typed_diagnostic_consumers() {
@@ -644,31 +647,41 @@ mod tests {
     }
     /// RAII guard: pins `GROK_AUTH_EARLY_INVALIDATION_SECS` to the production
     /// default (300s) while held, restoring the previous value on drop.
-    /// Acquires `EARLY_INVALIDATION_LOCK` so concurrent test runners can't
-    /// observe a half-mutated env.
+    /// Acquires `EARLY_INVALIDATION_TEST_LOCK` so concurrent test runners
+    /// (including `auth/model.rs`) can't observe a half-mutated env.
     struct EarlyInvalidationGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<String>,
+        previous_grok: Option<String>,
+        previous_medley: Option<String>,
     }
     impl EarlyInvalidationGuard {
         fn pin_to_default() -> Self {
-            let lock = EARLY_INVALIDATION_LOCK
+            let lock = super::EARLY_INVALIDATION_TEST_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let previous = std::env::var("GROK_AUTH_EARLY_INVALIDATION_SECS").ok();
-            unsafe { std::env::set_var("GROK_AUTH_EARLY_INVALIDATION_SECS", "300") };
+            let previous_grok = std::env::var("GROK_AUTH_EARLY_INVALIDATION_SECS").ok();
+            let previous_medley = std::env::var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS").ok();
+            unsafe {
+                std::env::set_var("GROK_AUTH_EARLY_INVALIDATION_SECS", "300");
+                std::env::remove_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS");
+            }
             Self {
                 _lock: lock,
-                previous,
+                previous_grok,
+                previous_medley,
             }
         }
     }
     impl Drop for EarlyInvalidationGuard {
         fn drop(&mut self) {
             unsafe {
-                match self.previous.take() {
+                match self.previous_grok.take() {
                     Some(prev) => std::env::set_var("GROK_AUTH_EARLY_INVALIDATION_SECS", prev),
                     None => std::env::remove_var("GROK_AUTH_EARLY_INVALIDATION_SECS"),
+                }
+                match self.previous_medley.take() {
+                    Some(prev) => std::env::set_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS", prev),
+                    None => std::env::remove_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS"),
                 }
             }
         }

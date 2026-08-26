@@ -3989,6 +3989,20 @@ pub(crate) fn resolve_external_otel_config_with(
                 .get("otel_log_tool_details")
                 .and_then(toml::Value::as_bool),
         });
+    let getenv_aliased = |name: &str| -> Option<String> {
+        if name == xai_grok_telemetry::external::config::ENV_MASTER_SWITCH {
+            match getenv("MEDLEY_EXTERNAL_OTEL") {
+                Some(v) if !v.trim().is_empty() => return Some(v),
+                _ => {}
+            }
+            if let Some(v) = getenv(name).filter(|s| !s.trim().is_empty()) {
+                xai_grok_config::note_legacy_hit("GROK_EXTERNAL_OTEL");
+                return Some(v);
+            }
+            return None;
+        }
+        getenv(name)
+    };
     let req_get =
         |key: &str| -> Option<bool> { requirements?.get("telemetry")?.get(key)?.as_bool() };
     let req_enabled = req_get("otel_enabled");
@@ -4004,7 +4018,7 @@ pub(crate) fn resolve_external_otel_config_with(
         if let Some(v) = pin {
             return Some(if v { "1" } else { "0" }.to_owned());
         }
-        getenv(name)
+        getenv_aliased(name)
     };
     let mut resolved = xai_grok_telemetry::external::ExternalOtelConfig::resolve_with(
         getenv_pinned,
@@ -16212,6 +16226,39 @@ agent_type = "cursor"
                 false,
             )
             .is_some()
+        );
+        // The stream resolver must honor the same MEDLEY_*-first alias as
+        // `external_otel_master_switch_resolved`. A map that only sets
+        // `MEDLEY_EXTERNAL_OTEL` is exactly the "fork env, no GROK_*" case
+        // the alias exists for (#491 review).
+        assert!(
+            resolve_external_otel_config_with(
+                None,
+                None,
+                ext_env(&[
+                    ("MEDLEY_EXTERNAL_OTEL", "1"),
+                    ("OTEL_METRICS_EXPORTER", "otlp"),
+                ]),
+                ext_client(),
+                false,
+            )
+            .is_some(),
+            "MEDLEY_EXTERNAL_OTEL=1 must activate the external stream"
+        );
+        assert!(
+            resolve_external_otel_config_with(
+                None,
+                None,
+                ext_env(&[
+                    ("MEDLEY_EXTERNAL_OTEL", "0"),
+                    ("GROK_EXTERNAL_OTEL", "1"),
+                    ("OTEL_METRICS_EXPORTER", "otlp"),
+                ]),
+                ext_client(),
+                false,
+            )
+            .is_none(),
+            "MEDLEY_EXTERNAL_OTEL=0 must win over GROK_EXTERNAL_OTEL=1 on the stream"
         );
     }
     #[test]

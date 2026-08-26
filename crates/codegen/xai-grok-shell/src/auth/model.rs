@@ -413,8 +413,11 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    #[serial]
+    #[serial(early_invalidation)]
     fn early_invalidation_medley_wins_over_grok() {
+        let _lock = crate::auth::credential_provider::EARLY_INVALIDATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS", "11");
             std::env::set_var("GROK_AUTH_EARLY_INVALIDATION_SECS", "22");
@@ -428,8 +431,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(early_invalidation)]
     fn early_invalidation_grok_still_works_when_medley_unset() {
+        let _lock = crate::auth::credential_provider::EARLY_INVALIDATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS");
             std::env::set_var("GROK_AUTH_EARLY_INVALIDATION_SECS", "22");

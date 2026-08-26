@@ -1289,6 +1289,10 @@ jobs:
             mock_model_emits_explicit_auth_scheme -- --nocapture
           run_nonzero -p xai-grok-pager-pty-harness --lib \
             replacement_models_keep_keyless_loopback_default -- --nocapture
+          # #426: PTY children honor MEDLEY_THEME; the host strip list must
+          # include it or theme=auto PTY tests pick up the runner's theme.
+          run_nonzero -p xai-grok-pager-pty-harness --lib \
+            appearance_env_vars_include_medley_theme -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             unresolved_empty_current_model_uses_live_fail_closed_sampling_config -- --nocapture
           run_nonzero -p xai-grok-tools --lib \

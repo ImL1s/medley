@@ -536,6 +536,7 @@ const CLIPBOARD_SINK_ENV_VARS: &[&str] = &["GROK_OSC52_SINK", "LC_GROK_OSC52_SIN
 const APPEARANCE_ENV_VARS: &[&str] = &[
     "GROK_APPEARANCE",
     "LC_GROK_APPEARANCE",
+    "MEDLEY_THEME",
     "GROK_THEME",
     "LC_GROK_THEME",
     "COLORFGBG",
@@ -947,6 +948,14 @@ mod tests {
     /// `cmd.env` (same `CommandBuilder` map that inherited base-env entries
     /// live in, so `env_remove` takes the identical path) rather than
     /// process-global `set_var` (racy under parallel tests).
+    #[test]
+    fn appearance_env_vars_include_medley_theme() {
+        assert!(
+            APPEARANCE_ENV_VARS.contains(&"MEDLEY_THEME"),
+            "PTY children honor MEDLEY_THEME; leaving it in the host env makes theme=auto non-deterministic (#491 review)"
+        );
+    }
+
     #[test]
     fn apply_child_env_strips_all_host_terminal_markers() {
         let mut cmd = CommandBuilder::new("true");

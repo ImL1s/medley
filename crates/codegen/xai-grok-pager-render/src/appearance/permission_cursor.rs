@@ -81,11 +81,19 @@ impl DefaultSelectedPermission {
     /// [`AlwaysAllowAllSessions`](Self::AlwaysAllowAllSessions), so no `Option`
     /// has to be threaded through callers.
     pub fn from_config_value(s: &str) -> Self {
+        Self::try_from_config_value(s).unwrap_or(Self::AlwaysAllowAllSessions)
+    }
+
+    /// Recognised config/env tokens only. Empty and garbage return `None`
+    /// so the next layer can win — unlike [`from_config_value`], which
+    /// collapses those to the effective default.
+    pub fn try_from_config_value(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "allow_once" => Self::AllowOnce,
-            "allow_command_always" => Self::AllowCommandAlways,
-            "reject" => Self::Reject,
-            _ => Self::AlwaysAllowAllSessions,
+            "allow_once" => Some(Self::AllowOnce),
+            "allow_command_always" => Some(Self::AllowCommandAlways),
+            "reject" => Some(Self::Reject),
+            "always_allow_all_sessions" => Some(Self::AlwaysAllowAllSessions),
+            _ => None,
         }
     }
 
@@ -158,22 +166,31 @@ thread_local! {
 pub fn load_default_selected_permission() -> DefaultSelectedPermission {
     CONFIG_LOADED.with(|loaded| {
         if !loaded.get() {
-            let resolved = xai_grok_config::resolve_env_var(
-                "MEDLEY_DEFAULT_SELECTED_PERMISSION",
-                "GROK_DEFAULT_SELECTED_PERMISSION",
-            )
-            .map(|s| DefaultSelectedPermission::from_config_value(&s))
-            .filter(|p| *p != DefaultSelectedPermission::AlwaysAllowAllSessions)
-            .or_else(|| {
-                load_string_from_effective_config("default_selected_permission")
-                    .map(|s| DefaultSelectedPermission::from_config_value(&s))
-            })
-            .unwrap_or(DefaultSelectedPermission::AlwaysAllowAllSessions);
+            let resolved = resolve_default_selected_permission_from(
+                xai_grok_config::resolve_env_var(
+                    "MEDLEY_DEFAULT_SELECTED_PERMISSION",
+                    "GROK_DEFAULT_SELECTED_PERMISSION",
+                )
+                .as_deref(),
+                load_string_from_effective_config("default_selected_permission").as_deref(),
+            );
             CONFIG_CURRENT.with(|c| c.set(resolved));
             loaded.set(true);
         }
     });
     CONFIG_CURRENT.with(Cell::get)
+}
+
+/// Env, then config, then the effective default. Extracted so the alias
+/// vs. config interaction is unit-testable without mutating process env
+/// or reading `config.toml`.
+fn resolve_default_selected_permission_from(
+    env: Option<&str>,
+    config: Option<&str>,
+) -> DefaultSelectedPermission {
+    env.and_then(DefaultSelectedPermission::try_from_config_value)
+        .or_else(|| config.map(DefaultSelectedPermission::from_config_value))
+        .unwrap_or(DefaultSelectedPermission::AlwaysAllowAllSessions)
 }
 
 /// Replace the cached configured value (optimistic update from the settings
@@ -292,6 +309,26 @@ mod tests {
         assert_eq!(
             DefaultSelectedPermission::from_config_value("bogus"),
             DefaultSelectedPermission::AlwaysAllowAllSessions
+        );
+    }
+
+    #[test]
+    fn explicit_always_allow_env_alias_beats_a_reject_config() {
+        // `from_config_value("always_allow_all_sessions")` is the same
+        // sentinel as "unset / garbage". Filtering that sentinel out of the
+        // env layer lets `[ui].default_selected_permission = reject` win
+        // even when the user explicitly exported the alias (#491 review).
+        assert_eq!(
+            resolve_default_selected_permission_from(
+                Some("always_allow_all_sessions"),
+                Some("reject"),
+            ),
+            DefaultSelectedPermission::AlwaysAllowAllSessions
+        );
+        assert_eq!(
+            resolve_default_selected_permission_from(Some("bogus"), Some("reject")),
+            DefaultSelectedPermission::Reject,
+            "unrecognised env must still fall through to config"
         );
     }
 
