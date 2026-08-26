@@ -3583,6 +3583,37 @@ impl SessionIdLock {
     }
 }
 
+/// #462/#463: `close(2)` -- what dropping `namespace`/`mutation` would do on
+/// its own -- releases a `flock(2)` lease only when the last descriptor on
+/// its open file description closes. A forked child inherits a duplicate of
+/// that description for the whole fork-to-exec window (`O_CLOEXEC` prunes
+/// it only *at* `execve`, not before), so a concurrent spawn elsewhere in
+/// the process can keep a lease alive past this guard's drop.
+/// `flock(fd, LOCK_UN)` releases the lease on the description itself,
+/// immediately, regardless of how many descriptors still reference it --
+/// the same reason the mid-life transitions above
+/// (`retain_lifetime_shared`,
+/// `transition_exclusive_to_lifetime_shared_with_unlock`) already unlock
+/// explicitly instead of trusting `close` to do it. This extends that same
+/// pattern to the one path that was missing it: final drop.
+impl Drop for SessionIdLock {
+    fn drop(&mut self) {
+        // Best-effort: a failed unlock here must not panic -- `Drop` also
+        // runs during unwinding, where a panic would abort the process --
+        // and the fds are about to close either way.
+        if let Some(namespace) = self.namespace.as_ref()
+            && let Err(error) = FileExt::unlock(namespace)
+        {
+            tracing::warn!(%error, "failed to unlock session-id namespace lease on drop");
+        }
+        if let Some(mutation) = self.mutation.as_ref()
+            && let Err(error) = FileExt::unlock(mutation)
+        {
+            tracing::warn!(%error, "failed to unlock session-id mutation lease on drop");
+        }
+    }
+}
+
 /// A published session resolved while holding its per-id shared visibility lock.
 ///
 /// Keep this value alive for the entire filesystem read.  Resolving a path and
@@ -7685,6 +7716,138 @@ mod fresh_session_claim_tests {
             try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
                 .expect("try writer after retained claim drops")
                 .is_some()
+        );
+    }
+
+    /// Proves the mechanism behind #462/#463 deterministically. Does **not**
+    /// prove it is what produced #462's flake rate -- see the gap below.
+    ///
+    /// `fork(2)` duplicates the open file description a flock lease attaches
+    /// to; `close()` -- what `drop(File)` does on its own -- releases the
+    /// parent's reference but not a forked child's copy, so the lease
+    /// outlives its guard for as long as that child has not exec'd or
+    /// exited. This test holds a child there indefinitely (via a pipe
+    /// handshake, see below) and shows the guard's drop does not free the
+    /// lease without the `Drop` impl above, and does with it.
+    ///
+    /// **What this does not demonstrate:** two sibling tests --
+    /// `failed_lease_downgrade_keeps_namespace_exclusive_until_claim_drop`
+    /// and `failed_namespace_unlock_keeps_namespace_exclusive_until_claim_drop`
+    /// (#462) -- flake on the same kind of post-drop `is_some()` assert,
+    /// only under the module filter, at a measured 3 failures in 28 runs.
+    /// This test's child never execs -- it is deliberately parked forever, short
+    /// of `exec`, to make the window unconditional. Production's child
+    /// (`spawn_claim_child`, real subprocess spawns, and `git`/`jj` per
+    /// #463) execs promptly, and the fds in question are opened with
+    /// `O_CLOEXEC` (confirmed via `fcntl(F_GETFD)` against both lock-file
+    /// stacks), which prunes the inherited descriptor *at* `execve` -- so
+    /// production's exposure, if this is what causes it, is the much
+    /// narrower fork-to-exec span, not "until the child exits." Whether that
+    /// microsecond-scale span, widened by scheduler pressure under a loaded
+    /// test run with many concurrent spawns, is sufficient to produce a
+    /// 3-in-28 rate remains unmeasured. #462's flake did not reproduce at
+    /// all in a same-day check on unmodified `providers` (0 failures in 28
+    /// runs), so there was no live baseline to test a fix against here.
+    /// This `Drop` is still the correct thing to add: it closes a real gap
+    /// (`SessionIdLock` had no `Drop` at all, unlike its own mid-life
+    /// transitions below, which already unlock explicitly for the identical
+    /// reason), it cannot make anything *more* likely to contend, and this
+    /// test is the deterministic proof the mechanism it targets is real --
+    /// just not proof of the historical rate.
+    ///
+    /// Two earlier versions of this test tried to widen the window with a
+    /// timing guess (a `pre_exec` sleep, first via `std::thread::sleep` --
+    /// forbidden between `fork` and `exec` by `CommandExt::pre_exec`'s own
+    /// contract, since std machinery is not guaranteed safe against a
+    /// forked child's corrupted post-fork state -- then via `libc::usleep`,
+    /// which is a raw syscall but still just a guess against host
+    /// scheduling). Both let the child finish and exit before the check on
+    /// a loaded host, passing for the wrong reason: the assertion held
+    /// because there was nothing left to contend, not because the `Drop`
+    /// released anything. This version uses a `fork(2)`/pipe handshake
+    /// instead of a guess: the child is provably alive and un-exec'd at the
+    /// moment of the check, on any host, under any load, because it is
+    /// blocked on a `read()` the parent controls.
+    #[cfg(unix)]
+    #[test]
+    fn session_id_lock_drop_releases_lease_still_held_by_a_forked_child() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000154";
+        const CWD: &str = "/repo/publication/fork-window-release";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let claim = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CWD, SESSION_ID),
+        )
+        .expect("fresh claim");
+
+        // `ready` lets the child tell the parent it has forked (so holds a
+        // duplicate of the still-open, still-locked lease fds) and has not
+        // called `exec`. `release` then holds it there, deliberately
+        // un-exec'd, until the parent has made its check.
+        let mut ready = [-1i32; 2];
+        let mut release = [-1i32; 2];
+        // SAFETY: `pipe` writes two valid fds into the given 2-element
+        // array; it has no other preconditions.
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "pipe(ready)");
+        assert_eq!(
+            unsafe { libc::pipe(release.as_mut_ptr()) },
+            0,
+            "pipe(release)"
+        );
+        let [ready_r, ready_w] = ready;
+        let [release_r, release_w] = release;
+
+        // SAFETY: `fork` itself has no preconditions. The child branch below
+        // (and only that branch) runs between fork and its own exit; it
+        // calls nothing but async-signal-safe libc functions (`close`,
+        // `write`, `read`, `_exit`) -- no allocation, no std locks, no
+        // panicking -- which is the contract a forked child must honor, and
+        // it never falls through to any code written for the parent.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                libc::close(ready_r);
+                libc::close(release_w);
+                let byte: u8 = 1;
+                libc::write(ready_w, (&raw const byte).cast(), 1);
+                let mut ack: u8 = 0;
+                libc::read(release_r, (&raw mut ack).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        assert!(pid > 0, "fork failed: {}", io::Error::last_os_error());
+
+        // Parent: wait for the child's ready handshake before touching the
+        // claim, so the drop below is guaranteed to race nothing.
+        unsafe {
+            libc::close(ready_w);
+            libc::close(release_r);
+        }
+        let mut ack: u8 = 0;
+        let read = unsafe { libc::read(ready_r, (&raw mut ack).cast(), 1) };
+        assert_eq!(read, 1, "child ready handshake");
+        unsafe { libc::close(ready_r) };
+
+        drop(claim);
+
+        let result = try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+            .expect("try writer immediately after claim drop");
+
+        // Release and reap the child before asserting, so a failure here
+        // does not leak a stuck process.
+        unsafe {
+            let byte: u8 = 1;
+            libc::write(release_w, (&raw const byte).cast(), 1);
+            libc::close(release_w);
+        }
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        assert!(
+            result.is_some(),
+            "namespace lease must not survive its guard's drop just because a forked \
+             child has not exec'd yet"
         );
     }
 
