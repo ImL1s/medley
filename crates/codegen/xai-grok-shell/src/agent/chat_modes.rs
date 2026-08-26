@@ -7,6 +7,8 @@ use crate::remote::chat_models_client::{
     ChatModelsClient, ChatModelsError, ListModesResponse, Mode,
 };
 use agent_client_protocol as acp;
+#[cfg(test)]
+use parking_lot::Mutex as TestMutex;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,33 +25,35 @@ pub const GROK_CHAT_MODE_ENV: &str = "GROK_CHAT_MODE";
 pub fn process_chat_mode_enabled() -> bool {
     false
 }
-/// Whether a [`ChatModesManager::model_state_with_authority`] snapshot
-/// represents a real `/rest/modes` answer or the absence of one (#483
-/// review finding).
+/// Whether a [`ChatModesManager::model_state_with_authority`] snapshot is
+/// **fresh enough to justify rejecting a request**, not merely whether a
+/// response object exists (#483 review, rounds 2 and 3).
 ///
-/// A raw [`acp::SessionModelState`] with `available_models.is_empty()` is
-/// ambiguous on its own: it could mean the server authoritatively reported
-/// zero currently-available modes (e.g. every mode requires an upgrade —
-/// [`modes_to_model_state`]'s filter genuinely produces this from a
-/// well-formed response, it is not hypothetical), or it could mean no real
-/// answer was ever obtained at all (unauthenticated, a fetch failure with
-/// nothing cached, auth changing mid-fetch, or a degenerate all-empty
-/// response). Those two facts warrant different handling — the first is
-/// "this id is not available", the second is "we cannot evaluate this id"
-/// — so this type keeps them apart instead of collapsing both into the
-/// same empty [`acp::SessionModelState`] the way returning one bare value
-/// would.
+/// The axis is deliberately about consequence, not presence: refusing to
+/// spawn a chat session is hard to undo; reporting a possibly-stale model
+/// name for display is not. Measured against the actual fetch/cache logic
+/// in [`ChatModesManager::model_state_with_authority`], there are four
+/// distinct source states — fresh-non-empty, fresh-empty, stale, and
+/// no-data-at-all — and the first two are `Authoritative` while the last
+/// two are `NoInfo`, because staleness carries the same "cannot justify a
+/// reject" risk as having nothing at all (entitlement can change in either
+/// direction since a stale fetch). See that method's doc for the full
+/// mapping table and why two earlier attempts at this split each got one
+/// of these four cells wrong.
 #[derive(Debug, Clone)]
 pub(crate) enum ChatModelCatalog {
-    /// Built from a real `/rest/modes` response — fresh, or served from a
-    /// cache that itself came from a real response (including a stale one
-    /// while a background refresh is in flight). `available_models` may
-    /// still be empty; that is a real, authoritative answer in that case,
-    /// not missing information.
+    /// A fresh (non-stale), successful `/rest/modes` response.
+    /// `available_models` may still be empty — every mode currently
+    /// requiring an upgrade, or the server itself returning zero modes, are
+    /// both real, authoritative answers, not missing information.
     Authoritative(acp::SessionModelState),
-    /// No real `/rest/modes` response was ever obtained. `available_models`
-    /// is always empty here and the emptiness carries no information about
-    /// the user's actual chat modes.
+    /// Not fresh enough to reject a request on: no response was ever
+    /// obtained (unauthenticated, auth changed mid-fetch, a fetch failure
+    /// with nothing cached), **or** the response held is stale (serving
+    /// cached data while a background refresh runs, or cached data used
+    /// after a failed live fetch). The carried state may still be
+    /// non-empty in the stale sub-case — display tolerates staleness even
+    /// though eligibility decisions must not rely on it.
     NoInfo(acp::SessionModelState),
 }
 impl ChatModelCatalog {
@@ -81,6 +85,14 @@ struct Inner {
     cache: RwLock<Option<CachedModes>>,
     /// Single-flight guard so concurrent fetches coalesce.
     fetch_lock: tokio::sync::Mutex<()>,
+    /// Test-only network seam (#483 review, round 3): there is no mockable
+    /// `ChatModelsClient`, so this is the only way to deterministically
+    /// drive [`ChatModesManager::fetch`]'s `Ok`/`Err` outcomes -- in
+    /// particular `Ok` with an empty `modes` list, the exact shape the
+    /// round-3 review found mistagged. Consumed once (`.take()`) so a test
+    /// controls exactly one fetch.
+    #[cfg(test)]
+    fetch_override: TestMutex<Option<Result<ListModesResponse, ChatModelsError>>>,
 }
 impl ChatModesManager {
     pub(crate) fn new(auth: Arc<AuthManager>) -> Self {
@@ -89,8 +101,19 @@ impl ChatModesManager {
                 auth,
                 cache: RwLock::new(None),
                 fetch_lock: tokio::sync::Mutex::new(()),
+                #[cfg(test)]
+                fetch_override: TestMutex::new(None),
             }),
         }
+    }
+    /// Test-only: make the next [`Self::fetch`] call return `value` instead
+    /// of hitting the network. Consumed once.
+    #[cfg(test)]
+    pub(crate) fn set_fetch_override_for_test(
+        &self,
+        value: Result<ListModesResponse, ChatModelsError>,
+    ) {
+        *self.inner.fetch_override.lock() = Some(value);
     }
     /// The active grok.com identity, or `None` when unauthenticated. Modes are
     /// per-identity (tier/ACL), so every cache key and store is gated on it.
@@ -111,13 +134,35 @@ impl ChatModesManager {
     /// Same as [`Self::model_state`], but keeps the fact of *how* the
     /// returned state was produced instead of discarding it.
     ///
-    /// A response with zero `available_models` is ambiguous by itself: it
-    /// could mean "the server authoritatively says every mode currently
-    /// requires an upgrade" (a real answer a caller may need to act on) or
-    /// "we have no server answer at all" (unauthenticated, a fetch failure
-    /// with nothing cached, or a malformed empty response) — a caller with
-    /// nothing to validate against. Every return point below is tagged with
-    /// which one it is; see [`ChatModelCatalog`].
+    /// The axis this method actually distinguishes is not "did we get a
+    /// response" but **"is this fresh enough to justify rejecting a
+    /// request"** — because that is the asymmetry that matters: refusing to
+    /// spawn a session is a consequential, hard-to-undo action; reporting a
+    /// possibly-stale model name for display is not (#483 review, round 3).
+    /// Measured against the actual fetch/cache logic below, there are four
+    /// distinct states, not two, and they do not all resolve the same way:
+    ///
+    /// | State | `available_models` | Fresh confirmation? | Tag |
+    /// |---|---|---|---|
+    /// | Fresh, non-empty | non-empty | yes | `Authoritative` |
+    /// | Fresh, empty (every mode requires upgrade, or the server itself returned zero modes) | empty | yes | `Authoritative` |
+    /// | Stale (serving cached data while a background refresh runs, or after a fetch failure) | whatever the cache holds | **no** | `NoInfo` (data still returned for display) |
+    /// | No data at all (unauthenticated, auth changed mid-fetch, fetch failed with nothing cached) | empty | no | `NoInfo` |
+    ///
+    /// Two rows collapse to `NoInfo` for the same underlying reason:
+    /// entitlement can change in *either* direction since a stale fetch —
+    /// access revoked (should now reject, but stale data would still accept)
+    /// or newly granted (would be wrongly rejected on stale data) — so stale
+    /// data is not confident enough to justify rejection either way, exactly
+    /// like having no data. It is still returned (not discarded) because
+    /// display tolerates staleness the way it already tolerates an
+    /// out-of-catalog id (see [`chat_new_session_model_state`]'s "picker may
+    /// diverge from catalog" comment).
+    ///
+    /// The two rows that collapsed the *other* way in an earlier version of
+    /// this method — "the server returned zero modes" was `NoInfo`, "stale
+    /// cache" was `Authoritative` — were both wrong, caught across two
+    /// separate review rounds. See [`ChatModelCatalog`].
     pub(crate) async fn model_state_with_authority(&self) -> ChatModelCatalog {
         let Some(user_id) = self.current_user_id() else {
             return ChatModelCatalog::NoInfo(empty_state());
@@ -132,10 +177,14 @@ impl ChatModesManager {
                 if c.fetched_at.elapsed() < CACHE_TTL {
                     return ChatModelCatalog::Authoritative(modes_to_model_state(&c.response));
                 }
+                // Stale: real data, but not fresh enough to reject a
+                // request on (see the table above). Serve it for display
+                // and let the caller trust the request; refresh in the
+                // background so the *next* request gets a fresh answer.
                 let stale = c.response.clone();
                 drop(guard);
                 self.spawn_refresh(user_id, locale);
-                return ChatModelCatalog::Authoritative(modes_to_model_state(&stale));
+                return ChatModelCatalog::NoInfo(modes_to_model_state(&stale));
             }
         }
         let _flight = self.inner.fetch_lock.lock().await;
@@ -150,7 +199,7 @@ impl ChatModesManager {
             }
         }
         match self.fetch(locale).await {
-            Ok(resp) if !resp.modes.is_empty() => {
+            Ok(resp) => {
                 if self.current_user_id().as_deref() != Some(user_id.as_str()) {
                     return ChatModelCatalog::NoInfo(empty_state());
                 }
@@ -158,25 +207,32 @@ impl ChatModesManager {
                 if mapped.available_models.is_empty() {
                     tracing::warn!(
                         raw_modes = resp.modes.len(),
-                        "chat modes: fetch returned modes but none selectable after availability filter"
+                        "chat modes: authoritative fetch produced zero available modes \
+                         (either the server returned none, or none passed the availability filter)"
                     );
                 }
+                // A fresh, successful, non-stale response is authoritative
+                // regardless of whether its emptiness came from the raw
+                // `resp.modes` list itself being empty or from every mode
+                // failing the availability filter: both mean the same real
+                // thing (this authenticated user currently has zero usable
+                // chat modes), so both get to say `Unavailable` for a
+                // requested id rather than being silently trusted through.
+                // Cached either way -- caching behavior itself is unchanged
+                // by this fix, only the authority tag is.
                 self.store(user_id, locale.to_owned(), resp);
                 ChatModelCatalog::Authoritative(mapped)
             }
-            // The server itself returned zero modes (not merely zero
-            // *available* ones) -- a degenerate response shape, not the
-            // well-formed "every mode requires upgrade" answer
-            // `Authoritative` with an empty `available_models` represents.
-            // Treated as no information rather than an authoritative
-            // rejection.
-            Ok(_) => ChatModelCatalog::NoInfo(empty_state()),
             Err(err) => {
                 tracing::warn!(error = %err, "chat modes fetch failed; serving cache/empty");
                 let guard = self.inner.cache.read();
                 match guard.as_ref() {
+                    // Cached data after a failed live fetch carries the
+                    // same staleness risk as the background-refresh case
+                    // above, just reached via a different path -- treated
+                    // the same way: displayable, not authoritative.
                     Some(c) if c.user_id == user_id => {
-                        ChatModelCatalog::Authoritative(modes_to_model_state(&c.response))
+                        ChatModelCatalog::NoInfo(modes_to_model_state(&c.response))
                     }
                     _ => ChatModelCatalog::NoInfo(empty_state()),
                 }
@@ -184,6 +240,10 @@ impl ChatModesManager {
         }
     }
     async fn fetch(&self, locale: &str) -> Result<ListModesResponse, ChatModelsError> {
+        #[cfg(test)]
+        if let Some(overridden) = self.inner.fetch_override.lock().take() {
+            return overridden;
+        }
         let client = ChatModelsClient::new(self.inner.auth.clone());
         match tokio::time::timeout(COLD_FETCH_TIMEOUT, client.list_modes(locale)).await {
             Ok(result) => result,
@@ -223,6 +283,28 @@ impl ChatModesManager {
             return;
         };
         self.spawn_refresh(user_id, DEFAULT_LOCALE);
+    }
+    /// Test-only: seed the cache directly, at a controlled age, without a
+    /// network fetch — the only way to deterministically reach the
+    /// fresh-cache-hit and stale-cache-hit branches of
+    /// [`Self::model_state_with_authority`] (#483 review, round 3). `age`
+    /// is measured against [`CACHE_TTL`]; pass `Duration::ZERO` for fresh,
+    /// anything `>= CACHE_TTL` for stale.
+    #[cfg(test)]
+    pub(crate) fn seed_cache_for_test(
+        &self,
+        user_id: impl Into<String>,
+        age: Duration,
+        response: ListModesResponse,
+    ) {
+        *self.inner.cache.write() = Some(CachedModes {
+            user_id: user_id.into(),
+            locale: DEFAULT_LOCALE.to_owned(),
+            fetched_at: Instant::now()
+                .checked_sub(age)
+                .expect("test age must not underflow Instant"),
+            response,
+        });
     }
 }
 fn empty_state() -> acp::SessionModelState {
@@ -301,6 +383,158 @@ mod tests {
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    /// #483 review, round 3: an authenticated `ChatModesManager` with a
+    /// user_id-matched cache entry seeded directly (no network fetch --
+    /// there is no mock `ChatModelsClient`, and the fresh/stale-cache-hit
+    /// branches don't need one; they're reached identically whether the
+    /// cache was populated by a real fetch or seeded here, since both paths
+    /// converge on the same `Authoritative(modes_to_model_state(&response))`
+    /// / staleness tagging logic this test exercises).
+    fn manager_authenticated_as(user_id: &str) -> ChatModesManager {
+        use crate::auth::GrokAuth;
+        let temp_dir = tempfile::tempdir().expect("temp auth root");
+        let auth = std::sync::Arc::new(crate::auth::AuthManager::new(
+            temp_dir.path(),
+            crate::auth::GrokComConfig::default(),
+        ));
+        auth.hot_swap(GrokAuth {
+            user_id: user_id.to_owned(),
+            ..GrokAuth::test_default()
+        });
+        ChatModesManager::new(auth)
+    }
+
+    /// #483 review, round 3: the four states `model_state_with_authority`
+    /// actually distinguishes, measured against the real fetch/cache logic
+    /// rather than assumed. The two cells that must **not** collapse into
+    /// each other, despite superficially similar data shapes, are the pair
+    /// this round's review caught wrong in two different directions:
+    /// "fresh but empty" (an authoritative zero-modes answer) must be
+    /// `Authoritative`, and "stale but non-empty" (real data, just not
+    /// fresh enough to reject on) must be `NoInfo` -- the opposite of what
+    /// an emptiness-only check would produce for each.
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_state_with_authority_distinguishes_all_four_states() {
+        const USER: &str = "chat-483-round3-user";
+
+        // Fresh, non-empty: no cache, a live fetch (via the test override,
+        // since there is no mockable ChatModelsClient) succeeds with real
+        // modes. Drives the actual `Ok(resp) => {...}` branch in
+        // `model_state_with_authority`, not a cache-hit shortcut.
+        let manager = manager_authenticated_as(USER);
+        manager.set_fetch_override_for_test(Ok(ListModesResponse {
+            modes: vec![available("auto", "Auto")],
+            default_mode_id: "auto".to_owned(),
+        }));
+        match manager.model_state_with_authority().await {
+            ChatModelCatalog::Authoritative(state) => {
+                assert!(
+                    !state.available_models.is_empty(),
+                    "[fresh_non_empty] must carry the real modes"
+                );
+            }
+            other => panic!("[fresh_non_empty] expected Authoritative, got {other:?}"),
+        }
+
+        // Fresh, empty: no cache, a live fetch succeeds but every mode
+        // requires an upgrade -- a real, authoritative "zero available"
+        // answer, not missing information. This is the *exact* code path
+        // Codex's round-3 review flagged (`Ok(_)` with `resp.modes` after
+        // the availability filter producing zero entries) -- must not
+        // collapse into `NoInfo` just because `available_models` is empty.
+        let manager = manager_authenticated_as(USER);
+        manager.set_fetch_override_for_test(Ok(ListModesResponse {
+            modes: vec![requires_upgrade("heavy")],
+            default_mode_id: "heavy".to_owned(),
+        }));
+        match manager.model_state_with_authority().await {
+            ChatModelCatalog::Authoritative(state) => {
+                assert!(
+                    state.available_models.is_empty(),
+                    "[fresh_empty] the fetched response has zero available modes"
+                );
+            }
+            other => panic!("[fresh_empty] expected Authoritative, got {other:?}"),
+        }
+
+        // Fresh, empty (the *other* shape #483 review flagged): the server
+        // itself returns zero modes at all, not merely zero available
+        // ones. Same authoritative answer, same code path, different raw
+        // shape -- must land the same place as the case above.
+        let manager = manager_authenticated_as(USER);
+        manager.set_fetch_override_for_test(Ok(ListModesResponse {
+            modes: Vec::new(),
+            default_mode_id: String::new(),
+        }));
+        match manager.model_state_with_authority().await {
+            ChatModelCatalog::Authoritative(state) => {
+                assert!(
+                    state.available_models.is_empty(),
+                    "[fresh_empty_raw] a zero-mode response is still empty"
+                );
+            }
+            other => panic!("[fresh_empty_raw] expected Authoritative, got {other:?}"),
+        }
+
+        // Stale: a cache entry older than CACHE_TTL, carrying real,
+        // non-empty data. Must NOT collapse into Authoritative just because
+        // it has data -- staleness means entitlement could have changed in
+        // either direction since this response was fetched.
+        let manager = manager_authenticated_as(USER);
+        manager.seed_cache_for_test(
+            USER,
+            CACHE_TTL + Duration::from_secs(1),
+            ListModesResponse {
+                modes: vec![available("auto", "Auto")],
+                default_mode_id: "auto".to_owned(),
+            },
+        );
+        match manager.model_state_with_authority().await {
+            ChatModelCatalog::NoInfo(state) => {
+                assert!(
+                    !state.available_models.is_empty(),
+                    "[stale] must still carry the stale data for display, not discard it"
+                );
+            }
+            other => panic!("[stale] expected NoInfo, got {other:?}"),
+        }
+
+        // No data at all: unauthenticated. Empty, and NoInfo for the same
+        // reason `Unavailable` would be wrong here -- there is nothing to
+        // reject the request against.
+        let temp_dir = tempfile::tempdir().expect("temp auth root");
+        let unauthenticated = ChatModesManager::new(std::sync::Arc::new(
+            crate::auth::AuthManager::new(temp_dir.path(), crate::auth::GrokComConfig::default()),
+        ));
+        match unauthenticated.model_state_with_authority().await {
+            ChatModelCatalog::NoInfo(state) => {
+                assert!(
+                    state.available_models.is_empty(),
+                    "[no_data] unauthenticated must carry nothing"
+                );
+            }
+            other => panic!("[no_data] expected NoInfo, got {other:?}"),
+        }
+
+        // A second flavor of "no data": authenticated, no cache, but the
+        // live fetch itself fails. Same NoInfo(empty) outcome as being
+        // unauthenticated, reached through a different code branch
+        // (`Err(err) => { ... _ => NoInfo(empty_state()) }`).
+        let manager = manager_authenticated_as(USER);
+        manager.set_fetch_override_for_test(Err(
+            crate::remote::chat_models_client::ChatModelsError::Timeout,
+        ));
+        match manager.model_state_with_authority().await {
+            ChatModelCatalog::NoInfo(state) => {
+                assert!(
+                    state.available_models.is_empty(),
+                    "[fetch_failure_no_cache] nothing was ever cached, so there is nothing to fall back to"
+                );
+            }
+            other => panic!("[fetch_failure_no_cache] expected NoInfo, got {other:?}"),
         }
     }
     #[test]

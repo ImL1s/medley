@@ -385,8 +385,9 @@ pub(crate) struct PreparedNewSessionModelPlan {
 /// from `chat_modes::modes_to_model_state`'s filter, not a hypothetical —
 /// is `Unavailable`, because it is a genuine answer about every id, not
 /// missing information. Only [`crate::agent::chat_modes::ChatModelCatalog::NoInfo`]
-/// (no real `/rest/modes` response was ever obtained at all) is
-/// `CatalogUnavailable`. An earlier version of this function read only the
+/// (no response was ever obtained *or* the only response held is stale —
+/// see that type's doc for why staleness gets the same treatment as having
+/// nothing) is `CatalogUnavailable`. An earlier version of this function read only the
 /// raw `available_models` emptiness — which cannot make this distinction,
 /// since both cases produce an empty list — and returned `Eligible` for
 /// *any* empty catalog, authoritative or not, which is the review finding
@@ -407,12 +408,15 @@ pub(crate) enum ChatCustomModelOutcome {
     /// user-facing auto-switch notification (there is nothing named to
     /// report switching away from).
     Unavailable,
-    /// No authoritative `/rest/modes` response exists at all
-    /// (unauthenticated, a fetch failure with nothing cached, or a
-    /// degenerate empty response — see
-    /// [`crate::agent::chat_modes::ChatModelCatalog::NoInfo`]). Distinct
-    /// from `Unavailable`: this says nothing about the requested id
-    /// itself, only that there is nothing to check it against.
+    /// No response fresh enough to reject a request on: no `/rest/modes`
+    /// response exists at all (unauthenticated, auth changed mid-fetch, a
+    /// fetch failure with nothing cached), *or* the only response held is
+    /// stale (serving cached data during a background refresh, or after a
+    /// failed live fetch) — see
+    /// [`crate::agent::chat_modes::ChatModelCatalog::NoInfo`] for why
+    /// staleness gets the same treatment as no data. Distinct from
+    /// `Unavailable`: this says nothing about the requested id itself, only
+    /// that there is nothing confident enough to check it against.
     CatalogUnavailable,
 }
 
@@ -610,16 +614,18 @@ fn chat_custom_model_outcome(
 ///   authoritative catalog that is itself empty (every mode currently
 ///   requires an upgrade), which is a real answer, not missing
 ///   information — see [`crate::agent::chat_modes::ChatModelCatalog`].
-/// - `CatalogUnavailable`: no real `/rest/modes` response exists at all
-///   (unauthenticated, a fetch failure with nothing cached, or a
-///   degenerate empty response). **Trust the request.** This mirrors
+/// - `CatalogUnavailable`: nothing fresh enough to reject on — no
+///   `/rest/modes` response exists at all (unauthenticated, a fetch
+///   failure with nothing cached), *or* the only response held is stale.
+///   **Trust the request.** This mirrors
 ///   [`chat_new_session_model_state`]'s own, separate, display-only
 ///   membership check, which already fails open when it has no catalog to
-///   check against. Rejecting every request whenever no real answer is
-///   available would be exactly as blunt as accepting every request was
-///   before this fix — just wrong in the other direction — so this chooses
-///   the same "no information means nothing to reject against" policy the
-///   codebase already uses next to it, and states it once, by name.
+///   check against. Rejecting every request whenever there is no fresh
+///   answer available would be exactly as blunt as accepting every request
+///   was before this fix — just wrong in the other direction — so this
+///   chooses the same "no confirmed information means nothing to reject
+///   against" policy the codebase already uses next to it, and states it
+///   once, by name.
 fn chat_custom_model_id_after_outcome(
     requested: &str,
     outcome: ChatCustomModelOutcome,
