@@ -116,32 +116,73 @@ def parse_documented_hot_path(text: str) -> dict[str, int]:
     return entries
 
 
+def _crate_source_rel(rs: Path) -> tuple[str, list[str]] | None:
+    """(`src`|`tests`, remaining components including the filename).
+
+    Anchored at the crate source root, not the last `src`/`tests` in the
+    path. `src/agent/subagent/tests/rest.rs` is `agent::subagent::tests::rest`,
+    not `rest` -- libtest uses the crate-root-relative module path
+    (#507 review). Mirrors `check_new_tests_are_filtered.py`'s `_crate_split`.
+    """
+    parts = list(rs.parts)
+    if "crates" in parts:
+        i = parts.index("crates")
+        # crates/<group>/<crate>/{src,tests}/... in the real tree;
+        # crates/<crate>/{src,tests}/... in this file's unit fixtures.
+        for crate_end in (i + 3, i + 2):
+            if len(parts) > crate_end and parts[crate_end] in ("src", "tests"):
+                return parts[crate_end], list(parts[crate_end + 1 :])
+        return None
+    if "prod" in parts:
+        i = parts.index("prod")
+        for j in range(i + 1, len(parts)):
+            if parts[j] in ("src", "tests"):
+                return parts[j], list(parts[j + 1 :])
+        return None
+    return None
+
+
 def _path_module_prefix(rs: Path) -> list[str]:
     """Module path implied by a file under `src/` or `tests/`.
 
     `mod name;` in a parent file loads `name.rs` (or `name/mod.rs`);
     libtest then reports `name::fn`, not a bare `fn`. Walking only
     inline `mod X {` blocks misses that prefix (#507 review).
+
+    Integration targets `tests/foo.rs` are a cargo test binary named
+    after the stem: libtest reports `fn`, not `foo::fn`. Prefixing the
+    stem would inflate CLAUDE.md counts (#507 review).
     """
-    parts = rs.parts
-    marker_idx = None
-    for i, part in enumerate(parts):
-        if part in ("src", "tests"):
-            marker_idx = i
-    if marker_idx is None:
+    split = _crate_source_rel(rs)
+    if split is None:
         return []
-    rest = list(parts[marker_idx + 1 :])
+    marker, rest = split
     if not rest:
         return []
+    if marker == "tests" and len(rest) == 1:
+        return []
+    rest = list(rest)
     rest[-1] = Path(rest[-1]).stem
     if rest[-1] in ("lib", "main", "mod"):
         rest.pop()
+    if marker == "tests" and rest:
+        # `tests/foo/bar.rs`: `foo` is the integration crate, not a module.
+        rest = rest[1:]
     return list(rest)
 
 
-def _declared_module_overrides(root: Path) -> dict[Path, str]:
-    """`#[path = "..."] mod name;` maps the target file to `name`."""
-    overrides: dict[Path, str] = {}
+def _declared_module_overrides(root: Path) -> dict[Path, list[str]]:
+    """`#[path = "..."] mod name;` maps the target to the declaring
+    file's module prefix plus `name`.
+
+    The declared module is a child of the declaring file, not a sibling
+    of the target's directory. `session/acp_session.rs` with
+    `#[path = "acp_session_tests/auth_error_no_retry_tests.rs"] mod
+    auth_error_no_retry_tests;` is
+    `session::acp_session::auth_error_no_retry_tests`, not
+    `session::acp_session_tests::...` (#507 review).
+    """
+    overrides: dict[Path, list[str]] = {}
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
@@ -161,7 +202,7 @@ def _declared_module_overrides(root: Path) -> dict[Path, str]:
                 semi = _MOD_SEMI.match(line)
                 if semi and pending_path:
                     child = (rs.parent / pending_path).resolve()
-                    overrides[child] = semi.group(1)
+                    overrides[child] = _path_module_prefix(rs) + [semi.group(1)]
                     pending_path = None
                     continue
                 if line:
@@ -175,8 +216,9 @@ def _qualified_test_names(root: Path) -> list[str]:
     file-path module plus in-file `mod X { ... }` blocks.
 
     File-path prefix covers the common `mod name;` / `name.rs` shape
-    libtest uses (#507 review). `#[path = "..."] mod name;` overrides
-    the file stem with the declared module name. Cross-file `mod x;`
+    libtest uses (#507 review). `#[path = "..."] mod name;` replaces the
+    target file's path prefix with the declaring file's prefix plus
+    `name`. Cross-file `mod x;`
     whose file is not `x.rs` and has no `#[path]` is still a shorter
     name than cargo would report -- conservative, same direction as
     the defect this guard exists to catch.
@@ -195,10 +237,7 @@ def _qualified_test_names(root: Path) -> list[str]:
             file_mods = _path_module_prefix(rs)
             key = rs.resolve()
             if key in overrides:
-                if file_mods:
-                    file_mods = file_mods[:-1] + [overrides[key]]
-                else:
-                    file_mods = [overrides[key]]
+                file_mods = list(overrides[key])
             lines = text.splitlines()
             mod_stack: list[tuple[int, str]] = []
             depth = 0
@@ -293,6 +332,56 @@ class ExternalModulePrefix(unittest.TestCase):
             (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_regressions::works", names)
+
+    def test_nested_src_tests_dir_keeps_the_crate_root_prefix(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            nested = root / "crates" / "codegen" / "demo" / "src" / "agent" / "subagent" / "tests"
+            nested.mkdir(parents=True)
+            (nested.parent.parent.parent / "lib.rs").write_text("")
+            (nested / "rest.rs").write_text("#[test]\nfn works() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("agent::subagent::tests::rest::works", names)
+            self.assertNotIn("rest::works", names)
+
+    def test_path_attr_keeps_the_declaring_file_prefix(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            session = root / "crates" / "codegen" / "demo" / "src" / "session"
+            session.mkdir(parents=True)
+            (session.parent / "lib.rs").write_text("mod session;\n")
+            (session / "mod.rs").write_text("mod acp_session;\n")
+            (session / "acp_session.rs").write_text(
+                '#[path = "acp_session_tests/auth_error_no_retry_tests.rs"]\n'
+                "mod auth_error_no_retry_tests;\n"
+            )
+            tests_dir = session / "acp_session_tests"
+            tests_dir.mkdir()
+            (tests_dir / "auth_error_no_retry_tests.rs").write_text(
+                "#[test]\nfn works() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn(
+                "session::acp_session::auth_error_no_retry_tests::works", names
+            )
+            self.assertNotIn(
+                "session::acp_session_tests::auth_error_no_retry_tests::works",
+                names,
+            )
+
+    def test_integration_target_has_no_file_stem_prefix(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            tests = root / "crates" / "codegen" / "demo" / "tests"
+            tests.mkdir(parents=True)
+            (tests / "shared_http_wire.rs").write_text(
+                "#[test]\nfn none_auth_scheme_sends() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_sends", names)
+            self.assertNotIn(
+                "shared_http_wire::none_auth_scheme_sends", names
+            )
 
 
 if __name__ == "__main__":
