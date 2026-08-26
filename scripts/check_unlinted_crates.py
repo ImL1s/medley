@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,7 @@ _MEMBERS_BLOCK = re.compile(r"^members\s*=\s*\[(.*?)^\]", re.MULTILINE | re.DOTA
 _QUOTED = re.compile(r"""["']([^"']+)["']""")
 _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
 _P_FLAG = re.compile(r"(?:^|[\s\\])(?:-p|--package)\s+([A-Za-z0-9][A-Za-z0-9_-]*)")
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 # A crate the workspace declares but whose manifest cannot be read is a bug in
 # this script or a broken tree, never a silent pass.
@@ -197,17 +199,28 @@ def linted_invocation_tokens(workflow_text: str) -> LintedInvocationTokens:
     the command. Both would need step-boundary parsing this script
     deliberately does not do (see the module docstring); they are not
     checked here.
+
+    `"cargo clippy" in line` is not enough: `echo cargo clippy ...`
+    contains those words and never lints. After comment-stripping and
+    continuation-joining, the line is `shlex`-split and `cargo`/`clippy`
+    must occupy the command position (after optional `NAME=value`
+    assignments). A diagnostic print of the command must not count as a
+    deny-level invocation (#508 review).
     """
     commentless = _strip_shell_comments(workflow_text)
     joined = re.sub(r"\\\s*\n\s*", " ", commentless)
     manifest_dirs: set[str] = set()
     package_names: set[str] = set()
     for line in joined.splitlines():
-        if "cargo clippy" not in line:
-            continue
         if "--all-targets" not in line or "-D warnings" not in line:
             continue
         if any(op in line for op in (";", "&", "|")):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            continue
+        if not _is_cargo_clippy_argv(tokens):
             continue
         for raw in _MANIFEST.findall(line):
             parent = Path(raw.strip().strip("'\"")).parent.name
@@ -217,6 +230,14 @@ def linted_invocation_tokens(workflow_text: str) -> LintedInvocationTokens:
     return LintedInvocationTokens(
         manifest_dirs=frozenset(manifest_dirs), package_names=frozenset(package_names)
     )
+
+
+def _is_cargo_clippy_argv(tokens: list[str]) -> bool:
+    """True when `cargo clippy` is the invoked command, not a substring."""
+    i = 0
+    while i < len(tokens) and _ENV_ASSIGNMENT.match(tokens[i]):
+        i += 1
+    return i + 1 < len(tokens) and tokens[i] == "cargo" and tokens[i + 1] == "clippy"
 
 
 def linted_tokens(workflow_text: str) -> set[str]:

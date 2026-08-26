@@ -204,11 +204,24 @@ class LintedTokens(unittest.TestCase):
         text = _workflow(CLIPPY.format(d="xai-grok-shell") + "  # keep")
         self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
 
+    def test_ignores_an_echo_of_the_clippy_command(self):
+        # `"cargo clippy" in line` also matches `echo cargo clippy ...`,
+        # which never invokes clippy. Counting it would let a diagnostic
+        # print stand in for a deny-level lint (#508 review).
+        text = _workflow("echo " + CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_counts_a_package_flag_invocation(self):
+        text = _workflow(
+            "cargo clippy -p xai-grok-shell --all-targets -- -D warnings"
+        )
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
 
 def _independent_linted_crates(workflow_text: str) -> set[str]:
-    """Real deny-level `cargo clippy --manifest-path X` directories, found by
-    `shlex`-tokenizing each line -- deliberately not
-    `linted_invocation_tokens()`'s regex/substring checks.
+    """Real deny-level `cargo clippy` crates, found by `shlex`-tokenizing
+    each line -- deliberately not `linted_invocation_tokens()`'s regex
+    checks.
 
     Every discrimination case above (`|| true`, `;`, pipes, unknown
     spellings, comments) already has a hand-written test in `LintedTokens`;
@@ -218,6 +231,13 @@ def _independent_linted_crates(workflow_text: str) -> set[str]:
     here with plain string ops and `shlex`, not the production regex, and
     "does this token look like `-D warnings`" is answered by checking two
     separate shlex tokens rather than a literal substring match.
+
+    `cargo clippy` must occupy the command position (after optional
+    `NAME=value` assignments), not merely appear as a substring --
+    `echo cargo clippy ...` never lints. Both `--manifest-path`
+    directories and `-p` / `--package` names are collected: comparing
+    only directories lets a `-p`-only deny-level line drift out of the
+    corpus (#508 review).
     """
     lines: list[str] = []
     for raw in workflow_text.splitlines():
@@ -228,27 +248,54 @@ def _independent_linted_crates(workflow_text: str) -> set[str]:
     joined = re.sub(r"\\\s*\n\s*", " ", "\n".join(lines))
     found: set[str] = set()
     for line in joined.splitlines():
-        if "cargo clippy" not in line:
-            continue
         if any(op in line for op in (";", "&", "|")):
             continue
         try:
             tokens = shlex.split(line)
         except ValueError:
             continue
+        i = 0
+        while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[i]):
+            i += 1
+        if i + 1 >= len(tokens) or tokens[i] != "cargo" or tokens[i + 1] != "clippy":
+            continue
         if "--all-targets" not in tokens:
             continue
         if not ("-D" in tokens and "warnings" in tokens):
             continue
-        for i, tok in enumerate(tokens):
-            if tok == "--manifest-path" and i + 1 < len(tokens):
-                found.add(Path(tokens[i + 1]).parent.name)
+        for j, tok in enumerate(tokens):
+            if tok == "--manifest-path" and j + 1 < len(tokens):
+                found.add(Path(tokens[j + 1]).parent.name)
+            if tok in ("-p", "--package") and j + 1 < len(tokens):
+                found.add(tokens[j + 1])
     return found
 
 
+class IndependentLintedOracle(unittest.TestCase):
+    """The corpus oracle must reject non-invocations and see `-p` (#508)."""
+
+    def test_does_not_count_an_echo_of_clippy(self):
+        text = _workflow("echo " + CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(_independent_linted_crates(text), set())
+
+    def test_counts_a_package_flag(self):
+        text = _workflow(
+            "cargo clippy -p xai-grok-shell --all-targets -- -D warnings"
+        )
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+    def test_counts_a_manifest_path(self):
+        text = _workflow(CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+
 class LintedTokensCorpus(unittest.TestCase):
-    """`linted_invocation_tokens()` against the real `ci.yml`, enumerated by
+    """`linted_tokens()` against the real `ci.yml`, enumerated by
     `_independent_linted_crates` rather than the pattern under test.
+
+    Compared as the union of `--manifest-path` directories and `-p`
+    package names -- not directories alone -- so a deny-level `-p` line
+    cannot leave the corpus (#508 review).
     """
 
     @classmethod
@@ -257,7 +304,7 @@ class LintedTokensCorpus(unittest.TestCase):
             encoding="utf-8"
         )
         cls.oracle = _independent_linted_crates(cls.workflow_text)
-        cls.real = set(linted_invocation_tokens(cls.workflow_text).manifest_dirs)
+        cls.real = linted_tokens(cls.workflow_text)
 
     def test_the_corpus_is_not_empty(self):
         # A silent-empty scan would pass the agreement check below by
