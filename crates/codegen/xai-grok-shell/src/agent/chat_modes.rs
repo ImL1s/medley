@@ -269,7 +269,6 @@ impl ChatModesManager {
                 return;
             }
             if let Ok(resp) = me.fetch(locale).await
-                && !resp.modes.is_empty()
                 && me.current_user_id().as_deref() == Some(user_id.as_str())
             {
                 me.store(user_id, locale.to_owned(), resp);
@@ -305,6 +304,11 @@ impl ChatModesManager {
                 .expect("test age must not underflow Instant"),
             response,
         });
+    }
+
+    #[cfg(test)]
+    fn cached_modes_for_test(&self) -> Option<ListModesResponse> {
+        self.inner.cache.read().as_ref().map(|c| c.response.clone())
     }
 }
 fn empty_state() -> acp::SessionModelState {
@@ -535,6 +539,57 @@ mod tests {
                 );
             }
             other => panic!("[fetch_failure_no_cache] expected NoInfo, got {other:?}"),
+        }
+    }
+
+    /// #483 review, round 4: `spawn_refresh` used to skip `Ok` responses
+    /// whose `modes` list was empty, so a successful empty refresh never
+    /// replaced a stale non-empty cache. Every later `session/new` then
+    /// stayed `NoInfo` and trusted any model. Store the empty success so
+    /// the next snapshot is `Authoritative` empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_refresh_stores_a_successful_empty_response() {
+        const USER: &str = "chat-483-empty-refresh-user";
+        let manager = manager_authenticated_as(USER);
+        manager.seed_cache_for_test(
+            USER,
+            CACHE_TTL + Duration::from_secs(1),
+            ListModesResponse {
+                modes: vec![available("auto", "Auto")],
+                default_mode_id: "auto".to_owned(),
+            },
+        );
+        manager.set_fetch_override_for_test(Ok(ListModesResponse {
+            modes: vec![],
+            default_mode_id: String::new(),
+        }));
+        match manager.model_state_with_authority().await {
+            ChatModelCatalog::NoInfo(state) => {
+                assert!(
+                    !state.available_models.is_empty(),
+                    "[stale] must still carry display data while the refresh is in flight"
+                );
+            }
+            other => panic!("[stale] expected NoInfo, got {other:?}"),
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match manager.cached_modes_for_test() {
+                Some(resp) if resp.modes.is_empty() => break,
+                _ if std::time::Instant::now() >= deadline => {
+                    panic!("background refresh never stored the empty success");
+                }
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        match manager.model_state_with_authority().await {
+            ChatModelCatalog::Authoritative(state) => {
+                assert!(
+                    state.available_models.is_empty(),
+                    "[refreshed] a stored empty success is authoritative"
+                );
+            }
+            other => panic!("[refreshed] expected Authoritative empty, got {other:?}"),
         }
     }
     #[test]
