@@ -9407,6 +9407,33 @@ fn chat_session_requires_visible_routing_failure_matrix() {
     }
 }
 
+#[test]
+fn chat_session_local_route_is_usable_requires_eligibility_and_readiness() {
+    // label, resolved, selectable, visible, ready, expected usable
+    let cases: &[(&str, bool, bool, bool, bool, bool)] = &[
+        ("missing_is_not_usable", false, true, true, true, false),
+        ("present_selectable_visible_ready", true, true, true, true, true),
+        ("disallowed_by_allowed_models", true, false, true, true, false),
+        ("hidden_for_auth_mode", true, true, false, true, false),
+        ("unready", true, true, true, false, false),
+    ];
+    for (label, resolved, selectable, visible, ready, expected) in cases {
+        let usable = super::agent_ops::chat_session_local_route_is_usable(
+            *resolved, *selectable, *visible, *ready,
+        );
+        assert_eq!(usable, *expected, "[{label}] usable");
+        assert_eq!(
+            super::agent_ops::chat_session_requires_visible_routing_failure(true, usable),
+            !usable,
+            "[{label}] chat-kind must fail visibly unless the local route is usable"
+        );
+        assert!(
+            !super::agent_ops::chat_session_requires_visible_routing_failure(false, usable),
+            "[{label}] build-kind stays exempt"
+        );
+    }
+}
+
 /// #489 follow-up: Codex review on PR #505 (`agent_ops.rs:5768`) found that
 /// a chat-kind session with **no** explicit `custom_model_id` fell back to
 /// the build catalog's current model, while the client is told the *chat*
