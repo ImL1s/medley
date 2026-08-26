@@ -42,6 +42,7 @@ This guard checks two things CLAUDE.md's prose alone cannot self-verify:
 from __future__ import annotations
 
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -56,9 +57,28 @@ _FN = re.compile(
 _MOD_OPEN = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
 )
+_MOD_SEMI = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;"
+)
+_PATH_ATTR = re.compile(r'#\[path\s*=\s*"([^"]+)"\]')
 
 _HOT_PATH_MARKER = "CI's hot path is exactly this suite"
 _DOC_ENTRY = re.compile(r"`([a-z][a-z0-9_]*)`\s*\((\d+)\)")
+
+# The seven names the hot-path paragraph must keep enumerating. Counts
+# still come from CLAUDE.md; this set is the ratchet that a deleted
+# named entry cannot silently drop out of the loop (#507 review).
+_REQUIRED_HOT_PATH_ENTRIES = frozenset(
+    {
+        "is_secret_free_",
+        "omits_xai_identity",
+        "hostile_injector",
+        "none_auth_scheme_",
+        "sampler_request_logs_never_emit_credential_bytes",
+        "transport_failure_never_emits_query_credential_bytes",
+        "subagent_resolution_diagnostics_never_emit_parent_or_child_credentials",
+    }
+)
 
 
 def _strip_line_comment(line: str) -> str:
@@ -96,27 +116,72 @@ def parse_documented_hot_path(text: str) -> dict[str, int]:
     return entries
 
 
+def _path_module_prefix(rs: Path) -> list[str]:
+    """Module path implied by a file under `src/` or `tests/`.
+
+    `mod name;` in a parent file loads `name.rs` (or `name/mod.rs`);
+    libtest then reports `name::fn`, not a bare `fn`. Walking only
+    inline `mod X {` blocks misses that prefix (#507 review).
+    """
+    parts = rs.parts
+    marker_idx = None
+    for i, part in enumerate(parts):
+        if part in ("src", "tests"):
+            marker_idx = i
+    if marker_idx is None:
+        return []
+    rest = list(parts[marker_idx + 1 :])
+    if not rest:
+        return []
+    rest[-1] = Path(rest[-1]).stem
+    if rest[-1] in ("lib", "main", "mod"):
+        rest.pop()
+    return list(rest)
+
+
+def _declared_module_overrides(root: Path) -> dict[Path, str]:
+    """`#[path = "..."] mod name;` maps the target file to `name`."""
+    overrides: dict[Path, str] = {}
+    for base in _CRATE_ROOTS:
+        base_dir = root / base
+        if not base_dir.is_dir():
+            continue
+        for rs in base_dir.rglob("*.rs"):
+            try:
+                text = rs.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            pending_path: str | None = None
+            for raw in text.splitlines():
+                line = _strip_line_comment(raw).strip()
+                path_match = _PATH_ATTR.search(line)
+                if path_match:
+                    pending_path = path_match.group(1)
+                    continue
+                semi = _MOD_SEMI.match(line)
+                if semi and pending_path:
+                    child = (rs.parent / pending_path).resolve()
+                    overrides[child] = semi.group(1)
+                    pending_path = None
+                    continue
+                if line:
+                    pending_path = None
+    return overrides
+
+
 def _qualified_test_names(root: Path) -> list[str]:
     """Every `#[test]`/`#[tokio::test]` function's qualified name under
     `crates/`/`prod/` -- `src/` and `tests/` alike -- prefixed with its
-    in-file module path via brace-depth tracking of `mod X { ... }`
-    blocks.
+    file-path module plus in-file `mod X { ... }` blocks.
 
-    Exact for the common case this repo overwhelmingly uses --
-    `#[cfg(test)] mod tests { ... }` and similar inline nesting -- since
-    the actual source text is walked, not approximated from a file path.
-    Does NOT resolve a cross-file `mod x;` / `#[path = ...] mod x;`
-    declaration into the *including* file's own module prefix (unlike
-    `check_new_tests_are_filtered.py`'s `selected()`, which approximates
-    that case from the file's path but does not track inline `mod`
-    blocks at all -- neither approximation is a superset of the other).
-    A test in a file only reachable through such a declaration is
-    enumerated with a shorter qualified name than `cargo test` would
-    report; this can only make the guard MISS a module-prefix match, the
-    same direction as the defect it exists to catch, so it is a known
-    conservative gap rather than a silent wrong answer in the other
-    direction.
+    File-path prefix covers the common `mod name;` / `name.rs` shape
+    libtest uses (#507 review). `#[path = "..."] mod name;` overrides
+    the file stem with the declared module name. Cross-file `mod x;`
+    whose file is not `x.rs` and has no `#[path]` is still a shorter
+    name than cargo would report -- conservative, same direction as
+    the defect this guard exists to catch.
     """
+    overrides = _declared_module_overrides(root)
     names: list[str] = []
     for base in _CRATE_ROOTS:
         base_dir = root / base
@@ -127,6 +192,13 @@ def _qualified_test_names(root: Path) -> list[str]:
                 text = rs.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
+            file_mods = _path_module_prefix(rs)
+            key = rs.resolve()
+            if key in overrides:
+                if file_mods:
+                    file_mods = file_mods[:-1] + [overrides[key]]
+                else:
+                    file_mods = [overrides[key]]
             lines = text.splitlines()
             mod_stack: list[tuple[int, str]] = []
             depth = 0
@@ -143,7 +215,8 @@ def _qualified_test_names(root: Path) -> list[str]:
                             continue
                         m = _FN.match(follow_raw)
                         if m:
-                            prefix = "::".join(name for _, name in mod_stack)
+                            prefix_parts = file_mods + [name for _, name in mod_stack]
+                            prefix = "::".join(prefix_parts)
                             names.append(
                                 f"{prefix}::{m.group(1)}" if prefix else m.group(1)
                             )
@@ -172,17 +245,10 @@ class CredentialHotPathCorpus(unittest.TestCase):
         # below while checking nothing at all.
         self.assertGreater(len(self.names), 1000, len(self.names))
 
-    def test_claude_md_still_documents_at_least_the_five_known_entries(self):
-        # Guards against the parse silently degrading to zero real
-        # entries while still finding an unrelated `` `x` (N) `` span
-        # elsewhere in the file.
-        known = {
-            "is_secret_free_",
-            "omits_xai_identity",
-            "hostile_injector",
-            "none_auth_scheme_",
-        }
-        self.assertLessEqual(known, set(self.documented))
+    def test_claude_md_still_documents_all_required_hot_path_entries(self):
+        # A deleted named entry must not drop out of the count loop
+        # because this assertion only listed the four patterns (#507 review).
+        self.assertEqual(set(self.documented), _REQUIRED_HOT_PATH_ENTRIES)
 
     def test_each_documented_entry_selects_its_documented_count(self):
         # The counterexample CLAUDE.md's own commit history should never
@@ -201,6 +267,32 @@ class CredentialHotPathCorpus(unittest.TestCase):
             f"CLAUDE.md's documented count does not match source (got, "
             f"documented, matches): {wrong}",
         )
+
+
+class ExternalModulePrefix(unittest.TestCase):
+    def test_mod_decl_file_uses_the_file_stem_as_libtest_prefix(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text("mod none_auth_scheme_regressions;\n")
+            (src / "none_auth_scheme_regressions.rs").write_text(
+                "#[test]\nfn works() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_regressions::works", names)
+
+    def test_path_attr_overrides_the_file_stem(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                '#[path = "elsewhere.rs"]\nmod none_auth_scheme_regressions;\n'
+            )
+            (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_regressions::works", names)
 
 
 if __name__ == "__main__":
