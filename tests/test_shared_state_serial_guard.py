@@ -551,6 +551,36 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"real_toucher"})
 
+    def test_fixed_name_generated_helper_is_expanded(self):
+        """A macro-emitted `fn helper()` called as `helper()` still
+        transfers keys (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! bundle {
+                ($($name:ident),*) => {
+                    fn helper() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    $(
+                        #[test]
+                        fn $name() {
+                            helper();
+                        }
+                    )*
+                };
+            }
+
+            bundle!(a, b);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("bundle!")}
+        self.assertEqual(len(generated), 2, names)
+
     def test_macro_generated_tests_inherit_helper_keys(self):
         """A generated `#[test] fn $name() { helper(); }` only acquires the
         key after call-graph closure (#516 review)."""
@@ -986,6 +1016,39 @@ class TransitiveClosure(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_imported_bump_untagged"})
+
+    def test_inline_super_import_resolves_from_the_inline_module(self):
+        """`mod tests { use super::helpers::bump }` is `a::helpers::bump`,
+        not crate-root `helpers::bump` (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    mod helpers {
+                        pub fn bump() {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+
+                    mod tests {
+                        use super::helpers::bump;
+
+                        #[test]
+                        fn calls_super_helpers_untagged() {
+                            bump();
+                        }
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_super_helpers_untagged"})
 
     def test_brace_import_with_nested_path_reaches_registered_state(self):
         """`use crate::{a::bump}` must record `bump`, not the `a` prefix

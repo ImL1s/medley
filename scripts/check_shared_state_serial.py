@@ -858,16 +858,20 @@ def _module_path(rel: Path) -> tuple[str, ...] | None:
 
 
 def _use_module_prefix(
-    root: str, mid: tuple[str, ...], file_mod: tuple[str, ...] | None
+    root: str,
+    mid: tuple[str, ...],
+    file_mod: tuple[str, ...] | None,
+    inline_mods: tuple[str, ...] = (),
 ) -> tuple[str, ...] | None:
     if root == "crate":
         return mid
     if file_mod is None:
         return None
+    effective = file_mod + inline_mods
     if root == "self":
-        return file_mod + mid
+        return effective + mid
     if root == "super":
-        return (file_mod[:-1] if file_mod else ()) + mid
+        return (effective[:-1] if effective else ()) + mid
     return None
 
 
@@ -889,10 +893,10 @@ def _use_imports(
     def record(
         pos: int, root: str, mid: tuple[str, ...], fname: str, local: str
     ) -> None:
-        module = _use_module_prefix(root, mid, file_mod)
+        inline = _inline_path_from_spans(spans, pos)
+        module = _use_module_prefix(root, mid, file_mod, inline)
         if module is None:
             return
-        inline = _inline_path_from_spans(spans, pos)
         scoped.setdefault(inline, {})[local] = (module, fname)
 
     for m in USE_PLAIN.finditer(code):
@@ -1289,19 +1293,27 @@ def _inside_dollar_repeat(source: str, pos: int) -> bool:
 _METAVAR_CALL = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
 
+def _helper_refs(fn_body: str, helpers: dict[str, str]) -> list[str]:
+    names = list(_METAVAR_CALL.findall(fn_body))
+    for name in helpers:
+        if re.search(rf"(?<![:.\w]){re.escape(name)}\s*\(", fn_body):
+            names.append(name)
+    return names
+
+
 def _expand_generated_helper_bodies(fn_body: str, helpers: dict[str, str]) -> str:
-    """Inline `$helper()` bodies, including nested `$relay()` / `$leaf()`."""
+    """Inline `$helper()` / `helper()` bodies, including nested helpers."""
 
     seen: set[str] = set()
     extra: list[str] = []
-    stack = list(_METAVAR_CALL.findall(fn_body))
+    stack = _helper_refs(fn_body, helpers)
     while stack:
         name = stack.pop()
         if name in seen or name not in helpers:
             continue
         seen.add(name)
         extra.append(helpers[name])
-        stack.extend(_METAVAR_CALL.findall(helpers[name]))
+        stack.extend(_helper_refs(helpers[name], helpers))
     return fn_body + "".join(extra)
 
 
