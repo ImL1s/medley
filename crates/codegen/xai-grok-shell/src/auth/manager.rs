@@ -553,7 +553,7 @@ pub fn explicit_xai_auth_path() -> Option<PathBuf> {
     }
     #[cfg(not(test))]
     {
-        std::env::var("GROK_AUTH_PATH").ok().map(PathBuf::from)
+        xai_grok_config::explicit_xai_auth_override()
     }
 }
 

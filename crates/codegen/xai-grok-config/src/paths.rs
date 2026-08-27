@@ -5,6 +5,11 @@ use std::sync::OnceLock;
 
 static GROK_HOME: OnceLock<PathBuf> = OnceLock::new();
 
+/// Working directory captured on the first auth-path resolution in this
+/// process. Relative `GROK_AUTH_PATH` values join against this, not against
+/// whatever cwd a later pager `/cd` left behind (#481).
+static PROCESS_START_CWD: OnceLock<PathBuf> = OnceLock::new();
+
 #[cfg(target_os = "macos")]
 const CLAUDE_MANAGED_SETTINGS_PATH: &str =
     "/Library/Application Support/ClaudeCode/managed-settings.json";
@@ -93,10 +98,37 @@ pub fn user_grok_home() -> Option<PathBuf> {
 /// function directly only from a context that either doesn't need that
 /// isolation (an independent binary, e.g. `xai-workspace-server`) or
 /// supplies its own equivalent.
+///
+/// A relative `GROK_AUTH_PATH` is joined against the process-start cwd
+/// once, so later `chdir` (pager `/cd`) cannot retarget the credential
+/// file (#481 review).
 pub fn resolved_xai_auth_path(grok_home: &std::path::Path) -> PathBuf {
+    explicit_xai_auth_override().unwrap_or_else(|| grok_home.join("auth.json"))
+}
+
+fn process_start_cwd() -> PathBuf {
+    PROCESS_START_CWD
+        .get_or_init(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .clone()
+}
+
+fn absolutize_xai_auth_override(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        process_start_cwd().join(path)
+    }
+}
+
+/// `$GROK_AUTH_PATH` when set, made absolute against process-start cwd
+/// when the value is relative. `None` when unset. Callers that have no
+/// `grok_home` to fall back to (containers, bare CI) use this instead of
+/// [`resolved_xai_auth_path`].
+pub fn explicit_xai_auth_override() -> Option<PathBuf> {
     std::env::var("GROK_AUTH_PATH")
+        .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|_| grok_home.join("auth.json"))
+        .map(absolutize_xai_auth_override)
 }
 
 /// Canonical grok application path: `$GROK_HOME/bin/grok` (Unix) or `grok.exe` (Windows).
@@ -251,6 +283,7 @@ fn slugify(input: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Realistic CWDs that trigger the bug (URL-encoded > 255 bytes).
@@ -377,5 +410,54 @@ mod tests {
     #[test]
     fn slugify_truncates() {
         assert_eq!(slugify(&"a".repeat(100), 10).len(), 10);
+    }
+
+    #[test]
+    fn relative_grok_auth_path_stays_anchored_after_chdir() {
+        // RefreshGate re-resolves on every poll. A relative GROK_AUTH_PATH
+        // joined against the *current* cwd would silently follow pager `/cd`
+        // (#481 review). Pin the override to process-start cwd once.
+        struct AuthPathEnvGuard {
+            prev: Option<std::ffi::OsString>,
+            prev_cwd: PathBuf,
+        }
+        impl Drop for AuthPathEnvGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.prev_cwd);
+                match &self.prev {
+                    Some(v) => unsafe { std::env::set_var("GROK_AUTH_PATH", v) },
+                    None => unsafe { std::env::remove_var("GROK_AUTH_PATH") },
+                }
+            }
+        }
+
+        let start = std::env::current_dir().expect("process cwd");
+        let _guard = AuthPathEnvGuard {
+            prev: std::env::var_os("GROK_AUTH_PATH"),
+            prev_cwd: start.clone(),
+        };
+        unsafe { std::env::set_var("GROK_AUTH_PATH", "auth.json") };
+
+        let dummy_home = PathBuf::from("/tmp/unused-grok-home");
+        let first = resolved_xai_auth_path(&dummy_home);
+        assert!(
+            first.is_absolute(),
+            "relative GROK_AUTH_PATH must be joined against a real directory, got {}",
+            first.display()
+        );
+        assert_eq!(first, start.join("auth.json"));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_current_dir(tmp.path()).expect("chdir into temp");
+        let second = resolved_xai_auth_path(&dummy_home);
+        assert_eq!(
+            first, second,
+            "later chdir must not retarget a relative GROK_AUTH_PATH"
+        );
+        assert_ne!(
+            second,
+            tmp.path().join("auth.json"),
+            "must not follow the post-launch cwd"
+        );
     }
 }

@@ -1411,6 +1411,12 @@ jobs:
           # cross-crate caller while every one of them still compiles.
           run_nonzero -p xai-grok-config --lib \
             state_home:: -- --nocapture
+          # #481: relative GROK_AUTH_PATH is joined against process-start
+          # cwd, not the cwd a later pager `/cd` left behind. The rest of
+          # `paths::` is cheap encoding/slugify coverage that previously
+          # ran nowhere. 13 tests.
+          run_nonzero -p xai-grok-config --lib \
+            paths:: -- --nocapture
           # Same `#[path]` move as `restore_fetch::` above, and stopped one
           # segment short for the same reason: the file is `fs_size_tests.rs`,
           # the module is `fs_size::tests`, and only `fs_size::` is a substring
