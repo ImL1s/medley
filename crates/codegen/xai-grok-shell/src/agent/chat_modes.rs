@@ -306,8 +306,13 @@ impl ChatModesManager {
             }
         }
         let client = ChatModelsClient::new(self.inner.auth.clone());
+        // Generation of the credential used to construct this request, not
+        // whatever is current after `list_modes` returns. API keys share an
+        // empty `user_id`; stamping A's response with B's generation would
+        // cache A's entitlements as B's (#483 review).
+        let sent_generation = self.current_auth_generation();
         match tokio::time::timeout(COLD_FETCH_TIMEOUT, client.list_modes(locale)).await {
-            Ok(result) => result.map(|resp| (resp, self.current_auth_generation())),
+            Ok(result) => result.map(|resp| (resp, sent_generation)),
             Err(_elapsed) => Err(ChatModelsError::Timeout),
         }
     }
