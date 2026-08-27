@@ -623,19 +623,59 @@ def _fn_body(source: str, name_end: int) -> tuple[int, int] | None:
     if index >= len(source) or source[index] != "(":
         return None
     index = _balanced_end(source, index)
+    # After the parameter list: skip return types / where-clauses, including
+    # const-generic braces inside `<>` (`fn bump() -> impl Trait<{ 1 }> {`)
+    # so the first `{` at depth 0 is the actual body (#516 review).
+    angle = paren = square = 0
     while index < len(source):
         if source[index].isspace():
             index += 1
             continue
         comment_end = _skip_comment(source, index)
         if comment_end is not None:
-            # `fn bump() /* { } */ { body }` — the comment's braces are not
-            # the body (#516 review).
             index = comment_end
             continue
-        if source[index] == "{":
-            return index, _balanced_end(source, index)
-        if source[index] == ";":
+        raw_end = _skip_raw_string(source, index)
+        if raw_end is not None:
+            index = raw_end
+            continue
+        ch = source[index]
+        if ch == '"':
+            index = _skip_quoted(source, index, ch)
+            continue
+        if ch == "'" and (char_end := _skip_char_literal(source, index)) is not None:
+            index = char_end
+            continue
+        if ch == "<":
+            angle += 1
+            index += 1
+            continue
+        if ch == ">" and angle:
+            angle -= 1
+            index += 1
+            continue
+        if ch == "(":
+            paren += 1
+            index += 1
+            continue
+        if ch == ")" and paren:
+            paren -= 1
+            index += 1
+            continue
+        if ch == "[":
+            square += 1
+            index += 1
+            continue
+        if ch == "]" and square:
+            square -= 1
+            index += 1
+            continue
+        if ch == "{":
+            if angle == 0 and paren == 0 and square == 0:
+                return index, _balanced_end(source, index)
+            index = _balanced_end(source, index)
+            continue
+        if ch == ";" and angle == 0 and paren == 0 and square == 0:
             return None
         index += 1
     return None
@@ -1060,31 +1100,98 @@ def _serial_from_macro_body(body: str) -> tuple[frozenset[str], bool]:
     return frozenset(held), has_unkeyed
 
 
-def _generated_test_serials(body: str) -> list[tuple[frozenset[str], bool]]:
-    """Serial attrs on each generated `fn $name`, not the union of the body.
+def _inside_dollar_repeat(source: str, pos: int) -> bool:
+    """True when ``pos`` sits inside `$ ( ... ) *|+`.
 
-    One invocation can expand to several tests with different attributes.
-    Unioning them onto a single synthetic lets an untagged touching test
-    hide behind a sibling `#[serial(k)]` (#516 review).
+    That is the expansion pattern that repeats per invocation item;
+    argument count is multiplicity only then (#516 review).
     """
 
-    out: list[tuple[frozenset[str], bool]] = []
+    i = 0
+    n = len(source)
+    while i < n:
+        dollar = source.find("$", i)
+        if dollar < 0 or dollar >= pos:
+            return False
+        j = dollar + 1
+        while j < n and source[j].isspace():
+            j += 1
+        if j >= n or source[j] != "(":
+            i = dollar + 1
+            continue
+        end = _balanced_end(source, j)
+        if j < pos < end:
+            k = end
+            while k < n and source[k].isspace():
+                k += 1
+            if k < n and source[k] in "*+":
+                return True
+        i = dollar + 1
+    return False
+
+
+def _after_macro_fn_name(source: str, dollar_end: int) -> int:
+    index = dollar_end
+    while index < len(source) and (source[index].isalnum() or source[index] == "_"):
+        index += 1
+    return index
+
+
+_METAVAR_CALL = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _generated_test_templates(
+    body: str,
+) -> list[tuple[frozenset[str], bool, bool, str]]:
+    """Serial attrs, repetition, and body for each generated `fn $name`.
+
+    Keys later come from that body (and its callees), not the macro-wide
+    union (#516 review). A generated test that calls `$helper()` still
+    inherits that helper's body, because the helper is not a real `fn`.
+    """
+
+    parsed: list[tuple[str, bool, frozenset[str], bool, bool, str]] = []
     for match in MACRO_TEST_FN.finditer(body):
         attrs = _preceding_attributes(body, body, match.start())
-        if not any(_is_test_attr(a) for a in attrs):
-            continue
+        is_test = any(_is_test_attr(a) for a in attrs)
         held: set[str] = set()
         has_unkeyed = False
         for attr in attrs:
-            parsed = _serial_keys(attr)
-            if parsed is None:
+            parsed_keys = _serial_keys(attr)
+            if parsed_keys is None:
                 continue
-            if not parsed:
+            if not parsed_keys:
                 has_unkeyed = True
             else:
-                held.update(parsed)
-        out.append((frozenset(held), has_unkeyed))
+                held.update(parsed_keys)
+        metavar_end = _after_macro_fn_name(body, match.end())
+        metavar = body[match.end() : metavar_end]
+        span = _fn_body(body, metavar_end)
+        fn_body = _strip_turbofish(body[span[0] : span[1]]) if span else ""
+        parsed.append(
+            (
+                metavar,
+                is_test,
+                frozenset(held),
+                has_unkeyed,
+                _inside_dollar_repeat(body, match.start()),
+                fn_body,
+            )
+        )
+    helpers = {metavar: fn_body for metavar, is_test, *_rest, fn_body in parsed if not is_test}
+    out: list[tuple[frozenset[str], bool, bool, str]] = []
+    for metavar, is_test, held, has_unkeyed, in_repeat, fn_body in parsed:
+        if not is_test:
+            continue
+        extra = "".join(
+            helpers[name] for name in _METAVAR_CALL.findall(fn_body) if name in helpers
+        )
+        out.append((held, has_unkeyed, in_repeat, fn_body + extra))
     return out
+
+
+def _generated_test_serials(body: str) -> list[tuple[frozenset[str], bool]]:
+    return [(held, unkeyed) for held, unkeyed, _rep, _body in _generated_test_templates(body)]
 
 
 @dataclass(frozen=True)
@@ -1097,6 +1204,7 @@ class _PendingMacroTest:
     serial_held: frozenset[str]
     has_unkeyed_serial: bool
     slot: int
+    template_index: int
 
 
 def index_functions(
@@ -1104,7 +1212,7 @@ def index_functions(
 ) -> tuple[list[FnInfo], list[_PendingMacroTest]]:
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
-    generated_by_macro: dict[str, list[tuple[frozenset[str], bool]]] = {}
+    generated_by_macro: dict[str, list[tuple[frozenset[str], bool, bool, int]]] = {}
     scans: list[
         tuple[Path, str, str, list[tuple[int, int]], list[tuple[int, int, int, str]]]
     ] = []
@@ -1172,9 +1280,36 @@ def index_functions(
                 item.key for item in registry if _body_touches(body_code, item.identifiers)
             )
             if _macro_generates_tests(body_code):
-                generated_by_macro.setdefault(name, []).extend(
-                    _generated_test_serials(body_code)
-                )
+                raw_macro_body = raw[body_start:body_end]
+                for held, unkeyed, in_repeat, test_body in _generated_test_templates(
+                    raw_macro_body
+                ):
+                    template_keys = frozenset(
+                        item.key
+                        for item in registry
+                        if _body_touches(test_body, item.identifiers)
+                    )
+                    template_index = len(out)
+                    out.append(
+                        FnInfo(
+                            name=f"{name}#template{template_index}",
+                            file=rel,
+                            type_name=None,
+                            trait_name=None,
+                            is_macro=False,
+                            inline_mods=(),
+                            body=test_body,
+                            start=body_start,
+                            keys=template_keys,
+                            is_test=False,
+                            serial_held=held,
+                            has_unkeyed_serial=unkeyed,
+                            attrs_line=_line(raw, match.start()),
+                        )
+                    )
+                    generated_by_macro.setdefault(name, []).append(
+                        (held, unkeyed, in_repeat, template_index)
+                    )
             out.append(
                 FnInfo(
                     name=name,
@@ -1204,9 +1339,11 @@ def index_functions(
             line = _line(raw, invoke.start())
             inline_mods = _inline_path_from_spans(inline_spans, invoke.start())
             arity = _macro_invoke_arity(code, invoke.end())
-            n_serials = len(serials)
-            for rep in range(arity):
-                for slot, (serial_held, has_unkeyed) in enumerate(serials):
+            for slot, (serial_held, has_unkeyed, in_repeat, template_index) in enumerate(
+                serials
+            ):
+                reps = arity if in_repeat else 1
+                for rep in range(reps):
                     pending.append(
                         _PendingMacroTest(
                             file=rel,
@@ -1216,7 +1353,8 @@ def index_functions(
                             inline_mods=inline_mods,
                             serial_held=serial_held,
                             has_unkeyed_serial=has_unkeyed,
-                            slot=rep * n_serials + slot,
+                            slot=rep * len(serials) + slot,
+                            template_index=template_index,
                         )
                     )
     return out, pending
@@ -1506,8 +1644,11 @@ def analyze(
         if not indices:
             continue
         keys: frozenset[str] = frozenset()
-        for idx in indices:
-            keys = keys | keys_of[idx]
+        if 0 <= pending.template_index < len(keys_of):
+            keys = keys_of[pending.template_index]
+        elif indices:
+            for idx in indices:
+                keys = keys | keys_of[idx]
         if not keys:
             continue
         functions.append(

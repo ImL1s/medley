@@ -568,6 +568,62 @@ class TransitiveClosure(unittest.TestCase):
             "two generated tests must not collapse into a sole-member exemption",
         )
 
+    def test_fixed_arity_macro_is_not_multiplied_by_argument_count(self):
+        """`case!(name, expected)` emits one test, not one per argument (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! case {
+                ($name:ident, $expected:expr) => {
+                    #[test]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                        let _ = $expected;
+                    }
+                };
+            }
+
+            case!(only, 1);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("case!")}
+        self.assertEqual(len(generated), 1, names)
+        findings = guard.scan_source(text)
+        self.assertEqual(findings, [])
+
+    def test_generated_test_keys_are_per_slot_not_macro_union(self):
+        """An expansion with one touching test and one unrelated body must
+        not count the unrelated test as a toucher (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! pair {
+                ($touch:ident, $skip:ident) => {
+                    #[test]
+                    fn $touch() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    #[test]
+                    fn $skip() {}
+                };
+            }
+
+            pair!(touch, skip);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("pair!")}
+        self.assertEqual(len(generated), 1, names)
+        findings = guard.scan_source(text)
+        self.assertEqual(findings, [])
+
     def test_bare_call_resolves_inside_the_caller_inline_module(self):
         """File-wide last `fn bump` must not steal an earlier module (#516 review)."""
 
@@ -895,6 +951,28 @@ class TransitiveClosure(unittest.TestCase):
         )
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"calls_bound_fn_untagged"})
+
+    def test_const_generic_braces_in_return_type_are_not_the_body(self):
+        """`fn bump() -> impl Trait<{ 1 }> { COUNTER... }` must index the
+        real body, not the const expression (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn bump() -> impl Trait<{ 1 }> {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn calls_const_generic_return_untagged() {
+                bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_const_generic_return_untagged"})
 
 
 class CrateQualifiedResolution(unittest.TestCase):
