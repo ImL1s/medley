@@ -1570,12 +1570,14 @@ impl acp::Agent for MvpAgent {
                     // This display-only path does not need the
                     // authoritative/no-info distinction (#483), so it
                     // drops the tag here. If that snapshot has no current
-                    // id, report the spawn fallback actually used.
+                    // id, report the id the actor actually spawned with
+                    // (`session_model_id`), not the build-catalog default
+                    // that only applies when no request survived.
                     chat_report_spawned_model(
                         chat_catalog
                             .expect("chat_catalog is fetched whenever is_chat_kind")
                             .into_state(),
-                        &fallback_model_id,
+                        &session_model_id,
                     ),
                     session_initial_model
                         .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),

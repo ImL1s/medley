@@ -9172,12 +9172,18 @@ fn chat_catalog_spawn_fallback_uses_chat_catalog_not_build() {
         .is_err(),
         "[empty_current] must not cross into the build catalog"
     );
-    let empty = acp::SessionModelState::new(acp::ModelId::new(String::new()), Vec::new());
+    let empty = || acp::SessionModelState::new(acp::ModelId::new(String::new()), Vec::new());
     let spawned = acp::ModelId::new("build-default".to_owned());
     assert_eq!(
-        chat_report_spawned_model(empty, &spawned).current_model_id,
+        chat_report_spawned_model(empty(), &spawned).current_model_id,
         spawned,
         "[empty_current] response must report the spawn fallback"
+    );
+    let requested = acp::ModelId::new("chat-requested".to_owned());
+    assert_eq!(
+        chat_report_spawned_model(empty(), &requested).current_model_id,
+        requested,
+        "[empty_current] reports the id the actor spawned with, not a blank catalog current"
     );
     assert_eq!(
         chat_report_spawned_model(state("chat-cached"), &spawned)
