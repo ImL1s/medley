@@ -17,7 +17,7 @@ const GROUP_EXIT_POLL: Duration = Duration::from_millis(1);
 thread_local! {
     static TERMINATE_OWNED_GROUP_SLEEPS: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
-    static LAST_PIPE_DRAIN_GRACE: std::cell::Cell<Option<Duration>> =
+    static LAST_PIPE_DRAIN_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -124,9 +124,9 @@ fn post_exit_cleanup_and_drain(
     stderr: std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
     grace: Duration,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    #[cfg(test)]
-    LAST_PIPE_DRAIN_GRACE.with(|slot| slot.set(Some(grace)));
     let cleanup_deadline = std::time::Instant::now() + grace;
+    #[cfg(test)]
+    LAST_PIPE_DRAIN_DEADLINE.with(|slot| slot.set(Some(cleanup_deadline)));
     terminate_owned_group(group);
     let stdout = recv_pipe_drain(stdout, cleanup_deadline, "stdout")?;
     let stderr = recv_pipe_drain(stderr, cleanup_deadline, "stderr")?;
@@ -453,13 +453,15 @@ mod tests {
         );
     }
 
-    /// Records the relative grace passed into the drain, rather than a
-    /// remaining Instant budget that a descheduled test thread can shrink
-    /// (#501 review).
+    /// Records the *usable* drain deadline (`now + grace`), not the input
+    /// `grace` argument. Pre-filled pipes drain immediately, so asserting the
+    /// argument still passes if the helper computes `Instant::now()` and
+    /// throws the grace away — the zero-grace regression the sibling timeout
+    /// test explicitly delegates here (#501 review).
     #[test]
     fn post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline() {
         let group = xai_tty_utils::ProcessGroup::new().expect("group");
-        LAST_PIPE_DRAIN_GRACE.with(|c| c.set(None));
+        LAST_PIPE_DRAIN_DEADLINE.with(|c| c.set(None));
 
         let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
         stdout_tx
@@ -470,17 +472,23 @@ mod tests {
         stderr_tx.send(Ok(Vec::new())).expect("pre-fill stderr");
         drop(stderr_tx);
 
+        let before = std::time::Instant::now();
         let (stdout, stderr) =
             post_exit_cleanup_and_drain(&group, stdout_rx, stderr_rx, POST_EXIT_CLEANUP_GRACE)
                 .expect("pre-filled pipes must drain under a fresh grace");
+        let after = std::time::Instant::now();
         assert_eq!(String::from_utf8_lossy(&stdout).trim(), "ok");
         assert!(stderr.is_empty());
-        let recorded = LAST_PIPE_DRAIN_GRACE
+        let recorded = LAST_PIPE_DRAIN_DEADLINE
             .with(|c| c.get())
-            .expect("drain must record the relative grace it was given");
-        assert_eq!(
-            recorded, POST_EXIT_CLEANUP_GRACE,
-            "post-exit drain must be given a fresh relative grace, not a borrowed remainder"
+            .expect("drain must record the usable deadline it waited against");
+        assert!(
+            recorded >= before + POST_EXIT_CLEANUP_GRACE,
+            "usable deadline must include the full supplied grace, not Instant::now()"
+        );
+        assert!(
+            recorded <= after + POST_EXIT_CLEANUP_GRACE,
+            "usable deadline must be now+grace, not a leftover outer timeout"
         );
     }
 
@@ -515,8 +523,9 @@ mod tests {
     ///
     /// One thing this test still does *not* catch: a `grace` silently
     /// dropped (collapsed to ~0). That path is `Err` too, indistinguishable
-    /// from correct behaviour here — it stays the sibling positive test's
-    /// job (`post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline`).
+    /// from correct behaviour here — the sibling positive test catches it by
+    /// asserting the recorded usable deadline is `now + grace`, not `now`
+    /// (`post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline`).
     #[test]
     fn post_exit_grace_bounds_the_drain_when_the_pipe_closes_only_after_the_grace() {
         let group = xai_tty_utils::ProcessGroup::new().expect("group");
