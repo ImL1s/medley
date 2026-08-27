@@ -13,6 +13,8 @@ commit -- so nothing below touches the repository's own tree.
 
 from __future__ import annotations
 
+import re
+import shlex
 import sys
 import tempfile
 import textwrap
@@ -32,6 +34,7 @@ from check_unlinted_crates import (  # noqa: E402
     main,
     package_name,
     workspace_member_dirs,
+    _workflow_shell_line,
 )
 
 CLIPPY = "cargo clippy --manifest-path crates/{d}/Cargo.toml --all-targets -- -D warnings"
@@ -201,6 +204,161 @@ class LintedTokens(unittest.TestCase):
         # not disqualify an otherwise-clean, unmasked invocation.
         text = _workflow(CLIPPY.format(d="xai-grok-shell") + "  # keep")
         self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+    def test_ignores_an_echo_of_the_clippy_command(self):
+        # `"cargo clippy" in line` also matches `echo cargo clippy ...`,
+        # which never invokes clippy. Counting it would let a diagnostic
+        # print stand in for a deny-level lint (#508 review).
+        text = _workflow("echo " + CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(linted_tokens(text), set())
+
+    def test_counts_an_inline_yaml_run_invocation(self):
+        # Single-line `run:` is valid GHA; shlex then sees `-` and `run:`
+        # before `cargo`. Skipping those YAML tokens is what keeps this
+        # a real deny-level invocation (#508 review).
+        text = "      - run: " + CLIPPY.format(d="xai-grok-shell") + "\n"
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+    def test_counts_a_quoted_inline_yaml_run_invocation(self):
+        # GHA strips YAML quotes before the shell sees the value. `shlex`
+        # on the raw line would treat `'cargo clippy ...'` as one token
+        # (#508 review).
+        text = "      - run: '" + CLIPPY.format(d="xai-grok-shell") + "'\n"
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+    def test_counts_a_double_quoted_inline_yaml_run_invocation(self):
+        text = '      - run: "' + CLIPPY.format(d="xai-grok-shell") + '"\n'
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+    def test_counts_a_quoted_named_step_run_invocation(self):
+        # Named steps put `run:` on its own mapping line, with no leading
+        # `-`. YAML quoting still has to be stripped (#508 review).
+        text = (
+            "      - name: lint\n"
+            "        run: '" + CLIPPY.format(d="xai-grok-shell") + "'\n"
+        )
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+    def test_counts_a_package_flag_invocation(self):
+        text = _workflow(
+            "cargo clippy -p xai-grok-shell --all-targets -- -D warnings"
+        )
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
+
+def _independent_linted_crates(workflow_text: str) -> set[str]:
+    """Real deny-level `cargo clippy` crates, found by `shlex`-tokenizing
+    each line -- deliberately not `linted_invocation_tokens()`'s regex
+    checks.
+
+    Every discrimination case above (`|| true`, `;`, pipes, unknown
+    spellings, comments) already has a hand-written test in `LintedTokens`;
+    what that class cannot show is whether the pattern is right about the
+    real file, since its own fixtures chose the examples (#455). This is
+    the other leg: comment-stripping and operator-disqualifying are done
+    here with plain string ops and `shlex`, not the production regex, and
+    "does this token look like `-D warnings`" is answered by checking two
+    separate shlex tokens rather than a literal substring match.
+
+    `cargo clippy` must occupy the command position (after optional
+    `NAME=value` assignments), not merely appear as a substring --
+    `echo cargo clippy ...` never lints. Both `--manifest-path`
+    directories and `-p` / `--package` names are collected: comparing
+    only directories lets a `-p`-only deny-level line drift out of the
+    corpus (#508 review).
+    """
+    lines: list[str] = []
+    for raw in workflow_text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("#"):
+            continue
+        lines.append(raw.split("#", 1)[0] if "#" in raw else raw)
+    joined = re.sub(r"\\\s*\n\s*", " ", "\n".join(lines))
+    found: set[str] = set()
+    for line in joined.splitlines():
+        if any(op in line for op in (";", "&", "|")):
+            continue
+        shell = _workflow_shell_line(line)
+        try:
+            tokens = shlex.split(shell)
+        except ValueError:
+            continue
+        i = 0
+        while i < len(tokens) and tokens[i] in ("-", "run:"):
+            i += 1
+        while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[i]):
+            i += 1
+        if i + 1 >= len(tokens) or tokens[i] != "cargo" or tokens[i + 1] != "clippy":
+            continue
+        if "--all-targets" not in tokens:
+            continue
+        if not ("-D" in tokens and "warnings" in tokens):
+            continue
+        for j, tok in enumerate(tokens):
+            if tok == "--manifest-path" and j + 1 < len(tokens):
+                found.add(Path(tokens[j + 1]).parent.name)
+            if tok in ("-p", "--package") and j + 1 < len(tokens):
+                found.add(tokens[j + 1])
+    return found
+
+
+class IndependentLintedOracle(unittest.TestCase):
+    """The corpus oracle must reject non-invocations and see `-p` (#508)."""
+
+    def test_does_not_count_an_echo_of_clippy(self):
+        text = _workflow("echo " + CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(_independent_linted_crates(text), set())
+
+    def test_counts_a_package_flag(self):
+        text = _workflow(
+            "cargo clippy -p xai-grok-shell --all-targets -- -D warnings"
+        )
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+    def test_counts_a_manifest_path(self):
+        text = _workflow(CLIPPY.format(d="xai-grok-shell"))
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+    def test_counts_an_inline_yaml_run_invocation(self):
+        text = "      - run: " + CLIPPY.format(d="xai-grok-shell") + "\n"
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+    def test_counts_a_quoted_inline_yaml_run_invocation(self):
+        text = "      - run: '" + CLIPPY.format(d="xai-grok-shell") + "'\n"
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+    def test_counts_a_quoted_named_step_run_invocation(self):
+        text = (
+            "      - name: lint\n"
+            "        run: '" + CLIPPY.format(d="xai-grok-shell") + "'\n"
+        )
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+
+class LintedTokensCorpus(unittest.TestCase):
+    """`linted_tokens()` against the real `ci.yml`, enumerated by
+    `_independent_linted_crates` rather than the pattern under test.
+
+    Compared as the union of `--manifest-path` directories and `-p`
+    package names -- not directories alone -- so a deny-level `-p` line
+    cannot leave the corpus (#508 review).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow_text = (REPO / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        cls.oracle = _independent_linted_crates(cls.workflow_text)
+        cls.real = linted_tokens(cls.workflow_text)
+
+    def test_the_corpus_is_not_empty(self):
+        # A silent-empty scan would pass the agreement check below by
+        # vacuously agreeing with nothing.
+        self.assertGreater(len(self.oracle), 3, self.oracle)
+
+    def test_agrees_with_an_independently_tokenized_reading_of_the_real_workflow(self):
+        self.assertEqual(self.real, self.oracle)
 
 
 class PackageName(unittest.TestCase):

@@ -1231,6 +1231,20 @@ impl acp::Agent for MvpAgent {
             id: session_id.clone(),
             cwd: cwd.as_str().to_owned(),
         };
+        let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
+        // Bind the spawn-time catalog to one auth generation *before* the
+        // fetch: capturing afterwards would stamp user B onto user A's
+        // snapshot if auth flipped during the await (#505 review).
+        let chat_spawn_user_id = if is_chat_kind {
+            self.chat_modes.current_user_id()
+        } else {
+            None
+        };
+        let chat_spawn_auth_generation = if is_chat_kind {
+            self.chat_modes.current_auth_generation()
+        } else {
+            0
+        };
         // #418: a chat-kind session used to take `custom_model_id` verbatim
         // through `chat_initial_model`, never checking it against anything.
         // Fetch the chat-product catalog once here — `self.chat_modes`,
@@ -1244,12 +1258,25 @@ impl acp::Agent for MvpAgent {
         // (via `.into_state()`, which that display-only path does not need
         // the authority tag for), instead of the second
         // `self.chat_modes.model_state()` fetch that used to sit there
-        // alone.
+        // alone. #505's spawn-time fallback uses this same snapshot's
+        // `current_model_id` rather than the build catalog's.
         let chat_catalog = if is_chat_kind {
             Some(self.chat_modes.model_state_with_authority().await)
         } else {
             None
         };
+        if is_chat_kind
+            && !chat_spawn_identity_unchanged(
+                chat_spawn_user_id.as_deref(),
+                chat_spawn_auth_generation,
+                self.chat_modes.current_user_id().as_deref(),
+                self.chat_modes.current_auth_generation(),
+            )
+        {
+            return Err(acp::Error::internal_error().data(
+                "chat identity changed during session/new",
+            ));
+        }
         let chat_eligible_model_id = if is_chat_kind {
             custom_model_id.and_then(|requested| {
                 let catalog = chat_catalog
@@ -1265,7 +1292,6 @@ impl acp::Agent for MvpAgent {
         };
         let session_initial_model =
             chat_initial_model(is_chat_kind, chat_eligible_model_id.as_deref());
-        let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
         let prepared_model_plan = if is_chat_kind {
             None
         } else {
@@ -1522,6 +1548,21 @@ impl acp::Agent for MvpAgent {
             (show_non_git_warning, feedback_enabled)
         };
         let (models, model_presentation) = if is_chat_kind {
+            if !chat_spawn_identity_unchanged(
+                chat_spawn_user_id.as_deref(),
+                chat_spawn_auth_generation,
+                self.chat_modes.current_user_id().as_deref(),
+                self.chat_modes.current_auth_generation(),
+            ) {
+                if prepared_session.is_none() {
+                    self.remove_session(&session_id);
+                    #[cfg(all(feature = "local-workspace", unix))]
+                    self.shutdown_gateway_bridge(&session_id);
+                }
+                return Err(acp::Error::internal_error().data(
+                    "chat identity changed during session/new",
+                ));
+            }
             (
                 chat_new_session_model_state(
                     // Reuses the snapshot fetched above for the eligibility
@@ -1564,6 +1605,23 @@ impl acp::Agent for MvpAgent {
                 }
             }
         };
+        if is_chat_kind
+            && !chat_spawn_identity_unchanged(
+                chat_spawn_user_id.as_deref(),
+                chat_spawn_auth_generation,
+                self.chat_modes.current_user_id().as_deref(),
+                self.chat_modes.current_auth_generation(),
+            )
+        {
+            if prepared_session.is_none() {
+                self.remove_session(&session_id);
+                #[cfg(all(feature = "local-workspace", unix))]
+                self.shutdown_gateway_bridge(&session_id);
+            }
+            return Err(acp::Error::internal_error().data(
+                "chat identity changed during session/new",
+            ));
+        }
         let mut meta = serde_json::json!({
             "currentWorkingDirectory": cwd.as_str().to_owned(),
             "codebaseIndexed": indexed_roots,
