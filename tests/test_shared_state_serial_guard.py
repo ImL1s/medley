@@ -156,6 +156,44 @@ class RegistryDiscovery(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(items[0].identifiers, ("A", "B"))
 
+    def test_multiline_attr_between_statics_does_not_end_the_block(self):
+        # rustfmt wraps `#[cfg(any(...))]` across lines. SKIPPABLE_LINE
+        # matches `#[` but only the first line; the continuation is neither
+        # a static nor skippable, so the block used to end before B
+        # (#516 review).
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static A: AtomicU64 = AtomicU64::new(0);
+            #[cfg(any(
+                unix,
+                windows,
+            ))]
+            static B: AtomicU64 = AtomicU64::new(0);
+            """
+        )
+        items, errors = guard.find_registry([(Path("f.rs"), text)])
+        self.assertEqual(errors, [])
+        self.assertEqual(items[0].identifiers, ("A", "B"))
+
+    def test_inner_semicolon_in_static_initializer_does_not_end_the_decl(self):
+        # `";" not in line` stops on the inner `;` of
+        # `LazyLock::new(|| { let x = 1; x })`, dropping every later static
+        # (#516 review).
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static A: T = LazyLock::new(|| {
+                let x = 1;
+                x
+            });
+            static B: T = make();
+            """
+        )
+        items, errors = guard.find_registry([(Path("f.rs"), text)])
+        self.assertEqual(errors, [])
+        self.assertEqual(items[0].identifiers, ("A", "B"))
+
     def test_marker_inside_a_raw_string_is_not_a_registry_entry(self):
         text = src(
             '''\
@@ -288,6 +326,27 @@ class TransitiveClosure(unittest.TestCase):
             static COUNTER: AtomicU64 = AtomicU64::new(0);
 
             fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn calls_bump_untagged() {
+                bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_bump_untagged"})
+
+    def test_block_comment_between_signature_and_body_is_not_the_body(self):
+        # `fn bump() /* { } */ { COUNTER... }` — taking the comment's braces
+        # as the body hides the real toucher (#516 review).
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn bump() /* { } */ {
                 COUNTER.fetch_add(1, Ordering::SeqCst);
             }
 

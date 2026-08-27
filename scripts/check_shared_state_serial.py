@@ -564,6 +564,12 @@ def _fn_body(source: str, name_end: int) -> tuple[int, int] | None:
         if source[index].isspace():
             index += 1
             continue
+        comment_end = _skip_comment(source, index)
+        if comment_end is not None:
+            # `fn bump() /* { } */ { body }` — the comment's braces are not
+            # the body (#516 review).
+            index = comment_end
+            continue
         if source[index] == "{":
             return index, _balanced_end(source, index)
         if source[index] == ";":
@@ -750,6 +756,62 @@ def _keep_only_line_comments(source: str) -> str:
     return "".join(chars)
 
 
+def _lines_spanned(text: str, end: int) -> int:
+    """How many lines of `text` are occupied by `text[:end]`.
+
+    Maps a byte offset in a `''.join(lines)` remainder back to a count of
+    consumed `lines` entries.
+    """
+    if end <= 0:
+        return 0
+    prefix = text[:end]
+    n = prefix.count("\n")
+    if prefix.endswith("\n"):
+        return n
+    return n + 1
+
+
+def _static_decl_semicolon_end(source: str) -> int | None:
+    """Byte index just past the depth-0 `;` that ends a `static` decl.
+
+    An inner `;` (`LazyLock::new(|| { let x = 1; x })`) does not count
+    (#516 review). Comments, strings, and raw strings are skipped the same
+    way `_balanced_end` skips them.
+    """
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    stack: list[str] = []
+    index = 0
+    n = len(source)
+    while index < n:
+        comment_end = _skip_comment(source, index)
+        if comment_end is not None:
+            index = comment_end
+            continue
+        raw_end = _skip_raw_string(source, index)
+        if raw_end is not None:
+            index = raw_end
+            continue
+        char = source[index]
+        if char == '"':
+            index = _skip_quoted(source, index, char)
+            continue
+        if char == "'" and (char_end := _skip_char_literal(source, index)) is not None:
+            index = char_end
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+            index += 1
+            continue
+        if stack and char == stack[-1]:
+            stack.pop()
+            index += 1
+            continue
+        if char == ";" and not stack:
+            return index + 1
+        index += 1
+    return None
+
+
 def _consume_static_decl(lines: list[str], start: int) -> tuple[str | None, int]:
     """Read one `static NAME: ...;` possibly split across rustfmt lines.
 
@@ -761,24 +823,30 @@ def _consume_static_decl(lines: list[str], start: int) -> tuple[str | None, int]
     decl = STATIC_DECL.match(lines[start])
     if not decl:
         return None, start
-    i = start
-    while i < len(lines) and ";" not in lines[i]:
-        i += 1
-    if i < len(lines):
-        i += 1
-    else:
-        i = start + 1
-    return decl.group("name"), i
+    remainder = "".join(lines[start:])
+    end = _static_decl_semicolon_end(remainder)
+    if end is None:
+        return decl.group("name"), start + 1
+    return decl.group("name"), start + max(_lines_spanned(remainder, end), 1)
 
 
 def _skip_registry_filler(lines: list[str], start: int) -> int | None:
     """Advance past one blank/comment/attr line, or a `/* ... */` comment.
 
     Returns the next index, or `None` if `lines[start]` ends the block.
+    A `#[...]` attribute is consumed as a whole, including rustfmt-wrapped
+    `#[cfg(any(\\n ... \\n))]` (#516 review).
     """
     if start >= len(lines):
         return None
     if SKIPPABLE_LINE.match(lines[start]):
+        remainder = "".join(lines[start:])
+        stripped = lines[start].lstrip()
+        if stripped.startswith("#["):
+            indent = len(lines[start]) - len(stripped)
+            bracket = indent + 1  # the `[` in `#[`
+            end = _balanced_end(remainder, bracket)
+            return start + max(_lines_spanned(remainder, end), 1)
         return start + 1
     if not _BLOCK_COMMENT_OPEN.match(lines[start]):
         return None
