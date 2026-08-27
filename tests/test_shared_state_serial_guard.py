@@ -569,6 +569,71 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertIn("calls_imported_bump_untagged", names)
 
+    def test_path_qualified_macro_invocation_reaches_registered_state(self):
+        """`crate::bump!()` is a valid invocation; a lookbehind that
+        rejects `:` misses it (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[macro_export]
+            macro_rules! bump {
+                () => {
+                    COUNTER.fetch_add(1, Ordering::SeqCst)
+                };
+            }
+
+            #[test]
+            fn calls_crate_qualified_bump_untagged() {
+                crate::bump!();
+            }
+            """
+        )
+        names = derived_names(
+            [(Path("crates/codegen/demo/src/lib.rs"), text)], "demo_key"
+        )
+        self.assertIn("calls_crate_qualified_bump_untagged", names)
+
+    def test_generated_tests_from_an_imported_macro_are_derived_members(self):
+        """A test-generating macro defined in another file is still the
+        definition `pending.file` cannot name (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    #[macro_export]
+                    macro_rules! cases {
+                        ($name:ident) => {
+                            #[test]
+                            fn $name() {
+                                COUNTER.fetch_add(1, Ordering::SeqCst);
+                            }
+                        };
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    cases!(first);
+                    cases!(second);
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+
     def test_cross_file_call_into_inline_module_reaches_registered_state(self):
         sources = [
             (

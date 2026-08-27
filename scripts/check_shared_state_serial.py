@@ -251,7 +251,9 @@ FN_DEF = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
 )
 MACRO_DEF = re.compile(r"macro_rules!\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
-MACRO_INVOKE = re.compile(r"(?<![:.\w])([A-Za-z_][A-Za-z0-9_]*)\s*!")
+MACRO_INVOKE = re.compile(
+    r"(?<![:.\w])(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*([A-Za-z_][A-Za-z0-9_]*)\s*!"
+)
 INLINE_MOD = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
 )
@@ -1423,9 +1425,16 @@ def analyze(
     macro_index = {(fn.file, fn.name): i for i, fn in enumerate(functions) if fn.is_macro}
     for pending in pending_macro_tests:
         j = macro_index.get((pending.file, pending.macro_name))
-        if j is None:
+        indices = (
+            [j]
+            if j is not None
+            else list(by_macro_any.get(pending.macro_name, ()))
+        )
+        if not indices:
             continue
-        keys = keys_of[j]
+        keys: frozenset[str] = frozenset()
+        for idx in indices:
+            keys = keys | keys_of[idx]
         if not keys:
             continue
         functions.append(
