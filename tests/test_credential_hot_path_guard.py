@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+import textwrap
 import unittest
 from collections import deque
 from pathlib import Path
@@ -83,12 +84,70 @@ _REQUIRED_HOT_PATH_ENTRIES = frozenset(
 
 
 def _strip_line_comment(line: str) -> str:
-    # Good enough for brace-depth counting: does not account for `//`
-    # inside a string or char literal, which this repo's test modules do
-    # not do at a `mod`/brace boundary. A noted limitation, not a silent
-    # one.
+    # Used only for `mod name {` detection on already-masked lines.
     idx = line.find("//")
     return line if idx == -1 else line[:idx]
+
+
+_RAW_STRING_START = re.compile(r"(?:c|b)?r(#*)\"")
+
+
+def _mask_rust_literals(text: str) -> str:
+    """Replace comments and string/char/raw-string bodies with spaces.
+
+    Newlines are kept so line-oriented `mod` / `#[test]` scanning stays
+    aligned. Brace counting on the masked text then ignores `{` inside
+    `"{"`, `'{'`, `r#"{"paths":[]}"#`, and similar (#507 review).
+    """
+
+    out: list[str] = []
+    i = 0
+    n = len(text)
+
+    def keep_newlines(chunk: str) -> str:
+        return "".join("\n" if c == "\n" else " " for c in chunk)
+
+    while i < n:
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            if end < 0:
+                out.append(" " * (n - i))
+                break
+            out.append(" " * (end - i))
+            i = end
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append(keep_newlines(text[i:end]))
+            i = end
+            continue
+        raw = _RAW_STRING_START.match(text, i)
+        if raw:
+            hashes = raw.group(1)
+            closer = '"' + hashes
+            end = text.find(closer, raw.end())
+            end = n if end < 0 else end + len(closer)
+            out.append(keep_newlines(text[i:end]))
+            i = end
+            continue
+        if text[i] in "\"'":
+            q = text[i]
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == q:
+                    j += 1
+                    break
+                j += 1
+            out.append(keep_newlines(text[i:j]))
+            i = j
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
 
 
 def parse_documented_hot_path(text: str) -> dict[str, int]:
@@ -302,15 +361,18 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
 
 def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
     names: list[str] = []
-    lines = text.splitlines()
+    raw_lines = text.splitlines()
+    masked_lines = _mask_rust_literals(text).splitlines()
+    if len(masked_lines) < len(raw_lines):
+        masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
     mod_stack: list[tuple[int, str]] = []
     depth = 0
-    n = len(lines)
+    n = len(raw_lines)
     for i in range(n):
-        raw = lines[i]
+        raw = raw_lines[i]
 
         if _TEST_ATTR.match(raw):
-            for follow_raw in lines[i + 1 :]:
+            for follow_raw in raw_lines[i + 1 :]:
                 follow = follow_raw.strip()
                 if follow.startswith("#[") or follow.startswith("//"):
                     continue
@@ -323,7 +385,7 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
                     names.append(f"{prefix}::{m.group(1)}" if prefix else m.group(1))
                 break
 
-        line = _strip_line_comment(raw)
+        line = _strip_line_comment(masked_lines[i])
         mod_match = _MOD_OPEN.match(line)
         if mod_match:
             mod_stack.append((depth, mod_match.group(1)))
@@ -331,6 +393,25 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
         while mod_stack and depth <= mod_stack[-1][0]:
             mod_stack.pop()
     return names
+
+
+def _module_prefixes_for_source(
+    rs: Path, overrides: dict[Path, list[list[str]]]
+) -> list[list[str]] | None:
+    """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
+
+    Cargo crate roots (`src/lib.rs`, `tests/*.rs`) keep their path prefix
+    even when nothing `mod`s them. Every other file must appear in the
+    module graph (#507 review); an orphan leftover after a `mod` was
+    removed is not compiled and must not inflate CLAUDE.md counts.
+    """
+
+    key = rs.resolve()
+    if key in overrides:
+        return overrides[key]
+    if _is_cargo_crate_root_file(rs):
+        return [_path_module_prefix(rs)]
+    return None
 
 
 def _qualified_test_names(root: Path) -> list[str]:
@@ -359,8 +440,9 @@ def _qualified_test_names(root: Path) -> list[str]:
                 text = rs.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            key = rs.resolve()
-            prefix_lists = overrides.get(key) or [_path_module_prefix(rs)]
+            prefix_lists = _module_prefixes_for_source(rs, overrides)
+            if prefix_lists is None:
+                continue
             for file_mods in prefix_lists:
                 names.extend(_tests_in_file(text, file_mods))
     return names
@@ -431,13 +513,49 @@ class ExternalModulePrefix(unittest.TestCase):
     def test_nested_src_tests_dir_keeps_the_crate_root_prefix(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            nested = root / "crates" / "codegen" / "demo" / "src" / "agent" / "subagent" / "tests"
+            crate = root / "crates" / "codegen" / "demo" / "src"
+            nested = crate / "agent" / "subagent" / "tests"
             nested.mkdir(parents=True)
-            (nested.parent.parent.parent / "lib.rs").write_text("")
+            (crate / "lib.rs").write_text("mod agent;\n")
+            (crate / "agent").mkdir(parents=True, exist_ok=True)
+            (crate / "agent" / "mod.rs").write_text("mod subagent;\n")
+            (crate / "agent" / "subagent").mkdir(parents=True, exist_ok=True)
+            (crate / "agent" / "subagent" / "mod.rs").write_text("mod tests;\n")
+            (nested / "mod.rs").write_text("mod rest;\n")
             (nested / "rest.rs").write_text("#[test]\nfn works() {}\n")
             names = _qualified_test_names(root)
             self.assertIn("agent::subagent::tests::rest::works", names)
             self.assertNotIn("rest::works", names)
+
+    def test_orphan_src_file_is_not_scanned(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text("mod kept;\n")
+            (src / "kept.rs").write_text("#[test]\nfn visible() {}\n")
+            (src / "orphan.rs").write_text("#[test]\nfn hidden() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("kept::visible", names)
+            self.assertNotIn("orphan::hidden", names)
+            self.assertNotIn("hidden", names)
+
+    def test_string_brace_does_not_nest_following_module(self):
+        text = textwrap.dedent(
+            """\
+            mod first {
+                #[test]
+                fn in_first() {}
+                fn helper() { let _s = "{"; }
+            }
+            mod second {
+                #[test]
+                fn in_second() {}
+            }
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["first::in_first", "second::in_second"])
 
     def test_path_attr_keeps_the_declaring_file_prefix(self):
         with tempfile.TemporaryDirectory() as d:
