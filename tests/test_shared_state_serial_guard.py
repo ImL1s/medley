@@ -536,6 +536,103 @@ class TransitiveClosure(unittest.TestCase):
             untagged,
         )
 
+    def test_repeated_macro_args_are_distinct_members_not_sole_exempt(self):
+        """`cases!(one, two)` expands twice from one `fn $name` (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($($name:ident),*) => {
+                    $(
+                        #[test]
+                        fn $name() {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    )*
+                };
+            }
+
+            cases!(one, two);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+        findings = guard.scan_source(text)
+        self.assertGreaterEqual(
+            len(findings),
+            1,
+            "two generated tests must not collapse into a sole-member exemption",
+        )
+
+    def test_bare_call_resolves_inside_the_caller_inline_module(self):
+        """File-wide last `fn bump` must not steal an earlier module (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            mod a {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+
+                #[test]
+                fn calls_a() {
+                    bump();
+                }
+            }
+
+            mod b {
+                fn bump() {}
+
+                #[test]
+                fn calls_b() {
+                    bump();
+                }
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertIn("calls_a", names)
+        self.assertNotIn("calls_b", names)
+
+    def test_generated_helper_fn_without_test_attr_is_not_a_member(self):
+        """Only `#[test] fn $ident` slots count as generated tests (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn already_a_member() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            macro_rules! wrap {
+                ($name:ident) => {
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    #[test]
+                    fn $name_test() {
+                        $name();
+                    }
+                };
+            }
+
+            wrap!(helper);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("wrap!")}
+        self.assertEqual(len(generated), 1, names)
+
     def test_imported_macro_invocation_reaches_registered_state(self):
         sources = [
             (

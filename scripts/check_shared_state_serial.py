@@ -394,6 +394,61 @@ def _balanced_end(source: str, open_index: int) -> int:
     return index
 
 
+def _macro_invoke_arity(source: str, bang_end: int) -> int:
+    """Top-level items in `macro!(...)` / `![...]` / `!{...}`.
+
+    `cases!(one, two)` with one `fn $name` template expands twice; counting
+    the invocation's arity is what lets those expansions exist as two
+    members before the sole-member exemption (#516 review).
+    """
+
+    index = bang_end
+    while index < len(source) and source[index].isspace():
+        index += 1
+    if index >= len(source) or source[index] not in "([{":
+        return 1
+    end = _balanced_end(source, index)
+    items = 0
+    saw_item = False
+    i = index + 1
+    limit = end - 1 if end > index else index
+    while i < limit:
+        comment_end = _skip_comment(source, i)
+        if comment_end is not None:
+            i = comment_end
+            continue
+        raw_end = _skip_raw_string(source, i)
+        if raw_end is not None:
+            i = raw_end
+            saw_item = True
+            continue
+        ch = source[i]
+        if ch == '"':
+            i = _skip_quoted(source, i, ch)
+            saw_item = True
+            continue
+        if ch == "'" and (char_end := _skip_char_literal(source, i)) is not None:
+            i = char_end
+            saw_item = True
+            continue
+        if ch in "([{":
+            i = _balanced_end(source, i)
+            saw_item = True
+            continue
+        if ch == ",":
+            if saw_item:
+                items += 1
+            saw_item = False
+            i += 1
+            continue
+        if not ch.isspace():
+            saw_item = True
+        i += 1
+    if saw_item:
+        items += 1
+    return max(items, 1)
+
+
 def _skip_generic_params(source: str, open_index: int) -> int:
     """Skip a `<...>` generic parameter list starting at `open_index`
     (`source[open_index]` must be `<`), respecting nesting (`<A<B>>`) and
@@ -1015,9 +1070,12 @@ def _generated_test_serials(body: str) -> list[tuple[frozenset[str], bool]]:
 
     out: list[tuple[frozenset[str], bool]] = []
     for match in MACRO_TEST_FN.finditer(body):
+        attrs = _preceding_attributes(body, body, match.start())
+        if not any(_is_test_attr(a) for a in attrs):
+            continue
         held: set[str] = set()
         has_unkeyed = False
-        for attr in _preceding_attributes(body, body, match.start()):
+        for attr in attrs:
             parsed = _serial_keys(attr)
             if parsed is None:
                 continue
@@ -1026,7 +1084,7 @@ def _generated_test_serials(body: str) -> list[tuple[frozenset[str], bool]]:
             else:
                 held.update(parsed)
         out.append((frozenset(held), has_unkeyed))
-    return out or [(frozenset(), False)]
+    return out
 
 
 @dataclass(frozen=True)
@@ -1145,19 +1203,22 @@ def index_functions(
                 continue
             line = _line(raw, invoke.start())
             inline_mods = _inline_path_from_spans(inline_spans, invoke.start())
-            for slot, (serial_held, has_unkeyed) in enumerate(serials):
-                pending.append(
-                    _PendingMacroTest(
-                        file=rel,
-                        macro_name=macro_name,
-                        line=line,
-                        start=invoke.start(),
-                        inline_mods=inline_mods,
-                        serial_held=serial_held,
-                        has_unkeyed_serial=has_unkeyed,
-                        slot=slot,
+            arity = _macro_invoke_arity(code, invoke.end())
+            n_serials = len(serials)
+            for rep in range(arity):
+                for slot, (serial_held, has_unkeyed) in enumerate(serials):
+                    pending.append(
+                        _PendingMacroTest(
+                            file=rel,
+                            macro_name=macro_name,
+                            line=line,
+                            start=invoke.start(),
+                            inline_mods=inline_mods,
+                            serial_held=serial_held,
+                            has_unkeyed_serial=has_unkeyed,
+                            slot=rep * n_serials + slot,
+                        )
                     )
-                )
     return out, pending
 
 
@@ -1249,7 +1310,19 @@ def _resolve_calls(
     file_index = by_file.get(fn.file, {})
     caller_module = _module_path(fn.file)
     for m in FREE_CALL.finditer(fn.body):
-        j = file_index.get(m.group(1))
+        # Resolve a bare call inside the caller's inline module first, then
+        # ancestors. File-wide last-definition lookup lets `mod b { fn bump }`
+        # steal `mod a { bump() }` (#516 review).
+        name = m.group(1)
+        j = None
+        prefix = fn.inline_mods
+        while True:
+            j = by_inline.get((fn.file, prefix), {}).get(name)
+            if j is not None:
+                break
+            if not prefix:
+                break
+            prefix = prefix[:-1]
         if j is not None and j != self_index:
             gained.update(keys_of[j])
     macro_index = by_macro.get(fn.file, {})
