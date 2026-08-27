@@ -44,6 +44,7 @@ from __future__ import annotations
 import re
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -190,21 +191,89 @@ def _is_lib_or_integration_source(rs: Path) -> bool:
     return True
 
 
+def _is_cargo_crate_root_file(rs: Path) -> bool:
+    """`src/lib.rs` or an integration target `tests/foo.rs`."""
+
+    split = _crate_source_rel(rs)
+    if split is None:
+        return False
+    marker, rest = split
+    if marker == "src" and rest == ["lib.rs"]:
+        return True
+    if marker == "tests" and len(rest) == 1 and rest[0].endswith(".rs"):
+        return True
+    return False
+
+
+def _mod_search_dir(declaring: Path) -> Path:
+    """Directory rustc searches for `mod name;` declared in `declaring`."""
+
+    if declaring.name in ("lib.rs", "main.rs", "mod.rs"):
+        return declaring.parent
+    split = _crate_source_rel(declaring)
+    if split and split[0] == "tests" and len(split[1]) == 1:
+        return declaring.parent
+    return declaring.parent / declaring.stem
+
+
+def _existing_mod_file(search_dir: Path, name: str) -> Path | None:
+    for candidate in (search_dir / f"{name}.rs", search_dir / name / "mod.rs"):
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _iter_module_decls(text: str, declaring: Path) -> list[tuple[str, Path]]:
+    """`(name, child file)` for `#[path]` and ordinary `mod name;` that resolve."""
+
+    decls: list[tuple[str, Path]] = []
+    pending_path: str | None = None
+    for raw in text.splitlines():
+        line = _strip_line_comment(raw).strip()
+        path_match = _PATH_ATTR.search(line)
+        if path_match:
+            pending_path = path_match.group(1)
+            continue
+        semi = _MOD_SEMI.match(line)
+        if semi:
+            name = semi.group(1)
+            if pending_path:
+                child = (declaring.parent / pending_path).resolve()
+                decls.append((name, child))
+            else:
+                child = _existing_mod_file(_mod_search_dir(declaring), name)
+                if child is not None:
+                    decls.append((name, child))
+            pending_path = None
+            continue
+        if line:
+            pending_path = None
+    return decls
+
+
 def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
-    """`#[path = "..."] mod name;` maps the target to the declaring
-    file's module prefix plus `name`.
+    """Logical module prefixes for files reached via `mod` / `#[path]`.
 
-    The declared module is a child of the declaring file, not a sibling
-    of the target's directory. `session/acp_session.rs` with
-    `#[path = "acp_session_tests/auth_error_no_retry_tests.rs"] mod
-    auth_error_no_retry_tests;` is
-    `session::acp_session::auth_error_no_retry_tests`, not
-    `session::acp_session_tests::...` (#507 review).
-
-    One file included by several integration targets contributes one
-    prefix per declaring target, not a last-writer-wins map (#507 review).
+    Ordinary `mod common;` from several integration roots counts once per
+    target (#507 review). `#[path]` prefixes propagate into descendant
+    `mod child;` files so Cargo's logical path is what the scan records.
     """
     overrides: dict[Path, list[list[str]]] = {}
+    seen: set[tuple[Path, tuple[str, ...]]] = set()
+    queue: deque[tuple[Path, tuple[str, ...]]] = deque()
+    texts: dict[Path, str] = {}
+
+    def read_rs(rs: Path) -> str | None:
+        key = rs.resolve()
+        if key in texts:
+            return texts[key]
+        try:
+            text = rs.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        texts[key] = text
+        return text
+
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
@@ -212,27 +281,22 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         for rs in base_dir.rglob("*.rs"):
             if not _is_lib_or_integration_source(rs):
                 continue
-            try:
-                text = rs.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            pending_path: str | None = None
-            for raw in text.splitlines():
-                line = _strip_line_comment(raw).strip()
-                path_match = _PATH_ATTR.search(line)
-                if path_match:
-                    pending_path = path_match.group(1)
-                    continue
-                semi = _MOD_SEMI.match(line)
-                if semi and pending_path:
-                    child = (rs.parent / pending_path).resolve()
-                    overrides.setdefault(child, []).append(
-                        _path_module_prefix(rs) + [semi.group(1)]
-                    )
-                    pending_path = None
-                    continue
-                if line:
-                    pending_path = None
+            if _is_cargo_crate_root_file(rs):
+                queue.append((rs.resolve(), tuple(_path_module_prefix(rs))))
+
+    while queue:
+        declaring, prefix = queue.popleft()
+        seen_key = (declaring, prefix)
+        if seen_key in seen:
+            continue
+        seen.add(seen_key)
+        text = read_rs(declaring)
+        if text is None:
+            continue
+        for name, child in _iter_module_decls(text, declaring):
+            child_prefix = list(prefix) + [name]
+            overrides.setdefault(child, []).append(child_prefix)
+            queue.append((child, tuple(child_prefix)))
     return overrides
 
 
@@ -438,6 +502,42 @@ class ExternalModulePrefix(unittest.TestCase):
             (tests / "b.rs").write_text('#[path = "shared.rs"]\nmod common;\n')
             names = _qualified_test_names(root)
             self.assertEqual(names.count("common::none_auth_scheme_sends"), 2)
+
+    def test_ordinary_mod_from_two_integration_roots_is_counted_twice(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            tests = root / "crates" / "codegen" / "demo" / "tests"
+            (tests / "common").mkdir(parents=True)
+            (tests / "common" / "mod.rs").write_text(
+                "#[test]\nfn none_auth_scheme_sends() {}\n"
+            )
+            (tests / "a.rs").write_text("mod common;\n")
+            (tests / "b.rs").write_text("mod common;\n")
+            names = _qualified_test_names(root)
+            self.assertEqual(names.count("common::none_auth_scheme_sends"), 2)
+
+    def test_path_prefix_propagates_to_descendant_modules(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            session = root / "crates" / "codegen" / "demo" / "src" / "session"
+            impl = session / "acp_session_impl"
+            (impl / "extensions").mkdir(parents=True)
+            (root / "crates" / "codegen" / "demo" / "src" / "lib.rs").write_text(
+                "mod session;\n"
+            )
+            (session / "mod.rs").write_text("mod acp_session;\n")
+            (session / "acp_session.rs").write_text(
+                '#[path = "acp_session_impl/extensions.rs"]\nmod extensions;\n'
+            )
+            (impl / "extensions.rs").write_text("mod idle_prompt;\n")
+            (impl / "extensions" / "idle_prompt.rs").write_text(
+                "#[test]\nfn none_auth_scheme_sends() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn(
+                "session::acp_session::extensions::idle_prompt::none_auth_scheme_sends",
+                names,
+            )
 
     def test_src_bin_tests_are_not_scanned(self):
         with tempfile.TemporaryDirectory() as d:
