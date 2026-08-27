@@ -17,6 +17,8 @@ const GROUP_EXIT_POLL: Duration = Duration::from_millis(1);
 thread_local! {
     static TERMINATE_OWNED_GROUP_SLEEPS: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
+    static LAST_PIPE_DRAIN_REMAINING: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +153,12 @@ fn recv_pipe_drain(
     label: &'static str,
 ) -> Result<Vec<u8>, String> {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    #[cfg(test)]
+    LAST_PIPE_DRAIN_REMAINING.with(|slot| {
+        if slot.get().is_none() {
+            slot.set(Some(remaining));
+        }
+    });
     receiver
         .recv_timeout(remaining)
         .map_err(|_| format!("tmux {label} did not close before the query deadline"))?
@@ -449,34 +457,38 @@ mod tests {
         );
     }
 
-    /// Drives `post_exit_cleanup_and_drain` with pipes that close after a
-    /// guaranteed minimum still inside `POST_EXIT_CLEANUP_GRACE`. Collapsing
-    /// the helper's deadline to `Instant::now()` loses that race; a fresh
-    /// grace wins (#501 review). The sibling test below bounds the other
-    /// direction (pipe closes only after a too-small grace).
+    /// Records the remaining drain budget at `recv_timeout`, rather than
+    /// racing a worker thread against a wall-clock upper bound (#501 review).
+    /// Pre-filling the pipes means a borrowed `Instant::now()` deadline
+    /// still succeeds on the recv itself; the remaining duration is what
+    /// distinguishes a fresh grace (~300ms) from a collapsed one (~0).
     #[test]
     fn post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline() {
         let group = xai_tty_utils::ProcessGroup::new().expect("group");
+        LAST_PIPE_DRAIN_REMAINING.with(|c| c.set(None));
 
-        // Pipes close after a guaranteed minimum that still fits inside
-        // `POST_EXIT_CLEANUP_GRACE`. Collapsing the helper's deadline to
-        // `Instant::now()` loses the race; a fresh grace wins (#501 review).
         let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            let _ = stdout_tx.send(Ok(b"ok\n".to_vec()));
-        });
+        stdout_tx
+            .send(Ok(b"ok\n".to_vec()))
+            .expect("pre-fill stdout");
+        drop(stdout_tx);
         let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            let _ = stderr_tx.send(Ok(Vec::new()));
-        });
+        stderr_tx.send(Ok(Vec::new())).expect("pre-fill stderr");
+        drop(stderr_tx);
 
         let (stdout, stderr) =
             post_exit_cleanup_and_drain(&group, stdout_rx, stderr_rx, POST_EXIT_CLEANUP_GRACE)
-                .expect("a fresh nominal grace must outlast a 20ms pipe close");
+                .expect("pre-filled pipes must drain under a fresh grace");
         assert_eq!(String::from_utf8_lossy(&stdout).trim(), "ok");
         assert!(stderr.is_empty());
+        let remaining = LAST_PIPE_DRAIN_REMAINING
+            .with(|c| c.get())
+            .expect("drain must record the remaining budget");
+        assert!(
+            remaining > POST_EXIT_CLEANUP_GRACE / 2,
+            "fresh grace remaining was {remaining:?}; a borrowed Instant::now() \
+             deadline would be ~0"
+        );
     }
 
     /// The other half of the property above, made deterministic instead of
@@ -703,6 +715,7 @@ mod tests {
         let timeout = Duration::from_millis(5000);
         let ready_marker = temp.path().join("descendant-ready");
         let go_marker = temp.path().join("leader-exited");
+        let pid_file = temp.path().join("leader-pid");
         let script = format!(
             "#!/bin/sh\n\
              ( /usr/bin/perl -e 'use POSIX qw(setsid); setsid(); \
@@ -711,10 +724,11 @@ mod tests {
              select(undef, undef, undef, 0.8);' ) &\n\
              while [ ! -f \"{marker}\" ]; do :; done\n\
              printf 'tmux 3.4\\n'\n\
-             : > \"{go}\"\n\
+             printf '%s\\n' \"$$\" > \"{pid}\"\n\
              exit 0\n",
             marker = ready_marker.display(),
             go = go_marker.display(),
+            pid = pid_file.display(),
         );
         std::fs::write(&tmux, script).unwrap();
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -729,9 +743,39 @@ mod tests {
         unsafe {
             std::env::set_var("PATH", &path);
         }
+        let pid_file_for_watch = pid_file.clone();
+        let go_for_watch = go_marker.clone();
+        let watcher = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let pid = loop {
+                if let Ok(s) = std::fs::read_to_string(&pid_file_for_watch) {
+                    if let Ok(p) = s.trim().parse::<libc::pid_t>() {
+                        if p > 1 {
+                            break p;
+                        }
+                    }
+                }
+                if start.elapsed() > Duration::from_secs(5) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            loop {
+                let alive = unsafe { libc::kill(pid, 0) == 0 };
+                if !alive {
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(10) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = std::fs::write(&go_for_watch, b"");
+        });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_tmux_bounded(TmuxCommand::Version, timeout)
         }));
+        let _ = watcher.join();
         match previous_path {
             Some(value) => unsafe {
                 std::env::set_var("PATH", value);
