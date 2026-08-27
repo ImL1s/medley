@@ -883,9 +883,19 @@ mod tests {
     #[test]
     fn group_that_ignores_sigterm_waits_the_grace_and_is_killed() {
         let mut group = xai_tty_utils::ProcessGroup::new().expect("group");
+        let ready_path = std::env::temp_dir().join(format!(
+            "medley-tmux-probe-escalation-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&ready_path);
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-            .arg("trap '' TERM; sleep 1000")
+            .arg("trap '' TERM; : > \"$READY_FILE\"; sleep 1000")
+            .env("READY_FILE", &ready_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -893,10 +903,21 @@ mod tests {
         #[allow(clippy::disallowed_methods)] // test fixture; the test kills it
         let mut child = cmd.spawn().expect("spawn sigterm-ignoring child");
         group.attach_std(&child).expect("attach");
-        // The shell installs its trap ~0.3ms after exec. Signal before that
-        // and it dies to the default SIGTERM, leaving a zombie that still
-        // reports live — the test then passes without exercising SIGKILL.
-        std::thread::sleep(Duration::from_millis(250));
+        // Handshake, not a head start: the child creates READY_FILE only
+        // after the SIGTERM trap is installed. Waiting for that file is
+        // what keeps SIGTERM from racing the default disposition under a
+        // loaded Ubuntu runner (#501 review).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = group.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&ready_path);
+                panic!("fixture never signalled that its SIGTERM trap was installed");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_file(&ready_path);
 
         let started = std::time::Instant::now();
         terminate_owned_group(&group);
