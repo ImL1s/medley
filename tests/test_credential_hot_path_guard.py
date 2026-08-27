@@ -253,12 +253,18 @@ def _path_module_prefix(rs: Path) -> list[str]:
     return list(rest)
 
 
-def _is_lib_or_integration_source(rs: Path) -> bool:
+def _is_lib_or_integration_source(
+    rs: Path, extra_roots: set[Path] | frozenset[Path] | None = None
+) -> bool:
     """CLAUDE.md measures `--lib` plus integration targets, not bins.
 
     `src/main.rs` and `src/bin/**` are cargo binary roots; a test there is
     not selected by the documented hot-path invocation (#507 review).
+    An explicit `[[test]] path` outside `src/`/`tests/` is still a cargo
+    integration target (#507 review).
     """
+    if extra_roots and rs.resolve() in extra_roots:
+        return True
     split = _crate_source_rel(rs)
     if split is None:
         return False
@@ -272,11 +278,19 @@ def _is_lib_or_integration_source(rs: Path) -> bool:
 
 
 def _is_cargo_crate_root_file(
-    rs: Path, extra_roots: set[Path] | frozenset[Path] | None = None
+    rs: Path,
+    extra_roots: set[Path] | frozenset[Path] | None = None,
+    gated_roots: set[Path] | frozenset[Path] | None = None,
 ) -> bool:
-    """`src/lib.rs`, an integration target `tests/*.rs`, or an explicit `[[test]].path`."""
+    """`src/lib.rs`, an integration target `tests/*.rs`, or an explicit `[[test]].path`.
+
+    `required-features` targets are off by default and are not part of the
+    documented hot-path invocation (#507 review).
+    """
 
     key = rs.resolve()
+    if gated_roots and key in gated_roots:
+        return False
     if extra_roots and key in extra_roots:
         return True
     split = _crate_source_rel(rs)
@@ -290,14 +304,20 @@ def _is_cargo_crate_root_file(
     return False
 
 
-def _explicit_integration_roots(root: Path) -> set[Path]:
-    """Cargo `[[test]]` targets whose `path` is not a top-level `tests/*.rs`.
+def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
+    """Explicit `[[test]]` paths and feature-gated integration targets.
 
-    `tests/leader_pty_e2e/mod.rs` is a real integration crate (#507 review)
-    but `_is_cargo_crate_root_file`'s `tests/*.rs` shape misses it.
+    Extra roots: `path =` files cargo compiles without extra features.
+    `tests/leader_pty_e2e/mod.rs` is one -- `_is_cargo_crate_root_file`'s
+    `tests/*.rs` shape misses it (#507 review).
+
+    Gated: `required-features` targets, including default
+    `tests/<name>.rs`. Default `cargo test` (the CLAUDE.md hot path) does
+    not build them.
     """
 
-    roots: set[Path] = set()
+    extra: set[Path] = set()
+    gated: set[Path] = set()
     for manifest in root.rglob("Cargo.toml"):
         if "target" in manifest.parts:
             continue
@@ -305,23 +325,59 @@ def _explicit_integration_roots(root: Path) -> set[Path]:
             text = manifest.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        crate = manifest.parent
         in_test = False
+        name: str | None = None
+        path_s: str | None = None
+        required = False
+
+        def flush() -> None:
+            nonlocal name, path_s, required, in_test
+            if not in_test:
+                return
+            target: Path | None = None
+            if path_s:
+                target = (crate / path_s).resolve()
+            elif name:
+                target = (crate / "tests" / f"{name}.rs").resolve()
+            if target is not None:
+                if required:
+                    gated.add(target)
+                elif path_s and target.is_file():
+                    extra.add(target)
+            name = None
+            path_s = None
+            required = False
+            in_test = False
+
         for line in text.splitlines():
             stripped = line.strip()
             if stripped == "[[test]]":
+                flush()
                 in_test = True
+                name = None
+                path_s = None
+                required = False
                 continue
             if stripped.startswith("["):
-                in_test = False
+                flush()
                 continue
             if not in_test:
                 continue
+            match = re.match(r'^name\s*=\s*"([^"]+)"', stripped)
+            if match:
+                name = match.group(1)
+                continue
             match = re.match(r'^path\s*=\s*"([^"]+)"', stripped)
             if match:
-                path = (manifest.parent / match.group(1)).resolve()
-                if path.is_file():
-                    roots.add(path)
-    return roots
+                path_s = match.group(1)
+                continue
+            if stripped.startswith("required-features"):
+                inner = stripped.split("=", 1)[-1].strip()
+                compact = re.sub(r"\s+", "", inner)
+                required = compact not in ("[]", "")
+        flush()
+    return extra, gated
 
 
 def _mod_search_dir(declaring: Path) -> Path:
@@ -365,10 +421,21 @@ def _iter_module_decls(
     inline_stack: list[tuple[int, str, bool]] = []
     for i, raw in enumerate(raw_lines):
         line = _strip_line_comment(masked_lines[i])
-        stripped_raw = _strip_line_comment(raw).strip()
+        raw_no_line_comment = _strip_line_comment(raw)
+        stripped_raw = raw_no_line_comment.strip()
         attrs, remainder = _leading_attrs(line)
         enclosing_off = any(off for _, _, off in inline_stack)
-        path_match = _PATH_ATTR.search(stripped_raw)
+        # `#[path = "x"]` stores the path in a string, so a full literal
+        # mask blanks it. Search the line-comment-stripped raw line, then
+        # keep the match only if that `#[path]` is live code: the `#`
+        # survives the comment/string mask. A `#[path]` inside `/* ... */`
+        # or a string is spaces in the mask (#507 review).
+        path_match = _PATH_ATTR.search(raw_no_line_comment)
+        if path_match:
+            start = path_match.start()
+            masked_line = masked_lines[i]
+            if start >= len(masked_line) or masked_line[start] != "#":
+                path_match = None
         if path_match:
             pending_path = path_match.group(1)
             pending_attrs.extend(attrs)
@@ -437,15 +504,15 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         texts[key] = text
         return text
 
-    extra_roots = _explicit_integration_roots(root)
+    extra_roots, gated_roots = _cargo_test_targets(root)
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
             continue
         for rs in base_dir.rglob("*.rs"):
-            if not _is_lib_or_integration_source(rs):
+            if not _is_lib_or_integration_source(rs, extra_roots):
                 continue
-            if _is_cargo_crate_root_file(rs, extra_roots):
+            if _is_cargo_crate_root_file(rs, extra_roots, gated_roots):
                 queue.append((rs.resolve(), tuple(_path_module_prefix(rs)), ()))
 
     while queue:
@@ -636,6 +703,7 @@ def _module_prefixes_for_source(
     rs: Path,
     overrides: dict[Path, list[list[str]]],
     extra_roots: set[Path] | frozenset[Path] | None = None,
+    gated_roots: set[Path] | frozenset[Path] | None = None,
 ) -> list[list[str]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
@@ -649,7 +717,7 @@ def _module_prefixes_for_source(
     prefixes: list[list[str]] = []
     if key in overrides:
         prefixes.extend(overrides[key])
-    if _is_cargo_crate_root_file(rs, extra_roots):
+    if _is_cargo_crate_root_file(rs, extra_roots, gated_roots):
         root_prefix = _path_module_prefix(rs)
         if root_prefix not in prefixes:
             prefixes.append(root_prefix)
@@ -670,20 +738,22 @@ def _qualified_test_names(root: Path) -> list[str]:
     the defect this guard exists to catch.
     """
     overrides = _declared_module_overrides(root)
-    extra_roots = _explicit_integration_roots(root)
+    extra_roots, gated_roots = _cargo_test_targets(root)
     names: list[str] = []
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
             continue
         for rs in base_dir.rglob("*.rs"):
-            if not _is_lib_or_integration_source(rs):
+            if not _is_lib_or_integration_source(rs, extra_roots):
                 continue
             try:
                 text = rs.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            prefix_lists = _module_prefixes_for_source(rs, overrides, extra_roots)
+            prefix_lists = _module_prefixes_for_source(
+                rs, overrides, extra_roots, gated_roots
+            )
             if prefix_lists is None:
                 continue
             for file_mods in prefix_lists:
@@ -799,6 +869,55 @@ class ExternalModulePrefix(unittest.TestCase):
             (nested / "cluster.rs").write_text("#[test]\nfn boots() {}\n", encoding="utf-8")
             names = _qualified_test_names(root)
             self.assertIn("cluster::boots", names)
+
+    def test_required_features_integration_target_is_not_seeded(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            tests = crate / "tests"
+            tests.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[[test]]\nname = \"gated\"\n"
+                'required-features = ["test-support"]\n',
+                encoding="utf-8",
+            )
+            (tests / "gated.rs").write_text("#[test]\nfn hidden() {}\n")
+            (tests / "live.rs").write_text("#[test]\nfn visible() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("visible", names)
+            self.assertNotIn("hidden", names)
+
+    def test_commented_path_attr_does_not_redirect_live_mod(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "codegen" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                '/* #[path = "orphan.rs"] */\nmod live;\n'
+            )
+            (src / "orphan.rs").write_text("#[test]\nfn hidden() {}\n")
+            (src / "live.rs").write_text("#[test]\nfn visible() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("live::visible", names)
+            self.assertNotIn("orphan::hidden", names)
+            self.assertNotIn("hidden", names)
+
+    def test_explicit_cargo_test_path_outside_src_tests_is_scanned(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            integ = crate / "integration"
+            integ.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[[test]]\nname = \"custom\"\n"
+                'path = "integration/custom.rs"\n',
+                encoding="utf-8",
+            )
+            (integ / "custom.rs").write_text("#[test]\nfn boots() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("boots", names)
 
     def test_string_brace_does_not_nest_following_module(self):
         text = textwrap.dedent(
