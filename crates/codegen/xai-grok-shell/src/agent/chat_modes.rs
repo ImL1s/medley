@@ -72,6 +72,9 @@ struct CachedModes {
     /// Keyed by identity; a mismatch is a miss so one user's modes never leak to another.
     user_id: String,
     locale: String,
+    /// API keys share an empty `user_id`; this generation distinguishes
+    /// credential replacements (#483 review).
+    auth_generation: u64,
     fetched_at: Instant,
     response: ListModesResponse,
 }
@@ -119,6 +122,14 @@ impl ChatModesManager {
     /// per-identity (tier/ACL), so every cache key and store is gated on it.
     fn current_user_id(&self) -> Option<String> {
         self.inner.auth.current_or_expired().map(|a| a.user_id)
+    }
+    fn current_auth_generation(&self) -> u64 {
+        self.inner.auth.current_selection_generation()
+    }
+    fn cache_matches(&self, cached: &CachedModes, user_id: &str, locale: &str) -> bool {
+        cached.user_id == user_id
+            && cached.locale == locale
+            && cached.auth_generation == self.current_auth_generation()
     }
     /// Chat model state for a `session/load` response. On missing auth or fetch
     /// failure, serves last-good cache else empty — never the build catalog.
@@ -168,11 +179,11 @@ impl ChatModesManager {
             return ChatModelCatalog::NoInfo(empty_state());
         };
         let locale = DEFAULT_LOCALE;
+        let auth_generation = self.current_auth_generation();
         {
             let guard = self.inner.cache.read();
             if let Some(c) = guard.as_ref()
-                && c.user_id == user_id
-                && c.locale == locale
+                && self.cache_matches(c, &user_id, locale)
             {
                 if c.fetched_at.elapsed() < CACHE_TTL {
                     return ChatModelCatalog::Authoritative(modes_to_model_state(&c.response));
@@ -191,8 +202,7 @@ impl ChatModesManager {
         {
             let guard = self.inner.cache.read();
             if let Some(c) = guard.as_ref()
-                && c.user_id == user_id
-                && c.locale == locale
+                && self.cache_matches(c, &user_id, locale)
                 && c.fetched_at.elapsed() < CACHE_TTL
             {
                 return ChatModelCatalog::Authoritative(modes_to_model_state(&c.response));
@@ -200,7 +210,9 @@ impl ChatModesManager {
         }
         match self.fetch(locale).await {
             Ok(resp) => {
-                if self.current_user_id().as_deref() != Some(user_id.as_str()) {
+                if self.current_user_id().as_deref() != Some(user_id.as_str())
+                    || self.current_auth_generation() != auth_generation
+                {
                     return ChatModelCatalog::NoInfo(empty_state());
                 }
                 let mapped = modes_to_model_state(&resp);
@@ -231,7 +243,7 @@ impl ChatModesManager {
                     // same staleness risk as the background-refresh case
                     // above, just reached via a different path -- treated
                     // the same way: displayable, not authoritative.
-                    Some(c) if c.user_id == user_id => {
+                    Some(c) if self.cache_matches(c, &user_id, locale) => {
                         ChatModelCatalog::NoInfo(modes_to_model_state(&c.response))
                     }
                     _ => ChatModelCatalog::NoInfo(empty_state()),
@@ -254,6 +266,7 @@ impl ChatModesManager {
         *self.inner.cache.write() = Some(CachedModes {
             user_id,
             locale,
+            auth_generation: self.current_auth_generation(),
             fetched_at: Instant::now(),
             response,
         });
@@ -299,11 +312,17 @@ impl ChatModesManager {
         *self.inner.cache.write() = Some(CachedModes {
             user_id: user_id.into(),
             locale: DEFAULT_LOCALE.to_owned(),
+            auth_generation: self.current_auth_generation(),
             fetched_at: Instant::now()
                 .checked_sub(age)
                 .expect("test age must not underflow Instant"),
             response,
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn auth_for_test(&self) -> Arc<AuthManager> {
+        self.inner.auth.clone()
     }
 
     #[cfg(test)]
@@ -675,5 +694,39 @@ mod tests {
         };
         let state = modes_to_model_state(&resp);
         assert_eq!(state.available_models[0].name, "grok-4.5");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_misses_when_auth_generation_changes_for_the_same_user_id() {
+        use crate::auth::GrokAuth;
+
+        let manager = manager_authenticated_as("");
+        manager.seed_cache_for_test(
+            "",
+            Duration::ZERO,
+            ListModesResponse {
+                modes: vec![available("a", "A")],
+                default_mode_id: "a".to_owned(),
+            },
+        );
+        manager.auth_for_test().hot_swap(GrokAuth {
+            user_id: String::new(),
+            key: "second-api-key".into(),
+            ..GrokAuth::test_default()
+        });
+        manager.set_fetch_override_for_test(Ok(ListModesResponse {
+            modes: vec![available("b", "B")],
+            default_mode_id: "b".to_owned(),
+        }));
+        match manager.model_state_with_authority().await {
+            ChatModelCatalog::Authoritative(state) => {
+                assert_eq!(
+                    state.current_model_id.0.as_ref(),
+                    "b",
+                    "a replaced API key must not reuse the previous key's catalog"
+                );
+            }
+            other => panic!("expected Authoritative after generation change, got {other:?}"),
+        }
     }
 }
