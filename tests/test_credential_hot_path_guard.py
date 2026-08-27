@@ -331,31 +331,57 @@ def _existing_mod_file(search_dir: Path, name: str) -> Path | None:
     return None
 
 
-def _iter_module_decls(text: str, declaring: Path) -> list[tuple[str, Path]]:
-    """`(name, child file)` for `#[path]` and ordinary `mod name;` that resolve."""
+def _iter_module_decls(
+    text: str, declaring: Path
+) -> list[tuple[str, Path, tuple[str, ...]]]:
+    """`(name, child file, enclosing inline modules)` for `#[path]` and
+    ordinary `mod name;` that resolve.
 
-    decls: list[tuple[str, Path]] = []
+    `mod inner;` inside `mod outer { ... }` is loaded from `outer/inner.rs`
+    (or `outer/inner/mod.rs`) relative to the declaring file's module search
+    dir, not from the declaring file's own directory, and libtest qualifies
+    it as `outer::inner::...` (#507 review).
+    """
+
+    decls: list[tuple[str, Path, tuple[str, ...]]] = []
     pending_path: str | None = None
-    for raw in text.splitlines():
-        line = _strip_line_comment(raw).strip()
-        path_match = _PATH_ATTR.search(line)
+    raw_lines = text.splitlines()
+    masked_lines = _mask_rust_literals(text).splitlines()
+    if len(masked_lines) < len(raw_lines):
+        masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
+    depth = 0
+    inline_stack: list[tuple[int, str]] = []
+    for i, raw in enumerate(raw_lines):
+        line = _strip_line_comment(masked_lines[i])
+        stripped_raw = _strip_line_comment(raw).strip()
+        path_match = _PATH_ATTR.search(stripped_raw)
         if path_match:
             pending_path = path_match.group(1)
-            continue
-        semi = _MOD_SEMI.match(line)
-        if semi:
-            name = semi.group(1)
-            if pending_path:
-                child = (declaring.parent / pending_path).resolve()
-                decls.append((name, child))
+        else:
+            semi = _MOD_SEMI.match(line)
+            if semi:
+                name = semi.group(1)
+                inline_names = tuple(n for _, n in inline_stack)
+                search = _mod_search_dir(declaring)
+                for inline_name in inline_names:
+                    search = search / inline_name
+                if pending_path:
+                    child = (declaring.parent / pending_path).resolve()
+                    decls.append((name, child, inline_names))
+                else:
+                    child = _existing_mod_file(search, name)
+                    if child is not None:
+                        decls.append((name, child, inline_names))
+                pending_path = None
             else:
-                child = _existing_mod_file(_mod_search_dir(declaring), name)
-                if child is not None:
-                    decls.append((name, child))
-            pending_path = None
-            continue
-        if line:
-            pending_path = None
+                brace_mod = _MOD_OPEN.match(line)
+                if brace_mod:
+                    inline_stack.append((depth, brace_mod.group(1)))
+                if stripped_raw:
+                    pending_path = None
+        depth += line.count("{") - line.count("}")
+        while inline_stack and depth <= inline_stack[-1][0]:
+            inline_stack.pop()
     return decls
 
 
@@ -367,8 +393,7 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
     `mod child;` files so Cargo's logical path is what the scan records.
     """
     overrides: dict[Path, list[list[str]]] = {}
-    seen: set[tuple[Path, tuple[str, ...]]] = set()
-    queue: deque[tuple[Path, tuple[str, ...]]] = deque()
+    queue: deque[tuple[Path, tuple[str, ...], tuple[Path, ...]]] = deque()
     texts: dict[Path, str] = {}
 
     def read_rs(rs: Path) -> str | None:
@@ -391,21 +416,19 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
             if not _is_lib_or_integration_source(rs):
                 continue
             if _is_cargo_crate_root_file(rs, extra_roots):
-                queue.append((rs.resolve(), tuple(_path_module_prefix(rs))))
+                queue.append((rs.resolve(), tuple(_path_module_prefix(rs)), ()))
 
     while queue:
-        declaring, prefix = queue.popleft()
-        seen_key = (declaring, prefix)
-        if seen_key in seen:
+        declaring, prefix, ancestors = queue.popleft()
+        if declaring in ancestors:
             continue
-        seen.add(seen_key)
         text = read_rs(declaring)
         if text is None:
             continue
-        for name, child in _iter_module_decls(text, declaring):
-            child_prefix = list(prefix) + [name]
+        for name, child, inline_names in _iter_module_decls(text, declaring):
+            child_prefix = list(prefix) + list(inline_names) + [name]
             overrides.setdefault(child, []).append(child_prefix)
-            queue.append((child, tuple(child_prefix)))
+            queue.append((child, tuple(child_prefix), ancestors + (declaring,)))
     return overrides
 
 
@@ -459,11 +482,14 @@ def _module_prefixes_for_source(
     """
 
     key = rs.resolve()
+    prefixes: list[list[str]] = []
     if key in overrides:
-        return overrides[key]
+        prefixes.extend(overrides[key])
     if _is_cargo_crate_root_file(rs, extra_roots):
-        return [_path_module_prefix(rs)]
-    return None
+        root_prefix = _path_module_prefix(rs)
+        if root_prefix not in prefixes:
+            prefixes.append(root_prefix)
+    return prefixes or None
 
 
 def _qualified_test_names(root: Path) -> list[str]:
@@ -703,6 +729,11 @@ class ExternalModulePrefix(unittest.TestCase):
             (tests / "b.rs").write_text('#[path = "shared.rs"]\nmod common;\n')
             names = _qualified_test_names(root)
             self.assertEqual(names.count("common::none_auth_scheme_sends"), 2)
+            self.assertEqual(
+                names.count("none_auth_scheme_sends"),
+                1,
+                "tests/shared.rs is also its own integration target",
+            )
 
     def test_ordinary_mod_from_two_integration_roots_is_counted_twice(self):
         with tempfile.TemporaryDirectory() as d:
@@ -716,6 +747,39 @@ class ExternalModulePrefix(unittest.TestCase):
             (tests / "b.rs").write_text("mod common;\n")
             names = _qualified_test_names(root)
             self.assertEqual(names.count("common::none_auth_scheme_sends"), 2)
+
+    def test_shared_module_child_is_counted_once_per_including_target(self):
+        """Duplicate (path, prefix) visits must still walk `mod child;` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            tests = root / "crates" / "codegen" / "demo" / "tests"
+            (tests / "common").mkdir(parents=True)
+            (tests / "common" / "mod.rs").write_text("mod child;\n")
+            (tests / "common" / "child.rs").write_text(
+                "#[test]\nfn none_auth_scheme_sends() {}\n"
+            )
+            (tests / "a.rs").write_text("mod common;\n")
+            (tests / "b.rs").write_text("mod common;\n")
+            names = _qualified_test_names(root)
+            self.assertEqual(names.count("common::child::none_auth_scheme_sends"), 2)
+
+    def test_external_module_under_an_inline_module_keeps_the_inline_prefix(self):
+        """`mod outer { mod inner; }` loads `outer/inner.rs` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "codegen" / "demo" / "src"
+            (src / "outer").mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "mod outer {\n    mod inner;\n}\n"
+            )
+            (src / "outer" / "inner.rs").write_text(
+                "#[test]\nfn none_auth_scheme_sends() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("outer::inner::none_auth_scheme_sends", names)
+            self.assertNotIn("inner::none_auth_scheme_sends", names)
 
     def test_path_prefix_propagates_to_descendant_modules(self):
         with tempfile.TemporaryDirectory() as d:
