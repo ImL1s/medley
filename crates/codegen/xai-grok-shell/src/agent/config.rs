@@ -3991,8 +3991,14 @@ pub(crate) fn resolve_external_otel_config_with(
         });
     let getenv_aliased = |name: &str| -> Option<String> {
         if name == xai_grok_telemetry::external::config::ENV_MASTER_SWITCH {
+            let valid_switch = |v: &str| -> bool {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "0" | "false" | "no" | "off"
+                )
+            };
             match getenv("MEDLEY_EXTERNAL_OTEL") {
-                Some(v) if !v.trim().is_empty() => return Some(v),
+                Some(v) if !v.trim().is_empty() && valid_switch(&v) => return Some(v),
                 _ => {}
             }
             if let Some(v) = getenv(name).filter(|s| !s.trim().is_empty()) {
@@ -4000,13 +4006,11 @@ pub(crate) fn resolve_external_otel_config_with(
                 // Invalid values such as `maybe` are ignored by that parser;
                 // recording a hit here would claim the variable was honored
                 // (#491 review).
-                match v.trim().to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" | "0" | "false" | "no" | "off" => {
-                        xai_grok_config::note_legacy_hit("GROK_EXTERNAL_OTEL");
-                        return Some(v);
-                    }
-                    _ => return None,
+                if valid_switch(&v) {
+                    xai_grok_config::note_legacy_hit("GROK_EXTERNAL_OTEL");
+                    return Some(v);
                 }
+                return None;
             }
             return None;
         }
@@ -16268,6 +16272,21 @@ agent_type = "cursor"
             )
             .is_none(),
             "MEDLEY_EXTERNAL_OTEL=0 must win over GROK_EXTERNAL_OTEL=1 on the stream"
+        );
+        assert!(
+            resolve_external_otel_config_with(
+                None,
+                None,
+                ext_env(&[
+                    ("MEDLEY_EXTERNAL_OTEL", "maybe"),
+                    ("GROK_EXTERNAL_OTEL", "1"),
+                    ("OTEL_METRICS_EXPORTER", "otlp"),
+                ]),
+                ext_client(),
+                false,
+            )
+            .is_some(),
+            "invalid MEDLEY_EXTERNAL_OTEL must fall through to GROK_EXTERNAL_OTEL=1"
         );
     }
     #[test]
