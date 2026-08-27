@@ -252,6 +252,10 @@ FN_DEF = re.compile(
 )
 MACRO_DEF = re.compile(r"macro_rules!\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
 MACRO_INVOKE = re.compile(r"(?<![:.\w])([A-Za-z_][A-Za-z0-9_]*)\s*!")
+INLINE_MOD = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+)
+MACRO_TEST_FN = re.compile(r"\bfn\s+\$")
 TEST_ATTR = re.compile(
     r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b",
     re.DOTALL,
@@ -934,6 +938,7 @@ class FnInfo:
     type_name: str | None  # set for an `impl Type { fn name }` method
     trait_name: str | None  # set for `impl Trait for Type` methods
     is_macro: bool
+    inline_mods: tuple[str, ...]  # inline `mod a { mod b { fn } }` path
     body: str  # code-only, turbofish-stripped -- see `_strip_turbofish`
     start: int
     keys: frozenset[str]  # Stage-1 direct touch, possibly empty
@@ -947,6 +952,27 @@ def _body_touches(code_only_body: str, identifiers: tuple[str, ...]) -> bool:
     return any(re.search(rf"\b{re.escape(ident)}\b", code_only_body) for ident in identifiers)
 
 
+def _inline_path_at(code: str, pos: int) -> tuple[str, ...]:
+    """Inline `mod name { ... }` modules whose body still contains `pos`."""
+
+    hits: list[tuple[int, str]] = []
+    for match in INLINE_MOD.finditer(code):
+        if match.start() >= pos:
+            break
+        open_index = match.end() - 1
+        end = _balanced_end(code, open_index)
+        if open_index <= pos < end:
+            hits.append((match.start(), match.group(1)))
+    hits.sort()
+    return tuple(name for _, name in hits)
+
+
+def _macro_generates_tests(body: str) -> bool:
+    """`#[test] fn $name()` (and the tokio form) inside `macro_rules!`."""
+
+    return bool(TEST_ATTR.search(body) and MACRO_TEST_FN.search(body))
+
+
 def index_functions(
     sources: list[tuple[Path, str]], registry: list[SharedItem]
 ) -> list[FnInfo]:
@@ -954,12 +980,15 @@ def index_functions(
     for rel, raw in sources:
         code = _code_only(raw)
         impls = _impl_blocks(code)
+        occupied: list[tuple[int, int]] = []
+        test_macros: list[tuple[str, frozenset[str]]] = []
         for match in FN_DEF.finditer(code):
             name = match.group("name")
             body_span = _fn_body(raw, match.end())
             if body_span is None:
                 continue
             body_start, body_end = body_span
+            occupied.append((body_start, body_end))
             body_code = _strip_turbofish(code[body_start:body_end])
             keys = frozenset(
                 item.key for item in registry if _body_touches(body_code, item.identifiers)
@@ -990,6 +1019,7 @@ def index_functions(
                     type_name=type_name,
                     trait_name=trait_name,
                     is_macro=False,
+                    inline_mods=_inline_path_at(code, match.start()),
                     body=body_code,
                     start=body_start,
                     keys=keys,
@@ -1005,10 +1035,13 @@ def index_functions(
             if body_span is None:
                 continue
             body_start, body_end = body_span
+            occupied.append((body_start, body_end))
             body_code = _strip_turbofish(code[body_start:body_end])
             keys = frozenset(
                 item.key for item in registry if _body_touches(body_code, item.identifiers)
             )
+            if _macro_generates_tests(body_code) and keys:
+                test_macros.append((name, keys))
             out.append(
                 FnInfo(
                     name=name,
@@ -1016,6 +1049,7 @@ def index_functions(
                     type_name=None,
                     trait_name=None,
                     is_macro=True,
+                    inline_mods=(),
                     body=body_code,
                     start=body_start,
                     keys=keys,
@@ -1025,6 +1059,30 @@ def index_functions(
                     attrs_line=_line(raw, match.start()),
                 )
             )
+        for macro_name, keys in test_macros:
+            for invoke in MACRO_INVOKE.finditer(code):
+                if invoke.group(1) != macro_name:
+                    continue
+                if any(start <= invoke.start() < end for start, end in occupied):
+                    continue
+                line = _line(raw, invoke.start())
+                out.append(
+                    FnInfo(
+                        name=f"{macro_name}!@{line}",
+                        file=rel,
+                        type_name=None,
+                        trait_name=None,
+                        is_macro=False,
+                        inline_mods=_inline_path_at(code, invoke.start()),
+                        body="",
+                        start=invoke.start(),
+                        keys=keys,
+                        is_test=True,
+                        serial_held=frozenset(),
+                        has_unkeyed_serial=False,
+                        attrs_line=line,
+                    )
+                )
     return out
 
 
@@ -1107,6 +1165,7 @@ def _resolve_calls(
     by_leaf: dict[str, dict[str, int]],
     by_type: dict[str, dict[str, list[int]]],
     by_macro: dict[Path, dict[str, int]],
+    by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, int]],
     keys_of: list[frozenset[str]],
     self_index: int,
 ) -> frozenset[str]:
@@ -1185,6 +1244,11 @@ def _resolve_calls(
             j = by_leaf.get(leaf, {}).get(m.group(2))
             if j is not None and j != self_index:
                 gained.update(keys_of[j])
+        # Inline `mod inner { fn relay }` is not a filename leaf (#516 review).
+        for prefix in (fn.inline_mods, ()):
+            j = by_inline.get((fn.file, prefix + segs), {}).get(m.group(2))
+            if j is not None and j != self_index:
+                gained.update(keys_of[j])
     for m in TYPE_ASSOC_CALL.finditer(fn.body):
         # `Self::name(` resolves against the CALLING function's own
         # enclosing impl type, not a literal lookup on the string "Self"
@@ -1219,11 +1283,13 @@ def analyze(
     by_leaf: dict[str, dict[str, int]] = {}
     by_type: dict[str, dict[str, list[int]]] = {}
     by_macro: dict[Path, dict[str, int]] = {}
+    by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, int]] = {}
     for i, fn in enumerate(functions):
         if fn.is_macro:
             by_macro.setdefault(fn.file, {})[fn.name] = i
             continue
         by_file.setdefault(fn.file, {})[fn.name] = i
+        by_inline.setdefault((fn.file, fn.inline_mods), {})[fn.name] = i
         module = _module_path(fn.file)
         if module is not None:
             # `module` is a valid module path even when empty (`()` is the
@@ -1253,6 +1319,7 @@ def analyze(
                 by_leaf=by_leaf,
                 by_type=by_type,
                 by_macro=by_macro,
+                by_inline=by_inline,
                 keys_of=keys_of,
                 self_index=i,
             )

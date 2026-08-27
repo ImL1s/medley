@@ -395,6 +395,54 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"calls_bump_macro_untagged"})
 
+    def test_inline_module_call_reaches_registered_state(self):
+        """`inner::relay()` is not a filename leaf (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            mod inner {
+                fn relay() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn calls_inner_relay_untagged() {
+                inner::relay();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_inner_relay_untagged"})
+
+    def test_macro_generated_tests_are_derived_members(self):
+        """`#[test] fn $name()` expansions are not `FN_DEF` identifiers (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! case {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            case!(a);
+            case!(b);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertTrue(any(n.startswith("case!") for n in names), names)
+        self.assertEqual(len(names), 2, names)
+
     def test_two_hops_same_file_is_still_derived(self):
         """The real #492 shape: test -> `quarantined_after` -> `heal_unusable`,
         all same-file, neither intermediate call textually mentioning the
