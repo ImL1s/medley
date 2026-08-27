@@ -282,8 +282,9 @@ USE_BRACE = re.compile(
     r"\buse\s+(crate|super|self)((?:::[A-Za-z_][A-Za-z0-9_]*)*)"
     r"::\{([^}]+)\}\s*;"
 )
-USE_ITEM = re.compile(
-    r"([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?"
+USE_BRACE_ITEM = re.compile(
+    r"((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?"
 )
 # Any `path::to::name(` call, `crate`-rooted or not. Resolved two ways (see
 # `_resolve_calls`): a `crate`-rooted path by its FULL module path, and every
@@ -903,11 +904,20 @@ def _use_imports(
     for m in USE_BRACE.finditer(code):
         mid = tuple(s for s in m.group(2).split("::") if s)
         for raw in m.group(3).split(","):
-            item = USE_ITEM.search(raw.strip())
-            if item is None or item.group(1) in ("self", "super"):
+            item = USE_BRACE_ITEM.search(raw.strip())
+            if item is None:
                 continue
-            fname = item.group(1)
-            record(m.start(), m.group(1), mid, fname, item.group(2) or fname)
+            segs = tuple(s.strip() for s in item.group(1).split("::") if s.strip())
+            if not segs or segs[0] in ("self", "super"):
+                continue
+            fname = segs[-1]
+            record(
+                m.start(),
+                m.group(1),
+                mid + segs[:-1],
+                fname,
+                item.group(2) or fname,
+            )
     return scoped
 
 
@@ -1623,16 +1633,29 @@ def _ufcs_calls(body: str) -> list[tuple[str, str]]:
     return out
 
 
+def _gain_from(
+    gained: set[str],
+    keys_of: list[frozenset[str]],
+    self_index: int,
+    slot: list[int] | None,
+) -> None:
+    if not slot:
+        return
+    for j in slot:
+        if j != self_index:
+            gained.update(keys_of[j])
+
+
 def _resolve_calls(
     fn: FnInfo,
     *,
-    by_file: dict[Path, dict[str, int]],
-    by_module: dict[tuple[str, ...], dict[str, int]],
-    by_leaf: dict[str, dict[str, int]],
+    by_file: dict[Path, dict[str, list[int]]],
+    by_module: dict[tuple[str, ...], dict[str, list[int]]],
+    by_leaf: dict[str, dict[str, list[int]]],
     by_type: dict[str, dict[str, list[int]]],
     by_macro: dict[Path, dict[str, int]],
     by_macro_any: dict[str, list[int]],
-    by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, int]],
+    by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]],
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     ],
@@ -1645,43 +1668,44 @@ def _resolve_calls(
     for m in FREE_CALL.finditer(fn.body):
         # Resolve a bare call inside the caller's inline module first, then
         # ancestors. File-wide last-definition lookup lets `mod b { fn bump }`
-        # steal `mod a { bump() }` (#516 review).
+        # steal `mod a { bump() }` (#516 review). Same-scope cfg twins are
+        # all kept; callers union their keys (#516 review).
         name = m.group(1)
-        j = None
+        js: list[int] = []
         prefix = fn.inline_mods
         while True:
-            j = by_inline.get((fn.file, prefix), {}).get(name)
-            if j is not None:
+            js = by_inline.get((fn.file, prefix), {}).get(name, [])
+            if js:
                 break
             if not prefix:
                 break
             prefix = prefix[:-1]
-        if j is None:
+        if not js:
             imported = _lookup_import(
                 imports_by_file.get(fn.file, {}), fn.inline_mods, name
             )
             if imported is not None:
                 module, fname = imported
-                j = by_module.get(module, {}).get(fname)
-        if j is not None and j != self_index:
-            gained.update(keys_of[j])
+                js = by_module.get(module, {}).get(fname, [])
+        _gain_from(gained, keys_of, self_index, js)
     macro_index = by_macro.get(fn.file, {})
     for m in MACRO_INVOKE.finditer(fn.body):
         name = m.group(1)
         j = macro_index.get(name)
         if j is None:
-            for j in by_macro_any.get(name, []):
-                if j != self_index:
-                    gained.update(keys_of[j])
+            _gain_from(gained, keys_of, self_index, by_macro_any.get(name, []))
             continue
         if j != self_index:
             gained.update(keys_of[j])
     for m in QUALIFIED_CALL.finditer(fn.body):
         segs = tuple(s.strip() for s in m.group(1).split("::") if s.strip())
         if segs and segs[0] == "crate":
-            j = by_module.get(segs[1:], {}).get(m.group(2))
-            if j is not None and j != self_index:
-                gained.update(keys_of[j])
+            _gain_from(
+                gained,
+                keys_of,
+                self_index,
+                by_module.get(segs[1:], {}).get(m.group(2), []),
+            )
         elif segs and segs[0] in ("self", "super"):
             # `self::[...]name(` / `super::[...]name(`, with zero or more
             # ADDITIONAL segments after the relative prefix -- measured,
@@ -1712,9 +1736,12 @@ def _resolve_calls(
                 # file with no `src` component (this checker's own test
                 # fixtures, and in principle any Rust file laid out
                 # differently than this repo's own crates are).
-                j = file_index.get(m.group(2))
-                if j is not None and j != self_index:
-                    gained.update(keys_of[j])
+                _gain_from(
+                    gained,
+                    keys_of,
+                    self_index,
+                    file_index.get(m.group(2), []),
+                )
             elif caller_module is not None:
                 # Ambiguity this checker cannot resolve, named rather than
                 # guessed at: a `super` prefix's ascent count conflates
@@ -1731,19 +1758,28 @@ def _resolve_calls(
                     if levels > len(caller_module):
                         break
                     base = caller_module[: len(caller_module) - levels]
-                    j = by_module.get(base + trailing, {}).get(m.group(2))
-                    if j is not None and j != self_index:
-                        gained.update(keys_of[j])
+                    _gain_from(
+                        gained,
+                        keys_of,
+                        self_index,
+                        by_module.get(base + trailing, {}).get(m.group(2), []),
+                    )
         leaf = segs[-1] if segs else None
         if leaf and leaf not in ("crate", "self", "super"):
-            j = by_leaf.get(leaf, {}).get(m.group(2))
-            if j is not None and j != self_index:
-                gained.update(keys_of[j])
+            _gain_from(
+                gained,
+                keys_of,
+                self_index,
+                by_leaf.get(leaf, {}).get(m.group(2), []),
+            )
         # Inline `mod inner { fn relay }` is not a filename leaf (#516 review).
         for prefix in (fn.inline_mods, ()):
-            j = by_inline.get((fn.file, prefix + segs), {}).get(m.group(2))
-            if j is not None and j != self_index:
-                gained.update(keys_of[j])
+            _gain_from(
+                gained,
+                keys_of,
+                self_index,
+                by_inline.get((fn.file, prefix + segs), {}).get(m.group(2), []),
+            )
     for m in TYPE_ASSOC_CALL.finditer(fn.body):
         # `Self::name(` resolves against the CALLING function's own
         # enclosing impl type, not a literal lookup on the string "Self"
@@ -1752,15 +1788,20 @@ def _resolve_calls(
         type_name = fn.type_name if m.group(1) == "Self" else m.group(1)
         if type_name is None:
             continue
-        for j in by_type.get(type_name, {}).get(m.group(2), []):
-            if j != self_index:
-                gained.update(keys_of[j])
+        _gain_from(
+            gained,
+            keys_of,
+            self_index,
+            by_type.get(type_name, {}).get(m.group(2), []),
+        )
     for type_name, method in _ufcs_calls(fn.body):
-        for j in by_type.get(type_name, {}).get(method, []):
-            if j != self_index:
-                gained.update(keys_of[j])
+        _gain_from(
+            gained,
+            keys_of,
+            self_index,
+            by_type.get(type_name, {}).get(method, []),
+        )
     return frozenset(gained)
-
 
 def analyze(
     sources: list[tuple[Path, str]], *, scan_root: Path
@@ -1774,20 +1815,22 @@ def analyze(
     functions, pending_macro_tests = index_functions(sources, registry)
     imports_by_file = {path: _use_imports(path, text) for path, text in sources}
 
-    by_file: dict[Path, dict[str, int]] = {}
-    by_module: dict[tuple[str, ...], dict[str, int]] = {}
-    by_leaf: dict[str, dict[str, int]] = {}
+    by_file: dict[Path, dict[str, list[int]]] = {}
+    by_module: dict[tuple[str, ...], dict[str, list[int]]] = {}
+    by_leaf: dict[str, dict[str, list[int]]] = {}
     by_type: dict[str, dict[str, list[int]]] = {}
     by_macro: dict[Path, dict[str, int]] = {}
     by_macro_any: dict[str, list[int]] = {}
-    by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, int]] = {}
+    by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]] = {}
     for i, fn in enumerate(functions):
         if fn.is_macro:
             by_macro.setdefault(fn.file, {})[fn.name] = i
             by_macro_any.setdefault(fn.name, []).append(i)
             continue
-        by_file.setdefault(fn.file, {})[fn.name] = i
-        by_inline.setdefault((fn.file, fn.inline_mods), {})[fn.name] = i
+        by_file.setdefault(fn.file, {}).setdefault(fn.name, []).append(i)
+        by_inline.setdefault((fn.file, fn.inline_mods), {}).setdefault(
+            fn.name, []
+        ).append(i)
         module = _module_path(fn.file)
         if module is not None:
             # `module` is a valid module path even when empty (`()` is the
@@ -1798,11 +1841,13 @@ def analyze(
             # crate-root function as `lib::name()`/`main::name()`, so
             # `by_leaf` is simply not populated for it, guarded here
             # instead of raising `IndexError` on the empty tuple.
-            by_module.setdefault(module, {})[fn.name] = i
+            by_module.setdefault(module, {}).setdefault(fn.name, []).append(i)
             if fn.inline_mods:
-                by_module.setdefault(module + fn.inline_mods, {})[fn.name] = i
+                by_module.setdefault(module + fn.inline_mods, {}).setdefault(
+                    fn.name, []
+                ).append(i)
             if module:
-                by_leaf.setdefault(module[-1], {})[fn.name] = i
+                by_leaf.setdefault(module[-1], {}).setdefault(fn.name, []).append(i)
         if fn.type_name is not None:
             by_type.setdefault(fn.type_name, {}).setdefault(fn.name, []).append(i)
         if fn.trait_name is not None:

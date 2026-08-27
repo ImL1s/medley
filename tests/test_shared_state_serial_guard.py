@@ -905,6 +905,74 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_imported_bump_untagged"})
 
+    def test_brace_import_with_nested_path_reaches_registered_state(self):
+        """`use crate::{a::bump}` must record `bump`, not the `a` prefix
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    use crate::{a::bump};
+
+                    #[test]
+                    fn calls_brace_imported_bump_untagged() {
+                        bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_brace_imported_bump_untagged"})
+
+    def test_cfg_gated_same_name_functions_are_all_candidates(self):
+        """A later `#[cfg(not(unix))] fn bump` must not hide an earlier
+        touching `#[cfg(unix)] fn bump` (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[cfg(unix)]
+            fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[cfg(not(unix))]
+            fn bump() {}
+
+            #[test]
+            fn calls_cfg_unix_untagged() {
+                bump();
+            }
+
+            #[test]
+            fn calls_cfg_not_unix_untagged() {
+                bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(
+            names, {"calls_cfg_unix_untagged", "calls_cfg_not_unix_untagged"}
+        )
+
     def test_imported_bare_call_is_scoped_to_the_inline_module(self):
         """A later `mod second { use … as bump }` must not steal `mod first`
         (#516 review)."""
