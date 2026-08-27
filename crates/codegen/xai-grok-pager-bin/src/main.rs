@@ -2543,6 +2543,7 @@ async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> R
         unsafe {
             std::env::set_var("GROK_DEBUG_LOG", path);
             std::env::remove_var("GROK_LOG_FILE");
+            std::env::remove_var("MEDLEY_LOG_FILE");
         }
     }
     if args.debug || args.debug_file.is_some() {

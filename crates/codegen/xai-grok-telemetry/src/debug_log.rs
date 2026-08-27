@@ -424,16 +424,26 @@ pub(crate) enum DebugTarget {
     SingleFile { path: PathBuf, src: DebugSource },
 }
 
-/// Resolve the debug target, honoring precedence: explicit `MEDLEY_LOG_FILE`
-/// / `GROK_LOG_FILE` wins (single file, RUST_LOG filter); else GROK_DEBUG_LOG
-/// — a truthy bool routes per session into `~/.grok/debug`, an explicit path
-/// writes a single file.
+/// Resolve the debug target, honoring precedence: an explicit path in
+/// `GROK_DEBUG_LOG` (`--debug-file`) outranks both log-file aliases, so an
+/// inherited `MEDLEY_LOG_FILE` cannot swallow the requested firehose
+/// (#491 review). Else `MEDLEY_LOG_FILE` / `GROK_LOG_FILE` (single file,
+/// RUST_LOG filter); else a truthy `GROK_DEBUG_LOG` bool routes per session
+/// into `~/.grok/debug`.
 ///
 /// Read via `OsStr` (not `str`) so a non-UTF-8 path isn't silently dropped.
 pub(crate) fn resolve_debug_target() -> Option<DebugTarget> {
     let medley_log_file = std::env::var_os("MEDLEY_LOG_FILE");
     let grok_log_file = std::env::var_os("GROK_LOG_FILE");
     let grok_debug_log = std::env::var_os("GROK_DEBUG_LOG");
+    if let Some(raw) = grok_debug_log.as_deref().filter(|v| !is_blank(v))
+        && debug_log_is_explicit_path(raw)
+    {
+        return Some(DebugTarget::SingleFile {
+            path: os_path(raw),
+            src: DebugSource::GrokDebugLog,
+        });
+    }
     let (log_file, src) = match (
         medley_log_file.as_deref().filter(|v| !is_blank(v)),
         grok_log_file.as_deref().filter(|v| !is_blank(v)),
@@ -450,6 +460,13 @@ pub(crate) fn resolve_debug_target() -> Option<DebugTarget> {
         grok_debug_log.as_deref(),
         &grok_home().join("debug"),
         src,
+    )
+}
+
+fn debug_log_is_explicit_path(raw: &OsStr) -> bool {
+    !matches!(
+        raw.to_str().map(str::trim),
+        Some("" | "0" | "false" | "off" | "no" | "1" | "true" | "on" | "yes")
     )
 }
 
@@ -596,6 +613,29 @@ mod tests {
                 assert_eq!(src, DebugSource::MedleyLogFile);
             }
             other => panic!("expected a SingleFile target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn debug_file_path_outranks_medley_log_file() {
+        // `--debug-file` sets GROK_DEBUG_LOG to a path. An inherited
+        // MEDLEY_LOG_FILE must not keep the ordinary file filter (#491).
+        let _guard = flush_test_lock();
+        unsafe {
+            std::env::set_var("MEDLEY_LOG_FILE", "/tmp/medley-ordinary.log");
+            std::env::set_var("GROK_DEBUG_LOG", "/tmp/debug-file.log");
+        }
+        let target = resolve_debug_target();
+        unsafe {
+            std::env::remove_var("MEDLEY_LOG_FILE");
+            std::env::remove_var("GROK_DEBUG_LOG");
+        }
+        match target {
+            Some(DebugTarget::SingleFile { path, src }) => {
+                assert_eq!(path, std::path::PathBuf::from("/tmp/debug-file.log"));
+                assert_eq!(src, DebugSource::GrokDebugLog);
+            }
+            other => panic!("expected the --debug-file path, got {other:?}"),
         }
     }
 

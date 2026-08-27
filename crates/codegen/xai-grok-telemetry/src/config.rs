@@ -94,8 +94,9 @@ pub fn env_telemetry_mode(name: &str) -> Option<TelemetryMode> {
 pub fn env_telemetry_mode_alias(medley_name: &str, grok_name: &str) -> Option<TelemetryMode> {
     if let Ok(value) = std::env::var(medley_name)
         && !value.trim().is_empty()
+        && let Some(parsed) = TelemetryMode::parse(&value)
     {
-        return TelemetryMode::parse(&value);
+        return Some(parsed);
     }
     let value = std::env::var(grok_name)
         .ok()
@@ -315,6 +316,27 @@ mod tests {
         assert!(
             !notice.contains(GROK),
             "an unparseable GROK_* value was not honored, got {notice:?}"
+        );
+    }
+
+    #[test]
+    fn env_telemetry_mode_alias_invalid_medley_falls_through_to_grok() {
+        const MEDLEY: &str = "MEDLEY_TEST_TELEMETRY_MODE_ALIAS_INVALID_MEDLEY";
+        const GROK: &str = "GROK_TEST_TELEMETRY_MODE_ALIAS_INVALID_MEDLEY";
+        unsafe {
+            std::env::set_var(MEDLEY, "typo");
+            std::env::set_var(GROK, "0");
+        }
+        let result = env_telemetry_mode_alias(MEDLEY, GROK);
+        unsafe {
+            std::env::remove_var(MEDLEY);
+            std::env::remove_var(GROK);
+        }
+        assert_eq!(result, Some(TelemetryMode::Disabled));
+        let notice = xai_grok_config::legacy_notice().unwrap_or_default();
+        assert!(
+            notice.contains(GROK),
+            "falling through to a parseable GROK_* mode is a real hit, got {notice:?}"
         );
     }
 

@@ -122,8 +122,10 @@ pub fn resolve_env_bool(medley_name: &str, grok_name: &str) -> Option<bool> {
 }
 
 fn resolve_bool_in(medley: Option<&str>, grok: Option<&str>, grok_name: &str) -> Option<bool> {
-    if let Some(v) = medley.filter(|s| !s.trim().is_empty()) {
-        return parse_bool_str(v);
+    if let Some(v) = medley.filter(|s| !s.trim().is_empty())
+        && let Some(parsed) = parse_bool_str(v)
+    {
+        return Some(parsed);
     }
     let v = grok.filter(|s| !s.trim().is_empty())?;
     let parsed = parse_bool_str(v)?;
@@ -272,6 +274,25 @@ mod tests {
         ] {
             assert_eq!(parse_bool_str(raw), expected, "input {raw:?}");
         }
+    }
+
+    #[test]
+    #[serial(legacy_hits)]
+    fn invalid_medley_bool_falls_through_to_valid_grok() {
+        // Same shape as the permission-alias finding: a nonblank but
+        // unparseable MEDLEY_* must not hide a valid GROK_* (#491 review).
+        clear_legacy_hits_for_test();
+        assert_eq!(
+            resolve_bool_in(Some("typo"), Some("false"), "GROK_FEEDBACK_ENABLED"),
+            Some(false)
+        );
+        assert!(
+            legacy_notice()
+                .as_deref()
+                .is_some_and(|n| n.contains("GROK_FEEDBACK_ENABLED")),
+            "falling through to a parseable GROK_* bool is a real hit, got {:?}",
+            legacy_notice()
+        );
     }
 
     #[test]
