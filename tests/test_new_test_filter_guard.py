@@ -30,9 +30,11 @@ import check_test_filter_coverage as coverage  # noqa: E402
 from check_test_filter_coverage import (  # noqa: E402
     _parse_workflow,
     parse_workflow,
+    parse_workflow_lanes,
     uncovered,
     workspace_members,
 )
+from toml_package_name import package_name  # noqa: E402
 
 
 class ParseWorkflowFeatures(unittest.TestCase):
@@ -48,7 +50,7 @@ class ParseWorkflowFeatures(unittest.TestCase):
             "          run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture\n"
             "          run_nonzero -p xai-grok-auth --lib bearer_fragment:: -- --nocapture\n"
         )
-        _flat, nested = _parse_workflow(wf)
+        _flat, nested, _lanes = _parse_workflow(wf)
         self.assertEqual(
             nested["xai-grok-auth"],
             {
@@ -59,7 +61,7 @@ class ParseWorkflowFeatures(unittest.TestCase):
 
     def test_comma_separated_features_split_into_one_set(self):
         wf = "          run_nonzero -p c --features a,b --lib f -- --nocapture\n"
-        _flat, nested = _parse_workflow(wf)
+        _flat, nested, _lanes = _parse_workflow(wf)
         self.assertEqual(list(nested["c"]), [frozenset({"a", "b"})])
 
     def test_public_parse_workflow_keeps_its_flat_shape(self):
@@ -259,10 +261,9 @@ class ParseWorkflowRealCorpus(unittest.TestCase):
                             crate = name
                             i += 2
                             continue
-                        match = re.search(
-                            r'^\s*name\s*=\s*"([^"]+)"', text, re.M
-                        )
-                        crate = match.group(1) if match else name
+                        # `[package] name`, not the first `name =` in the
+                        # file -- a `[[bin]]` table can precede it (#497).
+                        crate = package_name(text) or name
                     else:
                         crate = name
                     i += 2
@@ -282,6 +283,8 @@ class ParseWorkflowRealCorpus(unittest.TestCase):
                 filters.add(tok)
                 i += 1
             if crate is not None:
+                if "--no-run" in tokens:
+                    continue
                 invocations.append((crate, frozenset(filters)))
         cls.real_invocations = invocations
         cls.real_crates = {c for c, _ in invocations}
@@ -290,15 +293,19 @@ class ParseWorkflowRealCorpus(unittest.TestCase):
         self.assertGreater(len(self.real_crates), 20, self.real_crates)
 
     def test_every_real_invocation_crate_is_recognised(self):
-        parsed = parse_workflow(self.text)
+        parsed_lanes = parse_workflow_lanes(self.text, root=REPO)
+        remaining = list(parsed_lanes)
         missed = []
         for crate, filters in self.real_invocations:
-            have: set[str] = set()
-            for fs in parsed.get(crate, {}).values():
-                have |= set(fs)
-            missing = set(filters) - have
-            if crate not in parsed or missing:
-                missed.append((crate, sorted(missing)))
+            found = None
+            for i, (parsed_crate, parsed_filters) in enumerate(remaining):
+                if parsed_crate == crate and parsed_filters == filters:
+                    found = i
+                    break
+            if found is None:
+                missed.append((crate, sorted(filters)))
+            else:
+                remaining.pop(found)
         self.assertEqual(
             missed, [], f"parse_workflow() misses real invocations: {missed}"
         )

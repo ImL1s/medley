@@ -148,6 +148,11 @@ def _parse_workflow(text: str, root: Path | None = None):
     by_features: dict[str, dict[frozenset, dict[str, set[str]]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(set))
     )
+    # One entry per matched invocation, before crate-wide union. A later
+    # comparison that unions filters per crate cannot see a `NO_COLOR=1
+    # run_nonzero` lane whose filters also appear on an ordinary lane
+    # (#497 review).
+    lanes: list[tuple[str, frozenset[str]]] = []
 
     for line in joined.splitlines():
         m = _RUNNER.match(_strip_env_assignments_prefix(line))
@@ -229,6 +234,8 @@ def _parse_workflow(text: str, root: Path | None = None):
         if crate is None:
             continue
 
+        lanes.append((crate, frozenset(filters)))
+
         if not targets:
             targets = ["*"]
 
@@ -255,7 +262,7 @@ def _parse_workflow(text: str, root: Path | None = None):
     nested = {
         c: {f: dict(t) for f, t in feats.items()} for c, feats in by_features.items()
     }
-    return flat, nested
+    return flat, nested, lanes
 
 
 def parse_workflow(
@@ -269,6 +276,14 @@ def parse_workflow(
     breaking eleven tests to accommodate a refactor is the wrong direction.
     """
     return _parse_workflow(text, root=root)[0]
+
+
+def parse_workflow_lanes(
+    text: str, root: Path | None = None
+) -> list[tuple[str, frozenset[str]]]:
+    """Per-invocation `(crate, filters)` before crate-wide union (#497)."""
+
+    return _parse_workflow(text, root=root)[2]
 
 
 # Marks a filter that came from a lane carrying `--exact`, where libtest matches
@@ -348,7 +363,7 @@ def main() -> int:
                     help="write the current uncovered set to this file and exit 0")
     args = ap.parse_args()
 
-    per_crate, by_features = _parse_workflow(
+    per_crate, by_features, _lanes = _parse_workflow(
         args.workflow.read_text(), root=args.root
     )
     if not per_crate:
