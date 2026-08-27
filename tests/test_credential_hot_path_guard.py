@@ -54,6 +54,7 @@ CLAUDE_MD = ROOT / "CLAUDE.md"
 _CRATE_ROOTS = ("crates", "prod", "third_party")
 
 _TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test\b")
+_IGNORE_ATTR = re.compile(r"^#\[\s*ignore\b")
 _FN = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
@@ -789,7 +790,8 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
             inactive = enclosing_off or any(
                 _cfg_attr_is_inactive(a) for a in all_attrs
             )
-            if found and not inactive:
+            ignored = any(_IGNORE_ATTR.match(a.strip()) for a in all_attrs)
+            if found and not inactive and not ignored:
                 prefix_parts = file_mods + [name for _, name, _ in mod_stack]
                 prefix = "::".join(prefix_parts)
                 names.append(f"{prefix}::{found}" if prefix else found)
@@ -1482,6 +1484,27 @@ class ExternalModulePrefix(unittest.TestCase):
                 self.assertIn("platform::none_auth_scheme_windows_inner", names)
             else:
                 self.assertNotIn("platform::none_auth_scheme_windows_inner", names)
+
+    def test_ignored_tests_are_not_counted(self):
+        """`#[ignore]` is skipped by libtest unless `--ignored` (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            #[test]
+            fn none_auth_scheme_live() {}
+            #[test]
+            #[ignore]
+            fn none_auth_scheme_ignored() {}
+            #[ignore]
+            #[test]
+            fn none_auth_scheme_ignored_first() {}
+            #[test]
+            #[ignore = "not on this runner"]
+            fn none_auth_scheme_ignored_reason() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_live"])
 
     def test_src_bin_tests_are_not_scanned(self):
         with tempfile.TemporaryDirectory() as d:
