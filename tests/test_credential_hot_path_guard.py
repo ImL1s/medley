@@ -419,17 +419,21 @@ def _mod_search_dir(
     declaring: Path,
     extra_roots: set[Path] | frozenset[Path] | None = None,
     gated_roots: set[Path] | frozenset[Path] | None = None,
+    *,
+    as_crate_root: bool = False,
 ) -> Path:
     """Directory rustc searches for `mod name;` declared in `declaring`.
 
     An explicit `[[test]] path = "integration/custom.rs"` is a crate root,
     so `mod child;` loads `integration/child.rs`, not
-    `integration/custom/child.rs` (#507 review).
+    `integration/custom/child.rs` (#507 review). When the same file is
+    later visited as `mod shared;`, it is a nested module and `mod child;`
+    loads `shared/child.rs` (#507 review).
     """
 
     if declaring.name in ("lib.rs", "main.rs", "mod.rs"):
         return declaring.parent
-    if _is_cargo_crate_root_file(declaring, extra_roots, gated_roots):
+    if as_crate_root:
         return declaring.parent
     return declaring.parent / declaring.stem
 
@@ -446,6 +450,8 @@ def _iter_module_decls(
     declaring: Path,
     extra_roots: set[Path] | frozenset[Path] | None = None,
     gated_roots: set[Path] | frozenset[Path] | None = None,
+    *,
+    as_crate_root: bool = False,
 ) -> list[tuple[str, Path, tuple[str, ...]]]:
     """`(name, child file, enclosing inline modules)` for `#[path]` and
     ordinary `mod name;` that resolve.
@@ -494,7 +500,12 @@ def _iter_module_decls(
             if not skip:
                 name = semi.group(1)
                 inline_names = tuple(n for _, n, _ in inline_stack)
-                search = _mod_search_dir(declaring, extra_roots, gated_roots)
+                search = _mod_search_dir(
+                    declaring,
+                    extra_roots,
+                    gated_roots,
+                    as_crate_root=as_crate_root,
+                )
                 for inline_name in inline_names:
                     search = search / inline_name
                 if pending_path:
@@ -539,7 +550,7 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
     `mod child;` files so Cargo's logical path is what the scan records.
     """
     overrides: dict[Path, list[list[str]]] = {}
-    queue: deque[tuple[Path, tuple[str, ...], tuple[Path, ...]]] = deque()
+    queue: deque[tuple[Path, tuple[str, ...], tuple[Path, ...], bool]] = deque()
     texts: dict[Path, str] = {}
 
     def read_rs(rs: Path) -> str | None:
@@ -562,21 +573,29 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
             if not _is_lib_or_integration_source(rs, extra_roots):
                 continue
             if _is_cargo_crate_root_file(rs, extra_roots, gated_roots):
-                queue.append((rs.resolve(), tuple(_path_module_prefix(rs)), ()))
+                queue.append(
+                    (rs.resolve(), tuple(_path_module_prefix(rs)), (), True)
+                )
 
     while queue:
-        declaring, prefix, ancestors = queue.popleft()
+        declaring, prefix, ancestors, as_crate_root = queue.popleft()
         if declaring in ancestors:
             continue
         text = read_rs(declaring)
         if text is None:
             continue
         for name, child, inline_names in _iter_module_decls(
-            text, declaring, extra_roots, gated_roots
+            text,
+            declaring,
+            extra_roots,
+            gated_roots,
+            as_crate_root=as_crate_root,
         ):
             child_prefix = list(prefix) + list(inline_names) + [name]
             overrides.setdefault(child, []).append(child_prefix)
-            queue.append((child, tuple(child_prefix), ancestors + (declaring,)))
+            queue.append(
+                (child, tuple(child_prefix), ancestors + (declaring,), False)
+            )
     return overrides
 
 
@@ -1185,6 +1204,26 @@ class ExternalModulePrefix(unittest.TestCase):
             (tests / "b.rs").write_text("mod common;\n")
             names = _qualified_test_names(root)
             self.assertEqual(names.count("common::child::none_auth_scheme_sends"), 2)
+
+    def test_integration_file_imported_as_module_resolves_nested_child(self):
+        """`tests/shared.rs` as its own target uses `tests/child.rs`; as
+        `mod shared` it uses `tests/shared/child.rs` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            tests = root / "crates" / "codegen" / "demo" / "tests"
+            (tests / "shared").mkdir(parents=True)
+            (tests / "shared.rs").write_text("mod child;\n")
+            (tests / "child.rs").write_text(
+                "#[test]\nfn crate_root_child() {}\n"
+            )
+            (tests / "shared" / "child.rs").write_text(
+                "#[test]\nfn none_auth_scheme_nested() {}\n"
+            )
+            (tests / "a.rs").write_text("mod shared;\n")
+            names = _qualified_test_names(root)
+            self.assertIn("child::crate_root_child", names)
+            self.assertIn("shared::child::none_auth_scheme_nested", names)
 
     def test_external_module_under_an_inline_module_keeps_the_inline_prefix(self):
         """`mod outer { mod inner; }` loads `outer/inner.rs` (#507 review)."""
