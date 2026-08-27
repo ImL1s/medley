@@ -112,7 +112,7 @@ fn eligible_team_principal(auth: GrokAuth) -> Option<GrokAuth> {
 /// config is a grok.com feature with one grok.com auth.
 fn read_active_team_auth() -> Option<GrokAuth> {
     let home = crate::util::grok_home::grok_home();
-    let store = crate::auth::read_auth_json(&home.join("auth.json")).ok()?;
+    let store = crate::auth::read_auth_json(&crate::auth::resolved_xai_auth_path(&home)).ok()?;
     let team = store.values().find(|a| a.is_team_principal())?.clone();
     eligible_team_principal(team)
 }
@@ -126,7 +126,7 @@ pub(crate) fn has_active_team_auth() -> bool {
 /// NOT treat that as a logout — it would wipe enforced policy on a read blip.
 fn team_principal_signed_in() -> std::io::Result<bool> {
     let home = crate::util::grok_home::grok_home();
-    match crate::auth::read_auth_json(&home.join("auth.json")) {
+    match crate::auth::read_auth_json(&crate::auth::resolved_xai_auth_path(&home)) {
         Ok(store) => Ok(store.values().any(|a| a.is_team_principal())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
@@ -886,7 +886,7 @@ pub fn current_serving_identity() -> crate::config::ServingIdentity {
 /// disable envelope binding for a real team user. Used at fetch time to bind the envelope.
 pub fn active_team_id_any_expiry() -> Option<String> {
     let home = crate::util::grok_home::grok_home();
-    let store = crate::auth::read_auth_json(&home.join("auth.json")).ok()?;
+    let store = crate::auth::read_auth_json(&crate::auth::resolved_xai_auth_path(&home)).ok()?;
     store
         .values()
         .find(|a| a.is_team_principal())

@@ -5,6 +5,17 @@ use std::sync::OnceLock;
 
 static GROK_HOME: OnceLock<PathBuf> = OnceLock::new();
 
+/// Working directory captured on the first auth-path resolution in this
+/// process. Relative `GROK_AUTH_PATH` values join against this, not against
+/// whatever cwd a later pager `/cd` left behind (#481).
+static PROCESS_START_CWD: OnceLock<PathBuf> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LAUNCH_CWD: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(target_os = "macos")]
 const CLAUDE_MANAGED_SETTINGS_PATH: &str =
     "/Library/Application Support/ClaudeCode/managed-settings.json";
@@ -93,10 +104,50 @@ pub fn user_grok_home() -> Option<PathBuf> {
 /// function directly only from a context that either doesn't need that
 /// isolation (an independent binary, e.g. `xai-workspace-server`) or
 /// supplies its own equivalent.
+///
+/// A relative `GROK_AUTH_PATH` is joined against the process-start cwd
+/// once, so later `chdir` (pager `/cd`) cannot retarget the credential
+/// file (#481 review).
 pub fn resolved_xai_auth_path(grok_home: &std::path::Path) -> PathBuf {
+    explicit_xai_auth_override().unwrap_or_else(|| grok_home.join("auth.json"))
+}
+
+/// Capture the process-start cwd before anything calls `set_current_dir`.
+///
+/// Pager `--cwd` (`apply_cwd`) chdirs before `AuthManager` is constructed.
+/// A lazy first read would then join a relative `GROK_AUTH_PATH` against
+/// `--cwd` rather than the launch directory (#481 review).
+pub fn pin_process_start_cwd() {
+    let _ = process_start_cwd();
+}
+
+fn process_start_cwd() -> PathBuf {
+    #[cfg(test)]
+    if let Some(pinned) = TEST_LAUNCH_CWD.with(|c| c.borrow().clone()) {
+        return pinned;
+    }
+    PROCESS_START_CWD
+        .get_or_init(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .clone()
+}
+
+fn absolutize_xai_auth_override(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        process_start_cwd().join(path)
+    }
+}
+
+/// `$GROK_AUTH_PATH` when set, made absolute against process-start cwd
+/// when the value is relative. `None` when unset. Callers that have no
+/// `grok_home` to fall back to (containers, bare CI) use this instead of
+/// [`resolved_xai_auth_path`].
+pub fn explicit_xai_auth_override() -> Option<PathBuf> {
     std::env::var("GROK_AUTH_PATH")
+        .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|_| grok_home.join("auth.json"))
+        .map(absolutize_xai_auth_override)
 }
 
 /// Canonical grok application path: `$GROK_HOME/bin/grok` (Unix) or `grok.exe` (Windows).
@@ -251,6 +302,7 @@ fn slugify(input: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Realistic CWDs that trigger the bug (URL-encoded > 255 bytes).
@@ -377,5 +429,56 @@ mod tests {
     #[test]
     fn slugify_truncates() {
         assert_eq!(slugify(&"a".repeat(100), 10).len(), 10);
+    }
+
+    #[test]
+    fn relative_grok_auth_path_stays_anchored_after_chdir() {
+        // RefreshGate re-resolves on every poll. A relative GROK_AUTH_PATH
+        // joined against the *current* cwd would silently follow pager `/cd`
+        // (#481 review). Pin the override to an injected launch directory
+        // rather than `set_current_dir`, which is process-global and races
+        // the parallel test runner.
+        struct AuthPathEnvGuard {
+            prev: Option<std::ffi::OsString>,
+        }
+        impl Drop for AuthPathEnvGuard {
+            fn drop(&mut self) {
+                TEST_LAUNCH_CWD.with(|c| *c.borrow_mut() = None);
+                match &self.prev {
+                    Some(v) => unsafe { std::env::set_var("GROK_AUTH_PATH", v) },
+                    None => unsafe { std::env::remove_var("GROK_AUTH_PATH") },
+                }
+            }
+        }
+
+        let launch = tempfile::TempDir::new().unwrap();
+        TEST_LAUNCH_CWD.with(|c| {
+            *c.borrow_mut() = Some(launch.path().to_path_buf());
+        });
+        let _guard = AuthPathEnvGuard {
+            prev: std::env::var_os("GROK_AUTH_PATH"),
+        };
+        unsafe { std::env::set_var("GROK_AUTH_PATH", "auth.json") };
+
+        let dummy_home = PathBuf::from("/tmp/unused-grok-home");
+        let resolved = resolved_xai_auth_path(&dummy_home);
+        assert_eq!(
+            resolved,
+            launch.path().join("auth.json"),
+            "relative GROK_AUTH_PATH must join the launch directory"
+        );
+        assert_eq!(
+            explicit_xai_auth_override(),
+            Some(launch.path().join("auth.json")),
+            "Codex production resolution shares this override (#481 review)"
+        );
+        let cwd = std::env::current_dir().expect("process cwd");
+        if cwd != launch.path() {
+            assert_ne!(
+                resolved,
+                cwd.join("auth.json"),
+                "must not follow the process cwd when a launch directory is pinned"
+            );
+        }
     }
 }

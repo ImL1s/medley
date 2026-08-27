@@ -7221,3 +7221,87 @@ async fn permanent_codex_rejection_never_exposes_torn_json_to_readers() {
             .contains_key(crate::auth::openai_codex::AUTH_SCOPE)
     );
 }
+
+/// #481 (Codex review on #498): an explicit `GROK_AUTH_PATH` must seed
+/// [`current_auth_key_hash`] with a real credential's hash even when no user
+/// home resolves at all -- containers and bare CI runners are exactly where
+/// `GROK_AUTH_PATH` exists to be used. Gating the whole computation on
+/// `xai_grok_config::user_grok_home()` returning `Some` silently left that
+/// seed at 0 there (`user_home: None` in this test models HOME / MEDLEY_HOME
+/// / GROK_HOME all being unavailable, the exact precondition Codex named),
+/// which then made `ConfigReloader::reload_auth` treat a genuinely-removed
+/// credential as "there was never one to clear" and suppress `AuthCleared`
+/// -- the leader kept running on a revoked credential.
+///
+/// Chains both halves against the real production path rather than seeding
+/// `ConfigReloader` with a hand-picked hash (as
+/// `reloader_detects_auth_cleared` already does, and continues to cover on
+/// its own): first proves `current_auth_key_hash` itself is non-zero in the
+/// home-less/explicit-path scenario, then feeds that exact value into a real
+/// `ConfigReloader` and proves a scope removal downstream still surfaces as
+/// `AuthCleared`. Either half alone would leave the other unproven.
+#[tokio::test]
+async fn explicit_auth_path_seeds_hash_with_no_home_and_reload_detects_its_removal() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Deliberately not named `auth.json` and not nested under anything
+    // home-shaped: this file is reachable only through the explicit
+    // `GROK_AUTH_PATH` pin below, never through a home-derived default.
+    let explicit_path = tmp.path().join("explicit-grok-auth.json");
+    let scope = "https://revoke-test.example.com".to_string();
+
+    let mut store: AuthStore = AuthStore::new();
+    store.insert(
+        scope.clone(),
+        GrokAuth {
+            key: "explicit-path-live-credential".into(),
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json(&explicit_path, &store).unwrap();
+
+    let _xai_pin = XaiAuthPathGuard::pin(explicit_path.clone());
+
+    let hash = current_auth_key_hash(&scope, None);
+    assert_ne!(
+        hash, 0,
+        "an explicit GROK_AUTH_PATH must seed a non-zero hash even with no \
+         user home resolved -- it names its own file and needs no home"
+    );
+
+    // Another process rewrites the SAME file, removing our scope but keeping
+    // a different one (matching `reloader_detects_auth_cleared`'s shape) --
+    // simulating a credential revocation the leader must notice.
+    let mut store_after_revoke: AuthStore = AuthStore::new();
+    store_after_revoke.insert(
+        "https://other.example.com".to_string(),
+        GrokAuth::test_default(),
+    );
+    write_auth_json(&explicit_path, &store_after_revoke).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let empty_config = toml::Value::Table(toml::map::Map::new());
+    // `tmp.path()` here is an unused placeholder: `ConfigReloader::new`
+    // derives its own auth_path via `resolved_xai_auth_path`, which (like
+    // `current_auth_key_hash` above) honours the same `XaiAuthPathGuard` pin
+    // regardless of the `grok_home` argument passed in.
+    let mut reloader = crate::config::reloader::ConfigReloader::new(
+        tmp.path().to_path_buf(),
+        hash,
+        empty_config,
+        scope,
+        None,
+        tx,
+        false,
+        false,
+    );
+
+    reloader.reload_auth().unwrap();
+    let update = rx
+        .try_recv()
+        .expect("reload_auth must send AuthCleared, not stay silent");
+    assert!(
+        matches!(update, crate::config::reloader::ConfigUpdate::AuthCleared),
+        "a real credential's hash seeded via the explicit-path branch must \
+         still be recognized as \"had a credential\" once it's removed"
+    );
+}

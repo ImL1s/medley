@@ -1260,6 +1260,13 @@ jobs:
             cache_ -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             terminal::tmux:: -- --nocapture
+          # #499: libtest filters are substring matches, and `tmux::` is not a
+          # substring of `tmux_probe::` -- so the filter above never reached the
+          # seven tests in `terminal::tmux_probe`, which ran nowhere in CI. Its own
+          # line rather than widening the one above to `terminal::tmux`: only a
+          # dedicated invocation lets `run_nonzero` fail if this module is emptied.
+          run_nonzero -p xai-grok-pager-render --lib \
+            terminal::tmux_probe:: -- --nocapture
           run_nonzero -p xai-grok-pager-render --lib \
             theme:: -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
@@ -1421,6 +1428,12 @@ jobs:
           # touch without anyone noticing downstream. 13 tests, all new.
           run_nonzero -p xai-grok-config --lib \
             env_alias:: -- --nocapture
+          # #481: relative GROK_AUTH_PATH is joined against process-start
+          # cwd, not the cwd a later pager `/cd` left behind. The rest of
+          # `paths::` is cheap encoding/slugify coverage that previously
+          # ran nowhere. 13 tests.
+          run_nonzero -p xai-grok-config --lib \
+            paths:: -- --nocapture
           # `xai-grok-config-types` had no filter at all, so every test in it
           # ran nowhere. `BoolFlag`'s `.env_alias()` opt-in (#426) is a choke
           # point ~49 other flags flow through unaliased -- the one place a
@@ -1522,6 +1535,12 @@ jobs:
           # module path inside the binary, and `run_nonzero` fails a filter that
           # matches zero tests (see `grok_home_paths` above).
           run_nonzero -p xai-grok-shell --test test_auth_path_env_precedence \
+            -- --nocapture
+          # #434: the write-side counterpart to #409 above -- store_api_key /
+          # clear_api_key must honour `GROK_AUTH_PATH` too, not just
+          # `AuthManager`'s read. Same reason for being an integration target
+          # with no positional after `--test`.
+          run_nonzero -p xai-grok-shell --test test_auth_path_write_side \
             -- --nocapture
           # #482: the standalone hub binary's own GROK_AUTH_PATH precedence.
           # Same reason as the target above -- integration target, no

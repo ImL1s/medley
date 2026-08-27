@@ -106,6 +106,56 @@ On every sync PR, review upstream diffs that touch:
 
 Prefer keeping fork intent on auth hotspots (`AuthScheme::None`, `local.none`, no ambient xAI credential leak) rather than blindly taking upstream.
 
+### Quarantined upstream features — take *ours*, and know what would change that
+
+Two upstream features are deliberately switched off in a way that reads, at
+conflict time, exactly like the fork having lost something. Both resolutions
+are **keep ours**. Neither was written down before #485, and the 2026-08-04
+sync survived them on memory rather than record.
+
+The tell for both is a **bare block wrapping a whole function body**, or a
+`check-cfg` entry naming a feature no `[features]` table declares — the residue
+of a removed `#[cfg]`.
+
+- **`local-workspace`** — upstream declares the feature in four `Cargo.toml`
+  files (`xai-grok-pager`, `-pager-bin`, `xai-grok-shell`, `-shell-base`); the
+  fork declares it in **none**, and adds
+  `unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("local-workspace"))'] }`
+  at `Cargo.toml:399` so the compiler stays quiet about the **several hundred**
+  now-permanently-false gates across the tree. Quarantined by `7b512227`.
+  (Counting them is itself a trap: `cfg(feature = "local-workspace")` matches
+  far fewer than the `all(..)` / `any(..)` forms that also enable on it, and a
+  grep wide enough to catch those also catches `not(feature = ..)` gates, which
+  are permanently *true*. Grep for the mechanism, not for a number.)
+  **Why:** `gateway_bridge` — the module the gated code imports — exists in
+  **neither** tree, so upstream's own Cargo build cannot enable it either.
+  **At conflict time:** take ours; do not restore the declarations.
+  **What would change it:** upstream shipping `gateway_bridge` in the public
+  extraction.
+
+- **chat-kind sessions** — `reject_chat_kind_without_feature`
+  (`xai-grok-shell/src/agent/mvp_agent/mod.rs:433`) rejects every
+  `kind: "chat"` request unconditionally, with no `cfg` variant anywhere. It is
+  literally the first line of `new_session` (`acp_agent.rs:1110`). On the other
+  two paths it is `?`-propagated one line *after* `begin_session_load`, which is
+  itself fallible — `load_session` (`:1674`/`:1675`) and `attach_session`
+  (`session_setup.rs:254`/`:255`) — so a chat request there can surface a
+  load-claim error instead of the chat rejection. The gate is early on every
+  path and nothing chat-specific runs ahead of it, but "first line" is true of
+  `new_session` alone. `is_chat_kind` has exactly one non-test binding
+  (`acp_agent.rs:1202`), after the gate.
+  **Why:** this is a build-only binary; the chat product is grok.com's.
+  **At conflict time:** take ours.
+  **What would change it:** this fork wanting a chat-enabled binary.
+
+Both mean several hundred lines of synced upstream code that **nothing
+executes**. That is not harmless: #384 found `session_token_auth_gate`'s
+production check *and its own guard test* reverted together by an auto-merge, in
+a file that never appeared in the conflict list — nothing went red because the
+test travelled with the code. Unexecuted code has strictly less protection than
+that, so these two paths are where a sync can quietly take upstream's side
+wholesale. Read their diffs on every sync even though no test will complain.
+
 ## Conflicts git does not report
 
 A textual conflict is not the only kind, and it is not the expensive kind. On
@@ -143,7 +193,18 @@ In order, cheapest first:
   `cargo check --lib` and clippy on `--lib` never compile.
 - `cargo test --workspace --no-run` compiles those targets without running them.
   That catches callers which stopped *compiling*. It cannot catch the ones that
-  still compile and now read the wrong thing — only the grep does.
+  still compile and now read the wrong thing — only the grep does. **And it does
+  not compile everything.** Two silent omissions, both measured (#474):
+  - Targets whose `required-features` are unmet are skipped with no error and no
+    warning. All six `[[test]]` targets in `xai-grok-shell` are gated on
+    `test-support`; pass the feature, or they are not in the check.
+  - `[[bench]]` targets are not built at all without `--benches`, feature or no
+    feature. `cargo test -p xai-grok-shell --tests --benches --features
+    test-support --no-run` yields 51 executables; drop `--benches` and three
+    disappear from the output without comment.
+
+  So `--workspace` is not the completeness guarantee its name suggests, and the
+  failure mode is an empty space in a list nobody counts.
 
 #409 later closed the other half of the same channel. `AuthManager::new` read
 `GROK_AUTH_PATH` unconditionally, so the env was shut out of the Codex resolver
@@ -226,7 +287,41 @@ Triggers:
 Scope is the fork hot path (not full workspace):
 
 - `cargo fmt --all -- --check`
-- `clippy --lib -D warnings` on `xai-grok-sampler`, `xai-grok-shell`, `xai-grok-pager` (lib only; avoids unrelated upstream bench/test lints)
+- `clippy --all-targets -D warnings` on `xai-grok-sampler`, `xai-grok-shell`,
+  `xai-grok-tools` (with `--features pi`), `xai-grok-pager`, `xai-grok-pager-bin`,
+  and `xai-grok-workspace` (enrolled after it sat failing while `providers`
+  looked green, #439). Two things this still does **not** cover, both of
+  which have read as coverage before:
+  - **The rest of the workspace.** `xai-grok-config` is not on that named
+    list. Omitting `--no-deps` still *builds* it as a library dependency of
+    `xai-grok-shell`, but Cargo invokes that dependency through `rustc`,
+    not `clippy-driver`, and does not forward `-D warnings`. A warning in
+    config therefore stays green. Config is on the test list (`display::`,
+    `validation::`, `state_home::`) and on
+    `tests/ci/unlinted-crates.allowlist`; it has no clippy
+    `--manifest-path` of its own. The remaining unnamed crates are
+    recorded by `check_unlinted_crates.py`; triaging them is #457.
+    Test coverage and lint coverage are answered by different lists:
+    `xai-grok-workspace` is named by dozens of `run_nonzero` test filters
+    *and* by a clippy `--manifest-path` of its own.
+  - **`required-features` targets used to be skipped silently.**
+    `--all-targets` omits them with no error and no warning, so the six
+    `[[test]]` targets in `xai-grok-shell` gated on `test-support` — the
+    memory/OOM regression suite — and the sibling `[[bench]] fork_copy`
+    were invisible to the plain `--all-targets` line (#474). CI now has
+    dedicated invocations for that gate: `cargo clippy ... --all-targets
+    --features test-support` in the clippy job, and `cargo test -p
+    xai-grok-shell --tests --benches --features test-support --no-run` in
+    compile-tests. The `--features pi` line above exists because somebody
+    hit the same skip for one crate.
+
+    Feature unification is no longer the only compile path for those six
+    tests: `xai-grok-pager`'s `[dev-dependencies]` still names
+    `xai-grok-shell = { features = ["test-support"] }`
+    (`crates/codegen/xai-grok-pager/Cargo.toml:168`), so
+    `cargo test --workspace --no-run` also turns the gate on, but dropping
+    that one dev-dependency feature no longer silently stops the dedicated
+    compile-tests / clippy steps from building or linting them.
 - Targeted auth / readiness / model-picker tests (subagent None credential strip, session model-switch credential clear, pager unready hard-blocks)
 
 **Merge pull requests with `scripts/merge-pr.sh`, not `gh pr merge`** (issue #202):

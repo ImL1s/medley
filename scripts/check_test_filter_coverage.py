@@ -99,9 +99,27 @@ def workspace_members(root: Path) -> set[str]:
     return names
 
 
-def _crate_from_manifest(path: str) -> str:
-    """`crates/codegen/xai-grok-sampler/Cargo.toml` -> `xai-grok-sampler`."""
-    return Path(path).parent.name
+def _crate_from_manifest(path: str, root: Path) -> str:
+    """Read `[package] name` via the shared `toml_package_name` reader.
+
+    Directory basename is only the fallback when the file cannot be read:
+    `prod/mc/cli-chat-proxy-types` is the package
+    `prod-mc-cli-chat-proxy-types`, not `cli-chat-proxy-types`. A private
+    regex here would be a fifth incomplete copy of the #494 extractor.
+
+    Relative `--manifest-path` values resolve against `root` (the requested
+    workspace), not the process CWD or this script's checkout. Resolving
+    against those would silently name a crate from a different tree when
+    `--root` points elsewhere (#497 review).
+    """
+    candidate = Path(path)
+    manifest = candidate if candidate.is_absolute() else root / candidate
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except OSError:
+        return Path(path).parent.name
+    declared = package_name(text)
+    return declared or manifest.parent.name
 
 
 def _strip_env_assignments_prefix(line: str) -> str:
@@ -114,12 +132,15 @@ def _strip_env_assignments_prefix(line: str) -> str:
         stripped = m.group(1).lstrip()
 
 
-def _parse_workflow(text: str):
+def _parse_workflow(text: str, root: Path | None = None):
     """Map crate -> target -> filters, and the same keyed by lane `--features`.
 
     Joins YAML line continuations first: `ci.yml` wraps long invocations with a
     trailing backslash, and the filter is usually on the continuation line.
+    `root` is the workspace `--manifest-path` is resolved against; default is
+    this script's repository so callers that only parse a snippet keep working.
     """
+    root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
     joined = re.sub(r"\\\s*\n\s*", " ", text)
     per_crate: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     # Same filters, keyed additionally by the lane's `--features`, so coverage
@@ -127,6 +148,11 @@ def _parse_workflow(text: str):
     by_features: dict[str, dict[frozenset, dict[str, set[str]]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(set))
     )
+    # One entry per matched invocation, before crate-wide union. A later
+    # comparison that unions filters per crate cannot see a `NO_COLOR=1
+    # run_nonzero` lane whose filters also appear on an ordinary lane
+    # (#497 review).
+    lanes: list[tuple[str, frozenset[str]]] = []
 
     for line in joined.splitlines():
         m = _RUNNER.match(_strip_env_assignments_prefix(line))
@@ -160,7 +186,7 @@ def _parse_workflow(text: str):
                     if a in ("-p", "--package"):
                         crate = val
                     elif a == "--manifest-path":
-                        crate = _crate_from_manifest(val)
+                        crate = _crate_from_manifest(val, root)
                     elif a == "--test":
                         targets.append(f"test:{val}")
                     elif a == "--bin":
@@ -208,6 +234,8 @@ def _parse_workflow(text: str):
         if crate is None:
             continue
 
+        lanes.append((crate, frozenset(filters)))
+
         if not targets:
             targets = ["*"]
 
@@ -234,10 +262,12 @@ def _parse_workflow(text: str):
     nested = {
         c: {f: dict(t) for f, t in feats.items()} for c, feats in by_features.items()
     }
-    return flat, nested
+    return flat, nested, lanes
 
 
-def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
+def parse_workflow(
+    text: str, root: Path | None = None
+) -> dict[str, dict[str, set[str]]]:
     """Crate -> target -> filters, ignoring which `--features` each lane used.
 
     Kept as the module's public shape because `tests/test_new_test_filter_guard.py`
@@ -245,7 +275,15 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
     parse, so it gets its own name rather than changing this one's contract --
     breaking eleven tests to accommodate a refactor is the wrong direction.
     """
-    return _parse_workflow(text)[0]
+    return _parse_workflow(text, root=root)[0]
+
+
+def parse_workflow_lanes(
+    text: str, root: Path | None = None
+) -> list[tuple[str, frozenset[str]]]:
+    """Per-invocation `(crate, filters)` before crate-wide union (#497)."""
+
+    return _parse_workflow(text, root=root)[2]
 
 
 # Marks a filter that came from a lane carrying `--exact`, where libtest matches
@@ -325,7 +363,9 @@ def main() -> int:
                     help="write the current uncovered set to this file and exit 0")
     args = ap.parse_args()
 
-    per_crate, by_features = _parse_workflow(args.workflow.read_text())
+    per_crate, by_features, _lanes = _parse_workflow(
+        args.workflow.read_text(), root=args.root
+    )
     if not per_crate:
         print("error: no cargo test invocations found -- has ci.yml's shape changed?", file=sys.stderr)
         return 2

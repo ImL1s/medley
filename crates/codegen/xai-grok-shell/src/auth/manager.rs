@@ -513,9 +513,15 @@ enum LockOutcome {
 /// because `cfg(test)` is only ever true when *this* crate compiles as a
 /// test target, not when `xai-grok-config` does as an ordinary dependency
 /// of it (see the moved function's own doc comment for why that matters).
-pub(crate) fn resolved_xai_auth_path(grok_home: &Path) -> PathBuf {
+///
+/// `pub`, not `pub(crate)` (#434 / #481): `xai-grok-pager` must call this
+/// wrapper rather than `xai_grok_config::resolved_xai_auth_path` directly,
+/// so a `GROK_AUTH_PATH` operator setting hashes the same file `AuthManager`
+/// reads. A second, crate-local `grok_home.join("auth.json")` is how #434
+/// happened.
+pub fn resolved_xai_auth_path(grok_home: &Path) -> PathBuf {
     #[cfg(test)]
-    if let Some(path) = XAI_AUTH_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
+    if let Some(path) = explicit_xai_auth_path() {
         return path;
     }
     // In-process unit tests must not share process-global `GROK_AUTH_PATH`.
@@ -525,6 +531,57 @@ pub(crate) fn resolved_xai_auth_path(grok_home: &Path) -> PathBuf {
     } else {
         xai_grok_config::resolved_xai_auth_path(grok_home)
     }
+}
+
+/// The explicit auth-path override — `GROK_AUTH_PATH` in production, the
+/// thread-local test pin under `cfg(test)` — independent of whether a user
+/// home resolves.
+///
+/// [`resolved_xai_auth_path`] already checks this, but only after it has a
+/// `grok_home: &Path` to fall back to when the override is absent. A caller
+/// that gates the *entire* resolution on `user_grok_home()` returning `Some`
+/// before calling `resolved_xai_auth_path` at all silently drops explicit-path
+/// support the moment no home resolves — containers and bare CI runners,
+/// exactly where `GROK_AUTH_PATH` exists to be used (#481, Codex review).
+/// Check this first; only fall back to a `user_grok_home()`-gated
+/// [`resolved_xai_auth_path`] call when it returns `None` — that gate belongs
+/// solely to the default `grok_home.join("auth.json")` path.
+pub fn explicit_xai_auth_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        XAI_AUTH_PATH_OVERRIDE.with(|slot| slot.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        xai_grok_config::explicit_xai_auth_override()
+    }
+}
+
+/// The current auth key's hash for `scope`, resolved the same way
+/// `AuthManager` resolves `auth.json`: an explicit `GROK_AUTH_PATH`
+/// ([`explicit_xai_auth_path`]) first — it needs no home to find its file —
+/// falling back to [`resolved_xai_auth_path`] under `user_home` only for the
+/// default `grok_home.join("auth.json")` path. `0` when nothing resolves,
+/// the file is unreadable, or `scope` isn't present in the store — the same
+/// sentinel `ConfigReloader::reload_auth` compares its next read against to
+/// decide whether to emit `AuthCleared`.
+///
+/// Takes the already-resolved `user_home` instead of calling
+/// `xai_grok_config::user_grok_home()` itself, the same way
+/// `resolved_xai_auth_path` takes `grok_home: &Path` instead of resolving it.
+/// That is what makes the explicit-path-independent-of-home-gate behavior
+/// (#481, Codex review on #498) testable without needing HOME / MEDLEY_HOME /
+/// GROK_HOME to actually be unset in the test process — `user_home: None`
+/// exercises exactly the "no home resolves" branch deterministically, no env
+/// mutation or new thread-local override required.
+pub fn current_auth_key_hash(scope: &str, user_home: Option<PathBuf>) -> u64 {
+    explicit_xai_auth_path()
+        .or_else(|| user_home.map(|g| resolved_xai_auth_path(&g)))
+        .and_then(|auth_path| read_auth_json(&auth_path).ok())
+        .and_then(|store| {
+            lookup_auth(&store, scope).map(|a| crate::config::reloader::hash_auth_key(&a.key))
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1639,6 +1696,10 @@ impl AuthManager {
             }
             self.wait_for_selection_progress(&mut backoff);
         }
+    }
+
+    pub(crate) fn current_selection_generation(&self) -> u64 {
+        self.selection_generation.load(Ordering::Acquire)
     }
 
     /// Whether a previously captured selection snapshot is still current.

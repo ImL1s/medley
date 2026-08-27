@@ -2523,6 +2523,8 @@ fn run_after_cli_preflight(args: PagerArgs, prepared_serve: Option<PreparedServe
     }
 }
 async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> Result<()> {
+    // Relative GROK_AUTH_PATH joins against this, not against `--cwd`.
+    xai_grok_config::pin_process_start_cwd();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut args = args.apply_cwd()?;
     if let Some(ref mode) = args.compaction_mode {

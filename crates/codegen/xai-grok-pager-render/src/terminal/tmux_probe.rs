@@ -13,6 +13,18 @@ const POST_EXIT_CLEANUP_GRACE: Duration = Duration::from_millis(300);
 const GROUP_EXIT_GRACE: Duration = Duration::from_millis(100);
 const GROUP_EXIT_POLL: Duration = Duration::from_millis(1);
 
+#[cfg(test)]
+thread_local! {
+    static TERMINATE_OWNED_GROUP_SLEEPS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+    static LAST_PIPE_DRAIN_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    static LAST_PIPE_DRAIN_GRACE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_TMUX_PROGRAM: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TmuxCommand<'a> {
     Version,
@@ -90,17 +102,41 @@ fn run_tmux_bounded(
     };
 
     // The leader may be reaped while descendants still exist or hold pipes.
-    // Use a fresh post-exit bound so near-deadline success still drains; the
-    // main process deadline is not extended for hung leaders.
-    let cleanup_deadline = std::time::Instant::now() + POST_EXIT_CLEANUP_GRACE;
-    terminate_owned_group(&group);
-    let stdout = recv_pipe_drain(stdout, cleanup_deadline, "stdout")?;
-    let stderr = recv_pipe_drain(stderr, cleanup_deadline, "stderr")?;
+    // `post_exit_cleanup_and_drain` grants a fresh post-exit bound so a
+    // near-deadline success still drains; the main process deadline above is
+    // not extended for hung leaders.
+    let (stdout, stderr) =
+        post_exit_cleanup_and_drain(&group, stdout, stderr, POST_EXIT_CLEANUP_GRACE)?;
     Ok(TmuxCommandOutput {
         status_success: status.success(),
         stdout,
         stderr,
     })
+}
+
+/// SIGTERMs the group, then drains both pipes against a window that starts
+/// *now* — not against whatever remained of an earlier deadline. `grace` is a
+/// relative [`Duration`], not an absolute [`std::time::Instant`]: there is no
+/// outer deadline variable in this function's scope to accidentally reuse, so
+/// the #490 regression this guards against (a drain silently inheriting a
+/// near-exhausted main-process deadline) would need a caller to explicitly
+/// compute and pass a borrowed remainder — a deliberate, reviewable act,
+/// rather than a one-line variable-reuse mistake made invisible by scope.
+fn post_exit_cleanup_and_drain(
+    group: &xai_tty_utils::ProcessGroup,
+    stdout: std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    stderr: std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    grace: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let cleanup_deadline = std::time::Instant::now() + grace;
+    #[cfg(test)]
+    LAST_PIPE_DRAIN_DEADLINE.with(|slot| slot.set(Some(cleanup_deadline)));
+    #[cfg(test)]
+    LAST_PIPE_DRAIN_GRACE.with(|slot| slot.set(Some(grace)));
+    terminate_owned_group(group);
+    let stdout = recv_pipe_drain(stdout, cleanup_deadline, "stdout")?;
+    let stderr = recv_pipe_drain(stderr, cleanup_deadline, "stderr")?;
+    Ok((stdout, stderr))
 }
 
 fn spawn_pipe_drain(
@@ -125,9 +161,14 @@ fn recv_pipe_drain(
     label: &'static str,
 ) -> Result<Vec<u8>, String> {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    receiver
-        .recv_timeout(remaining)
-        .map_err(|_| format!("tmux {label} did not close before the query deadline"))?
+    let timed_out = || format!("tmux {label} did not close before the query deadline");
+    if remaining.is_zero() {
+        return match receiver.try_recv() {
+            Ok(value) => value,
+            Err(_) => Err(timed_out()),
+        };
+    }
+    receiver.recv_timeout(remaining).map_err(|_| timed_out())?
 }
 
 fn terminate_tmux_tree(group: &xai_tty_utils::ProcessGroup, child: &mut std::process::Child) {
@@ -151,6 +192,8 @@ fn terminate_owned_group(group: &xai_tty_utils::ProcessGroup) {
         if std::time::Instant::now() >= deadline {
             break;
         }
+        #[cfg(test)]
+        TERMINATE_OWNED_GROUP_SLEEPS.with(|c| c.set(c.get() + 1));
         std::thread::sleep(GROUP_EXIT_POLL);
     }
     let _ = group.kill();
@@ -237,8 +280,16 @@ fn query_control_mode_with(runner: &dyn TmuxCommandRunner) -> TmuxQueryResult<bo
     }
 }
 
+fn tmux_program() -> std::ffi::OsString {
+    #[cfg(test)]
+    if let Some(path) = TEST_TMUX_PROGRAM.with(|slot| slot.borrow().clone()) {
+        return path.into();
+    }
+    "tmux".into()
+}
+
 fn build_tmux_command(command: TmuxCommand<'_>) -> Command {
-    let mut cmd = Command::new("tmux");
+    let mut cmd = Command::new(tmux_program());
     match command {
         TmuxCommand::Version => {
             cmd.arg("-V").stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -328,6 +379,25 @@ mod tests {
                 TmuxCommand::ClientFeatures => "client-features".to_owned(),
             });
             self.output.clone()
+        }
+    }
+
+    struct TmuxProgramGuard {
+        previous: Option<std::path::PathBuf>,
+    }
+
+    impl TmuxProgramGuard {
+        fn pin(path: impl Into<std::path::PathBuf>) -> Self {
+            let previous = TEST_TMUX_PROGRAM.with(|slot| slot.replace(Some(path.into())));
+            Self { previous }
+        }
+    }
+
+    impl Drop for TmuxProgramGuard {
+        fn drop(&mut self) {
+            TEST_TMUX_PROGRAM.with(|slot| {
+                *slot.borrow_mut() = self.previous.take();
+            });
         }
     }
 
@@ -421,34 +491,144 @@ mod tests {
         );
     }
 
-    /// A leader that exits successfully just under the process deadline must
-    /// still return captured output: post-exit TERM grace + pipe drain use a
-    /// separate bound and must not turn success into a drain timeout.
+    /// Records the *usable* drain deadline (`now + grace`), not the input
+    /// `grace` argument. Pre-filled pipes drain immediately, so asserting the
+    /// argument still passes if the helper computes `Instant::now()` and
+    /// throws the grace away — the zero-grace regression the sibling timeout
+    /// test explicitly delegates here (#501 review).
+    #[test]
+    fn post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline() {
+        let group = xai_tty_utils::ProcessGroup::new().expect("group");
+        LAST_PIPE_DRAIN_DEADLINE.with(|c| c.set(None));
+
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        stdout_tx
+            .send(Ok(b"ok\n".to_vec()))
+            .expect("pre-fill stdout");
+        drop(stdout_tx);
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        stderr_tx.send(Ok(Vec::new())).expect("pre-fill stderr");
+        drop(stderr_tx);
+
+        let before = std::time::Instant::now();
+        let (stdout, stderr) =
+            post_exit_cleanup_and_drain(&group, stdout_rx, stderr_rx, POST_EXIT_CLEANUP_GRACE)
+                .expect("pre-filled pipes must drain under a fresh grace");
+        let after = std::time::Instant::now();
+        assert_eq!(String::from_utf8_lossy(&stdout).trim(), "ok");
+        assert!(stderr.is_empty());
+        let recorded = LAST_PIPE_DRAIN_DEADLINE
+            .with(|c| c.get())
+            .expect("drain must record the usable deadline it waited against");
+        assert!(
+            recorded >= before + POST_EXIT_CLEANUP_GRACE,
+            "usable deadline must include the full supplied grace, not Instant::now()"
+        );
+        assert!(
+            recorded <= after + POST_EXIT_CLEANUP_GRACE,
+            "usable deadline must be now+grace, not a leftover outer timeout"
+        );
+    }
+
+    /// The other half of the property above, made deterministic instead of
+    /// a second race against signal/escalation timing — which a PR whose
+    /// entire subject is removing scheduling races should not introduce.
     ///
-    /// A background descendant keeps the captured pipes open until process-group
-    /// teardown so the drain cannot finish during the wait loop. That makes the
-    /// post-exit cleanup window load-bearing once the main deadline is nearly
-    /// exhausted.
+    /// Two earlier drafts of this test both raced real time. The first
+    /// reused the SIGTERM-ignoring fixture above with a too-small `grace`,
+    /// depending on trap-install timing *and* on SIGKILL teardown and
+    /// drain-thread scheduling landing in a specific order relative to a
+    /// 5ms deadline. The second replaced that with an external `sh -c
+    /// 'sleep 1000'` holder deliberately never attached to `group`, and
+    /// proved the timeout by asserting `elapsed < 200ms` — an upper bound
+    /// on the *test's own* wall-clock time, which Codex's review of #501
+    /// correctly flagged: a descheduled test thread can exceed any fixed
+    /// ceiling even when the implementation under test is entirely
+    /// correct, reintroducing exactly the class of flakiness this PR
+    /// removes everywhere else.
+    ///
+    /// This version never races a delayed send against `recv_timeout`.
+    /// The pipe is left empty and the deadline is already in the past, so
+    /// `recv_pipe_drain` takes the zero-remaining `try_recv` path: either
+    /// the value is already queued (pipe closed in time) or the wait is a
+    /// timeout. A descheduled test thread cannot turn a later send into
+    /// `Ok` (#501 review).
+    ///
+    /// One thing this test still does *not* catch: a `grace` silently
+    /// dropped (collapsed to ~0). That path is `Err` too, indistinguishable
+    /// from correct behaviour here — the sibling positive test catches it by
+    /// asserting the recorded usable deadline is `now + grace`, not `now`
+    /// (`post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline`).
+    #[test]
+    fn post_exit_grace_bounds_the_drain_when_the_pipe_closes_only_after_the_grace() {
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        let past = std::time::Instant::now() - Duration::from_secs(1);
+        let result = recv_pipe_drain(stdout_rx, past, "stdout");
+        drop(stdout_tx);
+
+        assert!(
+            result.is_err(),
+            "an already-elapsed deadline must bound the drain wait even when the pipe is still open: {result:?}"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("did not close before the query deadline"),
+            "must fail as a drain timeout, not some other error"
+        );
+    }
+
+    /// End-to-end sanity through the real spawn/wait/cleanup pipeline: a
+    /// leader that forks a descendant which keeps the pipes open still
+    /// produces captured output once the leader exits, because
+    /// `post_exit_cleanup_and_drain` (tested for its specific "fresh grace"
+    /// property above, in isolation from any external-process timing) tears
+    /// the descendant down and finishes the drain.
+    ///
+    /// #490: no longer a race. The predecessor of this test made the leader
+    /// sleep to just under the main deadline so a shared-deadline bug would
+    /// fail the drain — sound in design, but it meant a real `perl`+shell
+    /// spawn chain had to finish within 300ms of an unrelated 1.5s deadline,
+    /// and that margin is exactly what ambient CPU contention eats: it
+    /// failed **in isolation**, not just under load, with
+    /// `tmux query timed out after 1.5s` — the *wait loop's* timeout, not a
+    /// drain error, meaning the flake was in how long the external process
+    /// chain took to run, not in anything `post_exit_cleanup_and_drain`
+    /// does. The regression that race actually guarded against is now
+    /// guarded by that function's own signature instead (see the test
+    /// above), so this leader has no reason to cut it close: it exits
+    /// immediately, and the only real-time dependency left is "SIGTERM
+    /// reaps a `sleep` descendant," which needs low milliseconds, not
+    /// hundreds.
+    ///
+    /// On its own this test cannot distinguish a caller passing a *fresh*
+    /// grace from one passing a *borrowed* remainder of `timeout`: its
+    /// descendant stays in the group and dies to the leading `SIGTERM`
+    /// well inside either window, so a caller-side regression that
+    /// resurrected the exact bug #490 removed would still leave this test
+    /// green. That is a real, separately-caught gap, not a rhetorical
+    /// one — a mutation at the `run_tmux_bounded` call site that swaps
+    /// `POST_EXIT_CLEANUP_GRACE` for
+    /// `deadline.saturating_duration_since(Instant::now())` reds only the
+    /// sibling test below (`run_tmux_bounded_uses_a_fresh_grace_not_the_
+    /// remaining_main_deadline`), never this one — confirmed by running
+    /// that exact mutation against this file. That sibling test is what
+    /// actually proves freshness at the caller level; this one only
+    /// proves the drain survives a descendant outliving the leader at
+    /// all.
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial(tmux_probe_path)]
-    fn successful_near_deadline_exit_still_returns_captured_output() {
+    fn run_tmux_bounded_drains_a_descendant_still_holding_the_pipes() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let tmux = bin.join("tmux");
-        // Burn most of the process budget, then exit successfully while a
-        // descendant still holds the pipes. Remaining main-deadline time is
-        // intentionally below the fixed TERM grace sleep so a shared deadline
-        // would fail the drain; the separate post-exit cleanup grace must keep
-        // this a success. Perl select is used for subsecond precision.
         let timeout = Duration::from_millis(1500);
         std::fs::write(
             &tmux,
             "#!/bin/sh\n\
-             /usr/bin/perl -e 'select(undef, undef, undef, 1.2)'\n\
              ( exec sleep 30 ) &\n\
              printf 'tmux 3.4\\n'\n\
              exit 0\n",
@@ -456,44 +636,75 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let previous_path = std::env::var_os("PATH");
-        let mut path = OsString::from(bin.as_os_str());
-        path.push(":");
-        if let Some(existing) = &previous_path {
-            path.push(existing);
-        }
-        // SAFETY: serialized on `tmux_probe_path`; restored before return.
-        unsafe {
-            std::env::set_var("PATH", &path);
-        }
+        let _tmux_bin = TmuxProgramGuard::pin(&tmux);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_tmux_bounded(TmuxCommand::Version, timeout)
         }));
-        match previous_path {
-            Some(value) => unsafe {
-                std::env::set_var("PATH", value);
-            },
-            None => unsafe {
-                std::env::remove_var("PATH");
-            },
-        }
         let output = result
-            .expect("near-deadline probe must not panic")
-            .expect("near-deadline success must not become a drain error");
+            .expect("probe must not panic")
+            .expect("a pipe-holding descendant must not turn a clean exit into a drain error");
         assert!(output.status_success, "expected successful status");
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "tmux 3.4");
     }
 
+    /// Sibling to the end-to-end test above: `run_tmux_bounded` must pass
+    /// [`post_exit_cleanup_and_drain`] a *fresh* [`POST_EXIT_CLEANUP_GRACE`],
+    /// not a remainder borrowed from its own much larger `timeout`.
+    ///
+    /// Earlier drafts inferred that from a wall-clock race (an escaped
+    /// holder closing between 300ms and 5s). Under deschedule the holder
+    /// can close before the drain thread observes its timeout, and a
+    /// correct implementation then looks like `Ok` (#501 review). The
+    /// drain now records the `Duration` it was given, so the assertion is
+    /// on that value rather than on whether a real-time holder outlived
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn run_tmux_bounded_uses_a_fresh_grace_not_the_remaining_main_deadline() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tmux = bin.join("tmux");
+        let timeout = Duration::from_millis(5000);
+        std::fs::write(
+            &tmux,
+            "#!/bin/sh\n\
+             printf 'tmux 3.4\\n'\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _tmux_bin = TmuxProgramGuard::pin(&tmux);
+        LAST_PIPE_DRAIN_GRACE.with(|c| c.set(None));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_tmux_bounded(TmuxCommand::Version, timeout)
+        }));
+        result
+            .expect("probe must not panic")
+            .expect("an immediate-exit tmux must drain successfully");
+        assert_eq!(
+            LAST_PIPE_DRAIN_GRACE.with(|c| c.get()),
+            Some(POST_EXIT_CLEANUP_GRACE),
+            "run_tmux_bounded must pass a fresh POST_EXIT_CLEANUP_GRACE, not a remainder of timeout"
+        );
+    }
+
+    /// Observe the poll/sleep path directly instead of inferring it from
+    /// wall time: an empty group returns before `sleep`, so a descheduled
+    /// test thread cannot false-fail a correct short-circuit (#501 review).
     #[cfg(unix)]
     #[test]
     fn empty_group_teardown_does_not_wait_out_the_grace() {
         let group = xai_tty_utils::ProcessGroup::new().expect("group");
-        let started = std::time::Instant::now();
+        TERMINATE_OWNED_GROUP_SLEEPS.with(|c| c.set(0));
         terminate_owned_group(&group);
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < GROUP_EXIT_GRACE / 2,
-            "an empty group must not wait out the grace, took {elapsed:?}"
+        assert_eq!(
+            TERMINATE_OWNED_GROUP_SLEEPS.with(|c| c.get()),
+            0,
+            "an empty group must return before the poll/sleep loop"
         );
     }
 
@@ -501,9 +712,19 @@ mod tests {
     #[test]
     fn group_that_ignores_sigterm_waits_the_grace_and_is_killed() {
         let mut group = xai_tty_utils::ProcessGroup::new().expect("group");
+        let ready_path = std::env::temp_dir().join(format!(
+            "medley-tmux-probe-escalation-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&ready_path);
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-            .arg("trap '' TERM; sleep 1000")
+            .arg("trap '' TERM; : > \"$READY_FILE\"; sleep 1000")
+            .env("READY_FILE", &ready_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -511,10 +732,21 @@ mod tests {
         #[allow(clippy::disallowed_methods)] // test fixture; the test kills it
         let mut child = cmd.spawn().expect("spawn sigterm-ignoring child");
         group.attach_std(&child).expect("attach");
-        // The shell installs its trap ~0.3ms after exec. Signal before that
-        // and it dies to the default SIGTERM, leaving a zombie that still
-        // reports live — the test then passes without exercising SIGKILL.
-        std::thread::sleep(Duration::from_millis(250));
+        // Handshake, not a head start: the child creates READY_FILE only
+        // after the SIGTERM trap is installed. Waiting for that file is
+        // what keeps SIGTERM from racing the default disposition under a
+        // loaded Ubuntu runner (#501 review).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = group.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&ready_path);
+                panic!("fixture never signalled that its SIGTERM trap was installed");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_file(&ready_path);
 
         let started = std::time::Instant::now();
         terminate_owned_group(&group);
