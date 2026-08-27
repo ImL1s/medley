@@ -17,7 +17,7 @@ const GROUP_EXIT_POLL: Duration = Duration::from_millis(1);
 thread_local! {
     static TERMINATE_OWNED_GROUP_SLEEPS: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
-    static LAST_PIPE_DRAIN_REMAINING: std::cell::Cell<Option<Duration>> =
+    static LAST_PIPE_DRAIN_GRACE: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -124,6 +124,8 @@ fn post_exit_cleanup_and_drain(
     stderr: std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
     grace: Duration,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    #[cfg(test)]
+    LAST_PIPE_DRAIN_GRACE.with(|slot| slot.set(Some(grace)));
     let cleanup_deadline = std::time::Instant::now() + grace;
     terminate_owned_group(group);
     let stdout = recv_pipe_drain(stdout, cleanup_deadline, "stdout")?;
@@ -153,12 +155,6 @@ fn recv_pipe_drain(
     label: &'static str,
 ) -> Result<Vec<u8>, String> {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    #[cfg(test)]
-    LAST_PIPE_DRAIN_REMAINING.with(|slot| {
-        if slot.get().is_none() {
-            slot.set(Some(remaining));
-        }
-    });
     receiver
         .recv_timeout(remaining)
         .map_err(|_| format!("tmux {label} did not close before the query deadline"))?
@@ -457,15 +453,13 @@ mod tests {
         );
     }
 
-    /// Records the remaining drain budget at `recv_timeout`, rather than
-    /// racing a worker thread against a wall-clock upper bound (#501 review).
-    /// Pre-filling the pipes means a borrowed `Instant::now()` deadline
-    /// still succeeds on the recv itself; the remaining duration is what
-    /// distinguishes a fresh grace (~300ms) from a collapsed one (~0).
+    /// Records the relative grace passed into the drain, rather than a
+    /// remaining Instant budget that a descheduled test thread can shrink
+    /// (#501 review).
     #[test]
     fn post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline() {
         let group = xai_tty_utils::ProcessGroup::new().expect("group");
-        LAST_PIPE_DRAIN_REMAINING.with(|c| c.set(None));
+        LAST_PIPE_DRAIN_GRACE.with(|c| c.set(None));
 
         let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
         stdout_tx
@@ -481,13 +475,12 @@ mod tests {
                 .expect("pre-filled pipes must drain under a fresh grace");
         assert_eq!(String::from_utf8_lossy(&stdout).trim(), "ok");
         assert!(stderr.is_empty());
-        let remaining = LAST_PIPE_DRAIN_REMAINING
+        let recorded = LAST_PIPE_DRAIN_GRACE
             .with(|c| c.get())
-            .expect("drain must record the remaining budget");
-        assert!(
-            remaining > POST_EXIT_CLEANUP_GRACE / 2,
-            "fresh grace remaining was {remaining:?}; a borrowed Instant::now() \
-             deadline would be ~0"
+            .expect("drain must record the relative grace it was given");
+        assert_eq!(
+            recorded, POST_EXIT_CLEANUP_GRACE,
+            "post-exit drain must be given a fresh relative grace, not a borrowed remainder"
         );
     }
 
@@ -746,6 +739,16 @@ mod tests {
         let pid_file_for_watch = pid_file.clone();
         let go_for_watch = go_marker.clone();
         let watcher = std::thread::spawn(move || {
+            struct ReleaseGo(std::path::PathBuf);
+            impl Drop for ReleaseGo {
+                fn drop(&mut self) {
+                    // Every watcher exit (success, timeout, panic) must
+                    // release the escaped holder so it cannot wait forever
+                    // on a marker that never arrives (#501 review).
+                    let _ = std::fs::write(&self.0, b"");
+                }
+            }
+            let _release = ReleaseGo(go_for_watch.clone());
             let start = std::time::Instant::now();
             let pid = loop {
                 if let Ok(s) = std::fs::read_to_string(&pid_file_for_watch) {
