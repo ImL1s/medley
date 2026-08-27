@@ -9470,6 +9470,15 @@ fn chat_session_fallback_model_id_matrix() {
     );
 }
 
+#[test]
+fn chat_spawn_identity_unchanged_matrix() {
+    assert!(chat_spawn_identity_unchanged(Some("a"), Some("a")));
+    assert!(chat_spawn_identity_unchanged(None, None));
+    assert!(!chat_spawn_identity_unchanged(Some("a"), Some("b")));
+    assert!(!chat_spawn_identity_unchanged(Some("a"), None));
+    assert!(!chat_spawn_identity_unchanged(None, Some("b")));
+}
+
 /// #489 follow-up: composes the two decisions above the way `session/new`
 /// actually does -- resolve the fallback with
 /// `chat_session_fallback_model_id`, then judge it with

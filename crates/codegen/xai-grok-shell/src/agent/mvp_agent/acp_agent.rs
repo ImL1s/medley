@@ -1251,6 +1251,11 @@ impl acp::Agent for MvpAgent {
         } else {
             None
         };
+        let chat_spawn_user_id = if is_chat_kind {
+            self.chat_modes.current_user_id()
+        } else {
+            None
+        };
         let prepared_model_plan = if is_chat_kind {
             None
         } else {
@@ -1509,12 +1514,21 @@ impl acp::Agent for MvpAgent {
             (show_non_git_warning, feedback_enabled)
         };
         let (models, model_presentation) = if is_chat_kind {
+            if !chat_spawn_identity_unchanged(
+                chat_spawn_user_id.as_deref(),
+                self.chat_modes.current_user_id().as_deref(),
+            ) {
+                return Err(acp::Error::internal_error().data(
+                    "chat identity changed during session/new",
+                ));
+            }
             (
                 chat_new_session_model_state(
                     // Recheck the active identity: auth can change while
                     // `new_session` is in flight, and the snapshot fetched
                     // before spawn is keyed to whoever was signed in then
-                    // (#505 review).
+                    // (#505 review). Restart/reject if it did; otherwise
+                    // this fetch is the same user as `fallback_model_id`.
                     self.chat_modes.model_state().await,
                     session_initial_model
                         .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
