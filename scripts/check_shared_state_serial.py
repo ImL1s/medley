@@ -952,19 +952,33 @@ def _body_touches(code_only_body: str, identifiers: tuple[str, ...]) -> bool:
     return any(re.search(rf"\b{re.escape(ident)}\b", code_only_body) for ident in identifiers)
 
 
+def _inline_module_spans(code: str) -> list[tuple[int, int, int, str]]:
+    """`(mod_start, open_index, end, name)` for each inline `mod name { ... }`."""
+
+    spans: list[tuple[int, int, int, str]] = []
+    for match in INLINE_MOD.finditer(code):
+        open_index = match.end() - 1
+        end = _balanced_end(code, open_index)
+        spans.append((match.start(), open_index, end, match.group(1)))
+    return spans
+
+
+def _inline_path_from_spans(
+    spans: list[tuple[int, int, int, str]], pos: int
+) -> tuple[str, ...]:
+    hits = [
+        (start, name)
+        for start, open_index, end, name in spans
+        if start < pos and open_index <= pos < end
+    ]
+    hits.sort()
+    return tuple(name for _, name in hits)
+
+
 def _inline_path_at(code: str, pos: int) -> tuple[str, ...]:
     """Inline `mod name { ... }` modules whose body still contains `pos`."""
 
-    hits: list[tuple[int, str]] = []
-    for match in INLINE_MOD.finditer(code):
-        if match.start() >= pos:
-            break
-        open_index = match.end() - 1
-        end = _balanced_end(code, open_index)
-        if open_index <= pos < end:
-            hits.append((match.start(), match.group(1)))
-    hits.sort()
-    return tuple(name for _, name in hits)
+    return _inline_path_from_spans(_inline_module_spans(code), pos)
 
 
 def _macro_generates_tests(body: str) -> bool:
@@ -973,15 +987,44 @@ def _macro_generates_tests(body: str) -> bool:
     return bool(TEST_ATTR.search(body) and MACRO_TEST_FN.search(body))
 
 
+def _serial_from_macro_body(body: str) -> tuple[frozenset[str], bool]:
+    """`#[serial(...)]` the macro emits next to the generated `#[test]`."""
+
+    held: set[str] = set()
+    has_unkeyed = False
+    for match in SERIAL_ATTR.finditer(body):
+        parsed = _serial_keys(match.group(0))
+        if parsed is None:
+            continue
+        if not parsed:
+            has_unkeyed = True
+        else:
+            held.update(parsed)
+    return frozenset(held), has_unkeyed
+
+
+@dataclass(frozen=True)
+class _PendingMacroTest:
+    file: Path
+    macro_name: str
+    line: int
+    start: int
+    inline_mods: tuple[str, ...]
+    serial_held: frozenset[str]
+    has_unkeyed_serial: bool
+
+
 def index_functions(
     sources: list[tuple[Path, str]], registry: list[SharedItem]
-) -> list[FnInfo]:
+) -> tuple[list[FnInfo], list[_PendingMacroTest]]:
     out: list[FnInfo] = []
+    pending: list[_PendingMacroTest] = []
     for rel, raw in sources:
         code = _code_only(raw)
         impls = _impl_blocks(code)
+        inline_spans = _inline_module_spans(code)
         occupied: list[tuple[int, int]] = []
-        test_macros: list[tuple[str, frozenset[str]]] = []
+        test_macros: list[tuple[str, frozenset[str], bool]] = []
         for match in FN_DEF.finditer(code):
             name = match.group("name")
             body_span = _fn_body(raw, match.end())
@@ -1019,7 +1062,7 @@ def index_functions(
                     type_name=type_name,
                     trait_name=trait_name,
                     is_macro=False,
-                    inline_mods=_inline_path_at(code, match.start()),
+                    inline_mods=_inline_path_from_spans(inline_spans, match.start()),
                     body=body_code,
                     start=body_start,
                     keys=keys,
@@ -1040,8 +1083,9 @@ def index_functions(
             keys = frozenset(
                 item.key for item in registry if _body_touches(body_code, item.identifiers)
             )
-            if _macro_generates_tests(body_code) and keys:
-                test_macros.append((name, keys))
+            if _macro_generates_tests(body_code):
+                serial_held, has_unkeyed = _serial_from_macro_body(body_code)
+                test_macros.append((name, serial_held, has_unkeyed))
             out.append(
                 FnInfo(
                     name=name,
@@ -1059,31 +1103,25 @@ def index_functions(
                     attrs_line=_line(raw, match.start()),
                 )
             )
-        for macro_name, keys in test_macros:
+        for macro_name, serial_held, has_unkeyed in test_macros:
             for invoke in MACRO_INVOKE.finditer(code):
                 if invoke.group(1) != macro_name:
                     continue
                 if any(start <= invoke.start() < end for start, end in occupied):
                     continue
                 line = _line(raw, invoke.start())
-                out.append(
-                    FnInfo(
-                        name=f"{macro_name}!@{line}",
+                pending.append(
+                    _PendingMacroTest(
                         file=rel,
-                        type_name=None,
-                        trait_name=None,
-                        is_macro=False,
-                        inline_mods=_inline_path_at(code, invoke.start()),
-                        body="",
+                        macro_name=macro_name,
+                        line=line,
                         start=invoke.start(),
-                        keys=keys,
-                        is_test=True,
-                        serial_held=frozenset(),
-                        has_unkeyed_serial=False,
-                        attrs_line=line,
+                        inline_mods=_inline_path_from_spans(inline_spans, invoke.start()),
+                        serial_held=serial_held,
+                        has_unkeyed_serial=has_unkeyed,
                     )
                 )
-    return out
+    return out, pending
 
 
 # --- membership: a monotonic fixpoint over the call graph -------------------
@@ -1276,7 +1314,7 @@ def analyze(
     if errors:
         return [], errors, {}
 
-    functions = index_functions(sources, registry)
+    functions, pending_macro_tests = index_functions(sources, registry)
 
     by_file: dict[Path, dict[str, int]] = {}
     by_module: dict[tuple[str, ...], dict[str, int]] = {}
@@ -1331,6 +1369,36 @@ def analyze(
                 changed = True
         if not changed:
             break
+
+    # Synthesize macro-generated tests only after the call-graph closure, so
+    # a `#[test] fn $name() { helper(); }` expansion inherits keys `helper`
+    # acquired transitively (#516 review).
+    macro_index = {(fn.file, fn.name): i for i, fn in enumerate(functions) if fn.is_macro}
+    for pending in pending_macro_tests:
+        j = macro_index.get((pending.file, pending.macro_name))
+        if j is None:
+            continue
+        keys = keys_of[j]
+        if not keys:
+            continue
+        functions.append(
+            FnInfo(
+                name=f"{pending.macro_name}!@{pending.line}",
+                file=pending.file,
+                type_name=None,
+                trait_name=None,
+                is_macro=False,
+                inline_mods=pending.inline_mods,
+                body="",
+                start=pending.start,
+                keys=keys,
+                is_test=True,
+                serial_held=pending.serial_held,
+                has_unkeyed_serial=pending.has_unkeyed_serial,
+                attrs_line=pending.line,
+            )
+        )
+        keys_of.append(keys)
 
     membership: dict[str, list[tuple[Path, int, str]]] = {item.key: [] for item in registry}
     for i, fn in enumerate(functions):

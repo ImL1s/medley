@@ -443,6 +443,62 @@ class TransitiveClosure(unittest.TestCase):
         self.assertTrue(any(n.startswith("case!") for n in names), names)
         self.assertEqual(len(names), 2, names)
 
+    def test_macro_generated_tests_inherit_helper_keys(self):
+        """A generated `#[test] fn $name() { helper(); }` only acquires the
+        key after call-graph closure (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            macro_rules! case {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {
+                        bump();
+                    }
+                };
+            }
+
+            case!(a);
+            case!(b);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertTrue(any(n.startswith("case!") for n in names), names)
+        self.assertEqual(len(names), 2, names)
+
+    def test_macro_emitted_serial_is_preserved_on_synthetics(self):
+        """A correctly tagged generating macro must not be reported missing
+        the key it already emits (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! case {
+                ($name:ident) => {
+                    #[serial(demo_key)]
+                    #[test]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            case!(a);
+            case!(b);
+            """
+        )
+        findings = guard.scan_source(text)
+        self.assertEqual(findings, [])
+
     def test_two_hops_same_file_is_still_derived(self):
         """The real #492 shape: test -> `quarantined_after` -> `heal_unusable`,
         all same-file, neither intermediate call textually mentioning the
