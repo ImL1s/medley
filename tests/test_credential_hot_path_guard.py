@@ -366,7 +366,11 @@ def _iter_module_decls(
                 for inline_name in inline_names:
                     search = search / inline_name
                 if pending_path:
-                    child = (declaring.parent / pending_path).resolve()
+                    # `#[path]` beside a file-level `mod` is relative to the
+                    # declaring file's directory. Inside `mod outer { ... }`
+                    # rustc loads `outer/<path>` (#507 review).
+                    base = search if inline_names else declaring.parent
+                    child = (base / pending_path).resolve()
                     decls.append((name, child, inline_names))
                 else:
                     child = _existing_mod_file(search, name)
@@ -442,9 +446,7 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
     depth = 0
     n = len(raw_lines)
     for i in range(n):
-        raw = raw_lines[i]
-
-        if _TEST_ATTR.match(raw):
+        if _TEST_ATTR.match(masked_lines[i]):
             for follow_raw in raw_lines[i + 1 :]:
                 follow = follow_raw.strip()
                 if follow.startswith("#[") or follow.startswith("//"):
@@ -780,6 +782,43 @@ class ExternalModulePrefix(unittest.TestCase):
             names = _qualified_test_names(root)
             self.assertIn("outer::inner::none_auth_scheme_sends", names)
             self.assertNotIn("inner::none_auth_scheme_sends", names)
+
+    def test_path_attr_inside_an_inline_module_uses_the_inline_directory(self):
+        """`mod outer { #[path = "actual.rs"] mod alias; }` loads
+        `outer/actual.rs` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "codegen" / "demo" / "src"
+            (src / "outer").mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                'mod outer {\n    #[path = "actual.rs"]\n    mod alias;\n}\n'
+            )
+            (src / "outer" / "actual.rs").write_text(
+                "#[test]\nfn none_auth_scheme_sends() {}\n"
+            )
+            (src / "actual.rs").write_text(
+                "#[test]\nfn none_auth_scheme_wrong_dir() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("outer::alias::none_auth_scheme_sends", names)
+            self.assertNotIn("none_auth_scheme_wrong_dir", names)
+            self.assertNotIn("alias::none_auth_scheme_sends", names)
+
+    def test_block_commented_test_attr_is_not_counted(self):
+        """Wrapping a hot-path test in `/* ... */` must drop it (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "#[test]\nfn none_auth_scheme_live() {}\n"
+                "/*\n#[test]\nfn none_auth_scheme_commented() {}\n*/\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_live", names)
+            self.assertNotIn("none_auth_scheme_commented", names)
 
     def test_path_prefix_propagates_to_descendant_modules(self):
         with tempfile.TemporaryDirectory() as d:
