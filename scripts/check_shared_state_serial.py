@@ -1183,6 +1183,28 @@ def _body_touches(code_only_body: str, identifiers: tuple[str, ...]) -> bool:
     return any(re.search(rf"\b{re.escape(ident)}\b", code_only_body) for ident in identifiers)
 
 
+def _with_aliases(
+    file_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]],
+    inline_mods: tuple[str, ...],
+    identifiers: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Registered identifiers plus in-scope `use … as` aliases of them."""
+
+    known = set(identifiers)
+    extra: list[str] = []
+    prefix = inline_mods
+    while True:
+        for local, (_module, fname) in file_imports.get(prefix, {}).items():
+            if fname in known and local not in known:
+                extra.append(local)
+        if not prefix:
+            break
+        prefix = prefix[:-1]
+    if not extra:
+        return identifiers
+    return identifiers + tuple(extra)
+
+
 def _inline_module_spans(code: str) -> list[tuple[int, int, int, str]]:
     """`(mod_start, open_index, end, name)` for each inline `mod name { ... }`."""
 
@@ -1295,8 +1317,9 @@ def _generated_test_templates(
     """
 
     parsed: list[tuple[str, bool, frozenset[str], bool, bool, str]] = []
-    for match in MACRO_TEST_FN.finditer(body):
-        attrs = _preceding_attributes(body, body, match.start())
+    code = _code_only(body)
+    for match in MACRO_TEST_FN.finditer(code):
+        attrs = _preceding_attributes(body, code, match.start())
         is_test = any(_is_test_attr(a) for a in attrs)
         held: set[str] = set()
         has_unkeyed = False
@@ -1309,8 +1332,8 @@ def _generated_test_templates(
             else:
                 held.update(parsed_keys)
         metavar = match.group(1)
-        span = _fn_body(body, match.end())
-        fn_body = _strip_turbofish(body[span[0] : span[1]]) if span else ""
+        span = _fn_body(code, match.end())
+        fn_body = _strip_turbofish(code[span[0] : span[1]]) if span else ""
         parsed.append(
             (
                 metavar,
@@ -1367,6 +1390,7 @@ def index_functions(
         code = _code_only(raw)
         impls = _impl_blocks(code)
         inline_spans = _inline_module_spans(code)
+        file_imports = _use_imports(rel, raw)
         occupied: list[tuple[int, int]] = []
         macro_bodies: list[tuple[int, int]] = []
         for macro_match in MACRO_DEF.finditer(code):
@@ -1383,8 +1407,14 @@ def index_functions(
             body_start, body_end = body_span
             occupied.append((body_start, body_end))
             body_code = _strip_turbofish(code[body_start:body_end])
+            inline_mods = _inline_path_from_spans(inline_spans, match.start())
             keys = frozenset(
-                item.key for item in registry if _body_touches(body_code, item.identifiers)
+                item.key
+                for item in registry
+                if _body_touches(
+                    body_code,
+                    _with_aliases(file_imports, inline_mods, item.identifiers),
+                )
             )
             type_name = None
             trait_name = None
@@ -1412,7 +1442,7 @@ def index_functions(
                     type_name=type_name,
                     trait_name=trait_name,
                     is_macro=False,
-                    inline_mods=_inline_path_from_spans(inline_spans, match.start()),
+                    inline_mods=inline_mods,
                     body=body_code,
                     start=body_start,
                     keys=keys,

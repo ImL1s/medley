@@ -332,6 +332,32 @@ class DirectReference(unittest.TestCase):
         findings = guard.scan_source(text)
         self.assertEqual(findings, [])
 
+    def test_aliased_static_is_a_direct_touch(self):
+        """`use super::COUNTER as C` then `C.fetch_add` is still a touch
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            mod inner {
+                use super::COUNTER as C;
+
+                fn helper() {
+                    C.fetch_add(1, Ordering::SeqCst);
+                }
+
+                #[test]
+                fn calls_aliased_helper_untagged() {
+                    helper();
+                }
+            }
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        self.assertIn("calls_aliased_helper_untagged", names)
+
 
 class TransitiveClosure(unittest.TestCase):
     def test_one_hop_same_file_bare_call(self):
@@ -468,6 +494,62 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), fixed)], "demo_key")
         self.assertTrue(any(n.startswith("case!") for n in names), names)
         self.assertEqual(len(names), 2, names)
+
+    def test_comment_between_generated_test_attr_and_fn_is_still_a_test(self):
+        """`#[test]` then `// note` then `fn $name` must still count
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! case {
+                ($name:ident) => {
+                    #[test]
+                    // rationale
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            case!(a);
+            case!(b);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(len(names), 2, names)
+
+    def test_generated_test_string_mention_is_not_a_touch(self):
+        """A generated test that only logs `\"COUNTER\"` is not a toucher
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn real_toucher() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            macro_rules! case {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {
+                        let _s = "COUNTER";
+                    }
+                };
+            }
+
+            case!(a);
+            case!(b);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"real_toucher"})
 
     def test_macro_generated_tests_inherit_helper_keys(self):
         """A generated `#[test] fn $name() { helper(); }` only acquires the
