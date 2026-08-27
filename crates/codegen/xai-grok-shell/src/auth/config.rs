@@ -333,11 +333,21 @@ impl Default for GrokComConfig {
                 "MEDLEY_AUTH_PROVIDER_LABEL",
                 "GROK_AUTH_PROVIDER_LABEL",
             ),
-            auth_token_ttl: xai_grok_config::resolve_env_var(
-                "MEDLEY_AUTH_TOKEN_TTL",
-                "GROK_AUTH_TOKEN_TTL",
-            )
-            .and_then(|v| v.parse().ok()),
+            auth_token_ttl: {
+                let parse = |raw: String| raw.parse::<u64>().ok();
+                match std::env::var("MEDLEY_AUTH_TOKEN_TTL") {
+                    Ok(v) if !v.trim().is_empty() => parse(v).or_else(|| {
+                        std::env::var("GROK_AUTH_TOKEN_TTL")
+                            .ok()
+                            .and_then(parse)
+                            .inspect(|_| xai_grok_config::note_legacy_hit("GROK_AUTH_TOKEN_TTL"))
+                    }),
+                    _ => std::env::var("GROK_AUTH_TOKEN_TTL")
+                        .ok()
+                        .and_then(parse)
+                        .inspect(|_| xai_grok_config::note_legacy_hit("GROK_AUTH_TOKEN_TTL")),
+                }
+            },
             disable_api_key_auth: std::env::var("GROK_DISABLE_API_KEY_AUTH")
                 .ok()
                 .map(|v| env_flag_enabled(&v)),
@@ -450,11 +460,21 @@ mod tests {
             std::env::set_var("GROK_AUTH_TOKEN_TTL", "222");
         }
         let cfg = GrokComConfig::default();
+        assert_eq!(cfg.auth_token_ttl, Some(111));
+
+        unsafe {
+            std::env::set_var("MEDLEY_AUTH_TOKEN_TTL", "not-a-number");
+        }
+        let cfg = GrokComConfig::default();
         unsafe {
             std::env::remove_var("MEDLEY_AUTH_TOKEN_TTL");
             std::env::remove_var("GROK_AUTH_TOKEN_TTL");
         }
-        assert_eq!(cfg.auth_token_ttl, Some(111));
+        assert_eq!(
+            cfg.auth_token_ttl,
+            Some(222),
+            "invalid MEDLEY_AUTH_TOKEN_TTL must fall through to GROK_AUTH_TOKEN_TTL"
+        );
     }
 
     #[test]

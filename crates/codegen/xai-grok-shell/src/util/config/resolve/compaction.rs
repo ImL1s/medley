@@ -111,12 +111,21 @@ pub(crate) fn resolve_auto_compact_threshold_percent_from_tiers(
         }
     }
     let from_env = || -> Option<u8> {
-        xai_grok_config::resolve_env_var(
-            "MEDLEY_AUTO_COMPACT_THRESHOLD_PERCENT",
-            ENV_AUTO_COMPACT_THRESHOLD_PERCENT,
-        )
-        .and_then(|s| s.parse::<i64>().ok())
-        .and_then(clamp_env)
+        let parse_clamp = |s: String| s.parse::<i64>().ok().and_then(clamp_env);
+        match std::env::var("MEDLEY_AUTO_COMPACT_THRESHOLD_PERCENT") {
+            Ok(v) if !v.trim().is_empty() => parse_clamp(v).or_else(|| {
+                std::env::var(ENV_AUTO_COMPACT_THRESHOLD_PERCENT)
+                    .ok()
+                    .and_then(parse_clamp)
+                    .inspect(|_| {
+                        xai_grok_config::note_legacy_hit(ENV_AUTO_COMPACT_THRESHOLD_PERCENT)
+                    })
+            }),
+            _ => std::env::var(ENV_AUTO_COMPACT_THRESHOLD_PERCENT)
+                .ok()
+                .and_then(parse_clamp)
+                .inspect(|_| xai_grok_config::note_legacy_hit(ENV_AUTO_COMPACT_THRESHOLD_PERCENT)),
+        }
     };
 
     from_env()
@@ -337,13 +346,22 @@ mod auto_compact_threshold_env_alias_tests {
         }
         let cfg = crate::agent::config::Config::default();
         let result = resolve_auto_compact_threshold_percent(&cfg, "some-model", None);
+        assert_eq!(
+            result, 10,
+            "MEDLEY_AUTO_COMPACT_THRESHOLD_PERCENT=10 must win over GROK_*=90"
+        );
+
+        unsafe {
+            std::env::set_var("MEDLEY_AUTO_COMPACT_THRESHOLD_PERCENT", "nope");
+        }
+        let result = resolve_auto_compact_threshold_percent(&cfg, "some-model", None);
         unsafe {
             std::env::remove_var("MEDLEY_AUTO_COMPACT_THRESHOLD_PERCENT");
             std::env::remove_var("GROK_AUTO_COMPACT_THRESHOLD_PERCENT");
         }
         assert_eq!(
-            result, 10,
-            "MEDLEY_AUTO_COMPACT_THRESHOLD_PERCENT=10 must win over GROK_*=90"
+            result, 90,
+            "invalid MEDLEY_AUTO_COMPACT_THRESHOLD_PERCENT must fall through to GROK_*"
         );
     }
 
