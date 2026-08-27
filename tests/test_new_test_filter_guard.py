@@ -283,11 +283,8 @@ class WorkspaceMembersRealCorpus(unittest.TestCase):
         self.assertEqual(workspace_members(REPO), set(self.ground_truth.values()))
 
     def test_a_trailing_comment_is_already_tolerated(self):
-        # Unlike its two siblings, this regex carries no `$` end anchor, so
-        # a trailing comment does not stop it from matching -- verified
-        # here rather than assumed, since the other two copies of this
-        # pattern (`check_unlinted_crates.py`, `check_uncovered_crates.py`)
-        # both need `(?:#.*)?` explicitly for the same case.
+        # #506's shared reader (`toml_package_name`) is what `workspace_members`
+        # calls; a trailing comment is one of the spellings it exists to keep.
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -302,12 +299,9 @@ class WorkspaceMembersRealCorpus(unittest.TestCase):
             )
             self.assertEqual(workspace_members(root), {"foo"})
 
-    def test_a_single_quoted_value_is_a_known_unfixed_gap_see_issue_494(self):
-        # Double-quote only in the value; unlike the trailing-comment case
-        # above, there is no anchor to blame here -- the value's quote
-        # class is checked, and `'foo'` never matches `"([^"]+)"`. The
-        # regex misses the line entirely and falls back to the directory
-        # basename -- "m", not the real package name "foo". See #494.
+    def test_a_single_quoted_value_is_read(self):
+        # #494 used to fall back to the directory basename here. The shared
+        # reader landed in #506; this pins that the gap is closed.
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,9 +313,9 @@ class WorkspaceMembersRealCorpus(unittest.TestCase):
             (root / "m" / "Cargo.toml").write_text(
                 "[package]\nname = 'foo'\nversion = \"0.1.0\"\n", encoding="utf-8"
             )
-            self.assertEqual(workspace_members(root), {"m"})
+            self.assertEqual(workspace_members(root), {"foo"})
 
-    def test_a_quoted_key_is_a_known_unfixed_gap_see_issue_494(self):
+    def test_a_quoted_key_is_read(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -333,7 +327,7 @@ class WorkspaceMembersRealCorpus(unittest.TestCase):
             (root / "m" / "Cargo.toml").write_text(
                 '[package]\n"name" = "foo"\nversion = "0.1.0"\n', encoding="utf-8"
             )
-            self.assertEqual(workspace_members(root), {"m"})
+            self.assertEqual(workspace_members(root), {"foo"})
 
 
 class AddedTests(unittest.TestCase):
