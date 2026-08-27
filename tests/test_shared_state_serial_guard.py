@@ -1017,6 +1017,129 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_imported_bump_untagged"})
 
+    def test_reexported_function_resolves_through_the_exporting_module(self):
+        """`pub use crate::a::bump` in `b.rs` must make `crate::b::bump()`
+        a toucher (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    pub use crate::a::bump;
+                    """
+                ),
+            ),
+            (
+                Path("src/c.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn calls_reexported_bump_untagged() {
+                        crate::b::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_reexported_bump_untagged"})
+
+    def test_reexport_chain_resolves_through_each_exporter(self):
+        """`pub use` of a `pub use` still has to land on the definition
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    pub use crate::a::bump;
+                    """
+                ),
+            ),
+            (
+                Path("src/c.rs"),
+                src(
+                    """\
+                    pub use crate::b::bump;
+                    """
+                ),
+            ),
+            (
+                Path("src/d.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn calls_chained_reexport_untagged() {
+                        crate::c::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_chained_reexport_untagged"})
+
+    def test_raw_identifier_function_is_indexed_and_called(self):
+        """`fn r#match` is a real name; capturing only `r` drops the body
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn r#match() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn calls_raw_ident_untagged() {
+                        crate::a::r#match();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_raw_ident_untagged"})
+
     def test_inline_super_import_resolves_from_the_inline_module(self):
         """`mod tests { use super::helpers::bump }` is `a::helpers::bump`,
         not crate-root `helpers::bump` (#516 review)."""

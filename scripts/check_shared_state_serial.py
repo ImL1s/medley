@@ -251,7 +251,8 @@ DEFAULT_SCAN_ROOT = Path("crates/codegen/xai-grok-shell/src")
 RAW_STRING_START = re.compile(r'r(#+)?"')
 CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'\n])'")
 FN_DEF = re.compile(
-    r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+"
+    r"(?:r#)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
 )
 MACRO_DEF = re.compile(r"macro_rules!\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
 MACRO_INVOKE = re.compile(
@@ -273,18 +274,18 @@ SERIAL_ATTR = re.compile(
 )
 IMPL_KW = re.compile(r"\bimpl\b")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-FREE_CALL = re.compile(r"(?<![:.\w])([a-z_][a-z0-9_]*)\s*\(")
+FREE_CALL = re.compile(r"(?<![:.\w])(?:r#)?([a-z_][a-z0-9_]*)\s*\(")
 USE_PLAIN = re.compile(
-    r"\buse\s+(crate|super|self)((?:::[A-Za-z_][A-Za-z0-9_]*)+)"
-    r"(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*;"
+    r"\buse\s+(crate|super|self)((?:::(?:r#)?[A-Za-z_][A-Za-z0-9_]*)+)"
+    r"(?:\s+as\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*))?\s*;"
 )
 USE_BRACE = re.compile(
-    r"\buse\s+(crate|super|self)((?:::[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"\buse\s+(crate|super|self)((?:::(?:r#)?[A-Za-z_][A-Za-z0-9_]*)*)"
     r"::\{([^}]+)\}\s*;"
 )
 USE_BRACE_ITEM = re.compile(
-    r"((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Za-z_][A-Za-z0-9_]*)"
-    r"(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?"
+    r"((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(?:r#)?[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s+as\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*))?"
 )
 # Any `path::to::name(` call, `crate`-rooted or not. Resolved two ways (see
 # `_resolve_calls`): a `crate`-rooted path by its FULL module path, and every
@@ -292,7 +293,7 @@ USE_BRACE_ITEM = re.compile(
 # leaf -- the shape a sibling module is actually called by in this tree
 # (`search_recovery::heal_unusable(`, no `crate::` prefix at all).
 QUALIFIED_CALL = re.compile(
-    r"\b((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)([a-z_][a-z0-9_]*)\s*\("
+    r"\b((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)(?:r#)?([a-z_][a-z0-9_]*)\s*\("
 )
 TYPE_ASSOC_CALL = re.compile(
     r"\b([A-Z][A-Za-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>\s*)?\("
@@ -857,6 +858,14 @@ def _module_path(rel: Path) -> tuple[str, ...] | None:
     return tuple(segs)
 
 
+def _raw_ident(name: str) -> str:
+    return name[2:] if name.startswith("r#") else name
+
+
+def _is_pub_use(code: str, use_start: int) -> bool:
+    return re.search(r"\bpub(?:\s*\([^)]*\))?\s*$", code[:use_start]) is not None
+
+
 def _use_module_prefix(
     root: str,
     mid: tuple[str, ...],
@@ -900,18 +909,85 @@ def _use_imports(
         scoped.setdefault(inline, {})[local] = (module, fname)
 
     for m in USE_PLAIN.finditer(code):
-        segs = tuple(s for s in m.group(2).split("::") if s)
+        segs = tuple(_raw_ident(s) for s in m.group(2).split("::") if s)
         if not segs:
             continue
         fname = segs[-1]
-        record(m.start(), m.group(1), segs[:-1], fname, m.group(3) or fname)
+        record(m.start(), m.group(1), segs[:-1], fname, _raw_ident(m.group(3) or fname))
     for m in USE_BRACE.finditer(code):
-        mid = tuple(s for s in m.group(2).split("::") if s)
+        mid = tuple(_raw_ident(s) for s in m.group(2).split("::") if s)
         for raw in m.group(3).split(","):
             item = USE_BRACE_ITEM.search(raw.strip())
             if item is None:
                 continue
             segs = tuple(s.strip() for s in item.group(1).split("::") if s.strip())
+            if not segs or segs[0] in ("self", "super"):
+                continue
+            fname = _raw_ident(segs[-1])
+            record(
+                m.start(),
+                m.group(1),
+                mid + tuple(_raw_ident(s) for s in segs[:-1]),
+                fname,
+                _raw_ident(item.group(2) or fname),
+            )
+    return scoped
+
+
+def _pub_reexports(
+    path: Path, text: str
+) -> list[tuple[tuple[str, ...], str, tuple[str, ...], str]]:
+    """`(dest_module, local, src_module, fname)` for `pub use` bindings.
+
+    A re-export is not a physical definition, so `by_module[dest][local]`
+    would otherwise miss `crate::b::bump()` when `b.rs` only has
+    `pub use crate::a::bump` (#516 review).
+    """
+
+    code = _code_only(text)
+    file_mod = _module_path(path)
+    if file_mod is None:
+        return []
+    spans = _inline_module_spans(code)
+    out: list[tuple[tuple[str, ...], str, tuple[str, ...], str]] = []
+
+    def record(
+        pos: int, root: str, mid: tuple[str, ...], fname: str, local: str
+    ) -> None:
+        inline = _inline_path_from_spans(spans, pos)
+        src = _use_module_prefix(root, mid, file_mod, inline)
+        if src is None:
+            return
+        dest = file_mod + inline
+        out.append((dest, local, src, fname))
+
+    for m in USE_PLAIN.finditer(code):
+        if not _is_pub_use(code, m.start()):
+            continue
+        segs = tuple(_raw_ident(s) for s in m.group(2).split("::") if s)
+        if not segs:
+            continue
+        fname = segs[-1]
+        record(
+            m.start(),
+            m.group(1),
+            segs[:-1],
+            fname,
+            _raw_ident(m.group(3) or fname),
+        )
+    for m in USE_BRACE.finditer(code):
+        if not _is_pub_use(code, m.start()):
+            continue
+        mid = tuple(_raw_ident(s) for s in m.group(2).split("::") if s)
+        for raw in m.group(3).split(","):
+            item = USE_BRACE_ITEM.search(raw.strip())
+            if item is None:
+                continue
+            segs = tuple(
+                _raw_ident(s.strip())
+                for s in item.group(1).split("::")
+                if s.strip()
+            )
             if not segs or segs[0] in ("self", "super"):
                 continue
             fname = segs[-1]
@@ -920,9 +996,37 @@ def _use_imports(
                 m.group(1),
                 mid + segs[:-1],
                 fname,
-                item.group(2) or fname,
+                _raw_ident(item.group(2) or fname),
             )
-    return scoped
+    return out
+
+
+def _copy_reexports_into_indices(
+    reexports: list[tuple[tuple[str, ...], str, tuple[str, ...], str]],
+    by_module: dict[tuple[str, ...], dict[str, list[int]]],
+    by_leaf: dict[str, dict[str, list[int]]],
+) -> None:
+    if not reexports:
+        return
+    for _ in range(len(reexports) + 1):
+        progressed = False
+        for dest, local, src, fname in reexports:
+            js = list(by_module.get(src, {}).get(fname, []))
+            if not js:
+                continue
+            slot = by_module.setdefault(dest, {}).setdefault(local, [])
+            for j in js:
+                if j not in slot:
+                    slot.append(j)
+                    progressed = True
+            if dest:
+                leaf_slot = by_leaf.setdefault(dest[-1], {}).setdefault(local, [])
+                for j in js:
+                    if j not in leaf_slot:
+                        leaf_slot.append(j)
+                        progressed = True
+        if not progressed:
+            break
 
 
 def _lookup_import(
@@ -1894,6 +1998,11 @@ def analyze(
             by_type.setdefault(fn.type_name, {}).setdefault(fn.name, []).append(i)
         if fn.trait_name is not None:
             by_type.setdefault(fn.trait_name, {}).setdefault(fn.name, []).append(i)
+
+    reexports: list[tuple[tuple[str, ...], str, tuple[str, ...], str]] = []
+    for path, text in sources:
+        reexports.extend(_pub_reexports(path, text))
+    _copy_reexports_into_indices(reexports, by_module, by_leaf)
 
     keys_of: list[frozenset[str]] = [fn.keys for fn in functions]
     converged = False
