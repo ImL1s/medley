@@ -1511,11 +1511,11 @@ impl acp::Agent for MvpAgent {
         let (models, model_presentation) = if is_chat_kind {
             (
                 chat_new_session_model_state(
-                    // Reuses the snapshot fetched above for the
-                    // chat-catalog-aware fallback (#489 follow-up) rather
-                    // than fetching `/rest/modes` twice.
-                    chat_model_state
-                        .expect("chat_model_state is fetched whenever is_chat_kind"),
+                    // Recheck the active identity: auth can change while
+                    // `new_session` is in flight, and the snapshot fetched
+                    // before spawn is keyed to whoever was signed in then
+                    // (#505 review).
+                    self.chat_modes.model_state().await,
                     session_initial_model
                         .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
                 ),
