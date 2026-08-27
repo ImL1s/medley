@@ -543,7 +543,15 @@ fn chat_catalog_spawn_fallback_model_id(
     match chat_catalog {
         Some(crate::agent::chat_modes::ChatModelCatalog::Authoritative(state)
             | crate::agent::chat_modes::ChatModelCatalog::NoInfo(state)) => {
-            state.current_model_id.clone()
+            // An authoritative empty catalog, or a cold fetch that never
+            // populated `current_model_id`, carries `""` — not a usable
+            // chat default (#483 review). Falling through to the previous
+            // fallback beats spawning an actor with a blank identity.
+            if state.current_model_id.0.as_ref().is_empty() {
+                build_default()
+            } else {
+                state.current_model_id.clone()
+            }
         }
         None => build_default(),
     }

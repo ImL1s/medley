@@ -9159,6 +9159,16 @@ fn chat_catalog_spawn_fallback_uses_chat_catalog_not_build() {
         acp::ModelId::new("build-default".to_owned()),
         "[no_catalog]"
     );
+    assert_eq!(
+        chat_catalog_spawn_fallback_model_id(
+            Some(&ChatModelCatalog::Authoritative(
+                acp::SessionModelState::new(acp::ModelId::new(String::new()), Vec::new()),
+            )),
+            || acp::ModelId::new("build-default".to_owned()),
+        ),
+        acp::ModelId::new("build-default".to_owned()),
+        "[empty_current]"
+    );
 }
 
 /// #418 review finding: the first version of this fix classified a chat-kind
