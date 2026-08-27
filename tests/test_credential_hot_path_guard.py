@@ -133,6 +133,16 @@ def _mask_rust_literals(text: str) -> str:
             continue
         if text[i] in "\"'":
             q = text[i]
+            if q == "'" and i + 1 < n and (text[i + 1].isalpha() or text[i + 1] == "_"):
+                j = i + 1
+                while j < n and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                if j >= n or text[j] != "'":
+                    # Lifetime or label (`'a`, `'static`, `'foo:`) — not a
+                    # character literal (#507 review).
+                    out.append(" " * (j - i))
+                    i = j
+                    continue
             j = i + 1
             while j < n:
                 if text[j] == "\\":
@@ -250,9 +260,14 @@ def _is_lib_or_integration_source(rs: Path) -> bool:
     return True
 
 
-def _is_cargo_crate_root_file(rs: Path) -> bool:
-    """`src/lib.rs` or an integration target `tests/foo.rs`."""
+def _is_cargo_crate_root_file(
+    rs: Path, extra_roots: set[Path] | frozenset[Path] | None = None
+) -> bool:
+    """`src/lib.rs`, an integration target `tests/*.rs`, or an explicit `[[test]].path`."""
 
+    key = rs.resolve()
+    if extra_roots and key in extra_roots:
+        return True
     split = _crate_source_rel(rs)
     if split is None:
         return False
@@ -262,6 +277,40 @@ def _is_cargo_crate_root_file(rs: Path) -> bool:
     if marker == "tests" and len(rest) == 1 and rest[0].endswith(".rs"):
         return True
     return False
+
+
+def _explicit_integration_roots(root: Path) -> set[Path]:
+    """Cargo `[[test]]` targets whose `path` is not a top-level `tests/*.rs`.
+
+    `tests/leader_pty_e2e/mod.rs` is a real integration crate (#507 review)
+    but `_is_cargo_crate_root_file`'s `tests/*.rs` shape misses it.
+    """
+
+    roots: set[Path] = set()
+    for manifest in root.rglob("Cargo.toml"):
+        if "target" in manifest.parts:
+            continue
+        try:
+            text = manifest.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        in_test = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped == "[[test]]":
+                in_test = True
+                continue
+            if stripped.startswith("["):
+                in_test = False
+                continue
+            if not in_test:
+                continue
+            match = re.match(r'^path\s*=\s*"([^"]+)"', stripped)
+            if match:
+                path = (manifest.parent / match.group(1)).resolve()
+                if path.is_file():
+                    roots.add(path)
+    return roots
 
 
 def _mod_search_dir(declaring: Path) -> Path:
@@ -333,6 +382,7 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         texts[key] = text
         return text
 
+    extra_roots = _explicit_integration_roots(root)
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
@@ -340,7 +390,7 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         for rs in base_dir.rglob("*.rs"):
             if not _is_lib_or_integration_source(rs):
                 continue
-            if _is_cargo_crate_root_file(rs):
+            if _is_cargo_crate_root_file(rs, extra_roots):
                 queue.append((rs.resolve(), tuple(_path_module_prefix(rs))))
 
     while queue:
@@ -396,7 +446,9 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
 
 
 def _module_prefixes_for_source(
-    rs: Path, overrides: dict[Path, list[list[str]]]
+    rs: Path,
+    overrides: dict[Path, list[list[str]]],
+    extra_roots: set[Path] | frozenset[Path] | None = None,
 ) -> list[list[str]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
@@ -409,7 +461,7 @@ def _module_prefixes_for_source(
     key = rs.resolve()
     if key in overrides:
         return overrides[key]
-    if _is_cargo_crate_root_file(rs):
+    if _is_cargo_crate_root_file(rs, extra_roots):
         return [_path_module_prefix(rs)]
     return None
 
@@ -428,6 +480,7 @@ def _qualified_test_names(root: Path) -> list[str]:
     the defect this guard exists to catch.
     """
     overrides = _declared_module_overrides(root)
+    extra_roots = _explicit_integration_roots(root)
     names: list[str] = []
     for base in _CRATE_ROOTS:
         base_dir = root / base
@@ -440,7 +493,7 @@ def _qualified_test_names(root: Path) -> list[str]:
                 text = rs.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            prefix_lists = _module_prefixes_for_source(rs, overrides)
+            prefix_lists = _module_prefixes_for_source(rs, overrides, extra_roots)
             if prefix_lists is None:
                 continue
             for file_mods in prefix_lists:
@@ -540,6 +593,23 @@ class ExternalModulePrefix(unittest.TestCase):
             self.assertNotIn("orphan::hidden", names)
             self.assertNotIn("hidden", names)
 
+    def test_explicit_cargo_test_path_is_a_seeded_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            nested = crate / "tests" / "leader_pty_e2e"
+            nested.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[[test]]\nname = \"leader_pty_e2e\"\n"
+                'path = "tests/leader_pty_e2e/mod.rs"\n',
+                encoding="utf-8",
+            )
+            (nested / "mod.rs").write_text("mod cluster;\n", encoding="utf-8")
+            (nested / "cluster.rs").write_text("#[test]\nfn boots() {}\n", encoding="utf-8")
+            names = _qualified_test_names(root)
+            self.assertIn("cluster::boots", names)
+
     def test_string_brace_does_not_nest_following_module(self):
         text = textwrap.dedent(
             """\
@@ -556,6 +626,19 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["first::in_first", "second::in_second"])
+
+    def test_lifetime_apostrophe_does_not_swallow_following_module(self):
+        text = textwrap.dedent(
+            """\
+            fn helper<'a>() {}
+            mod none_auth_scheme_ {
+                #[test]
+                fn works() {}
+            }
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_::works"])
 
     def test_path_attr_keeps_the_declaring_file_prefix(self):
         with tempfile.TemporaryDirectory() as d:
