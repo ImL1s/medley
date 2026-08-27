@@ -48,7 +48,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CLAUDE_MD = ROOT / "CLAUDE.md"
-_CRATE_ROOTS = ("crates", "prod")
+_CRATE_ROOTS = ("crates", "prod", "third_party")
 
 _TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test\b")
 _FN = re.compile(
@@ -133,8 +133,9 @@ def _crate_source_rel(rs: Path) -> tuple[str, list[str]] | None:
             if len(parts) > crate_end and parts[crate_end] in ("src", "tests"):
                 return parts[crate_end], list(parts[crate_end + 1 :])
         return None
-    if "prod" in parts:
-        i = parts.index("prod")
+    if "prod" in parts or "third_party" in parts:
+        marker = "prod" if "prod" in parts else "third_party"
+        i = parts.index(marker)
         for j in range(i + 1, len(parts)):
             if parts[j] in ("src", "tests"):
                 return parts[j], list(parts[j + 1 :])
@@ -382,6 +383,18 @@ class ExternalModulePrefix(unittest.TestCase):
             self.assertNotIn(
                 "shared_http_wire::none_auth_scheme_sends", names
             )
+
+    def test_third_party_crate_is_scanned(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "third_party" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text("mod none_auth_scheme_regressions;\n")
+            (src / "none_auth_scheme_regressions.rs").write_text(
+                "#[test]\nfn works() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_regressions::works", names)
 
 
 if __name__ == "__main__":
