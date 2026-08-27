@@ -257,7 +257,9 @@ MACRO_INVOKE = re.compile(
 INLINE_MOD = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
 )
-MACRO_TEST_FN = re.compile(r"\bfn\s+\$")
+MACRO_TEST_FN = re.compile(
+    r"\bfn\s+(?:\$)?([A-Za-z_][A-Za-z0-9_]*)"
+)
 TEST_ATTR = re.compile(
     r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b",
     re.DOTALL,
@@ -1079,9 +1081,9 @@ def _inline_path_at(code: str, pos: int) -> tuple[str, ...]:
 
 
 def _macro_generates_tests(body: str) -> bool:
-    """`#[test] fn $name()` (and the tokio form) inside `macro_rules!`."""
+    """`#[test] fn $name()` / `#[test] fn generated()` inside `macro_rules!`."""
 
-    return bool(TEST_ATTR.search(body) and MACRO_TEST_FN.search(body))
+    return bool(_generated_test_templates(body))
 
 
 def _serial_from_macro_body(body: str) -> tuple[frozenset[str], bool]:
@@ -1130,14 +1132,23 @@ def _inside_dollar_repeat(source: str, pos: int) -> bool:
     return False
 
 
-def _after_macro_fn_name(source: str, dollar_end: int) -> int:
-    index = dollar_end
-    while index < len(source) and (source[index].isalnum() or source[index] == "_"):
-        index += 1
-    return index
-
-
 _METAVAR_CALL = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _expand_generated_helper_bodies(fn_body: str, helpers: dict[str, str]) -> str:
+    """Inline `$helper()` bodies, including nested `$relay()` / `$leaf()`."""
+
+    seen: set[str] = set()
+    extra: list[str] = []
+    stack = list(_METAVAR_CALL.findall(fn_body))
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in helpers:
+            continue
+        seen.add(name)
+        extra.append(helpers[name])
+        stack.extend(_METAVAR_CALL.findall(helpers[name]))
+    return fn_body + "".join(extra)
 
 
 def _generated_test_templates(
@@ -1148,6 +1159,7 @@ def _generated_test_templates(
     Keys later come from that body (and its callees), not the macro-wide
     union (#516 review). A generated test that calls `$helper()` still
     inherits that helper's body, because the helper is not a real `fn`.
+    Nested `$relay()` -> `$leaf()` calls are expanded transitively.
     """
 
     parsed: list[tuple[str, bool, frozenset[str], bool, bool, str]] = []
@@ -1164,9 +1176,8 @@ def _generated_test_templates(
                 has_unkeyed = True
             else:
                 held.update(parsed_keys)
-        metavar_end = _after_macro_fn_name(body, match.end())
-        metavar = body[match.end() : metavar_end]
-        span = _fn_body(body, metavar_end)
+        metavar = match.group(1)
+        span = _fn_body(body, match.end())
         fn_body = _strip_turbofish(body[span[0] : span[1]]) if span else ""
         parsed.append(
             (
@@ -1183,10 +1194,14 @@ def _generated_test_templates(
     for metavar, is_test, held, has_unkeyed, in_repeat, fn_body in parsed:
         if not is_test:
             continue
-        extra = "".join(
-            helpers[name] for name in _METAVAR_CALL.findall(fn_body) if name in helpers
+        out.append(
+            (
+                held,
+                has_unkeyed,
+                in_repeat,
+                _expand_generated_helper_bodies(fn_body, helpers),
+            )
         )
-        out.append((held, has_unkeyed, in_repeat, fn_body + extra))
     return out
 
 
@@ -1221,7 +1236,14 @@ def index_functions(
         impls = _impl_blocks(code)
         inline_spans = _inline_module_spans(code)
         occupied: list[tuple[int, int]] = []
+        macro_bodies: list[tuple[int, int]] = []
+        for macro_match in MACRO_DEF.finditer(code):
+            body_span = _macro_body(raw, macro_match.end())
+            if body_span is not None:
+                macro_bodies.append(body_span)
         for match in FN_DEF.finditer(code):
+            if any(start <= match.start() < end for start, end in macro_bodies):
+                continue
             name = match.group("name")
             body_span = _fn_body(raw, match.end())
             if body_span is None:

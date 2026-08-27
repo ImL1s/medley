@@ -443,6 +443,32 @@ class TransitiveClosure(unittest.TestCase):
         self.assertTrue(any(n.startswith("case!") for n in names), names)
         self.assertEqual(len(names), 2, names)
 
+        fixed = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! case {
+                () => {
+                    #[test]
+                    fn generated() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            mod one {
+                case!();
+            }
+            mod two {
+                case!();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), fixed)], "demo_key")
+        self.assertTrue(any(n.startswith("case!") for n in names), names)
+        self.assertEqual(len(names), 2, names)
+
     def test_macro_generated_tests_inherit_helper_keys(self):
         """A generated `#[test] fn $name() { helper(); }` only acquires the
         key after call-graph closure (#516 review)."""
@@ -470,6 +496,34 @@ class TransitiveClosure(unittest.TestCase):
             """
         )
         names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertTrue(any(n.startswith("case!") for n in names), names)
+        self.assertEqual(len(names), 2, names)
+
+        nested = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! case {
+                ($name:ident, $relay:ident, $leaf:ident) => {
+                    fn $leaf() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    fn $relay() {
+                        $leaf();
+                    }
+                    #[test]
+                    fn $name() {
+                        $relay();
+                    }
+                };
+            }
+
+            case!(a, a_relay, a_leaf);
+            case!(b, b_relay, b_leaf);
+            """
+        )
+        names = derived_names([(Path("f.rs"), nested)], "demo_key")
         self.assertTrue(any(n.startswith("case!") for n in names), names)
         self.assertEqual(len(names), 2, names)
 
