@@ -54,8 +54,11 @@ impl ChatModesManager {
     }
     /// The active grok.com identity, or `None` when unauthenticated. Modes are
     /// per-identity (tier/ACL), so every cache key and store is gated on it.
-    fn current_user_id(&self) -> Option<String> {
+    pub(crate) fn current_user_id(&self) -> Option<String> {
         self.inner.auth.current_or_expired().map(|a| a.user_id)
+    }
+    pub(crate) fn current_auth_generation(&self) -> u64 {
+        self.inner.auth.current_selection_generation()
     }
     /// Chat model state for a `session/load` response. On missing auth or fetch
     /// failure, serves last-good cache else empty — never the build catalog.

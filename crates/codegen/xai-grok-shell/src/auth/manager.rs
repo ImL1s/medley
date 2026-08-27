@@ -1641,6 +1641,10 @@ impl AuthManager {
         }
     }
 
+    pub(crate) fn current_selection_generation(&self) -> u64 {
+        self.selection_generation.load(Ordering::Acquire)
+    }
+
     /// Whether a previously captured selection snapshot is still current.
     pub(crate) fn selection_generation_is_current(&self, generation: u64) -> bool {
         generation.is_multiple_of(2)

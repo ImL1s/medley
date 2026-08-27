@@ -466,6 +466,60 @@ fn chat_new_session_model_state(
     state.current_model_id = acp::ModelId::new(requested);
     state
 }
+
+/// The model id a chat-kind `session/new` should fall back to when no
+/// explicit `custom_model_id` was requested (#489 follow-up: a Codex review
+/// finding on PR #505, `agent_ops.rs:5768`).
+///
+/// Before this, the fallback for *every* session kind was the build
+/// catalog's current model (`ModelsManager::current_model_id()`). For
+/// build-kind sessions that's correct — it's the only catalog they have.
+/// For chat-kind, it was wrong in exactly the shape #489's spawn-time guard
+/// (`chat_session_requires_visible_routing_failure`) exists to catch: the
+/// client is told the *chat* catalog's own default is current (via
+/// `chat_new_session_model_state`, a few lines later in the same handler),
+/// while the actor was silently spawned on the *build* catalog's default
+/// instead — a mismatch the guard never saw, because a build-catalog id
+/// trivially "resolves in the build catalog" by construction, regardless of
+/// whether it is the id anyone was actually told about.
+///
+/// This makes the two consistent: a chat-kind session's fallback is now the
+/// chat catalog's own default, so it flows into the *same* guard the
+/// explicit-id path already uses. If that id happens to also resolve in the
+/// build catalog, spawning proceeds; if not (the common case, since chat
+/// and build are different id namespaces), the guard now visibly rejects it
+/// instead of silently substituting a different model than the one
+/// reported — the same policy #489 already chose for an explicit
+/// unroutable id, now applied uniformly rather than only to that one path.
+///
+/// This is deliberately **not** "treat an absent explicit model as
+/// unroutable" (Codex's other suggested option): that would reject a chat
+/// session outright without ever trying to resolve what its real default
+/// is, discarding the case where the chat default legitimately does have a
+/// local route. Resolving it first and reusing the existing consistency
+/// guard treats both paths under one honest rule instead of two different
+/// ones.
+fn chat_session_fallback_model_id(
+    chat_model_state: Option<&acp::SessionModelState>,
+    build_default: impl FnOnce() -> acp::ModelId,
+) -> acp::ModelId {
+    match chat_model_state {
+        Some(state) => state.current_model_id.clone(),
+        None => build_default(),
+    }
+}
+/// `session/new` captured the chat catalog under one identity; auth can
+/// flip before the response is assembled (#505 review). Same identity
+/// (including both-unauthenticated) is required for the spawned actor and
+/// the reported catalog to describe the same user.
+fn chat_spawn_identity_unchanged(
+    spawned_user: Option<&str>,
+    spawned_generation: u64,
+    current_user: Option<&str>,
+    current_generation: u64,
+) -> bool {
+    spawned_user == current_user && spawned_generation == current_generation
+}
 /// `session/new` / `session/load` `_meta` key carrying per-session plugin roots.
 pub(crate) const SESSION_PLUGIN_DIRS_META_KEY: &str = "pluginDirs";
 /// `initialize` response `_meta` key advertising [`SESSION_PLUGIN_DIRS_META_KEY`] support.

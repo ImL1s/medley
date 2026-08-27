@@ -2333,6 +2333,31 @@ impl ModelsManager {
     }
 
     /// Build a `SamplingConfig` from the current model + auth state.
+    ///
+    /// **Deliberately infallible** (#489): there is no error branch here, by
+    /// construction — a degraded catalog still produces a best-effort
+    /// `ModelEntry::fallback` config below rather than propagating a
+    /// failure. This is a considered choice, not an oversight, and both of
+    /// this method's two production callers genuinely need it:
+    ///
+    /// - [`MvpAgent::with_models`] calls it during agent *construction*,
+    ///   before any session or requested model id exists. Bootstrap must not
+    ///   hard-fail because a catalog happens to be imperfect at process
+    ///   start.
+    /// - [`MvpAgent::resolve_sampling_config_for_model`]'s fallback branch
+    ///   calls it when a *specific requested* model id fails to resolve.
+    ///   That caller does know a request was made and could fail visibly
+    ///   instead of substituting — #489 found exactly that gap on the
+    ///   chat-kind session-spawn path, where a chat-only mode id (real in
+    ///   `/rest/modes`, absent from this catalog) was silently swapped for
+    ///   the current default with no signal the caller could observe.
+    ///
+    /// The fix for that gap does not belong here: widening this method's
+    /// signature would force the bootstrap caller to handle a failure case
+    /// that makes no sense for it. It belongs one layer up, at the one call
+    /// site that both knows a specific id was requested *and* knows whether
+    /// the session is chat-kind — see the `is_chat_kind` guard in
+    /// [`MvpAgent::spawn_and_register_session`].
     pub fn sampling_config(&self) -> SamplingConfig {
         let config = self.inner.cfg.read().clone();
         let auth_manager = self.inner.auth_manager.as_ref();
