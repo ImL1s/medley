@@ -407,6 +407,24 @@ pub fn set_keep_text_selection(value: TextSelection) {
 
 // -- Scroll speed ------------------------------------------------------------
 
+/// Parse `MEDLEY_*` first, then `GROK_*` only if Medley is unset, blank, or
+/// unparseable — `resolve_env_var` would stop at a garbage Medley value
+/// (#491 review).
+fn env_alias_parsed<T>(medley: &str, grok: &str, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
+    match std::env::var(medley) {
+        Ok(v) if !v.trim().is_empty() => parse(v.trim()).or_else(|| {
+            std::env::var(grok)
+                .ok()
+                .and_then(|g| parse(g.trim()))
+                .inspect(|_| xai_grok_config::note_legacy_hit(grok))
+        }),
+        _ => std::env::var(grok)
+            .ok()
+            .and_then(|g| parse(g.trim()))
+            .inspect(|_| xai_grok_config::note_legacy_hit(grok)),
+    }
+}
+
 thread_local! {
     static SCROLL_SPEED_CURRENT: Cell<u8> = const { Cell::new(SCROLL_SPEED_DEFAULT) };
     static SCROLL_SPEED_LOADED: Cell<bool> = const { Cell::new(false) };
@@ -418,9 +436,9 @@ thread_local! {
 pub fn load_scroll_speed() -> u8 {
     SCROLL_SPEED_LOADED.with(|loaded| {
         if !loaded.get() {
-            let from_env =
-                xai_grok_config::resolve_env_var("MEDLEY_SCROLL_SPEED", "GROK_SCROLL_SPEED")
-                    .and_then(|v| v.parse::<u8>().ok());
+            let from_env = env_alias_parsed("MEDLEY_SCROLL_SPEED", "GROK_SCROLL_SPEED", |v| {
+                v.parse::<u8>().ok()
+            });
             let raw = from_env.unwrap_or_else(|| {
                 load_u8_from_effective_config("scroll_speed", SCROLL_SPEED_DEFAULT)
             });
@@ -451,9 +469,9 @@ thread_local! {
 pub fn load_scroll_mode() -> ScrollMode {
     SCROLL_MODE_LOADED.with(|loaded| {
         if !loaded.get() {
-            let from_env =
-                xai_grok_config::resolve_env_var("MEDLEY_SCROLL_MODE", "GROK_SCROLL_MODE")
-                    .and_then(|v| ScrollMode::from_canonical(v.trim()));
+            let from_env = env_alias_parsed("MEDLEY_SCROLL_MODE", "GROK_SCROLL_MODE", |v| {
+                ScrollMode::from_canonical(v)
+            });
             let value = from_env.unwrap_or_else(|| {
                 load_str_from_effective_config("scroll_mode")
                     .as_deref()
@@ -486,12 +504,11 @@ pub fn load_invert_scroll() -> bool {
     INVERT_SCROLL_LOADED.with(|loaded| {
         if !loaded.get() {
             let from_env =
-                xai_grok_config::resolve_env_var("MEDLEY_INVERT_SCROLL", "GROK_INVERT_SCROLL")
-                    .and_then(|v| match v.trim() {
-                        "1" | "true" => Some(true),
-                        "0" | "false" => Some(false),
-                        _ => None,
-                    });
+                env_alias_parsed("MEDLEY_INVERT_SCROLL", "GROK_INVERT_SCROLL", |v| match v {
+                    "1" | "true" => Some(true),
+                    "0" | "false" => Some(false),
+                    _ => None,
+                });
             let value = from_env.unwrap_or_else(|| {
                 load_bool_from_effective_config("invert_scroll", INVERT_SCROLL_DEFAULT)
             });
@@ -521,9 +538,9 @@ thread_local! {
 pub fn load_scroll_lines() -> Option<u8> {
     SCROLL_LINES_LOADED.with(|loaded| {
         if !loaded.get() {
-            let from_env =
-                xai_grok_config::resolve_env_var("MEDLEY_SCROLL_LINES", "GROK_SCROLL_LINES")
-                    .and_then(|v| v.trim().parse::<u8>().ok());
+            let from_env = env_alias_parsed("MEDLEY_SCROLL_LINES", "GROK_SCROLL_LINES", |v| {
+                v.parse::<u8>().ok()
+            });
             let raw = from_env.unwrap_or_else(|| {
                 load_u8_from_effective_config("scroll_lines", SCROLL_LINES_UNSET)
             });
@@ -778,6 +795,19 @@ mod tests {
             })
             .join()
             .unwrap();
+            std::thread::spawn(|| {
+                unsafe {
+                    std::env::set_var("MEDLEY_SCROLL_SPEED", "typo");
+                    std::env::set_var("GROK_SCROLL_SPEED", "7");
+                }
+                assert_eq!(
+                    load_scroll_speed(),
+                    7,
+                    "invalid MEDLEY_SCROLL_SPEED must fall through to GROK_SCROLL_SPEED"
+                );
+            })
+            .join()
+            .unwrap();
         }
 
         #[test]
@@ -805,6 +835,19 @@ mod tests {
                     std::env::set_var("GROK_SCROLL_MODE", "wheel");
                 }
                 assert_eq!(load_scroll_mode(), ScrollMode::Wheel);
+            })
+            .join()
+            .unwrap();
+            std::thread::spawn(|| {
+                unsafe {
+                    std::env::set_var("MEDLEY_SCROLL_MODE", "typo");
+                    std::env::set_var("GROK_SCROLL_MODE", "wheel");
+                }
+                assert_eq!(
+                    load_scroll_mode(),
+                    ScrollMode::Wheel,
+                    "invalid MEDLEY_SCROLL_MODE must fall through to GROK_SCROLL_MODE"
+                );
             })
             .join()
             .unwrap();
@@ -838,6 +881,18 @@ mod tests {
             })
             .join()
             .unwrap();
+            std::thread::spawn(|| {
+                unsafe {
+                    std::env::set_var("MEDLEY_INVERT_SCROLL", "typo");
+                    std::env::set_var("GROK_INVERT_SCROLL", "1");
+                }
+                assert!(
+                    load_invert_scroll(),
+                    "invalid MEDLEY_INVERT_SCROLL must fall through to GROK_INVERT_SCROLL"
+                );
+            })
+            .join()
+            .unwrap();
         }
 
         #[test]
@@ -865,6 +920,19 @@ mod tests {
                     std::env::set_var("GROK_SCROLL_LINES", "9");
                 }
                 assert_eq!(load_scroll_lines(), Some(9));
+            })
+            .join()
+            .unwrap();
+            std::thread::spawn(|| {
+                unsafe {
+                    std::env::set_var("MEDLEY_SCROLL_LINES", "typo");
+                    std::env::set_var("GROK_SCROLL_LINES", "9");
+                }
+                assert_eq!(
+                    load_scroll_lines(),
+                    Some(9),
+                    "invalid MEDLEY_SCROLL_LINES must fall through to GROK_SCROLL_LINES"
+                );
             })
             .join()
             .unwrap();

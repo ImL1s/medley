@@ -1024,16 +1024,25 @@ impl ToolsConfig {
                     }
                 }),
         };
-        match xai_grok_config::resolve_env_var("MEDLEY_RESPECT_GITIGNORE", "GROK_RESPECT_GITIGNORE")
-            .as_deref()
-        {
-            Some("0") | Some("false") => {
-                result.respect_gitignore = false;
-            }
-            Some("1") | Some("true") => {
-                result.respect_gitignore = true;
-            }
-            _ => {}
+        let parse_gitignore = |raw: &str| match raw.trim() {
+            "0" | "false" => Some(false),
+            "1" | "true" => Some(true),
+            _ => None,
+        };
+        let from_env = match std::env::var("MEDLEY_RESPECT_GITIGNORE") {
+            Ok(v) if !v.trim().is_empty() => parse_gitignore(&v).or_else(|| {
+                std::env::var("GROK_RESPECT_GITIGNORE")
+                    .ok()
+                    .and_then(|g| parse_gitignore(&g))
+                    .inspect(|_| xai_grok_config::note_legacy_hit("GROK_RESPECT_GITIGNORE"))
+            }),
+            _ => std::env::var("GROK_RESPECT_GITIGNORE")
+                .ok()
+                .and_then(|g| parse_gitignore(&g))
+                .inspect(|_| xai_grok_config::note_legacy_hit("GROK_RESPECT_GITIGNORE")),
+        };
+        if let Some(flag) = from_env {
+            result.respect_gitignore = flag;
         }
         match std::env::var("GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS").as_deref() {
             Ok("0") | Ok("false") => {

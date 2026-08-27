@@ -382,13 +382,20 @@ pub fn lookup_auth(map: &AuthStore, scope: &str) -> Option<GrokAuth> {
 /// Early-invalidation buffer. Override with `GROK_AUTH_EARLY_INVALIDATION_SECS`
 /// for testing (e.g. `=5` to shrink the buffer to 5 seconds).
 pub(super) fn early_invalidation() -> Duration {
-    xai_grok_config::resolve_env_var(
-        "MEDLEY_AUTH_EARLY_INVALIDATION_SECS",
-        "GROK_AUTH_EARLY_INVALIDATION_SECS",
-    )
-    .and_then(|v| v.parse::<u64>().ok())
-    .map(|s| Duration::seconds(s as i64))
-    .unwrap_or_else(|| Duration::seconds(DEFAULT_EARLY_INVALIDATION_SECS as i64))
+    let parse = |raw: String| raw.trim().parse::<u64>().ok();
+    let secs = match std::env::var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS") {
+        Ok(v) if !v.trim().is_empty() => parse(v).or_else(|| {
+            std::env::var("GROK_AUTH_EARLY_INVALIDATION_SECS")
+                .ok()
+                .and_then(parse)
+                .inspect(|_| xai_grok_config::note_legacy_hit("GROK_AUTH_EARLY_INVALIDATION_SECS"))
+        }),
+        _ => std::env::var("GROK_AUTH_EARLY_INVALIDATION_SECS")
+            .ok()
+            .and_then(parse)
+            .inspect(|_| xai_grok_config::note_legacy_hit("GROK_AUTH_EARLY_INVALIDATION_SECS")),
+    };
+    Duration::seconds(secs.unwrap_or(DEFAULT_EARLY_INVALIDATION_SECS) as i64)
 }
 
 pub(crate) fn is_expired(auth: &GrokAuth) -> bool {
@@ -445,6 +452,21 @@ mod tests {
         let buffer = early_invalidation();
         unsafe { std::env::remove_var("GROK_AUTH_EARLY_INVALIDATION_SECS") };
         assert_eq!(buffer, Duration::seconds(22));
+
+        unsafe {
+            std::env::set_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS", "typo");
+            std::env::set_var("GROK_AUTH_EARLY_INVALIDATION_SECS", "22");
+        }
+        let buffer = early_invalidation();
+        unsafe {
+            std::env::remove_var("MEDLEY_AUTH_EARLY_INVALIDATION_SECS");
+            std::env::remove_var("GROK_AUTH_EARLY_INVALIDATION_SECS");
+        }
+        assert_eq!(
+            buffer,
+            Duration::seconds(22),
+            "invalid MEDLEY_AUTH_EARLY_INVALIDATION_SECS must fall through to GROK_*"
+        );
     }
 
     fn make_auth(mode: AuthMode) -> GrokAuth {

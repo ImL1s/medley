@@ -4581,6 +4581,16 @@ fn respect_gitignore_grok_still_works_when_medley_unset() {
             );
         });
     });
+    with_env_var_opt("MEDLEY_RESPECT_GITIGNORE", Some("typo"), || {
+        with_env_var_opt("GROK_RESPECT_GITIGNORE", Some("1"), || {
+            let config: toml::Value = toml::from_str("").unwrap();
+            let resolved = ToolsConfig::resolve(&config);
+            assert!(
+                resolved.respect_gitignore,
+                "invalid MEDLEY_RESPECT_GITIGNORE must fall through to GROK_RESPECT_GITIGNORE=1"
+            );
+        });
+    });
 }
 
 #[test]
