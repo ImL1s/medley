@@ -92,8 +92,17 @@ pub fn env_telemetry_mode(name: &str) -> Option<TelemetryMode> {
 /// (#426) — a sibling rather than a parameter on `env_telemetry_mode` itself,
 /// which stays untouched for every other caller.
 pub fn env_telemetry_mode_alias(medley_name: &str, grok_name: &str) -> Option<TelemetryMode> {
-    let value = xai_grok_config::resolve_env_var(medley_name, grok_name)?;
-    TelemetryMode::parse(&value)
+    if let Ok(value) = std::env::var(medley_name)
+        && !value.trim().is_empty()
+    {
+        return TelemetryMode::parse(&value);
+    }
+    let value = std::env::var(grok_name)
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let parsed = TelemetryMode::parse(&value)?;
+    xai_grok_config::note_legacy_hit(grok_name);
+    Some(parsed)
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -284,6 +293,29 @@ mod tests {
         let result = env_telemetry_mode_alias(MEDLEY, GROK);
         unsafe { std::env::remove_var(GROK) };
         assert_eq!(result, Some(TelemetryMode::Enabled));
+        let notice = xai_grok_config::legacy_notice().unwrap_or_default();
+        assert!(
+            notice.contains(GROK),
+            "a parseable GROK_* value is a real hit, got {notice:?}"
+        );
+    }
+
+    #[test]
+    fn env_telemetry_mode_alias_invalid_legacy_is_not_recorded_as_a_hit() {
+        const MEDLEY: &str = "MEDLEY_TEST_TELEMETRY_MODE_ALIAS_INVALID";
+        const GROK: &str = "GROK_TEST_TELEMETRY_MODE_ALIAS_INVALID";
+        unsafe {
+            std::env::remove_var(MEDLEY);
+            std::env::set_var(GROK, "maybe");
+        }
+        let result = env_telemetry_mode_alias(MEDLEY, GROK);
+        unsafe { std::env::remove_var(GROK) };
+        assert_eq!(result, None);
+        let notice = xai_grok_config::legacy_notice().unwrap_or_default();
+        assert!(
+            !notice.contains(GROK),
+            "an unparseable GROK_* value was not honored, got {notice:?}"
+        );
     }
 
     /// `apply_env_overrides` reads the real, hardcoded var names, so both
