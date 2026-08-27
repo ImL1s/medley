@@ -42,6 +42,7 @@ This guard checks two things CLAUDE.md's prose alone cannot self-verify:
 from __future__ import annotations
 
 import re
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -117,10 +118,20 @@ def _mask_rust_literals(text: str) -> str:
             i = end
             continue
         if text.startswith("/*", i):
-            end = text.find("*/", i + 2)
-            end = n if end < 0 else end + 2
-            out.append(keep_newlines(text[i:end]))
-            i = end
+            depth = 1
+            j = i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth += 1
+                    j += 2
+                    continue
+                if text.startswith("*/", j):
+                    depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            out.append(keep_newlines(text[i:j]))
+            i = j
             continue
         raw = _RAW_STRING_START.match(text, i)
         if raw:
@@ -436,34 +447,172 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
     return overrides
 
 
+_CFG_ATTR = re.compile(r"^#\[\s*cfg\s*\((.*)\)\s*\]\s*$", re.DOTALL)
+
+
+def _cfg_split_args(inner: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(inner):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(inner[start:i].strip())
+            start = i + 1
+    tail = inner[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _cfg_atom(atom: str) -> bool | None:
+    atom = atom.strip()
+    if atom == "test":
+        return True
+    if atom == "unix":
+        return sys.platform != "win32"
+    if atom == "windows":
+        return sys.platform == "win32"
+    if atom == "macos":
+        return sys.platform == "darwin"
+    if atom == "linux":
+        return sys.platform.startswith("linux")
+    os_eq = re.fullmatch(r'target_os\s*=\s*"([^"]+)"', atom)
+    if os_eq:
+        wanted = os_eq.group(1)
+        if sys.platform == "darwin":
+            actual = "macos"
+        elif sys.platform == "win32":
+            actual = "windows"
+        elif sys.platform.startswith("linux"):
+            actual = "linux"
+        else:
+            actual = sys.platform
+        return actual == wanted
+    family = re.fullmatch(r'target_family\s*=\s*"([^"]+)"', atom)
+    if family:
+        fam = family.group(1)
+        if fam == "unix":
+            return sys.platform != "win32"
+        if fam == "windows":
+            return sys.platform == "win32"
+    return None
+
+
+def _eval_cfg(expr: str) -> bool | None:
+    expr = expr.strip()
+    for kind in ("not", "all", "any"):
+        prefix = f"{kind}("
+        if expr.startswith(prefix) and expr.endswith(")"):
+            inner = expr[len(prefix) : -1]
+            if kind == "not":
+                value = _eval_cfg(inner)
+                return None if value is None else (not value)
+            values = [_eval_cfg(part) for part in _cfg_split_args(inner)]
+            if kind == "all":
+                if any(v is False for v in values):
+                    return False
+                if any(v is None for v in values):
+                    return None
+                return True
+            if any(v is True for v in values):
+                return True
+            if any(v is None for v in values):
+                return None
+            return False
+    return _cfg_atom(expr)
+
+
+def _cfg_attr_is_inactive(attr: str) -> bool:
+    match = _CFG_ATTR.match(attr.strip())
+    if match is None:
+        return False
+    return _eval_cfg(match.group(1).strip()) is False
+
+
+def _leading_attrs(line: str) -> tuple[list[str], str]:
+    attrs: list[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        if line[i].isspace():
+            i += 1
+            continue
+        if not line.startswith("#[", i):
+            break
+        depth = 0
+        j = i
+        while j < n:
+            if line[j] == "[":
+                depth += 1
+            elif line[j] == "]":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    attrs.append(line[i:j])
+                    i = j
+                    break
+            j += 1
+        else:
+            break
+    return attrs, line[i:]
+
+
 def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
     names: list[str] = []
     raw_lines = text.splitlines()
     masked_lines = _mask_rust_literals(text).splitlines()
     if len(masked_lines) < len(raw_lines):
         masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
-    mod_stack: list[tuple[int, str]] = []
+    mod_stack: list[tuple[int, str, bool]] = []
+    pending: list[str] = []
     depth = 0
     n = len(raw_lines)
     for i in range(n):
-        if _TEST_ATTR.match(masked_lines[i]):
-            for follow_raw in raw_lines[i + 1 :]:
+        raw = raw_lines[i]
+        masked = masked_lines[i]
+        attrs, remainder_masked = _leading_attrs(masked)
+        _, remainder_raw = _leading_attrs(raw)
+        has_test = any(_TEST_ATTR.match(a) for a in attrs) or bool(
+            _TEST_ATTR.match(masked)
+        )
+        enclosing_off = any(off for _, _, off in mod_stack)
+
+        if has_test:
+            all_attrs = pending + attrs
+            pending = []
+            inactive = enclosing_off or any(_cfg_attr_is_inactive(a) for a in all_attrs)
+            found = None
+            for follow_raw in [remainder_raw, *raw_lines[i + 1 :]]:
                 follow = follow_raw.strip()
                 if follow.startswith("#[") or follow.startswith("//"):
                     continue
                 if not follow:
                     continue
-                m = _FN.match(follow_raw)
-                if m:
-                    prefix_parts = file_mods + [name for _, name in mod_stack]
-                    prefix = "::".join(prefix_parts)
-                    names.append(f"{prefix}::{m.group(1)}" if prefix else m.group(1))
+                matched = _FN.match(follow_raw) or _FN.match(follow)
+                if matched:
+                    found = matched.group(1)
                 break
+            if found and not inactive:
+                prefix_parts = file_mods + [name for _, name, _ in mod_stack]
+                prefix = "::".join(prefix_parts)
+                names.append(f"{prefix}::{found}" if prefix else found)
+        elif attrs and not remainder_masked.strip():
+            pending.extend(attrs)
+        elif remainder_masked.strip():
+            item_off = enclosing_off or any(_cfg_attr_is_inactive(a) for a in pending)
+            pending = []
+            line = _strip_line_comment(masked)
+            mod_match = _MOD_OPEN.match(line)
+            if mod_match:
+                mod_stack.append((depth, mod_match.group(1), item_off))
 
-        line = _strip_line_comment(masked_lines[i])
-        mod_match = _MOD_OPEN.match(line)
-        if mod_match:
-            mod_stack.append((depth, mod_match.group(1)))
+        line = _strip_line_comment(masked)
+        if not remainder_masked.strip() or has_test:
+            pass
         depth += line.count("{") - line.count("}")
         while mod_stack and depth <= mod_stack[-1][0]:
             mod_stack.pop()
@@ -819,6 +968,49 @@ class ExternalModulePrefix(unittest.TestCase):
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_live", names)
             self.assertNotIn("none_auth_scheme_commented", names)
+
+    def test_same_line_test_attr_and_fn_is_counted(self):
+        names = _tests_in_file("#[test] fn none_auth_scheme_case() {}\n", [])
+        self.assertEqual(names, ["none_auth_scheme_case"])
+
+    def test_nested_block_comment_does_not_leak_braces(self):
+        text = textwrap.dedent(
+            """\
+            mod first {
+                fn helper() { let _c = /* /* inner */ { */ 1; }
+                #[test]
+                fn in_first() {}
+            }
+            mod none_auth_scheme_ {
+                #[test]
+                fn works() {}
+            }
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["first::in_first", "none_auth_scheme_::works"])
+
+    def test_cfg_false_tests_are_not_counted_on_this_target(self):
+        text = textwrap.dedent(
+            """\
+            #[cfg(windows)]
+            #[test]
+            fn none_auth_scheme_windows_only() {}
+            #[test]
+            fn none_auth_scheme_everywhere() {}
+            #[cfg(unix)]
+            #[test]
+            fn none_auth_scheme_unix_only() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertIn("none_auth_scheme_everywhere", names)
+        if sys.platform == "win32":
+            self.assertIn("none_auth_scheme_windows_only", names)
+            self.assertNotIn("none_auth_scheme_unix_only", names)
+        else:
+            self.assertNotIn("none_auth_scheme_windows_only", names)
+            self.assertIn("none_auth_scheme_unix_only", names)
 
     def test_path_prefix_propagates_to_descendant_modules(self):
         with tempfile.TemporaryDirectory() as d:
