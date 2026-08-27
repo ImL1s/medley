@@ -89,6 +89,15 @@ pub(crate) struct ConfigReloader {
     /// mtime-only touches (see `hash_project_mcp_config`).
     last_project_mcp_hashes: HashMap<PathBuf, u64>,
     grok_home: PathBuf,
+    /// `auth.json` path this reloader watches for [`Self::reload_auth`] and
+    /// the "unreadable" diagnostic — [`crate::auth::resolved_xai_auth_path`]
+    /// applied to `grok_home` at construction, not a bare
+    /// `grok_home.join("auth.json")` (#434). Computed once here rather than
+    /// re-derived per event so the reloader can never drift from what
+    /// `AuthManager` reads even if `GROK_AUTH_PATH` changes mid-process
+    /// (env changes are not expected to be observed live, but a stored path
+    /// makes that explicit instead of accidental).
+    auth_path: PathBuf,
     auth_scope: String,
     remote_settings: Option<crate::util::config::RemoteSettings>,
     config_update_tx: mpsc::UnboundedSender<ConfigUpdate>,
@@ -109,11 +118,13 @@ impl ConfigReloader {
         experimental_memory: bool,
         no_memory: bool,
     ) -> Self {
+        let auth_path = crate::auth::resolved_xai_auth_path(&grok_home);
         Self {
             last_auth_key_hash: initial_auth_key_hash,
             last_global_config: initial_config,
             last_project_mcp_hashes: HashMap::new(),
             grok_home,
+            auth_path,
             auth_scope,
             remote_settings,
             config_update_tx,
@@ -181,8 +192,12 @@ impl ConfigReloader {
                         error!(error = %e, "auth hot-reload failed, keeping previous credentials");
                         // Whole-file deletion (NotFound) and corrupt JSON
                         // land here. The resulting memory/disk divergence
-                        // must be visible in unified.jsonl.
-                        let path = self.grok_home.join("auth.json");
+                        // must be visible in unified.jsonl. Named from
+                        // `self.auth_path`, not `grok_home.join("auth.json")`
+                        // (#434) — otherwise a `GROK_AUTH_PATH` operator
+                        // setting would make this diagnostic name a file that
+                        // is not the one actually in use.
+                        let path = self.auth_path.clone();
                         xai_grok_telemetry::unified_log::error(
                             "auth reload: auth.json unreadable, keeping previous credentials",
                             None,
@@ -274,8 +289,11 @@ impl ConfigReloader {
     }
 
     pub(crate) fn reload_auth(&mut self) -> anyhow::Result<()> {
-        let auth_path = self.grok_home.join("auth.json");
-        let store = read_auth_json(&auth_path)?;
+        // `self.auth_path`, not `grok_home.join("auth.json")` (#434) — the
+        // watcher (`ConfigFileWatcher::start`) fires `AuthChanged` for
+        // exactly this path, so reloading a different one here would read
+        // stale/wrong content on every hot-reload while `GROK_AUTH_PATH` is set.
+        let store = read_auth_json(&self.auth_path)?;
 
         match crate::auth::lookup_auth(&store, &self.auth_scope) {
             Some(auth) => {
@@ -687,6 +705,68 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "should not send update on missing file"
+        );
+    }
+
+    /// #434: `ConfigReloader::new` used to compute `auth_path` as a bare
+    /// `grok_home.join("auth.json")`, ignoring whatever
+    /// [`crate::auth::resolved_xai_auth_path`] (what `AuthManager` and every
+    /// storage.rs writer/reader now agree on) would have said. Pinning
+    /// [`crate::auth::manager::XaiAuthPathGuard`] reproduces a `GROK_AUTH_PATH`
+    /// operator setting without touching the process env (no `#[serial]`
+    /// needed — the pin is thread-local, not process-global, #409).
+    ///
+    /// `grok_home` here is a *different* directory than the pinned file's
+    /// parent, and `grok_home/auth.json` is asserted absent throughout — the
+    /// only way this test can pass is if `reload_auth` actually read the
+    /// pinned file, not the default location it used to hardcode.
+    #[tokio::test]
+    async fn reloader_reads_the_resolved_auth_path_not_grok_home_join_auth_json() {
+        let grok_home = tempfile::TempDir::new().unwrap();
+        let auth_dir = tempfile::TempDir::new().unwrap();
+        let auth_path = auth_dir.path().join("elsewhere.json");
+        let default_path = grok_home.path().join("auth.json");
+        assert_ne!(
+            auth_path, default_path,
+            "the fixture must keep the pinned path and grok_home/auth.json distinct"
+        );
+
+        let auth = make_auth("pinned-key");
+        let mut store = BTreeMap::new();
+        let scope = "https://test.example.com".to_string();
+        store.insert(scope.clone(), auth);
+        let json = serde_json::to_string_pretty(&store).unwrap();
+        std::fs::write(&auth_path, &json).unwrap();
+        assert!(
+            !default_path.exists(),
+            "precondition: nothing at grok_home/auth.json, so only the pinned \
+             path can satisfy the reload"
+        );
+
+        let _xai_pin = crate::auth::manager::XaiAuthPathGuard::pin(auth_path.clone());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let empty_config = toml::Value::Table(toml::map::Map::new());
+        let mut reloader = ConfigReloader::new(
+            grok_home.path().to_path_buf(),
+            0,
+            empty_config,
+            scope,
+            None,
+            tx,
+            false,
+            false,
+        );
+
+        reloader
+            .reload_auth()
+            .expect("reload_auth must read the file the pin (GROK_AUTH_PATH's stand-in) names");
+        let update = rx
+            .try_recv()
+            .expect("should send Auth update read from the pinned path");
+        assert!(
+            matches!(update, ConfigUpdate::Auth(a) if a.key == "pinned-key"),
+            "should contain the key stored at the resolved auth path, not a stale/absent default"
         );
     }
 

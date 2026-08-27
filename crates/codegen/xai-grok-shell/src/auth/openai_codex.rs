@@ -943,13 +943,12 @@ pub(crate) fn resolved_auth_path(grok_home: &Path) -> PathBuf {
         return path;
     }
     // In-process unit tests must not share process-global `GROK_AUTH_PATH`.
-    // Production still honors the env so a user-specified auth.json works.
+    // Production uses the same launch-cwd-aware join as the xAI resolver so a
+    // relative `GROK_AUTH_PATH` cannot split after pager `--cwd` (#481).
     if cfg!(test) {
         grok_home.join("auth.json")
     } else {
-        std::env::var("GROK_AUTH_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| grok_home.join("auth.json"))
+        xai_grok_config::resolved_xai_auth_path(grok_home)
     }
 }
 

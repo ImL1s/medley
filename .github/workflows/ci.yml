@@ -1418,6 +1418,12 @@ jobs:
           # cross-crate caller while every one of them still compiles.
           run_nonzero -p xai-grok-config --lib \
             state_home:: -- --nocapture
+          # #481: relative GROK_AUTH_PATH is joined against process-start
+          # cwd, not the cwd a later pager `/cd` left behind. The rest of
+          # `paths::` is cheap encoding/slugify coverage that previously
+          # ran nowhere. 13 tests.
+          run_nonzero -p xai-grok-config --lib \
+            paths:: -- --nocapture
           # Same `#[path]` move as `restore_fetch::` above, and stopped one
           # segment short for the same reason: the file is `fs_size_tests.rs`,
           # the module is `fs_size::tests`, and only `fs_size::` is a substring
@@ -1456,6 +1462,12 @@ jobs:
           # module path inside the binary, and `run_nonzero` fails a filter that
           # matches zero tests (see `grok_home_paths` above).
           run_nonzero -p xai-grok-shell --test test_auth_path_env_precedence \
+            -- --nocapture
+          # #434: the write-side counterpart to #409 above -- store_api_key /
+          # clear_api_key must honour `GROK_AUTH_PATH` too, not just
+          # `AuthManager`'s read. Same reason for being an integration target
+          # with no positional after `--test`.
+          run_nonzero -p xai-grok-shell --test test_auth_path_write_side \
             -- --nocapture
           # #482: the standalone hub binary's own GROK_AUTH_PATH precedence.
           # Same reason as the target above -- integration target, no

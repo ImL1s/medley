@@ -98,9 +98,10 @@ pub enum ConfigChangeEvent {
     HomeClaudeJsonChanged,
 }
 
-/// Watches `~/.grok/` for `auth.json`, `config.toml`, and `models_cache.json`
-/// changes, plus any extra paths (project `.grok/config.toml`, `.mcp.json`,
-/// etc.) provided at startup.
+/// Watches `~/.grok/` for `auth.json` (or wherever `GROK_AUTH_PATH` resolves
+/// to instead — see [`crate::auth::resolved_xai_auth_path`], #434),
+/// `config.toml`, and `models_cache.json` changes, plus any extra paths
+/// (project `.grok/config.toml`, `.mcp.json`, etc.) provided at startup.
 ///
 /// Uses `notify-debouncer-mini` for built-in debounce that coalesces rapid
 /// editor writes (including write-then-rename patterns).
@@ -133,6 +134,20 @@ pub struct ConfigFileWatcher {
     watched_cwds: HashSet<PathBuf>,
 }
 
+/// `Path::parent()` of a bare relative filename (`auth.json`) is the empty
+/// path. `notify` cannot watch `""`, and an event's parent never compares
+/// equal to it, so `GROK_AUTH_PATH=auth.json` would never produce
+/// `AuthChanged` (#481 review). Join against the process cwd first.
+fn auth_path_for_watch(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => Path::new(".").join(path),
+    }
+}
+
 impl ConfigFileWatcher {
     /// Start watching. Returns `None` if the OS watcher fails to initialize.
     ///
@@ -149,6 +164,15 @@ impl ConfigFileWatcher {
         let debounce = debounce.unwrap_or(DEFAULT_DEBOUNCE);
         let (tx, rx) = mpsc::unbounded_channel();
         let grok_home_buf = grok_home.to_path_buf();
+        // The file this watcher must fire `AuthChanged` for.
+        // `resolved_xai_auth_path`, not a bare `grok_home.join("auth.json")`
+        // (#434) — otherwise, with `GROK_AUTH_PATH` set, this watcher keeps
+        // watching (and matching events against) a file `AuthManager`,
+        // storage.rs, and the reloader all agree is not the one in use.
+        // Resolved once here so the closure below and the extra watch
+        // registered further down never disagree with each other.
+        let auth_path_buf = auth_path_for_watch(crate::auth::resolved_xai_auth_path(grok_home));
+        let auth_path_for_closure = auth_path_buf.clone();
         // `~/.claude.json` is consumed by **every**
         // session (see `load_claude_json_mcp_servers_as_configs`), so
         // a write to it must broadcast through the unit
@@ -178,10 +202,16 @@ impl ConfigFileWatcher {
                 let name = path.file_name().and_then(|n| n.to_str());
                 let parent = path.parent();
 
+                // Checked ahead of the `name`-only match below: the resolved
+                // auth path may not be named `auth.json` at all (`GROK_AUTH_PATH`
+                // is a full file path override, not just a directory), so the
+                // comparison must be against the whole resolved path, not the
+                // literal filename `grok_home_buf` assumes elsewhere (#434).
+                let is_auth_path_event = parent == auth_path_for_closure.parent()
+                    && name == auth_path_for_closure.file_name().and_then(|n| n.to_str());
+
                 let change = match name {
-                    Some("auth.json") if parent == Some(grok_home_buf.as_path()) => {
-                        Some(ConfigChangeEvent::AuthChanged)
-                    }
+                    _ if is_auth_path_event => Some(ConfigChangeEvent::AuthChanged),
                     Some("config.toml") if parent == Some(grok_home_buf.as_path()) => {
                         Some(ConfigChangeEvent::GlobalConfigChanged)
                     }
@@ -234,6 +264,29 @@ impl ConfigFileWatcher {
             })
             .ok()?;
 
+        // `GROK_AUTH_PATH` can point outside `grok_home` entirely, in which
+        // case the `grok_home` watch above never sees writes to it — add its
+        // parent directory as its own watch target (#434). When
+        // `auth_path_buf`'s parent IS `grok_home` (the default, and the
+        // common case), this is a deliberate no-op: `notify` dedupes a
+        // second watch on the same directory (see the `extra_paths` comment
+        // below), so skipping it here is an optimization, not a correctness
+        // requirement.
+        if let Some(auth_parent) = auth_path_buf.parent()
+            && auth_parent != grok_home
+        {
+            let _ = debouncer
+                .watcher()
+                .watch(auth_parent, RecursiveMode::NonRecursive)
+                .map_err(|e| {
+                    tracing::warn!(
+                        path = %auth_parent.display(),
+                        error = %e,
+                        "failed to watch GROK_AUTH_PATH directory"
+                    )
+                });
+        }
+
         for p in extra_paths {
             if let Some(parent) = p.parent() {
                 let _ = debouncer
@@ -264,6 +317,7 @@ impl ConfigFileWatcher {
 
         tracing::info!(
             grok_home = %grok_home.display(),
+            auth_path = %auth_path_buf.display(),
             extra_paths = extra_paths.len(),
             cwd = ?cwd,
             debounce_ms = debounce.as_millis(),
@@ -1549,6 +1603,65 @@ mod tests {
         assert!(found, "should detect auth.json change");
     }
 
+    /// #434: the watcher used to fire `AuthChanged` only for a file
+    /// literally named `auth.json` whose parent was `grok_home` — so a
+    /// `GROK_AUTH_PATH` pointed elsewhere (a different directory, and/or a
+    /// different filename) was never watched at all. Pinning
+    /// [`crate::auth::manager::XaiAuthPathGuard`] reproduces that without
+    /// touching the process env.
+    ///
+    /// Two assertions, not one: a write to the *resolved* path fires
+    /// `AuthChanged`, and a write to the *old default* location
+    /// (`grok_home/auth.json`, which is no longer the resolved path while
+    /// pinned) fires nothing. Only the second half proves the watcher
+    /// stopped hardcoding the old check rather than merely gaining a second
+    /// one alongside it.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "flaky on macOS: FSEvents does not reliably deliver events in test harness"
+    )]
+    fn watcher_detects_change_at_a_pinned_auth_path_outside_grok_home() {
+        let grok_home = TempDir::new().unwrap();
+        let auth_dir = TempDir::new().unwrap();
+        let auth_path = auth_dir.path().join("elsewhere.json");
+        assert_ne!(
+            auth_path,
+            grok_home.path().join("auth.json"),
+            "fixture must keep the pinned path and grok_home/auth.json distinct"
+        );
+        fs::write(&auth_path, "{}").unwrap();
+
+        let _xai_pin = crate::auth::manager::XaiAuthPathGuard::pin(auth_path.clone());
+
+        let (_w, mut rx) =
+            ConfigFileWatcher::start(grok_home.path(), &[], None, Some(Duration::from_millis(50)))
+                .expect("watcher should start");
+
+        fs::write(&auth_path, r#"{"new":"token"}"#).unwrap();
+        wait_ms(300);
+        let mut found = false;
+        while let Ok(evt) = rx.try_recv() {
+            if evt == ConfigChangeEvent::AuthChanged {
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "should detect a change at the resolved (pinned) auth path"
+        );
+
+        // The old default location is no longer the resolved path while
+        // pinned — a write there must not be reported as AuthChanged (or as
+        // anything else; "auth.json" matches no other arm).
+        fs::write(grok_home.path().join("auth.json"), "{}").unwrap();
+        wait_ms(300);
+        assert!(
+            rx.try_recv().is_err(),
+            "must not fire for grok_home/auth.json once GROK_AUTH_PATH names a different file"
+        );
+    }
+
     /// Regression test for the MCP/skills reload storm (feedback loop):
     /// merely *reading* a watched config file must NOT produce a
     /// `ConfigChangeEvent`. Linux inotify delivers `IN_OPEN`/`IN_ACCESS`
@@ -1936,5 +2049,27 @@ mod tests {
         assert!(!watcher.watched_cwds.contains(p));
         watcher.unwatch_path(p);
         assert!(!watcher.watched_cwds.contains(p));
+    }
+
+    #[test]
+    fn relative_auth_path_parent_sync_uses_current_directory_for_watcher() {
+        let relative = PathBuf::from("auth.json");
+        assert!(
+            relative.parent().is_some_and(|p| p.as_os_str().is_empty()),
+            "a bare filename's lexical parent is the empty path"
+        );
+        let watched = auth_path_for_watch(relative);
+        let parent = watched.parent().expect("watch path has a parent");
+        assert!(
+            !parent.as_os_str().is_empty(),
+            "notify cannot watch an empty parent"
+        );
+        if let Ok(cwd) = std::env::current_dir() {
+            assert_eq!(parent, cwd.as_path());
+            assert_eq!(
+                watched.file_name().and_then(|n| n.to_str()),
+                Some("auth.json")
+            );
+        }
     }
 }
