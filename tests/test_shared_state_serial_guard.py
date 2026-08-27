@@ -873,6 +873,38 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertIn("calls_cross_file_inner_untagged", names)
 
+    def test_imported_bare_call_reaches_registered_state(self):
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    use crate::a::bump;
+
+                    #[test]
+                    fn calls_imported_bump_untagged() {
+                        bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_imported_bump_untagged"})
+
     def test_two_hops_same_file_is_still_derived(self):
         """The real #492 shape: test -> `quarantined_after` -> `heal_unusable`,
         all same-file, neither intermediate call textually mentioning the

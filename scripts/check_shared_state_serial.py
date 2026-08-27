@@ -82,7 +82,9 @@ finite universe of keys and functions, so this is monotonic on a finite
 lattice and provably terminates (`_MAX_ROUNDS` is a generous safety bound on
 top of that, not the termination argument; exceeding it is a hard error,
 not a silent pass). Three call shapes propagate a
-hop: a bare `name(` resolved within the SAME FILE; a `path::to::name(`
+hop: a bare `name(` resolved within the SAME FILE, then via a `use`
+import of that name (`use crate::a::bump; bump()`), then (if still
+unresolved) not at all; a `path::to::name(`
 resolved by full module path when `path` starts with `crate`, and ALSO by
 its last segment alone against every file's own module leaf (its filename
 stem) either way -- the shape a sibling module is actually called by in
@@ -272,6 +274,17 @@ SERIAL_ATTR = re.compile(
 IMPL_HEAD = re.compile(r"\bimpl\b[^{;]*\{")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 FREE_CALL = re.compile(r"(?<![:.\w])([a-z_][a-z0-9_]*)\s*\(")
+USE_PLAIN = re.compile(
+    r"\buse\s+(crate|super|self)((?:::[A-Za-z_][A-Za-z0-9_]*)+)"
+    r"(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*;"
+)
+USE_BRACE = re.compile(
+    r"\buse\s+(crate|super|self)((?:::[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"::\{([^}]+)\}\s*;"
+)
+USE_ITEM = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?"
+)
 # Any `path::to::name(` call, `crate`-rooted or not. Resolved two ways (see
 # `_resolve_calls`): a `crate`-rooted path by its FULL module path, and every
 # path (rooted or not) by its LAST segment alone against a file's own module
@@ -803,6 +816,49 @@ def _module_path(rel: Path) -> tuple[str, ...] | None:
     if segs[-1] in ("mod", "lib", "main"):
         segs = segs[:-1]
     return tuple(segs)
+
+
+def _use_module_prefix(
+    root: str, mid: tuple[str, ...], file_mod: tuple[str, ...] | None
+) -> tuple[str, ...] | None:
+    if root == "crate":
+        return mid
+    if file_mod is None:
+        return None
+    if root == "self":
+        return file_mod + mid
+    if root == "super":
+        return (file_mod[:-1] if file_mod else ()) + mid
+    return None
+
+
+def _use_imports(path: Path, text: str) -> dict[str, tuple[tuple[str, ...], str]]:
+    """Local name -> (module path, function name) from `use crate::...`."""
+
+    file_mod = _module_path(path)
+    imports: dict[str, tuple[tuple[str, ...], str]] = {}
+
+    def record(root: str, mid: tuple[str, ...], fname: str, local: str) -> None:
+        module = _use_module_prefix(root, mid, file_mod)
+        if module is None:
+            return
+        imports[local] = (module, fname)
+
+    for m in USE_PLAIN.finditer(text):
+        segs = tuple(s for s in m.group(2).split("::") if s)
+        if not segs:
+            continue
+        fname = segs[-1]
+        record(m.group(1), segs[:-1], fname, m.group(3) or fname)
+    for m in USE_BRACE.finditer(text):
+        mid = tuple(s for s in m.group(2).split("::") if s)
+        for raw in m.group(3).split(","):
+            item = USE_ITEM.search(raw.strip())
+            if item is None or item.group(1) in ("self", "super"):
+                continue
+            fname = item.group(1)
+            record(m.group(1), mid, fname, item.group(2) or fname)
+    return imports
 
 
 def _is_integration_target(path: Path) -> bool:
@@ -1411,8 +1467,8 @@ def index_functions(
 # Four call shapes are resolved, all requiring `name(` -- never a bare
 # mention without a call, per the module docstring's measured false-positive
 # finding:
-#   1. `name(`                    -- same file only (unambiguous without
-#                                     import resolution)
+#   1. `name(`                    -- same file, then a `use` import of that
+#                                     name (`use crate::a::bump; bump()`)
 #   2. `crate::a::b::name(`       -- resolved by full module path
 #   3. `some_mod::name(`          -- resolved by the LAST path segment
 #                                     against every file's own module leaf
@@ -1466,6 +1522,7 @@ def _resolve_calls(
     by_macro: dict[Path, dict[str, int]],
     by_macro_any: dict[str, list[int]],
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, int]],
+    imports_by_file: dict[Path, dict[str, tuple[tuple[str, ...], str]]],
     keys_of: list[frozenset[str]],
     self_index: int,
 ) -> frozenset[str]:
@@ -1486,6 +1543,11 @@ def _resolve_calls(
             if not prefix:
                 break
             prefix = prefix[:-1]
+        if j is None:
+            imported = imports_by_file.get(fn.file, {}).get(name)
+            if imported is not None:
+                module, fname = imported
+                j = by_module.get(module, {}).get(fname)
         if j is not None and j != self_index:
             gained.update(keys_of[j])
     macro_index = by_macro.get(fn.file, {})
@@ -1595,6 +1657,7 @@ def analyze(
         return [], errors, {}
 
     functions, pending_macro_tests = index_functions(sources, registry)
+    imports_by_file = {path: _use_imports(path, text) for path, text in sources}
 
     by_file: dict[Path, dict[str, int]] = {}
     by_module: dict[tuple[str, ...], dict[str, int]] = {}
@@ -1644,6 +1707,7 @@ def analyze(
                 by_macro=by_macro,
                 by_macro_any=by_macro_any,
                 by_inline=by_inline,
+                imports_by_file=imports_by_file,
                 keys_of=keys_of,
                 self_index=i,
             )
