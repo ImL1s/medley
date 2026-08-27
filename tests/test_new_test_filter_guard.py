@@ -11,6 +11,7 @@ filter that cannot match a bare function name.
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -25,6 +26,7 @@ from check_new_tests_are_filtered import (  # noqa: E402
     target_of,
     targets_of,
 )
+import check_test_filter_coverage as coverage  # noqa: E402
 from check_test_filter_coverage import (  # noqa: E402
     _parse_workflow,
     parse_workflow,
@@ -118,6 +120,30 @@ class ParseWorkflow(unittest.TestCase):
         )
         self.assertNotIn("cli-chat-proxy-types", parsed)
 
+    def test_manifest_path_resolves_against_the_requested_root(self):
+        """`--root` is the workspace `--manifest-path` is resolved against.
+
+        CWD / this checkout would name `xai-grok-pager`; a different tree at
+        the same relative path must win (#497 review).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rel = Path("crates") / "codegen" / "xai-grok-pager"
+            (root / rel).mkdir(parents=True)
+            (root / rel / "Cargo.toml").write_text(
+                '[package]\nname = "other-workspace-pager"\n',
+                encoding="utf-8",
+            )
+            wf = (
+                "          run_nonzero --manifest-path "
+                "crates/codegen/xai-grok-pager/Cargo.toml --lib foo -- --nocapture\n"
+            )
+            parsed = parse_workflow(wf, root=root)
+            self.assertEqual(
+                parsed, {"other-workspace-pager": {"lib": {"foo"}}}
+            )
+            self.assertNotIn("xai-grok-pager", parsed)
+
     def test_unfiltered_invocation_covers_everything(self):
         wf = "          run_nonzero -p xai-grok-update --lib -- --nocapture\n"
         self.assertEqual(parse_workflow(wf), {"xai-grok-update": {"lib": {""}}})
@@ -156,10 +182,13 @@ class ParseWorkflowRealCorpus(unittest.TestCase):
 
     Enumerated independently of `_parse_workflow()`: a plain per-token scan
     (`str.split()`) over each physical, backslash-joined line -- not the
-    guard's own `shlex`-based flag walk. `--manifest-path` is resolved by
-    reading the referenced Cargo.toml's `[package] name` here, separately
-    from production's `_crate_from_manifest`, so a basename-only production
-    parser cannot stay green against this corpus (#497 review).
+    guard's own `shlex`-based flag walk. Each invocation keeps its own
+    filter set so a crate that also appears on a `run_nonzero` line cannot
+    hide a dropped `cargo test` lane's distinct filters (#497 review).
+    `--manifest-path` is resolved by reading the referenced Cargo.toml's
+    `[package] name` here, separately from production's
+    `_crate_from_manifest`, so a basename-only production parser cannot
+    stay green against this corpus.
     """
 
     @classmethod
@@ -176,38 +205,103 @@ class ParseWorkflowRealCorpus(unittest.TestCase):
                 continue
             joined.append(pending + raw)
             pending = ""
-        crates: set[str] = set()
+        valued = {
+            "-p",
+            "--package",
+            "--manifest-path",
+            "--features",
+            "--test",
+            "--bin",
+            "--example",
+        }
+        bare = {
+            "--lib",
+            "--all-targets",
+            "--no-run",
+            "--release",
+            "--all-features",
+            "--no-default-features",
+        }
+        runner = {"run_nonzero", "cargo", "test"}
+        invocations: list[tuple[str, frozenset[str]]] = []
         for line in joined:
-            if "run_nonzero" not in line and "cargo test" not in line:
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
                 continue
-            tokens = line.split()
-            for i, tok in enumerate(tokens):
+            if stripped.startswith("- name:") or stripped.startswith("name:"):
+                continue
+            if stripped.startswith("- run:"):
+                stripped = stripped[len("- run:") :].lstrip()
+            elif stripped.startswith("run:"):
+                stripped = stripped[4:].lstrip()
+            if "run_nonzero" not in stripped and "cargo test" not in stripped:
+                continue
+            tokens = stripped.split()
+            crate = None
+            filters: set[str] = set()
+            i = 0
+            while i < len(tokens):
+                tok = tokens[i]
+                if tok == "--":
+                    break
                 if tok in ("-p", "--package") and i + 1 < len(tokens):
-                    crates.add(tokens[i + 1])
+                    crate = tokens[i + 1]
+                    i += 2
+                    continue
                 if tok == "--manifest-path" and i + 1 < len(tokens):
                     path = tokens[i + 1].strip("'\"")
+                    name = path.rsplit("/", 2)[-2] if "/" in path else path
                     if "/" in path:
                         manifest = REPO / path
                         try:
                             text = manifest.read_text(encoding="utf-8")
                         except OSError:
-                            crates.add(path.rsplit("/", 2)[-2])
+                            crate = name
+                            i += 2
                             continue
                         match = re.search(
                             r'^\s*name\s*=\s*"([^"]+)"', text, re.M
                         )
-                        crates.add(
-                            match.group(1) if match else path.rsplit("/", 2)[-2]
-                        )
-        cls.real_crates = crates
+                        crate = match.group(1) if match else name
+                    else:
+                        crate = name
+                    i += 2
+                    continue
+                if tok in valued and i + 1 < len(tokens):
+                    i += 2
+                    continue
+                if tok in bare or tok.startswith("-") or tok in runner:
+                    i += 1
+                    continue
+                if "=" in tok and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+                    i += 1
+                    continue
+                if "$" in tok:
+                    i += 1
+                    continue
+                filters.add(tok)
+                i += 1
+            if crate is not None:
+                invocations.append((crate, frozenset(filters)))
+        cls.real_invocations = invocations
+        cls.real_crates = {c for c, _ in invocations}
 
     def test_the_corpus_is_not_empty(self):
         self.assertGreater(len(self.real_crates), 20, self.real_crates)
 
     def test_every_real_invocation_crate_is_recognised(self):
         parsed = parse_workflow(self.text)
-        missed = sorted(self.real_crates - set(parsed))
-        self.assertEqual(missed, [], f"parse_workflow() misses real crates: {missed}")
+        missed = []
+        for crate, filters in self.real_invocations:
+            have: set[str] = set()
+            for fs in parsed.get(crate, {}).values():
+                have |= set(fs)
+            missing = set(filters) - have
+            if crate not in parsed or missing:
+                missed.append((crate, sorted(missing)))
+        self.assertEqual(
+            missed, [], f"parse_workflow() misses real invocations: {missed}"
+        )
 
     def test_the_pattern_still_discriminates(self):
         # A `cargo clippy` line naming a crate must contribute nothing --
@@ -217,19 +311,28 @@ class ParseWorkflowRealCorpus(unittest.TestCase):
 
     def test_a_narrowed_pattern_would_fail_this_corpus(self):
         # Proof the corpus can fail: a plausible narrowing that only
-        # recognises `run_nonzero`, dropping `cargo test` support, misses
-        # any real `cargo test -p`/`cargo test --manifest-path` line -- and
-        # this tree has both forms (`_RUNNER` in the guard covers both).
-        narrowed = re.compile(r"^\s*run_nonzero\b")
-        joined = re.sub(r"\\\s*\n\s*", " ", self.text)
-        missed = [
-            line
-            for line in joined.splitlines()
-            if "cargo test" in line
-            and ("-p " in line or "--package " in line or "--manifest-path" in line)
-            and not narrowed.match(line.strip())
-        ]
-        self.assertTrue(missed, "corpus cannot distinguish a run_nonzero-only pattern")
+        # recognises `run_nonzero` is actually parsed, not just scanned as
+        # text. ci.yml's bare `cargo test` lanes carry filters that no
+        # `run_nonzero` line repeats, so the mutated parser must miss them
+        # (#497 review).
+        original = coverage._RUNNER
+        coverage._RUNNER = re.compile(r"^\s*run_nonzero\s+(.*)$")
+        try:
+            parsed = coverage.parse_workflow(self.text)
+        finally:
+            coverage._RUNNER = original
+        missed = []
+        for crate, filters in self.real_invocations:
+            have: set[str] = set()
+            for fs in parsed.get(crate, {}).values():
+                have |= set(fs)
+            missing = set(filters) - have
+            if missing:
+                missed.append((crate, sorted(missing)))
+        self.assertTrue(
+            missed,
+            "narrowing _RUNNER to run_nonzero must miss distinct cargo test filters",
+        )
 
 
 class WorkspaceMembersRealCorpus(unittest.TestCase):
