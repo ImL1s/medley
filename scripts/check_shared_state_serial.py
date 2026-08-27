@@ -271,7 +271,7 @@ SERIAL_ATTR = re.compile(
     r"#\s*\[\s*(?:serial_test\s*::\s*)?serial\s*(?:\((?P<args>.*)\))?\s*\]",
     re.DOTALL,
 )
-IMPL_HEAD = re.compile(r"\bimpl\b[^{;]*\{")
+IMPL_KW = re.compile(r"\bimpl\b")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 FREE_CALL = re.compile(r"(?<![:.\w])([a-z_][a-z0-9_]*)\s*\(")
 USE_PLAIN = re.compile(
@@ -296,19 +296,9 @@ QUALIFIED_CALL = re.compile(
 TYPE_ASSOC_CALL = re.compile(
     r"\b([A-Z][A-Za-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>\s*)?\("
 )
-# `<Type as Trait>::method(` -- QUALIFIED_CALL cannot cross `as Trait>`.
-# Resolves the same way as TYPE_ASSOC_CALL: last segment of the type path
-# against `by_type` (#516 review).
-UFCS_CALL = re.compile(
-    r"<\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*([A-Z][A-Za-z0-9_]*)"
-    r"(?:\s*<[^>]*>)?"
-    r"\s+as\s+"
-    r"(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Za-z_][A-Za-z0-9_]*"
-    r"(?:\s*<[^>]*>)?"
-    r"\s*>\s*::\s*"
-    r"([A-Za-z_][A-Za-z0-9_]*)"
-    r"\s*\("
-)
+# `<Type as Trait>::method(` is scanned by `_ufcs_calls`, not a regex:
+# `[^\>]*` cannot cross nested generics (`<Box<Vec<u8>> as Bump>::bump()`)
+# (#516 review).
 
 # --- the registry: `// SERIAL-GROUP: <key>` anchors a `static` block -------
 
@@ -477,8 +467,10 @@ def _skip_generic_params(source: str, open_index: int) -> int:
     expression must not be misread as opening a generic. Every current
     caller (`_fn_body` at a function name's immediate next character,
     `_impl_type_name` walking an `impl` head's own type-path segments,
-    `_strip_turbofish` at a literal `::<`) is a position already known by
-    its own caller's structure to be a generic-list opener specifically,
+    `_impl_blocks` / `_ufcs_calls` skipping nested `<>` (and const-generic
+    `{ 1 }` braces inside them), `_strip_turbofish` at a literal `::<`) is a
+    position already known by its own caller's structure to be a generic-list
+    opener specifically,
     never an ordinary comparison -- that constraint travels with each call
     site, not with this function.
 
@@ -714,6 +706,38 @@ def _macro_body(source: str, name_end: int) -> tuple[int, int] | None:
     return None
 
 
+def _skip_ws(source: str, index: int) -> int:
+    n = len(source)
+    while index < n and source[index].isspace():
+        index += 1
+    return index
+
+
+def _read_type_path(source: str, index: int) -> tuple[str | None, int]:
+    """One `Path::To::Type<generics>` -- last segment's identifier.
+
+    Generic arguments use `_skip_generic_params`, so `Box<Vec<u8>>` yields
+    `Box` and lands after the matching `>`, not the inner `>` (#516).
+    """
+
+    n = len(source)
+    name = None
+    while True:
+        index = _skip_ws(source, index)
+        match = IDENT.match(source, index)
+        if match is None:
+            break
+        name = match.group(0)
+        index = _skip_ws(source, match.end())
+        if index < n and source[index] == "<":
+            index = _skip_ws(source, _skip_generic_params(source, index))
+        if source[index : index + 2] == "::":
+            index += 2
+            continue
+        break
+    return name, index
+
+
 def _impl_type_name(head: str) -> tuple[str | None, str | None]:
     """`(implementing type, trait name or None)` for an `impl` head.
 
@@ -743,58 +767,72 @@ def _impl_type_name(head: str) -> tuple[str | None, str | None]:
         return None, None
     index = match.end()
     n = len(head)
-
-    def skip_ws(i: int) -> int:
-        while i < n and head[i].isspace():
-            i += 1
-        return i
-
-    def read_type_path(i: int) -> tuple[str | None, int]:
-        """One `Path::To::Type<generics>` expression -- returns its LAST
-        segment's identifier (the type/trait's own name, generic
-        parameters/arguments of that segment skipped) and the index just
-        past it."""
-        name = None
-        while True:
-            i = skip_ws(i)
-            m = IDENT.match(head, i)
-            if m is None:
-                break
-            name = m.group(0)
-            i = skip_ws(m.end())
-            if i < n and head[i] == "<":
-                i = skip_ws(_skip_generic_params(head, i))
-            if head[i : i + 2] == "::":
-                i += 2
-                continue
-            break
-        return name, i
-
-    index = skip_ws(index)
+    index = _skip_ws(head, index)
     if index < n and head[index] == "<":
-        index = skip_ws(_skip_generic_params(head, index))
-    first_name, index = read_type_path(index)
-    index = skip_ws(index)
+        index = _skip_ws(head, _skip_generic_params(head, index))
+    first_name, index = _read_type_path(head, index)
+    index = _skip_ws(head, index)
     if head[index : index + 3] == "for" and not (
         index + 3 < n and (head[index + 3].isalnum() or head[index + 3] == "_")
     ):
-        second_name, _index = read_type_path(index + 3)
+        second_name, _index = _read_type_path(head, index + 3)
         return second_name, first_name
     return first_name, None
 
 
 def _impl_blocks(code: str) -> list[tuple[str, str | None, int, int]]:
-    """`(type, trait or None, start, end)` for each `impl … { … }`."""
+    """`(type, trait or None, start, end)` for each `impl … { … }`.
+
+    `<...>` lists are skipped before looking for the body brace, so
+    `impl Bump<{ 1 }> for S {` does not treat `{ 1 }` as the body
+    (#516 review). Nested impls remain visible: search resumes at the
+    body `{`, not after the whole block.
+    """
 
     blocks: list[tuple[str, str | None, int, int]] = []
-    for match in IMPL_HEAD.finditer(code):
-        type_name, trait_name = _impl_type_name(match.group(0))
-        if type_name is None:
+    index = 0
+    n = len(code)
+    while index < n:
+        match = IMPL_KW.search(code, index)
+        if match is None:
+            break
+        head_start = match.start()
+        i = match.end()
+        body_open: int | None = None
+        while i < n:
+            comment_end = _skip_comment(code, i)
+            if comment_end is not None:
+                i = comment_end
+                continue
+            raw_end = _skip_raw_string(code, i)
+            if raw_end is not None:
+                i = raw_end
+                continue
+            char = code[i]
+            if char == '"':
+                i = _skip_quoted(code, i, char)
+                continue
+            if char == "'" and (char_end := _skip_char_literal(code, i)) is not None:
+                i = char_end
+                continue
+            if char == "<":
+                i = _skip_generic_params(code, i)
+                continue
+            if char == "{":
+                body_open = i
+                break
+            if char == ";":
+                break
+            i += 1
+        if body_open is None:
+            index = match.end()
             continue
-        open_index = match.end() - 1
-        blocks.append(
-            (type_name, trait_name, open_index, _balanced_end(code, open_index))
-        )
+        type_name, trait_name = _impl_type_name(code[head_start : body_open + 1])
+        if type_name is not None:
+            blocks.append(
+                (type_name, trait_name, body_open, _balanced_end(code, body_open))
+            )
+        index = body_open + 1
     return blocks
 
 
@@ -832,33 +870,60 @@ def _use_module_prefix(
     return None
 
 
-def _use_imports(path: Path, text: str) -> dict[str, tuple[tuple[str, ...], str]]:
-    """Local name -> (module path, function name) from `use crate::...`."""
+def _use_imports(
+    path: Path, text: str
+) -> dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]:
+    """Inline-module path -> local name -> (module path, function name).
 
+    File-wide last-write let `mod second { use … as bump }` steal
+    `mod first`'s import (#516 review). Lookup walks ancestor inline
+    modules the same way bare calls walk `by_inline`.
+    """
+
+    code = _code_only(text)
     file_mod = _module_path(path)
-    imports: dict[str, tuple[tuple[str, ...], str]] = {}
+    spans = _inline_module_spans(code)
+    scoped: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]] = {}
 
-    def record(root: str, mid: tuple[str, ...], fname: str, local: str) -> None:
+    def record(
+        pos: int, root: str, mid: tuple[str, ...], fname: str, local: str
+    ) -> None:
         module = _use_module_prefix(root, mid, file_mod)
         if module is None:
             return
-        imports[local] = (module, fname)
+        inline = _inline_path_from_spans(spans, pos)
+        scoped.setdefault(inline, {})[local] = (module, fname)
 
-    for m in USE_PLAIN.finditer(text):
+    for m in USE_PLAIN.finditer(code):
         segs = tuple(s for s in m.group(2).split("::") if s)
         if not segs:
             continue
         fname = segs[-1]
-        record(m.group(1), segs[:-1], fname, m.group(3) or fname)
-    for m in USE_BRACE.finditer(text):
+        record(m.start(), m.group(1), segs[:-1], fname, m.group(3) or fname)
+    for m in USE_BRACE.finditer(code):
         mid = tuple(s for s in m.group(2).split("::") if s)
         for raw in m.group(3).split(","):
             item = USE_ITEM.search(raw.strip())
             if item is None or item.group(1) in ("self", "super"):
                 continue
             fname = item.group(1)
-            record(m.group(1), mid, fname, item.group(2) or fname)
-    return imports
+            record(m.start(), m.group(1), mid, fname, item.group(2) or fname)
+    return scoped
+
+
+def _lookup_import(
+    file_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]],
+    inline_mods: tuple[str, ...],
+    name: str,
+) -> tuple[tuple[str, ...], str] | None:
+    prefix = inline_mods
+    while True:
+        found = file_imports.get(prefix, {}).get(name)
+        if found is not None:
+            return found
+        if not prefix:
+            return None
+        prefix = prefix[:-1]
 
 
 def _is_integration_target(path: Path) -> bool:
@@ -1512,6 +1577,52 @@ class Finding:
     reason: str
 
 
+def _ufcs_calls(body: str) -> list[tuple[str, str]]:
+    """`<Type as Trait>::method(` with nested generics on Type and Trait.
+
+    Resolves like TYPE_ASSOC_CALL: last segment of the type path against
+    `by_type` (#516 review).
+    """
+
+    out: list[tuple[str, str]] = []
+    index = 0
+    n = len(body)
+    while index < n:
+        lt = body.find("<", index)
+        if lt < 0:
+            break
+        i = lt + 1
+        type_name, i = _read_type_path(body, i)
+        i = _skip_ws(body, i)
+        if type_name is None or not body.startswith("as", i):
+            index = lt + 1
+            continue
+        after_as = i + 2
+        if after_as < n and (body[after_as].isalnum() or body[after_as] == "_"):
+            index = lt + 1
+            continue
+        i = _skip_ws(body, after_as)
+        _trait, i = _read_type_path(body, i)
+        i = _skip_ws(body, i)
+        if i >= n or body[i] != ">":
+            index = lt + 1
+            continue
+        i = _skip_ws(body, i + 1)
+        if body[i : i + 2] != "::":
+            index = lt + 1
+            continue
+        i = _skip_ws(body, i + 2)
+        method = IDENT.match(body, i)
+        if method is None:
+            index = lt + 1
+            continue
+        i = _skip_ws(body, method.end())
+        if i < n and body[i] == "(":
+            out.append((type_name, method.group(0)))
+        index = lt + 1
+    return out
+
+
 def _resolve_calls(
     fn: FnInfo,
     *,
@@ -1522,7 +1633,9 @@ def _resolve_calls(
     by_macro: dict[Path, dict[str, int]],
     by_macro_any: dict[str, list[int]],
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, int]],
-    imports_by_file: dict[Path, dict[str, tuple[tuple[str, ...], str]]],
+    imports_by_file: dict[
+        Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
+    ],
     keys_of: list[frozenset[str]],
     self_index: int,
 ) -> frozenset[str]:
@@ -1544,7 +1657,9 @@ def _resolve_calls(
                 break
             prefix = prefix[:-1]
         if j is None:
-            imported = imports_by_file.get(fn.file, {}).get(name)
+            imported = _lookup_import(
+                imports_by_file.get(fn.file, {}), fn.inline_mods, name
+            )
             if imported is not None:
                 module, fname = imported
                 j = by_module.get(module, {}).get(fname)
@@ -1640,8 +1755,8 @@ def _resolve_calls(
         for j in by_type.get(type_name, {}).get(m.group(2), []):
             if j != self_index:
                 gained.update(keys_of[j])
-    for m in UFCS_CALL.finditer(fn.body):
-        for j in by_type.get(m.group(1), {}).get(m.group(2), []):
+    for type_name, method in _ufcs_calls(fn.body):
+        for j in by_type.get(type_name, {}).get(method, []):
             if j != self_index:
                 gained.update(keys_of[j])
     return frozenset(gained)

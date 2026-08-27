@@ -905,6 +905,61 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_imported_bump_untagged"})
 
+    def test_imported_bare_call_is_scoped_to_the_inline_module(self):
+        """A later `mod second { use … as bump }` must not steal `mod first`
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/unrelated.rs"),
+                src(
+                    """\
+                    pub fn bump() {}
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    mod first {
+                        use crate::a::bump;
+
+                        #[test]
+                        fn calls_first_imported_untagged() {
+                            bump();
+                        }
+                    }
+
+                    mod second {
+                        use crate::unrelated::bump as bump;
+
+                        #[test]
+                        fn calls_second_imported_untagged() {
+                            bump();
+                        }
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertIn("calls_first_imported_untagged", names)
+        self.assertNotIn("calls_second_imported_untagged", names)
+
     def test_two_hops_same_file_is_still_derived(self):
         """The real #492 shape: test -> `quarantined_after` -> `heal_unusable`,
         all same-file, neither intermediate call textually mentioning the
@@ -1098,6 +1153,34 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"calls_const_generic_return_untagged"})
 
+    def test_const_generic_braces_in_impl_head_are_not_the_body(self):
+        """`impl Bump<{ 1 }> for S {` must not treat `{ 1 }` as the impl
+        body (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct S;
+            trait Bump<const N: u32> {
+                fn bump();
+            }
+            impl Bump<{ 1 }> for S {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn calls_const_generic_impl_untagged() {
+                <S as Bump<{ 1 }>>::bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_const_generic_impl_untagged"})
+
 
 class CrateQualifiedResolution(unittest.TestCase):
     def test_crate_qualified_call_resolves_by_module_path(self):
@@ -1251,6 +1334,34 @@ class TypeAssociatedResolution(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_ufcs_trait_untagged"})
+
+    def test_ufcs_nested_generic_type_still_resolves(self):
+        """`<Box<Vec<u8>> as Bump>::bump()` must survive nested `<>`
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct Box<T>(T);
+            trait Bump {
+                fn bump();
+            }
+            impl Bump for Box<Vec<u8>> {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn calls_nested_generic_ufcs_untagged() {
+                <Box<Vec<u8>> as Bump>::bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_nested_generic_ufcs_untagged"})
 
     def test_trait_qualified_call_resolves_to_the_impl(self):
         """`Bump::bump(&S)` looks up the trait name, not the concrete type
