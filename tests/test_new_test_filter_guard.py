@@ -107,6 +107,17 @@ class ParseWorkflow(unittest.TestCase):
         )
         self.assertEqual(parse_workflow(wf), {"xai-grok-sampler": {"lib": {"none_scheme_"}}})
 
+    def test_manifest_path_reads_package_name_when_it_differs_from_the_directory(self):
+        wf = (
+            "          cargo test --manifest-path prod/mc/cli-chat-proxy-types/Cargo.toml \\\n"
+            "            --lib never_emit -- --nocapture\n"
+        )
+        parsed = parse_workflow(wf)
+        self.assertEqual(
+            parsed, {"prod-mc-cli-chat-proxy-types": {"lib": {"never_emit"}}}
+        )
+        self.assertNotIn("cli-chat-proxy-types", parsed)
+
     def test_unfiltered_invocation_covers_everything(self):
         wf = "          run_nonzero -p xai-grok-update --lib -- --nocapture\n"
         self.assertEqual(parse_workflow(wf), {"xai-grok-update": {"lib": {""}}})
@@ -145,12 +156,10 @@ class ParseWorkflowRealCorpus(unittest.TestCase):
 
     Enumerated independently of `_parse_workflow()`: a plain per-token scan
     (`str.split()`) over each physical, backslash-joined line -- not the
-    guard's own `shlex`-based flag walk. `--manifest-path` resolves to a
-    crate name via directory basename here, not by reading the manifest as
-    production does; measured against the real workflow this never diverges
-    (no invocation below names one of the handful of members whose package
-    name differs from its directory's last component), so the simpler
-    resolution is safe for this corpus without importing production's own.
+    guard's own `shlex`-based flag walk. `--manifest-path` is resolved by
+    reading the referenced Cargo.toml's `[package] name` here, separately
+    from production's `_crate_from_manifest`, so a basename-only production
+    parser cannot stay green against this corpus (#497 review).
     """
 
     @classmethod
@@ -178,7 +187,18 @@ class ParseWorkflowRealCorpus(unittest.TestCase):
                 if tok == "--manifest-path" and i + 1 < len(tokens):
                     path = tokens[i + 1].strip("'\"")
                     if "/" in path:
-                        crates.add(path.rsplit("/", 2)[-2])
+                        manifest = REPO / path
+                        try:
+                            text = manifest.read_text(encoding="utf-8")
+                        except OSError:
+                            crates.add(path.rsplit("/", 2)[-2])
+                            continue
+                        match = re.search(
+                            r'^\s*name\s*=\s*"([^"]+)"', text, re.M
+                        )
+                        crates.add(
+                            match.group(1) if match else path.rsplit("/", 2)[-2]
+                        )
         cls.real_crates = crates
 
     def test_the_corpus_is_not_empty(self):

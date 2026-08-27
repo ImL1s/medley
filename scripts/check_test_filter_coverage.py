@@ -100,7 +100,20 @@ def workspace_members(root: Path) -> set[str]:
 
 
 def _crate_from_manifest(path: str) -> str:
-    """`crates/codegen/xai-grok-sampler/Cargo.toml` -> `xai-grok-sampler`."""
+    """Read `[package] name` from the named Cargo.toml.
+
+    Directory basename is only the fallback when the file cannot be read:
+    `prod/mc/cli-chat-proxy-types` is the package
+    `prod-mc-cli-chat-proxy-types`, not `cli-chat-proxy-types`.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    for manifest in (Path(path), repo / path):
+        try:
+            text = manifest.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        match = re.search(r'^\s*name\s*=\s*"([^"]+)"', text, re.M)
+        return match.group(1) if match else manifest.parent.name
     return Path(path).parent.name
 
 
