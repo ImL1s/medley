@@ -356,44 +356,59 @@ def _iter_module_decls(
 
     decls: list[tuple[str, Path, tuple[str, ...]]] = []
     pending_path: str | None = None
+    pending_attrs: list[str] = []
     raw_lines = text.splitlines()
     masked_lines = _mask_rust_literals(text).splitlines()
     if len(masked_lines) < len(raw_lines):
         masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
     depth = 0
-    inline_stack: list[tuple[int, str]] = []
+    inline_stack: list[tuple[int, str, bool]] = []
     for i, raw in enumerate(raw_lines):
         line = _strip_line_comment(masked_lines[i])
         stripped_raw = _strip_line_comment(raw).strip()
+        attrs, remainder = _leading_attrs(line)
+        enclosing_off = any(off for _, _, off in inline_stack)
         path_match = _PATH_ATTR.search(stripped_raw)
         if path_match:
             pending_path = path_match.group(1)
+            pending_attrs.extend(attrs)
         else:
-            semi = _MOD_SEMI.match(line)
+            semi = _MOD_SEMI.match(line) or _MOD_SEMI.match(remainder)
+            cfg_off = any(
+                _cfg_attr_is_inactive(a) for a in pending_attrs + attrs
+            )
+            skip = enclosing_off or cfg_off
             if semi:
-                name = semi.group(1)
-                inline_names = tuple(n for _, n in inline_stack)
-                search = _mod_search_dir(declaring)
-                for inline_name in inline_names:
-                    search = search / inline_name
-                if pending_path:
-                    # `#[path]` beside a file-level `mod` is relative to the
-                    # declaring file's directory. Inside `mod outer { ... }`
-                    # rustc loads `outer/<path>` (#507 review).
-                    base = search if inline_names else declaring.parent
-                    child = (base / pending_path).resolve()
-                    decls.append((name, child, inline_names))
-                else:
-                    child = _existing_mod_file(search, name)
-                    if child is not None:
+                if not skip:
+                    name = semi.group(1)
+                    inline_names = tuple(n for _, n, _ in inline_stack)
+                    search = _mod_search_dir(declaring)
+                    for inline_name in inline_names:
+                        search = search / inline_name
+                    if pending_path:
+                        # `#[path]` beside a file-level `mod` is relative to the
+                        # declaring file's directory. Inside `mod outer { ... }`
+                        # rustc loads `outer/<path>` (#507 review).
+                        base = search if inline_names else declaring.parent
+                        child = (base / pending_path).resolve()
                         decls.append((name, child, inline_names))
+                    else:
+                        child = _existing_mod_file(search, name)
+                        if child is not None:
+                            decls.append((name, child, inline_names))
                 pending_path = None
+                pending_attrs = []
             else:
-                brace_mod = _MOD_OPEN.match(line)
+                brace_mod = _MOD_OPEN.match(line) or _MOD_OPEN.match(remainder)
                 if brace_mod:
-                    inline_stack.append((depth, brace_mod.group(1)))
-                if stripped_raw:
+                    inline_stack.append((depth, brace_mod.group(1), skip))
                     pending_path = None
+                    pending_attrs = []
+                elif attrs and not remainder.strip():
+                    pending_attrs.extend(attrs)
+                elif stripped_raw:
+                    pending_path = None
+                    pending_attrs = []
         depth += line.count("{") - line.count("}")
         while inline_stack and depth <= inline_stack[-1][0]:
             inline_stack.pop()
@@ -572,10 +587,8 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
     depth = 0
     n = len(raw_lines)
     for i in range(n):
-        raw = raw_lines[i]
         masked = masked_lines[i]
         attrs, remainder_masked = _leading_attrs(masked)
-        _, remainder_raw = _leading_attrs(raw)
         has_test = any(_TEST_ATTR.match(a) for a in attrs) or bool(
             _TEST_ATTR.match(masked)
         )
@@ -586,13 +599,13 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
             pending = []
             inactive = enclosing_off or any(_cfg_attr_is_inactive(a) for a in all_attrs)
             found = None
-            for follow_raw in [remainder_raw, *raw_lines[i + 1 :]]:
-                follow = follow_raw.strip()
+            for follow in [remainder_masked, *masked_lines[i + 1 :]]:
+                follow = follow.strip()
                 if follow.startswith("#[") or follow.startswith("//"):
                     continue
                 if not follow:
                     continue
-                matched = _FN.match(follow_raw) or _FN.match(follow)
+                matched = _FN.match(follow)
                 if matched:
                     found = matched.group(1)
                 break
@@ -972,6 +985,11 @@ class ExternalModulePrefix(unittest.TestCase):
     def test_same_line_test_attr_and_fn_is_counted(self):
         names = _tests_in_file("#[test] fn none_auth_scheme_case() {}\n", [])
         self.assertEqual(names, ["none_auth_scheme_case"])
+        names = _tests_in_file(
+            "#[test] /* rationale */ fn none_auth_scheme_commented_gap() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_commented_gap"])
 
     def test_nested_block_comment_does_not_leak_braces(self):
         text = textwrap.dedent(
@@ -1011,6 +1029,25 @@ class ExternalModulePrefix(unittest.TestCase):
         else:
             self.assertNotIn("none_auth_scheme_windows_only", names)
             self.assertIn("none_auth_scheme_unix_only", names)
+
+    def test_cfg_false_external_module_is_not_scanned_on_this_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "codegen" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "#[cfg(windows)]\nmod platform;\n"
+                "#[test]\nfn none_auth_scheme_everywhere() {}\n"
+            )
+            (src / "platform.rs").write_text(
+                "#[test]\nfn none_auth_scheme_windows_mod() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_everywhere", names)
+            if sys.platform == "win32":
+                self.assertIn("platform::none_auth_scheme_windows_mod", names)
+            else:
+                self.assertNotIn("platform::none_auth_scheme_windows_mod", names)
 
     def test_path_prefix_propagates_to_descendant_modules(self):
         with tempfile.TemporaryDirectory() as d:
