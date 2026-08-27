@@ -718,9 +718,11 @@ mod tests {
         let ready_marker = temp.path().join("descendant-ready");
         let go_marker = temp.path().join("leader-exited");
         let pid_file = temp.path().join("leader-pid");
+        let holder_pid_file = temp.path().join("holder-pid");
         let script = format!(
             "#!/bin/sh\n\
              ( /usr/bin/perl -e 'use POSIX qw(setsid); setsid(); \
+             open(my $pidfh, \">\", \"{holder_pid}\") or die $!; print $pidfh $$; close $pidfh; \
              open(my $fh, \">\", \"{marker}\") or die $!; close $fh; \
              while (! -e \"{go}\") {{ select(undef, undef, undef, 0.01); }} \
              select(undef, undef, undef, 0.8);' ) &\n\
@@ -731,6 +733,7 @@ mod tests {
             marker = ready_marker.display(),
             go = go_marker.display(),
             pid = pid_file.display(),
+            holder_pid = holder_pid_file.display(),
         );
         std::fs::write(&tmux, script).unwrap();
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -747,17 +750,40 @@ mod tests {
         }
         let pid_file_for_watch = pid_file.clone();
         let go_for_watch = go_marker.clone();
+        let holder_pid_for_watch = holder_pid_file.clone();
         let watcher = std::thread::spawn(move || {
-            struct ReleaseGo(std::path::PathBuf);
-            impl Drop for ReleaseGo {
+            // Write `go` only after observing the leader is gone. Timing out
+            // while `kill(pid, 0)` still sees a zombie must kill the holder
+            // instead: writing `go` would start its 800ms interval and a
+            // descheduled main thread can then see `Ok` instead of drain
+            // timeout (#501 review).
+            struct WatcherExit {
+                go: std::path::PathBuf,
+                holder_pid: std::path::PathBuf,
+                start_holder: bool,
+            }
+            impl Drop for WatcherExit {
                 fn drop(&mut self) {
-                    // Every watcher exit (success, timeout, panic) must
-                    // release the escaped holder so it cannot wait forever
-                    // on a marker that never arrives (#501 review).
-                    let _ = std::fs::write(&self.0, b"");
+                    if self.start_holder {
+                        let _ = std::fs::write(&self.go, b"");
+                        return;
+                    }
+                    if let Ok(s) = std::fs::read_to_string(&self.holder_pid) {
+                        if let Ok(p) = s.trim().parse::<libc::pid_t>() {
+                            if p > 1 {
+                                unsafe {
+                                    libc::kill(p, libc::SIGKILL);
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            let _release = ReleaseGo(go_for_watch.clone());
+            let mut exit = WatcherExit {
+                go: go_for_watch.clone(),
+                holder_pid: holder_pid_for_watch,
+                start_holder: false,
+            };
             let start = std::time::Instant::now();
             let pid = loop {
                 if let Ok(s) = std::fs::read_to_string(&pid_file_for_watch) {
@@ -782,6 +808,7 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
+            exit.start_holder = true;
             let _ = std::fs::write(&go_for_watch, b"");
         });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
