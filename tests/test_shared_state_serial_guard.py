@@ -923,6 +923,44 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"calls_hop0_untagged"})
 
+    def test_call_graph_that_does_not_converge_is_a_hard_error(self):
+        # A chain deeper than the bound must not exit as 0 violations
+        # (#516 review). Lower the bound so a 5-hop fixture trips it
+        # without emitting 65 functions.
+        chain = "\n".join(f"fn hop{i}() {{ hop{i + 1}(); }}" for i in range(5))
+        text = src(
+            f"""\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn hop5() {{
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }}
+
+            {chain}
+
+            #[test]
+            fn calls_hop0_untagged() {{
+                hop0();
+            }}
+            """
+        )
+        original = guard._MAX_ROUNDS
+        guard._MAX_ROUNDS = 2
+        try:
+            _findings, errors, membership = guard.analyze(
+                [(Path("f.rs"), text)], scan_root=Path(".")
+            )
+        finally:
+            guard._MAX_ROUNDS = original
+        self.assertTrue(errors, errors)
+        self.assertTrue(
+            any("converge" in e for e in errors),
+            errors,
+        )
+        self.assertEqual(_findings, [])
+        self.assertEqual(membership, {})
+
     def test_function_pointer_as_value_is_not_a_call(self):
         """Measured false-positive risk named in the module docstring: a
         toucher's name passed as a bare argument (never invoked with `()`)

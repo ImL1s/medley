@@ -80,7 +80,8 @@ references into a function that already holds keys, unioning them in, until
 a full pass adds nothing. Keys only ever get ADDED, never removed, over a
 finite universe of keys and functions, so this is monotonic on a finite
 lattice and provably terminates (`_MAX_ROUNDS` is a generous safety bound on
-top of that, not the termination argument). Three call shapes propagate a
+top of that, not the termination argument; exceeding it is a hard error,
+not a silent pass). Three call shapes propagate a
 hop: a bare `name(` resolved within the SAME FILE; a `path::to::name(`
 resolved by full module path when `path` starts with `crate`, and ALSO by
 its last segment alone against every file's own module leaf (its filename
@@ -1400,7 +1401,9 @@ def index_functions(
 # in. Because keys only ever get ADDED (never removed) and the key universe
 # is finite, this is monotonic on a finite lattice and provably terminates;
 # `_MAX_ROUNDS` below is a generous safety bound, not the actual termination
-# argument. A call not shaped like one of the four resolved forms below
+# argument. Exceeding it is a hard error (#516 review): a truncated
+# closure must not report 0 violations. A call not shaped like one of the
+# four resolved forms below
 # breaks the chain at that point -- silently, same as it would for
 # `check_envguard_serial.py`'s own one-hop resolution -- see WHAT THIS DOES
 # NOT CHECK in the module docstring.
@@ -1628,6 +1631,7 @@ def analyze(
             by_type.setdefault(fn.trait_name, {}).setdefault(fn.name, []).append(i)
 
     keys_of: list[frozenset[str]] = [fn.keys for fn in functions]
+    converged = False
     for _round in range(_MAX_ROUNDS):
         changed = False
         for i, fn in enumerate(functions):
@@ -1650,7 +1654,13 @@ def analyze(
                 keys_of[i] = new_total
                 changed = True
         if not changed:
+            converged = True
             break
+    if not converged:
+        errors.append(
+            f"call-graph closure did not converge in {_MAX_ROUNDS} rounds"
+        )
+        return [], errors, {}
 
     # Synthesize macro-generated tests only after the call-graph closure, so
     # a `#[test] fn $name() { helper(); }` expansion inherits keys `helper`
