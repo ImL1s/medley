@@ -96,6 +96,15 @@ struct Inner {
     /// controls exactly one fetch.
     #[cfg(test)]
     fetch_override: TestMutex<Option<Result<ListModesResponse, ChatModelsError>>>,
+    /// Test-only: pause `fetch` after it has started so a test can
+    /// `hot_swap` the credential before the response is stored (#483).
+    #[cfg(test)]
+    fetch_hold: TestMutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 impl ChatModesManager {
     pub(crate) fn new(auth: Arc<AuthManager>) -> Self {
@@ -106,6 +115,8 @@ impl ChatModesManager {
                 fetch_lock: tokio::sync::Mutex::new(()),
                 #[cfg(test)]
                 fetch_override: TestMutex::new(None),
+                #[cfg(test)]
+                fetch_hold: TestMutex::new(None),
             }),
         }
     }
@@ -117,6 +128,16 @@ impl ChatModesManager {
         value: Result<ListModesResponse, ChatModelsError>,
     ) {
         *self.inner.fetch_override.lock() = Some(value);
+    }
+    /// Test-only: `fetch` signals on `started` then blocks on `proceed`
+    /// so a test can replace the API key mid-flight (#483 review).
+    #[cfg(test)]
+    pub(crate) fn set_fetch_hold_for_test(
+        &self,
+        started: std::sync::mpsc::SyncSender<()>,
+        proceed: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.inner.fetch_hold.lock() = Some((started, proceed));
     }
     /// The active grok.com identity, or `None` when unauthenticated. Modes are
     /// per-identity (tier/ACL), so every cache key and store is gated on it.
@@ -232,7 +253,7 @@ impl ChatModesManager {
                 // requested id rather than being silently trusted through.
                 // Cached either way -- caching behavior itself is unchanged
                 // by this fix, only the authority tag is.
-                self.store(user_id, locale.to_owned(), resp);
+                self.store(user_id, locale.to_owned(), resp, auth_generation);
                 ChatModelCatalog::Authoritative(mapped)
             }
             Err(err) => {
@@ -253,6 +274,11 @@ impl ChatModesManager {
     }
     async fn fetch(&self, locale: &str) -> Result<ListModesResponse, ChatModelsError> {
         #[cfg(test)]
+        if let Some((started, proceed)) = self.inner.fetch_hold.lock().take() {
+            let _ = started.send(());
+            let _ = tokio::task::spawn_blocking(move || proceed.recv()).await;
+        }
+        #[cfg(test)]
         if let Some(overridden) = self.inner.fetch_override.lock().take() {
             return overridden;
         }
@@ -262,29 +288,39 @@ impl ChatModesManager {
             Err(_elapsed) => Err(ChatModelsError::Timeout),
         }
     }
-    fn store(&self, user_id: String, locale: String, response: ListModesResponse) {
+    fn store(
+        &self,
+        user_id: String,
+        locale: String,
+        response: ListModesResponse,
+        auth_generation: u64,
+    ) {
         *self.inner.cache.write() = Some(CachedModes {
             user_id,
             locale,
-            auth_generation: self.current_auth_generation(),
+            auth_generation,
             fetched_at: Instant::now(),
             response,
         });
     }
     /// Best-effort stale refresh; skips if a fetch is already in flight.
     fn spawn_refresh(&self, user_id: String, locale: &'static str) {
+        let generation = self.current_auth_generation();
         let me = self.clone();
         tokio::spawn(async move {
             let Ok(_flight) = me.inner.fetch_lock.try_lock() else {
                 return;
             };
-            if me.current_user_id().as_deref() != Some(user_id.as_str()) {
+            if me.current_user_id().as_deref() != Some(user_id.as_str())
+                || me.current_auth_generation() != generation
+            {
                 return;
             }
             if let Ok(resp) = me.fetch(locale).await
                 && me.current_user_id().as_deref() == Some(user_id.as_str())
+                && me.current_auth_generation() == generation
             {
-                me.store(user_id, locale.to_owned(), resp);
+                me.store(user_id, locale.to_owned(), resp, generation);
             }
         });
     }
@@ -328,6 +364,11 @@ impl ChatModesManager {
     #[cfg(test)]
     fn cached_modes_for_test(&self) -> Option<ListModesResponse> {
         self.inner.cache.read().as_ref().map(|c| c.response.clone())
+    }
+
+    #[cfg(test)]
+    fn cached_auth_generation_for_test(&self) -> Option<u64> {
+        self.inner.cache.read().as_ref().map(|c| c.auth_generation)
     }
 }
 fn empty_state() -> acp::SessionModelState {
@@ -728,5 +769,69 @@ mod tests {
             }
             other => panic!("expected Authoritative after generation change, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_refresh_does_not_stamp_a_fetch_onto_a_newer_generation() {
+        use crate::auth::GrokAuth;
+
+        let manager = manager_authenticated_as("");
+        manager.seed_cache_for_test(
+            "",
+            CACHE_TTL + Duration::from_secs(1),
+            ListModesResponse {
+                modes: vec![available("a", "A")],
+                default_mode_id: "a".to_owned(),
+            },
+        );
+        let generation_before = manager
+            .cached_auth_generation_for_test()
+            .expect("seeded cache has a generation");
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        manager.set_fetch_hold_for_test(started_tx, proceed_rx);
+        manager.set_fetch_override_for_test(Ok(ListModesResponse {
+            modes: vec![available("b", "B")],
+            default_mode_id: "b".to_owned(),
+        }));
+        match manager.model_state_with_authority().await {
+            ChatModelCatalog::NoInfo(_) => {}
+            other => panic!("[stale] expected NoInfo while refresh is in flight, got {other:?}"),
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if started_rx.try_recv().is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("background refresh never entered fetch");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        manager.auth_for_test().hot_swap(GrokAuth {
+            user_id: String::new(),
+            key: "second-api-key".into(),
+            ..GrokAuth::test_default()
+        });
+        proceed_tx.send(()).expect("unblock fetch");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        let stored = manager
+            .cached_modes_for_test()
+            .expect("seeded cache remains");
+        assert_eq!(
+            stored.default_mode_id, "a",
+            "a fetch started under key A must not replace the cache after key B lands"
+        );
+        assert_eq!(
+            manager.cached_auth_generation_for_test(),
+            Some(generation_before),
+            "must not stamp A's response with B's generation"
+        );
     }
 }
