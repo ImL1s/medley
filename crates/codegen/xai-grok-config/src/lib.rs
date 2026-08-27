@@ -77,6 +77,7 @@ pub use paths::{
 // the upstream merge base: an inserted name reflows it, so every upstream addition to the
 // same block then conflicts on sync. Keep this separate.
 pub use paths::pin_grok_home;
+pub use paths::pin_process_start_cwd;
 // Same reason, same fix (#482): `resolved_xai_auth_path` /
 // `explicit_xai_auth_override` are fork-only (multi-provider `GROK_AUTH_PATH`
 // credential-path override; upstream has no such variable), so they stay

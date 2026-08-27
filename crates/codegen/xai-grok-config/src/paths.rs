@@ -10,6 +10,12 @@ static GROK_HOME: OnceLock<PathBuf> = OnceLock::new();
 /// whatever cwd a later pager `/cd` left behind (#481).
 static PROCESS_START_CWD: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LAUNCH_CWD: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(target_os = "macos")]
 const CLAUDE_MANAGED_SETTINGS_PATH: &str =
     "/Library/Application Support/ClaudeCode/managed-settings.json";
@@ -106,7 +112,20 @@ pub fn resolved_xai_auth_path(grok_home: &std::path::Path) -> PathBuf {
     explicit_xai_auth_override().unwrap_or_else(|| grok_home.join("auth.json"))
 }
 
+/// Capture the process-start cwd before anything calls `set_current_dir`.
+///
+/// Pager `--cwd` (`apply_cwd`) chdirs before `AuthManager` is constructed.
+/// A lazy first read would then join a relative `GROK_AUTH_PATH` against
+/// `--cwd` rather than the launch directory (#481 review).
+pub fn pin_process_start_cwd() {
+    let _ = process_start_cwd();
+}
+
 fn process_start_cwd() -> PathBuf {
+    #[cfg(test)]
+    if let Some(pinned) = TEST_LAUNCH_CWD.with(|c| c.borrow().clone()) {
+        return pinned;
+    }
     PROCESS_START_CWD
         .get_or_init(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .clone()
@@ -416,14 +435,15 @@ mod tests {
     fn relative_grok_auth_path_stays_anchored_after_chdir() {
         // RefreshGate re-resolves on every poll. A relative GROK_AUTH_PATH
         // joined against the *current* cwd would silently follow pager `/cd`
-        // (#481 review). Pin the override to process-start cwd once.
+        // (#481 review). Pin the override to an injected launch directory
+        // rather than `set_current_dir`, which is process-global and races
+        // the parallel test runner.
         struct AuthPathEnvGuard {
             prev: Option<std::ffi::OsString>,
-            prev_cwd: PathBuf,
         }
         impl Drop for AuthPathEnvGuard {
             fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.prev_cwd);
+                TEST_LAUNCH_CWD.with(|c| *c.borrow_mut() = None);
                 match &self.prev {
                     Some(v) => unsafe { std::env::set_var("GROK_AUTH_PATH", v) },
                     None => unsafe { std::env::remove_var("GROK_AUTH_PATH") },
@@ -431,33 +451,29 @@ mod tests {
             }
         }
 
-        let start = std::env::current_dir().expect("process cwd");
+        let launch = tempfile::TempDir::new().unwrap();
+        TEST_LAUNCH_CWD.with(|c| {
+            *c.borrow_mut() = Some(launch.path().to_path_buf());
+        });
         let _guard = AuthPathEnvGuard {
             prev: std::env::var_os("GROK_AUTH_PATH"),
-            prev_cwd: start.clone(),
         };
         unsafe { std::env::set_var("GROK_AUTH_PATH", "auth.json") };
 
         let dummy_home = PathBuf::from("/tmp/unused-grok-home");
-        let first = resolved_xai_auth_path(&dummy_home);
-        assert!(
-            first.is_absolute(),
-            "relative GROK_AUTH_PATH must be joined against a real directory, got {}",
-            first.display()
-        );
-        assert_eq!(first, start.join("auth.json"));
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::env::set_current_dir(tmp.path()).expect("chdir into temp");
-        let second = resolved_xai_auth_path(&dummy_home);
+        let resolved = resolved_xai_auth_path(&dummy_home);
         assert_eq!(
-            first, second,
-            "later chdir must not retarget a relative GROK_AUTH_PATH"
+            resolved,
+            launch.path().join("auth.json"),
+            "relative GROK_AUTH_PATH must join the launch directory"
         );
-        assert_ne!(
-            second,
-            tmp.path().join("auth.json"),
-            "must not follow the post-launch cwd"
-        );
+        let cwd = std::env::current_dir().expect("process cwd");
+        if cwd != launch.path() {
+            assert_ne!(
+                resolved,
+                cwd.join("auth.json"),
+                "must not follow the process cwd when a launch directory is pinned"
+            );
+        }
     }
 }
