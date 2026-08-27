@@ -288,7 +288,8 @@ impl ChatModesManager {
         let start_generation = self.current_auth_generation();
         #[cfg(test)]
         {
-            if let Some((started, proceed)) = self.inner.fetch_hold.lock().take() {
+            let held = self.inner.fetch_hold.lock().take();
+            if let Some((started, proceed)) = held {
                 let _ = started.send(());
                 let _ = tokio::task::spawn_blocking(move || proceed.recv()).await;
             }

@@ -539,21 +539,28 @@ fn chat_initial_model(
 fn chat_catalog_spawn_fallback_model_id(
     chat_catalog: Option<&crate::agent::chat_modes::ChatModelCatalog>,
     build_default: impl FnOnce() -> acp::ModelId,
-) -> acp::ModelId {
+) -> Result<acp::ModelId, acp::Error> {
     match chat_catalog {
-        Some(crate::agent::chat_modes::ChatModelCatalog::Authoritative(state)
-            | crate::agent::chat_modes::ChatModelCatalog::NoInfo(state)) => {
-            // An authoritative empty catalog, or a cold fetch that never
-            // populated `current_model_id`, carries `""` — not a usable
-            // chat default (#483 review). Falling through to the previous
-            // fallback beats spawning an actor with a blank identity.
+        Some(crate::agent::chat_modes::ChatModelCatalog::Authoritative(state)) => {
+            // A fresh empty catalog is an authoritative "no modes", not a
+            // missing default. Crossing into the build catalog here would
+            // spawn a chat actor under an id the chat catalog rejected
+            // (#483 review).
             if state.current_model_id.0.as_ref().is_empty() {
-                build_default()
+                Err(acp::Error::invalid_params()
+                    .data("chat catalog has no available modes"))
             } else {
-                state.current_model_id.clone()
+                Ok(state.current_model_id.clone())
             }
         }
-        None => build_default(),
+        Some(crate::agent::chat_modes::ChatModelCatalog::NoInfo(state)) => {
+            if state.current_model_id.0.as_ref().is_empty() {
+                Ok(build_default())
+            } else {
+                Ok(state.current_model_id.clone())
+            }
+        }
+        None => Ok(build_default()),
     }
 }
 fn chat_new_session_model_state(

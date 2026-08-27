@@ -9140,7 +9140,8 @@ fn chat_catalog_spawn_fallback_uses_chat_catalog_not_build() {
         chat_catalog_spawn_fallback_model_id(
             Some(&ChatModelCatalog::Authoritative(state("chat-default"))),
             || acp::ModelId::new("build-default".to_owned()),
-        ),
+        )
+        .expect("[authoritative]"),
         acp::ModelId::new("chat-default".to_owned()),
         "[authoritative]"
     );
@@ -9148,26 +9149,28 @@ fn chat_catalog_spawn_fallback_uses_chat_catalog_not_build() {
         chat_catalog_spawn_fallback_model_id(
             Some(&ChatModelCatalog::NoInfo(state("chat-cached"))),
             || acp::ModelId::new("build-default".to_owned()),
-        ),
+        )
+        .expect("[no_info]"),
         acp::ModelId::new("chat-cached".to_owned()),
         "[no_info]"
     );
     assert_eq!(
         chat_catalog_spawn_fallback_model_id(None, || acp::ModelId::new(
             "build-default".to_owned()
-        )),
+        ))
+        .expect("[no_catalog]"),
         acp::ModelId::new("build-default".to_owned()),
         "[no_catalog]"
     );
-    assert_eq!(
+    assert!(
         chat_catalog_spawn_fallback_model_id(
             Some(&ChatModelCatalog::Authoritative(
                 acp::SessionModelState::new(acp::ModelId::new(String::new()), Vec::new()),
             )),
             || acp::ModelId::new("build-default".to_owned()),
-        ),
-        acp::ModelId::new("build-default".to_owned()),
-        "[empty_current]"
+        )
+        .is_err(),
+        "[empty_current] must not cross into the build catalog"
     );
 }
 

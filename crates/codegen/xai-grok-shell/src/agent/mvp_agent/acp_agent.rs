@@ -1289,14 +1289,12 @@ impl acp::Agent for MvpAgent {
         let publication_gate = prepared_model_plan
             .as_ref()
             .map(|_| crate::session::SessionPublicationGate::pending());
-        let fallback_model_id = prepared_model_plan
-            .as_ref()
-            .map(|plan| plan.session_model_id.clone())
-            .unwrap_or_else(|| {
-                chat_catalog_spawn_fallback_model_id(chat_catalog.as_ref(), || {
-                    self.models_manager.current_model_id()
-                })
-            });
+        let fallback_model_id = match prepared_model_plan.as_ref() {
+            Some(plan) => plan.session_model_id.clone(),
+            None => chat_catalog_spawn_fallback_model_id(chat_catalog.as_ref(), || {
+                self.models_manager.current_model_id()
+            })?,
+        };
         // An exact model-declared harness is a prerequisite, not a best-effort
         // hint. Stock non-strict harnesses intentionally allow an explicit
         // agent profile (including its own ready model pin) to keep its prompt
