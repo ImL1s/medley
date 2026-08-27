@@ -134,6 +134,20 @@ pub struct ConfigFileWatcher {
     watched_cwds: HashSet<PathBuf>,
 }
 
+/// `Path::parent()` of a bare relative filename (`auth.json`) is the empty
+/// path. `notify` cannot watch `""`, and an event's parent never compares
+/// equal to it, so `GROK_AUTH_PATH=auth.json` would never produce
+/// `AuthChanged` (#481 review). Join against the process cwd first.
+fn auth_path_for_watch(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => Path::new(".").join(path),
+    }
+}
+
 impl ConfigFileWatcher {
     /// Start watching. Returns `None` if the OS watcher fails to initialize.
     ///
@@ -157,7 +171,7 @@ impl ConfigFileWatcher {
         // storage.rs, and the reloader all agree is not the one in use.
         // Resolved once here so the closure below and the extra watch
         // registered further down never disagree with each other.
-        let auth_path_buf = crate::auth::resolved_xai_auth_path(grok_home);
+        let auth_path_buf = auth_path_for_watch(crate::auth::resolved_xai_auth_path(grok_home));
         let auth_path_for_closure = auth_path_buf.clone();
         // `~/.claude.json` is consumed by **every**
         // session (see `load_claude_json_mcp_servers_as_configs`), so
@@ -2035,5 +2049,27 @@ mod tests {
         assert!(!watcher.watched_cwds.contains(p));
         watcher.unwatch_path(p);
         assert!(!watcher.watched_cwds.contains(p));
+    }
+
+    #[test]
+    fn relative_auth_path_parent_sync_uses_current_directory_for_watcher() {
+        let relative = PathBuf::from("auth.json");
+        assert!(
+            relative.parent().is_some_and(|p| p.as_os_str().is_empty()),
+            "a bare filename's lexical parent is the empty path"
+        );
+        let watched = auth_path_for_watch(relative);
+        let parent = watched.parent().expect("watch path has a parent");
+        assert!(
+            !parent.as_os_str().is_empty(),
+            "notify cannot watch an empty parent"
+        );
+        if let Ok(cwd) = std::env::current_dir() {
+            assert_eq!(parent, cwd.as_path());
+            assert_eq!(
+                watched.file_name().and_then(|n| n.to_str()),
+                Some("auth.json")
+            );
+        }
     }
 }
