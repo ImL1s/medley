@@ -563,6 +563,19 @@ fn chat_catalog_spawn_fallback_model_id(
         None => Ok(build_default()),
     }
 }
+
+/// When spawn fell back because the chat catalog had no current id, the
+/// response must report that same id — not a blank `current_model_id`
+/// (#483 review).
+fn chat_report_spawned_model(
+    mut state: acp::SessionModelState,
+    spawned: &acp::ModelId,
+) -> acp::SessionModelState {
+    if state.current_model_id.0.as_ref().is_empty() {
+        state.current_model_id = spawned.clone();
+    }
+    state
+}
 fn chat_new_session_model_state(
     mut state: acp::SessionModelState,
     requested: Option<String>,

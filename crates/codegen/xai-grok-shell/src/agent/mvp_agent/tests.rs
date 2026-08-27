@@ -9172,6 +9172,21 @@ fn chat_catalog_spawn_fallback_uses_chat_catalog_not_build() {
         .is_err(),
         "[empty_current] must not cross into the build catalog"
     );
+    let empty = acp::SessionModelState::new(acp::ModelId::new(String::new()), Vec::new());
+    let spawned = acp::ModelId::new("build-default".to_owned());
+    assert_eq!(
+        chat_report_spawned_model(empty, &spawned).current_model_id,
+        spawned,
+        "[empty_current] response must report the spawn fallback"
+    );
+    assert_eq!(
+        chat_report_spawned_model(state("chat-cached"), &spawned)
+            .current_model_id
+            .0
+            .as_ref(),
+        "chat-cached",
+        "[no_info] must not overwrite a catalog current id"
+    );
 }
 
 /// #418 review finding: the first version of this fix classified a chat-kind
