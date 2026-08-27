@@ -250,6 +250,8 @@ CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'\n])'")
 FN_DEF = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
 )
+MACRO_DEF = re.compile(r"macro_rules!\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
+MACRO_INVOKE = re.compile(r"(?<![:.\w])([A-Za-z_][A-Za-z0-9_]*)\s*!")
 TEST_ATTR = re.compile(
     r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b",
     re.DOTALL,
@@ -578,10 +580,29 @@ def _fn_body(source: str, name_end: int) -> tuple[int, int] | None:
     return None
 
 
-def _impl_type_name(head: str) -> str | None:
-    """The type an `impl` head (`match.group(0)` from `IMPL_HEAD`, ending in
-    `{`) is FOR: the identifier after `for` in a trait impl, or the
-    inherent type otherwise.
+def _macro_body(source: str, name_end: int) -> tuple[int, int] | None:
+    """The `{ ... }` group of `macro_rules! name { ... }`."""
+    index = name_end
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+            continue
+        comment_end = _skip_comment(source, index)
+        if comment_end is not None:
+            index = comment_end
+            continue
+        if source[index] == "{":
+            return index, _balanced_end(source, index)
+        return None
+    return None
+
+
+def _impl_type_name(head: str) -> tuple[str | None, str | None]:
+    """`(implementing type, trait name or None)` for an `impl` head.
+
+    Trait impls (`impl Trait for Type {`) return the type after `for` and
+    the trait so `Trait::method(` can resolve (#516 review). Inherent impls
+    return `(Type, None)`.
 
     The earlier version of this function took `IDENT.findall(head)[-1]` --
     the LAST identifier anywhere in the head -- which happens to equal the
@@ -602,7 +623,7 @@ def _impl_type_name(head: str) -> str | None:
 
     match = re.match(r"\s*impl\b", head)
     if match is None:
-        return None
+        return None, None
     index = match.end()
     n = len(head)
 
@@ -641,20 +662,22 @@ def _impl_type_name(head: str) -> str | None:
         index + 3 < n and (head[index + 3].isalnum() or head[index + 3] == "_")
     ):
         second_name, _index = read_type_path(index + 3)
-        return second_name
-    return first_name
+        return second_name, first_name
+    return first_name, None
 
 
-def _impl_blocks(code: str) -> list[tuple[str, int, int]]:
-    """`(type name, start, end)` for each `impl … { … }`, block-scoped."""
+def _impl_blocks(code: str) -> list[tuple[str, str | None, int, int]]:
+    """`(type, trait or None, start, end)` for each `impl … { … }`."""
 
-    blocks: list[tuple[str, int, int]] = []
+    blocks: list[tuple[str, str | None, int, int]] = []
     for match in IMPL_HEAD.finditer(code):
-        type_name = _impl_type_name(match.group(0))
+        type_name, trait_name = _impl_type_name(match.group(0))
         if type_name is None:
             continue
         open_index = match.end() - 1
-        blocks.append((type_name, open_index, _balanced_end(code, open_index)))
+        blocks.append(
+            (type_name, trait_name, open_index, _balanced_end(code, open_index))
+        )
     return blocks
 
 
@@ -850,12 +873,13 @@ def _skip_registry_filler(lines: list[str], start: int) -> int | None:
         return start + 1
     if not _BLOCK_COMMENT_OPEN.match(lines[start]):
         return None
-    i = start
-    while i < len(lines) and "*/" not in lines[i]:
-        i += 1
-    if i < len(lines):
-        return i + 1
-    return len(lines)
+    remainder = "".join(lines[start:])
+    stripped = lines[start].lstrip()
+    indent = len(lines[start]) - len(stripped)
+    end = _skip_comment(remainder, indent)
+    if end is None:
+        return len(lines)
+    return start + max(_lines_spanned(remainder, end), 1)
 
 
 def find_registry(sources: list[tuple[Path, str]]) -> tuple[list[SharedItem], list[str]]:
@@ -908,6 +932,8 @@ class FnInfo:
     name: str
     file: Path
     type_name: str | None  # set for an `impl Type { fn name }` method
+    trait_name: str | None  # set for `impl Trait for Type` methods
+    is_macro: bool
     body: str  # code-only, turbofish-stripped -- see `_strip_turbofish`
     start: int
     keys: frozenset[str]  # Stage-1 direct touch, possibly empty
@@ -939,9 +965,11 @@ def index_functions(
                 item.key for item in registry if _body_touches(body_code, item.identifiers)
             )
             type_name = None
-            for tname, istart, iend in impls:
+            trait_name = None
+            for tname, trname, istart, iend in impls:
                 if istart <= match.start() < iend:
                     type_name = tname
+                    trait_name = trname
                     break
             attrs = _preceding_attributes(raw, code, match.start())
             is_test = any(_is_test_attr(a) for a in attrs)
@@ -960,12 +988,40 @@ def index_functions(
                     name=name,
                     file=rel,
                     type_name=type_name,
+                    trait_name=trait_name,
+                    is_macro=False,
                     body=body_code,
                     start=body_start,
                     keys=keys,
                     is_test=is_test,
                     serial_held=frozenset(serial_held),
                     has_unkeyed_serial=has_unkeyed,
+                    attrs_line=_line(raw, match.start()),
+                )
+            )
+        for match in MACRO_DEF.finditer(code):
+            name = match.group("name")
+            body_span = _macro_body(raw, match.end())
+            if body_span is None:
+                continue
+            body_start, body_end = body_span
+            body_code = _strip_turbofish(code[body_start:body_end])
+            keys = frozenset(
+                item.key for item in registry if _body_touches(body_code, item.identifiers)
+            )
+            out.append(
+                FnInfo(
+                    name=name,
+                    file=rel,
+                    type_name=None,
+                    trait_name=None,
+                    is_macro=True,
+                    body=body_code,
+                    start=body_start,
+                    keys=keys,
+                    is_test=False,
+                    serial_held=frozenset(),
+                    has_unkeyed_serial=False,
                     attrs_line=_line(raw, match.start()),
                 )
             )
@@ -1049,7 +1105,8 @@ def _resolve_calls(
     by_file: dict[Path, dict[str, int]],
     by_module: dict[tuple[str, ...], dict[str, int]],
     by_leaf: dict[str, dict[str, int]],
-    by_type: dict[str, dict[str, int]],
+    by_type: dict[str, dict[str, list[int]]],
+    by_macro: dict[Path, dict[str, int]],
     keys_of: list[frozenset[str]],
     self_index: int,
 ) -> frozenset[str]:
@@ -1058,6 +1115,11 @@ def _resolve_calls(
     caller_module = _module_path(fn.file)
     for m in FREE_CALL.finditer(fn.body):
         j = file_index.get(m.group(1))
+        if j is not None and j != self_index:
+            gained.update(keys_of[j])
+    macro_index = by_macro.get(fn.file, {})
+    for m in MACRO_INVOKE.finditer(fn.body):
+        j = macro_index.get(m.group(1))
         if j is not None and j != self_index:
             gained.update(keys_of[j])
     for m in QUALIFIED_CALL.finditer(fn.body):
@@ -1131,13 +1193,13 @@ def _resolve_calls(
         type_name = fn.type_name if m.group(1) == "Self" else m.group(1)
         if type_name is None:
             continue
-        j = by_type.get(type_name, {}).get(m.group(2))
-        if j is not None and j != self_index:
-            gained.update(keys_of[j])
+        for j in by_type.get(type_name, {}).get(m.group(2), []):
+            if j != self_index:
+                gained.update(keys_of[j])
     for m in UFCS_CALL.finditer(fn.body):
-        j = by_type.get(m.group(1), {}).get(m.group(2))
-        if j is not None and j != self_index:
-            gained.update(keys_of[j])
+        for j in by_type.get(m.group(1), {}).get(m.group(2), []):
+            if j != self_index:
+                gained.update(keys_of[j])
     return frozenset(gained)
 
 
@@ -1155,8 +1217,12 @@ def analyze(
     by_file: dict[Path, dict[str, int]] = {}
     by_module: dict[tuple[str, ...], dict[str, int]] = {}
     by_leaf: dict[str, dict[str, int]] = {}
-    by_type: dict[str, dict[str, int]] = {}
+    by_type: dict[str, dict[str, list[int]]] = {}
+    by_macro: dict[Path, dict[str, int]] = {}
     for i, fn in enumerate(functions):
+        if fn.is_macro:
+            by_macro.setdefault(fn.file, {})[fn.name] = i
+            continue
         by_file.setdefault(fn.file, {})[fn.name] = i
         module = _module_path(fn.file)
         if module is not None:
@@ -1172,7 +1238,9 @@ def analyze(
             if module:
                 by_leaf.setdefault(module[-1], {})[fn.name] = i
         if fn.type_name is not None:
-            by_type.setdefault(fn.type_name, {})[fn.name] = i
+            by_type.setdefault(fn.type_name, {}).setdefault(fn.name, []).append(i)
+        if fn.trait_name is not None:
+            by_type.setdefault(fn.trait_name, {}).setdefault(fn.name, []).append(i)
 
     keys_of: list[frozenset[str]] = [fn.keys for fn in functions]
     for _round in range(_MAX_ROUNDS):
@@ -1184,6 +1252,7 @@ def analyze(
                 by_module=by_module,
                 by_leaf=by_leaf,
                 by_type=by_type,
+                by_macro=by_macro,
                 keys_of=keys_of,
                 self_index=i,
             )

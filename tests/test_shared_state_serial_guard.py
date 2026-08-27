@@ -194,6 +194,21 @@ class RegistryDiscovery(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(items[0].identifiers, ("A", "B"))
 
+    def test_nested_block_comment_between_statics_does_not_end_the_block(self):
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static A: AtomicU64 = AtomicU64::new(0);
+            /* outer
+            /* nested */
+            still outer */
+            static B: AtomicU64 = AtomicU64::new(0);
+            """
+        )
+        items, errors = guard.find_registry([(Path("f.rs"), text)])
+        self.assertEqual(errors, [])
+        self.assertEqual(items[0].identifiers, ("A", "B"))
+
     def test_marker_inside_a_raw_string_is_not_a_registry_entry(self):
         text = src(
             '''\
@@ -358,6 +373,27 @@ class TransitiveClosure(unittest.TestCase):
         )
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"calls_bump_untagged"})
+
+    def test_macro_invocation_reaches_registered_state_in_the_macro_body(self):
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! bump {
+                () => {
+                    COUNTER.fetch_add(1, Ordering::SeqCst)
+                };
+            }
+
+            #[test]
+            fn calls_bump_macro_untagged() {
+                bump!();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_bump_macro_untagged"})
 
     def test_two_hops_same_file_is_still_derived(self):
         """The real #492 shape: test -> `quarantined_after` -> `heal_unusable`,
@@ -645,6 +681,34 @@ class TypeAssociatedResolution(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_ufcs_trait_untagged"})
+
+    def test_trait_qualified_call_resolves_to_the_impl(self):
+        """`Bump::bump(&S)` looks up the trait name, not the concrete type
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct S;
+            trait Bump {
+                fn bump(&self);
+            }
+            impl Bump for S {
+                fn bump(&self) {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn calls_trait_qualified_untagged() {
+                Bump::bump(&S);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_trait_qualified_untagged"})
 
     def test_instance_method_call_is_not_resolved(self):
         """Named, measured gap: `.changed()`-shaped instance calls are not
