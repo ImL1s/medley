@@ -467,6 +467,11 @@ mod tests {
             launch.path().join("auth.json"),
             "relative GROK_AUTH_PATH must join the launch directory"
         );
+        assert_eq!(
+            explicit_xai_auth_override(),
+            Some(launch.path().join("auth.json")),
+            "Codex production resolution shares this override (#481 review)"
+        );
         let cwd = std::env::current_dir().expect("process cwd");
         if cwd != launch.path() {
             assert_ne!(
