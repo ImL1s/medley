@@ -19,6 +19,8 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static LAST_PIPE_DRAIN_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
+    static LAST_PIPE_DRAIN_GRACE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +129,8 @@ fn post_exit_cleanup_and_drain(
     let cleanup_deadline = std::time::Instant::now() + grace;
     #[cfg(test)]
     LAST_PIPE_DRAIN_DEADLINE.with(|slot| slot.set(Some(cleanup_deadline)));
+    #[cfg(test)]
+    LAST_PIPE_DRAIN_GRACE.with(|slot| slot.set(Some(grace)));
     terminate_owned_group(group);
     let stdout = recv_pipe_drain(stdout, cleanup_deadline, "stdout")?;
     let stderr = recv_pipe_drain(stderr, cleanup_deadline, "stderr")?;
@@ -155,9 +159,14 @@ fn recv_pipe_drain(
     label: &'static str,
 ) -> Result<Vec<u8>, String> {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    receiver
-        .recv_timeout(remaining)
-        .map_err(|_| format!("tmux {label} did not close before the query deadline"))?
+    let timed_out = || format!("tmux {label} did not close before the query deadline");
+    if remaining.is_zero() {
+        return match receiver.try_recv() {
+            Ok(value) => value,
+            Err(_) => Err(timed_out()),
+        };
+    }
+    receiver.recv_timeout(remaining).map_err(|_| timed_out())?
 }
 
 fn terminate_tmux_tree(group: &xai_tty_utils::ProcessGroup, child: &mut std::process::Child) {
@@ -509,17 +518,12 @@ mod tests {
     /// correct, reintroducing exactly the class of flakiness this PR
     /// removes everywhere else.
     ///
-    /// This version spawns no process at all and asserts no elapsed time.
-    /// The "pipe" is a bare channel the test controls directly: the stdout
-    /// side only receives a value after a real delay chosen to land inside
-    /// any plausible "grace ignored, some larger fixed window used
-    /// instead" mutation (in particular, reusing [`POST_EXIT_CLEANUP_GRACE`]
-    /// itself) and outside the correct, much smaller `grace` under test. A
-    /// `thread::sleep` is a guaranteed *minimum*, never an upper bound —
-    /// scheduler jitter can only push the send *later*, which only widens
-    /// the pass margin, never narrows it. The property under test becomes a
-    /// pure outcome (did the deadline or the send win the race), not a
-    /// duration, so there is nothing left for ambient load to flake.
+    /// This version never races a delayed send against `recv_timeout`.
+    /// The pipe is left empty and the deadline is already in the past, so
+    /// `recv_pipe_drain` takes the zero-remaining `try_recv` path: either
+    /// the value is already queued (pipe closed in time) or the wait is a
+    /// timeout. A descheduled test thread cannot turn a later send into
+    /// `Ok` (#501 review).
     ///
     /// One thing this test still does *not* catch: a `grace` silently
     /// dropped (collapsed to ~0). That path is `Err` too, indistinguishable
@@ -528,26 +532,14 @@ mod tests {
     /// (`post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline`).
     #[test]
     fn post_exit_grace_bounds_the_drain_when_the_pipe_closes_only_after_the_grace() {
-        let group = xai_tty_utils::ProcessGroup::new().expect("group");
-
         let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
-        std::thread::spawn(move || {
-            // A guaranteed minimum, not an upper bound -- see the doc
-            // comment above.
-            std::thread::sleep(Duration::from_millis(150));
-            let _ = stdout_tx.send(Ok(b"too late\n".to_vec()));
-        });
-        let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
-        stderr_tx
-            .send(Ok(Vec::new()))
-            .expect("stderr channel has capacity for an immediate send");
-
-        let too_small = Duration::from_millis(20);
-        let result = post_exit_cleanup_and_drain(&group, stdout_rx, stderr_rx, too_small);
+        let past = std::time::Instant::now() - Duration::from_secs(1);
+        let result = recv_pipe_drain(stdout_rx, past, "stdout");
+        drop(stdout_tx);
 
         assert!(
             result.is_err(),
-            "grace must bound the drain wait even when the pipe closes well after it: {result:?}"
+            "an already-elapsed deadline must bound the drain wait even when the pipe is still open: {result:?}"
         );
         assert!(
             result
@@ -644,60 +636,17 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "tmux 3.4");
     }
 
-    /// Sibling to the end-to-end test above, restoring the coverage Codex's
-    /// review of #501 found missing from it: that `run_tmux_bounded` passes
+    /// Sibling to the end-to-end test above: `run_tmux_bounded` must pass
     /// [`post_exit_cleanup_and_drain`] a *fresh* [`POST_EXIT_CLEANUP_GRACE`],
-    /// not a remainder borrowed from its own much larger `timeout`. The test
-    /// above cannot tell these apart — its leader now exits at once, so
-    /// nearly the whole 1.5s `timeout` is still unused budget by the time
-    /// cleanup runs, and its descendant dies to the group's own `SIGTERM`
-    /// well inside either a fresh or a borrowed window.
+    /// not a remainder borrowed from its own much larger `timeout`.
     ///
-    /// This test's descendant instead must *outlive* the group's `SIGTERM`
-    /// entirely, so the two windows can be told apart. It calls its own
-    /// `setsid()` the moment it starts, moving itself to a brand-new
-    /// process group — the one escape `ProcessGroup`'s own doc comment
-    /// names as unreachable by `killpg` — then holds the piped stdout open
-    /// for a fixed lifetime and exits on its own; nothing outside the fake
-    /// `tmux` script can reach it to kill it early, so no manual teardown
-    /// is needed.
-    ///
-    /// Between spawning that descendant and exiting, the leader busy-polls
-    /// a marker file the descendant creates immediately after `setsid()`
-    /// succeeds. Without that handshake there is a real race: the main
-    /// wait loop polls for the leader's exit every 15ms, so on a loaded
-    /// machine the group's `SIGTERM` could in principle fire before the
-    /// descendant has finished detaching, killing it early and collapsing
-    /// the very distinction this test depends on. The marker makes "the
-    /// descendant has already escaped the group" a fact the leader waits
-    /// on rather than a timing assumption.
-    ///
-    /// That wait has no fixed iteration cap. A cap chosen independently of
-    /// the real timeout budget is exactly the failure mode Codex's review
-    /// of #501 flagged: pick it too small and heavy scheduling contention
-    /// exhausts it before the marker appears, letting the leader proceed
-    /// as though the handshake completed and producing a false failure
-    /// that looks like a real regression. The main wait loop's own 1.5s
-    /// `timeout` is already the sole bound this whole file trusts for "how
-    /// long is too long," so this loop defers to it instead of guessing a
-    /// second, smaller one: if `/usr/bin/perl` is ever unusable, the
-    /// leader spins until that outer deadline reaps it via
-    /// `terminate_tmux_tree`, and `run_tmux_bounded` returns `"tmux query
-    /// timed out after 1.5s"` — textually distinct from the drain
-    /// timeout below, so a run that hits this degenerate path fails loud
-    /// and diagnosably instead of silently validating nothing.
-    ///
-    /// A grace fresh off `POST_EXIT_CLEANUP_GRACE` (300ms) elapses well
-    /// before the descendant's fixed 800ms self-close, so a correct
-    /// `run_tmux_bounded` must report the drain timeout. A grace borrowed
-    /// from `timeout` instead — almost entirely unused, since the leader
-    /// exits at once — comfortably outlasts that 800ms close, and what
-    /// should have been `Err` becomes `Ok`: exactly the caller-side
-    /// regression this test exists to catch. `timeout`'s own value (and
-    /// why it is not simply "a bit more than 800ms") is explained where
-    /// it is set, below -- Codex's review of an earlier version of this
-    /// test found that margin was not as independent of contention as it
-    /// looked.
+    /// Earlier drafts inferred that from a wall-clock race (an escaped
+    /// holder closing between 300ms and 5s). Under deschedule the holder
+    /// can close before the drain thread observes its timeout, and a
+    /// correct implementation then looks like `Ok` (#501 review). The
+    /// drain now records the `Duration` it was given, so the assertion is
+    /// on that value rather than on whether a real-time holder outlived
+    /// it.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(tmux_probe_path)]
@@ -708,34 +657,14 @@ mod tests {
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let tmux = bin.join("tmux");
-        // `timeout` and the descendant's own 800ms self-close (below) are
-        // NOT independent quantities under load if the holder's countdown
-        // starts at the marker write: a descheduled leader burns the 800ms
-        // before exiting, shrinking the remaining grace. The holder now
-        // waits for a second "leader-exited" file before sleeping, so the
-        // 800ms starts after the leader's exit path (#501 review).
         let timeout = Duration::from_millis(5000);
-        let ready_marker = temp.path().join("descendant-ready");
-        let go_marker = temp.path().join("leader-exited");
-        let pid_file = temp.path().join("leader-pid");
-        let holder_pid_file = temp.path().join("holder-pid");
-        let script = format!(
+        std::fs::write(
+            &tmux,
             "#!/bin/sh\n\
-             ( /usr/bin/perl -e 'use POSIX qw(setsid); setsid(); \
-             open(my $pidfh, \">\", \"{holder_pid}\") or die $!; print $pidfh $$; close $pidfh; \
-             open(my $fh, \">\", \"{marker}\") or die $!; close $fh; \
-             while (! -e \"{go}\") {{ select(undef, undef, undef, 0.01); }} \
-             select(undef, undef, undef, 0.8);' ) &\n\
-             while [ ! -f \"{marker}\" ]; do :; done\n\
              printf 'tmux 3.4\\n'\n\
-             printf '%s\\n' \"$$\" > \"{pid}\"\n\
              exit 0\n",
-            marker = ready_marker.display(),
-            go = go_marker.display(),
-            pid = pid_file.display(),
-            holder_pid = holder_pid_file.display(),
-        );
-        std::fs::write(&tmux, script).unwrap();
+        )
+        .unwrap();
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let previous_path = std::env::var_os("PATH");
@@ -748,73 +677,10 @@ mod tests {
         unsafe {
             std::env::set_var("PATH", &path);
         }
-        let pid_file_for_watch = pid_file.clone();
-        let go_for_watch = go_marker.clone();
-        let holder_pid_for_watch = holder_pid_file.clone();
-        let watcher = std::thread::spawn(move || {
-            // Write `go` only after observing the leader is gone. Timing out
-            // while `kill(pid, 0)` still sees a zombie must kill the holder
-            // instead: writing `go` would start its 800ms interval and a
-            // descheduled main thread can then see `Ok` instead of drain
-            // timeout (#501 review).
-            struct WatcherExit {
-                go: std::path::PathBuf,
-                holder_pid: std::path::PathBuf,
-                start_holder: bool,
-            }
-            impl Drop for WatcherExit {
-                fn drop(&mut self) {
-                    if self.start_holder {
-                        let _ = std::fs::write(&self.go, b"");
-                        return;
-                    }
-                    if let Ok(s) = std::fs::read_to_string(&self.holder_pid) {
-                        if let Ok(p) = s.trim().parse::<libc::pid_t>() {
-                            if p > 1 {
-                                unsafe {
-                                    libc::kill(p, libc::SIGKILL);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let mut exit = WatcherExit {
-                go: go_for_watch.clone(),
-                holder_pid: holder_pid_for_watch,
-                start_holder: false,
-            };
-            let start = std::time::Instant::now();
-            let pid = loop {
-                if let Ok(s) = std::fs::read_to_string(&pid_file_for_watch) {
-                    if let Ok(p) = s.trim().parse::<libc::pid_t>() {
-                        if p > 1 {
-                            break p;
-                        }
-                    }
-                }
-                if start.elapsed() > Duration::from_secs(5) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            };
-            loop {
-                let alive = unsafe { libc::kill(pid, 0) == 0 };
-                if !alive {
-                    break;
-                }
-                if start.elapsed() > Duration::from_secs(10) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            exit.start_holder = true;
-            let _ = std::fs::write(&go_for_watch, b"");
-        });
+        LAST_PIPE_DRAIN_GRACE.with(|c| c.set(None));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_tmux_bounded(TmuxCommand::Version, timeout)
         }));
-        let _ = watcher.join();
         match previous_path {
             Some(value) => unsafe {
                 std::env::set_var("PATH", value);
@@ -823,15 +689,13 @@ mod tests {
                 std::env::remove_var("PATH");
             },
         }
-        let output = result.expect("probe must not panic");
-        let error = output.expect_err(
-            "a descendant outside the group that outlives a fresh grace must surface as a \
-             drain timeout, not a success -- a success here means the grace was borrowed from \
-             the main deadline instead of freshly computed",
-        );
-        assert!(
-            error.contains("did not close before the query deadline"),
-            "must fail as a drain timeout specifically, not some other error: {error}"
+        result
+            .expect("probe must not panic")
+            .expect("an immediate-exit tmux must drain successfully");
+        assert_eq!(
+            LAST_PIPE_DRAIN_GRACE.with(|c| c.get()),
+            Some(POST_EXIT_CLEANUP_GRACE),
+            "run_tmux_bounded must pass a fresh POST_EXIT_CLEANUP_GRACE, not a remainder of timeout"
         );
     }
 
