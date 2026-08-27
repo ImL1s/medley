@@ -156,22 +156,36 @@ thread_local! {
 ///
 /// Precedence (mirrors `appearance::cache::load_scroll_speed`):
 ///
-/// 1. `GROK_DEFAULT_SELECTED_PERMISSION` env var (headless / agent testing —
-///    overrides `config.toml` without editing it),
-/// 2. `[ui].default_selected_permission` in the layered effective config,
-/// 3. [`AlwaysAllowAllSessions`](DefaultSelectedPermission::AlwaysAllowAllSessions)
+/// 1. `MEDLEY_DEFAULT_SELECTED_PERMISSION` when it names a recognised token,
+/// 2. `GROK_DEFAULT_SELECTED_PERMISSION` when it names a recognised token
+///    (headless / agent testing — overrides `config.toml` without editing it),
+/// 3. `[ui].default_selected_permission` in the layered effective config,
+/// 4. [`AlwaysAllowAllSessions`](DefaultSelectedPermission::AlwaysAllowAllSessions)
 ///    (the effective default).
 ///
 /// Unrecognised / empty values at any layer fall through to the next.
+/// A garbage `MEDLEY_*` value does not hide a valid `GROK_*` token
+/// (#491 review) — [`resolve_env_var`] would stop at the first non-blank
+/// alias, so this site parses each alias itself.
 pub fn load_default_selected_permission() -> DefaultSelectedPermission {
     CONFIG_LOADED.with(|loaded| {
         if !loaded.get() {
+            let medley = std::env::var("MEDLEY_DEFAULT_SELECTED_PERMISSION").ok();
+            let grok = std::env::var("GROK_DEFAULT_SELECTED_PERMISSION").ok();
+            if medley
+                .as_deref()
+                .and_then(DefaultSelectedPermission::try_from_config_value)
+                .is_none()
+                && grok
+                    .as_deref()
+                    .and_then(DefaultSelectedPermission::try_from_config_value)
+                    .is_some()
+            {
+                xai_grok_config::note_legacy_hit("GROK_DEFAULT_SELECTED_PERMISSION");
+            }
             let resolved = resolve_default_selected_permission_from(
-                xai_grok_config::resolve_env_var(
-                    "MEDLEY_DEFAULT_SELECTED_PERMISSION",
-                    "GROK_DEFAULT_SELECTED_PERMISSION",
-                )
-                .as_deref(),
+                medley.as_deref(),
+                grok.as_deref(),
                 load_string_from_effective_config("default_selected_permission").as_deref(),
             );
             CONFIG_CURRENT.with(|c| c.set(resolved));
@@ -181,14 +195,17 @@ pub fn load_default_selected_permission() -> DefaultSelectedPermission {
     CONFIG_CURRENT.with(Cell::get)
 }
 
-/// Env, then config, then the effective default. Extracted so the alias
-/// vs. config interaction is unit-testable without mutating process env
-/// or reading `config.toml`.
+/// Medley env, then Grok env, then config, then the effective default.
+/// Extracted so the alias vs. config interaction is unit-testable without
+/// mutating process env or reading `config.toml`.
 fn resolve_default_selected_permission_from(
-    env: Option<&str>,
+    medley_env: Option<&str>,
+    grok_env: Option<&str>,
     config: Option<&str>,
 ) -> DefaultSelectedPermission {
-    env.and_then(DefaultSelectedPermission::try_from_config_value)
+    medley_env
+        .and_then(DefaultSelectedPermission::try_from_config_value)
+        .or_else(|| grok_env.and_then(DefaultSelectedPermission::try_from_config_value))
         .or_else(|| config.map(DefaultSelectedPermission::from_config_value))
         .unwrap_or(DefaultSelectedPermission::AlwaysAllowAllSessions)
 }
@@ -321,14 +338,20 @@ mod tests {
         assert_eq!(
             resolve_default_selected_permission_from(
                 Some("always_allow_all_sessions"),
+                None,
                 Some("reject"),
             ),
             DefaultSelectedPermission::AlwaysAllowAllSessions
         );
         assert_eq!(
-            resolve_default_selected_permission_from(Some("bogus"), Some("reject")),
+            resolve_default_selected_permission_from(Some("bogus"), None, Some("reject")),
             DefaultSelectedPermission::Reject,
             "unrecognised env must still fall through to config"
+        );
+        assert_eq!(
+            resolve_default_selected_permission_from(Some("bogus"), Some("reject"), None),
+            DefaultSelectedPermission::Reject,
+            "unrecognised MEDLEY_* must still fall through to a valid GROK_* token"
         );
     }
 
@@ -441,6 +464,27 @@ mod tests {
                 assert_eq!(
                     load_default_selected_permission(),
                     DefaultSelectedPermission::AllowOnce
+                );
+            })
+            .join()
+            .unwrap();
+        }
+
+        #[test]
+        #[serial_test::serial(default_selected_permission_env)]
+        fn invalid_medley_falls_through_to_valid_grok() {
+            // `resolve_env_var` returns the first non-blank alias, so a
+            // garbage MEDLEY_* value used to hide a valid GROK_* token
+            // and fall through to the effective default (#491 review).
+            let _guard = EnvGuard;
+            std::thread::spawn(|| {
+                unsafe {
+                    std::env::set_var("MEDLEY_DEFAULT_SELECTED_PERMISSION", "bogus");
+                    std::env::set_var("GROK_DEFAULT_SELECTED_PERMISSION", "reject");
+                }
+                assert_eq!(
+                    load_default_selected_permission(),
+                    DefaultSelectedPermission::Reject
                 );
             })
             .join()

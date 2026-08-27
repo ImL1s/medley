@@ -1449,7 +1449,7 @@ jobs:
           # tests both live under `appearance/`, so the file-derived module
           # prefix covers both in one line (the inline `env_alias_tests`
           # submodule name they share is invisible to #171's file-path-only
-          # guard, same reason as `flags::` above). 10 tests, all new.
+          # guard, same reason as `flags::` above). 11 tests, all new.
           run_nonzero -p xai-grok-pager-render --lib \
             appearance:: -- --nocapture
           # #426's MEDLEY_*-first telemetry-mode and apply_env_overrides
