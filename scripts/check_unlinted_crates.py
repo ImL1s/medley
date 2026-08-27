@@ -54,7 +54,10 @@ _QUOTED = re.compile(r"""["']([^"']+)["']""")
 _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
 _P_FLAG = re.compile(r"(?:^|[\s\\])(?:-p|--package)\s+([A-Za-z0-9][A-Za-z0-9_-]*)")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_YAML_RUN = re.compile(r"^-\s+run:\s+(.*)$")
+# GHA `run:` may be a list item (`- run:`) or a mapping on a named step
+# (`run:` with no leading dash). YAML quoting is stripped before the shell
+# sees the value (#508 review).
+_YAML_RUN = re.compile(r"^(?:-\s+)?run:\s+(.*)$")
 
 # A crate the workspace declares but whose manifest cannot be read is a bug in
 # this script or a broken tree, never a silent pass.
@@ -254,7 +257,7 @@ def _unquote_yaml_flow_scalar(value: str) -> str:
 
 
 def _workflow_shell_line(line: str) -> str:
-    """The command a GHA `- run:` scalar actually execs, else the line as-is."""
+    """The command a GHA `run:` scalar actually execs, else the line as-is."""
     match = _YAML_RUN.match(line.lstrip())
     if match:
         return _unquote_yaml_flow_scalar(match.group(1))

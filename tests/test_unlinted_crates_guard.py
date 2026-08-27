@@ -230,6 +230,15 @@ class LintedTokens(unittest.TestCase):
         text = '      - run: "' + CLIPPY.format(d="xai-grok-shell") + '"\n'
         self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
 
+    def test_counts_a_quoted_named_step_run_invocation(self):
+        # Named steps put `run:` on its own mapping line, with no leading
+        # `-`. YAML quoting still has to be stripped (#508 review).
+        text = (
+            "      - name: lint\n"
+            "        run: '" + CLIPPY.format(d="xai-grok-shell") + "'\n"
+        )
+        self.assertEqual(linted_tokens(text), {"xai-grok-shell"})
+
     def test_counts_a_package_flag_invocation(self):
         text = _workflow(
             "cargo clippy -p xai-grok-shell --all-targets -- -D warnings"
@@ -316,6 +325,13 @@ class IndependentLintedOracle(unittest.TestCase):
 
     def test_counts_a_quoted_inline_yaml_run_invocation(self):
         text = "      - run: '" + CLIPPY.format(d="xai-grok-shell") + "'\n"
+        self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
+
+    def test_counts_a_quoted_named_step_run_invocation(self):
+        text = (
+            "      - name: lint\n"
+            "        run: '" + CLIPPY.format(d="xai-grok-shell") + "'\n"
+        )
         self.assertEqual(_independent_linted_crates(text), {"xai-grok-shell"})
 
 
