@@ -293,18 +293,17 @@ Scope is the fork hot path (not full workspace):
   looked green, #439). Two things this still does **not** cover, both of
   which have read as coverage before:
   - **The rest of the workspace.** `xai-grok-config` is not on that named
-    list. It is still reached as an ordinary library dependency of
-    `xai-grok-shell`'s clippy invocation, which omits `--no-deps`: Cargo
-    therefore runs clippy on config's `lib` target (not tests/benches)
-    under `-D warnings`. That is not `--all-targets` coverage of config,
-    and it is not a substitute for naming a crate. The remaining unnamed
-    crates are recorded by `check_unlinted_crates.py`; triaging them is
-    #457. Test coverage and lint coverage are answered by different lists:
+    list. Omitting `--no-deps` still *builds* it as a library dependency of
+    `xai-grok-shell`, but Cargo invokes that dependency through `rustc`,
+    not `clippy-driver`, and does not forward `-D warnings`. A warning in
+    config therefore stays green. Config is on the test list (`display::`,
+    `validation::`, `state_home::`) and on
+    `tests/ci/unlinted-crates.allowlist`; it has no clippy
+    `--manifest-path` of its own. The remaining unnamed crates are
+    recorded by `check_unlinted_crates.py`; triaging them is #457.
+    Test coverage and lint coverage are answered by different lists:
     `xai-grok-workspace` is named by dozens of `run_nonzero` test filters
-    *and* by a clippy `--manifest-path` of its own. `xai-grok-config` is
-    named by the test list (`display::`, `validation::`, `state_home::`)
-    but still has no clippy `--manifest-path` of its own — only that
-    transitive `lib` reach from shell.
+    *and* by a clippy `--manifest-path` of its own.
   - **`required-features` targets used to be skipped silently.**
     `--all-targets` omits them with no error and no warning, so the six
     `[[test]]` targets in `xai-grok-shell` gated on `test-support` — the
