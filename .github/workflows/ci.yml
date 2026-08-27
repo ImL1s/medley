@@ -1435,7 +1435,7 @@ jobs:
           # `xai-grok-plugin-marketplace` had no filter at all either.
           # `GROK_MARKETPLACE_REQUIRE_SHA`'s MEDLEY_* alias (#426) is a
           # tighten-only security policy knob; a sync silently dropping the
-          # alias precedence would only be caught here. 2 tests, all new.
+          # alias precedence would only be caught here. 3 tests, all new.
           run_nonzero -p xai-grok-plugin-marketplace --lib \
             marketplace_require_sha -- --nocapture
           # `xai-grok-pager-bin` (bin target): #426's disable-autoupdater

@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn medley_falsy_cannot_turn_off_truthy_grok() {
+    fn medley_marketplace_require_sha_falsy_cannot_turn_off_truthy_grok() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("MEDLEY_MARKETPLACE_REQUIRE_SHA", "0");
