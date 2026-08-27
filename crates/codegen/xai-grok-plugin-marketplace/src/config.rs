@@ -45,11 +45,15 @@ pub fn load_require_sha(config: &toml::Value) -> bool {
 }
 
 pub fn env_require_sha() -> bool {
-    xai_grok_config::resolve_env_bool(
-        "MEDLEY_MARKETPLACE_REQUIRE_SHA",
-        "GROK_MARKETPLACE_REQUIRE_SHA",
-    )
-    .unwrap_or(false)
+    // Tighten-only across BOTH aliases: a falsy `MEDLEY_*` must not turn
+    // off a truthy `GROK_*` (#491 review). `resolve_env_bool` is
+    // first-wins and would let `MEDLEY_*=0` shadow `GROK_*=1`.
+    let medley = xai_grok_config::env_bool("MEDLEY_MARKETPLACE_REQUIRE_SHA");
+    let grok = xai_grok_config::env_bool("GROK_MARKETPLACE_REQUIRE_SHA");
+    if grok == Some(true) && medley != Some(true) {
+        xai_grok_config::note_legacy_hit("GROK_MARKETPLACE_REQUIRE_SHA");
+    }
+    medley == Some(true) || grok == Some(true)
 }
 
 /// Reads `[marketplace].sources` array. Returns empty vec if not configured.
@@ -393,6 +397,21 @@ mod tests {
         let result = env_require_sha();
         unsafe { std::env::remove_var("GROK_MARKETPLACE_REQUIRE_SHA") };
         assert!(result, "GROK_* must still work when MEDLEY_* is unset");
+    }
+
+    #[test]
+    fn medley_falsy_cannot_turn_off_truthy_grok() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEDLEY_MARKETPLACE_REQUIRE_SHA", "0");
+            std::env::set_var("GROK_MARKETPLACE_REQUIRE_SHA", "1");
+        }
+        let result = env_require_sha();
+        unsafe {
+            std::env::remove_var("MEDLEY_MARKETPLACE_REQUIRE_SHA");
+            std::env::remove_var("GROK_MARKETPLACE_REQUIRE_SHA");
+        }
+        assert!(result, "tighten-only: GROK_*=1 must survive MEDLEY_*=0");
     }
 
     #[test]
