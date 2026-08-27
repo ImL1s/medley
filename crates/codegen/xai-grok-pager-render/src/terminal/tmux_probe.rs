@@ -449,47 +449,34 @@ mod tests {
         );
     }
 
-    /// #490: `post_exit_cleanup_and_drain`'s "fresh, not borrowed" grace
-    /// window is now guarded by its own signature (see that function's doc
-    /// comment) — a caller has no `Instant` deadline in scope to reuse by
-    /// accident. This test drives that directly, with no outer deadline
-    /// object anywhere in scope at all.
-    ///
-    /// The process is built to ignore `SIGTERM` (same construction as
-    /// `group_that_ignores_sigterm_waits_the_grace_and_is_killed`, which
-    /// this shares timing with deliberately) so it needs the *full*
-    /// SIGTERM → `GROUP_EXIT_GRACE` → SIGKILL escalation to die, and its
-    /// pipe cannot close — so the drain thread cannot have anything
-    /// buffered — until that escalation actually completes. That makes this
-    /// test genuinely sensitive to `grace`'s value rather than trivially
-    /// true regardless of it: the sibling test below (a different fixture,
-    /// see its own doc comment for why) asserts the other direction, that
-    /// too small a `grace` legitimately fails, so together they bound the
-    /// function's behaviour instead of only checking the side that was
-    /// always going to pass.
-    ///
-    /// The fixture waits for an explicit readiness handshake (a file the
-    /// child creates after installing its SIGTERM trap) rather than a
-    /// fixed head start, so a loaded runner cannot SIGTERM the child
-    /// before the trap exists (#501 review).
-    #[cfg(unix)]
+    /// Drives `post_exit_cleanup_and_drain` with pipes that close after a
+    /// guaranteed minimum still inside `POST_EXIT_CLEANUP_GRACE`. Collapsing
+    /// the helper's deadline to `Instant::now()` loses that race; a fresh
+    /// grace wins (#501 review). The sibling test below bounds the other
+    /// direction (pipe closes only after a too-small grace).
     #[test]
     fn post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline() {
-        let (group, mut child, stdout_rx, stderr_rx) = spawn_sigterm_ignoring_pipe_holder();
+        let group = xai_tty_utils::ProcessGroup::new().expect("group");
 
-        // Escalation and drain are separate waits: requiring both to finish
-        // inside `POST_EXIT_CLEANUP_GRACE` fails for correct code whenever
-        // the test thread is descheduled across the SIGKILL (#501 review).
-        terminate_owned_group(&group);
-        let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let stdout = recv_pipe_drain(stdout_rx, drain_deadline, "stdout")
-            .expect("pipes must close after SIGKILL, independent of cleanup grace");
-        let stderr = recv_pipe_drain(stderr_rx, drain_deadline, "stderr")
-            .expect("stderr drain after SIGKILL");
+        // Pipes close after a guaranteed minimum that still fits inside
+        // `POST_EXIT_CLEANUP_GRACE`. Collapsing the helper's deadline to
+        // `Instant::now()` loses the race; a fresh grace wins (#501 review).
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = stdout_tx.send(Ok(b"ok\n".to_vec()));
+        });
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = stderr_tx.send(Ok(Vec::new()));
+        });
+
+        let (stdout, stderr) =
+            post_exit_cleanup_and_drain(&group, stdout_rx, stderr_rx, POST_EXIT_CLEANUP_GRACE)
+                .expect("a fresh nominal grace must outlast a 20ms pipe close");
         assert_eq!(String::from_utf8_lossy(&stdout).trim(), "ok");
         assert!(stderr.is_empty());
-
-        reap_after_escalation(&group, &mut child);
     }
 
     /// The other half of the property above, made deterministic instead of
@@ -554,80 +541,6 @@ mod tests {
                 .contains("did not close before the query deadline"),
             "must fail as a drain timeout, not some other error"
         );
-    }
-
-    /// Fixture for the positive test above: a process that prints, installs
-    /// a `SIGTERM` trap, and then blocks forever holding its own piped
-    /// stdout/stderr open.
-    #[cfg(unix)]
-    #[allow(clippy::type_complexity)] // test fixture; a named type would be single-use
-    fn spawn_sigterm_ignoring_pipe_holder() -> (
-        xai_tty_utils::ProcessGroup,
-        std::process::Child,
-        std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
-        std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
-    ) {
-        let mut group = xai_tty_utils::ProcessGroup::new().expect("group");
-        let ready_path = std::env::temp_dir().join(format!(
-            "medley-tmux-probe-ready-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_file(&ready_path);
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg("trap '' TERM; printf 'ok\\n'; : > \"$READY_FILE\"; sleep 1000")
-            .env("READY_FILE", &ready_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        xai_tty_utils::detach_std_command(&mut cmd);
-        #[allow(clippy::disallowed_methods)] // test fixture; killed via the escalation under test
-        let mut child = cmd.spawn().expect("spawn");
-        group.attach_std(&child).expect("attach");
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-        let stdout_rx = spawn_pipe_drain(stdout, "stdout");
-        let stderr_rx = spawn_pipe_drain(stderr, "stderr");
-        // Handshake, not a head start: the child creates READY_FILE only
-        // after the SIGTERM trap is installed. Waiting for that file is
-        // what keeps SIGTERM from racing the default disposition under a
-        // loaded Ubuntu runner (#501 review).
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !ready_path.exists() {
-            if std::time::Instant::now() >= deadline {
-                let _ = group.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_file(&ready_path);
-                panic!("fixture never signalled that its SIGTERM trap was installed");
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let _ = std::fs::remove_file(&ready_path);
-        (group, child, stdout_rx, stderr_rx)
-    }
-
-    /// `post_exit_cleanup_and_drain` sends SIGTERM but does not itself wait
-    /// on the child, so a SIGKILL'd-but-unreaped process would otherwise
-    /// leak as a zombie in the test binary. `terminate_owned_group` may
-    /// already have reaped it via the group; either order is fine for
-    /// `try_wait`.
-    #[cfg(unix)]
-    fn reap_after_escalation(group: &xai_tty_utils::ProcessGroup, child: &mut std::process::Child) {
-        let _ = group.kill();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match child.try_wait().expect("poll child") {
-                Some(_) => return,
-                None if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                None => panic!("fixture process survived its own test's escalation"),
-            }
-        }
     }
 
     /// End-to-end sanity through the real spawn/wait/cleanup pipeline: a
