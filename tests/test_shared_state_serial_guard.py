@@ -1017,6 +1017,54 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_imported_bump_untagged"})
 
+    def test_function_local_import_does_not_steal_a_sibling(self):
+        """A later `use crate::b::bump` inside another test must not
+        rewrite an earlier test's `use crate::a::bump` (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    pub fn bump() {}
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn calls_a_untagged() {
+                        use crate::a::bump;
+                        bump();
+                    }
+
+                    #[test]
+                    fn calls_b_untagged() {
+                        use crate::b::bump;
+                        bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_a_untagged"})
+
     def test_reexported_function_resolves_through_the_exporting_module(self):
         """`pub use crate::a::bump` in `b.rs` must make `crate::b::bump()`
         a toucher (#516 review)."""

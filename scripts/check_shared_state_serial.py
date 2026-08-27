@@ -239,7 +239,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_SCAN_ROOT = Path("crates/codegen/xai-grok-shell/src")
@@ -884,20 +884,28 @@ def _use_module_prefix(
     return None
 
 
-def _use_imports(
-    path: Path, text: str
-) -> dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]:
-    """Inline-module path -> local name -> (module path, function name).
+@dataclass(frozen=True)
+class _UseBinding:
+    pos: int
+    inline: tuple[str, ...]
+    local: str
+    module: tuple[str, ...]
+    fname: str
+
+
+def _use_bindings(path: Path, text: str) -> list[_UseBinding]:
+    """Every `use` binding with its source offset.
 
     File-wide last-write let `mod second { use … as bump }` steal
-    `mod first`'s import (#516 review). Lookup walks ancestor inline
-    modules the same way bare calls walk `by_inline`.
+    `mod first`'s import (#516 review). Function-local `use` is split
+    out later so two tests in one module cannot overwrite each other
+    (#516 review).
     """
 
     code = _code_only(text)
     file_mod = _module_path(path)
     spans = _inline_module_spans(code)
-    scoped: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]] = {}
+    out: list[_UseBinding] = []
 
     def record(
         pos: int, root: str, mid: tuple[str, ...], fname: str, local: str
@@ -906,7 +914,7 @@ def _use_imports(
         module = _use_module_prefix(root, mid, file_mod, inline)
         if module is None:
             return
-        scoped.setdefault(inline, {})[local] = (module, fname)
+        out.append(_UseBinding(pos, inline, local, module, fname))
 
     for m in USE_PLAIN.finditer(code):
         segs = tuple(_raw_ident(s) for s in m.group(2).split("::") if s)
@@ -931,7 +939,43 @@ def _use_imports(
                 fname,
                 _raw_ident(item.group(2) or fname),
             )
+    return out
+
+
+def _pos_in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= pos < end for start, end in spans)
+
+
+def _imports_outside_bodies(
+    bindings: list[_UseBinding], body_spans: list[tuple[int, int]]
+) -> dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]:
+    scoped: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]] = {}
+    for b in bindings:
+        if _pos_in_spans(b.pos, body_spans):
+            continue
+        scoped.setdefault(b.inline, {})[b.local] = (b.module, b.fname)
     return scoped
+
+
+def _imports_in_span(
+    bindings: list[_UseBinding], start: int, end: int
+) -> dict[str, tuple[tuple[str, ...], str]]:
+    local: dict[str, tuple[tuple[str, ...], str]] = {}
+    for b in bindings:
+        if start <= b.pos < end:
+            local[b.local] = (b.module, b.fname)
+    return local
+
+
+def _overlay_fn_imports(
+    module: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]],
+    local: dict[str, tuple[tuple[str, ...], str]],
+    inline_mods: tuple[str, ...],
+) -> dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]:
+    merged = {key: dict(value) for key, value in module.items()}
+    if local:
+        merged.setdefault(inline_mods, {}).update(local)
+    return merged
 
 
 def _pub_reexports(
@@ -1285,6 +1329,9 @@ class FnInfo:
     serial_held: frozenset[str]  # keys held by any #[serial(..)] on this fn
     has_unkeyed_serial: bool
     attrs_line: int
+    local_imports: dict[str, tuple[tuple[str, ...], str]] = field(
+        default_factory=dict
+    )
 
 
 def _body_touches(code_only_body: str, identifiers: tuple[str, ...]) -> bool:
@@ -1495,10 +1542,17 @@ class _PendingMacroTest:
 
 def index_functions(
     sources: list[tuple[Path, str]], registry: list[SharedItem]
-) -> tuple[list[FnInfo], list[_PendingMacroTest]]:
+) -> tuple[
+    list[FnInfo],
+    list[_PendingMacroTest],
+    dict[Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]],
+]:
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
     generated_by_macro: dict[str, list[tuple[frozenset[str], bool, bool, int]]] = {}
+    imports_by_file: dict[
+        Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
+    ] = {}
     scans: list[
         tuple[Path, str, str, list[tuple[int, int]], list[tuple[int, int, int, str]]]
     ] = []
@@ -1506,8 +1560,11 @@ def index_functions(
         code = _code_only(raw)
         impls = _impl_blocks(code)
         inline_spans = _inline_module_spans(code)
-        file_imports = _use_imports(rel, raw)
+        bindings = _use_bindings(rel, raw)
         occupied: list[tuple[int, int]] = []
+        pending_fns: list[
+            tuple[re.Match[str], str, int, int, str, tuple[str, ...]]
+        ] = []
         macro_bodies: list[tuple[int, int]] = []
         for macro_match in MACRO_DEF.finditer(code):
             body_span = _macro_body(raw, macro_match.end())
@@ -1524,12 +1581,24 @@ def index_functions(
             occupied.append((body_start, body_end))
             body_code = _strip_turbofish(code[body_start:body_end])
             inline_mods = _inline_path_from_spans(inline_spans, match.start())
+            pending_fns.append(
+                (match, name, body_start, body_end, body_code, inline_mods)
+            )
+        for match in MACRO_DEF.finditer(code):
+            body_span = _macro_body(raw, match.end())
+            if body_span is not None:
+                occupied.append(body_span)
+        file_imports = _imports_outside_bodies(bindings, occupied)
+        imports_by_file[rel] = file_imports
+        for match, name, body_start, body_end, body_code, inline_mods in pending_fns:
+            local = _imports_in_span(bindings, body_start, body_end)
+            scoped = _overlay_fn_imports(file_imports, local, inline_mods)
             keys = frozenset(
                 item.key
                 for item in registry
                 if _body_touches(
                     body_code,
-                    _with_aliases(file_imports, inline_mods, item.identifiers),
+                    _with_aliases(scoped, inline_mods, item.identifiers),
                 )
             )
             type_name = None
@@ -1566,6 +1635,7 @@ def index_functions(
                     serial_held=frozenset(serial_held),
                     has_unkeyed_serial=has_unkeyed,
                     attrs_line=_line(raw, match.start()),
+                    local_imports=local,
                 )
             )
         for match in MACRO_DEF.finditer(code):
@@ -1657,7 +1727,7 @@ def index_functions(
                             template_index=template_index,
                         )
                     )
-    return out, pending
+    return out, pending, imports_by_file
 
 
 # --- membership: a monotonic fixpoint over the call graph -------------------
@@ -1827,9 +1897,11 @@ def _resolve_calls(
                 break
             prefix = prefix[:-1]
         if not js:
-            imported = _lookup_import(
-                imports_by_file.get(fn.file, {}), fn.inline_mods, name
-            )
+            imported = fn.local_imports.get(name)
+            if imported is None:
+                imported = _lookup_import(
+                    imports_by_file.get(fn.file, {}), fn.inline_mods, name
+                )
             if imported is not None:
                 module, fname = imported
                 js = by_module.get(module, {}).get(fname, [])
@@ -1958,8 +2030,9 @@ def analyze(
     if errors:
         return [], errors, {}
 
-    functions, pending_macro_tests = index_functions(sources, registry)
-    imports_by_file = {path: _use_imports(path, text) for path, text in sources}
+    functions, pending_macro_tests, imports_by_file = index_functions(
+        sources, registry
+    )
 
     by_file: dict[Path, dict[str, list[int]]] = {}
     by_module: dict[tuple[str, ...], dict[str, list[int]]] = {}
