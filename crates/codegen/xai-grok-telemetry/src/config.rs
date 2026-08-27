@@ -266,7 +266,10 @@ mod tests {
 
     /// `env_telemetry_mode_alias` takes both names as parameters, so unique
     /// per-test names avoid any risk of colliding with a concurrently-run
-    /// test over shared process env — no lock needed.
+    /// test over shared process env — no lock needed. The names must also
+    /// not be substrings of each other: `legacy_notice()` is a joined
+    /// process-global string, and `contains(GROK)` on
+    /// `GROK_TEST_…_INVALID` matches a sibling's `…_INVALID_MEDLEY` hit.
     #[test]
     fn env_telemetry_mode_alias_prefers_medley() {
         const MEDLEY: &str = "MEDLEY_TEST_TELEMETRY_MODE_ALIAS_PREFERS";
@@ -303,8 +306,8 @@ mod tests {
 
     #[test]
     fn env_telemetry_mode_alias_invalid_legacy_is_not_recorded_as_a_hit() {
-        const MEDLEY: &str = "MEDLEY_TEST_TELEMETRY_MODE_ALIAS_INVALID";
-        const GROK: &str = "GROK_TEST_TELEMETRY_MODE_ALIAS_INVALID";
+        const MEDLEY: &str = "MEDLEY_TEST_TELEMETRY_MODE_ALIAS_UNPARSEABLE";
+        const GROK: &str = "GROK_TEST_TELEMETRY_MODE_ALIAS_UNPARSEABLE";
         unsafe {
             std::env::remove_var(MEDLEY);
             std::env::set_var(GROK, "maybe");
