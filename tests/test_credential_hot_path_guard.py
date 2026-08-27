@@ -584,6 +584,8 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         text = read_rs(declaring)
         if text is None:
             continue
+        if _file_inner_cfg_inactive(text):
+            continue
         for name, child, inline_names in _iter_module_decls(
             text,
             declaring,
@@ -689,6 +691,25 @@ def _cfg_attr_is_inactive(attr: str) -> bool:
     return _eval_cfg(match.group(1).strip()) is False
 
 
+def _file_inner_cfg_inactive(text: str) -> bool:
+    """True when the file is gated off by a leading `#![cfg(...)]`."""
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        if "//" in stripped:
+            stripped = stripped[: stripped.index("//")].rstrip()
+        if stripped.startswith("#!["):
+            if "cfg" in stripped:
+                attr = stripped.replace("#![", "#[", 1)
+                if _cfg_attr_is_inactive(attr):
+                    return True
+            continue
+        return False
+    return False
+
+
 def _leading_attrs(line: str) -> tuple[list[str], str]:
     attrs: list[str] = []
     i = 0
@@ -718,6 +739,8 @@ def _leading_attrs(line: str) -> tuple[list[str], str]:
 
 
 def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
+    if _file_inner_cfg_inactive(text):
+        return []
     names: list[str] = []
     raw_lines = text.splitlines()
     masked_lines = _mask_rust_literals(text).splitlines()
@@ -756,7 +779,13 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
                 matched = _FN.match(follow)
                 if matched:
                     found = matched.group(1)
-                break
+                    break
+                if re.match(
+                    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:mod|struct|enum|impl|use)\b",
+                    follow,
+                ):
+                    break
+                continue
             inactive = enclosing_off or any(
                 _cfg_attr_is_inactive(a) for a in all_attrs
             )
@@ -841,6 +870,8 @@ def _qualified_test_names(root: Path) -> list[str]:
             try:
                 text = rs.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
+                continue
+            if _file_inner_cfg_inactive(text):
                 continue
             prefix_lists = _module_prefixes_for_source(
                 rs, overrides, extra_roots, gated_roots
@@ -1414,6 +1445,43 @@ class ExternalModulePrefix(unittest.TestCase):
                 "session::acp_session::extensions::idle_prompt::none_auth_scheme_sends",
                 names,
             )
+
+    def test_multiline_tokio_test_attr_is_counted(self):
+        """`#[tokio::test(` options may close on a later line (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            #[tokio::test(
+                flavor = "multi_thread"
+            )]
+            fn none_auth_scheme_async() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_async"])
+
+    def test_inner_cfg_file_is_skipped_on_this_target(self):
+        """`#![cfg(windows)]` at the crate/module start is a file-level
+        gate, not a per-item `#[cfg]` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "codegen" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "mod platform;\n"
+                "#[test]\nfn none_auth_scheme_everywhere() {}\n"
+            )
+            (src / "platform.rs").write_text(
+                "#![cfg(windows)]\n"
+                "#[test]\nfn none_auth_scheme_windows_inner() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_everywhere", names)
+            if sys.platform == "win32":
+                self.assertIn("platform::none_auth_scheme_windows_inner", names)
+            else:
+                self.assertNotIn("platform::none_auth_scheme_windows_inner", names)
 
     def test_src_bin_tests_are_not_scanned(self):
         with tempfile.TemporaryDirectory() as d:
