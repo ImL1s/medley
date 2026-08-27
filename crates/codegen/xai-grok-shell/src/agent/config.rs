@@ -3996,8 +3996,17 @@ pub(crate) fn resolve_external_otel_config_with(
                 _ => {}
             }
             if let Some(v) = getenv(name).filter(|s| !s.trim().is_empty()) {
-                xai_grok_config::note_legacy_hit("GROK_EXTERNAL_OTEL");
-                return Some(v);
+                // Same tokens `ExternalOtelConfig::resolve_with` accepts.
+                // Invalid values such as `maybe` are ignored by that parser;
+                // recording a hit here would claim the variable was honored
+                // (#491 review).
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" | "0" | "false" | "no" | "off" => {
+                        xai_grok_config::note_legacy_hit("GROK_EXTERNAL_OTEL");
+                        return Some(v);
+                    }
+                    _ => return None,
+                }
             }
             return None;
         }

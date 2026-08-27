@@ -540,6 +540,10 @@ const APPEARANCE_ENV_VARS: &[&str] = &[
     "GROK_THEME",
     "LC_GROK_THEME",
     "COLORFGBG",
+    "MEDLEY_SCROLL_SPEED",
+    "MEDLEY_SCROLL_MODE",
+    "MEDLEY_SCROLL_LINES",
+    "MEDLEY_INVERT_SCROLL",
 ];
 
 /// Host terminal identity markers stripped from the child environment.
@@ -954,6 +958,17 @@ mod tests {
             APPEARANCE_ENV_VARS.contains(&"MEDLEY_THEME"),
             "PTY children honor MEDLEY_THEME; leaving it in the host env makes theme=auto non-deterministic (#491 review)"
         );
+        for var in [
+            "MEDLEY_SCROLL_SPEED",
+            "MEDLEY_SCROLL_MODE",
+            "MEDLEY_SCROLL_LINES",
+            "MEDLEY_INVERT_SCROLL",
+        ] {
+            assert!(
+                APPEARANCE_ENV_VARS.contains(&var),
+                "PTY children honor {var}; leaving it in the host env desyncs scroll-matrix cells that only inject GROK_* (#491 review)"
+            );
+        }
     }
 
     #[test]
