@@ -304,6 +304,26 @@ def _is_cargo_crate_root_file(
     return False
 
 
+def _manifest_default_features(text: str) -> set[str]:
+    """Names listed in `[features] default = [...]`, if any."""
+
+    in_features = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "[features]":
+            in_features = True
+            continue
+        if stripped.startswith("["):
+            in_features = False
+            continue
+        if not in_features:
+            continue
+        match = re.match(r"^default\s*=\s*\[(.*)\]", stripped)
+        if match:
+            return set(re.findall(r'"([^"]+)"', match.group(1)))
+    return set()
+
+
 def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
     """Explicit `[[test]]` paths and feature-gated integration targets.
 
@@ -311,9 +331,9 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
     `tests/leader_pty_e2e/mod.rs` is one -- `_is_cargo_crate_root_file`'s
     `tests/*.rs` shape misses it (#507 review).
 
-    Gated: `required-features` targets, including default
-    `tests/<name>.rs`. Default `cargo test` (the CLAUDE.md hot path) does
-    not build them.
+    Gated: `required-features` targets whose features are not all in the
+    crate's `default` set. Default `cargo test` (the CLAUDE.md hot path)
+    does not build those.
     """
 
     extra: set[Path] = set()
@@ -326,13 +346,14 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
         except (OSError, UnicodeDecodeError):
             continue
         crate = manifest.parent
+        default_feats = _manifest_default_features(text)
         in_test = False
         name: str | None = None
         path_s: str | None = None
-        required = False
+        required_feats: set[str] = set()
 
         def flush() -> None:
-            nonlocal name, path_s, required, in_test
+            nonlocal name, path_s, required_feats, in_test
             if not in_test:
                 return
             target: Path | None = None
@@ -341,13 +362,14 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
             elif name:
                 target = (crate / "tests" / f"{name}.rs").resolve()
             if target is not None:
-                if required:
+                extra_required = required_feats - default_feats
+                if extra_required:
                     gated.add(target)
                 elif path_s and target.is_file():
                     extra.add(target)
             name = None
             path_s = None
-            required = False
+            required_feats = set()
             in_test = False
 
         for line in text.splitlines():
@@ -357,7 +379,7 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
                 in_test = True
                 name = None
                 path_s = None
-                required = False
+                required_feats = set()
                 continue
             if stripped.startswith("["):
                 flush()
@@ -373,20 +395,27 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
                 path_s = match.group(1)
                 continue
             if stripped.startswith("required-features"):
-                inner = stripped.split("=", 1)[-1].strip()
-                compact = re.sub(r"\s+", "", inner)
-                required = compact not in ("[]", "")
+                inner = stripped.split("=", 1)[-1]
+                required_feats = set(re.findall(r'"([^"]+)"', inner))
         flush()
     return extra, gated
 
 
-def _mod_search_dir(declaring: Path) -> Path:
-    """Directory rustc searches for `mod name;` declared in `declaring`."""
+def _mod_search_dir(
+    declaring: Path,
+    extra_roots: set[Path] | frozenset[Path] | None = None,
+    gated_roots: set[Path] | frozenset[Path] | None = None,
+) -> Path:
+    """Directory rustc searches for `mod name;` declared in `declaring`.
+
+    An explicit `[[test]] path = "integration/custom.rs"` is a crate root,
+    so `mod child;` loads `integration/child.rs`, not
+    `integration/custom/child.rs` (#507 review).
+    """
 
     if declaring.name in ("lib.rs", "main.rs", "mod.rs"):
         return declaring.parent
-    split = _crate_source_rel(declaring)
-    if split and split[0] == "tests" and len(split[1]) == 1:
+    if _is_cargo_crate_root_file(declaring, extra_roots, gated_roots):
         return declaring.parent
     return declaring.parent / declaring.stem
 
@@ -399,7 +428,10 @@ def _existing_mod_file(search_dir: Path, name: str) -> Path | None:
 
 
 def _iter_module_decls(
-    text: str, declaring: Path
+    text: str,
+    declaring: Path,
+    extra_roots: set[Path] | frozenset[Path] | None = None,
+    gated_roots: set[Path] | frozenset[Path] | None = None,
 ) -> list[tuple[str, Path, tuple[str, ...]]]:
     """`(name, child file, enclosing inline modules)` for `#[path]` and
     ordinary `mod name;` that resolve.
@@ -449,7 +481,7 @@ def _iter_module_decls(
                 if not skip:
                     name = semi.group(1)
                     inline_names = tuple(n for _, n, _ in inline_stack)
-                    search = _mod_search_dir(declaring)
+                    search = _mod_search_dir(declaring, extra_roots, gated_roots)
                     for inline_name in inline_names:
                         search = search / inline_name
                     if pending_path:
@@ -522,7 +554,9 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         text = read_rs(declaring)
         if text is None:
             continue
-        for name, child, inline_names in _iter_module_decls(text, declaring):
+        for name, child, inline_names in _iter_module_decls(
+            text, declaring, extra_roots, gated_roots
+        ):
             child_prefix = list(prefix) + list(inline_names) + [name]
             overrides.setdefault(child, []).append(child_prefix)
             queue.append((child, tuple(child_prefix), ancestors + (declaring,)))
@@ -664,11 +698,18 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
         if has_test:
             all_attrs = pending + attrs
             pending = []
-            inactive = enclosing_off or any(_cfg_attr_is_inactive(a) for a in all_attrs)
             found = None
             for follow in [remainder_masked, *masked_lines[i + 1 :]]:
                 follow = follow.strip()
-                if follow.startswith("#[") or follow.startswith("//"):
+                if follow.startswith("//"):
+                    continue
+                if follow.startswith("#["):
+                    more, rest = _leading_attrs(follow)
+                    all_attrs.extend(more)
+                    matched = _FN.match(rest)
+                    if matched:
+                        found = matched.group(1)
+                        break
                     continue
                 if not follow:
                     continue
@@ -676,6 +717,9 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
                 if matched:
                     found = matched.group(1)
                 break
+            inactive = enclosing_off or any(
+                _cfg_attr_is_inactive(a) for a in all_attrs
+            )
             if found and not inactive:
                 prefix_parts = file_mods + [name for _, name, _ in mod_stack]
                 prefix = "::".join(prefix_parts)
@@ -745,7 +789,10 @@ def _qualified_test_names(root: Path) -> list[str]:
         if not base_dir.is_dir():
             continue
         for rs in base_dir.rglob("*.rs"):
-            if not _is_lib_or_integration_source(rs, extra_roots):
+            if (
+                not _is_lib_or_integration_source(rs, extra_roots)
+                and rs.resolve() not in overrides
+            ):
                 continue
             try:
                 text = rs.read_text(encoding="utf-8")
@@ -918,6 +965,41 @@ class ExternalModulePrefix(unittest.TestCase):
             (integ / "custom.rs").write_text("#[test]\nfn boots() {}\n")
             names = _qualified_test_names(root)
             self.assertIn("boots", names)
+
+    def test_explicit_integration_root_resolves_sibling_mod(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            integ = crate / "integration"
+            integ.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[[test]]\nname = \"custom\"\n"
+                'path = "integration/custom.rs"\n',
+                encoding="utf-8",
+            )
+            (integ / "custom.rs").write_text("mod child;\n")
+            (integ / "child.rs").write_text("#[test]\nfn boots() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("child::boots", names)
+
+    def test_required_features_that_are_default_stay_seeded(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            tests = crate / "tests"
+            tests.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[features]\ndefault = [\"test-support\"]\n"
+                'test-support = []\n\n'
+                "[[test]]\nname = \"gated\"\n"
+                'required-features = ["test-support"]\n',
+                encoding="utf-8",
+            )
+            (tests / "gated.rs").write_text("#[test]\nfn visible() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("visible", names)
 
     def test_string_brace_does_not_nest_following_module(self):
         text = textwrap.dedent(
@@ -1148,6 +1230,23 @@ class ExternalModulePrefix(unittest.TestCase):
         else:
             self.assertNotIn("none_auth_scheme_windows_only", names)
             self.assertIn("none_auth_scheme_unix_only", names)
+
+    def test_cfg_after_test_attr_is_honored(self):
+        text = textwrap.dedent(
+            """\
+            #[test]
+            #[cfg(windows)]
+            fn none_auth_scheme_windows_only() {}
+            #[test]
+            fn none_auth_scheme_everywhere() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertIn("none_auth_scheme_everywhere", names)
+        if sys.platform == "win32":
+            self.assertIn("none_auth_scheme_windows_only", names)
+        else:
+            self.assertNotIn("none_auth_scheme_windows_only", names)
 
     def test_cfg_false_external_module_is_not_scanned_on_this_target(self):
         with tempfile.TemporaryDirectory() as d:
