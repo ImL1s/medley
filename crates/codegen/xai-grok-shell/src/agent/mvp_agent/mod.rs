@@ -532,6 +532,22 @@ fn chat_initial_model(
 ) -> Option<String> {
     if is_chat_kind { custom_model_id.map(str::to_owned) } else { None }
 }
+/// Spawn-time fallback for a chat-kind `session/new` when the requested id
+/// is not in an authoritative chat catalog (#483 review). Uses the catalog's
+/// own `current_model_id` (the chat default), never the build catalog's —
+/// those are different id namespaces.
+fn chat_catalog_spawn_fallback_model_id(
+    chat_catalog: Option<&crate::agent::chat_modes::ChatModelCatalog>,
+    build_default: impl FnOnce() -> acp::ModelId,
+) -> acp::ModelId {
+    match chat_catalog {
+        Some(crate::agent::chat_modes::ChatModelCatalog::Authoritative(state)
+            | crate::agent::chat_modes::ChatModelCatalog::NoInfo(state)) => {
+            state.current_model_id.clone()
+        }
+        None => build_default(),
+    }
+}
 fn chat_new_session_model_state(
     mut state: acp::SessionModelState,
     requested: Option<String>,

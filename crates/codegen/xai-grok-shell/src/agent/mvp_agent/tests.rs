@@ -9119,6 +9119,48 @@ fn chat_custom_model_id_after_outcome_matrix() {
     }
 }
 
+/// #483 review: when `chat_custom_model_id_after_outcome` returns `None`
+/// (authoritative catalog does not contain the requested id), spawn still
+/// needs a `ModelId`. Chat and build catalogs are different id namespaces,
+/// so that fallback must come from the chat catalog's own `current_model_id`,
+/// never `ModelsManager::current_model_id`.
+#[test]
+fn chat_catalog_spawn_fallback_uses_chat_catalog_not_build() {
+    use crate::agent::chat_modes::ChatModelCatalog;
+    fn state(current: &str) -> acp::SessionModelState {
+        acp::SessionModelState::new(
+            acp::ModelId::new(current.to_owned()),
+            vec![acp::ModelInfo::new(
+                acp::ModelId::new(current.to_owned()),
+                current.to_owned(),
+            )],
+        )
+    }
+    assert_eq!(
+        chat_catalog_spawn_fallback_model_id(
+            Some(&ChatModelCatalog::Authoritative(state("chat-default"))),
+            || acp::ModelId::new("build-default".to_owned()),
+        ),
+        acp::ModelId::new("chat-default".to_owned()),
+        "[authoritative]"
+    );
+    assert_eq!(
+        chat_catalog_spawn_fallback_model_id(
+            Some(&ChatModelCatalog::NoInfo(state("chat-cached"))),
+            || acp::ModelId::new("build-default".to_owned()),
+        ),
+        acp::ModelId::new("chat-cached".to_owned()),
+        "[no_info]"
+    );
+    assert_eq!(
+        chat_catalog_spawn_fallback_model_id(None, || acp::ModelId::new(
+            "build-default".to_owned()
+        )),
+        acp::ModelId::new("build-default".to_owned()),
+        "[no_catalog]"
+    );
+}
+
 /// #418 review finding: the first version of this fix classified a chat-kind
 /// `custom_model_id` against `ModelsManager` (the *build* catalog) instead
 /// of the chat-product `/rest/modes` catalog. Chat and build catalogs are
