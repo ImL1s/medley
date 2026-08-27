@@ -591,6 +591,10 @@ def _cfg_atom(atom: str) -> bool | None:
     atom = atom.strip()
     if atom == "test":
         return True
+    if atom == "true":
+        return True
+    if atom == "false":
+        return False
     if atom == "unix":
         return sys.platform != "win32"
     if atom == "windows":
@@ -730,10 +734,14 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
         elif attrs and not remainder_masked.strip():
             pending.extend(attrs)
         elif remainder_masked.strip():
-            item_off = enclosing_off or any(_cfg_attr_is_inactive(a) for a in pending)
+            item_off = enclosing_off or any(
+                _cfg_attr_is_inactive(a) for a in pending + attrs
+            )
             pending = []
             line = _strip_line_comment(masked)
-            mod_match = _MOD_OPEN.match(line)
+            mod_match = _MOD_OPEN.match(line) or _MOD_OPEN.match(
+                remainder_masked
+            )
             if mod_match:
                 mod_stack.append((depth, mod_match.group(1), item_off))
 
@@ -1206,6 +1214,35 @@ class ExternalModulePrefix(unittest.TestCase):
             [],
         )
         self.assertEqual(names, ["none_auth_scheme_commented_gap"])
+
+    def test_same_line_attr_and_inline_mod_keeps_the_prefix(self):
+        """`#[allow(dead_code)] mod none_auth_scheme_ {` must still qualify
+        inner tests (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            #[allow(dead_code)] mod none_auth_scheme_ {
+                #[test]
+                fn works() {}
+            }
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_::works"])
+
+        text = textwrap.dedent(
+            """\
+            #[cfg(false)] mod none_auth_scheme_ {
+                #[test]
+                fn skipped() {}
+            }
+            #[test]
+            fn none_auth_scheme_live() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_live"])
+        self.assertNotIn("none_auth_scheme_::skipped", names)
 
     def test_nested_block_comment_does_not_leak_braces(self):
         text = textwrap.dedent(
