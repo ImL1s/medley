@@ -1233,6 +1233,19 @@ impl acp::Agent for MvpAgent {
         };
         let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
         let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
+        // Bind the spawn-time catalog to one auth generation *before* the
+        // fetch: capturing afterwards would stamp user B onto user A's
+        // snapshot if auth flipped during the await (#505 review).
+        let chat_spawn_user_id = if is_chat_kind {
+            self.chat_modes.current_user_id()
+        } else {
+            None
+        };
+        let chat_spawn_auth_generation = if is_chat_kind {
+            self.chat_modes.current_auth_generation()
+        } else {
+            0
+        };
         // Codex review finding on #505 (this PR), agent_ops.rs:5768: a
         // chat-kind session with no explicit `custom_model_id` fell back to
         // the *build* catalog's current model here, while the client is
@@ -1251,11 +1264,18 @@ impl acp::Agent for MvpAgent {
         } else {
             None
         };
-        let chat_spawn_user_id = if is_chat_kind {
-            self.chat_modes.current_user_id()
-        } else {
-            None
-        };
+        if is_chat_kind
+            && !chat_spawn_identity_unchanged(
+                chat_spawn_user_id.as_deref(),
+                chat_spawn_auth_generation,
+                self.chat_modes.current_user_id().as_deref(),
+                self.chat_modes.current_auth_generation(),
+            )
+        {
+            return Err(acp::Error::internal_error().data(
+                "chat identity changed during session/new",
+            ));
+        }
         let prepared_model_plan = if is_chat_kind {
             None
         } else {
@@ -1516,20 +1536,38 @@ impl acp::Agent for MvpAgent {
         let (models, model_presentation) = if is_chat_kind {
             if !chat_spawn_identity_unchanged(
                 chat_spawn_user_id.as_deref(),
+                chat_spawn_auth_generation,
                 self.chat_modes.current_user_id().as_deref(),
+                self.chat_modes.current_auth_generation(),
             ) {
+                if prepared_session.is_none() {
+                    self.remove_session(&session_id);
+                    #[cfg(all(feature = "local-workspace", unix))]
+                    self.shutdown_gateway_bridge(&session_id);
+                }
+                return Err(acp::Error::internal_error().data(
+                    "chat identity changed during session/new",
+                ));
+            }
+            let chat_state = self.chat_modes.model_state().await;
+            if !chat_spawn_identity_unchanged(
+                chat_spawn_user_id.as_deref(),
+                chat_spawn_auth_generation,
+                self.chat_modes.current_user_id().as_deref(),
+                self.chat_modes.current_auth_generation(),
+            ) {
+                if prepared_session.is_none() {
+                    self.remove_session(&session_id);
+                    #[cfg(all(feature = "local-workspace", unix))]
+                    self.shutdown_gateway_bridge(&session_id);
+                }
                 return Err(acp::Error::internal_error().data(
                     "chat identity changed during session/new",
                 ));
             }
             (
                 chat_new_session_model_state(
-                    // Recheck the active identity: auth can change while
-                    // `new_session` is in flight, and the snapshot fetched
-                    // before spawn is keyed to whoever was signed in then
-                    // (#505 review). Restart/reject if it did; otherwise
-                    // this fetch is the same user as `fallback_model_id`.
-                    self.chat_modes.model_state().await,
+                    chat_state,
                     session_initial_model
                         .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
                 ),

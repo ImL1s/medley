@@ -512,8 +512,13 @@ fn chat_session_fallback_model_id(
 /// flip before the response is assembled (#505 review). Same identity
 /// (including both-unauthenticated) is required for the spawned actor and
 /// the reported catalog to describe the same user.
-fn chat_spawn_identity_unchanged(spawned: Option<&str>, current: Option<&str>) -> bool {
-    spawned == current
+fn chat_spawn_identity_unchanged(
+    spawned_user: Option<&str>,
+    spawned_generation: u64,
+    current_user: Option<&str>,
+    current_generation: u64,
+) -> bool {
+    spawned_user == current_user && spawned_generation == current_generation
 }
 /// `session/new` / `session/load` `_meta` key carrying per-session plugin roots.
 pub(crate) const SESSION_PLUGIN_DIRS_META_KEY: &str = "pluginDirs";

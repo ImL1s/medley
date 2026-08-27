@@ -9472,11 +9472,12 @@ fn chat_session_fallback_model_id_matrix() {
 
 #[test]
 fn chat_spawn_identity_unchanged_matrix() {
-    assert!(chat_spawn_identity_unchanged(Some("a"), Some("a")));
-    assert!(chat_spawn_identity_unchanged(None, None));
-    assert!(!chat_spawn_identity_unchanged(Some("a"), Some("b")));
-    assert!(!chat_spawn_identity_unchanged(Some("a"), None));
-    assert!(!chat_spawn_identity_unchanged(None, Some("b")));
+    assert!(chat_spawn_identity_unchanged(Some("a"), 0, Some("a"), 0));
+    assert!(chat_spawn_identity_unchanged(None, 0, None, 0));
+    assert!(!chat_spawn_identity_unchanged(Some("a"), 0, Some("b"), 0));
+    assert!(!chat_spawn_identity_unchanged(Some("a"), 0, None, 0));
+    assert!(!chat_spawn_identity_unchanged(None, 0, Some("b"), 0));
+    assert!(!chat_spawn_identity_unchanged(Some("a"), 0, Some("a"), 2));
 }
 
 /// #489 follow-up: composes the two decisions above the way `session/new`
