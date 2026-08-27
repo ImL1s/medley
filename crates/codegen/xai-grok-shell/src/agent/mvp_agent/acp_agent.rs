@@ -1549,7 +1549,9 @@ impl acp::Agent for MvpAgent {
                     "chat identity changed during session/new",
                 ));
             }
-            let chat_state = self.chat_modes.model_state().await;
+            let chat_state = chat_model_state.expect(
+                    "chat-kind catalog was captured before spawn",
+                );
             if !chat_spawn_identity_unchanged(
                 chat_spawn_user_id.as_deref(),
                 chat_spawn_auth_generation,
