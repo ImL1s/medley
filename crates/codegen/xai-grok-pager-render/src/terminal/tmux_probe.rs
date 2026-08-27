@@ -21,6 +21,8 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static LAST_PIPE_DRAIN_GRACE: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
+    static TEST_TMUX_PROGRAM: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,8 +280,16 @@ fn query_control_mode_with(runner: &dyn TmuxCommandRunner) -> TmuxQueryResult<bo
     }
 }
 
+fn tmux_program() -> std::ffi::OsString {
+    #[cfg(test)]
+    if let Some(path) = TEST_TMUX_PROGRAM.with(|slot| slot.borrow().clone()) {
+        return path.into();
+    }
+    "tmux".into()
+}
+
 fn build_tmux_command(command: TmuxCommand<'_>) -> Command {
-    let mut cmd = Command::new("tmux");
+    let mut cmd = Command::new(tmux_program());
     match command {
         TmuxCommand::Version => {
             cmd.arg("-V").stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -369,6 +379,25 @@ mod tests {
                 TmuxCommand::ClientFeatures => "client-features".to_owned(),
             });
             self.output.clone()
+        }
+    }
+
+    struct TmuxProgramGuard {
+        previous: Option<std::path::PathBuf>,
+    }
+
+    impl TmuxProgramGuard {
+        fn pin(path: impl Into<std::path::PathBuf>) -> Self {
+            let previous = TEST_TMUX_PROGRAM.with(|slot| slot.replace(Some(path.into())));
+            Self { previous }
+        }
+    }
+
+    impl Drop for TmuxProgramGuard {
+        fn drop(&mut self) {
+            TEST_TMUX_PROGRAM.with(|slot| {
+                *slot.borrow_mut() = self.previous.take();
+            });
         }
     }
 
@@ -589,7 +618,6 @@ mod tests {
     /// all.
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial(tmux_probe_path)]
     fn run_tmux_bounded_drains_a_descendant_still_holding_the_pipes() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -608,27 +636,10 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let previous_path = std::env::var_os("PATH");
-        let mut path = OsString::from(bin.as_os_str());
-        path.push(":");
-        if let Some(existing) = &previous_path {
-            path.push(existing);
-        }
-        // SAFETY: serialized on `tmux_probe_path`; restored before return.
-        unsafe {
-            std::env::set_var("PATH", &path);
-        }
+        let _tmux_bin = TmuxProgramGuard::pin(&tmux);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_tmux_bounded(TmuxCommand::Version, timeout)
         }));
-        match previous_path {
-            Some(value) => unsafe {
-                std::env::set_var("PATH", value);
-            },
-            None => unsafe {
-                std::env::remove_var("PATH");
-            },
-        }
         let output = result
             .expect("probe must not panic")
             .expect("a pipe-holding descendant must not turn a clean exit into a drain error");
@@ -649,7 +660,6 @@ mod tests {
     /// it.
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial(tmux_probe_path)]
     fn run_tmux_bounded_uses_a_fresh_grace_not_the_remaining_main_deadline() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -667,28 +677,11 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let previous_path = std::env::var_os("PATH");
-        let mut path = OsString::from(bin.as_os_str());
-        path.push(":");
-        if let Some(existing) = &previous_path {
-            path.push(existing);
-        }
-        // SAFETY: serialized on `tmux_probe_path`; restored before return.
-        unsafe {
-            std::env::set_var("PATH", &path);
-        }
+        let _tmux_bin = TmuxProgramGuard::pin(&tmux);
         LAST_PIPE_DRAIN_GRACE.with(|c| c.set(None));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_tmux_bounded(TmuxCommand::Version, timeout)
         }));
-        match previous_path {
-            Some(value) => unsafe {
-                std::env::set_var("PATH", value);
-            },
-            None => unsafe {
-                std::env::remove_var("PATH");
-            },
-        }
         result
             .expect("probe must not panic")
             .expect("an immediate-exit tmux must drain successfully");
