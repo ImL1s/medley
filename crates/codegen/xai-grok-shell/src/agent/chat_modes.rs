@@ -306,12 +306,10 @@ impl ChatModesManager {
             }
         }
         let client = ChatModelsClient::new(self.inner.auth.clone());
-        // `list_modes` returns the generation of the credential it actually
-        // used, sampled after `AuthManager::auth()` inside that call. Sampling
-        // here before the await pairs a post-refresh catalog with the old
-        // generation and the store check discards it; sampling after HTTP
-        // returns can stamp A's catalog as B's. API keys share an empty
-        // `user_id` (#483 review).
+        // `list_modes` takes credential and generation from one
+        // `auth_with_generation` snapshot. Sampling generation separately
+        // from `auth()` can pair key A with B's generation across a
+        // concurrent swap; API keys share an empty `user_id` (#483 review).
         match tokio::time::timeout(COLD_FETCH_TIMEOUT, client.list_modes(locale)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(ChatModelsError::Timeout),

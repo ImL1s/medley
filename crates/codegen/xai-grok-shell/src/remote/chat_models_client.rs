@@ -117,16 +117,11 @@ impl ChatModelsClient {
         &self,
         locale: &str,
     ) -> Result<(ListModesResponse, u64), ChatModelsError> {
-        let auth = self
+        let (auth, sent_generation) = self
             .auth
-            .auth()
+            .auth_with_generation()
             .await
             .map_err(|_| ChatModelsError::NoAuth)?;
-        // Generation of the credential actually used to build this request,
-        // sampled after `auth()` so a refresh inside that call is the key
-        // we stamp -- not whatever was current before the await, and not
-        // whatever is current after HTTP returns (#483 review).
-        let sent_generation = self.auth.current_selection_generation();
 
         let url = format!("{}/rest/modes", self.base_url);
         let body = serde_json::json!({ "locale": locale });

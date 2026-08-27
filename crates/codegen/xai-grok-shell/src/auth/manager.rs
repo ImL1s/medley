@@ -2508,6 +2508,41 @@ impl AuthManager {
         Ok(auth)
     }
 
+    /// The prepared credential and the even selection generation of that
+    /// same published snapshot.
+    ///
+    /// `auth()` then a later `current_selection_generation()` can pair key
+    /// A's bearer with B's generation across a concurrent `hot_swap`; API
+    /// keys share an empty `user_id`, so that catalog would cache as B
+    /// (#483 review).
+    pub async fn auth_with_generation(self: &Arc<Self>) -> Result<(GrokAuth, u64), AuthError> {
+        loop {
+            let prepared = self.auth().await?;
+            if let Some((current, generation)) = self.stable_auth_and_generation()
+                && current.key == prepared.key
+            {
+                return Ok((current, generation));
+            }
+        }
+    }
+
+    fn stable_auth_and_generation(&self) -> Option<(GrokAuth, u64)> {
+        let mut backoff = AuthSelectionBackoff::default();
+        loop {
+            let before = self.selection_generation.load(Ordering::Acquire);
+            if before % 2 == 1 {
+                self.wait_for_selection_progress(&mut backoff);
+                continue;
+            }
+            let current = self.inner.read().as_ref().cloned();
+            let after = self.selection_generation.load(Ordering::Acquire);
+            if before == after && after.is_multiple_of(2) {
+                return current.map(|auth| (auth, after));
+            }
+            self.wait_for_selection_progress(&mut backoff);
+        }
+    }
+
     async fn auth_dispatch(self: &Arc<Self>) -> Result<GrokAuth, AuthError> {
         if !self.credential_store_is_safe() {
             return Err(AuthError::NotLoggedIn);
