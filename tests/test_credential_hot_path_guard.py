@@ -471,43 +471,46 @@ def _iter_module_decls(
         if path_match:
             pending_path = path_match.group(1)
             pending_attrs.extend(attrs)
-        else:
-            semi = _MOD_SEMI.match(line) or _MOD_SEMI.match(remainder)
+        semi = _MOD_SEMI.match(line) or _MOD_SEMI.match(remainder)
+        if semi:
             cfg_off = any(
                 _cfg_attr_is_inactive(a) for a in pending_attrs + attrs
             )
             skip = enclosing_off or cfg_off
-            if semi:
-                if not skip:
-                    name = semi.group(1)
-                    inline_names = tuple(n for _, n, _ in inline_stack)
-                    search = _mod_search_dir(declaring, extra_roots, gated_roots)
-                    for inline_name in inline_names:
-                        search = search / inline_name
-                    if pending_path:
-                        # `#[path]` beside a file-level `mod` is relative to the
-                        # declaring file's directory. Inside `mod outer { ... }`
-                        # rustc loads `outer/<path>` (#507 review).
-                        base = search if inline_names else declaring.parent
-                        child = (base / pending_path).resolve()
+            if not skip:
+                name = semi.group(1)
+                inline_names = tuple(n for _, n, _ in inline_stack)
+                search = _mod_search_dir(declaring, extra_roots, gated_roots)
+                for inline_name in inline_names:
+                    search = search / inline_name
+                if pending_path:
+                    # `#[path]` beside a file-level `mod` is relative to the
+                    # declaring file's directory. Inside `mod outer { ... }`
+                    # rustc loads `outer/<path>` (#507 review).
+                    base = search if inline_names else declaring.parent
+                    child = (base / pending_path).resolve()
+                    decls.append((name, child, inline_names))
+                else:
+                    child = _existing_mod_file(search, name)
+                    if child is not None:
                         decls.append((name, child, inline_names))
-                    else:
-                        child = _existing_mod_file(search, name)
-                        if child is not None:
-                            decls.append((name, child, inline_names))
+            pending_path = None
+            pending_attrs = []
+        elif not path_match:
+            cfg_off = any(
+                _cfg_attr_is_inactive(a) for a in pending_attrs + attrs
+            )
+            skip = enclosing_off or cfg_off
+            brace_mod = _MOD_OPEN.match(line) or _MOD_OPEN.match(remainder)
+            if brace_mod:
+                inline_stack.append((depth, brace_mod.group(1), skip))
                 pending_path = None
                 pending_attrs = []
-            else:
-                brace_mod = _MOD_OPEN.match(line) or _MOD_OPEN.match(remainder)
-                if brace_mod:
-                    inline_stack.append((depth, brace_mod.group(1), skip))
-                    pending_path = None
-                    pending_attrs = []
-                elif attrs and not remainder.strip():
-                    pending_attrs.extend(attrs)
-                elif stripped_raw:
-                    pending_path = None
-                    pending_attrs = []
+            elif attrs and not remainder.strip():
+                pending_attrs.extend(attrs)
+            elif stripped_raw:
+                pending_path = None
+                pending_attrs = []
         depth += line.count("{") - line.count("}")
         while inline_stack and depth <= inline_stack[-1][0]:
             inline_stack.pop()
@@ -869,6 +872,18 @@ class ExternalModulePrefix(unittest.TestCase):
             (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_regressions::works", names)
+
+    def test_same_line_path_attr_and_mod_is_followed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                '#[path = "elsewhere.rs"] mod none_auth_scheme_alias;\n'
+            )
+            (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_alias::works", names)
 
     def test_nested_src_tests_dir_keeps_the_crate_root_prefix(self):
         with tempfile.TemporaryDirectory() as d:
