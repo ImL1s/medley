@@ -329,7 +329,8 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
 
     Extra roots: `path =` files cargo compiles without extra features.
     `tests/leader_pty_e2e/mod.rs` is one -- `_is_cargo_crate_root_file`'s
-    `tests/*.rs` shape misses it (#507 review).
+    `tests/*.rs` shape misses it (#507 review). `[lib] path = "lib/custom.rs"`
+    is another: Cargo's library root is not always `src/lib.rs` (#507 review).
 
     Gated: `required-features` targets whose features are not all in the
     crate's `default` set. Default `cargo test` (the CLAUDE.md hot path)
@@ -348,41 +349,54 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
         crate = manifest.parent
         default_feats = _manifest_default_features(text)
         in_test = False
+        in_lib = False
         name: str | None = None
         path_s: str | None = None
+        lib_path: str | None = None
         required_feats: set[str] = set()
 
         def flush() -> None:
-            nonlocal name, path_s, required_feats, in_test
-            if not in_test:
-                return
-            target: Path | None = None
-            if path_s:
-                target = (crate / path_s).resolve()
-            elif name:
-                target = (crate / "tests" / f"{name}.rs").resolve()
-            if target is not None:
-                extra_required = required_feats - default_feats
-                if extra_required:
-                    gated.add(target)
-                elif path_s and target.is_file():
+            nonlocal name, path_s, required_feats, in_test, in_lib, lib_path
+            if in_lib and lib_path:
+                target = (crate / lib_path).resolve()
+                if target.is_file():
                     extra.add(target)
+            if in_test:
+                target = None
+                if path_s:
+                    target = (crate / path_s).resolve()
+                elif name:
+                    target = (crate / "tests" / f"{name}.rs").resolve()
+                if target is not None:
+                    extra_required = required_feats - default_feats
+                    if extra_required:
+                        gated.add(target)
+                    elif path_s and target.is_file():
+                        extra.add(target)
             name = None
             path_s = None
+            lib_path = None
             required_feats = set()
             in_test = False
+            in_lib = False
 
         for line in text.splitlines():
             stripped = line.strip()
             if stripped == "[[test]]":
                 flush()
                 in_test = True
-                name = None
-                path_s = None
-                required_feats = set()
+                continue
+            if stripped == "[lib]":
+                flush()
+                in_lib = True
                 continue
             if stripped.startswith("["):
                 flush()
+                continue
+            if in_lib:
+                match = re.match(r'^path\s*=\s*"([^"]+)"', stripped)
+                if match:
+                    lib_path = match.group(1)
                 continue
             if not in_test:
                 continue
@@ -988,6 +1002,26 @@ class ExternalModulePrefix(unittest.TestCase):
             (integ / "custom.rs").write_text("#[test]\nfn boots() {}\n")
             names = _qualified_test_names(root)
             self.assertIn("boots", names)
+
+    def test_custom_lib_path_is_seeded(self):
+        """`[lib] path = \"lib/custom.rs\"` is the crate root (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            libdir = crate / "lib"
+            libdir.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[lib]\n"
+                'path = "lib/custom.rs"\n',
+                encoding="utf-8",
+            )
+            (libdir / "custom.rs").write_text(
+                "#[test]\nfn none_auth_scheme_lib_root() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_lib_root", names)
 
     def test_explicit_integration_root_resolves_sibling_mod(self):
         with tempfile.TemporaryDirectory() as d:
