@@ -116,12 +116,17 @@ impl ChatModelsClient {
     pub(crate) async fn list_modes(
         &self,
         locale: &str,
-    ) -> Result<ListModesResponse, ChatModelsError> {
+    ) -> Result<(ListModesResponse, u64), ChatModelsError> {
         let auth = self
             .auth
             .auth()
             .await
             .map_err(|_| ChatModelsError::NoAuth)?;
+        // Generation of the credential actually used to build this request,
+        // sampled after `auth()` so a refresh inside that call is the key
+        // we stamp -- not whatever was current before the await, and not
+        // whatever is current after HTTP returns (#483 review).
+        let sent_generation = self.auth.current_selection_generation();
 
         let url = format!("{}/rest/modes", self.base_url);
         let body = serde_json::json!({ "locale": locale });
@@ -160,7 +165,7 @@ impl ChatModelsClient {
 
         let bytes = response.bytes().await?;
         let resp: ListModesResponse = serde_json::from_slice(&bytes)?;
-        Ok(resp)
+        Ok((resp, sent_generation))
     }
 }
 
