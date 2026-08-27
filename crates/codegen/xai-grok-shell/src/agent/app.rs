@@ -1552,20 +1552,21 @@ pub async fn run_leader(
                 watch_paths.push(home.join(".claude.json"));
             }
             let auth_scope = agent_config.grok_com_config.auth_scope();
-            // Gated on user_grok_home() so a cwd-relative .grok/auth.json is never
-            // read as the user auth store when no home resolves. The path itself
-            // resolves through `resolved_xai_auth_path`, not a bare
-            // `g.join("auth.json")` (#434), so a `GROK_AUTH_PATH` operator
-            // setting hashes the same file the hot-reload watcher/reloader below
-            // and `AuthManager` itself read.
-            let initial_auth_key_hash = xai_grok_config::user_grok_home()
-                .map(|g| crate::auth::resolved_xai_auth_path(&g))
-                .and_then(|auth_path| crate::auth::read_auth_json(&auth_path).ok())
-                .and_then(|store| {
-                    crate::auth::lookup_auth(&store, &auth_scope)
-                        .map(|a| crate::config::reloader::hash_auth_key(&a.key))
-                })
-                .unwrap_or(0);
+            // `current_auth_key_hash` resolves an explicit `GROK_AUTH_PATH`
+            // independently of `user_grok_home()` (#481, Codex review):
+            // gating the whole resolution on a resolved home used to leave
+            // this hash at 0 in a home-less environment (container, bare CI
+            // runner) even with an explicit path and a loaded credential —
+            // exactly where `GROK_AUTH_PATH` exists to be used. If another
+            // process then rewrote the store, `reload_auth` read a real
+            // credential's hash as "none" and suppressed `AuthCleared` — the
+            // leader kept running on a revoked credential. See
+            // `current_auth_key_hash`'s doc comment for the full resolution
+            // order.
+            let initial_auth_key_hash = crate::auth::current_auth_key_hash(
+                &auth_scope,
+                xai_grok_config::user_grok_home(),
+            );
             let (config_update_tx, mut config_update_rx) =
                 mpsc::unbounded_channel::<crate::config::reloader::ConfigUpdate>();
 
