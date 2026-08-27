@@ -116,10 +116,10 @@ impl ChatModelsClient {
     pub(crate) async fn list_modes(
         &self,
         locale: &str,
-    ) -> Result<ListModesResponse, ChatModelsError> {
-        let auth = self
+    ) -> Result<(ListModesResponse, u64), ChatModelsError> {
+        let (auth, sent_generation) = self
             .auth
-            .auth()
+            .auth_with_generation()
             .await
             .map_err(|_| ChatModelsError::NoAuth)?;
 
@@ -160,7 +160,7 @@ impl ChatModelsClient {
 
         let bytes = response.bytes().await?;
         let resp: ListModesResponse = serde_json::from_slice(&bytes)?;
-        Ok(resp)
+        Ok((resp, sent_generation))
     }
 }
 

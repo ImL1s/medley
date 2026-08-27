@@ -1231,7 +1231,6 @@ impl acp::Agent for MvpAgent {
             id: session_id.clone(),
             cwd: cwd.as_str().to_owned(),
         };
-        let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
         let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
         // Bind the spawn-time catalog to one auth generation *before* the
         // fetch: capturing afterwards would stamp user B onto user A's
@@ -1246,21 +1245,23 @@ impl acp::Agent for MvpAgent {
         } else {
             0
         };
-        // Codex review finding on #505 (this PR), agent_ops.rs:5768: a
-        // chat-kind session with no explicit `custom_model_id` fell back to
-        // the *build* catalog's current model here, while the client is
-        // told below (via `chat_new_session_model_state`) that the *chat*
-        // catalog's own default is current — the same silent
-        // reported-vs-actual mismatch this PR's spawn-time guard exists to
-        // catch (`chat_session_requires_visible_routing_failure`), just
-        // reached through the far more common no-explicit-id path instead
-        // of an explicit-but-unroutable id. Fetch the chat catalog once,
-        // early, for chat-kind sessions, and use its own default as the
-        // fallback instead of the build catalog's, so the existing guard
-        // judges the id that will actually be reported. Reused again at
-        // its later ("models" field) use site instead of fetching twice.
-        let chat_model_state = if is_chat_kind {
-            Some(self.chat_modes.model_state().await)
+        // #418: a chat-kind session used to take `custom_model_id` verbatim
+        // through `chat_initial_model`, never checking it against anything.
+        // Fetch the chat-product catalog once here — `self.chat_modes`,
+        // *not* `self.models_manager` (the build catalog; see
+        // `ChatCustomModelOutcome`'s doc for why an earlier version of this
+        // fix checked the wrong one) — via `model_state_with_authority`
+        // rather than `model_state`, so the eligibility check below can
+        // tell an authoritative empty catalog apart from no catalog at all
+        // (#483 review finding; see `ChatModelCatalog`'s doc). Reuse this
+        // same snapshot below for the `models` field the response reports
+        // (via `.into_state()`, which that display-only path does not need
+        // the authority tag for), instead of the second
+        // `self.chat_modes.model_state()` fetch that used to sit there
+        // alone. #505's spawn-time fallback uses this same snapshot's
+        // `current_model_id` rather than the build catalog's.
+        let chat_catalog = if is_chat_kind {
+            Some(self.chat_modes.model_state_with_authority().await)
         } else {
             None
         };
@@ -1276,6 +1277,21 @@ impl acp::Agent for MvpAgent {
                 "chat identity changed during session/new",
             ));
         }
+        let chat_eligible_model_id = if is_chat_kind {
+            custom_model_id.and_then(|requested| {
+                let catalog = chat_catalog
+                    .as_ref()
+                    .expect("chat_catalog is fetched whenever is_chat_kind");
+                chat_custom_model_id_after_outcome(
+                    requested,
+                    chat_custom_model_outcome(catalog, requested),
+                )
+            })
+        } else {
+            None
+        };
+        let session_initial_model =
+            chat_initial_model(is_chat_kind, chat_eligible_model_id.as_deref());
         let prepared_model_plan = if is_chat_kind {
             None
         } else {
@@ -1299,14 +1315,12 @@ impl acp::Agent for MvpAgent {
         let publication_gate = prepared_model_plan
             .as_ref()
             .map(|_| crate::session::SessionPublicationGate::pending());
-        let fallback_model_id = prepared_model_plan
-            .as_ref()
-            .map(|plan| plan.session_model_id.clone())
-            .unwrap_or_else(|| {
-                chat_session_fallback_model_id(chat_model_state.as_ref(), || {
-                    self.models_manager.current_model_id()
-                })
-            });
+        let fallback_model_id = match prepared_model_plan.as_ref() {
+            Some(plan) => plan.session_model_id.clone(),
+            None => chat_catalog_spawn_fallback_model_id(chat_catalog.as_ref(), || {
+                self.models_manager.current_model_id()
+            })?,
+        };
         // An exact model-declared harness is a prerequisite, not a best-effort
         // hint. Stock non-strict harnesses intentionally allow an explicit
         // agent profile (including its own ready model pin) to keep its prompt
@@ -1549,27 +1563,22 @@ impl acp::Agent for MvpAgent {
                     "chat identity changed during session/new",
                 ));
             }
-            let chat_state = chat_model_state.expect(
-                    "chat-kind catalog was captured before spawn",
-                );
-            if !chat_spawn_identity_unchanged(
-                chat_spawn_user_id.as_deref(),
-                chat_spawn_auth_generation,
-                self.chat_modes.current_user_id().as_deref(),
-                self.chat_modes.current_auth_generation(),
-            ) {
-                if prepared_session.is_none() {
-                    self.remove_session(&session_id);
-                    #[cfg(all(feature = "local-workspace", unix))]
-                    self.shutdown_gateway_bridge(&session_id);
-                }
-                return Err(acp::Error::internal_error().data(
-                    "chat identity changed during session/new",
-                ));
-            }
             (
                 chat_new_session_model_state(
-                    chat_state,
+                    // Reuses the snapshot fetched above for the eligibility
+                    // check (#418) rather than fetching `/rest/modes` twice.
+                    // This display-only path does not need the
+                    // authoritative/no-info distinction (#483), so it
+                    // drops the tag here. If that snapshot has no current
+                    // id, report the id the actor actually spawned with
+                    // (`session_model_id`), not the build-catalog default
+                    // that only applies when no request survived.
+                    chat_report_spawned_model(
+                        chat_catalog
+                            .expect("chat_catalog is fetched whenever is_chat_kind")
+                            .into_state(),
+                        &session_model_id,
+                    ),
                     session_initial_model
                         .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
                 ),

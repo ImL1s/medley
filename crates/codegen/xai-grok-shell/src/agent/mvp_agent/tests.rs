@@ -9010,6 +9010,258 @@ fn chat_initial_model_matrix() {
         );
     }
 }
+/// #418: a chat-kind session used to take `custom_model_id` verbatim,
+/// never checking it against anything. `chat_custom_model_outcome` is the
+/// fix — a pure membership check against an already-fetched `/rest/modes`
+/// snapshot, tagged by [`crate::agent::chat_modes::ChatModelCatalog`] with
+/// whether it is a real answer. Matrix over present / absent, mirroring
+/// `chat_new_session_model_state_matrix` right below, which builds the same
+/// kind of fixture for the sibling (display-only) membership check --
+/// **plus** the review finding on #483: an *authoritative* empty catalog
+/// (every mode currently requires an upgrade) and *no* catalog at all
+/// (unauthenticated / fetch failure) both produce an empty
+/// `available_models`, but must not collapse into the same outcome. Both
+/// live in this one matrix, in the same tree, so a red/green on one cannot
+/// be satisfied by a change that breaks the other -- that is the whole
+/// point Codex's review made: a check whose scope is empty must not
+/// silently agree with a check that has real, empty scope.
+#[test]
+fn chat_custom_model_outcome_matrix() {
+    use crate::agent::chat_modes::ChatModelCatalog;
+    fn state_with(available: &[&str]) -> acp::SessionModelState {
+        acp::SessionModelState::new(
+            acp::ModelId::new("current-placeholder".to_owned()),
+            available
+                .iter()
+                .map(|id| {
+                    acp::ModelInfo::new(acp::ModelId::new((*id).to_owned()), (*id).to_owned())
+                })
+                .collect(),
+        )
+    }
+    let cases: &[(&str, ChatModelCatalog, &str, ChatCustomModelOutcome)] = &[
+        (
+            "present",
+            ChatModelCatalog::Authoritative(state_with(&["auto", "fast"])),
+            "fast",
+            ChatCustomModelOutcome::Eligible,
+        ),
+        (
+            "absent_from_a_non_empty_authoritative_catalog",
+            ChatModelCatalog::Authoritative(state_with(&["auto", "fast"])),
+            "grok-4.5",
+            ChatCustomModelOutcome::Unavailable,
+        ),
+        (
+            // The server authoritatively says zero modes are currently
+            // available (e.g. every mode requires an upgrade) -- a real
+            // answer about this id, not missing information. Must be
+            // `Unavailable`, not `CatalogUnavailable`: this is exactly the
+            // case Codex's review on #483 found accepted as `Eligible` by
+            // an earlier version of this function, which read only whether
+            // `available_models` was empty and could not tell this apart
+            // from the next case below.
+            "authoritative_but_empty_is_unavailable_not_catalog_unavailable",
+            ChatModelCatalog::Authoritative(state_with(&[])),
+            "anything",
+            ChatCustomModelOutcome::Unavailable,
+        ),
+        (
+            // No real `/rest/modes` response exists at all (unauthenticated
+            // / fetch failure with nothing cached). There is nothing to
+            // reject the request against -- distinct from the case above,
+            // which has the exact same (empty) `available_models` but a
+            // real answer behind it. Whether to *trust* the request given
+            // this answer is `chat_custom_model_id_after_outcome`'s
+            // decision, pinned separately below.
+            "no_info_is_catalog_unavailable",
+            ChatModelCatalog::NoInfo(state_with(&[])),
+            "anything",
+            ChatCustomModelOutcome::CatalogUnavailable,
+        ),
+    ];
+    for (label, catalog, requested, expected) in cases {
+        assert_eq!(
+            chat_custom_model_outcome(catalog, requested),
+            *expected,
+            "[{label}]"
+        );
+    }
+}
+
+/// #483 review finding: pins the policy decision for each classification
+/// outcome, separated out of `chat_custom_model_outcome` on purpose (see
+/// that function's sibling `chat_custom_model_id_after_outcome`'s doc).
+/// This is the test that would have caught the empty-catalog bug: if
+/// `CatalogUnavailable` were still folded into `Eligible` at the
+/// classification layer, this matrix could not tell "trust it because the
+/// catalog says so" apart from "trust it because there is no catalog to
+/// say anything" -- they would be the same case. Asserting the *outcome*
+/// each variant maps to, one at a time, is what makes that distinction
+/// visible in a test.
+#[test]
+fn chat_custom_model_id_after_outcome_matrix() {
+    let cases: &[(&str, ChatCustomModelOutcome, Option<&str>)] = &[
+        ("eligible_uses_the_id", ChatCustomModelOutcome::Eligible, Some("fast")),
+        ("unavailable_falls_back", ChatCustomModelOutcome::Unavailable, None),
+        (
+            "catalog_unavailable_trusts_the_id",
+            ChatCustomModelOutcome::CatalogUnavailable,
+            Some("fast"),
+        ),
+    ];
+    for (label, outcome, expected) in cases {
+        assert_eq!(
+            chat_custom_model_id_after_outcome("fast", *outcome).as_deref(),
+            *expected,
+            "[{label}]"
+        );
+    }
+}
+
+/// #483 review: when `chat_custom_model_id_after_outcome` returns `None`
+/// (authoritative catalog does not contain the requested id), spawn still
+/// needs a `ModelId`. Chat and build catalogs are different id namespaces,
+/// so that fallback must come from the chat catalog's own `current_model_id`,
+/// never `ModelsManager::current_model_id`.
+#[test]
+fn chat_catalog_spawn_fallback_uses_chat_catalog_not_build() {
+    use crate::agent::chat_modes::ChatModelCatalog;
+    fn state(current: &str) -> acp::SessionModelState {
+        acp::SessionModelState::new(
+            acp::ModelId::new(current.to_owned()),
+            vec![acp::ModelInfo::new(
+                acp::ModelId::new(current.to_owned()),
+                current.to_owned(),
+            )],
+        )
+    }
+    assert_eq!(
+        chat_catalog_spawn_fallback_model_id(
+            Some(&ChatModelCatalog::Authoritative(state("chat-default"))),
+            || acp::ModelId::new("build-default".to_owned()),
+        )
+        .expect("[authoritative]"),
+        acp::ModelId::new("chat-default".to_owned()),
+        "[authoritative]"
+    );
+    assert_eq!(
+        chat_catalog_spawn_fallback_model_id(
+            Some(&ChatModelCatalog::NoInfo(state("chat-cached"))),
+            || acp::ModelId::new("build-default".to_owned()),
+        )
+        .expect("[no_info]"),
+        acp::ModelId::new("chat-cached".to_owned()),
+        "[no_info]"
+    );
+    assert_eq!(
+        chat_catalog_spawn_fallback_model_id(None, || acp::ModelId::new(
+            "build-default".to_owned()
+        ))
+        .expect("[no_catalog]"),
+        acp::ModelId::new("build-default".to_owned()),
+        "[no_catalog]"
+    );
+    assert!(
+        chat_catalog_spawn_fallback_model_id(
+            Some(&ChatModelCatalog::Authoritative(
+                acp::SessionModelState::new(acp::ModelId::new(String::new()), Vec::new()),
+            )),
+            || acp::ModelId::new("build-default".to_owned()),
+        )
+        .is_err(),
+        "[empty_current] must not cross into the build catalog"
+    );
+    let empty = || acp::SessionModelState::new(acp::ModelId::new(String::new()), Vec::new());
+    let spawned = acp::ModelId::new("build-default".to_owned());
+    assert_eq!(
+        chat_report_spawned_model(empty(), &spawned).current_model_id,
+        spawned,
+        "[empty_current] response must report the spawn fallback"
+    );
+    let requested = acp::ModelId::new("chat-requested".to_owned());
+    assert_eq!(
+        chat_report_spawned_model(empty(), &requested).current_model_id,
+        requested,
+        "[empty_current] reports the id the actor spawned with, not a blank catalog current"
+    );
+    assert_eq!(
+        chat_report_spawned_model(state("chat-cached"), &spawned)
+            .current_model_id
+            .0
+            .as_ref(),
+        "chat-cached",
+        "[no_info] must not overwrite a catalog current id"
+    );
+}
+
+/// #418 review finding: the first version of this fix classified a chat-kind
+/// `custom_model_id` against `ModelsManager` (the *build* catalog) instead
+/// of the chat-product `/rest/modes` catalog. Chat and build catalogs are
+/// independent — a mode real in one need not exist in the other — so that
+/// version would have rejected a legitimate chat mode absent from the build
+/// catalog as `NotFound` and silently discarded it.
+///
+/// This pins the fix: an id present only in the chat catalog comes back
+/// `Eligible` from `chat_custom_model_outcome`, while the *build* path
+/// (`prepare_new_session_model_plan`, run against a build catalog that does
+/// not contain this id at all) does not resolve to it — proving the two
+/// checks now correctly consult different authorities instead of agreeing
+/// on the wrong one.
+#[tokio::test(flavor = "current_thread")]
+async fn chat_custom_model_outcome_uses_chat_catalog_not_build_catalog() {
+    const CHAT_ONLY_MODE: &str = "fast";
+
+    let agent = build_minimal_agent_for_tests();
+    let build_default = agent.models_manager.current_model_id();
+    assert_ne!(
+        build_default.0.as_ref(),
+        CHAT_ONLY_MODE,
+        "precondition: the test catalog's default model must not already be named \"fast\""
+    );
+    // Precondition: the minimal test agent's build catalog genuinely does
+    // not contain this id (nothing in this test ever inserts it there).
+    assert!(
+        !agent.models_manager.models().contains_key(CHAT_ONLY_MODE),
+        "precondition: the build catalog must not contain the chat-only mode"
+    );
+
+    let chat_catalog = crate::agent::chat_modes::ChatModelCatalog::Authoritative(
+        acp::SessionModelState::new(
+            acp::ModelId::new(CHAT_ONLY_MODE.to_owned()),
+            vec![acp::ModelInfo::new(
+                acp::ModelId::new(CHAT_ONLY_MODE.to_owned()),
+                "Fast".to_owned(),
+            )],
+        ),
+    );
+
+    // The chat path: eligible, because it consults the chat catalog.
+    assert_eq!(
+        chat_custom_model_outcome(&chat_catalog, CHAT_ONLY_MODE),
+        ChatCustomModelOutcome::Eligible,
+        "a mode present in the chat catalog must be Eligible"
+    );
+
+    // The build path: does NOT resolve to this id, because it isn't in the
+    // build catalog. It silently falls back to the current default (a plain
+    // warn log, same as the build path's other "not found" cases) rather
+    // than reporting a rejection reason.
+    let plan = agent
+        .prepare_new_session_model_plan(Some(CHAT_ONLY_MODE), None)
+        .expect("fallback model always resolves in the minimal test catalog");
+    assert_ne!(
+        plan.catalog_identity.model_id, CHAT_ONLY_MODE,
+        "the build path must not resolve a chat-only mode id from its own catalog"
+    );
+    assert!(
+        plan.disallowed_custom.is_none()
+            && plan.auth_hidden_custom.is_none()
+            && plan.unreadiness_custom.is_none(),
+        "an id absent from the build catalog is \"not found\", not a rejection"
+    );
+}
+
 #[test]
 fn chat_new_session_model_state_matrix() {
     fn state_with(current: &str, available: &[&str]) -> acp::SessionModelState {
@@ -9439,20 +9691,24 @@ fn chat_session_local_route_is_usable_requires_eligibility_and_readiness() {
 /// the build catalog's current model, while the client is told the *chat*
 /// catalog's own default is current a few lines later -- the same silent
 /// mismatch the spawn-time guard exists to catch, reached through the far
-/// more common no-explicit-id path. `chat_session_fallback_model_id` is the
-/// fix: pins that a chat-kind fallback uses the chat catalog's own default,
-/// and a build-kind fallback is untouched (still the build default).
+/// more common no-explicit-id path. `chat_catalog_spawn_fallback_model_id`
+/// is the #483 successor of that helper: pins that a chat-kind fallback
+/// uses the chat catalog's own default, and a missing catalog still uses
+/// the build default.
 #[test]
 fn chat_session_fallback_model_id_matrix() {
+    use crate::agent::chat_modes::ChatModelCatalog;
     fn state_with_current(id: &str) -> acp::SessionModelState {
         acp::SessionModelState::new(acp::ModelId::new(id.to_owned()), Vec::new())
     }
     // label, chat_model_state, expected
     let chat_case_label = "chat_kind_uses_the_chat_catalogs_own_default";
     let chat_state = state_with_current("chat-catalog-default");
-    let resolved = chat_session_fallback_model_id(Some(&chat_state), || {
-        acp::ModelId::new("build-catalog-default")
-    });
+    let resolved = chat_catalog_spawn_fallback_model_id(
+        Some(&ChatModelCatalog::Authoritative(chat_state)),
+        || acp::ModelId::new("build-catalog-default"),
+    )
+    .expect(chat_case_label);
     assert_eq!(
         resolved.0.as_ref(),
         "chat-catalog-default",
@@ -9460,9 +9716,10 @@ fn chat_session_fallback_model_id_matrix() {
     );
 
     let build_case_label = "build_kind_is_unaffected_still_the_build_default";
-    let resolved = chat_session_fallback_model_id(None, || {
+    let resolved = chat_catalog_spawn_fallback_model_id(None, || {
         acp::ModelId::new("build-catalog-default")
-    });
+    })
+    .expect(build_case_label);
     assert_eq!(
         resolved.0.as_ref(),
         "build-catalog-default",
@@ -9482,7 +9739,7 @@ fn chat_spawn_identity_unchanged_matrix() {
 
 /// #489 follow-up: composes the two decisions above the way `session/new`
 /// actually does -- resolve the fallback with
-/// `chat_session_fallback_model_id`, then judge it with
+/// `chat_catalog_spawn_fallback_model_id`, then judge it with
 /// `chat_session_requires_visible_routing_failure` -- and shows the
 /// previously-silent no-explicit-id case now fails visibly, same as the
 /// explicit-id case #489 already covered.
@@ -9496,6 +9753,7 @@ fn chat_spawn_identity_unchanged_matrix() {
 /// namespaces), and the guard now fires.
 #[test]
 fn chat_session_default_path_now_fails_visibly_like_the_explicit_id_path() {
+    use crate::agent::chat_modes::ChatModelCatalog;
     let chat_state = acp::SessionModelState::new(
         acp::ModelId::new("chat-catalog-default"),
         Vec::new(),
@@ -9516,7 +9774,11 @@ fn chat_session_default_path_now_fails_visibly_like_the_explicit_id_path() {
 
     // Post-fix: the correct (chat-catalog) fallback does not resolve in the
     // build catalog (different namespace), so the guard now fires.
-    let fixed_fallback = chat_session_fallback_model_id(Some(&chat_state), build_default);
+    let fixed_fallback = chat_catalog_spawn_fallback_model_id(
+        Some(&ChatModelCatalog::Authoritative(chat_state)),
+        build_default,
+    )
+    .expect("authoritative chat catalog with a current id");
     let fixed_resolved_in_build_catalog = fixed_fallback.0.as_ref() == "build-catalog-default";
     assert!(
         super::agent_ops::chat_session_requires_visible_routing_failure(
