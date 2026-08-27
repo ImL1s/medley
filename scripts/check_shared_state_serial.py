@@ -1003,6 +1003,30 @@ def _serial_from_macro_body(body: str) -> tuple[frozenset[str], bool]:
     return frozenset(held), has_unkeyed
 
 
+def _generated_test_serials(body: str) -> list[tuple[frozenset[str], bool]]:
+    """Serial attrs on each generated `fn $name`, not the union of the body.
+
+    One invocation can expand to several tests with different attributes.
+    Unioning them onto a single synthetic lets an untagged touching test
+    hide behind a sibling `#[serial(k)]` (#516 review).
+    """
+
+    out: list[tuple[frozenset[str], bool]] = []
+    for match in MACRO_TEST_FN.finditer(body):
+        held: set[str] = set()
+        has_unkeyed = False
+        for attr in _preceding_attributes(body, body, match.start()):
+            parsed = _serial_keys(attr)
+            if parsed is None:
+                continue
+            if not parsed:
+                has_unkeyed = True
+            else:
+                held.update(parsed)
+        out.append((frozenset(held), has_unkeyed))
+    return out or [(frozenset(), False)]
+
+
 @dataclass(frozen=True)
 class _PendingMacroTest:
     file: Path
@@ -1012,6 +1036,7 @@ class _PendingMacroTest:
     inline_mods: tuple[str, ...]
     serial_held: frozenset[str]
     has_unkeyed_serial: bool
+    slot: int
 
 
 def index_functions(
@@ -1019,12 +1044,15 @@ def index_functions(
 ) -> tuple[list[FnInfo], list[_PendingMacroTest]]:
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
+    generated_by_macro: dict[str, list[tuple[frozenset[str], bool]]] = {}
+    scans: list[
+        tuple[Path, str, str, list[tuple[int, int]], list[tuple[int, int, int, str]]]
+    ] = []
     for rel, raw in sources:
         code = _code_only(raw)
         impls = _impl_blocks(code)
         inline_spans = _inline_module_spans(code)
         occupied: list[tuple[int, int]] = []
-        test_macros: list[tuple[str, frozenset[str], bool]] = []
         for match in FN_DEF.finditer(code):
             name = match.group("name")
             body_span = _fn_body(raw, match.end())
@@ -1084,8 +1112,9 @@ def index_functions(
                 item.key for item in registry if _body_touches(body_code, item.identifiers)
             )
             if _macro_generates_tests(body_code):
-                serial_held, has_unkeyed = _serial_from_macro_body(body_code)
-                test_macros.append((name, serial_held, has_unkeyed))
+                generated_by_macro.setdefault(name, []).extend(
+                    _generated_test_serials(body_code)
+                )
             out.append(
                 FnInfo(
                     name=name,
@@ -1103,22 +1132,28 @@ def index_functions(
                     attrs_line=_line(raw, match.start()),
                 )
             )
-        for macro_name, serial_held, has_unkeyed in test_macros:
-            for invoke in MACRO_INVOKE.finditer(code):
-                if invoke.group(1) != macro_name:
-                    continue
-                if any(start <= invoke.start() < end for start, end in occupied):
-                    continue
-                line = _line(raw, invoke.start())
+        scans.append((rel, raw, code, occupied, inline_spans))
+    for rel, raw, code, occupied, inline_spans in scans:
+        for invoke in MACRO_INVOKE.finditer(code):
+            macro_name = invoke.group(1)
+            serials = generated_by_macro.get(macro_name)
+            if not serials:
+                continue
+            if any(start <= invoke.start() < end for start, end in occupied):
+                continue
+            line = _line(raw, invoke.start())
+            inline_mods = _inline_path_from_spans(inline_spans, invoke.start())
+            for slot, (serial_held, has_unkeyed) in enumerate(serials):
                 pending.append(
                     _PendingMacroTest(
                         file=rel,
                         macro_name=macro_name,
                         line=line,
                         start=invoke.start(),
-                        inline_mods=_inline_path_from_spans(inline_spans, invoke.start()),
+                        inline_mods=inline_mods,
                         serial_held=serial_held,
                         has_unkeyed_serial=has_unkeyed,
+                        slot=slot,
                     )
                 )
     return out, pending
@@ -1203,6 +1238,7 @@ def _resolve_calls(
     by_leaf: dict[str, dict[str, int]],
     by_type: dict[str, dict[str, list[int]]],
     by_macro: dict[Path, dict[str, int]],
+    by_macro_any: dict[str, list[int]],
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, int]],
     keys_of: list[frozenset[str]],
     self_index: int,
@@ -1216,8 +1252,14 @@ def _resolve_calls(
             gained.update(keys_of[j])
     macro_index = by_macro.get(fn.file, {})
     for m in MACRO_INVOKE.finditer(fn.body):
-        j = macro_index.get(m.group(1))
-        if j is not None and j != self_index:
+        name = m.group(1)
+        j = macro_index.get(name)
+        if j is None:
+            for j in by_macro_any.get(name, []):
+                if j != self_index:
+                    gained.update(keys_of[j])
+            continue
+        if j != self_index:
             gained.update(keys_of[j])
     for m in QUALIFIED_CALL.finditer(fn.body):
         segs = tuple(s.strip() for s in m.group(1).split("::") if s.strip())
@@ -1321,10 +1363,12 @@ def analyze(
     by_leaf: dict[str, dict[str, int]] = {}
     by_type: dict[str, dict[str, list[int]]] = {}
     by_macro: dict[Path, dict[str, int]] = {}
+    by_macro_any: dict[str, list[int]] = {}
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, int]] = {}
     for i, fn in enumerate(functions):
         if fn.is_macro:
             by_macro.setdefault(fn.file, {})[fn.name] = i
+            by_macro_any.setdefault(fn.name, []).append(i)
             continue
         by_file.setdefault(fn.file, {})[fn.name] = i
         by_inline.setdefault((fn.file, fn.inline_mods), {})[fn.name] = i
@@ -1339,6 +1383,8 @@ def analyze(
             # `by_leaf` is simply not populated for it, guarded here
             # instead of raising `IndexError` on the empty tuple.
             by_module.setdefault(module, {})[fn.name] = i
+            if fn.inline_mods:
+                by_module.setdefault(module + fn.inline_mods, {})[fn.name] = i
             if module:
                 by_leaf.setdefault(module[-1], {})[fn.name] = i
         if fn.type_name is not None:
@@ -1357,6 +1403,7 @@ def analyze(
                 by_leaf=by_leaf,
                 by_type=by_type,
                 by_macro=by_macro,
+                by_macro_any=by_macro_any,
                 by_inline=by_inline,
                 keys_of=keys_of,
                 self_index=i,
@@ -1383,7 +1430,7 @@ def analyze(
             continue
         functions.append(
             FnInfo(
-                name=f"{pending.macro_name}!@{pending.line}",
+                name=f"{pending.macro_name}!@{pending.line}#{pending.slot}",
                 file=pending.file,
                 type_name=None,
                 trait_name=None,

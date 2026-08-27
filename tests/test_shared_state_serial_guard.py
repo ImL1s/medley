@@ -499,6 +499,108 @@ class TransitiveClosure(unittest.TestCase):
         findings = guard.scan_source(text)
         self.assertEqual(findings, [])
 
+    def test_macro_sibling_serial_does_not_cover_an_untagged_generated_test(self):
+        """Each generated test keeps its own attributes (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! pair {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    #[serial(demo_key)]
+                    #[test]
+                    fn $name_locked() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            pair!(a);
+            pair!(b);
+            """
+        )
+        findings = guard.scan_source(text)
+        untagged = [f.name for f in findings]
+        self.assertTrue(
+            any(n.startswith("pair!") and n.endswith("#0") for n in untagged),
+            untagged,
+        )
+        self.assertFalse(
+            any(n.endswith("#1") for n in untagged),
+            untagged,
+        )
+
+    def test_imported_macro_invocation_reaches_registered_state(self):
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    #[macro_export]
+                    macro_rules! bump {
+                        () => {
+                            COUNTER.fetch_add(1, Ordering::SeqCst)
+                        };
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn calls_imported_bump_untagged() {
+                        bump!();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertIn("calls_imported_bump_untagged", names)
+
+    def test_cross_file_call_into_inline_module_reaches_registered_state(self):
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    mod inner {
+                        fn relay() {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn calls_cross_file_inner_untagged() {
+                        crate::a::inner::relay();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertIn("calls_cross_file_inner_untagged", names)
+
     def test_two_hops_same_file_is_still_derived(self):
         """The real #492 shape: test -> `quarantined_after` -> `heal_unusable`,
         all same-file, neither intermediate call textually mentioning the
