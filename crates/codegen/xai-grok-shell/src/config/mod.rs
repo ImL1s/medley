@@ -195,12 +195,13 @@ impl MemoryConfig {
                 }
             }
         }
-        let resolved = crate::agent::config::resolve_enabled(
+        let resolved = crate::agent::config::resolve_enabled_aliased(
             if experimental_memory {
                 Some(true)
             } else {
                 None
             },
+            "MEDLEY_MEMORY",
             "GROK_MEMORY",
             result.enabled,
             config.get("memory").is_some(),
@@ -612,8 +613,9 @@ impl SubagentsConfig {
             .get("subagents")
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default();
-        let resolved = crate::agent::config::resolve_enabled(
+        let resolved = crate::agent::config::resolve_enabled_aliased(
             if cli_flag { Some(true) } else { None },
+            "MEDLEY_SUBAGENTS",
             "GROK_SUBAGENTS",
             result.enabled,
             config.get("subagents").is_some(),
@@ -864,7 +866,9 @@ impl ModelOverrideConfig {
                 prompt_suggestion = PromptSuggestModelPin::Pinned(v);
             }
         }
-        if let Ok(v) = std::env::var("GROK_WEB_SEARCH_MODEL") {
+        if let Some(v) =
+            xai_grok_config::resolve_env_var("MEDLEY_WEB_SEARCH_MODEL", "GROK_WEB_SEARCH_MODEL")
+        {
             let v = v.trim();
             if !v.is_empty() {
                 web_search = Some(v.to_owned());
@@ -1020,14 +1024,25 @@ impl ToolsConfig {
                     }
                 }),
         };
-        match std::env::var("GROK_RESPECT_GITIGNORE").as_deref() {
-            Ok("0") | Ok("false") => {
-                result.respect_gitignore = false;
-            }
-            Ok("1") | Ok("true") => {
-                result.respect_gitignore = true;
-            }
-            _ => {}
+        let parse_gitignore = |raw: &str| match raw.trim() {
+            "0" | "false" => Some(false),
+            "1" | "true" => Some(true),
+            _ => None,
+        };
+        let from_env = match std::env::var("MEDLEY_RESPECT_GITIGNORE") {
+            Ok(v) if !v.trim().is_empty() => parse_gitignore(&v).or_else(|| {
+                std::env::var("GROK_RESPECT_GITIGNORE")
+                    .ok()
+                    .and_then(|g| parse_gitignore(&g))
+                    .inspect(|_| xai_grok_config::note_legacy_hit("GROK_RESPECT_GITIGNORE"))
+            }),
+            _ => std::env::var("GROK_RESPECT_GITIGNORE")
+                .ok()
+                .and_then(|g| parse_gitignore(&g))
+                .inspect(|_| xai_grok_config::note_legacy_hit("GROK_RESPECT_GITIGNORE")),
+        };
+        if let Some(flag) = from_env {
+            result.respect_gitignore = flag;
         }
         match std::env::var("GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS").as_deref() {
             Ok("0") | Ok("false") => {

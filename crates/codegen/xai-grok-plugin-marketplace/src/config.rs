@@ -45,7 +45,15 @@ pub fn load_require_sha(config: &toml::Value) -> bool {
 }
 
 pub fn env_require_sha() -> bool {
-    xai_grok_config::env_bool("GROK_MARKETPLACE_REQUIRE_SHA").unwrap_or(false)
+    // Tighten-only across BOTH aliases: a falsy `MEDLEY_*` must not turn
+    // off a truthy `GROK_*` (#491 review). `resolve_env_bool` is
+    // first-wins and would let `MEDLEY_*=0` shadow `GROK_*=1`.
+    let medley = xai_grok_config::env_bool("MEDLEY_MARKETPLACE_REQUIRE_SHA");
+    let grok = xai_grok_config::env_bool("GROK_MARKETPLACE_REQUIRE_SHA");
+    if grok == Some(true) && medley != Some(true) {
+        xai_grok_config::note_legacy_hit("GROK_MARKETPLACE_REQUIRE_SHA");
+    }
+    medley == Some(true) || grok == Some(true)
 }
 
 /// Reads `[marketplace].sources` array. Returns empty vec if not configured.
@@ -268,6 +276,12 @@ pub fn load_extra_sources_from_settings_in(
 mod tests {
     use super::*;
 
+    /// Process-global env: serialize every test in this module that touches
+    /// `GROK_MARKETPLACE_REQUIRE_SHA` / `MEDLEY_MARKETPLACE_REQUIRE_SHA`
+    /// against each other. Module-level (not per-function) so it's actually
+    /// shared, not one distinct lock per test.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parse_local_source() {
         let config: toml::Value = toml::from_str(
@@ -333,15 +347,16 @@ mod tests {
     /// tighten-only rule (falsy env cannot relax config-set true).
     #[test]
     fn require_sha_policy_composition() {
-        // Process-global env: serialize against any other env-touching test.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let empty: toml::Value = toml::from_str("").unwrap();
         let enabled: toml::Value = toml::from_str("[marketplace]\nrequire_sha = true\n").unwrap();
 
         // SAFETY: single-threaded within the lock; restored before release.
-        unsafe { std::env::remove_var("GROK_MARKETPLACE_REQUIRE_SHA") };
+        unsafe {
+            std::env::remove_var("MEDLEY_MARKETPLACE_REQUIRE_SHA");
+            std::env::remove_var("GROK_MARKETPLACE_REQUIRE_SHA");
+        }
         assert!(!load_require_sha(&empty), "absent everywhere → off");
         assert!(load_require_sha(&enabled), "config alone can enable");
 
@@ -355,6 +370,48 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("GROK_MARKETPLACE_REQUIRE_SHA") };
+    }
+
+    #[test]
+    fn medley_marketplace_require_sha_wins_over_grok() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEDLEY_MARKETPLACE_REQUIRE_SHA", "1");
+            std::env::set_var("GROK_MARKETPLACE_REQUIRE_SHA", "0");
+        }
+        let result = env_require_sha();
+        unsafe {
+            std::env::remove_var("MEDLEY_MARKETPLACE_REQUIRE_SHA");
+            std::env::remove_var("GROK_MARKETPLACE_REQUIRE_SHA");
+        }
+        assert!(result, "MEDLEY_* must win over a conflicting GROK_*=0");
+    }
+
+    #[test]
+    fn grok_marketplace_require_sha_still_works_when_medley_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEDLEY_MARKETPLACE_REQUIRE_SHA");
+            std::env::set_var("GROK_MARKETPLACE_REQUIRE_SHA", "1");
+        }
+        let result = env_require_sha();
+        unsafe { std::env::remove_var("GROK_MARKETPLACE_REQUIRE_SHA") };
+        assert!(result, "GROK_* must still work when MEDLEY_* is unset");
+    }
+
+    #[test]
+    fn medley_marketplace_require_sha_falsy_cannot_turn_off_truthy_grok() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEDLEY_MARKETPLACE_REQUIRE_SHA", "0");
+            std::env::set_var("GROK_MARKETPLACE_REQUIRE_SHA", "1");
+        }
+        let result = env_require_sha();
+        unsafe {
+            std::env::remove_var("MEDLEY_MARKETPLACE_REQUIRE_SHA");
+            std::env::remove_var("GROK_MARKETPLACE_REQUIRE_SHA");
+        }
+        assert!(result, "tighten-only: GROK_*=1 must survive MEDLEY_*=0");
     }
 
     #[test]

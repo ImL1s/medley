@@ -117,7 +117,7 @@ After you answer the first prompt the cursor turns **sticky**: each later prompt
 
 Values match case-insensitively; an unset or unrecognized value falls back to `always_allow_all_sessions`. The `allow_command_always` row is always scoped to the specific action being approved (command / tool / domain / edit-session), never a global allow-everything — that's what `always_allow_all_sessions` is for. Note the per-command "Always allow" rows only appear when `[ui] remember_tool_approvals = true` (default false). See [22-permissions-and-safety.md](22-permissions-and-safety.md).
 
-You can also override this with `GROK_DEFAULT_SELECTED_PERMISSION`, which is handy for headless or agent test runs that shouldn't mutate `config.toml`. Precedence: env var → `config.toml` → `always_allow_all_sessions`.
+You can also override this with `MEDLEY_DEFAULT_SELECTED_PERMISSION` (checked first) or `GROK_DEFAULT_SELECTED_PERMISSION`, which is handy for headless or agent test runs that shouldn't mutate `config.toml`. Precedence: env var → `config.toml` → `always_allow_all_sessions`.
 
 #### Vim mode
 
@@ -166,7 +166,7 @@ invert_scroll = false
 # scroll_lines = 3
 ```
 
-Each setting also has an environment-variable override, applied on first load only (again, handy for headless / test runs): `GROK_SCROLL_SPEED`, `GROK_SCROLL_MODE`, `GROK_INVERT_SCROLL` (`1`/`true`/`0`/`false`), and `GROK_SCROLL_LINES`. Precedence: env var → `config.toml` → default. Unrecognized values fall back to the default, and out-of-range numbers clamp.
+Each setting also has an environment-variable override, applied on first load only (again, handy for headless / test runs): `GROK_SCROLL_SPEED`, `GROK_SCROLL_MODE`, `GROK_INVERT_SCROLL` (`1`/`true`/`0`/`false`), and `GROK_SCROLL_LINES` — each also has a `MEDLEY_*`-prefixed alias (e.g. `MEDLEY_SCROLL_SPEED`) checked first. Precedence: env var → `config.toml` → default. Unrecognized values fall back to the default, and out-of-range numbers clamp.
 
 ### Tool configuration
 
@@ -780,16 +780,30 @@ disable_plugins = false               # hide hooks/plugins UI entirely
 
 The key ones. See the README for the complete list.
 
+Most rows below have a `MEDLEY_*` row directly above them: checked first,
+with the `GROK_*` name kept as a permanent fallback (not a migration
+window — see [#426](https://github.com/ImL1s/medley/issues/426)). A
+variable with no `MEDLEY_*` row — `GROK_AGENT`, `GROK_SANDBOX`,
+`GROK_CLI_CHAT_PROXY_BASE_URL`, `GROK_DEPLOYMENT_KEY` among them — has no
+alias yet; #426 documents why each of those is deferred rather than aliased.
+An empty or all-whitespace value on either name is treated as unset.
+
 ### Authentication
 
 | Variable | Description |
 |----------|-------------|
 | `XAI_API_KEY` | API key from console.x.ai |
+| `MEDLEY_AUTH_PROVIDER_COMMAND` | Same as `GROK_AUTH_PROVIDER_COMMAND` below, checked first |
 | `GROK_AUTH_PROVIDER_COMMAND` | External auth binary path |
+| `MEDLEY_AUTH_PROVIDER_LABEL` | Same as `GROK_AUTH_PROVIDER_LABEL` below, checked first |
 | `GROK_AUTH_PROVIDER_LABEL` | Display name on TUI login screen |
+| `MEDLEY_AUTH_TOKEN_TTL` | Same as `GROK_AUTH_TOKEN_TTL` below, checked first |
 | `GROK_AUTH_TOKEN_TTL` | Token lifetime in seconds |
+| `MEDLEY_AUTH_EARLY_INVALIDATION_SECS` | Same as `GROK_AUTH_EARLY_INVALIDATION_SECS` below, checked first |
 | `GROK_AUTH_EARLY_INVALIDATION_SECS` | Seconds before expiry to refresh (default: 300) |
+| `MEDLEY_OIDC_ISSUER` | Same as `GROK_OIDC_ISSUER` below, checked first |
 | `GROK_OIDC_ISSUER` | OIDC issuer URL |
+| `MEDLEY_OIDC_CLIENT_ID` | Same as `GROK_OIDC_CLIENT_ID` below, checked first |
 | `GROK_OIDC_CLIENT_ID` | OIDC client ID |
 
 ### Endpoints
@@ -802,10 +816,15 @@ The key ones. See the README for the complete list.
 
 | Variable | Description |
 |----------|-------------|
+| `MEDLEY_MEMORY` | Same as `GROK_MEMORY` below, checked first |
 | `GROK_MEMORY` | Enable (`1`) or disable (`0`) cross-session memory |
+| `MEDLEY_SUBAGENTS` | Same as `GROK_SUBAGENTS` below, checked first |
 | `GROK_SUBAGENTS` | Enable (`1`) or disable (`0`) subagents |
+| `MEDLEY_WORKFLOWS` | Same as `GROK_WORKFLOWS` below, checked first |
 | `GROK_WORKFLOWS` | Enable (`1`) or disable (`0`) background workflows and select the `/goal` driver (default on: host-owned workflow driver; off: legacy `update_goal`) |
+| `MEDLEY_WEB_FETCH` | Same as `GROK_WEB_FETCH` below, checked first |
 | `GROK_WEB_FETCH` | Enable (`1`) or disable (`0`) the web_fetch tool |
+| `MEDLEY_WEB_FETCH_ALLOW_LOCAL` | Same as `GROK_WEB_FETCH_ALLOW_LOCAL` below, checked first |
 | `GROK_WEB_FETCH_ALLOW_LOCAL` | Allow `web_fetch` to explicit loopback hosts only (`localhost` / `127.0.0.0/8` / `::1`). Same as `[toolset.web_fetch] allow_local`. Default off; private/metadata stay blocked. |
 | `GROK_AGENT` | Custom agent definition path or name |
 | `GROK_SANDBOX` | Sandbox profile (off, workspace, devbox, read-only, strict; or a custom profile name) |
@@ -814,6 +833,7 @@ The key ones. See the README for the complete list.
 
 | Variable | Description |
 |----------|-------------|
+| `MEDLEY_LOG_FILE` | Same as `GROK_LOG_FILE` below, checked first |
 | `GROK_LOG_FILE` | Write logs to this file path (used verbatim as the path) |
 | `RUST_LOG` | Log level filter (e.g. `debug`); controls the `GROK_LOG_FILE` log and headless stderr output |
 
@@ -823,6 +843,7 @@ The key ones. See the README for the complete list.
 |----------|-------------|
 | `MEDLEY_HOME` | Override the state directory (default: `~/.medley`). Checked first |
 | `GROK_HOME` | Same, checked after `MEDLEY_HOME`; accepted for compatibility with existing setups |
+| `MEDLEY_RESPECT_GITIGNORE` | Same as `GROK_RESPECT_GITIGNORE` below, checked first |
 | `GROK_RESPECT_GITIGNORE` | Force gitignore filtering on (`1`) or off (`0`); overrides `[tools] respect_gitignore` |
 
 An empty or all-whitespace value is treated as unset. See
@@ -832,10 +853,15 @@ An empty or all-whitespace value is treated as unset. See
 
 | Variable | Description |
 |----------|-------------|
+| `MEDLEY_TELEMETRY_ENABLED` | Same as `GROK_TELEMETRY_ENABLED` below, checked first |
 | `GROK_TELEMETRY_ENABLED` | Enable/disable telemetry |
+| `MEDLEY_TELEMETRY_TRACE_UPLOAD` | Same as `GROK_TELEMETRY_TRACE_UPLOAD` below, checked first |
 | `GROK_TELEMETRY_TRACE_UPLOAD` | Enable/disable session trace upload |
+| `MEDLEY_TELEMETRY_MIXPANEL_ENABLED` | Same as `GROK_TELEMETRY_MIXPANEL_ENABLED` below, checked first |
 | `GROK_TELEMETRY_MIXPANEL_ENABLED` | Enable/disable Mixpanel specifically |
+| `MEDLEY_EXTERNAL_OTEL` | Same as `GROK_EXTERNAL_OTEL` below, checked first |
 | `GROK_EXTERNAL_OTEL` | External OTEL to your collector (see [24-monitoring-usage.md](24-monitoring-usage.md)) |
+| `MEDLEY_FEEDBACK_ENABLED` | Same as `GROK_FEEDBACK_ENABLED` below, checked first |
 | `GROK_FEEDBACK_ENABLED` | Enable/disable feedback system |
 | `GROK_DEPLOYMENT_KEY` | Management API key for enterprise |
 

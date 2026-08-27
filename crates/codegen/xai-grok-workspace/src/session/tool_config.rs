@@ -594,13 +594,18 @@ fn build_web_fetch_config() -> xai_grok_tools::implementations::grok_build::web_
     if let Ok(proxy) = std::env::var("GROK_WEB_FETCH_PROXY") {
         params.proxy_endpoint = Some(proxy);
     }
-    if xai_grok_config::env_bool("GROK_WEB_FETCH_ALLOW_LOCAL") == Some(true) {
+    if xai_grok_config::resolve_env_bool(
+        "MEDLEY_WEB_FETCH_ALLOW_LOCAL",
+        "GROK_WEB_FETCH_ALLOW_LOCAL",
+    ) == Some(true)
+    {
         params.allow_local = Some(true);
     }
     WebFetchConfig::Enabled { params }
 }
 fn default_web_search_model() -> String {
-    std::env::var("GROK_WEB_SEARCH_MODEL").unwrap_or_else(|_| "grok-4.5".to_string())
+    xai_grok_config::resolve_env_var("MEDLEY_WEB_SEARCH_MODEL", "GROK_WEB_SEARCH_MODEL")
+        .unwrap_or_else(|| "grok-4.5".to_string())
 }
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
@@ -1168,6 +1173,88 @@ mod tests {
         let filtered_ids: Vec<String> = filtered.tools.iter().map(|t| t.id.clone()).collect();
         assert_eq!(filtered_ids, baseline_ids);
     }
+    #[test]
+    fn medley_web_fetch_allow_local_wins_over_grok() {
+        let _guard = super::TOOL_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("GROK_DISABLE_WEB_FETCH");
+            std::env::set_var("MEDLEY_WEB_FETCH_ALLOW_LOCAL", "1");
+            std::env::set_var("GROK_WEB_FETCH_ALLOW_LOCAL", "0");
+        }
+        let config = super::build_web_fetch_config();
+        unsafe {
+            std::env::remove_var("MEDLEY_WEB_FETCH_ALLOW_LOCAL");
+            std::env::remove_var("GROK_WEB_FETCH_ALLOW_LOCAL");
+        }
+        match config {
+            xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig::Enabled {
+                params,
+            } => assert_eq!(
+                params.allow_local,
+                Some(true),
+                "MEDLEY_WEB_FETCH_ALLOW_LOCAL=1 must win over a conflicting GROK_*=0"
+            ),
+            other => panic!("expected Enabled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grok_web_fetch_allow_local_still_works_when_medley_unset() {
+        let _guard = super::TOOL_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("GROK_DISABLE_WEB_FETCH");
+            std::env::remove_var("MEDLEY_WEB_FETCH_ALLOW_LOCAL");
+            std::env::set_var("GROK_WEB_FETCH_ALLOW_LOCAL", "1");
+        }
+        let config = super::build_web_fetch_config();
+        unsafe { std::env::remove_var("GROK_WEB_FETCH_ALLOW_LOCAL") };
+        match config {
+            xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig::Enabled {
+                params,
+            } => assert_eq!(
+                params.allow_local,
+                Some(true),
+                "GROK_WEB_FETCH_ALLOW_LOCAL must still work when MEDLEY_* is unset"
+            ),
+            other => panic!("expected Enabled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn medley_web_search_model_wins_over_grok() {
+        let _guard = super::TOOL_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("MEDLEY_WEB_SEARCH_MODEL", "medley-search-1");
+            std::env::set_var("GROK_WEB_SEARCH_MODEL", "grok-search-1");
+        }
+        let model = super::default_web_search_model();
+        unsafe {
+            std::env::remove_var("MEDLEY_WEB_SEARCH_MODEL");
+            std::env::remove_var("GROK_WEB_SEARCH_MODEL");
+        }
+        assert_eq!(model, "medley-search-1");
+    }
+
+    #[test]
+    fn grok_web_search_model_still_works_when_medley_unset() {
+        let _guard = super::TOOL_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("MEDLEY_WEB_SEARCH_MODEL");
+            std::env::set_var("GROK_WEB_SEARCH_MODEL", "grok-search-1");
+        }
+        let model = super::default_web_search_model();
+        unsafe { std::env::remove_var("GROK_WEB_SEARCH_MODEL") };
+        assert_eq!(model, "grok-search-1");
+    }
+
     /// Only the literal `"true"` enables tool-state persistence.
     #[test]
     fn tool_state_enabled_only_true_enables() {

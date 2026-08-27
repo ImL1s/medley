@@ -185,7 +185,11 @@ fn env_theme_name() -> Option<String> {
 }
 
 fn env_theme_name_from(env: &HashMap<String, String>) -> Option<&str> {
-    for key in ["GROK_THEME", "LC_GROK_THEME"] {
+    // `MEDLEY_THEME` first (#426), then the legacy `GROK_THEME`, then
+    // `LC_GROK_THEME` — an SSH-passthrough stamp `grok wrap ssh` sets from
+    // the local OS theme, not something a user sets directly, so it gets no
+    // `MEDLEY_*` alias and is never counted as a legacy-var hit.
+    for key in ["MEDLEY_THEME", "GROK_THEME", "LC_GROK_THEME"] {
         let Some(raw) = env
             .get(key)
             .map(String::as_str)
@@ -194,6 +198,9 @@ fn env_theme_name_from(env: &HashMap<String, String>) -> Option<&str> {
             continue;
         };
         if ThemeKind::from_name(raw).is_some() {
+            if key == "GROK_THEME" {
+                xai_grok_config::note_legacy_hit("GROK_THEME");
+            }
             return Some(raw);
         }
     }
@@ -680,6 +687,34 @@ mod tests {
                 ThemeKind::GrokDay
             );
             assert!(!is_auto_mode());
+        });
+    }
+
+    #[test]
+    fn medley_theme_wins_over_grok_theme() {
+        with_test_env(|| {
+            let env = theme_env(&[("MEDLEY_THEME", "tokyonight"), ("GROK_THEME", "grokday")]);
+            assert_eq!(env_theme_name_from(&env), Some("tokyonight"));
+        });
+    }
+
+    #[test]
+    fn grok_theme_still_works_when_medley_theme_unset() {
+        with_test_env(|| {
+            let env = theme_env(&[("GROK_THEME", "grokday")]);
+            assert_eq!(env_theme_name_from(&env), Some("grokday"));
+        });
+    }
+
+    #[test]
+    fn invalid_medley_theme_falls_through_to_grok_theme() {
+        with_test_env(|| {
+            let env = theme_env(&[("MEDLEY_THEME", "not-a-theme"), ("GROK_THEME", "grokday")]);
+            assert_eq!(
+                env_theme_name_from(&env),
+                Some("grokday"),
+                "an unrecognized MEDLEY_THEME must not shadow a valid GROK_THEME"
+            );
         });
     }
 

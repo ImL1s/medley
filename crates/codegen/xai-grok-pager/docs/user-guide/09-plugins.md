@@ -301,7 +301,7 @@ Refuse any remote plugin install or update that is not pinned to a full commit s
 require_sha = true
 ```
 
-You can also set `GROK_MARKETPLACE_REQUIRE_SHA=1`. Both only tighten the policy; neither turns it back off. Publish `sha` values in your marketplace's `plugin-index.json` so installs from it satisfy the rule. Plugins vendored directly inside a marketplace repository are copied from that repository's checkout, so pin them the same way, with `sha` values in `plugin-index.json`.
+You can also set `MEDLEY_MARKETPLACE_REQUIRE_SHA=1` (checked first) or `GROK_MARKETPLACE_REQUIRE_SHA=1`. Both only tighten the policy; neither turns it back off. Publish `sha` values in your marketplace's `plugin-index.json` so installs from it satisfy the rule. Plugins vendored directly inside a marketplace repository are copied from that repository's checkout, so pin them the same way, with `sha` values in `plugin-index.json`.
 
 ### Turn off the plugins UI
 

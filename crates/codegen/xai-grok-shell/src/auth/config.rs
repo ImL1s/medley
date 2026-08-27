@@ -325,11 +325,29 @@ impl Default for GrokComConfig {
             token_header: "xai-grok-cli".to_owned(),
             oidc,
             oauth2,
-            auth_provider_command: std::env::var("GROK_AUTH_PROVIDER_COMMAND").ok(),
-            auth_provider_label: std::env::var("GROK_AUTH_PROVIDER_LABEL").ok(),
-            auth_token_ttl: std::env::var("GROK_AUTH_TOKEN_TTL")
-                .ok()
-                .and_then(|v| v.parse().ok()),
+            auth_provider_command: xai_grok_config::resolve_env_var(
+                "MEDLEY_AUTH_PROVIDER_COMMAND",
+                "GROK_AUTH_PROVIDER_COMMAND",
+            ),
+            auth_provider_label: xai_grok_config::resolve_env_var(
+                "MEDLEY_AUTH_PROVIDER_LABEL",
+                "GROK_AUTH_PROVIDER_LABEL",
+            ),
+            auth_token_ttl: {
+                let parse = |raw: String| raw.parse::<u64>().ok();
+                match std::env::var("MEDLEY_AUTH_TOKEN_TTL") {
+                    Ok(v) if !v.trim().is_empty() => parse(v).or_else(|| {
+                        std::env::var("GROK_AUTH_TOKEN_TTL")
+                            .ok()
+                            .and_then(parse)
+                            .inspect(|_| xai_grok_config::note_legacy_hit("GROK_AUTH_TOKEN_TTL"))
+                    }),
+                    _ => std::env::var("GROK_AUTH_TOKEN_TTL")
+                        .ok()
+                        .and_then(parse)
+                        .inspect(|_| xai_grok_config::note_legacy_hit("GROK_AUTH_TOKEN_TTL")),
+                }
+            },
             disable_api_key_auth: std::env::var("GROK_DISABLE_API_KEY_AUTH")
                 .ok()
                 .map(|v| env_flag_enabled(&v)),
@@ -359,8 +377,9 @@ fn env_lockdown_forced() -> bool {
 }
 impl OidcAuthConfig {
     pub fn from_env() -> Option<Self> {
-        let issuer = std::env::var("GROK_OIDC_ISSUER").ok()?;
-        let client_id = std::env::var("GROK_OIDC_CLIENT_ID").ok()?;
+        let issuer = xai_grok_config::resolve_env_var("MEDLEY_OIDC_ISSUER", "GROK_OIDC_ISSUER")?;
+        let client_id =
+            xai_grok_config::resolve_env_var("MEDLEY_OIDC_CLIENT_ID", "GROK_OIDC_CLIENT_ID")?;
         Some(Self {
             issuer,
             client_id,
@@ -374,6 +393,141 @@ impl OidcAuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn grok_com_config_default_medley_auth_provider_command_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_AUTH_PROVIDER_COMMAND", "medley-provider");
+            std::env::set_var("GROK_AUTH_PROVIDER_COMMAND", "grok-provider");
+        }
+        let cfg = GrokComConfig::default();
+        unsafe {
+            std::env::remove_var("MEDLEY_AUTH_PROVIDER_COMMAND");
+            std::env::remove_var("GROK_AUTH_PROVIDER_COMMAND");
+        }
+        assert_eq!(
+            cfg.auth_provider_command.as_deref(),
+            Some("medley-provider")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn grok_com_config_default_grok_auth_provider_command_still_works() {
+        unsafe {
+            std::env::remove_var("MEDLEY_AUTH_PROVIDER_COMMAND");
+            std::env::set_var("GROK_AUTH_PROVIDER_COMMAND", "grok-provider");
+        }
+        let cfg = GrokComConfig::default();
+        unsafe { std::env::remove_var("GROK_AUTH_PROVIDER_COMMAND") };
+        assert_eq!(cfg.auth_provider_command.as_deref(), Some("grok-provider"));
+    }
+
+    #[test]
+    #[serial]
+    fn grok_com_config_default_medley_auth_provider_label_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_AUTH_PROVIDER_LABEL", "Medley Login");
+            std::env::set_var("GROK_AUTH_PROVIDER_LABEL", "Grok Login");
+        }
+        let cfg = GrokComConfig::default();
+        unsafe {
+            std::env::remove_var("MEDLEY_AUTH_PROVIDER_LABEL");
+            std::env::remove_var("GROK_AUTH_PROVIDER_LABEL");
+        }
+        assert_eq!(cfg.auth_provider_label.as_deref(), Some("Medley Login"));
+    }
+
+    #[test]
+    #[serial]
+    fn grok_com_config_default_grok_auth_provider_label_still_works() {
+        unsafe {
+            std::env::remove_var("MEDLEY_AUTH_PROVIDER_LABEL");
+            std::env::set_var("GROK_AUTH_PROVIDER_LABEL", "Grok Login");
+        }
+        let cfg = GrokComConfig::default();
+        unsafe { std::env::remove_var("GROK_AUTH_PROVIDER_LABEL") };
+        assert_eq!(cfg.auth_provider_label.as_deref(), Some("Grok Login"));
+    }
+
+    #[test]
+    #[serial]
+    fn grok_com_config_default_medley_auth_token_ttl_wins_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_AUTH_TOKEN_TTL", "111");
+            std::env::set_var("GROK_AUTH_TOKEN_TTL", "222");
+        }
+        let cfg = GrokComConfig::default();
+        assert_eq!(cfg.auth_token_ttl, Some(111));
+
+        unsafe {
+            std::env::set_var("MEDLEY_AUTH_TOKEN_TTL", "not-a-number");
+        }
+        let cfg = GrokComConfig::default();
+        unsafe {
+            std::env::remove_var("MEDLEY_AUTH_TOKEN_TTL");
+            std::env::remove_var("GROK_AUTH_TOKEN_TTL");
+        }
+        assert_eq!(
+            cfg.auth_token_ttl,
+            Some(222),
+            "invalid MEDLEY_AUTH_TOKEN_TTL must fall through to GROK_AUTH_TOKEN_TTL"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn grok_com_config_default_grok_auth_token_ttl_still_works() {
+        unsafe {
+            std::env::remove_var("MEDLEY_AUTH_TOKEN_TTL");
+            std::env::set_var("GROK_AUTH_TOKEN_TTL", "222");
+        }
+        let cfg = GrokComConfig::default();
+        unsafe { std::env::remove_var("GROK_AUTH_TOKEN_TTL") };
+        assert_eq!(cfg.auth_token_ttl, Some(222));
+    }
+
+    #[test]
+    #[serial]
+    fn oidc_from_env_medley_issuer_and_client_id_win_over_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_OIDC_ISSUER", "https://medley.example/issuer");
+            std::env::set_var("GROK_OIDC_ISSUER", "https://grok.example/issuer");
+            std::env::set_var("MEDLEY_OIDC_CLIENT_ID", "medley-client");
+            std::env::set_var("GROK_OIDC_CLIENT_ID", "grok-client");
+        }
+        let cfg = OidcAuthConfig::from_env();
+        unsafe {
+            std::env::remove_var("MEDLEY_OIDC_ISSUER");
+            std::env::remove_var("GROK_OIDC_ISSUER");
+            std::env::remove_var("MEDLEY_OIDC_CLIENT_ID");
+            std::env::remove_var("GROK_OIDC_CLIENT_ID");
+        }
+        let cfg = cfg.expect("both issuer and client_id resolved, from MEDLEY_*");
+        assert_eq!(cfg.issuer, "https://medley.example/issuer");
+        assert_eq!(cfg.client_id, "medley-client");
+    }
+
+    #[test]
+    #[serial]
+    fn oidc_from_env_grok_issuer_and_client_id_still_work() {
+        unsafe {
+            std::env::remove_var("MEDLEY_OIDC_ISSUER");
+            std::env::set_var("GROK_OIDC_ISSUER", "https://grok.example/issuer");
+            std::env::remove_var("MEDLEY_OIDC_CLIENT_ID");
+            std::env::set_var("GROK_OIDC_CLIENT_ID", "grok-client");
+        }
+        let cfg = OidcAuthConfig::from_env();
+        unsafe {
+            std::env::remove_var("GROK_OIDC_ISSUER");
+            std::env::remove_var("GROK_OIDC_CLIENT_ID");
+        }
+        let cfg = cfg.expect("both issuer and client_id resolved, from GROK_*");
+        assert_eq!(cfg.issuer, "https://grok.example/issuer");
+        assert_eq!(cfg.client_id, "grok-client");
+    }
 
     #[test]
     fn grok_com_config_debug_never_exposes_provider_command_or_urls() {

@@ -29,10 +29,21 @@ pub fn detect_from_env_map(env: &HashMap<String, String>) -> Option<SystemAppear
 }
 
 /// Deliberate wrap/SSH stamps only — no inherited `COLORFGBG` guess.
+///
+/// `MEDLEY_APPEARANCE` is checked ahead of the legacy `GROK_APPEARANCE`
+/// (#426); `LC_GROK_APPEARANCE` stays last and gets no `MEDLEY_*` alias — it
+/// is machine-stamped by `grok wrap ssh` from the local OS theme, not
+/// something a user sets directly, so it is never counted as a legacy-var
+/// hit either.
 #[must_use]
 pub fn detect_explicit_from_env_map(env: &HashMap<String, String>) -> Option<SystemAppearance> {
-    parse_appearance_var(env_nonempty(env, "GROK_APPEARANCE"))
-        .or_else(|| parse_appearance_var(env_nonempty(env, "LC_GROK_APPEARANCE")))
+    parse_appearance_var(env_nonempty(env, "MEDLEY_APPEARANCE")).or_else(|| {
+        if let Some(v) = parse_appearance_var(env_nonempty(env, "GROK_APPEARANCE")) {
+            xai_grok_config::note_legacy_hit("GROK_APPEARANCE");
+            return Some(v);
+        }
+        parse_appearance_var(env_nonempty(env, "LC_GROK_APPEARANCE"))
+    })
 }
 
 /// Inherited `COLORFGBG` polarity guess.
@@ -100,6 +111,37 @@ mod tests {
         assert_eq!(
             detect_from_env_map(&env(&[("GROK_APPEARANCE", "day")])),
             Some(SystemAppearance::Light)
+        );
+    }
+
+    #[test]
+    fn medley_appearance_wins_over_grok_appearance() {
+        assert_eq!(
+            detect_from_env_map(&env(&[
+                ("MEDLEY_APPEARANCE", "light"),
+                ("GROK_APPEARANCE", "dark"),
+            ])),
+            Some(SystemAppearance::Light)
+        );
+    }
+
+    #[test]
+    fn grok_appearance_still_works_when_medley_appearance_unset() {
+        assert_eq!(
+            detect_from_env_map(&env(&[("GROK_APPEARANCE", "dark")])),
+            Some(SystemAppearance::Dark)
+        );
+    }
+
+    #[test]
+    fn invalid_medley_appearance_falls_through_to_grok_appearance() {
+        assert_eq!(
+            detect_from_env_map(&env(&[
+                ("MEDLEY_APPEARANCE", "not-a-color"),
+                ("GROK_APPEARANCE", "dark"),
+            ])),
+            Some(SystemAppearance::Dark),
+            "an unrecognized MEDLEY_APPEARANCE must not shadow a valid GROK_APPEARANCE"
         );
     }
 

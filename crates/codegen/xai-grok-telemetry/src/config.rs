@@ -88,6 +88,23 @@ pub fn env_telemetry_mode(name: &str) -> Option<TelemetryMode> {
     let value = std::env::var(name).ok()?;
     TelemetryMode::parse(&value)
 }
+/// [`env_telemetry_mode`] with `MEDLEY_*`-first precedence against `grok_name`
+/// (#426) — a sibling rather than a parameter on `env_telemetry_mode` itself,
+/// which stays untouched for every other caller.
+pub fn env_telemetry_mode_alias(medley_name: &str, grok_name: &str) -> Option<TelemetryMode> {
+    if let Ok(value) = std::env::var(medley_name)
+        && !value.trim().is_empty()
+        && let Some(parsed) = TelemetryMode::parse(&value)
+    {
+        return Some(parsed);
+    }
+    let value = std::env::var(grok_name)
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let parsed = TelemetryMode::parse(&value)?;
+    xai_grok_config::note_legacy_hit(grok_name);
+    Some(parsed)
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetryConfig {
@@ -192,10 +209,16 @@ impl TelemetryConfig {
         if let Some(value) = Self::env_override("GROK_TELEMETRY_MIXPANEL_TOKEN") {
             self.mixpanel_token = value;
         }
-        if let Some(value) = env_bool("GROK_TELEMETRY_MIXPANEL_ENABLED") {
+        if let Some(value) = xai_grok_config::resolve_env_bool(
+            "MEDLEY_TELEMETRY_MIXPANEL_ENABLED",
+            "GROK_TELEMETRY_MIXPANEL_ENABLED",
+        ) {
             self.mixpanel_enabled = value;
         }
-        if let Some(value) = env_bool("GROK_TELEMETRY_TRACE_UPLOAD") {
+        if let Some(value) = xai_grok_config::resolve_env_bool(
+            "MEDLEY_TELEMETRY_TRACE_UPLOAD",
+            "GROK_TELEMETRY_TRACE_UPLOAD",
+        ) {
             self.trace_upload = Some(value);
         }
     }
@@ -221,20 +244,11 @@ impl TelemetryConfig {
         })
     }
 }
-/// Parse an env var as a boolean. Returns `None` if unset or unrecognized.
-///
-/// Local copy of `xai_grok_shell::agent::config::env_bool` so this crate
-/// stays free of a shell back-edge. Shell keeps its own copy for callers
-/// outside the telemetry config path.
-fn env_bool(name: &str) -> Option<bool> {
-    let value = std::env::var(name).ok()?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "" => None,
-        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
-        "0" | "false" | "no" | "off" | "disabled" => Some(false),
-        _ => None,
-    }
-}
+// The local `env_bool` copy that used to live here (kept so this crate stayed
+// free of a shell back-edge) is gone: its only two call sites now go through
+// `xai_grok_config::resolve_env_bool` for the MEDLEY_*-first precedence
+// (#426) — `xai-grok-config` is a foundational dependency this crate already
+// has, not a back-edge, so the local copy has no remaining reason to exist.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +261,150 @@ mod tests {
                 !output.contains(fragment),
                 "credential fragment {fragment:?} leaked in {output:?}"
             );
+        }
+    }
+
+    /// `env_telemetry_mode_alias` takes both names as parameters, so unique
+    /// per-test names avoid any risk of colliding with a concurrently-run
+    /// test over shared process env — no lock needed. The names must also
+    /// not be substrings of each other: `legacy_notice()` is a joined
+    /// process-global string, and `contains(GROK)` on
+    /// `GROK_TEST_…_INVALID` matches a sibling's `…_INVALID_MEDLEY` hit.
+    #[test]
+    fn env_telemetry_mode_alias_prefers_medley() {
+        const MEDLEY: &str = "MEDLEY_TEST_TELEMETRY_MODE_ALIAS_PREFERS";
+        const GROK: &str = "GROK_TEST_TELEMETRY_MODE_ALIAS_PREFERS";
+        unsafe {
+            std::env::set_var(MEDLEY, "session_metrics");
+            std::env::set_var(GROK, "true");
+        }
+        let result = env_telemetry_mode_alias(MEDLEY, GROK);
+        unsafe {
+            std::env::remove_var(MEDLEY);
+            std::env::remove_var(GROK);
+        }
+        assert_eq!(result, Some(TelemetryMode::SessionMetrics));
+    }
+
+    #[test]
+    fn env_telemetry_mode_alias_falls_back_to_grok() {
+        const MEDLEY: &str = "MEDLEY_TEST_TELEMETRY_MODE_ALIAS_FALLBACK";
+        const GROK: &str = "GROK_TEST_TELEMETRY_MODE_ALIAS_FALLBACK";
+        unsafe {
+            std::env::remove_var(MEDLEY);
+            std::env::set_var(GROK, "true");
+        }
+        let result = env_telemetry_mode_alias(MEDLEY, GROK);
+        unsafe { std::env::remove_var(GROK) };
+        assert_eq!(result, Some(TelemetryMode::Enabled));
+        let notice = xai_grok_config::legacy_notice().unwrap_or_default();
+        assert!(
+            notice.contains(GROK),
+            "a parseable GROK_* value is a real hit, got {notice:?}"
+        );
+    }
+
+    #[test]
+    fn env_telemetry_mode_alias_invalid_legacy_is_not_recorded_as_a_hit() {
+        const MEDLEY: &str = "MEDLEY_TEST_TELEMETRY_MODE_ALIAS_UNPARSEABLE";
+        const GROK: &str = "GROK_TEST_TELEMETRY_MODE_ALIAS_UNPARSEABLE";
+        unsafe {
+            std::env::remove_var(MEDLEY);
+            std::env::set_var(GROK, "maybe");
+        }
+        let result = env_telemetry_mode_alias(MEDLEY, GROK);
+        unsafe { std::env::remove_var(GROK) };
+        assert_eq!(result, None);
+        let notice = xai_grok_config::legacy_notice().unwrap_or_default();
+        assert!(
+            !notice.contains(GROK),
+            "an unparseable GROK_* value was not honored, got {notice:?}"
+        );
+    }
+
+    #[test]
+    fn env_telemetry_mode_alias_invalid_medley_falls_through_to_grok() {
+        const MEDLEY: &str = "MEDLEY_TEST_TELEMETRY_MODE_ALIAS_INVALID_MEDLEY";
+        const GROK: &str = "GROK_TEST_TELEMETRY_MODE_ALIAS_INVALID_MEDLEY";
+        unsafe {
+            std::env::set_var(MEDLEY, "typo");
+            std::env::set_var(GROK, "0");
+        }
+        let result = env_telemetry_mode_alias(MEDLEY, GROK);
+        unsafe {
+            std::env::remove_var(MEDLEY);
+            std::env::remove_var(GROK);
+        }
+        assert_eq!(result, Some(TelemetryMode::Disabled));
+        let notice = xai_grok_config::legacy_notice().unwrap_or_default();
+        assert!(
+            notice.contains(GROK),
+            "falling through to a parseable GROK_* mode is a real hit, got {notice:?}"
+        );
+    }
+
+    /// `apply_env_overrides` reads the real, hardcoded var names, so both
+    /// assertions live in one test — sequential, not concurrent, is what
+    /// keeps this collision-free without a lock.
+    #[test]
+    fn apply_env_overrides_mixpanel_enabled_prefers_medley_then_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_TELEMETRY_MIXPANEL_ENABLED", "1");
+            std::env::set_var("GROK_TELEMETRY_MIXPANEL_ENABLED", "0");
+        }
+        let mut cfg = TelemetryConfig::default();
+        cfg.apply_env_overrides();
+        assert!(
+            cfg.mixpanel_enabled,
+            "MEDLEY_* must win over a conflicting GROK_*"
+        );
+
+        unsafe {
+            std::env::remove_var("MEDLEY_TELEMETRY_MIXPANEL_ENABLED");
+            std::env::set_var("GROK_TELEMETRY_MIXPANEL_ENABLED", "1");
+        }
+        let mut cfg = TelemetryConfig::default();
+        cfg.apply_env_overrides();
+        assert!(
+            cfg.mixpanel_enabled,
+            "GROK_* must still work when MEDLEY_* is unset"
+        );
+
+        unsafe {
+            std::env::remove_var("MEDLEY_TELEMETRY_MIXPANEL_ENABLED");
+            std::env::remove_var("GROK_TELEMETRY_MIXPANEL_ENABLED");
+        }
+    }
+
+    #[test]
+    fn apply_env_overrides_trace_upload_prefers_medley_then_grok() {
+        unsafe {
+            std::env::set_var("MEDLEY_TELEMETRY_TRACE_UPLOAD", "0");
+            std::env::set_var("GROK_TELEMETRY_TRACE_UPLOAD", "1");
+        }
+        let mut cfg = TelemetryConfig::default();
+        cfg.apply_env_overrides();
+        assert_eq!(
+            cfg.trace_upload,
+            Some(false),
+            "MEDLEY_* must win over a conflicting GROK_*"
+        );
+
+        unsafe {
+            std::env::remove_var("MEDLEY_TELEMETRY_TRACE_UPLOAD");
+            std::env::set_var("GROK_TELEMETRY_TRACE_UPLOAD", "1");
+        }
+        let mut cfg = TelemetryConfig::default();
+        cfg.apply_env_overrides();
+        assert_eq!(
+            cfg.trace_upload,
+            Some(true),
+            "GROK_* must still work when MEDLEY_* is unset"
+        );
+
+        unsafe {
+            std::env::remove_var("MEDLEY_TELEMETRY_TRACE_UPLOAD");
+            std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD");
         }
     }
 

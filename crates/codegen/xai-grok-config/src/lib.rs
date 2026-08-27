@@ -32,6 +32,11 @@ pub mod state_home;
 mod validation;
 pub mod version_overrides;
 
+// Kept off the alphabetized `pub mod` block above, on its own line, the same
+// way `pin_grok_home` was hoisted below (#405): a future sync's own insertion
+// there must not collide with this fork-only module.
+pub mod env_alias;
+
 // Only the cross-crate campaign surface is re-exported at the root; the rest stays
 // reachable via the `pub mod` paths for in-crate use without widening the API.
 pub use campaigns::{
@@ -90,6 +95,14 @@ pub use validation::{
     load_merged_requirements, requirements_layers, try_requirements_layers, validate_requirements,
 };
 pub use version_overrides::{VersionOverrideError, apply_version_overrides};
+
+// Fork-only, kept off any alphabetized `pub use` block for the same reason as
+// `pin_grok_home` above (#405): a future sync's own additions to those blocks
+// must not collide with this re-export.
+pub use env_alias::{
+    legacy_notice, note_legacy_hit, resolve_env_bool, resolve_env_var, resolve_env_var_os,
+    resolve_from_map,
+};
 
 /// Parse an env var as a boolean. `None` if unset or unrecognized.
 pub fn env_bool(name: &str) -> Option<bool> {

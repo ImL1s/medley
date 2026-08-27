@@ -56,9 +56,10 @@ local models, each with its credentials kept in its own lane.
 > **State lives in `~/.medley`.** It resolves as `$MEDLEY_HOME` → `$GROK_HOME` →
 > `~/.medley` when it exists → `~/.grok` when it exists and `~/.medley` does not
 > → `~/.medley`, so a fresh install lands in `~/.medley` while an existing
-> `~/.grok` keeps working. `MEDLEY_HOME` is the only `MEDLEY_*` variable the
-> binary itself reads; every other application variable is still `GROK_*`. The
-> `MEDLEY_*` prefix otherwise belongs to the installer. See
+> `~/.grok` keeps working. A documented, user-facing subset of application
+> variables also reads `MEDLEY_*` first with `GROK_*` as a permanent fallback
+> ([#426](https://github.com/ImL1s/medley/issues/426)); most `GROK_*` variables
+> have no `MEDLEY_*` equivalent and never will. See
 > [Coexistence](#coexistence-with-official-grok-build) for the migration and the
 > remaining sharp edges.
 
@@ -181,8 +182,12 @@ directory, so the two builds no longer collide by default. What still needs care
 - **Environment.** Both builds still honour the same `GROK_*` variables,
   including `GROK_HOME`. Exporting `GROK_HOME` globally therefore points both at
   one directory again — set `MEDLEY_HOME` instead, which only Medley reads.
-  Renaming the application's own `GROK_*` variables is remaining scope on
-  [#49](https://github.com/ImL1s/medley/issues/49).
+  A documented, user-facing subset of the other application variables (auth,
+  telemetry, theme, and similar) also reads a `MEDLEY_*` alias first, with
+  `GROK_*` as a permanent fallback — see the "Environment Variables" reference
+  in [05-configuration.md](crates/codegen/xai-grok-pager/docs/user-guide/05-configuration.md)
+  for the enumerated set and [#426](https://github.com/ImL1s/medley/issues/426)
+  for why it isn't every `GROK_*` variable.
 
 > [!NOTE]
 > **Medley does not self-update.** The inherited updater points at upstream's
