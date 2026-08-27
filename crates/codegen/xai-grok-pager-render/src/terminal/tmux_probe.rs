@@ -13,6 +13,12 @@ const POST_EXIT_CLEANUP_GRACE: Duration = Duration::from_millis(300);
 const GROUP_EXIT_GRACE: Duration = Duration::from_millis(100);
 const GROUP_EXIT_POLL: Duration = Duration::from_millis(1);
 
+#[cfg(test)]
+thread_local! {
+    static TERMINATE_OWNED_GROUP_SLEEPS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TmuxCommand<'a> {
     Version,
@@ -171,6 +177,8 @@ fn terminate_owned_group(group: &xai_tty_utils::ProcessGroup) {
         if std::time::Instant::now() >= deadline {
             break;
         }
+        #[cfg(test)]
+        TERMINATE_OWNED_GROUP_SLEEPS.with(|c| c.set(c.get() + 1));
         std::thread::sleep(GROUP_EXIT_POLL);
     }
     let _ = group.kill();
@@ -469,9 +477,15 @@ mod tests {
     fn post_exit_grace_is_fresh_not_borrowed_from_an_earlier_deadline() {
         let (group, mut child, stdout_rx, stderr_rx) = spawn_sigterm_ignoring_pipe_holder();
 
-        let (stdout, stderr) =
-            post_exit_cleanup_and_drain(&group, stdout_rx, stderr_rx, POST_EXIT_CLEANUP_GRACE)
-                .expect("a fresh nominal grace must survive the SIGTERM->SIGKILL escalation");
+        // Escalation and drain are separate waits: requiring both to finish
+        // inside `POST_EXIT_CLEANUP_GRACE` fails for correct code whenever
+        // the test thread is descheduled across the SIGKILL (#501 review).
+        terminate_owned_group(&group);
+        let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let stdout = recv_pipe_drain(stdout_rx, drain_deadline, "stdout")
+            .expect("pipes must close after SIGKILL, independent of cleanup grace");
+        let stderr = recv_pipe_drain(stderr_rx, drain_deadline, "stderr")
+            .expect("stderr drain after SIGKILL");
         assert_eq!(String::from_utf8_lossy(&stdout).trim(), "ok");
         assert!(stderr.is_empty());
 
@@ -768,39 +782,26 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let tmux = bin.join("tmux");
         // `timeout` and the descendant's own 800ms self-close (below) are
-        // NOT independent quantities under load -- both are functions of
-        // `D`, how long perl startup + `setsid()` + the marker handshake
-        // actually take on a contended host, and they move in the SAME
-        // direction as `D` grows. The borrowed-remainder mutation's
-        // window is `timeout - D` (the fixed absolute deadline computed
-        // once at spawn, minus however much of it `D` already spent); the
-        // descendant's absolute close time is `D + 800ms` (its sleep
-        // starts right after the marker write, which is what `D` mostly
-        // consists of). The mutation stops being caught once `D + 800ms
-        // >= timeout`, i.e. once `D >= timeout - 800ms` -- Codex's review
-        // of this test measured that crossing directly: at `timeout =
-        // 1500ms` a `D` of ~700ms (plausible on a loaded host; this
-        // file's own tests have been observed under load averages of
-        // 90-120 on a 16-core box earlier in this PR's own history) was
-        // enough to make the mutation silently pass undetected. Fixed by
-        // widening `timeout` alone, generously, so the margin (`timeout -
-        // 800ms`) some multi-second `D` would be needed to close --
-        // several times larger than any perl-startup delay this session
-        // has actually observed, including under that same load. The
-        // fresh-grace direction was never at risk: its own window is `D +
-        // 300ms` against the descendant's `D + 800ms`, a `D`-independent
-        // 500ms gap regardless of how large `timeout` is.
+        // NOT independent quantities under load if the holder's countdown
+        // starts at the marker write: a descheduled leader burns the 800ms
+        // before exiting, shrinking the remaining grace. The holder now
+        // waits for a second "leader-exited" file before sleeping, so the
+        // 800ms starts after the leader's exit path (#501 review).
         let timeout = Duration::from_millis(5000);
         let ready_marker = temp.path().join("descendant-ready");
+        let go_marker = temp.path().join("leader-exited");
         let script = format!(
             "#!/bin/sh\n\
              ( /usr/bin/perl -e 'use POSIX qw(setsid); setsid(); \
              open(my $fh, \">\", \"{marker}\") or die $!; close $fh; \
+             while (! -e \"{go}\") {{ select(undef, undef, undef, 0.01); }} \
              select(undef, undef, undef, 0.8);' ) &\n\
              while [ ! -f \"{marker}\" ]; do :; done\n\
              printf 'tmux 3.4\\n'\n\
+             : > \"{go}\"\n\
              exit 0\n",
             marker = ready_marker.display(),
+            go = go_marker.display(),
         );
         std::fs::write(&tmux, script).unwrap();
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -838,44 +839,19 @@ mod tests {
         );
     }
 
-    /// #499 enrolled this whole module on the CI hot path, and #501's
-    /// review of a *different* test in that same enrolled set (Codex,
-    /// `.github/workflows/ci.yml:1189`) pointed out this test carries the
-    /// same wall-clock-upper-bound defect this file's other tests were
-    /// just rewritten to avoid: `terminate_owned_group`'s empty-group
-    /// short-circuit returns before any `std::thread::sleep`, so under
-    /// real contention a descheduled test thread could push `elapsed`
-    /// past a tight bound even though the code took the fast path.
-    ///
-    /// Widened from `GROUP_EXIT_GRACE / 2` (50ms) to `GROUP_EXIT_GRACE`
-    /// itself (100ms). The mutation this test exists to catch — the
-    /// short-circuit failing to fire, falling through to the deadline
-    /// loop — makes `elapsed` at least `GROUP_EXIT_GRACE` by construction
-    /// (the loop does not return until its own deadline, computed from
-    /// that same constant, is reached), so the red direction is
-    /// guaranteed regardless of load: scheduling delay can only push a
-    /// broken short-circuit's `elapsed` later, never under the bound.
-    /// Only the green-side margin changes — a correct short-circuit now
-    /// needs more than 100ms of descheduling across three adjacent
-    /// in-thread statements to false-fail, instead of more than 50ms.
-    ///
-    /// Named rather than hidden: this is still an upper bound, and an
-    /// upper bound is never fully immune to scheduling — only less
-    /// exposed. Making it provably immune would need instrumenting
-    /// `terminate_owned_group` itself (a call-count or injected clock) to
-    /// observe "did the poll loop's sleep ever run" directly instead of
-    /// inferring it from wall time, which is more machinery than this
-    /// specific test has earned.
+    /// Observe the poll/sleep path directly instead of inferring it from
+    /// wall time: an empty group returns before `sleep`, so a descheduled
+    /// test thread cannot false-fail a correct short-circuit (#501 review).
     #[cfg(unix)]
     #[test]
     fn empty_group_teardown_does_not_wait_out_the_grace() {
         let group = xai_tty_utils::ProcessGroup::new().expect("group");
-        let started = std::time::Instant::now();
+        TERMINATE_OWNED_GROUP_SLEEPS.with(|c| c.set(0));
         terminate_owned_group(&group);
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < GROUP_EXIT_GRACE,
-            "an empty group must not wait out the grace, took {elapsed:?}"
+        assert_eq!(
+            TERMINATE_OWNED_GROUP_SLEEPS.with(|c| c.get()),
+            0,
+            "an empty group must return before the poll/sleep loop"
         );
     }
 
