@@ -1602,6 +1602,23 @@ impl acp::Agent for MvpAgent {
                 }
             }
         };
+        if is_chat_kind
+            && !chat_spawn_identity_unchanged(
+                chat_spawn_user_id.as_deref(),
+                chat_spawn_auth_generation,
+                self.chat_modes.current_user_id().as_deref(),
+                self.chat_modes.current_auth_generation(),
+            )
+        {
+            if prepared_session.is_none() {
+                self.remove_session(&session_id);
+                #[cfg(all(feature = "local-workspace", unix))]
+                self.shutdown_gateway_bridge(&session_id);
+            }
+            return Err(acp::Error::internal_error().data(
+                "chat identity changed during session/new",
+            ));
+        }
         let mut meta = serde_json::json!({
             "currentWorkingDirectory": cwd.as_str().to_owned(),
             "codebaseIndexed": indexed_roots,
