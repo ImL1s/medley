@@ -172,7 +172,25 @@ def _path_module_prefix(rs: Path) -> list[str]:
     return list(rest)
 
 
-def _declared_module_overrides(root: Path) -> dict[Path, list[str]]:
+def _is_lib_or_integration_source(rs: Path) -> bool:
+    """CLAUDE.md measures `--lib` plus integration targets, not bins.
+
+    `src/main.rs` and `src/bin/**` are cargo binary roots; a test there is
+    not selected by the documented hot-path invocation (#507 review).
+    """
+    split = _crate_source_rel(rs)
+    if split is None:
+        return False
+    marker, rest = split
+    if marker == "src" and rest:
+        if rest[0] == "bin":
+            return False
+        if rest == ["main.rs"]:
+            return False
+    return True
+
+
+def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
     """`#[path = "..."] mod name;` maps the target to the declaring
     file's module prefix plus `name`.
 
@@ -182,13 +200,18 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[str]]:
     auth_error_no_retry_tests;` is
     `session::acp_session::auth_error_no_retry_tests`, not
     `session::acp_session_tests::...` (#507 review).
+
+    One file included by several integration targets contributes one
+    prefix per declaring target, not a last-writer-wins map (#507 review).
     """
-    overrides: dict[Path, list[str]] = {}
+    overrides: dict[Path, list[list[str]]] = {}
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
             continue
         for rs in base_dir.rglob("*.rs"):
+            if not _is_lib_or_integration_source(rs):
+                continue
             try:
                 text = rs.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
@@ -203,12 +226,47 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[str]]:
                 semi = _MOD_SEMI.match(line)
                 if semi and pending_path:
                     child = (rs.parent / pending_path).resolve()
-                    overrides[child] = _path_module_prefix(rs) + [semi.group(1)]
+                    overrides.setdefault(child, []).append(
+                        _path_module_prefix(rs) + [semi.group(1)]
+                    )
                     pending_path = None
                     continue
                 if line:
                     pending_path = None
     return overrides
+
+
+def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
+    names: list[str] = []
+    lines = text.splitlines()
+    mod_stack: list[tuple[int, str]] = []
+    depth = 0
+    n = len(lines)
+    for i in range(n):
+        raw = lines[i]
+
+        if _TEST_ATTR.match(raw):
+            for follow_raw in lines[i + 1 :]:
+                follow = follow_raw.strip()
+                if follow.startswith("#[") or follow.startswith("//"):
+                    continue
+                if not follow:
+                    continue
+                m = _FN.match(follow_raw)
+                if m:
+                    prefix_parts = file_mods + [name for _, name in mod_stack]
+                    prefix = "::".join(prefix_parts)
+                    names.append(f"{prefix}::{m.group(1)}" if prefix else m.group(1))
+                break
+
+        line = _strip_line_comment(raw)
+        mod_match = _MOD_OPEN.match(line)
+        if mod_match:
+            mod_stack.append((depth, mod_match.group(1)))
+        depth += line.count("{") - line.count("}")
+        while mod_stack and depth <= mod_stack[-1][0]:
+            mod_stack.pop()
+    return names
 
 
 def _qualified_test_names(root: Path) -> list[str]:
@@ -231,44 +289,16 @@ def _qualified_test_names(root: Path) -> list[str]:
         if not base_dir.is_dir():
             continue
         for rs in base_dir.rglob("*.rs"):
+            if not _is_lib_or_integration_source(rs):
+                continue
             try:
                 text = rs.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            file_mods = _path_module_prefix(rs)
             key = rs.resolve()
-            if key in overrides:
-                file_mods = list(overrides[key])
-            lines = text.splitlines()
-            mod_stack: list[tuple[int, str]] = []
-            depth = 0
-            n = len(lines)
-            for i in range(n):
-                raw = lines[i]
-
-                if _TEST_ATTR.match(raw):
-                    for follow_raw in lines[i + 1 :]:
-                        follow = follow_raw.strip()
-                        if follow.startswith("#[") or follow.startswith("//"):
-                            continue
-                        if not follow:
-                            continue
-                        m = _FN.match(follow_raw)
-                        if m:
-                            prefix_parts = file_mods + [name for _, name in mod_stack]
-                            prefix = "::".join(prefix_parts)
-                            names.append(
-                                f"{prefix}::{m.group(1)}" if prefix else m.group(1)
-                            )
-                        break
-
-                line = _strip_line_comment(raw)
-                mod_match = _MOD_OPEN.match(line)
-                if mod_match:
-                    mod_stack.append((depth, mod_match.group(1)))
-                depth += line.count("{") - line.count("}")
-                while mod_stack and depth <= mod_stack[-1][0]:
-                    mod_stack.pop()
+            prefix_lists = overrides.get(key) or [_path_module_prefix(rs)]
+            for file_mods in prefix_lists:
+                names.extend(_tests_in_file(text, file_mods))
     return names
 
 
@@ -395,6 +425,32 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_regressions::works", names)
+
+    def test_shared_module_included_by_two_targets_is_counted_twice(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            tests = root / "crates" / "codegen" / "demo" / "tests"
+            tests.mkdir(parents=True)
+            (tests / "shared.rs").write_text(
+                "#[test]\nfn none_auth_scheme_sends() {}\n"
+            )
+            (tests / "a.rs").write_text('#[path = "shared.rs"]\nmod common;\n')
+            (tests / "b.rs").write_text('#[path = "shared.rs"]\nmod common;\n')
+            names = _qualified_test_names(root)
+            self.assertEqual(names.count("common::none_auth_scheme_sends"), 2)
+
+    def test_src_bin_tests_are_not_scanned(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "codegen" / "demo" / "src"
+            (src / "bin").mkdir(parents=True)
+            (src / "lib.rs").write_text("")
+            (src / "bin" / "workspace_server.rs").write_text(
+                "#[test]\nfn none_auth_scheme_sends() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertNotIn("none_auth_scheme_sends", names)
+            self.assertTrue(all("workspace_server" not in n for n in names))
 
 
 if __name__ == "__main__":
