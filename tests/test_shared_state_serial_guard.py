@@ -2037,6 +2037,50 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_glob_reexported_bump_untagged"})
 
+    def test_reexported_static_import_is_a_direct_touch(self):
+        """`pub use crate::a::COUNTER` must make `use crate::b::COUNTER`
+        a touch of the registered static (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    pub use crate::a::COUNTER;
+                    """
+                ),
+            ),
+            (
+                Path("src/c.rs"),
+                src(
+                    """\
+                    use crate::b::COUNTER;
+
+                    #[test]
+                    fn first_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_reexport_chain_resolves_through_each_exporter(self):
         """`pub use` of a `pub use` still has to land on the definition
         (#516 review)."""
@@ -3663,6 +3707,60 @@ class DefaultScanRoots(unittest.TestCase):
                     #[test]
                     fn second_untagged() {
                         super::helper();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_nested_path_attribute_inherits_the_parent_override(self):
+        """A `#[path]` file that itself `#[path]`s tests must keep the
+        first override's module, not the physical directory (#516 review)."""
+
+        sources = [
+            (
+                Path("src/managed.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn helper() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[path = "impl/mid.rs"]
+                    mod mid;
+                    """
+                ),
+            ),
+            (
+                Path("src/impl/mid.rs"),
+                src(
+                    """\
+                    pub fn relay() {
+                        super::helper();
+                    }
+
+                    #[path = "mid_tests.rs"]
+                    mod tests;
+                    """
+                ),
+            ),
+            (
+                Path("src/impl/mid_tests.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn first_untagged() {
+                        super::relay();
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        super::relay();
                     }
                     """
                 ),

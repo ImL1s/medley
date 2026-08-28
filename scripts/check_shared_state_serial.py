@@ -1306,28 +1306,82 @@ _PATH_MOD = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
 _PATH_OVERRIDE: dict[str, tuple[str, ...]] = {}
+_REEXPORTS: list[tuple[tuple[str, ...], str, tuple[str, ...], str]] = []
 
 
 def _load_path_overrides(sources: list[tuple[Path, str]]) -> None:
     """`#[path = \"foo.rs\"] mod bar;` maps foo.rs to this file's module
-    plus `bar`, not foo's filename stem (#516 review)."""
+    plus `bar`, not foo's filename stem. Nested `#[path]` files inherit
+    the already-resolved parent module (#516 review)."""
 
     global _PATH_OVERRIDE
     _PATH_OVERRIDE = {}
+    decls: list[tuple[Path, str, str]] = []
     for rel, text in sources:
-        parent = _module_path_fs(rel)
-        if parent is None:
-            parent = ()
-        # Scan the raw file: `_code_only` blanks string literals, which
-        # would erase the `#[path = "..."]` value. Skip matches whose
-        # `#` sits inside a comment or string.
         code = _code_only(text)
         for match in _PATH_MOD.finditer(text):
             start = match.start()
             if start < len(code) and code[start] == " " and text[start] != " ":
                 continue
             child = _norm_posix(rel.parent / match.group(1))
-            _PATH_OVERRIDE[child] = parent + (match.group(2),)
+            decls.append((rel, child, match.group(2)))
+    if not decls:
+        return
+    for _ in range(len(decls) + 1):
+        progressed = False
+        for declaring, child, mod_name in decls:
+            parent = _module_path(declaring)
+            if parent is None:
+                parent = ()
+            new = parent + (mod_name,)
+            if _PATH_OVERRIDE.get(child) != new:
+                _PATH_OVERRIDE[child] = new
+                progressed = True
+        if not progressed:
+            break
+
+
+def _load_reexports(sources: list[tuple[Path, str]]) -> None:
+    """Index `pub use` so a re-exported static still matches (#516 review)."""
+
+    global _REEXPORTS
+    _REEXPORTS = []
+    for path, text in sources:
+        _REEXPORTS.extend(_pub_reexports(path, text))
+
+
+def _reexport_reaches(
+    module: tuple[str, ...],
+    fname: str,
+    static_module: tuple[str, ...] | None,
+    identifiers: tuple[str, ...],
+) -> bool:
+    """True when `(module, fname)` is the registered static or pub-uses it."""
+
+    if static_module is None:
+        return False
+    seen: set[tuple[tuple[str, ...], str]] = set()
+    cur_mod, cur_name = module, fname
+    while True:
+        if cur_mod == static_module and cur_name in identifiers:
+            return True
+        key = (cur_mod, cur_name)
+        if key in seen:
+            return False
+        seen.add(key)
+        nxt: tuple[tuple[str, ...], str] | None = None
+        for dest, local, src, src_fname in _REEXPORTS:
+            if dest != cur_mod:
+                continue
+            if local == "*":
+                nxt = (src, cur_name)
+                break
+            if local == cur_name:
+                nxt = (src, src_fname)
+                break
+        if nxt is None:
+            return False
+        cur_mod, cur_name = nxt
 
 
 def _module_path_fs(rel: Path) -> tuple[str, ...] | None:
@@ -2244,17 +2298,33 @@ def _body_touches(
                     resolved = module + (fname,) + segs[1:]
                     if static_module is None or resolved == static_module:
                         return True
+                    if _reexport_reaches(
+                        resolved, ident, static_module, identifiers
+                    ):
+                        return True
                     continue
                 if static_module is None:
                     return True
-                if _resolve_path_module(segs, fn_module, inline_mods) == static_module:
+                resolved_mod = _resolve_path_module(
+                    segs, fn_module, inline_mods
+                )
+                if resolved_mod == static_module:
+                    return True
+                if _reexport_reaches(
+                    resolved_mod or (), ident, static_module, identifiers
+                ):
                     return True
                 continue
             imported = imported_at(ident, match.start())
             if imported is not None:
-                module, _fname = imported
-                if static_module is not None and module != static_module:
-                    continue
+                module, fname = imported
+                if static_module is not None and not (
+                    module == static_module and fname in identifiers
+                ):
+                    if not _reexport_reaches(
+                        module, fname, static_module, identifiers
+                    ):
+                        continue
             return True
     return False
 
@@ -2276,9 +2346,16 @@ def _with_aliases(
     prefix = inline_mods
     while True:
         for local, (module, fname) in file_imports.get(prefix, {}).items():
-            if fname not in known or local in known:
+            if local in known:
                 continue
-            if static_module is not None and module != static_module:
+            if static_module is None:
+                if fname not in known:
+                    continue
+            elif module == static_module and fname in identifiers:
+                pass
+            elif _reexport_reaches(module, fname, static_module, identifiers):
+                pass
+            else:
                 continue
             extra.append(local)
         if not prefix:
@@ -2597,6 +2674,7 @@ def index_functions(
     dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
 ]:
     _load_path_overrides(sources)
+    _load_reexports(sources)
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
     generated_by_macro: dict[tuple[Path, str], list[_MacroArm]] = {}
