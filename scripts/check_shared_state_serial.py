@@ -286,7 +286,9 @@ USE_BRACE = re.compile(
     r"\buse\s+(crate|super|self)((?:::(?:r#)?[A-Za-z_][A-Za-z0-9_]*)*)"
     r"::\{([^}]+)\}\s*;"
 )
-USE_HEAD = re.compile(r"\buse\s+(crate|super|self)")
+USE_HEAD = re.compile(
+    r"\buse\s+(crate|super|self|(?:r#)?[A-Za-z_][A-Za-z0-9_]*)"
+)
 # Any `path::to::name(` call, `crate`-rooted or not. Resolved two ways (see
 # `_resolve_calls`): a `crate`-rooted path by its FULL module path, and every
 # path (rooted or not) by its LAST segment alone against a file's own module
@@ -616,6 +618,42 @@ def _repetition_matches(body: str, sep: str, rep: str, invoke_inner: str) -> boo
     if rep == "+" and groups < 1:
         return False
     return True
+
+
+def _invoke_repeat_count(matcher: str, invoke_inner: str) -> int:
+    """How many times a `$(...)*` matcher expands for this invocation.
+
+    The separator is the matcher's, not a hardcoded comma: `$(ident);*`
+    counts `cases!(one; two)` as two (#516 review).
+    """
+
+    inner = matcher.strip()
+    if len(inner) >= 2 and inner[0] in "([{" and inner[-1] in ")]}":
+        inner = inner[1:-1]
+    parsed = _parse_repetition(inner)
+    if parsed is None:
+        return 1
+    body, sep, _rep = parsed
+    tokens = _token_list(invoke_inner)
+    if not tokens:
+        return 0
+    parts = _matcher_parts(body)
+    sep_tokens = _token_list(sep)
+    cursor = 0
+    groups = 0
+    n = len(tokens)
+    while cursor < n:
+        if groups and sep_tokens:
+            width = len(sep_tokens)
+            if tokens[cursor : cursor + width] != sep_tokens:
+                break
+            cursor += width
+        nxt = _matcher_consume(parts, tokens, cursor)
+        if nxt is None or nxt == cursor:
+            break
+        cursor = nxt
+        groups += 1
+    return groups
 
 
 def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
@@ -1027,6 +1065,21 @@ def _impl_blocks(code: str) -> list[tuple[str, str | None, int, int]]:
     return blocks
 
 
+def _lib_crate_idents() -> frozenset[str]:
+    """Rust idents for the scanned library (`xai-grok-shell` → both
+    hyphen and underscore forms). Integration tests import it as
+    `xai_grok_shell::...`, not `crate::` (#516 review)."""
+
+    crate_dir = DEFAULT_SCAN_ROOT.parent.name
+    rust = crate_dir.replace("-", "_")
+    return frozenset({crate_dir, rust})
+
+
+def _is_lib_crate_ident(name: str) -> bool:
+    rust = name.replace("-", "_")
+    return rust in {ident.replace("-", "_") for ident in _lib_crate_idents()}
+
+
 def _crate_of(path: Path) -> str:
     parts = path.parts
     return parts[2] if len(parts) > 2 else str(path)
@@ -1160,7 +1213,7 @@ def _use_module_prefix(
     file_mod: tuple[str, ...] | None,
     inline_mods: tuple[str, ...] = (),
 ) -> tuple[str, ...] | None:
-    if root == "crate":
+    if root == "crate" or _is_lib_crate_ident(root):
         return mid
     if file_mod is None:
         return None
@@ -2427,7 +2480,13 @@ def index_functions(
             for slot, (serial_held, has_unkeyed, in_repeat, template_index) in enumerate(
                 serials
             ):
-                reps = arity if in_repeat else 1
+                reps = (
+                    _invoke_repeat_count(chosen.matcher, inner)
+                    if in_repeat
+                    else 1
+                )
+                if reps < 1:
+                    continue
                 for rep in range(reps):
                     pending.append(
                         _PendingMacroTest(
@@ -2652,6 +2711,13 @@ def _resolve_calls(
     for m in QUALIFIED_CALL.finditer(fn.body):
         segs = tuple(s.strip() for s in m.group(1).split("::") if s.strip())
         if segs and segs[0] == "crate":
+            _gain_from(
+                gained,
+                keys_of,
+                self_index,
+                by_module.get(segs[1:], {}).get(m.group(2), []),
+            )
+        elif segs and _is_lib_crate_ident(segs[0]):
             _gain_from(
                 gained,
                 keys_of,

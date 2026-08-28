@@ -735,6 +735,39 @@ class TransitiveClosure(unittest.TestCase):
             "two generated tests must not collapse into a sole-member exemption",
         )
 
+    def test_repeated_macro_args_with_semicolon_separator_are_distinct(self):
+        """`cases!(one; two)` with `$($name:ident);*` is two tests
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($($name:ident);*) => {
+                    $(
+                        #[test]
+                        fn $name() {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    )*
+                };
+            }
+
+            cases!(one; two);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+        findings = guard.scan_source(text)
+        self.assertGreaterEqual(
+            len(findings),
+            1,
+            "semicolon-separated generated tests must not collapse into a sole-member exemption",
+        )
+
     def test_fixed_arity_macro_is_not_multiplied_by_argument_count(self):
         """`case!(name, expected)` emits one test, not one per argument (#516 review)."""
 
@@ -3204,6 +3237,46 @@ class DefaultScanRoots(unittest.TestCase):
             files = {rel.as_posix() for rel, _text in guard.collect_sources(repo, roots)}
             self.assertIn("crates/codegen/xai-grok-shell/src/lib.rs", files)
             self.assertIn("crates/codegen/xai-grok-shell/tests/it.rs", files)
+
+    def test_integration_test_library_import_reaches_registered_state(self):
+        """`use xai_grok_shell::bump` in `tests/*.rs` is the library
+        helper, not a same-crate path (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    use xai_grok_shell::bump;
+
+                    #[test]
+                    fn first_untagged() {
+                        bump();
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
 
 
 class ReportFormatting(unittest.TestCase):
