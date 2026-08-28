@@ -1202,6 +1202,17 @@ def _module_path(rel: Path) -> tuple[str, ...] | None:
     segs = list(parts[parts.index(root_key) + 1 :])
     if not segs:
         return None
+    if root_key == "src" and segs and segs[0] == "bin":
+        rest = segs[1:]
+        if len(rest) <= 1:
+            return None
+        if len(rest) == 2 and rest[1] == "main.rs":
+            return None
+        nested = list(rest[1:])
+        nested[-1] = Path(nested[-1]).stem
+        if nested[-1] in ("mod", "main"):
+            nested = nested[:-1]
+        return tuple(nested)
     if root_key == "tests":
         if len(segs) == 1:
             return None
@@ -1567,7 +1578,27 @@ def _process_group(path: Path) -> str:
             root = Path(parts[index + 1]).stem
             return f"bin:{crate}/tests/{root}"
         return f"bin:{crate}/tests"
+    stem = _src_bin_target_stem(path)
+    if stem is not None:
+        return f"bin:{_crate_of(path)}/src/bin/{stem}"
     return f"lib:{_crate_of(path)}"
+
+
+def _src_bin_target_stem(path: Path) -> str | None:
+    """Binary target name for `src/bin/tool.rs` / `src/bin/tool/main.rs`."""
+
+    parts = path.parts
+    if "src" not in parts:
+        return None
+    segs = list(parts[parts.index("src") + 1 :])
+    if not segs or segs[0] != "bin":
+        return None
+    rest = segs[1:]
+    if not rest:
+        return None
+    if len(rest) == 1 and rest[0].endswith(".rs"):
+        return Path(rest[0]).stem
+    return rest[0]
 
 
 _MOD_DECL = re.compile(r"\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
@@ -2874,7 +2905,9 @@ def _resolve_calls(
     file_arms = by_macro_arms.get(fn.file, {})
     for m in MACRO_INVOKE.finditer(fn.body):
         name = m.group(1)
-        arms = file_arms.get(name)
+        imported = _fn_import(fn, name, m.start(), imports_by_file)
+        resolved = imported[1] if imported is not None else name
+        arms = file_arms.get(name) or file_arms.get(resolved)
         if arms:
             inner = _macro_invoke_inner(fn.body, m.end())
             arity = _macro_invoke_arity(fn.body, m.end())
@@ -2888,7 +2921,14 @@ def _resolve_calls(
                 continue
         j = macro_index.get(name)
         if j is None:
-            _gain_from(gained, keys_of, self_index, by_macro_any.get(name, []))
+            j = macro_index.get(resolved)
+        if j is None:
+            _gain_from(
+                gained,
+                keys_of,
+                self_index,
+                by_macro_any.get(resolved, []) or by_macro_any.get(name, []),
+            )
             continue
         if j != self_index:
             gained.update(keys_of[j])
@@ -2901,6 +2941,13 @@ def _resolve_calls(
                 self_index,
                 by_module.get(segs[1:], {}).get(m.group(2), []),
             )
+            if not segs[1:] and caller_module in (None, ()):
+                # Binary/integration crate roots have no `src`-relative
+                # module path; `crate::bump()` is a same-crate-root call
+                # (#516 review).
+                _gain_from(
+                    gained, keys_of, self_index, file_index.get(m.group(2), [])
+                )
         elif segs and _is_lib_crate_ident(segs[0]):
             _gain_from(
                 gained,
