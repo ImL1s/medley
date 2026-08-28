@@ -600,6 +600,22 @@ def _toml_str_list(value: object) -> set[str]:
     return {item for item in value if isinstance(item, str)}
 
 
+def _feature_closure(features: object, roots: set[str]) -> set[str]:
+    """Features enabled by `roots`, including transitive `feature = [...]`
+    edges (#507 review)."""
+
+    table = features if isinstance(features, dict) else {}
+    enabled = set(roots)
+    stack = list(roots)
+    while stack:
+        name = stack.pop()
+        for dep in _toml_str_list(table.get(name)):
+            if dep not in enabled:
+                enabled.add(dep)
+                stack.append(dep)
+    return enabled
+
+
 def _manifest_default_features(text: str) -> set[str]:
     """Names listed in `[features] default = [...]`, including multiline."""
 
@@ -644,10 +660,13 @@ def _cargo_test_targets(
             pkg = data.get("package")
             if isinstance(pkg, dict) and pkg.get("autotests") is False:
                 no_autotest.add(crate.resolve())
-            default_feats = _toml_str_list(
-                data.get("features", {}).get("default")
+            feat_table = (
+                data.get("features")
                 if isinstance(data.get("features"), dict)
-                else None
+                else {}
+            )
+            default_feats = _feature_closure(
+                feat_table, _toml_str_list(feat_table.get("default"))
             )
             lib = data.get("lib")
             if isinstance(lib, dict):
@@ -1036,7 +1055,7 @@ def _cfg_attr_is_inactive(attr: str) -> bool:
 def _file_inner_cfg_inactive(text: str) -> bool:
     """True when the file is gated off by a leading `#![cfg(...)]`."""
 
-    for raw in text.splitlines():
+    for raw in _mask_rust_literals(text).splitlines():
         stripped = raw.strip()
         if not stripped or stripped.startswith("//"):
             continue
@@ -1564,6 +1583,28 @@ class ExternalModulePrefix(unittest.TestCase):
             names = _qualified_test_names(root)
             self.assertIn("visible", names)
 
+    def test_transitively_enabled_required_features_stay_seeded(self):
+        """`default = [\"bundle\"]` enabling `hot` still seeds a target
+        that requires `hot` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            tests = crate / "tests"
+            tests.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[features]\ndefault = [\"bundle\"]\n"
+                'bundle = ["hot"]\n'
+                'hot = []\n\n'
+                "[[test]]\nname = \"gated\"\n"
+                'required-features = ["hot"]\n',
+                encoding="utf-8",
+            )
+            (tests / "gated.rs").write_text("#[test]\nfn visible() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("visible", names)
+
     def test_multiline_default_features_keep_required_targets_seeded(self):
         """`default = [` split across lines is still the crate default
         (#507 review)."""
@@ -1992,6 +2033,30 @@ class ExternalModulePrefix(unittest.TestCase):
                 "#[test]\nfn none_auth_scheme_everywhere() {}\n"
             )
             (src / "platform.rs").write_text(
+                "#![cfg(windows)]\n"
+                "#[test]\nfn none_auth_scheme_windows_inner() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_everywhere", names)
+            if sys.platform == "win32":
+                self.assertIn("platform::none_auth_scheme_windows_inner", names)
+            else:
+                self.assertNotIn("platform::none_auth_scheme_windows_inner", names)
+
+    def test_inner_cfg_after_block_comment_is_honored(self):
+        """A leading `/* license */` must not hide `#![cfg(windows)]`
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "codegen" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "mod platform;\n"
+                "#[test]\nfn none_auth_scheme_everywhere() {}\n"
+            )
+            (src / "platform.rs").write_text(
+                "/* license */\n"
                 "#![cfg(windows)]\n"
                 "#[test]\nfn none_auth_scheme_windows_inner() {}\n"
             )
