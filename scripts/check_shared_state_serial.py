@@ -2244,7 +2244,7 @@ def _resolve_path_module(
     if not segs:
         return None
     base = (fn_module or ()) + inline_mods
-    if segs[0] == "crate":
+    if segs[0] == "crate" or _is_lib_crate_ident(segs[0]):
         return segs[1:]
     if segs[0] == "self":
         return base + segs[1:]
@@ -3082,10 +3082,11 @@ class Finding:
 
 
 def _ufcs_calls(body: str) -> list[tuple[str, str]]:
-    """`<Type as Trait>::method(` with nested generics on Type and Trait.
+    """`<Type as Trait>::method(` and `<Type>::method(`.
 
     Resolves like TYPE_ASSOC_CALL: last segment of the type path against
-    `by_type` (#516 review).
+    `by_type` (#516 review). `<Type>::method()` is valid Rust and is
+    not rejected for lacking `as Trait` (#516 review).
     """
 
     out: list[tuple[str, str]] = []
@@ -3098,16 +3099,17 @@ def _ufcs_calls(body: str) -> list[tuple[str, str]]:
         i = lt + 1
         type_name, i = _read_type_path(body, i)
         i = _skip_ws(body, i)
-        if type_name is None or not body.startswith("as", i):
+        if type_name is None:
             index = lt + 1
             continue
-        after_as = i + 2
-        if after_as < n and (body[after_as].isalnum() or body[after_as] == "_"):
-            index = lt + 1
-            continue
-        i = _skip_ws(body, after_as)
-        _trait, i = _read_type_path(body, i)
-        i = _skip_ws(body, i)
+        if body.startswith("as", i):
+            after_as = i + 2
+            if after_as < n and (body[after_as].isalnum() or body[after_as] == "_"):
+                index = lt + 1
+                continue
+            i = _skip_ws(body, after_as)
+            _trait, i = _read_type_path(body, i)
+            i = _skip_ws(body, i)
         if i >= n or body[i] != ">":
             index = lt + 1
             continue

@@ -2763,6 +2763,37 @@ class TypeAssociatedResolution(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"calls_type_assoc_untagged"})
 
+    def test_angle_bracket_type_assoc_without_as_trait_resolves(self):
+        """`<State>::bump()` is a valid associated call with no `as Trait`
+        clause (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct State;
+
+            impl State {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn first_untagged() {
+                <State>::bump();
+            }
+
+            #[test]
+            fn second_untagged() {
+                <State>::bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_cross_file_type_assoc_call_resolves_crate_wide(self):
         """The real #492 shape: `search_recovery::CacheEpoch::now()`, called
         from a DIFFERENT file than `CacheEpoch`'s own `impl` block."""
@@ -3528,6 +3559,42 @@ class DefaultScanRoots(unittest.TestCase):
                     #[test]
                     fn second_untagged() {
                         bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_integration_test_library_static_path_is_crate_rooted(self):
+        """`xai_grok_shell::a::COUNTER` in `tests/*.rs` is the library
+        static, not a path under the integration module (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    pub mod a {
+                        // SERIAL-GROUP: demo_key
+                        pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn first_untagged() {
+                        xai_grok_shell::a::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        xai_grok_shell::a::COUNTER.fetch_add(1, Ordering::SeqCst);
                     }
                     """
                 ),
