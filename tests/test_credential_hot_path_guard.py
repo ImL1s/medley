@@ -110,7 +110,54 @@ def _mask_rust_literals(text: str) -> str:
     def keep_newlines(chunk: str) -> str:
         return "".join("\n" if c == "\n" else " " for c in chunk)
 
+    def skip_quoted(index: int, quote: str) -> int:
+        index += 1
+        while index < n:
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == quote:
+                return index + 1
+            index += 1
+        return n
+
+    def attribute_end(hash_index: int) -> int | None:
+        """End of `#[...]` / `#![...]`, keeping string values intact."""
+
+        j = hash_index + 1
+        if j < n and text[j] == "!":
+            j += 1
+        if j >= n or text[j] != "[":
+            return None
+        depth = 0
+        while j < n:
+            raw = _RAW_STRING_START.match(text, j)
+            if raw:
+                hashes = raw.group(1)
+                closer = '"' + hashes
+                end = text.find(closer, raw.end())
+                j = n if end < 0 else end + len(closer)
+                continue
+            if text[j] in "\"'":
+                j = skip_quoted(j, text[j])
+                continue
+            if text[j] == "[":
+                depth += 1
+            elif text[j] == "]":
+                depth -= 1
+                j += 1
+                if depth == 0:
+                    return j
+                continue
+            j += 1
+        return n
+
     while i < n:
+        attr_end = attribute_end(i) if text[i] == "#" else None
+        if attr_end is not None:
+            out.append(text[i:attr_end])
+            i = attr_end
+            continue
         if text.startswith("//", i):
             end = text.find("\n", i)
             if end < 0:
@@ -321,11 +368,15 @@ def _is_cargo_crate_root_file(
     rs: Path,
     extra_roots: set[Path] | frozenset[Path] | None = None,
     gated_roots: set[Path] | frozenset[Path] | None = None,
+    suppressed_libs: set[Path] | frozenset[Path] | None = None,
+    no_autotest: set[Path] | frozenset[Path] | None = None,
 ) -> bool:
     """`src/lib.rs`, an integration target `tests/*.rs`, or an explicit `[[test]].path`.
 
     `required-features` targets are off by default and are not part of the
-    documented hot-path invocation (#507 review).
+    documented hot-path invocation (#507 review). An explicit `[lib] path`
+    replaces `src/lib.rs` (#507 review). `autotests = false` turns off
+    `tests/*.rs` auto-discovery (#507 review).
     """
 
     key = rs.resolve()
@@ -333,6 +384,8 @@ def _is_cargo_crate_root_file(
         return False
     if extra_roots and key in extra_roots:
         return True
+    if suppressed_libs and key in suppressed_libs:
+        return False
     split = _crate_source_rel(rs)
     if split is None:
         return False
@@ -340,6 +393,9 @@ def _is_cargo_crate_root_file(
     if marker == "src" and rest == ["lib.rs"]:
         return True
     if marker == "tests" and len(rest) == 1 and rest[0].endswith(".rs"):
+        crate_dir = rs.parent.parent.resolve()
+        if no_autotest and crate_dir in no_autotest:
+            return False
         return True
     return False
 
@@ -370,7 +426,9 @@ def _manifest_default_features(text: str) -> set[str]:
     return _toml_str_list(feats.get("default"))
 
 
-def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
+def _cargo_test_targets(
+    root: Path,
+) -> tuple[set[Path], set[Path], set[Path], set[Path]]:
     """Explicit `[[test]]` paths and feature-gated integration targets.
 
     Extra roots: `path =` files cargo compiles without extra features.
@@ -385,6 +443,8 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
 
     extra: set[Path] = set()
     gated: set[Path] = set()
+    suppressed_libs: set[Path] = set()
+    no_autotest: set[Path] = set()
     for manifest in root.rglob("Cargo.toml"):
         if "target" in manifest.parts:
             continue
@@ -395,6 +455,9 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
         crate = manifest.parent
         data = _load_manifest_toml(text)
         if data is not None:
+            pkg = data.get("package")
+            if isinstance(pkg, dict) and pkg.get("autotests") is False:
+                no_autotest.add(crate.resolve())
             default_feats = _toml_str_list(
                 data.get("features", {}).get("default")
                 if isinstance(data.get("features"), dict)
@@ -407,6 +470,7 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
                     target = (crate / lib_path).resolve()
                     if target.is_file():
                         extra.add(target)
+                    suppressed_libs.add((crate / "src" / "lib.rs").resolve())
             tests = data.get("test")
             if isinstance(tests, dict):
                 tests = [tests]
@@ -445,6 +509,7 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
                 target = (crate / lib_path).resolve()
                 if target.is_file():
                     extra.add(target)
+                suppressed_libs.add((crate / "src" / "lib.rs").resolve())
             if in_test:
                 target = None
                 if path_s:
@@ -496,7 +561,7 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
                 inner = stripped.split("=", 1)[-1]
                 required_feats = set(re.findall(r'"([^"]+)"', inner))
         flush()
-    return extra, gated
+    return extra, gated, suppressed_libs, no_autotest
 
 
 def _mod_search_dir(
@@ -648,7 +713,7 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         texts[key] = text
         return text
 
-    extra_roots, gated_roots = _cargo_test_targets(root)
+    extra_roots, gated_roots, suppressed_libs, no_autotest = _cargo_test_targets(root)
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
@@ -656,7 +721,9 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         for rs in base_dir.rglob("*.rs"):
             if not _is_lib_or_integration_source(rs, extra_roots):
                 continue
-            if _is_cargo_crate_root_file(rs, extra_roots, gated_roots):
+            if _is_cargo_crate_root_file(
+                rs, extra_roots, gated_roots, suppressed_libs, no_autotest
+            ):
                 queue.append(
                     (rs.resolve(), tuple(_path_module_prefix(rs)), (), True)
                 )
@@ -911,6 +978,8 @@ def _module_prefixes_for_source(
     overrides: dict[Path, list[list[str]]],
     extra_roots: set[Path] | frozenset[Path] | None = None,
     gated_roots: set[Path] | frozenset[Path] | None = None,
+    suppressed_libs: set[Path] | frozenset[Path] | None = None,
+    no_autotest: set[Path] | frozenset[Path] | None = None,
 ) -> list[list[str]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
@@ -924,7 +993,9 @@ def _module_prefixes_for_source(
     prefixes: list[list[str]] = []
     if key in overrides:
         prefixes.extend(overrides[key])
-    if _is_cargo_crate_root_file(rs, extra_roots, gated_roots):
+    if _is_cargo_crate_root_file(
+        rs, extra_roots, gated_roots, suppressed_libs, no_autotest
+    ):
         root_prefix = _path_module_prefix(rs)
         if root_prefix not in prefixes:
             prefixes.append(root_prefix)
@@ -945,7 +1016,7 @@ def _qualified_test_names(root: Path) -> list[str]:
     the defect this guard exists to catch.
     """
     overrides = _declared_module_overrides(root)
-    extra_roots, gated_roots = _cargo_test_targets(root)
+    extra_roots, gated_roots, suppressed_libs, no_autotest = _cargo_test_targets(root)
     names: list[str] = []
     for base in _CRATE_ROOTS:
         base_dir = root / base
@@ -964,7 +1035,7 @@ def _qualified_test_names(root: Path) -> list[str]:
             if _file_inner_cfg_inactive(text):
                 continue
             prefix_lists = _module_prefixes_for_source(
-                rs, overrides, extra_roots, gated_roots
+                rs, overrides, extra_roots, gated_roots, suppressed_libs, no_autotest
             )
             if prefix_lists is None:
                 continue
@@ -1183,6 +1254,59 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_lib_root", names)
+
+    def test_custom_lib_path_replaces_stale_src_lib(self):
+        """An explicit `[lib] path` is the only library root (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            libdir = crate / "lib"
+            src.mkdir(parents=True)
+            libdir.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[lib]\n"
+                'path = "lib/custom.rs"\n',
+                encoding="utf-8",
+            )
+            (libdir / "custom.rs").write_text(
+                "#[test]\nfn none_auth_scheme_lib_root() {}\n"
+            )
+            (src / "lib.rs").write_text(
+                "#[test]\nfn none_auth_scheme_stale() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_lib_root", names)
+            self.assertNotIn("none_auth_scheme_stale", names)
+
+    def test_autotests_false_skips_undeclared_integration_files(self):
+        """`autotests = false` disables `tests/*.rs` auto-discovery
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            tests = crate / "tests"
+            tests.mkdir(parents=True)
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+                "autotests = false\n\n"
+                "[[test]]\nname = \"kept\"\n"
+                'path = "tests/kept.rs"\n',
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text("#[test]\nfn lib_ok() {}\n")
+            (tests / "kept.rs").write_text("#[test]\nfn kept() {}\n")
+            (tests / "stale.rs").write_text(
+                "#[test]\nfn none_auth_scheme_stale() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("lib_ok", names)
+            self.assertIn("kept", names)
+            self.assertNotIn("none_auth_scheme_stale", names)
 
     def test_explicit_integration_root_resolves_sibling_mod(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1518,6 +1642,33 @@ class ExternalModulePrefix(unittest.TestCase):
         else:
             self.assertNotIn("none_auth_scheme_windows_only", names)
             self.assertIn("none_auth_scheme_unix_only", names)
+
+    def test_cfg_target_os_string_is_still_evaluated(self):
+        """`#[cfg(target_os = \"macos\")]` must keep its string after
+        masking (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            #[cfg(target_os = "linux")]
+            #[test]
+            fn none_auth_scheme_linux() {}
+            #[cfg(target_os = "macos")]
+            #[test]
+            fn none_auth_scheme_macos() {}
+            #[cfg(target_os = "windows")]
+            #[test]
+            fn none_auth_scheme_windows() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        if sys.platform.startswith("linux"):
+            self.assertEqual(names, ["none_auth_scheme_linux"])
+        elif sys.platform == "darwin":
+            self.assertEqual(names, ["none_auth_scheme_macos"])
+        elif sys.platform == "win32":
+            self.assertEqual(names, ["none_auth_scheme_windows"])
+        else:
+            self.assertEqual(names, [])
 
     def test_cfg_after_test_attr_is_honored(self):
         text = textwrap.dedent(
