@@ -539,12 +539,32 @@ def _matcher_parts(
     return _matcher_named_parts(inner)
 
 
+def _fragment_token_ok(token: str, kind: str) -> bool:
+    """Whether one token satisfies a `macro_rules` fragment specifier."""
+
+    if kind == "tt":
+        return True
+    if kind == "ident":
+        return bool(re.fullmatch(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*", token))
+    if kind == "lifetime":
+        return bool(re.fullmatch(r"'(?:_|[A-Za-z_][A-Za-z0-9_]*)", token))
+    if kind == "literal":
+        if token in {"true", "false"}:
+            return True
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", token):
+            return True
+        return len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'"
+    return True
+
+
 def _consume_fragment(
     tokens: list[str], cursor: int, kind: str, next_literal: str | None
 ) -> int | None:
     if cursor >= len(tokens):
         return None
     if kind in {"ident", "lifetime", "literal", "tt"}:
+        if not _fragment_token_ok(tokens[cursor], kind):
+            return None
         return cursor + 1
     depth = 0
     index = cursor
@@ -845,6 +865,24 @@ def _bindings_for_invoke(
 
 
 _SUB_METAVAR = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _serial_from_attrs(
+    attrs: tuple[str, ...] | list[str], bindings: dict[str, str]
+) -> tuple[frozenset[str], bool]:
+    """`#[serial]` keys after substituting invocation metavars (#516 review)."""
+
+    held: set[str] = set()
+    has_unkeyed = False
+    for attr in attrs:
+        parsed = _serial_keys(_substitute_metavars(attr, bindings))
+        if parsed is None:
+            continue
+        if not parsed:
+            has_unkeyed = True
+        else:
+            held.update(parsed)
+    return frozenset(held), has_unkeyed
 
 
 def _substitute_metavars(text: str, bindings: dict[str, str]) -> str:
@@ -2643,8 +2681,8 @@ def _macro_rule_arms(body: str) -> list[tuple[str, str]]:
 
 def _generated_test_templates_in_arm(
     arm: str,
-) -> list[tuple[frozenset[str], bool, bool, str]]:
-    parsed: list[tuple[str, bool, frozenset[str], bool, bool, str]] = []
+) -> list[tuple[frozenset[str], bool, bool, str, tuple[str, ...]]]:
+    parsed: list[tuple[str, bool, frozenset[str], bool, bool, str, tuple[str, ...]]] = []
     code = _code_only(arm)
     for match in MACRO_TEST_FN.finditer(code):
         attrs = _preceding_attributes(arm, code, match.start())
@@ -2670,15 +2708,16 @@ def _generated_test_templates_in_arm(
                 has_unkeyed,
                 _inside_dollar_repeat(arm, match.start()),
                 fn_body,
+                tuple(attrs),
             )
         )
     helpers = {
         metavar: fn_body
-        for metavar, is_test, *_rest, fn_body in parsed
+        for metavar, is_test, _held, _unkeyed, _rep, fn_body, _attrs in parsed
         if not is_test
     }
-    out: list[tuple[frozenset[str], bool, bool, str]] = []
-    for metavar, is_test, held, has_unkeyed, in_repeat, fn_body in parsed:
+    out: list[tuple[frozenset[str], bool, bool, str, tuple[str, ...]]] = []
+    for _metavar, is_test, held, has_unkeyed, in_repeat, fn_body, attrs in parsed:
         if not is_test:
             continue
         out.append(
@@ -2687,6 +2726,7 @@ def _generated_test_templates_in_arm(
                 has_unkeyed,
                 in_repeat,
                 _expand_generated_helper_bodies(fn_body, helpers),
+                attrs,
             )
         )
     return out
@@ -2694,7 +2734,7 @@ def _generated_test_templates_in_arm(
 
 def _generated_test_templates(
     body: str,
-) -> list[tuple[frozenset[str], bool, bool, str]]:
+) -> list[tuple[frozenset[str], bool, bool, str, tuple[str, ...]]]:
     """Serial attrs, repetition, and body for each generated `fn $name`.
 
     Keys later come from that body (and its callees), not the macro-wide
@@ -2705,14 +2745,17 @@ def _generated_test_templates(
     arm's same-named helper (#516 review).
     """
 
-    out: list[tuple[frozenset[str], bool, bool, str]] = []
+    out: list[tuple[frozenset[str], bool, bool, str, tuple[str, ...]]] = []
     for _matcher, arm in _macro_rule_arms(body):
         out.extend(_generated_test_templates_in_arm(arm))
     return out
 
 
 def _generated_test_serials(body: str) -> list[tuple[frozenset[str], bool]]:
-    return [(held, unkeyed) for held, unkeyed, _rep, _body in _generated_test_templates(body)]
+    return [
+        (held, unkeyed)
+        for held, unkeyed, _rep, _body, _attrs in _generated_test_templates(body)
+    ]
 
 
 @dataclass(frozen=True)
@@ -2733,7 +2776,7 @@ class _PendingMacroTest:
 @dataclass
 class _MacroArm:
     matcher: str
-    serials: list[tuple[frozenset[str], bool, bool, int]]
+    serials: list[tuple[frozenset[str], bool, bool, int, tuple[str, ...]]]
 
 
 def _serials_for_macro_invoke(
@@ -2959,8 +3002,10 @@ def index_functions(
                         ),
                     )
                 )
-                serials_for_arm: list[tuple[frozenset[str], bool, bool, int]] = []
-                for held, unkeyed, in_repeat, test_body in _generated_test_templates_in_arm(
+                serials_for_arm: list[
+                    tuple[frozenset[str], bool, bool, int, tuple[str, ...]]
+                ] = []
+                for held, unkeyed, in_repeat, test_body, attrs in _generated_test_templates_in_arm(
                     arm_body
                 ):
                     template_keys = frozenset(
@@ -2993,7 +3038,9 @@ def index_functions(
                             attrs_line=_line(raw, match.start()),
                         )
                     )
-                    serials_for_arm.append((held, unkeyed, in_repeat, template_index))
+                    serials_for_arm.append(
+                        (held, unkeyed, in_repeat, template_index, attrs)
+                    )
                 arm_list.append(_MacroArm(matcher, serials_for_arm))
             if any(arm.serials for arm in arm_list):
                 generated_by_macro[(rel, name)] = arm_list
@@ -3049,7 +3096,7 @@ def index_functions(
             if chosen is None:
                 continue
             serials = chosen.serials
-            for slot, (serial_held, has_unkeyed, in_repeat, template_index) in enumerate(
+            for slot, (_serial_held, _has_unkeyed, in_repeat, template_index, attrs) in enumerate(
                 serials
             ):
                 reps = (
@@ -3068,6 +3115,7 @@ def index_functions(
                     bindings = _bindings_for_invoke(
                         chosen.matcher, inner, rep=rep, in_repeat=in_repeat
                     )
+                    held, unkeyed = _serial_from_attrs(attrs, bindings)
                     pending.append(
                         _PendingMacroTest(
                             file=rel,
@@ -3076,8 +3124,8 @@ def index_functions(
                             line=line,
                             start=invoke.start(),
                             inline_mods=inline_mods,
-                            serial_held=serial_held,
-                            has_unkeyed_serial=has_unkeyed,
+                            serial_held=held,
+                            has_unkeyed_serial=unkeyed,
                             slot=rep * len(serials) + slot,
                             template_index=template_index,
                             body=_substitute_metavars(template_body, bindings),

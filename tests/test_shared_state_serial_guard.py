@@ -797,6 +797,36 @@ class TransitiveClosure(unittest.TestCase):
             untagged,
         )
 
+    def test_generated_serial_attr_metavars_are_substituted(self):
+        """`#[$guard]` with `$guard = serial(demo_key)` holds that key
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($guard:meta, $name:ident) => {
+                    #[$guard]
+                    #[test]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            cases!(serial(demo_key), first);
+            cases!(serial(demo_key), second);
+            """
+        )
+        findings, errors, membership = guard.analyze(
+            [(Path("src/lib.rs"), text)], scan_root=Path(".")
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(membership["demo_key"]), 2)
+        self.assertEqual({f.name for f in findings}, set())
+
     def test_repeated_macro_args_are_distinct_members_not_sole_exempt(self):
         """`cases!(one, two)` expands twice from one `fn $name` (#516 review)."""
 
@@ -1270,6 +1300,36 @@ class TransitiveClosure(unittest.TestCase):
             cases!(touch first);
             cases!(touch second);
             cases!(clean x);
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+
+    def test_macro_invoke_rejects_number_for_ident_fragment(self):
+        """`$kind:ident` must not accept `42`; the literal arm is the
+        one Rust selects (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($kind:ident, $name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+                (42, $name:ident) => {
+                    #[test]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            cases!(42, one);
+            cases!(42, two);
             """
         )
         names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
