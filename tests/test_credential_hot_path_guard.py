@@ -41,6 +41,7 @@ This guard checks two things CLAUDE.md's prose alone cannot self-verify:
 
 from __future__ import annotations
 
+import platform
 import re
 import sys
 import tempfile
@@ -986,6 +987,40 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
 _CFG_ATTR = re.compile(r"^#\[\s*cfg\s*\((.*)\)\s*\]\s*$", re.DOTALL)
 
 
+def _host_target_arch() -> str:
+    """Normalize `platform.machine()` to rustc `target_arch` names."""
+
+    machine = platform.machine().lower()
+    if machine in {"amd64", "x64"}:
+        return "x86_64"
+    if machine in {"arm64", "aarch64"}:
+        return "aarch64"
+    return machine
+
+
+def _selected_arm_source(
+    masked: str,
+    defs: list[tuple[str, int, int]],
+    name: str,
+    invoke_inner: str,
+) -> str | None:
+    """Body of the first `macro_rules!` arm that accepts this invocation."""
+
+    for def_name, start, end in defs:
+        if def_name != name:
+            continue
+        arms = _macro_arm_spans(masked, start, end)
+        if not arms:
+            if start + 1 < end:
+                return masked[start + 1 : end - 1]
+            return None
+        for matcher, arm_start, arm_end in arms:
+            if _simple_arm_accepts(matcher, invoke_inner):
+                return masked[arm_start:arm_end]
+        return None
+    return None
+
+
 def _cfg_split_args(inner: str) -> list[str]:
     parts: list[str] = []
     depth = 0
@@ -1045,6 +1080,9 @@ def _cfg_atom(
     if feat:
         enabled = enabled_features if enabled_features is not None else set()
         return feat.group(1) in enabled
+    arch_eq = re.fullmatch(r'target_arch\s*=\s*"([^"]+)"', atom)
+    if arch_eq:
+        return _host_target_arch() == arch_eq.group(1)
     return None
 
 
@@ -1151,7 +1189,21 @@ def _tests_in_file(
         masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
     if len(brace_lines) < len(raw_lines):
         brace_lines.extend([""] * (len(raw_lines) - len(brace_lines)))
-    macro_spans = _macro_rules_body_spans(masked)
+    defs = _macro_rules_defs(masked)
+    def_spans = [(start, end) for _, start, end in defs]
+    known_macros = {name for name, _, _ in defs}
+    invoke_at: list[tuple[int, str, str]] = []
+    for im in _MACRO_INVOKE.finditer(masked):
+        if im.group(1) not in known_macros:
+            continue
+        if any(start <= im.start() < end for start, end in def_spans):
+            continue
+        delim = im.end() - 1
+        end = _balanced_pair_end(masked, delim)
+        invoke_at.append((im.start(), im.group(1), masked[delim + 1 : end - 1]))
+    invoke_at.sort()
+    invoke_i = 0
+    invocations: list[tuple[str, str, list[str]]] = []
     mod_stack: list[tuple[int, str, bool]] = []
     pending: list[str] = []
     depth = 0
@@ -1197,8 +1249,8 @@ def _tests_in_file(
                 _cfg_attr_is_inactive(a, enabled_features) for a in all_attrs
             )
             ignored = any(_IGNORE_ATTR.match(a.strip()) for a in all_attrs)
-            in_macro = any(start <= line_start < end for start, end in macro_spans)
-            if found and not inactive and not ignored and not in_macro:
+            in_macro_def = any(start <= line_start < end for start, end in def_spans)
+            if found and not inactive and not ignored and not in_macro_def:
                 prefix_parts = file_mods + [name for _, name, _ in mod_stack]
                 prefix = "::".join(prefix_parts)
                 names.append(f"{prefix}::{found}" if prefix else found)
@@ -1216,6 +1268,16 @@ def _tests_in_file(
             if mod_match:
                 mod_stack.append((depth, mod_match.group(1), item_off))
 
+        invoke_end = line_start + len(masked_line)
+        while (
+            invoke_i < len(invoke_at)
+            and line_start <= invoke_at[invoke_i][0] <= invoke_end
+        ):
+            _pos, inv_name, inner = invoke_at[invoke_i]
+            prefix = file_mods + [name for _, name, _ in mod_stack]
+            invocations.append((inv_name, inner, prefix))
+            invoke_i += 1
+
         line = _strip_line_comment(brace_lines[i])
         if not remainder_masked.strip() or has_test:
             pass
@@ -1223,6 +1285,11 @@ def _tests_in_file(
         while mod_stack and depth <= mod_stack[-1][0]:
             mod_stack.pop()
         line_start += len(masked_line) + 1
+    for inv_name, inner, prefix in invocations:
+        arm_text = _selected_arm_source(masked, defs, inv_name, inner)
+        if not arm_text:
+            continue
+        names.extend(_tests_in_file(arm_text, prefix, enabled_features))
     return names
 
 
@@ -2250,6 +2317,50 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_generated"])
+
+    def test_invoked_macro_tests_use_each_invocation_module_prefix(self):
+        """`generated!()` in two modules emits two qualified tests
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                () => {
+                    #[test]
+                    fn works() {}
+                };
+            }
+            mod none_auth_scheme_a {
+                generated!();
+            }
+            mod none_auth_scheme_b {
+                generated!();
+            }
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(
+            sorted(names),
+            ["none_auth_scheme_a::works", "none_auth_scheme_b::works"],
+        )
+
+    def test_foreign_target_arch_cfg_is_not_counted(self):
+        """`#[cfg(target_arch = \"wasm32\")]` is off on the CI hosts
+        (#507 review)."""
+
+        names = _tests_in_file(
+            "#[cfg(target_arch = \"wasm32\")]\n"
+            "#[test]\nfn none_auth_scheme_wasm() {}\n"
+            "#[test]\nfn none_auth_scheme_host() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_host"])
+        names = _tests_in_file(
+            f'#[cfg(target_arch = "{_host_target_arch()}")]\n'
+            "#[test]\nfn none_auth_scheme_native() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_native"])
 
     def test_uninvoked_macro_mod_is_not_followed(self):
         """`mod alias;` inside an uninvoked macro is not a live module
