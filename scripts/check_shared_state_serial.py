@@ -89,7 +89,8 @@ resolved by full module path when `path` starts with `crate`, and ALSO by
 its last segment alone against every file's own module leaf (its filename
 stem) either way -- the shape a sibling module is actually called by in
 this tree, with no `crate::` prefix at all; and a `Type::assoc_fn(`
-resolved crate-wide against `impl Type { .. }` blocks, so a call written
+resolved against `impl Type { .. }` blocks in the same cargo process
+group, so a call written
 `some_mod::Type::assoc_fn(...)` still resolves on the `Type::assoc_fn(`
 suffix regardless of what qualifies it.
 
@@ -1039,7 +1040,17 @@ def _is_test_attr(attr: str) -> bool:
     if TEST_ATTR.match(stripped) is not None:
         return True
     # `#[$attr] fn $name()` — the invocation supplies `test` (#516 review).
-    return re.match(r"#\s*\[\s*\$", stripped) is not None
+    if re.match(r"#\s*\[\s*\$", stripped) is not None:
+        return True
+    # `#[cfg_attr(test, test)]` / `#[cfg_attr(test, tokio::test)]` is a
+    # live test under `cargo test` (#516 review).
+    return (
+        re.search(
+            r"cfg_attr\s*\(\s*test\s*,\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b",
+            stripped,
+        )
+        is not None
+    )
 
 
 def _serial_keys(attr: str) -> tuple[str, ...] | None:
@@ -1325,8 +1336,24 @@ def _is_lib_crate_ident(name: str) -> bool:
 
 
 def _crate_of(path: Path) -> str:
+    """Owning crate name for process-group keys.
+
+    Real tree paths are `crates/<family>/<crate>/...`, so `parts[2]` is
+    the crate. Short fixture paths (`src/a.rs`) have no such prefix:
+    siblings under the same `src/` share one crate so library unit tests
+    (and `Type::method` lookup) stay crate-wide (#516 review).
+    """
+
     parts = path.parts
-    return parts[2] if len(parts) > 2 else str(path)
+    if len(parts) > 2:
+        return parts[2]
+    if "src" in parts:
+        prefix = parts[: parts.index("src")]
+        return "/".join(prefix) if prefix else "."
+    if "tests" in parts:
+        prefix = parts[: parts.index("tests")]
+        return "/".join(prefix) if prefix else "."
+    return str(path)
 
 
 def _norm_posix(path: Path) -> str:
@@ -3148,7 +3175,7 @@ def _resolve_calls(
     by_file: dict[Path, dict[str, list[int]]],
     by_module: dict[tuple[str, ...], dict[str, list[int]]],
     by_leaf: dict[str, dict[str, list[int]]],
-    by_type: dict[str, dict[str, list[int]]],
+    by_type: dict[tuple[str, str], dict[str, list[int]]],
     by_macro: dict[Path, dict[str, int]],
     by_macro_any: dict[str, list[int]],
     by_macro_arms: dict[Path, dict[str, tuple[tuple[str, frozenset[str]], ...]]],
@@ -3362,21 +3389,35 @@ def _resolve_calls(
             imported = _fn_import(fn, raw_type, m.start(), imports_by_file)
             if imported is not None:
                 type_name = imported[1]
+        caller_groups = groups_of.get(
+            fn.file, frozenset({_process_group(fn.file)})
+        )
+        slots: list[int] = []
+        for group in caller_groups:
+            slots.extend(
+                by_type.get((group, type_name), {}).get(m.group(2), [])
+            )
         _gain_from(
             gained,
             keys_of,
             self_index,
-            by_type.get(type_name, {}).get(m.group(2), []),
+            slots,
         )
     for type_name, method in _ufcs_calls(fn.body):
         imported = _fn_import(fn, type_name, 0, imports_by_file)
         if imported is not None:
             type_name = imported[1]
+        caller_groups = groups_of.get(
+            fn.file, frozenset({_process_group(fn.file)})
+        )
+        slots = []
+        for group in caller_groups:
+            slots.extend(by_type.get((group, type_name), {}).get(method, []))
         _gain_from(
             gained,
             keys_of,
             self_index,
-            by_type.get(type_name, {}).get(method, []),
+            slots,
         )
     return frozenset(gained)
 
@@ -3398,7 +3439,7 @@ def analyze(
     by_module: dict[tuple[str, ...], dict[str, list[int]]] = {}
     by_crate_module: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] = {}
     by_leaf: dict[str, dict[str, list[int]]] = {}
-    by_type: dict[str, dict[str, list[int]]] = {}
+    by_type: dict[tuple[str, str], dict[str, list[int]]] = {}
     by_macro: dict[Path, dict[str, int]] = {}
     by_macro_any: dict[str, list[int]] = {}
     by_macro_arms: dict[Path, dict[str, tuple[tuple[str, frozenset[str]], ...]]] = {}
@@ -3424,6 +3465,14 @@ def analyze(
                 by_crate_module.setdefault(
                     (group, crate_mod + fn.inline_mods), {}
                 ).setdefault(fn.name, []).append(i)
+            if fn.type_name is not None:
+                by_type.setdefault((group, fn.type_name), {}).setdefault(
+                    fn.name, []
+                ).append(i)
+            if fn.trait_name is not None:
+                by_type.setdefault((group, fn.trait_name), {}).setdefault(
+                    fn.name, []
+                ).append(i)
         if module is not None:
             # `module` is a valid module path even when empty (`()` is the
             # crate root itself, from a function declared directly in
@@ -3440,10 +3489,6 @@ def analyze(
                 ).append(i)
             if module:
                 by_leaf.setdefault(module[-1], {}).setdefault(fn.name, []).append(i)
-        if fn.type_name is not None:
-            by_type.setdefault(fn.type_name, {}).setdefault(fn.name, []).append(i)
-        if fn.trait_name is not None:
-            by_type.setdefault(fn.trait_name, {}).setdefault(fn.name, []).append(i)
 
     reexports: list[tuple[tuple[str, ...], str, tuple[str, ...], str]] = []
     for path, text in sources:

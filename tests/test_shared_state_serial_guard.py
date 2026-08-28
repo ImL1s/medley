@@ -306,6 +306,29 @@ class DirectReference(unittest.TestCase):
         names = {f.name for f in findings}
         self.assertIn("untagged_direct_toucher", names)
 
+    def test_cfg_attr_test_is_a_test(self):
+        """`#[cfg_attr(test, test)]` is a live test under cargo test
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[cfg_attr(test, test)]
+            fn first_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[cfg_attr(test, test)]
+            fn second_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_unrelated_test_is_not_a_finding(self):
         findings = guard.scan_source(DIRECT_TOUCH)
         names = {f.name for f in findings}
@@ -2793,6 +2816,54 @@ class TypeAssociatedResolution(unittest.TestCase):
         )
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_type_assoc_is_namespaced_by_cargo_target(self):
+        """Library `State::bump` must not tag an integration-local
+        `State::bump` (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub struct State;
+
+                    impl State {
+                        pub fn bump() {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/a.rs"),
+                src(
+                    """\
+                    struct State;
+
+                    impl State {
+                        fn bump() {}
+                    }
+
+                    #[test]
+                    fn local_state_bump_is_clean() {
+                        State::bump();
+                    }
+
+                    #[test]
+                    fn also_clean() {
+                        State::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, set())
 
     def test_cross_file_type_assoc_call_resolves_crate_wide(self):
         """The real #492 shape: `search_recovery::CacheEpoch::now()`, called
