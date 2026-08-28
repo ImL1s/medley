@@ -1176,6 +1176,86 @@ def _cfg_attr_is_inactive(
     return _eval_cfg(match.group(1).strip(), enabled_features) is False
 
 
+_CFG_ATTR_WRAP = re.compile(r"^#\[\s*cfg_attr\s*\((.*)\)\s*\]\s*$", re.DOTALL)
+_TEST_ATTR_HEAD = re.compile(r"#\[(?:tokio::)?test\b")
+
+
+def _split_cfg_attr_args(inner: str) -> tuple[str, str] | None:
+    depth = 0
+    for i, ch in enumerate(inner):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            return inner[:i].strip(), inner[i + 1 :].strip()
+    return None
+
+
+def _expand_cfg_attr(
+    attr: str, enabled_features: set[str] | frozenset[str] | None = None
+) -> list[str]:
+    """`#[cfg_attr(test, ignore)]` becomes `#[ignore]` when `test` is on."""
+
+    match = _CFG_ATTR_WRAP.match(attr.strip())
+    if match is None:
+        return [attr]
+    split = _split_cfg_attr_args(match.group(1))
+    if split is None:
+        return [attr]
+    pred, rest = split
+    active = _eval_cfg(pred, enabled_features)
+    if active is False:
+        return []
+    if active is not True:
+        return [attr]
+    return [f"#[{rest}]"]
+
+
+def _effective_attrs(
+    attrs: list[str], enabled_features: set[str] | frozenset[str] | None = None
+) -> list[str]:
+    out: list[str] = []
+    for attr in attrs:
+        out.extend(_expand_cfg_attr(attr, enabled_features))
+    return out
+
+
+def _is_test_attr(attr: str) -> bool:
+    return bool(_TEST_ATTR_HEAD.match(attr.strip()))
+
+
+def _compact_test_fns(
+    masked_line: str,
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> list[tuple[str, bool, bool]]:
+    """`(name, inactive, ignored)` for each same-line `#[test] fn`."""
+
+    out: list[tuple[str, bool, bool]] = []
+    i = 0
+    while True:
+        j = masked_line.find("#[", i)
+        if j < 0:
+            break
+        attrs, rest = _leading_attrs(masked_line[j:])
+        if not any(_is_test_attr(a) for a in attrs):
+            i = j + 2
+            continue
+        matched = _FN.match(rest)
+        if matched is None:
+            i = j + 2
+            continue
+        effective = _effective_attrs(attrs, enabled_features)
+        inactive = any(
+            _cfg_attr_is_inactive(a, enabled_features) for a in effective
+        )
+        ignored = any(_IGNORE_ATTR.match(a.strip()) for a in effective)
+        out.append((matched.group(1), inactive, ignored))
+        consumed = len(masked_line[j:]) - len(rest) + matched.end()
+        i = j + max(consumed, 2)
+    return out
+
+
 def _file_inner_cfg_inactive(
     text: str, enabled_features: set[str] | frozenset[str] | None = None
 ) -> bool:
@@ -1272,6 +1352,8 @@ def _tests_in_file(
         line_cfg_off = enclosing_off or any(
             _cfg_attr_is_inactive(a, enabled_features) for a in pending + attrs
         )
+        pushed_mod = False
+        found = None
 
         if has_test:
             all_attrs = pending + attrs
@@ -1302,9 +1384,13 @@ def _tests_in_file(
                     break
                 continue
             inactive = enclosing_off or any(
-                _cfg_attr_is_inactive(a, enabled_features) for a in all_attrs
+                _cfg_attr_is_inactive(a, enabled_features)
+                for a in _effective_attrs(all_attrs, enabled_features)
             )
-            ignored = any(_IGNORE_ATTR.match(a.strip()) for a in all_attrs)
+            ignored = any(
+                _IGNORE_ATTR.match(a.strip())
+                for a in _effective_attrs(all_attrs, enabled_features)
+            )
             in_macro_def = any(start <= line_start < end for start, end in def_spans)
             if found and not inactive and not ignored and not in_macro_def:
                 prefix_parts = file_mods + [name for _, name, _ in mod_stack]
@@ -1323,6 +1409,29 @@ def _tests_in_file(
             )
             if mod_match:
                 mod_stack.append((depth, mod_match.group(1), item_off))
+                pushed_mod = True
+
+        if not pushed_mod:
+            inline_mod = re.search(
+                r"(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{",
+                masked_line,
+            )
+            if inline_mod is not None:
+                mod_stack.append((depth, inline_mod.group(1), line_cfg_off))
+
+        in_macro_def = any(start <= line_start < end for start, end in def_spans)
+        seen_on_line = {found} if has_test and found else set()
+        for fname, cinactive, cignored in _compact_test_fns(
+            masked_line, enabled_features
+        ):
+            if fname in seen_on_line:
+                continue
+            if enclosing_off or cinactive or cignored or in_macro_def:
+                continue
+            prefix_parts = file_mods + [name for _, name, _ in mod_stack]
+            prefix = "::".join(prefix_parts)
+            names.append(f"{prefix}::{fname}" if prefix else fname)
+            seen_on_line.add(fname)
 
         invoke_end = line_start + len(masked_line)
         while (
@@ -2302,6 +2411,45 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_live"])
+
+    def test_cfg_attr_ignore_is_not_counted(self):
+        """`#[cfg_attr(test, ignore)]` is `#[ignore]` under libtest
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            #[test]
+            fn none_auth_scheme_live() {}
+            #[test]
+            #[cfg_attr(test, ignore)]
+            fn none_auth_scheme_cfg_attr_after() {}
+            #[cfg_attr(test, ignore)]
+            #[test]
+            fn none_auth_scheme_cfg_attr_before() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_live"])
+
+    def test_same_line_mod_and_test_are_both_seen(self):
+        """`mod name { #[test] fn works() {} }` is `name::works`
+        (#507 review)."""
+
+        names = _tests_in_file(
+            "mod none_auth_scheme_ { #[test] fn works() {} }\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_::works"])
+
+    def test_two_tests_on_the_same_line_are_both_counted(self):
+        names = _tests_in_file(
+            "#[test] fn none_auth_scheme_a() {} #[test] fn none_auth_scheme_b() {}\n",
+            [],
+        )
+        self.assertEqual(
+            sorted(names),
+            ["none_auth_scheme_a", "none_auth_scheme_b"],
+        )
 
     def test_unexpanded_macro_rules_test_is_not_counted(self):
         """`#[test]` inside an uninvoked `macro_rules!` is not a libtest
