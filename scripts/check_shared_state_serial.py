@@ -485,7 +485,7 @@ def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
     if matcher == "*":
         return True
     inner = matcher.strip()
-    if len(inner) >= 2 and inner[0] == "(" and inner[-1] == ")":
+    if len(inner) >= 2 and inner[0] in "([{" and inner[-1] in ")]}":
         inner = inner[1:-1]
     if "$" not in inner:
         return _token_list(inner) == _token_list(invoke_inner)
@@ -933,6 +933,9 @@ def _collect_use_leaves(
     """Parse a use-tree node starting at `i`; append `(mid, fname, local)` leaves."""
 
     i = _skip_ws_code(code, i)
+    if i < len(code) and code[i] == "*":
+        out.append((prefix, "*", "*"))
+        return i + 1
     if i < len(code) and code[i] == "{":
         i += 1
         n = len(code)
@@ -961,6 +964,9 @@ def _collect_use_leaves(
             i = _skip_ws_code(code, i)
             if i < n and code[i] == "{":
                 return _collect_use_leaves(code, i, prefix + tuple(segs), pos, out)
+            if i < n and code[i] == "*":
+                out.append((prefix + tuple(segs), "*", "*"))
+                return i + 1
             continue
         break
     alias, i = _parse_use_as(code, i)
@@ -1053,23 +1059,49 @@ def _pos_in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
 
 def _imports_outside_bodies(
     bindings: list[_UseBinding], body_spans: list[tuple[int, int]]
-) -> dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]:
+) -> tuple[
+    dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]],
+    dict[tuple[str, ...], list[tuple[str, ...]]],
+]:
     scoped: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]] = {}
+    globs: dict[tuple[str, ...], list[tuple[str, ...]]] = {}
     for b in bindings:
         if _pos_in_spans(b.pos, body_spans):
             continue
+        if b.fname == "*":
+            globs.setdefault(b.inline, []).append(b.module)
+            continue
         scoped.setdefault(b.inline, {})[b.local] = (b.module, b.fname)
-    return scoped
+    return scoped, globs
 
 
 def _imports_in_span(
     bindings: list[_UseBinding], start: int, end: int
-) -> dict[str, tuple[tuple[str, ...], str]]:
+) -> tuple[dict[str, tuple[tuple[str, ...], str]], list[tuple[str, ...]]]:
     local: dict[str, tuple[tuple[str, ...], str]] = {}
+    globs: list[tuple[str, ...]] = []
     for b in bindings:
         if start <= b.pos < end:
-            local[b.local] = (b.module, b.fname)
-    return local
+            if b.fname == "*":
+                globs.append(b.module)
+            else:
+                local[b.local] = (b.module, b.fname)
+    return local, globs
+
+
+def _globs_in_scope(
+    file_globs: dict[tuple[str, ...], list[tuple[str, ...]]],
+    inline_mods: tuple[str, ...],
+    extra: tuple[tuple[str, ...], ...] = (),
+) -> list[tuple[str, ...]]:
+    out = list(extra)
+    prefix = inline_mods
+    while True:
+        out.extend(file_globs.get(prefix, []))
+        if not prefix:
+            break
+        prefix = prefix[:-1]
+    return out
 
 
 def _overlay_fn_imports(
@@ -1111,7 +1143,7 @@ def _pub_reexports(
         out.append((dest, local, src, fname))
 
     for pos, root, mid, fname, local in _iter_use_leaves(code):
-        if not _is_pub_use(code, pos):
+        if not _is_pub_use(code, pos) or fname == "*":
             continue
         record(pos, root, mid, fname, local)
     return out
@@ -1418,6 +1450,7 @@ class FnInfo:
     local_imports: dict[str, tuple[tuple[str, ...], str]] = field(
         default_factory=dict
     )
+    glob_modules: tuple[tuple[str, ...], ...] = ()
 
 
 def _item_module(item: SharedItem) -> tuple[str, ...] | None:
@@ -1661,7 +1694,7 @@ def _macro_rule_arms(body: str) -> list[tuple[str, str]]:
             i += 1
         if i >= n:
             break
-        if code[i] != "(":
+        if code[i] not in "([{":
             return [("*", body)] if not arms else arms
         matcher_end = _balanced_end(code, i)
         matcher = code[i:matcher_end]
@@ -1673,7 +1706,7 @@ def _macro_rule_arms(body: str) -> list[tuple[str, str]]:
         j += 2
         while j < n and code[j].isspace():
             j += 1
-        if j >= n or code[j] not in "{(":
+        if j >= n or code[j] not in "{([":
             return [("*", body)] if not arms else arms
         end = _balanced_end(code, j)
         inner_start = j + 1
@@ -1833,6 +1866,7 @@ def index_functions(
     list[FnInfo],
     list[_PendingMacroTest],
     dict[Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]],
+    dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
 ]:
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
@@ -1846,6 +1880,7 @@ def index_functions(
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     ] = {}
+    globs_by_file: dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]] = {}
     scans: list[
         tuple[Path, str, str, list[tuple[int, int]], list[tuple[int, int, int, str]]]
     ] = []
@@ -1881,10 +1916,11 @@ def index_functions(
             body_span = _macro_body(raw, match.end())
             if body_span is not None:
                 occupied.append(body_span)
-        file_imports = _imports_outside_bodies(bindings, occupied)
+        file_imports, file_globs = _imports_outside_bodies(bindings, occupied)
         imports_by_file[rel] = file_imports
+        globs_by_file[rel] = file_globs
         for match, name, body_start, body_end, body_code, inline_mods in pending_fns:
-            local = _imports_in_span(bindings, body_start, body_end)
+            local, local_globs = _imports_in_span(bindings, body_start, body_end)
             scoped = _overlay_fn_imports(file_imports, local, inline_mods)
             keys = frozenset(
                 item.key
@@ -1939,6 +1975,7 @@ def index_functions(
                     has_unkeyed_serial=has_unkeyed,
                     attrs_line=_line(raw, match.start()),
                     local_imports=local,
+                    glob_modules=tuple(local_globs),
                 )
             )
         for match in MACRO_DEF.finditer(code):
@@ -2074,7 +2111,7 @@ def index_functions(
                             template_index=template_index,
                         )
                     )
-    return out, pending, imports_by_file
+    return out, pending, imports_by_file, globs_by_file
 
 
 # --- membership: a monotonic fixpoint over the call graph -------------------
@@ -2222,6 +2259,7 @@ def _resolve_calls(
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     ],
+    globs_by_file: dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
     keys_of: list[frozenset[str]],
     self_index: int,
 ) -> frozenset[str]:
@@ -2252,6 +2290,13 @@ def _resolve_calls(
             if imported is not None:
                 module, fname = imported
                 js = by_module.get(module, {}).get(fname, [])
+        if not js:
+            for module in _globs_in_scope(
+                globs_by_file.get(fn.file, {}),
+                fn.inline_mods,
+                fn.glob_modules,
+            ):
+                js.extend(by_module.get(module, {}).get(name, []))
         _gain_from(gained, keys_of, self_index, js)
     macro_index = by_macro.get(fn.file, {})
     for m in MACRO_INVOKE.finditer(fn.body):
@@ -2394,7 +2439,7 @@ def analyze(
     if errors:
         return [], errors, {}
 
-    functions, pending_macro_tests, imports_by_file = index_functions(
+    functions, pending_macro_tests, imports_by_file, globs_by_file = index_functions(
         sources, registry
     )
 
@@ -2456,6 +2501,7 @@ def analyze(
                 by_macro_any=by_macro_any,
                 by_inline=by_inline,
                 imports_by_file=imports_by_file,
+                globs_by_file=globs_by_file,
                 keys_of=keys_of,
                 self_index=i,
             )

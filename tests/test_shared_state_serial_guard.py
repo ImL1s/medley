@@ -1019,6 +1019,37 @@ class TransitiveClosure(unittest.TestCase):
         generated = {n for n in names if n.startswith("cases!")}
         self.assertEqual(len(generated), 1, names)
 
+    def test_macro_invoke_matches_bracket_delimited_arms(self):
+        """`[touch]` / `[clean]` matchers must select like `(touch)`
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                [touch] => {
+                    #[test]
+                    fn generated() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+                [clean] => {
+                    #[test]
+                    fn generated() {}
+                };
+            }
+
+            cases![touch];
+            cases![clean];
+            cases![clean];
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 1, names)
+
     def test_same_named_macros_in_different_files_are_not_combined(self):
         """Invoking a local `cases!` must not inherit another file's
         touching template of the same name (#516 review)."""
@@ -1245,6 +1276,51 @@ class TransitiveClosure(unittest.TestCase):
             {
                 "calls_aliased_module_untagged",
                 "also_calls_aliased_module_untagged",
+            },
+        )
+
+    def test_glob_import_bare_call_reaches_registered_state(self):
+        """`use crate::a::*; bump()` must expand the glob (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    use crate::a::*;
+
+                    #[test]
+                    fn calls_glob_imported_bump_untagged() {
+                        bump();
+                    }
+
+                    #[test]
+                    fn also_calls_glob_imported_bump_untagged() {
+                        bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(
+            names,
+            {
+                "calls_glob_imported_bump_untagged",
+                "also_calls_glob_imported_bump_untagged",
             },
         )
 
