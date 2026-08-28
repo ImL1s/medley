@@ -630,7 +630,7 @@ def _manifest_default_features(text: str) -> set[str]:
 
 def _cargo_test_targets(
     root: Path,
-) -> tuple[set[Path], set[Path], set[Path], set[Path]]:
+) -> tuple[set[Path], set[Path], set[Path], set[Path], dict[Path, set[str]]]:
     """Explicit `[[test]]` paths and feature-gated integration targets.
 
     Extra roots: `path =` files cargo compiles without extra features.
@@ -647,6 +647,7 @@ def _cargo_test_targets(
     gated: set[Path] = set()
     suppressed_libs: set[Path] = set()
     no_autotest: set[Path] = set()
+    crate_feats: dict[Path, set[str]] = {}
     for manifest in root.rglob("Cargo.toml"):
         if "target" in manifest.parts:
             continue
@@ -668,6 +669,7 @@ def _cargo_test_targets(
             default_feats = _feature_closure(
                 feat_table, _toml_str_list(feat_table.get("default"))
             )
+            crate_feats[crate.resolve()] = default_feats
             lib = data.get("lib")
             if isinstance(lib, dict):
                 lib_path = lib.get("path")
@@ -766,7 +768,19 @@ def _cargo_test_targets(
                 inner = stripped.split("=", 1)[-1]
                 required_feats = set(re.findall(r'"([^"]+)"', inner))
         flush()
-    return extra, gated, suppressed_libs, no_autotest
+        crate_feats[crate.resolve()] = default_feats
+    return extra, gated, suppressed_libs, no_autotest, crate_feats
+
+
+def _features_for(path: Path, crate_feats: dict[Path, set[str]]) -> set[str]:
+    current = path.resolve()
+    if current.is_file():
+        current = current.parent
+    for parent in (current, *current.parents):
+        found = crate_feats.get(parent)
+        if found is not None:
+            return found
+    return set()
 
 
 def _mod_search_dir(
@@ -806,6 +820,7 @@ def _iter_module_decls(
     gated_roots: set[Path] | frozenset[Path] | None = None,
     *,
     as_crate_root: bool = False,
+    enabled_features: set[str] | frozenset[str] | None = None,
 ) -> list[tuple[str, Path, tuple[str, ...]]]:
     """`(name, child file, enclosing inline modules)` for `#[path]` and
     ordinary `mod name;` that resolve.
@@ -852,7 +867,8 @@ def _iter_module_decls(
         semi = _MOD_SEMI.match(line) or _MOD_SEMI.match(remainder)
         if semi:
             cfg_off = any(
-                _cfg_attr_is_inactive(a) for a in pending_attrs + attrs
+                _cfg_attr_is_inactive(a, enabled_features)
+                for a in pending_attrs + attrs
             )
             skip = enclosing_off or cfg_off or in_macro
             if not skip:
@@ -881,7 +897,8 @@ def _iter_module_decls(
             pending_attrs = []
         elif not path_match:
             cfg_off = any(
-                _cfg_attr_is_inactive(a) for a in pending_attrs + attrs
+                _cfg_attr_is_inactive(a, enabled_features)
+                for a in pending_attrs + attrs
             )
             skip = enclosing_off or cfg_off
             brace_mod = _MOD_OPEN.match(line) or _MOD_OPEN.match(remainder)
@@ -923,7 +940,9 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         texts[key] = text
         return text
 
-    extra_roots, gated_roots, suppressed_libs, no_autotest = _cargo_test_targets(root)
+    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats = (
+        _cargo_test_targets(root)
+    )
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
@@ -945,7 +964,8 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
         text = read_rs(declaring)
         if text is None:
             continue
-        if _file_inner_cfg_inactive(text):
+        enabled = _features_for(declaring, crate_feats)
+        if _file_inner_cfg_inactive(text, enabled):
             continue
         for name, child, inline_names in _iter_module_decls(
             text,
@@ -953,6 +973,7 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
             extra_roots,
             gated_roots,
             as_crate_root=as_crate_root,
+            enabled_features=enabled,
         ):
             child_prefix = list(prefix) + list(inline_names) + [name]
             overrides.setdefault(child, []).append(child_prefix)
@@ -983,7 +1004,9 @@ def _cfg_split_args(inner: str) -> list[str]:
     return parts
 
 
-def _cfg_atom(atom: str) -> bool | None:
+def _cfg_atom(
+    atom: str, enabled_features: set[str] | frozenset[str] | None = None
+) -> bool | None:
     atom = atom.strip()
     if atom == "test":
         return True
@@ -1018,19 +1041,27 @@ def _cfg_atom(atom: str) -> bool | None:
             return sys.platform != "win32"
         if fam == "windows":
             return sys.platform == "win32"
+    feat = re.fullmatch(r'feature\s*=\s*"([^"]+)"', atom)
+    if feat:
+        enabled = enabled_features if enabled_features is not None else set()
+        return feat.group(1) in enabled
     return None
 
 
-def _eval_cfg(expr: str) -> bool | None:
+def _eval_cfg(
+    expr: str, enabled_features: set[str] | frozenset[str] | None = None
+) -> bool | None:
     expr = expr.strip()
     for kind in ("not", "all", "any"):
         prefix = f"{kind}("
         if expr.startswith(prefix) and expr.endswith(")"):
             inner = expr[len(prefix) : -1]
             if kind == "not":
-                value = _eval_cfg(inner)
+                value = _eval_cfg(inner, enabled_features)
                 return None if value is None else (not value)
-            values = [_eval_cfg(part) for part in _cfg_split_args(inner)]
+            values = [
+                _eval_cfg(part, enabled_features) for part in _cfg_split_args(inner)
+            ]
             if kind == "all":
                 if any(v is False for v in values):
                     return False
@@ -1042,17 +1073,21 @@ def _eval_cfg(expr: str) -> bool | None:
             if any(v is None for v in values):
                 return None
             return False
-    return _cfg_atom(expr)
+    return _cfg_atom(expr, enabled_features)
 
 
-def _cfg_attr_is_inactive(attr: str) -> bool:
+def _cfg_attr_is_inactive(
+    attr: str, enabled_features: set[str] | frozenset[str] | None = None
+) -> bool:
     match = _CFG_ATTR.match(attr.strip())
     if match is None:
         return False
-    return _eval_cfg(match.group(1).strip()) is False
+    return _eval_cfg(match.group(1).strip(), enabled_features) is False
 
 
-def _file_inner_cfg_inactive(text: str) -> bool:
+def _file_inner_cfg_inactive(
+    text: str, enabled_features: set[str] | frozenset[str] | None = None
+) -> bool:
     """True when the file is gated off by a leading `#![cfg(...)]`."""
 
     for raw in _mask_rust_literals(text).splitlines():
@@ -1064,7 +1099,7 @@ def _file_inner_cfg_inactive(text: str) -> bool:
         if stripped.startswith("#!["):
             if "cfg" in stripped:
                 attr = stripped.replace("#![", "#[", 1)
-                if _cfg_attr_is_inactive(attr):
+                if _cfg_attr_is_inactive(attr, enabled_features):
                     return True
             continue
         return False
@@ -1099,8 +1134,12 @@ def _leading_attrs(line: str) -> tuple[list[str], str]:
     return attrs, line[i:]
 
 
-def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
-    if _file_inner_cfg_inactive(text):
+def _tests_in_file(
+    text: str,
+    file_mods: list[str],
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> list[str]:
+    if _file_inner_cfg_inactive(text, enabled_features):
         return []
     names: list[str] = []
     raw_lines = text.splitlines()
@@ -1155,7 +1194,7 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
                     break
                 continue
             inactive = enclosing_off or any(
-                _cfg_attr_is_inactive(a) for a in all_attrs
+                _cfg_attr_is_inactive(a, enabled_features) for a in all_attrs
             )
             ignored = any(_IGNORE_ATTR.match(a.strip()) for a in all_attrs)
             in_macro = any(start <= line_start < end for start, end in macro_spans)
@@ -1167,7 +1206,7 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
             pending.extend(attrs)
         elif remainder_masked.strip():
             item_off = enclosing_off or any(
-                _cfg_attr_is_inactive(a) for a in pending + attrs
+                _cfg_attr_is_inactive(a, enabled_features) for a in pending + attrs
             )
             pending = []
             line = _strip_line_comment(masked_line)
@@ -1230,7 +1269,9 @@ def _qualified_test_names(root: Path) -> list[str]:
     the defect this guard exists to catch.
     """
     overrides = _declared_module_overrides(root)
-    extra_roots, gated_roots, suppressed_libs, no_autotest = _cargo_test_targets(root)
+    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats = (
+        _cargo_test_targets(root)
+    )
     names: list[str] = []
     for base in _CRATE_ROOTS:
         base_dir = root / base
@@ -1246,7 +1287,8 @@ def _qualified_test_names(root: Path) -> list[str]:
                 text = rs.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            if _file_inner_cfg_inactive(text):
+            enabled = _features_for(rs, crate_feats)
+            if _file_inner_cfg_inactive(text, enabled):
                 continue
             prefix_lists = _module_prefixes_for_source(
                 rs, overrides, extra_roots, gated_roots, suppressed_libs, no_autotest
@@ -1254,7 +1296,7 @@ def _qualified_test_names(root: Path) -> list[str]:
             if prefix_lists is None:
                 continue
             for file_mods in prefix_lists:
-                names.extend(_tests_in_file(text, file_mods))
+                names.extend(_tests_in_file(text, file_mods, enabled))
     return names
 
 
@@ -1604,6 +1646,54 @@ class ExternalModulePrefix(unittest.TestCase):
             (tests / "gated.rs").write_text("#[test]\nfn visible() {}\n")
             names = _qualified_test_names(root)
             self.assertIn("visible", names)
+
+    def test_non_default_feature_cfg_is_not_counted(self):
+        """`#[cfg(feature = \"optional\")]` is off under default cargo test
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[features]\ndefault = []\n"
+                'optional = []\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                "#[cfg(feature = \"optional\")]\n"
+                "#[test]\nfn none_auth_scheme_optional() {}\n"
+                "#[test]\nfn none_auth_scheme_always() {}\n",
+                encoding="utf-8",
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_always", names)
+            self.assertNotIn("none_auth_scheme_optional", names)
+
+    def test_default_feature_cfg_is_counted(self):
+        """`#[cfg(feature = \"hot\")]` stays when `hot` is default
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[features]\ndefault = [\"hot\"]\n"
+                'hot = []\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                "#[cfg(feature = \"hot\")]\n"
+                "#[test]\nfn none_auth_scheme_hot() {}\n",
+                encoding="utf-8",
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_hot", names)
 
     def test_multiline_default_features_keep_required_targets_seeded(self):
         """`default = [` split across lines is still the crate default
