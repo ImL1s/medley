@@ -306,20 +306,30 @@ def _is_cargo_crate_root_file(
     return False
 
 
-def _manifest_default_features(text: str) -> set[str]:
-    """Names listed in `[features] default = [...]`, including multiline."""
-
+def _load_manifest_toml(text: str) -> dict | None:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _toml_str_list(value: object) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {item for item in value if isinstance(item, str)}
+
+
+def _manifest_default_features(text: str) -> set[str]:
+    """Names listed in `[features] default = [...]`, including multiline."""
+
+    data = _load_manifest_toml(text)
+    if data is None:
         return set()
     feats = data.get("features")
     if not isinstance(feats, dict):
         return set()
-    default = feats.get("default")
-    if not isinstance(default, list):
-        return set()
-    return {item for item in default if isinstance(item, str)}
+    return _toml_str_list(feats.get("default"))
 
 
 def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
@@ -345,7 +355,45 @@ def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
         except (OSError, UnicodeDecodeError):
             continue
         crate = manifest.parent
-        default_feats = _manifest_default_features(text)
+        data = _load_manifest_toml(text)
+        if data is not None:
+            default_feats = _toml_str_list(
+                data.get("features", {}).get("default")
+                if isinstance(data.get("features"), dict)
+                else None
+            )
+            lib = data.get("lib")
+            if isinstance(lib, dict):
+                lib_path = lib.get("path")
+                if isinstance(lib_path, str):
+                    target = (crate / lib_path).resolve()
+                    if target.is_file():
+                        extra.add(target)
+            tests = data.get("test")
+            if isinstance(tests, dict):
+                tests = [tests]
+            if not isinstance(tests, list):
+                tests = []
+            for table in tests:
+                if not isinstance(table, dict):
+                    continue
+                name = table.get("name")
+                path_s = table.get("path")
+                required_feats = _toml_str_list(table.get("required-features"))
+                target = None
+                if isinstance(path_s, str):
+                    target = (crate / path_s).resolve()
+                elif isinstance(name, str):
+                    target = (crate / "tests" / f"{name}.rs").resolve()
+                if target is None:
+                    continue
+                extra_required = required_feats - default_feats
+                if extra_required:
+                    gated.add(target)
+                elif isinstance(path_s, str) and target.is_file():
+                    extra.add(target)
+            continue
+        default_feats = set()
         in_test = False
         in_lib = False
         name: str | None = None
@@ -1013,6 +1061,27 @@ class ExternalModulePrefix(unittest.TestCase):
                 "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
                 "[[test]]\nname = \"gated\"\n"
                 'required-features = ["test-support"]\n',
+                encoding="utf-8",
+            )
+            (tests / "gated.rs").write_text("#[test]\nfn hidden() {}\n")
+            (tests / "live.rs").write_text("#[test]\nfn visible() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("visible", names)
+            self.assertNotIn("hidden", names)
+
+    def test_multiline_required_features_still_gate_the_target(self):
+        """`required-features = [` split across lines is still gated
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            tests = crate / "tests"
+            tests.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[[test]]\nname = \"gated\"\n"
+                'required-features = [\n    "test-support",\n]\n',
                 encoding="utf-8",
             )
             (tests / "gated.rs").write_text("#[test]\nfn hidden() {}\n")
