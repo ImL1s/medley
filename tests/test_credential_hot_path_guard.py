@@ -76,16 +76,19 @@ _FN = re.compile(
     r"fn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)"
 )
 _MOD_OPEN = re.compile(
-    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{"
 )
 _MOD_SEMI = re.compile(
-    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;"
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;"
 )
 _MOD_KW_ONLY = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s*$"
 )
-_IDENT_SEMI = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*;")
-_IDENT_OPEN = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{")
+_IDENT_SEMI = re.compile(r"^\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
+_IDENT_OPEN = re.compile(r"^\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{")
+_INLINE_MOD_OPEN = re.compile(
+    r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+)
 _PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]', re.DOTALL)
 
 _HOT_PATH_MARKER = "CI's hot path is exactly this suite"
@@ -1498,7 +1501,9 @@ def _split_cfg_attr_args(inner: str) -> tuple[str, str] | None:
 
 
 def _expand_cfg_attr(
-    attr: str, enabled_features: set[str] | frozenset[str] | None = None
+    attr: str,
+    enabled_features: set[str] | frozenset[str] | None = None,
+    depth: int = 0,
 ) -> list[str]:
     """`#[cfg_attr(test, ignore)]` becomes `#[ignore]` when `test` is on."""
 
@@ -1514,7 +1519,16 @@ def _expand_cfg_attr(
         return []
     if active is not True:
         return [attr]
-    return [f"#[{piece}]" for piece in _split_depth_sep(rest, ",") if piece]
+    out: list[str] = []
+    for piece in _split_depth_sep(rest, ","):
+        if not piece:
+            continue
+        emitted = f"#[{piece}]"
+        if _CFG_ATTR_WRAP.match(emitted.strip()) and depth < 8:
+            out.extend(_expand_cfg_attr(emitted, enabled_features, depth + 1))
+        else:
+            out.append(emitted)
+    return out
 
 
 def _effective_attrs(
@@ -1577,9 +1591,7 @@ def _mod_stack_at_column(
     depth = start_depth
     i = 0
     n = min(column, len(masked_line))
-    mod_open = re.compile(
-        r"(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
-    )
+    mod_open = _INLINE_MOD_OPEN
     while i < n:
         matched = mod_open.match(masked_line, i)
         if matched:
@@ -1782,10 +1794,7 @@ def _tests_in_file(
                 pushed_mod = True
 
         if not pushed_mod:
-            inline_mod = re.search(
-                r"(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{",
-                masked_line,
-            )
+            inline_mod = _INLINE_MOD_OPEN.search(masked_line)
             if inline_mod is not None:
                 mod_stack.append((depth, inline_mod.group(1), line_cfg_off))
 
@@ -3186,6 +3195,27 @@ class ExternalModulePrefix(unittest.TestCase):
 
         names = _tests_in_file(
             "#[test]\nfn r#none_auth_scheme_case() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_case"])
+
+    def test_raw_identifier_module_prefix_is_counted(self):
+        """`mod r#none_auth_scheme_ { #[test] fn works() }` is
+        `none_auth_scheme_::works` (#507 review)."""
+
+        names = _tests_in_file(
+            "mod r#none_auth_scheme_ { #[test] fn works() {} }\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_::works"])
+
+    def test_nested_cfg_attr_test_is_counted(self):
+        """`#[cfg_attr(test, cfg_attr(test, test))]` is a live test
+        (#507 review)."""
+
+        names = _tests_in_file(
+            "#[cfg_attr(test, cfg_attr(test, test))]\n"
+            "fn none_auth_scheme_case() {}\n",
             [],
         )
         self.assertEqual(names, ["none_auth_scheme_case"])
