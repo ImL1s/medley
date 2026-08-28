@@ -45,6 +45,7 @@ import re
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from collections import deque
 from pathlib import Path
@@ -306,23 +307,19 @@ def _is_cargo_crate_root_file(
 
 
 def _manifest_default_features(text: str) -> set[str]:
-    """Names listed in `[features] default = [...]`, if any."""
+    """Names listed in `[features] default = [...]`, including multiline."""
 
-    in_features = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped == "[features]":
-            in_features = True
-            continue
-        if stripped.startswith("["):
-            in_features = False
-            continue
-        if not in_features:
-            continue
-        match = re.match(r"^default\s*=\s*\[(.*)\]", stripped)
-        if match:
-            return set(re.findall(r'"([^"]+)"', match.group(1)))
-    return set()
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return set()
+    feats = data.get("features")
+    if not isinstance(feats, dict):
+        return set()
+    default = feats.get("default")
+    if not isinstance(default, list):
+        return set()
+    return {item for item in default if isinstance(item, str)}
 
 
 def _cargo_test_targets(root: Path) -> tuple[set[Path], set[Path]]:
@@ -1101,6 +1098,27 @@ class ExternalModulePrefix(unittest.TestCase):
             (crate / "Cargo.toml").write_text(
                 "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
                 "[features]\ndefault = [\"test-support\"]\n"
+                'test-support = []\n\n'
+                "[[test]]\nname = \"gated\"\n"
+                'required-features = ["test-support"]\n',
+                encoding="utf-8",
+            )
+            (tests / "gated.rs").write_text("#[test]\nfn visible() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("visible", names)
+
+    def test_multiline_default_features_keep_required_targets_seeded(self):
+        """`default = [` split across lines is still the crate default
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            tests = crate / "tests"
+            tests.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[features]\ndefault = [\n    \"test-support\",\n]\n"
                 'test-support = []\n\n'
                 "[[test]]\nname = \"gated\"\n"
                 'required-features = ["test-support"]\n',
