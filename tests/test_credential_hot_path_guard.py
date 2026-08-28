@@ -747,6 +747,9 @@ def _cargo_test_targets(
                     target = (crate / "tests" / f"{name}.rs").resolve()
                 if target is None:
                     continue
+                if table.get("test") is False:
+                    gated.add(target)
+                    continue
                 extra_required = required_feats - default_feats
                 if extra_required:
                     gated.add(target)
@@ -760,9 +763,10 @@ def _cargo_test_targets(
         path_s: str | None = None
         lib_path: str | None = None
         required_feats: set[str] = set()
+        test_enabled = True
 
         def flush() -> None:
-            nonlocal name, path_s, required_feats, in_test, in_lib, lib_path
+            nonlocal name, path_s, required_feats, in_test, in_lib, lib_path, test_enabled
             if in_lib and lib_path:
                 target = (crate / lib_path).resolve()
                 if target.is_file():
@@ -776,7 +780,9 @@ def _cargo_test_targets(
                     target = (crate / "tests" / f"{name}.rs").resolve()
                 if target is not None:
                     extra_required = required_feats - default_feats
-                    if extra_required:
+                    if not test_enabled:
+                        gated.add(target)
+                    elif extra_required:
                         gated.add(target)
                     elif target.is_file():
                         extra.add(target)
@@ -784,6 +790,7 @@ def _cargo_test_targets(
             path_s = None
             lib_path = None
             required_feats = set()
+            test_enabled = True
             in_test = False
             in_lib = False
 
@@ -814,6 +821,12 @@ def _cargo_test_targets(
             match = re.match(r'^path\s*=\s*"([^"]+)"', stripped)
             if match:
                 path_s = match.group(1)
+                continue
+            if re.match(r"^test\s*=\s*false\b", stripped):
+                test_enabled = False
+                continue
+            if re.match(r"^test\s*=\s*true\b", stripped):
+                test_enabled = True
                 continue
             if stripped.startswith("required-features"):
                 inner = stripped.split("=", 1)[-1]
@@ -1238,14 +1251,14 @@ def _compact_test_fns(
         if j < 0:
             break
         attrs, rest = _leading_attrs(masked_line[j:])
-        if not any(_is_test_attr(a) for a in attrs):
+        effective = _effective_attrs(attrs, enabled_features)
+        if not any(_is_test_attr(a) for a in effective):
             i = j + 2
             continue
         matched = _FN.match(rest)
         if matched is None:
             i = j + 2
             continue
-        effective = _effective_attrs(attrs, enabled_features)
         inactive = any(
             _cfg_attr_is_inactive(a, enabled_features) for a in effective
         )
@@ -1345,9 +1358,10 @@ def _tests_in_file(
     for i in range(n):
         masked_line = masked_lines[i]
         attrs, remainder_masked = _leading_attrs(masked_line)
-        has_test = any(_TEST_ATTR.match(a) for a in attrs) or bool(
-            _TEST_ATTR.match(masked_line)
-        )
+        has_test = any(
+            _is_test_attr(a)
+            for a in _effective_attrs(pending + attrs, enabled_features)
+        ) or bool(_TEST_ATTR.match(masked_line))
         enclosing_off = any(off for _, _, off in mod_stack)
         line_cfg_off = enclosing_off or any(
             _cfg_attr_is_inactive(a, enabled_features) for a in pending + attrs
@@ -1797,6 +1811,34 @@ class ExternalModulePrefix(unittest.TestCase):
             self.assertIn("lib_ok", names)
             self.assertIn("kept", names)
             self.assertNotIn("none_auth_scheme_stale", names)
+
+    def test_explicit_test_false_target_is_not_counted(self):
+        """`[[test]] test = false` is excluded from `cargo test`
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            tests = crate / "tests"
+            tests.mkdir(parents=True)
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+                "autotests = false\n\n"
+                "[[test]]\nname = \"off\"\n"
+                'path = "tests/off.rs"\n'
+                "test = false\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[test]\nfn none_auth_scheme_live() {}\n"
+            )
+            (tests / "off.rs").write_text(
+                "#[test]\nfn none_auth_scheme_off() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_live", names)
+            self.assertNotIn("none_auth_scheme_off", names)
 
     def test_autotests_false_name_only_explicit_test_is_kept(self):
         """`[[test]] name = "kept"` with no `path` still seeds
@@ -2430,6 +2472,16 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_live"])
+
+    def test_cfg_attr_test_is_counted(self):
+        """`#[cfg_attr(test, test)]` is a test under the harness
+        (#507 review)."""
+
+        names = _tests_in_file(
+            "#[cfg_attr(test, test)]\nfn none_auth_scheme_generated() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_generated"])
 
     def test_same_line_mod_and_test_are_both_seen(self):
         """`mod name { #[test] fn works() {} }` is `name::works`
