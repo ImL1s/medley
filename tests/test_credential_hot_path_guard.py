@@ -57,7 +57,9 @@ _CRATE_ROOTS = ("crates", "prod", "third_party")
 _TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test\b")
 _IGNORE_ATTR = re.compile(r"^#\[\s*ignore\b")
 _FN = re.compile(
-    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
+    r"(?:(?:async|const|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
+    r"fn\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
 _MOD_OPEN = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
@@ -1793,6 +1795,21 @@ class ExternalModulePrefix(unittest.TestCase):
             [],
         )
         self.assertEqual(names, ["none_auth_scheme_commented_gap"])
+
+    def test_const_and_extern_test_fns_are_counted(self):
+        """`const fn` and `extern \"C\" fn` tests are registered by
+        libtest (#507 review)."""
+
+        names = _tests_in_file(
+            "#[test] const fn none_auth_scheme_const() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_const"])
+        names = _tests_in_file(
+            '#[test] extern "C" fn none_auth_scheme_extern() {}\n',
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_extern"])
 
     def test_same_line_attr_and_inline_mod_keeps_the_prefix(self):
         """`#[allow(dead_code)] mod none_auth_scheme_ {` must still qualify
