@@ -953,6 +953,121 @@ class TransitiveClosure(unittest.TestCase):
         generated = {n for n in names if n.startswith("cases!")}
         self.assertEqual(len(generated), 2, names)
 
+    def test_generated_helpers_stay_in_their_macro_arm(self):
+        """A later arm's `fn helper` must not replace an earlier arm's
+        touching helper (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! bundle {
+                ($name:ident) => {
+                    fn helper() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    #[test]
+                    fn $name() {
+                        helper();
+                    }
+                };
+                ($name:ident, $x:expr) => {
+                    fn helper() {}
+                    #[test]
+                    fn $name() {
+                        helper();
+                    }
+                };
+            }
+
+            bundle!(touching);
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("bundle!")}
+        self.assertEqual(len(generated), 1, names)
+
+    def test_same_named_macros_in_different_files_are_not_combined(self):
+        """Invoking a local `cases!` must not inherit another file's
+        touching template of the same name (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    macro_rules! cases {
+                        ($name:ident) => {
+                            #[test]
+                            fn $name() {
+                                COUNTER.fetch_add(1, Ordering::SeqCst);
+                            }
+                        };
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    macro_rules! cases {
+                        ($name:ident) => {
+                            #[test]
+                            fn $name() {}
+                        };
+                    }
+                    cases!(local);
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertTrue(all(not n.startswith("cases!") for n in names), names)
+
+    def test_aliased_unrelated_static_is_not_a_touch(self):
+        """`use crate::b::COUNTER as C` is not the registered `a::COUNTER`
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    use crate::b::COUNTER as C;
+
+                    #[test]
+                    fn uses_other_counter_untagged() {
+                        C.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, set())
+
     def test_cross_file_call_into_inline_module_reaches_registered_state(self):
         sources = [
             (

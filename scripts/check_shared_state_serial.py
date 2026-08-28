@@ -1342,16 +1342,24 @@ def _with_aliases(
     file_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]],
     inline_mods: tuple[str, ...],
     identifiers: tuple[str, ...],
+    static_module: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
-    """Registered identifiers plus in-scope `use … as` aliases of them."""
+    """Registered identifiers plus in-scope `use … as` aliases of them.
+
+    The alias must resolve to this registered static's module, not some
+    other item that happens to share the identifier (#516 review).
+    """
 
     known = set(identifiers)
     extra: list[str] = []
     prefix = inline_mods
     while True:
-        for local, (_module, fname) in file_imports.get(prefix, {}).items():
-            if fname in known and local not in known:
-                extra.append(local)
+        for local, (module, fname) in file_imports.get(prefix, {}).items():
+            if fname not in known or local in known:
+                continue
+            if static_module is not None and module != static_module:
+                continue
+            extra.append(local)
         if not prefix:
             break
         prefix = prefix[:-1]
@@ -1468,21 +1476,57 @@ def _expand_generated_helper_bodies(fn_body: str, helpers: dict[str, str]) -> st
     return fn_body + "".join(extra)
 
 
-def _generated_test_templates(
-    body: str,
-) -> list[tuple[frozenset[str], bool, bool, str]]:
-    """Serial attrs, repetition, and body for each generated `fn $name`.
+def _macro_rule_arms(body: str) -> list[str]:
+    """Bodies of each `macro_rules!` match arm, or `[body]` if unparsed."""
 
-    Keys later come from that body (and its callees), not the macro-wide
-    union (#516 review). A generated test that calls `$helper()` still
-    inherits that helper's body, because the helper is not a real `fn`.
-    Nested `$relay()` -> `$leaf()` calls are expanded transitively.
-    """
-
-    parsed: list[tuple[str, bool, frozenset[str], bool, bool, str]] = []
     code = _code_only(body)
+    i = 0
+    n = len(code)
+    while i < n and code[i].isspace():
+        i += 1
+    if i < n and code[i] == "{":
+        end = _balanced_end(code, i)
+        code = code[i + 1 : end - 1]
+        i = 0
+        n = len(code)
+    arms: list[str] = []
+    while i < n:
+        while i < n and code[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        if code[i] != "(":
+            return [body] if not arms else arms
+        matcher_end = _balanced_end(code, i)
+        j = matcher_end
+        while j < n and code[j].isspace():
+            j += 1
+        if j + 1 >= n or code[j : j + 2] != "=>":
+            return [body] if not arms else arms
+        j += 2
+        while j < n and code[j].isspace():
+            j += 1
+        if j >= n or code[j] not in "{(":
+            return [body] if not arms else arms
+        end = _balanced_end(code, j)
+        inner_start = j + 1
+        inner_end = end - 1 if end > inner_start else end
+        arms.append(code[inner_start:inner_end])
+        i = end
+        while i < n and code[i].isspace():
+            i += 1
+        if i < n and code[i] == ";":
+            i += 1
+    return arms or [body]
+
+
+def _generated_test_templates_in_arm(
+    arm: str,
+) -> list[tuple[frozenset[str], bool, bool, str]]:
+    parsed: list[tuple[str, bool, frozenset[str], bool, bool, str]] = []
+    code = _code_only(arm)
     for match in MACRO_TEST_FN.finditer(code):
-        attrs = _preceding_attributes(body, code, match.start())
+        attrs = _preceding_attributes(arm, code, match.start())
         is_test = any(_is_test_attr(a) for a in attrs)
         held: set[str] = set()
         has_unkeyed = False
@@ -1503,11 +1547,15 @@ def _generated_test_templates(
                 is_test,
                 frozenset(held),
                 has_unkeyed,
-                _inside_dollar_repeat(body, match.start()),
+                _inside_dollar_repeat(arm, match.start()),
                 fn_body,
             )
         )
-    helpers = {metavar: fn_body for metavar, is_test, *_rest, fn_body in parsed if not is_test}
+    helpers = {
+        metavar: fn_body
+        for metavar, is_test, *_rest, fn_body in parsed
+        if not is_test
+    }
     out: list[tuple[frozenset[str], bool, bool, str]] = []
     for metavar, is_test, held, has_unkeyed, in_repeat, fn_body in parsed:
         if not is_test:
@@ -1523,6 +1571,25 @@ def _generated_test_templates(
     return out
 
 
+def _generated_test_templates(
+    body: str,
+) -> list[tuple[frozenset[str], bool, bool, str]]:
+    """Serial attrs, repetition, and body for each generated `fn $name`.
+
+    Keys later come from that body (and its callees), not the macro-wide
+    union (#516 review). A generated test that calls `$helper()` still
+    inherits that helper's body, because the helper is not a real `fn`.
+    Nested `$relay()` -> `$leaf()` calls are expanded transitively.
+    Helpers are per match arm so a later arm cannot replace an earlier
+    arm's same-named helper (#516 review).
+    """
+
+    out: list[tuple[frozenset[str], bool, bool, str]] = []
+    for arm in _macro_rule_arms(body):
+        out.extend(_generated_test_templates_in_arm(arm))
+    return out
+
+
 def _generated_test_serials(body: str) -> list[tuple[frozenset[str], bool]]:
     return [(held, unkeyed) for held, unkeyed, _rep, _body in _generated_test_templates(body)]
 
@@ -1531,6 +1598,7 @@ def _generated_test_serials(body: str) -> list[tuple[frozenset[str], bool]]:
 class _PendingMacroTest:
     file: Path
     macro_name: str
+    macro_file: Path
     line: int
     start: int
     inline_mods: tuple[str, ...]
@@ -1538,6 +1606,54 @@ class _PendingMacroTest:
     has_unkeyed_serial: bool
     slot: int
     template_index: int
+
+
+def _serials_for_macro_invoke(
+    *,
+    generated_by_macro: dict[
+        tuple[Path, str], list[tuple[frozenset[str], bool, bool, int]]
+    ],
+    exported_macros: dict[str, Path],
+    file_by_module: dict[tuple[str, ...], Path],
+    rel: Path,
+    macro_name: str,
+    invoke_text: str,
+    file_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]],
+    inline_mods: tuple[str, ...],
+) -> tuple[list[tuple[frozenset[str], bool, bool, int]], Path] | None:
+    """Templates for this invocation, bound to the defining file (#516 review)."""
+
+    full = invoke_text.strip()
+    if full.endswith("!"):
+        full = full[:-1]
+    segs = tuple(s.strip() for s in full.split("::") if s.strip())
+    if len(segs) >= 2 and segs[0] == "crate":
+        module = segs[1:-1]
+        fname = segs[-1]
+        def_file = file_by_module.get(module)
+        if def_file is None:
+            return None
+        serials = generated_by_macro.get((def_file, fname))
+        if not serials:
+            return None
+        return serials, def_file
+    serials = generated_by_macro.get((rel, macro_name))
+    if serials:
+        return serials, rel
+    imported = _lookup_import(file_imports, inline_mods, macro_name)
+    if imported is not None:
+        module, fname = imported
+        def_file = file_by_module.get(module)
+        if def_file is not None:
+            found = generated_by_macro.get((def_file, fname))
+            if found:
+                return found, def_file
+    export_file = exported_macros.get(macro_name)
+    if export_file is not None:
+        found = generated_by_macro.get((export_file, macro_name))
+        if found:
+            return found, export_file
+    return None
 
 
 def index_functions(
@@ -1549,7 +1665,15 @@ def index_functions(
 ]:
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
-    generated_by_macro: dict[str, list[tuple[frozenset[str], bool, bool, int]]] = {}
+    generated_by_macro: dict[
+        tuple[Path, str], list[tuple[frozenset[str], bool, bool, int]]
+    ] = {}
+    exported_macros: dict[str, Path] = {}
+    file_by_module: dict[tuple[str, ...], Path] = {}
+    for rel, _raw in sources:
+        module = _module_path(rel)
+        if module is not None:
+            file_by_module[module] = rel
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     ] = {}
@@ -1598,7 +1722,12 @@ def index_functions(
                 for item in registry
                 if _body_touches(
                     body_code,
-                    _with_aliases(scoped, inline_mods, item.identifiers),
+                    _with_aliases(
+                        scoped,
+                        inline_mods,
+                        item.identifiers,
+                        static_module=_module_path(item.file),
+                    ),
                 )
             )
             type_name = None
@@ -1646,6 +1775,8 @@ def index_functions(
             body_start, body_end = body_span
             occupied.append((body_start, body_end))
             body_code = _strip_turbofish(code[body_start:body_end])
+            macro_attrs = _preceding_attributes(raw, code, match.start())
+            is_export = any("macro_export" in a for a in macro_attrs)
             keys = frozenset(
                 item.key for item in registry if _body_touches(body_code, item.identifiers)
             )
@@ -1677,9 +1808,11 @@ def index_functions(
                             attrs_line=_line(raw, match.start()),
                         )
                     )
-                    generated_by_macro.setdefault(name, []).append(
+                    generated_by_macro.setdefault((rel, name), []).append(
                         (held, unkeyed, in_repeat, template_index)
                     )
+            if is_export:
+                exported_macros[name] = rel
             out.append(
                 FnInfo(
                     name=name,
@@ -1699,15 +1832,26 @@ def index_functions(
             )
         scans.append((rel, raw, code, occupied, inline_spans))
     for rel, raw, code, occupied, inline_spans in scans:
+        file_imports = imports_by_file.get(rel, {})
         for invoke in MACRO_INVOKE.finditer(code):
             macro_name = invoke.group(1)
-            serials = generated_by_macro.get(macro_name)
-            if not serials:
-                continue
             if any(start <= invoke.start() < end for start, end in occupied):
                 continue
-            line = _line(raw, invoke.start())
             inline_mods = _inline_path_from_spans(inline_spans, invoke.start())
+            resolved = _serials_for_macro_invoke(
+                generated_by_macro=generated_by_macro,
+                exported_macros=exported_macros,
+                file_by_module=file_by_module,
+                rel=rel,
+                macro_name=macro_name,
+                invoke_text=invoke.group(0),
+                file_imports=file_imports,
+                inline_mods=inline_mods,
+            )
+            if resolved is None:
+                continue
+            serials, macro_file = resolved
+            line = _line(raw, invoke.start())
             arity = _macro_invoke_arity(code, invoke.end())
             for slot, (serial_held, has_unkeyed, in_repeat, template_index) in enumerate(
                 serials
@@ -1718,6 +1862,7 @@ def index_functions(
                         _PendingMacroTest(
                             file=rel,
                             macro_name=macro_name,
+                            macro_file=macro_file,
                             line=line,
                             start=invoke.start(),
                             inline_mods=inline_mods,
@@ -2115,12 +2260,8 @@ def analyze(
     # acquired transitively (#516 review).
     macro_index = {(fn.file, fn.name): i for i, fn in enumerate(functions) if fn.is_macro}
     for pending in pending_macro_tests:
-        j = macro_index.get((pending.file, pending.macro_name))
-        indices = (
-            [j]
-            if j is not None
-            else list(by_macro_any.get(pending.macro_name, ()))
-        )
+        j = macro_index.get((pending.macro_file, pending.macro_name))
+        indices = [j] if j is not None else []
         if not indices:
             continue
         keys: frozenset[str] = frozenset()
