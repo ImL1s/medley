@@ -1708,6 +1708,118 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertIn("calls_outer_untagged", names)
 
+    def test_brace_self_alias_qualified_call_reaches_registered_state(self):
+        """`use crate::a::{self as h}; h::bump()` must resolve (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    use crate::a::{self as h};
+
+                    #[test]
+                    fn calls_self_alias_untagged() {
+                        h::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertIn("calls_self_alias_untagged", names)
+
+    def test_function_local_import_shadows_same_file_fn(self):
+        """`use crate::a::bump; bump()` wins over a same-file `fn bump`
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    fn bump() {}
+
+                    #[test]
+                    fn calls_imported_bump_untagged() {
+                        use crate::a::bump;
+                        bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertIn("calls_imported_bump_untagged", names)
+
+    def test_nested_block_static_use_does_not_shadow_outer_access(self):
+        """Outer `use crate::a::COUNTER` then inner `use crate::b::COUNTER`
+        must keep the outer access (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn uses_outer_counter_untagged() {
+                        use crate::a::COUNTER;
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                        {
+                            use crate::b::COUNTER;
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertIn("uses_outer_counter_untagged", names)
+
     def test_reexported_function_resolves_through_the_exporting_module(self):
         """`pub use crate::a::bump` in `b.rs` must make `crate::b::bump()`
         a toucher (#516 review)."""

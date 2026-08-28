@@ -1054,6 +1054,10 @@ def _collect_use_leaves(
             continue
         break
     alias, i = _parse_use_as(code, i)
+    if segs and segs[0] == "self" and prefix:
+        fname = prefix[-1]
+        out.append((prefix[:-1], fname, alias or fname))
+        return i
     if segs and segs[0] not in ("self", "super"):
         fname = segs[-1]
         out.append((prefix + tuple(segs[:-1]), fname, alias or fname))
@@ -1577,6 +1581,20 @@ class FnInfo:
     macro_arms: tuple[tuple[str, frozenset[str]], ...] = ()
 
 
+def _import_from_uses(
+    uses: tuple[tuple[int, int, str, tuple[str, ...], str], ...],
+    name: str,
+    pos: int,
+) -> tuple[tuple[str, ...], str] | None:
+    hits = [
+        entry for entry in uses if entry[2] == name and entry[0] <= pos < entry[1]
+    ]
+    if not hits:
+        return None
+    hits.sort(key=lambda entry: (entry[1], -entry[0]))
+    return hits[0][3], hits[0][4]
+
+
 def _fn_import(
     fn: FnInfo,
     name: str,
@@ -1587,14 +1605,9 @@ def _fn_import(
 ) -> tuple[tuple[str, ...], str] | None:
     """Resolve `name` at `call_pos` in `fn.body`, honoring nested blocks."""
 
-    hits = [
-        entry
-        for entry in fn.local_uses
-        if entry[2] == name and entry[0] <= call_pos < entry[1]
-    ]
-    if hits:
-        hits.sort(key=lambda entry: (entry[1], -entry[0]))
-        return hits[0][3], hits[0][4]
+    imported = _import_from_uses(fn.local_uses, name, call_pos)
+    if imported is not None:
+        return imported
     imported = fn.local_imports.get(name)
     if imported is not None:
         return imported
@@ -1679,6 +1692,7 @@ def _body_touches(
     inline_mods: tuple[str, ...] = (),
     scoped_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     | None = None,
+    local_uses: tuple[tuple[int, int, str, tuple[str, ...], str], ...] = (),
 ) -> bool:
     """True if `code_only_body` names this registered static.
 
@@ -1689,6 +1703,15 @@ def _body_touches(
 
     del original
     code_only_body = _mask_use_items(code_only_body)
+
+    def imported_at(name: str, pos: int) -> tuple[tuple[str, ...], str] | None:
+        found = _import_from_uses(local_uses, name, pos)
+        if found is not None:
+            return found
+        if scoped_imports is None:
+            return None
+        return _lookup_import(scoped_imports, inline_mods, name)
+
     for ident in identifiers:
         pattern = re.compile(
             rf"(?:((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+))"
@@ -1702,27 +1725,23 @@ def _body_touches(
                     for part in (p.strip() for p in prefix_raw.split("::"))
                     if part.strip()
                 )
-                if scoped_imports is not None and segs:
-                    imported = _lookup_import(
-                        scoped_imports, inline_mods, segs[0]
-                    )
-                    if imported is not None:
-                        module, fname = imported
-                        resolved = module + (fname,) + segs[1:]
-                        if static_module is None or resolved == static_module:
-                            return True
-                        continue
+                imported = imported_at(segs[0], match.start()) if segs else None
+                if imported is not None:
+                    module, fname = imported
+                    resolved = module + (fname,) + segs[1:]
+                    if static_module is None or resolved == static_module:
+                        return True
+                    continue
                 if static_module is None:
                     return True
                 if _resolve_path_module(segs, fn_module, inline_mods) == static_module:
                     return True
                 continue
-            if scoped_imports is not None:
-                imported = _lookup_import(scoped_imports, inline_mods, ident)
-                if imported is not None:
-                    module, _fname = imported
-                    if static_module is not None and module != static_module:
-                        continue
+            imported = imported_at(ident, match.start())
+            if imported is not None:
+                module, _fname = imported
+                if static_module is not None and module != static_module:
+                    continue
             return True
     return False
 
@@ -2116,23 +2135,33 @@ def index_functions(
         globs_by_file[rel] = file_globs
         for match, name, body_start, body_end, body_code, inline_mods in pending_fns:
             local, local_globs = _imports_in_span(bindings, body_start, body_end)
-            scoped = _overlay_fn_imports(file_imports, local, inline_mods)
+            local_uses = _local_uses_from_body(
+                body_code, _module_path(rel), inline_mods
+            )
             keys = frozenset(
                 item.key
                 for item in registry
                 if _body_touches(
                     body_code,
                     _with_aliases(
-                        scoped,
+                        file_imports,
                         inline_mods,
                         item.identifiers,
                         static_module=_item_module(item),
+                    )
+                    + tuple(
+                        {
+                            use[2]
+                            for use in local_uses
+                            if use[4] in item.identifiers
+                        }
                     ),
                     original=item.identifiers,
                     static_module=_item_module(item),
                     fn_module=_module_path(rel),
                     inline_mods=inline_mods,
-                    scoped_imports=scoped,
+                    scoped_imports=file_imports,
+                    local_uses=local_uses,
                 )
             )
             type_name = None
@@ -2171,9 +2200,7 @@ def index_functions(
                     attrs_line=_line(raw, match.start()),
                     local_imports=local,
                     glob_modules=tuple(local_globs),
-                    local_uses=_local_uses_from_body(
-                        body_code, _module_path(rel), inline_mods
-                    ),
+                    local_uses=local_uses,
                 )
             )
         for match in MACRO_DEF.finditer(code):
@@ -2492,19 +2519,19 @@ def _resolve_calls(
         # all kept; callers union their keys (#516 review).
         name = m.group(1)
         js: list[int] = []
-        prefix = fn.inline_mods
-        while True:
-            js = by_inline.get((fn.file, prefix), {}).get(name, [])
-            if js:
-                break
-            if not prefix:
-                break
-            prefix = prefix[:-1]
+        imported = _fn_import(fn, name, m.start(), imports_by_file)
+        if imported is not None:
+            module, fname = imported
+            js = by_module.get(module, {}).get(fname, [])
         if not js:
-            imported = _fn_import(fn, name, m.start(), imports_by_file)
-            if imported is not None:
-                module, fname = imported
-                js = by_module.get(module, {}).get(fname, [])
+            prefix = fn.inline_mods
+            while True:
+                js = by_inline.get((fn.file, prefix), {}).get(name, [])
+                if js:
+                    break
+                if not prefix:
+                    break
+                prefix = prefix[:-1]
         if not js:
             for module in _globs_in_scope(
                 globs_by_file.get(fn.file, {}),
