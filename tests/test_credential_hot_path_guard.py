@@ -24,6 +24,13 @@ This guard checks two things CLAUDE.md's prose alone cannot self-verify:
      investigation) -- `xai-grok-sampler/tests/shared_http_wire.rs` is a
      separate integration-test target, invisible to a `--lib`-only
      listing.
+   - A repo-wide total, ignoring the `-p` / `--lib` / `--test` of the
+     `run_nonzero` line that actually invokes the filter, lets a
+     sampler-lib test vanish while a same-pattern test appears in
+     another crate and both the documented count and `run_nonzero`
+     stay green (#507 review). Counts for a dedicated CI filter are
+     therefore taken only inside that invocation's package and cargo
+     target.
    - fn-name-only classification (no module prefix) reproduces the exact
      defect this guard exists to catch (#507 review): libtest matches a
      substring filter against the full `module::path::fn` name, so a
@@ -50,10 +57,16 @@ import tomllib
 import unittest
 from collections import deque
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent.parent
 CLAUDE_MD = ROOT / "CLAUDE.md"
 _CRATE_ROOTS = ("crates", "prod", "third_party")
+CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
+
+sys.path.insert(0, str(ROOT / "scripts"))
+from check_test_filter_coverage import parse_workflow  # noqa: E402
+from toml_package_name import package_name  # noqa: E402
 
 _TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test\b")
 _IGNORE_ATTR = re.compile(r"^#\[\s*ignore\b")
@@ -73,7 +86,7 @@ _MOD_KW_ONLY = re.compile(
 )
 _IDENT_SEMI = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*;")
 _IDENT_OPEN = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{")
-_PATH_ATTR = re.compile(r'#\[path\s*=\s*"([^"]+)"\]')
+_PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]', re.DOTALL)
 
 _HOT_PATH_MARKER = "CI's hot path is exactly this suite"
 _DOC_ENTRY = re.compile(r"`([a-z][a-z0-9_]*)`\s*\((\d+)\)")
@@ -526,6 +539,82 @@ def parse_documented_hot_path(text: str) -> dict[str, int]:
     return entries
 
 
+class _TestRecord(NamedTuple):
+    package: str
+    target: str
+    name: str
+
+
+def _package_name_for(path: Path, cache: dict[Path, str]) -> str:
+    current = path.parent if path.is_file() else path
+    for parent in (current, *current.parents):
+        cached = cache.get(parent)
+        if cached is not None:
+            return cached
+        manifest = parent / "Cargo.toml"
+        if not manifest.is_file():
+            continue
+        try:
+            text = manifest.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        name = package_name(text)
+        if name:
+            cache[parent] = name
+            return name
+    return ""
+
+
+def _cargo_target_of(
+    rs: Path, extra_roots: set[Path] | frozenset[Path] | None = None
+) -> str:
+    """Cargo test target key matching `parse_workflow` (`lib`, `test:name`)."""
+
+    split = _crate_source_rel(rs)
+    if split is None:
+        if extra_roots and rs.resolve() in extra_roots:
+            return f"test:{rs.stem}"
+        return ""
+    marker, rest = split
+    if marker == "src":
+        if rest[:1] == ["bin"] or rest == ["main.rs"]:
+            return ""
+        return "lib"
+    if marker == "tests":
+        if not rest:
+            return ""
+        first = rest[0]
+        stem = Path(first).stem if first.endswith(".rs") else first
+        return f"test:{stem}"
+    return ""
+
+
+def _ci_scopes_for_pattern(
+    parsed: dict[str, dict[str, set[str]]], pattern: str
+) -> set[tuple[str, str]] | None:
+    """`(package, target)` pairs whose `run_nonzero` filter token is
+    exactly `pattern`. `None` means no dedicated invocation -- count
+    repo-wide (#507 review)."""
+
+    found: set[tuple[str, str]] = set()
+    for crate, targets in parsed.items():
+        for target, filters in targets.items():
+            if pattern in filters:
+                found.add((crate, target))
+    return found or None
+
+
+def _hot_path_matches(
+    records: list[_TestRecord],
+    pattern: str,
+    scopes: set[tuple[str, str]] | None,
+) -> list[_TestRecord]:
+    hits = [r for r in records if pattern in r.name]
+    if scopes is None:
+        return hits
+    return [r for r in hits if (r.package, r.target) in scopes]
+
+
 def _crate_source_rel(rs: Path) -> tuple[str, list[str]] | None:
     """(`src`|`tests`, remaining components including the filename).
 
@@ -904,6 +993,8 @@ def _iter_module_decls(
     pending_path: str | None = None
     pending_attrs: list[str] = []
     pending_mod = False
+    pending_path_frag: str | None = None
+    pending_path_mask: str | None = None
     raw_lines = text.splitlines()
     masked = _mask_rust_literals(text)
     masked_lines = masked.splitlines()
@@ -921,16 +1012,25 @@ def _iter_module_decls(
         enclosing_off = any(off for _, _, off in inline_stack)
         in_macro = any(start <= line_start < end for start, end in inactive)
         # `#[path = "x"]` stores the path in a string, so a full literal
-        # mask blanks it. Search the line-comment-stripped raw line, then
+        # mask blanks it. Search the line-comment-stripped raw text, then
         # keep the match only if that `#[path]` is live code: the `#`
-        # survives the comment/string mask. A `#[path]` inside `/* ... */`
-        # or a string is spaces in the mask (#507 review).
-        path_match = _PATH_ATTR.search(raw_no_line_comment)
+        # survives the comment/string mask. Attributes may split across
+        # lines (`#[path =\n"actual.rs"]`) (#507 review).
+        raw_for_path = raw_no_line_comment
+        mask_for_path = masked_lines[i]
+        if pending_path_frag is not None:
+            raw_for_path = pending_path_frag + "\n" + raw_no_line_comment
+            mask_for_path = (pending_path_mask or "") + "\n" + masked_lines[i]
+            pending_path_frag = None
+            pending_path_mask = None
+        path_match = _PATH_ATTR.search(raw_for_path)
         if path_match:
             start = path_match.start()
-            masked_line = masked_lines[i]
-            if start >= len(masked_line) or masked_line[start] != "#":
+            if start >= len(mask_for_path) or mask_for_path[start] != "#":
                 path_match = None
+        elif re.search(r"#\[\s*path\b", raw_for_path) and "]" not in raw_for_path:
+            pending_path_frag = raw_for_path
+            pending_path_mask = mask_for_path
         if path_match:
             pending_path = path_match.group(1)
             pending_attrs.extend(attrs)
@@ -1169,6 +1269,10 @@ def _cfg_atom(
     arch_eq = re.fullmatch(r'target_arch\s*=\s*"([^"]+)"', atom)
     if arch_eq:
         return _host_target_arch() == arch_eq.group(1)
+    if atom == "debug_assertions":
+        # `cargo test` is the debug profile; the documented hot path is
+        # never `--release` (#507 review).
+        return True
     return None
 
 
@@ -1261,10 +1365,10 @@ def _is_test_attr(attr: str) -> bool:
 def _compact_test_fns(
     masked_line: str,
     enabled_features: set[str] | frozenset[str] | None = None,
-) -> list[tuple[str, bool, bool]]:
-    """`(name, inactive, ignored)` for each same-line `#[test] fn`."""
+) -> list[tuple[str, bool, bool, int]]:
+    """`(name, inactive, ignored, column)` for each same-line `#[test] fn`."""
 
-    out: list[tuple[str, bool, bool]] = []
+    out: list[tuple[str, bool, bool, int]] = []
     i = 0
     while True:
         j = masked_line.find("#[", i)
@@ -1283,10 +1387,47 @@ def _compact_test_fns(
             _cfg_attr_is_inactive(a, enabled_features) for a in effective
         )
         ignored = any(_IGNORE_ATTR.match(a.strip()) for a in effective)
-        out.append((matched.group(1), inactive, ignored))
+        out.append((matched.group(1), inactive, ignored, j))
         consumed = len(masked_line[j:]) - len(rest) + matched.end()
         i = j + max(consumed, 2)
     return out
+
+
+def _mod_stack_at_column(
+    masked_line: str,
+    column: int,
+    start_stack: list[tuple[int, str, bool]],
+    start_depth: int,
+) -> list[tuple[int, str, bool]]:
+    """Module nest at `column` on this line, not the line-wide stack.
+
+    `mod name { #[test] fn inner() {} } #[test] fn outer() {}` must
+    qualify only `inner` (#507 review).
+    """
+
+    stack = list(start_stack)
+    depth = start_depth
+    i = 0
+    n = min(column, len(masked_line))
+    mod_open = re.compile(
+        r"(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+    )
+    while i < n:
+        matched = mod_open.match(masked_line, i)
+        if matched:
+            stack.append((depth, matched.group(1), False))
+            depth += 1
+            i = matched.end()
+            continue
+        ch = masked_line[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            while stack and depth <= stack[-1][0]:
+                stack.pop()
+        i += 1
+    return stack
 
 
 def _file_inner_cfg_inactive(
@@ -1377,6 +1518,9 @@ def _tests_in_file(
     line_start = 0
     for i in range(n):
         masked_line = masked_lines[i]
+        line_stack = list(mod_stack)
+        line_depth = depth
+        compact_fns = _compact_test_fns(masked_line, enabled_features)
         attrs, remainder_masked = _leading_attrs(masked_line)
         has_test = any(
             _is_test_attr(a)
@@ -1426,7 +1570,13 @@ def _tests_in_file(
                 for a in _effective_attrs(all_attrs, enabled_features)
             )
             in_macro_def = any(start <= line_start < end for start, end in def_spans)
-            if found and not inactive and not ignored and not in_macro_def:
+            if (
+                found
+                and not inactive
+                and not ignored
+                and not in_macro_def
+                and not compact_fns
+            ):
                 prefix_parts = file_mods + [name for _, name, _ in mod_stack]
                 prefix = "::".join(prefix_parts)
                 names.append(f"{prefix}::{found}" if prefix else found)
@@ -1454,15 +1604,16 @@ def _tests_in_file(
                 mod_stack.append((depth, inline_mod.group(1), line_cfg_off))
 
         in_macro_def = any(start <= line_start < end for start, end in def_spans)
-        seen_on_line = {found} if has_test and found else set()
-        for fname, cinactive, cignored in _compact_test_fns(
-            masked_line, enabled_features
-        ):
+        seen_on_line = {found} if has_test and found and not compact_fns else set()
+        for fname, cinactive, cignored, col in compact_fns:
             if fname in seen_on_line:
                 continue
             if enclosing_off or cinactive or cignored or in_macro_def:
                 continue
-            prefix_parts = file_mods + [name for _, name, _ in mod_stack]
+            col_stack = _mod_stack_at_column(
+                masked_line, col, line_stack, line_depth
+            )
+            prefix_parts = file_mods + [name for _, name, _ in col_stack]
             prefix = "::".join(prefix_parts)
             names.append(f"{prefix}::{fname}" if prefix else fname)
             seen_on_line.add(fname)
@@ -1524,12 +1675,12 @@ def _module_prefixes_for_source(
     return prefixes or None
 
 
-def _qualified_test_names(root: Path) -> list[str]:
-    """Every `#[test]`/`#[tokio::test]` function's qualified name under
-    `crates/`/`prod/` -- `src/` and `tests/` alike -- prefixed with its
-    file-path module plus in-file `mod X { ... }` blocks.
+def _qualified_test_records(root: Path) -> list[_TestRecord]:
+    """Every `#[test]`/`#[tokio::test]` function under `crates/`/`prod/`
+    with the cargo package and target that would compile it.
 
-    File-path prefix covers the common `mod name;` / `name.rs` shape
+    Names are prefixed with the file-path module plus in-file `mod X { ... }`
+    blocks. File-path prefix covers the common `mod name;` / `name.rs` shape
     libtest uses (#507 review). `#[path = "..."] mod name;` replaces the
     target file's path prefix with the declaring file's prefix plus
     `name`. Cross-file `mod x;`
@@ -1541,7 +1692,8 @@ def _qualified_test_names(root: Path) -> list[str]:
     extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats = (
         _cargo_test_targets(root)
     )
-    names: list[str] = []
+    records: list[_TestRecord] = []
+    pkg_cache: dict[Path, str] = {}
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
@@ -1564,9 +1716,16 @@ def _qualified_test_names(root: Path) -> list[str]:
             )
             if prefix_lists is None:
                 continue
+            pkg = _package_name_for(rs, pkg_cache)
+            target = _cargo_target_of(rs, extra_roots)
             for file_mods in prefix_lists:
-                names.extend(_tests_in_file(text, file_mods, enabled))
-    return names
+                for name in _tests_in_file(text, file_mods, enabled):
+                    records.append(_TestRecord(pkg, target, name))
+    return records
+
+
+def _qualified_test_names(root: Path) -> list[str]:
+    return [record.name for record in _qualified_test_records(root)]
 
 
 class CredentialHotPathCorpus(unittest.TestCase):
@@ -1575,7 +1734,11 @@ class CredentialHotPathCorpus(unittest.TestCase):
         cls.documented = parse_documented_hot_path(
             CLAUDE_MD.read_text(encoding="utf-8")
         )
-        cls.names = _qualified_test_names(ROOT)
+        cls.records = _qualified_test_records(ROOT)
+        cls.names = [record.name for record in cls.records]
+        cls.ci_filters = parse_workflow(
+            CI_YML.read_text(encoding="utf-8"), root=ROOT
+        )
 
     def test_the_corpus_is_not_empty(self):
         # A scan that silently finds nothing satisfies every assertion
@@ -1587,23 +1750,170 @@ class CredentialHotPathCorpus(unittest.TestCase):
         # because this assertion only listed the four patterns (#507 review).
         self.assertEqual(set(self.documented), _REQUIRED_HOT_PATH_ENTRIES)
 
+    def test_dedicated_ci_filters_pin_their_package_and_target(self):
+        # The documented substring is the filter token CI actually passes
+        # to `run_nonzero`, not a family name that happens to match.
+        self.assertEqual(
+            _ci_scopes_for_pattern(self.ci_filters, "hostile_injector"),
+            {("xai-grok-sampler", "lib")},
+        )
+        self.assertEqual(
+            _ci_scopes_for_pattern(self.ci_filters, "omits_xai_identity"),
+            {("xai-grok-sampler", "lib")},
+        )
+        self.assertEqual(
+            _ci_scopes_for_pattern(self.ci_filters, "none_auth_scheme_"),
+            {("xai-grok-sampler", "test:shared_http_wire")},
+        )
+        self.assertIsNone(
+            _ci_scopes_for_pattern(self.ci_filters, "is_secret_free_")
+        )
+
     def test_each_documented_entry_selects_its_documented_count(self):
         # The counterexample CLAUDE.md's own commit history should never
         # reproduce (#507 review): editing only this file's number, with
         # nothing about the source changing, must turn this test red --
         # the guard checks CLAUDE.md's count against source, not a copy
-        # of the count against itself.
+        # of the count against itself. A dedicated CI filter is counted
+        # only inside that invocation's package and cargo target, so a
+        # sampler-lib test cannot be replaced by a same-pattern test in
+        # another crate without reddening the count (#507 review).
         wrong = {}
         for pattern, expected in self.documented.items():
-            matched = [n for n in self.names if pattern in n]
+            scopes = _ci_scopes_for_pattern(self.ci_filters, pattern)
+            matched = _hot_path_matches(self.records, pattern, scopes)
             if len(matched) != expected:
-                wrong[pattern] = (len(matched), expected, matched)
+                wrong[pattern] = (
+                    len(matched),
+                    expected,
+                    [(r.package, r.target, r.name) for r in matched],
+                    scopes,
+                )
         self.assertEqual(
             wrong,
             {},
             f"CLAUDE.md's documented count does not match source (got, "
-            f"documented, matches): {wrong}",
+            f"documented, matches, ci-scopes): {wrong}",
         )
+
+
+class CiPackageTargetCounts(unittest.TestCase):
+    def test_same_pattern_in_another_package_does_not_fill_the_ci_count(self):
+        """`hostile_injector` is `-p xai-grok-sampler --lib` in CI; a
+        same-pattern test added to another crate must not keep that
+        count green (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sampler = root / "crates" / "codegen" / "xai-grok-sampler"
+            (sampler / "src").mkdir(parents=True)
+            (sampler / "Cargo.toml").write_text(
+                '[package]\nname = "xai-grok-sampler"\n'
+            )
+            (sampler / "src" / "lib.rs").write_text(
+                "#[test]\nfn none_scheme_post_strips_auth_headers_after_hostile_injector() {}\n"
+            )
+            other = root / "crates" / "codegen" / "xai-grok-shell"
+            (other / "src").mkdir(parents=True)
+            (other / "Cargo.toml").write_text(
+                '[package]\nname = "xai-grok-shell"\n'
+            )
+            (other / "src" / "lib.rs").write_text(
+                "#[test]\nfn extra_hostile_injector_elsewhere() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --lib "
+                "hostile_injector -- --nocapture\n"
+            )
+            records = _qualified_test_records(root)
+            scopes = _ci_scopes_for_pattern(
+                parse_workflow(wf, root=root), "hostile_injector"
+            )
+            matched = _hot_path_matches(records, "hostile_injector", scopes)
+            self.assertEqual(
+                [r.name for r in matched],
+                ["none_scheme_post_strips_auth_headers_after_hostile_injector"],
+            )
+            self.assertEqual(
+                {(r.package, r.target) for r in matched},
+                {("xai-grok-sampler", "lib")},
+            )
+
+    def test_lib_match_does_not_fill_an_integration_filter_count(self):
+        """`none_auth_scheme_` CI is `--test shared_http_wire`, not `--lib`
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            (crate / "src").mkdir(parents=True)
+            (crate / "tests").mkdir()
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "xai-grok-sampler"\n'
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[test]\nfn none_auth_scheme_in_lib() {}\n"
+            )
+            (crate / "tests" / "shared_http_wire.rs").write_text(
+                "#[test]\nfn none_auth_scheme_on_the_wire() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --test "
+                "shared_http_wire none_auth_scheme_ -- --nocapture\n"
+            )
+            records = _qualified_test_records(root)
+            scopes = _ci_scopes_for_pattern(
+                parse_workflow(wf, root=root), "none_auth_scheme_"
+            )
+            matched = _hot_path_matches(records, "none_auth_scheme_", scopes)
+            self.assertEqual(
+                [r.name for r in matched],
+                ["none_auth_scheme_on_the_wire"],
+            )
+            self.assertEqual(
+                {(r.package, r.target) for r in matched},
+                {("xai-grok-sampler", "test:shared_http_wire")},
+            )
+
+    def test_pattern_without_a_ci_invocation_stays_repo_wide(self):
+        """`is_secret_free_` is not a `run_nonzero` token; its count stays
+        the repo-wide substring total (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sampler = root / "crates" / "codegen" / "xai-grok-sampler"
+            (sampler / "src").mkdir(parents=True)
+            (sampler / "Cargo.toml").write_text(
+                '[package]\nname = "xai-grok-sampler"\n'
+            )
+            (sampler / "src" / "lib.rs").write_text(
+                "#[test]\nfn provider_controlled_stream_error_is_secret_free_for_all_stream_apis() {}\n"
+            )
+            types = root / "crates" / "codegen" / "xai-grok-sampling-types"
+            (types / "src").mkdir(parents=True)
+            (types / "Cargo.toml").write_text(
+                '[package]\nname = "xai-grok-sampling-types"\n'
+            )
+            (types / "src" / "lib.rs").write_text(
+                "#[test]\nfn provider_error_body_preview_is_secret_free_and_bounded() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --lib "
+                "hostile_injector -- --nocapture\n"
+            )
+            records = _qualified_test_records(root)
+            scopes = _ci_scopes_for_pattern(
+                parse_workflow(wf, root=root), "is_secret_free_"
+            )
+            self.assertIsNone(scopes)
+            matched = _hot_path_matches(records, "is_secret_free_", scopes)
+            self.assertEqual(
+                sorted(r.name for r in matched),
+                [
+                    "provider_controlled_stream_error_is_secret_free_for_all_stream_apis",
+                    "provider_error_body_preview_is_secret_free_and_bounded",
+                ],
+            )
 
 
 class ExternalModulePrefix(unittest.TestCase):
@@ -1640,6 +1950,21 @@ class ExternalModulePrefix(unittest.TestCase):
             src.mkdir(parents=True)
             (src / "lib.rs").write_text(
                 '#[path = "elsewhere.rs"]\nmod none_auth_scheme_regressions;\n'
+            )
+            (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_regressions::works", names)
+
+    def test_path_attr_split_across_lines_is_followed(self):
+        """`#[path =\\n\"actual.rs\"]` still redirects the module
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                '#[path =\n"elsewhere.rs"]\nmod none_auth_scheme_regressions;\n'
             )
             (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
             names = _qualified_test_names(root)
@@ -2549,6 +2874,27 @@ class ExternalModulePrefix(unittest.TestCase):
             [],
         )
         self.assertEqual(names, ["none_auth_scheme_::works"])
+
+    def test_same_line_test_after_closed_inline_mod_is_not_nested(self):
+        """`mod name { #[test] fn inner() {} } #[test] fn outer() {}`
+        must not qualify `outer` (#507 review)."""
+
+        names = _tests_in_file(
+            "mod none_auth_scheme_ { #[test] fn works() {} } #[test] fn plain() {}\n",
+            [],
+        )
+        self.assertEqual(sorted(names), ["none_auth_scheme_::works", "plain"])
+
+    def test_debug_assertions_cfg_is_active_under_cargo_test(self):
+        """The documented hot path is debug `cargo test` (#507 review)."""
+
+        names = _tests_in_file(
+            "#[cfg(debug_assertions)]\n#[test]\nfn live() {}\n"
+            "#[cfg(not(debug_assertions))]\n#[test]\nfn hidden() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["live"])
+        self.assertNotIn("hidden", names)
 
     def test_two_tests_on_the_same_line_are_both_counted(self):
         names = _tests_in_file(
