@@ -309,28 +309,137 @@ def _invoked_macro_names(
     `macro_rules!` body. Invoked macros emit their `#[test]` items
     (#507 review)."""
 
+    return {name for name, _inner in _macro_invoke_inners(masked, defs)}
+
+
+_ARM_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[^\sA-Za-z0-9_]")
+
+
+def _macro_invoke_inners(
+    masked: str, defs: list[tuple[str, int, int]]
+) -> list[tuple[str, str]]:
+    """`(name, invoke_inner)` for invocations outside macro definitions."""
+
     known = {name for name, _, _ in defs}
     if not known:
-        return set()
+        return []
     bodies = [(start, end) for _, start, end in defs]
-    invoked: set[str] = set()
+    out: list[tuple[str, str]] = []
     for match in _MACRO_INVOKE.finditer(masked):
         name = match.group(1)
         if name not in known:
             continue
         if any(start <= match.start() < end for start, end in bodies):
             continue
-        invoked.add(name)
-    return invoked
+        delim = match.end() - 1
+        end = _balanced_pair_end(masked, delim)
+        out.append((name, masked[delim + 1 : end - 1]))
+    return out
+
+
+def _macro_arm_spans(
+    masked: str, body_start: int, body_end: int
+) -> list[tuple[str, int, int]]:
+    """`(matcher, inner_start, inner_end)` for each `macro_rules!` arm."""
+
+    inner = masked[body_start:body_end]
+    if not inner:
+        return []
+    i = 1
+    n = max(0, len(inner) - 1)
+    arms: list[tuple[str, int, int]] = []
+    while i < n:
+        while i < n and inner[i].isspace():
+            i += 1
+        if i >= n or inner[i] not in "{([":
+            break
+        matcher_end = _balanced_pair_end(inner, i)
+        matcher = inner[i:matcher_end]
+        j = matcher_end
+        while j < n and inner[j].isspace():
+            j += 1
+        if j + 1 >= n or inner[j : j + 2] != "=>":
+            break
+        j += 2
+        while j < n and inner[j].isspace():
+            j += 1
+        if j >= n or inner[j] not in "{([":
+            break
+        end = _balanced_pair_end(inner, j)
+        arms.append(
+            (matcher, body_start + j + 1, body_start + end - 1)
+        )
+        i = end
+        while i < n and inner[i].isspace():
+            i += 1
+        if i < n and inner[i] == ";":
+            i += 1
+    return arms
+
+
+def _simple_arm_accepts(matcher: str, invoke_inner: str) -> bool:
+    inner = matcher.strip()
+    if len(inner) >= 2 and inner[0] in "([{" and inner[-1] in ")]}":
+        inner = inner[1:-1]
+    if "$" not in inner:
+        return _ARM_TOKEN.findall(inner) == _ARM_TOKEN.findall(invoke_inner)
+    if re.search(r"\$\s*\(", inner):
+        return True
+    parts = re.split(r"\$[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?", inner)
+    tokens = _ARM_TOKEN.findall(invoke_inner)
+    cursor = 0
+    for index, piece in enumerate(parts):
+        lits = _ARM_TOKEN.findall(piece)
+        for lit in lits:
+            if cursor >= len(tokens) or tokens[cursor] != lit:
+                return False
+            cursor += 1
+        if index < len(parts) - 1:
+            if cursor >= len(tokens):
+                return False
+            cursor += 1
+    return cursor == len(tokens)
+
+
+def _inactive_macro_spans(masked: str) -> list[tuple[int, int]]:
+    """Spans rustc does not expand: uninvoked macros and unselected arms.
+
+    One `generated!(cold)` must not unmask a sibling `(hot)` arm
+    (#507 review).
+    """
+
+    defs = _macro_rules_defs(masked)
+    invokes_by_name: dict[str, list[str]] = {}
+    for name, inner in _macro_invoke_inners(masked, defs):
+        invokes_by_name.setdefault(name, []).append(inner)
+    inactive: list[tuple[int, int]] = []
+    for name, start, end in defs:
+        inners = invokes_by_name.get(name, [])
+        if not inners:
+            inactive.append((start, end))
+            continue
+        arms = _macro_arm_spans(masked, start, end)
+        if not arms:
+            continue
+        selected: list[tuple[int, int]] = []
+        for invoke_inner in inners:
+            for matcher, arm_start, arm_end in arms:
+                if _simple_arm_accepts(matcher, invoke_inner):
+                    selected.append((arm_start, arm_end))
+                    break
+        selected.sort()
+        cursor = start
+        for arm_start, arm_end in selected:
+            if cursor < arm_start:
+                inactive.append((cursor, arm_start))
+            cursor = max(cursor, arm_end)
+        if cursor < end:
+            inactive.append((cursor, end))
+    return inactive
 
 
 def _macro_rules_body_spans(masked: str) -> list[tuple[int, int]]:
-    """Uninvoked `macro_rules!` bodies. Invoked macros are expanded by
-    rustc, so their `#[test]` items count (#507 review)."""
-
-    defs = _macro_rules_defs(masked)
-    invoked = _invoked_macro_names(masked, defs)
-    return [(start, end) for name, start, end in defs if name not in invoked]
+    return _inactive_macro_spans(masked)
 
 
 def parse_documented_hot_path(text: str) -> dict[str, int]:
@@ -690,17 +799,21 @@ def _iter_module_decls(
     pending_path: str | None = None
     pending_attrs: list[str] = []
     raw_lines = text.splitlines()
-    masked_lines = _mask_rust_literals(text).splitlines()
+    masked = _mask_rust_literals(text)
+    masked_lines = masked.splitlines()
     if len(masked_lines) < len(raw_lines):
         masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
+    inactive = _inactive_macro_spans(masked)
     depth = 0
     inline_stack: list[tuple[int, str, bool]] = []
+    line_start = 0
     for i, raw in enumerate(raw_lines):
         line = _strip_line_comment(masked_lines[i])
         raw_no_line_comment = _strip_line_comment(raw)
         stripped_raw = raw_no_line_comment.strip()
         attrs, remainder = _leading_attrs(line)
         enclosing_off = any(off for _, _, off in inline_stack)
+        in_macro = any(start <= line_start < end for start, end in inactive)
         # `#[path = "x"]` stores the path in a string, so a full literal
         # mask blanks it. Search the line-comment-stripped raw line, then
         # keep the match only if that `#[path]` is live code: the `#`
@@ -720,7 +833,7 @@ def _iter_module_decls(
             cfg_off = any(
                 _cfg_attr_is_inactive(a) for a in pending_attrs + attrs
             )
-            skip = enclosing_off or cfg_off
+            skip = enclosing_off or cfg_off or in_macro
             if not skip:
                 name = semi.group(1)
                 inline_names = tuple(n for _, n, _ in inline_stack)
@@ -763,6 +876,7 @@ def _iter_module_decls(
         depth += line.count("{") - line.count("}")
         while inline_stack and depth <= inline_stack[-1][0]:
             inline_stack.pop()
+        line_start += len(masked_lines[i]) + 1
     return decls
 
 
@@ -1929,6 +2043,70 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_generated"])
+
+    def test_unselected_macro_arm_test_is_not_counted(self):
+        """`generated!(cold)` must not count a sibling `(hot)` arm
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                (hot) => {
+                    #[test]
+                    fn none_auth_scheme_generated() {}
+                };
+                (cold) => {};
+            }
+            generated!(cold);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, [])
+
+    def test_selected_macro_arm_test_is_counted(self):
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                (hot) => {
+                    #[test]
+                    fn none_auth_scheme_generated() {}
+                };
+                (cold) => {};
+            }
+            generated!(hot);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_generated"])
+
+    def test_uninvoked_macro_mod_is_not_followed(self):
+        """`mod alias;` inside an uninvoked macro is not a live module
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                "macro_rules! phantom {\n"
+                "    () => { mod alias; };\n"
+                "}\n"
+                "#[test]\nfn live() {}\n",
+                encoding="utf-8",
+            )
+            (src / "alias.rs").write_text(
+                "#[test]\nfn none_auth_scheme_stale() {}\n",
+                encoding="utf-8",
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("live", names)
+            self.assertNotIn("alias::none_auth_scheme_stale", names)
+            self.assertNotIn("none_auth_scheme_stale", names)
 
     def test_attr_string_brace_does_not_close_the_module(self):
         """`#[doc = "}"]` must not pop the enclosing inline module
