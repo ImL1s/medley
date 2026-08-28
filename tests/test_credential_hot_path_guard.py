@@ -566,13 +566,18 @@ def _package_name_for(path: Path, cache: dict[Path, str]) -> str:
 
 
 def _cargo_target_of(
-    rs: Path, extra_roots: set[Path] | frozenset[Path] | None = None
+    rs: Path,
+    extra_roots: set[Path] | frozenset[Path] | None = None,
+    test_names: dict[Path, str] | None = None,
 ) -> str:
     """Cargo test target key matching `parse_workflow` (`lib`, `test:name`)."""
 
+    key = rs.resolve()
+    if test_names and key in test_names:
+        return f"test:{test_names[key]}"
     split = _crate_source_rel(rs)
     if split is None:
-        if extra_roots and rs.resolve() in extra_roots:
+        if extra_roots and key in extra_roots:
             return f"test:{rs.stem}"
         return ""
     marker, rest = split
@@ -775,7 +780,7 @@ def _manifest_default_features(text: str) -> set[str]:
 
 def _cargo_test_targets(
     root: Path,
-) -> tuple[set[Path], set[Path], set[Path], set[Path], dict[Path, set[str]]]:
+) -> tuple[set[Path], set[Path], set[Path], set[Path], dict[Path, set[str]], dict[Path, str]]:
     """Explicit `[[test]]` paths and feature-gated integration targets.
 
     Extra roots: `path =` files cargo compiles without extra features.
@@ -793,6 +798,7 @@ def _cargo_test_targets(
     suppressed_libs: set[Path] = set()
     no_autotest: set[Path] = set()
     crate_feats: dict[Path, set[str]] = {}
+    test_names: dict[Path, str] = {}
     for manifest in root.rglob("Cargo.toml"):
         if "target" in manifest.parts:
             continue
@@ -841,6 +847,8 @@ def _cargo_test_targets(
                     target = (crate / "tests" / f"{name}.rs").resolve()
                 if target is None:
                     continue
+                if isinstance(name, str):
+                    test_names[target] = name
                 if table.get("test") is False or table.get("harness") is False:
                     gated.add(target)
                     continue
@@ -875,6 +883,8 @@ def _cargo_test_targets(
                     target = (crate / "tests" / f"{name}.rs").resolve()
                 if target is not None:
                     extra_required = required_feats - default_feats
+                    if name:
+                        test_names[target.resolve()] = name
                     if not test_enabled or not harness_enabled:
                         gated.add(target)
                     elif extra_required:
@@ -935,7 +945,7 @@ def _cargo_test_targets(
                 required_feats = set(re.findall(r'"([^"]+)"', inner))
         flush()
         crate_feats[crate.resolve()] = default_feats
-    return extra, gated, suppressed_libs, no_autotest, crate_feats
+    return extra, gated, suppressed_libs, no_autotest, crate_feats, test_names
 
 
 def _features_for(path: Path, crate_feats: dict[Path, set[str]]) -> set[str]:
@@ -1016,7 +1026,7 @@ def _iter_module_decls(
         line = _strip_line_comment(masked_lines[i])
         raw_no_line_comment = _strip_line_comment(raw)
         stripped_raw = raw_no_line_comment.strip()
-        attrs, remainder = _leading_attrs(line)
+        attrs, remainder, _unclosed = _leading_attrs(line)
         enclosing_off = any(off for _, _, off in inline_stack)
         in_macro = any(start <= line_start < end for start, end in inactive)
         # `#[path = "x"]` stores the path in a string, so a full literal
@@ -1142,7 +1152,7 @@ def _declared_module_overrides(
         texts[key] = text
         return text
 
-    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats = (
+    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names = (
         _cargo_test_targets(root)
     )
     for base in _CRATE_ROOTS:
@@ -1161,7 +1171,7 @@ def _declared_module_overrides(
                         (),
                         (),
                         True,
-                        _cargo_target_of(rs, extra_roots),
+                        _cargo_target_of(rs, extra_roots, test_names),
                     )
                 )
 
@@ -1404,7 +1414,7 @@ def _compact_test_fns(
         j = masked_line.find("#[", i)
         if j < 0:
             break
-        attrs, rest = _leading_attrs(masked_line[j:])
+        attrs, rest, _unclosed = _leading_attrs(masked_line[j:])
         effective = _effective_attrs(attrs, enabled_features)
         if not any(_is_test_attr(a) for a in effective):
             i = j + 2
@@ -1481,7 +1491,9 @@ def _file_inner_cfg_inactive(
     return False
 
 
-def _leading_attrs(line: str) -> tuple[list[str], str]:
+def _leading_attrs(line: str) -> tuple[list[str], str, bool]:
+    """Leading `#[...]` attrs. The bool is True when a `#[` is still open."""
+
     attrs: list[str] = []
     i = 0
     n = len(line)
@@ -1505,8 +1517,8 @@ def _leading_attrs(line: str) -> tuple[list[str], str]:
                     break
             j += 1
         else:
-            break
-    return attrs, line[i:]
+            return attrs, line[i:], True
+    return attrs, line[i:], False
 
 
 def _tests_in_file(
@@ -1543,6 +1555,7 @@ def _tests_in_file(
     invocations: list[tuple[str, str, list[str]]] = []
     mod_stack: list[tuple[int, str, bool]] = []
     pending: list[str] = []
+    pending_open_attr = ""
     depth = 0
     n = len(raw_lines)
     line_start = 0
@@ -1550,12 +1563,27 @@ def _tests_in_file(
         masked_line = masked_lines[i]
         line_stack = list(mod_stack)
         line_depth = depth
-        compact_fns = _compact_test_fns(masked_line, enabled_features)
-        attrs, remainder_masked = _leading_attrs(masked_line)
-        has_test = any(
-            _is_test_attr(a)
-            for a in _effective_attrs(pending + attrs, enabled_features)
-        ) or bool(_TEST_ATTR.match(masked_line))
+        scan = (
+            f"{pending_open_attr}\n{masked_line}"
+            if pending_open_attr
+            else masked_line
+        )
+        attrs, remainder_masked, unclosed = _leading_attrs(scan)
+        if unclosed:
+            pending_open_attr = remainder_masked
+            if attrs:
+                pending.extend(attrs)
+            compact_fns = []
+            has_test = False
+            remainder_masked = ""
+            attrs = []
+        else:
+            pending_open_attr = ""
+            compact_fns = _compact_test_fns(masked_line, enabled_features)
+            has_test = any(
+                _is_test_attr(a)
+                for a in _effective_attrs(pending + attrs, enabled_features)
+            ) or bool(_TEST_ATTR.match(masked_line))
         enclosing_off = any(off for _, _, off in mod_stack)
         line_cfg_off = enclosing_off or any(
             _cfg_attr_is_inactive(a, enabled_features) for a in pending + attrs
@@ -1572,7 +1600,7 @@ def _tests_in_file(
                 if follow.startswith("//"):
                     continue
                 if follow.startswith("#["):
-                    more, rest = _leading_attrs(follow)
+                    more, rest, _unclosed = _leading_attrs(follow)
                     all_attrs.extend(more)
                     matched = _FN.match(rest)
                     if matched:
@@ -1677,11 +1705,12 @@ def _tests_in_file(
 
 def _module_prefixes_for_source(
     rs: Path,
-    overrides: dict[Path, list[list[str]]],
+    overrides: dict[Path, list[tuple[list[str], str]]],
     extra_roots: set[Path] | frozenset[Path] | None = None,
     gated_roots: set[Path] | frozenset[Path] | None = None,
     suppressed_libs: set[Path] | frozenset[Path] | None = None,
     no_autotest: set[Path] | frozenset[Path] | None = None,
+    test_names: dict[Path, str] | None = None,
 ) -> list[tuple[list[str], str]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
@@ -1701,7 +1730,7 @@ def _module_prefixes_for_source(
     if _is_cargo_crate_root_file(
         rs, extra_roots, gated_roots, suppressed_libs, no_autotest
     ):
-        root_entry = ([], _cargo_target_of(rs, extra_roots))
+        root_entry = ([], _cargo_target_of(rs, extra_roots, test_names))
         if root_entry not in prefixes:
             prefixes.append(root_entry)
     return prefixes or None
@@ -1721,7 +1750,7 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
     the defect this guard exists to catch.
     """
     overrides = _declared_module_overrides(root)
-    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats = (
+    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names = (
         _cargo_test_targets(root)
     )
     records: list[_TestRecord] = []
@@ -1744,7 +1773,13 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
             if _file_inner_cfg_inactive(text, enabled):
                 continue
             prefix_lists = _module_prefixes_for_source(
-                rs, overrides, extra_roots, gated_roots, suppressed_libs, no_autotest
+                rs,
+                overrides,
+                extra_roots,
+                gated_roots,
+                suppressed_libs,
+                no_autotest,
+                test_names,
             )
             if prefix_lists is None:
                 continue
@@ -1936,6 +1971,40 @@ class CiPackageTargetCounts(unittest.TestCase):
             self.assertEqual(
                 [(r.target, r.name) for r in matched],
                 [("test:shared_http_wire", "common::none_auth_scheme_from_common")],
+            )
+
+    def test_explicit_test_name_is_the_cargo_target(self):
+        """`[[test]] name = \"renamed\"` is `--test renamed`, not the
+        file stem (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            integ = crate / "integration"
+            (crate / "src").mkdir(parents=True)
+            integ.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"xai-grok-sampler\"\n\n"
+                "[[test]]\nname = \"renamed\"\n"
+                'path = "integration/custom.rs"\n',
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text("")
+            (integ / "custom.rs").write_text(
+                "#[test]\nfn none_auth_scheme_renamed() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --test "
+                "renamed none_auth_scheme_ -- --nocapture\n"
+            )
+            records = _qualified_test_records(root)
+            scopes = _ci_scopes_for_pattern(
+                parse_workflow(wf, root=root), "none_auth_scheme_"
+            )
+            matched = _hot_path_matches(records, "none_auth_scheme_", scopes)
+            self.assertEqual(
+                [(r.target, r.name) for r in matched],
+                [("test:renamed", "none_auth_scheme_renamed")],
             )
 
     def test_pattern_without_a_ci_invocation_stays_repo_wide(self):
@@ -2676,6 +2745,21 @@ class ExternalModulePrefix(unittest.TestCase):
             [],
         )
         self.assertEqual(names, ["none_auth_scheme_commented_gap"])
+
+    def test_split_cfg_attr_is_still_evaluated(self):
+        """`#[cfg(\\nwindows\\n)]` still inactivates the following test
+        (#507 review)."""
+
+        names = _tests_in_file(
+            "#[cfg(\nwindows\n)]\n#[test]\nfn none_auth_scheme_windows_only() {}\n"
+            "#[test]\nfn none_auth_scheme_everywhere() {}\n",
+            [],
+        )
+        self.assertIn("none_auth_scheme_everywhere", names)
+        if sys.platform == "win32":
+            self.assertIn("none_auth_scheme_windows_only", names)
+        else:
+            self.assertNotIn("none_auth_scheme_windows_only", names)
 
     def test_const_and_extern_test_fns_are_counted(self):
         """`const fn` and `extern \"C\" fn` tests are registered by
