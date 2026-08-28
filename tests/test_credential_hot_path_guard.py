@@ -68,6 +68,11 @@ _MOD_OPEN = re.compile(
 _MOD_SEMI = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;"
 )
+_MOD_KW_ONLY = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s*$"
+)
+_IDENT_SEMI = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*;")
+_IDENT_OPEN = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{")
 _PATH_ATTR = re.compile(r'#\[path\s*=\s*"([^"]+)"\]')
 
 _HOT_PATH_MARKER = "CI's hot path is exactly this suite"
@@ -898,6 +903,7 @@ def _iter_module_decls(
     decls: list[tuple[str, Path, tuple[str, ...]]] = []
     pending_path: str | None = None
     pending_attrs: list[str] = []
+    pending_mod = False
     raw_lines = text.splitlines()
     masked = _mask_rust_literals(text)
     masked_lines = masked.splitlines()
@@ -928,8 +934,15 @@ def _iter_module_decls(
         if path_match:
             pending_path = path_match.group(1)
             pending_attrs.extend(attrs)
-        semi = _MOD_SEMI.match(line) or _MOD_SEMI.match(remainder)
+        ident_semi = None
+        ident_open = None
+        if pending_mod:
+            ident_semi = _IDENT_SEMI.match(line) or _IDENT_SEMI.match(remainder)
+            if ident_semi is None:
+                ident_open = _IDENT_OPEN.match(line) or _IDENT_OPEN.match(remainder)
+        semi = ident_semi or _MOD_SEMI.match(line) or _MOD_SEMI.match(remainder)
         if semi:
+            pending_mod = False
             cfg_off = any(
                 _cfg_attr_is_inactive(a, enabled_features)
                 for a in pending_attrs + attrs
@@ -965,16 +978,25 @@ def _iter_module_decls(
                 for a in pending_attrs + attrs
             )
             skip = enclosing_off or cfg_off
-            brace_mod = _MOD_OPEN.match(line) or _MOD_OPEN.match(remainder)
+            brace_mod = (
+                ident_open
+                or _MOD_OPEN.match(line)
+                or _MOD_OPEN.match(remainder)
+            )
             if brace_mod:
                 inline_stack.append((depth, brace_mod.group(1), skip))
                 pending_path = None
                 pending_attrs = []
+                pending_mod = False
+            elif _MOD_KW_ONLY.match(line) or _MOD_KW_ONLY.match(remainder):
+                pending_mod = True
+                pending_attrs.extend(attrs)
             elif attrs and not remainder.strip():
                 pending_attrs.extend(attrs)
             elif stripped_raw:
                 pending_path = None
                 pending_attrs = []
+                pending_mod = False
         depth += line.count("{") - line.count("}")
         while inline_stack and depth <= inline_stack[-1][0]:
             inline_stack.pop()
@@ -1017,9 +1039,7 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
             if _is_cargo_crate_root_file(
                 rs, extra_roots, gated_roots, suppressed_libs, no_autotest
             ):
-                queue.append(
-                    (rs.resolve(), tuple(_path_module_prefix(rs)), (), True)
-                )
+                queue.append((rs.resolve(), (), (), True))
 
     while queue:
         declaring, prefix, ancestors, as_crate_root = queue.popleft()
@@ -1484,10 +1504,11 @@ def _module_prefixes_for_source(
 ) -> list[list[str]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
-    Cargo crate roots (`src/lib.rs`, `tests/*.rs`) keep their path prefix
-    even when nothing `mod`s them. Every other file must appear in the
-    module graph (#507 review); an orphan leftover after a `mod` was
-    removed is not compiled and must not inflate CLAUDE.md counts.
+    Cargo crate roots (`src/lib.rs`, `tests/*.rs`, explicit `[lib] path`
+    / `[[test]] path`) are prefixless: libtest reports `fn`, not
+    `file_stem::fn`. Nested files must appear in the module graph
+    (#507 review); an orphan leftover after a `mod` was removed is not
+    compiled and must not inflate CLAUDE.md counts.
     """
 
     key = rs.resolve()
@@ -1497,7 +1518,7 @@ def _module_prefixes_for_source(
     if _is_cargo_crate_root_file(
         rs, extra_roots, gated_roots, suppressed_libs, no_autotest
     ):
-        root_prefix = _path_module_prefix(rs)
+        root_prefix: list[str] = []
         if root_prefix not in prefixes:
             prefixes.append(root_prefix)
     return prefixes or None
@@ -1592,6 +1613,20 @@ class ExternalModulePrefix(unittest.TestCase):
             src = root / "crates" / "demo" / "src"
             src.mkdir(parents=True)
             (src / "lib.rs").write_text("mod none_auth_scheme_regressions;\n")
+            (src / "none_auth_scheme_regressions.rs").write_text(
+                "#[test]\nfn works() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_regressions::works", names)
+
+    def test_mod_decl_split_across_lines_is_followed(self):
+        """`mod\\nname;` still loads `name.rs` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text("mod\nnone_auth_scheme_regressions;\n")
             (src / "none_auth_scheme_regressions.rs").write_text(
                 "#[test]\nfn works() {}\n"
             )
@@ -1758,6 +1793,28 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_lib_root", names)
+
+    def test_custom_lib_path_inside_src_is_prefixless(self):
+        """`[lib] path = \"src/none_auth_scheme_root.rs\"` is the crate
+        root, not a module named after the file (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[lib]\n"
+                'path = "src/none_auth_scheme_root.rs"\n',
+                encoding="utf-8",
+            )
+            (src / "none_auth_scheme_root.rs").write_text(
+                "#[test]\nfn works() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("works", names)
+            self.assertNotIn("none_auth_scheme_root::works", names)
 
     def test_custom_lib_path_replaces_stale_src_lib(self):
         """An explicit `[lib] path` is the only library root (#507 review)."""
