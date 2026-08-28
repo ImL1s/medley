@@ -173,6 +173,44 @@ def _mask_rust_literals(text: str) -> str:
     return "".join(out)
 
 
+_MACRO_RULES = re.compile(r"\bmacro_rules\s*!")
+
+
+def _balanced_brace_end(text: str, open_index: int) -> int:
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return len(text)
+
+
+def _macro_rules_body_spans(masked: str) -> list[tuple[int, int]]:
+    """`macro_rules! name { ... }` body ranges on already-masked source.
+
+    rustc does not register `#[test]` items sitting only in an uninvoked
+    macro definition (#507 review).
+    """
+
+    spans: list[tuple[int, int]] = []
+    for match in _MACRO_RULES.finditer(masked):
+        index = match.end()
+        while index < len(masked) and masked[index].isspace():
+            index += 1
+        ident = re.match(r"[A-Za-z_][A-Za-z0-9_]*", masked[index:])
+        if ident:
+            index += ident.end()
+        while index < len(masked) and masked[index].isspace():
+            index += 1
+        if index < len(masked) and masked[index] == "{":
+            spans.append((index, _balanced_brace_end(masked, index)))
+    return spans
+
+
 def parse_documented_hot_path(text: str) -> dict[str, int]:
     """CLAUDE.md's own `` `pattern` (N) `` entries in its hot-path
     paragraph -- the guard's source of truth, not a value copied into
@@ -789,18 +827,21 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
         return []
     names: list[str] = []
     raw_lines = text.splitlines()
-    masked_lines = _mask_rust_literals(text).splitlines()
+    masked = _mask_rust_literals(text)
+    masked_lines = masked.splitlines()
     if len(masked_lines) < len(raw_lines):
         masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
+    macro_spans = _macro_rules_body_spans(masked)
     mod_stack: list[tuple[int, str, bool]] = []
     pending: list[str] = []
     depth = 0
     n = len(raw_lines)
+    line_start = 0
     for i in range(n):
-        masked = masked_lines[i]
-        attrs, remainder_masked = _leading_attrs(masked)
+        masked_line = masked_lines[i]
+        attrs, remainder_masked = _leading_attrs(masked_line)
         has_test = any(_TEST_ATTR.match(a) for a in attrs) or bool(
-            _TEST_ATTR.match(masked)
+            _TEST_ATTR.match(masked_line)
         )
         enclosing_off = any(off for _, _, off in mod_stack)
 
@@ -836,7 +877,8 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
                 _cfg_attr_is_inactive(a) for a in all_attrs
             )
             ignored = any(_IGNORE_ATTR.match(a.strip()) for a in all_attrs)
-            if found and not inactive and not ignored:
+            in_macro = any(start <= line_start < end for start, end in macro_spans)
+            if found and not inactive and not ignored and not in_macro:
                 prefix_parts = file_mods + [name for _, name, _ in mod_stack]
                 prefix = "::".join(prefix_parts)
                 names.append(f"{prefix}::{found}" if prefix else found)
@@ -847,19 +889,20 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
                 _cfg_attr_is_inactive(a) for a in pending + attrs
             )
             pending = []
-            line = _strip_line_comment(masked)
+            line = _strip_line_comment(masked_line)
             mod_match = _MOD_OPEN.match(line) or _MOD_OPEN.match(
                 remainder_masked
             )
             if mod_match:
                 mod_stack.append((depth, mod_match.group(1), item_off))
 
-        line = _strip_line_comment(masked)
+        line = _strip_line_comment(masked_line)
         if not remainder_masked.strip() or has_test:
             pass
         depth += line.count("{") - line.count("}")
         while mod_stack and depth <= mod_stack[-1][0]:
             mod_stack.pop()
+        line_start += len(masked_line) + 1
     return names
 
 
@@ -1592,6 +1635,26 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_live"])
+
+    def test_unexpanded_macro_rules_test_is_not_counted(self):
+        """`#[test]` inside an uninvoked `macro_rules!` is not a libtest
+        case (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! phantom {
+                () => {
+                    #[test]
+                    fn none_auth_scheme_phantom() {}
+                };
+            }
+            #[test]
+            fn none_auth_scheme_live() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_live"])
+        self.assertNotIn("none_auth_scheme_phantom", names)
 
     def test_src_bin_tests_are_not_scanned(self):
         with tempfile.TemporaryDirectory() as d:
