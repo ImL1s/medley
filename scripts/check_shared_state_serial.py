@@ -474,12 +474,62 @@ def _token_list(text: str) -> list[str]:
     return _TOKEN.findall(text)
 
 
+_METAVAR = re.compile(
+    r"\$[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?"
+)
+
+
+def _matcher_parts(inner: str) -> list[str | None]:
+    """Literal tokens and `None` metavars in matcher order.
+
+    `(clean $name:ident)` vs `(touch $name:ident)` are both arity 2; the
+    distinguishing tokens are the literals (#516 review).
+    """
+
+    parts: list[str | None] = []
+    index = 0
+    n = len(inner)
+    while index < n:
+        if inner[index].isspace():
+            index += 1
+            continue
+        metavar = _METAVAR.match(inner, index)
+        if metavar:
+            parts.append(None)
+            index = metavar.end()
+            continue
+        token = _TOKEN.match(inner, index)
+        if token:
+            parts.append(token.group(0))
+            index = token.end()
+            continue
+        index += 1
+    return parts
+
+
+def _matcher_matches_invoke(inner: str, invoke_inner: str) -> bool:
+    parts = _matcher_parts(inner)
+    tokens = _token_list(invoke_inner)
+    cursor = 0
+    for part in parts:
+        if cursor >= len(tokens):
+            return False
+        if part is None:
+            cursor += 1
+            continue
+        if tokens[cursor] != part:
+            return False
+        cursor += 1
+    return cursor == len(tokens)
+
+
 def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
     """True when this `macro_rules!` matcher would accept the invocation.
 
     Literal arms (`(touch)` vs `(clean)`) compare tokens; `$name:ident`
-    arms compare top-level arity; `$(...)*|+` arms accept any arity.
-    First matching arm wins (#516 review).
+    arms match remaining literals then consume one token per metavar;
+    `$(...)*|+` arms accept any arity. First matching arm wins
+    (#516 review).
     """
 
     if matcher == "*":
@@ -491,7 +541,8 @@ def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
         return _token_list(inner) == _token_list(invoke_inner)
     if re.search(r"\$\s*\(", inner):
         return True
-    return _macro_invoke_arity("!(" + inner + ")", 1) == invoke_arity
+    _ = invoke_arity
+    return _matcher_matches_invoke(inner, invoke_inner)
 
 
 def _skip_generic_params(source: str, open_index: int) -> int:
@@ -2412,9 +2463,18 @@ def _resolve_calls(
         # enclosing impl type, not a literal lookup on the string "Self"
         # (which is never a real registered type name -- `by_type` is
         # keyed by concrete type names from `_impl_blocks`).
-        type_name = fn.type_name if m.group(1) == "Self" else m.group(1)
+        raw_type = m.group(1)
+        type_name = fn.type_name if raw_type == "Self" else raw_type
         if type_name is None:
             continue
+        if raw_type != "Self":
+            imported = fn.local_imports.get(raw_type)
+            if imported is None:
+                imported = _lookup_import(
+                    imports_by_file.get(fn.file, {}), fn.inline_mods, raw_type
+                )
+            if imported is not None:
+                type_name = imported[1]
         _gain_from(
             gained,
             keys_of,
@@ -2422,6 +2482,13 @@ def _resolve_calls(
             by_type.get(type_name, {}).get(m.group(2), []),
         )
     for type_name, method in _ufcs_calls(fn.body):
+        imported = fn.local_imports.get(type_name)
+        if imported is None:
+            imported = _lookup_import(
+                imports_by_file.get(fn.file, {}), fn.inline_mods, type_name
+            )
+        if imported is not None:
+            type_name = imported[1]
         _gain_from(
             gained,
             keys_of,
