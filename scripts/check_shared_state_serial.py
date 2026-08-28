@@ -724,7 +724,11 @@ def _preceding_attributes(source: str, code: str, position: int) -> list[str]:
 
 
 def _is_test_attr(attr: str) -> bool:
-    return TEST_ATTR.match(attr.strip()) is not None
+    stripped = attr.strip()
+    if TEST_ATTR.match(stripped) is not None:
+        return True
+    # `#[$attr] fn $name()` — the invocation supplies `test` (#516 review).
+    return re.match(r"#\s*\[\s*\$", stripped) is not None
 
 
 def _serial_keys(attr: str) -> tuple[str, ...] | None:
@@ -1652,7 +1656,7 @@ def _body_touches(
     same-named `a::COUNTER` (#516 review).
     """
 
-    del original, scoped_imports
+    del original
     for ident in identifiers:
         pattern = re.compile(
             rf"(?:((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+))"
@@ -1671,6 +1675,12 @@ def _body_touches(
                 if _resolve_path_module(segs, fn_module, inline_mods) == static_module:
                     return True
                 continue
+            if scoped_imports is not None:
+                imported = _lookup_import(scoped_imports, inline_mods, ident)
+                if imported is not None:
+                    module, _fname = imported
+                    if static_module is not None and module != static_module:
+                        continue
             return True
     return False
 

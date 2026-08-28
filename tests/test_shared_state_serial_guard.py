@@ -1114,6 +1114,32 @@ class TransitiveClosure(unittest.TestCase):
         generated = {n for n in names if n.startswith("cases!")}
         self.assertEqual(len(generated), 2, names)
 
+    def test_macro_attr_metavariable_still_generates_tests(self):
+        """`#[$attr] fn $name()` invoked with `test` is still a test
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($attr:meta, $name:ident) => {
+                    #[$attr]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            cases!(test, first);
+            cases!(test, second);
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+
     def test_same_named_macros_in_different_files_are_not_combined(self):
         """Invoking a local `cases!` must not inherit another file's
         touching template of the same name (#516 review)."""
@@ -1186,6 +1212,45 @@ class TransitiveClosure(unittest.TestCase):
                     #[test]
                     fn uses_other_counter_untagged() {
                         C.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, set())
+
+    def test_imported_unrelated_static_without_alias_is_not_a_touch(self):
+        """`use crate::b::COUNTER; COUNTER.load` is not `a::COUNTER`
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    use crate::b::COUNTER;
+
+                    #[test]
+                    fn uses_other_counter_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
                     }
                     """
                 ),
