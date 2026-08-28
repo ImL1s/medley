@@ -73,7 +73,7 @@ _IGNORE_ATTR = re.compile(r"^#\[\s*ignore\b")
 _FN = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
     r"(?:(?:async|const|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
-    r"fn\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"fn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)"
 )
 _MOD_OPEN = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
@@ -470,6 +470,131 @@ def _substitute_arm_metavars(arm: str, bindings: dict[str, str]) -> str:
         return bindings.get(name, match.group(0))
 
     return _ARM_SUB.sub(repl, arm)
+
+
+def _split_depth_sep(text: str, sep: str) -> list[str]:
+    """Top-level `sep` split, ignoring commas inside `()`, `[]`, `{}`."""
+
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(text):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == sep and depth == 0:
+            part = text[start:i].strip()
+            if part:
+                parts.append(part)
+            start = i + 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _find_dollar_repeat(
+    text: str, start: int = 0
+) -> tuple[int, str, str, str, int] | None:
+    """Next `$(...)sep*` from `start`: (at, inner, sep, kind, end)."""
+
+    n = len(text)
+    i = start
+    while i < n:
+        if text[i] != "$":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and text[j].isspace():
+            j += 1
+        if j >= n or text[j] != "(":
+            i += 1
+            continue
+        close = _balanced_pair_end(text, j)
+        inner = text[j + 1 : close - 1]
+        k = close
+        while k < n and text[k].isspace():
+            k += 1
+        sep = ""
+        if k < n and text[k] in ",;":
+            sep = text[k]
+            k += 1
+            while k < n and text[k].isspace():
+                k += 1
+        kind = ""
+        if k < n and text[k] in "*+?":
+            kind = text[k]
+            k += 1
+        if kind:
+            return i, inner, sep, kind, k
+        i += 1
+    return None
+
+
+def _repeat_matcher_inner(matcher: str) -> str:
+    inner = matcher.strip()
+    if len(inner) >= 2 and inner[0] in "([{" and inner[-1] in ")]}":
+        inner = inner[1:-1]
+    return inner
+
+
+def _bind_repeat_rows(
+    matcher: str, invoke_inner: str
+) -> list[dict[str, str]] | None:
+    """One binding dict per `$($name:ident),*` capture, or `None` if
+    the matcher is not a repetition (#507 review)."""
+
+    inner = _repeat_matcher_inner(matcher)
+    found = _find_dollar_repeat(inner)
+    if found is None:
+        return None
+    start, rep_inner, sep, _kind, end = found
+    if inner[:start].strip() or inner[end:].strip():
+        return None
+    names = _ARM_METAVAR.findall(rep_inner)
+    if not names:
+        return []
+    raw = invoke_inner.strip()
+    if not raw:
+        return []
+    if sep:
+        pieces = _split_depth_sep(raw, sep)
+    else:
+        pieces = [t for t in _ARM_TOKEN.findall(raw) if t[0].isalpha() or t[0] == "_"]
+    rows: list[dict[str, str]] = []
+    for piece in pieces:
+        idents = [
+            t
+            for t in _ARM_TOKEN.findall(piece)
+            if t[0].isalpha() or t[0] == "_"
+        ]
+        if len(idents) < len(names):
+            continue
+        rows.append(dict(zip(names, idents)))
+    return rows
+
+
+def _expand_arm_repeats(arm: str, rows: list[dict[str, str]]) -> str:
+    """Expand `$(...)*` in an arm body using captured rows."""
+
+    out: list[str] = []
+    i = 0
+    n = len(arm)
+    while i < n:
+        found = _find_dollar_repeat(arm, i)
+        if found is None:
+            leftover = arm[i:]
+            if len(rows) == 1:
+                leftover = _substitute_arm_metavars(leftover, rows[0])
+            out.append(leftover)
+            break
+        at, inner, sep, _kind, end = found
+        out.append(arm[i:at])
+        pieces = [_substitute_arm_metavars(inner, row) for row in rows]
+        out.append(sep.join(pieces))
+        i = end
+    return "".join(out)
 
 
 def _inactive_macro_spans(masked: str) -> list[tuple[int, int]]:
@@ -1240,6 +1365,9 @@ def _selected_arm_source(
         for matcher, arm_start, arm_end in arms:
             if _simple_arm_accepts(matcher, invoke_inner):
                 arm = masked[arm_start:arm_end]
+                rows = _bind_repeat_rows(matcher, invoke_inner)
+                if rows is not None:
+                    return _expand_arm_repeats(arm, rows)
                 return _substitute_arm_metavars(
                     arm, _bind_simple_arm(matcher, invoke_inner)
                 )
@@ -1386,7 +1514,7 @@ def _expand_cfg_attr(
         return []
     if active is not True:
         return [attr]
-    return [f"#[{rest}]"]
+    return [f"#[{piece}]" for piece in _split_depth_sep(rest, ",") if piece]
 
 
 def _effective_attrs(
@@ -3041,6 +3169,27 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         self.assertEqual(names, ["none_auth_scheme_generated"])
 
+    def test_cfg_attr_emits_each_attribute(self):
+        """`#[cfg_attr(test, should_panic, test)]` is a live test
+        (#507 review)."""
+
+        names = _tests_in_file(
+            "#[cfg_attr(test, should_panic, test)]\n"
+            "fn none_auth_scheme_case() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_case"])
+
+    def test_raw_identifier_test_name_is_counted(self):
+        """`fn r#none_auth_scheme_case()` is `none_auth_scheme_case`
+        in libtest (#507 review)."""
+
+        names = _tests_in_file(
+            "#[test]\nfn r#none_auth_scheme_case() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_case"])
+
     def test_same_line_mod_and_test_are_both_seen(self):
         """`mod name { #[test] fn works() {} }` is `name::works`
         (#507 review)."""
@@ -3216,6 +3365,29 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_generated"])
+
+    def test_repeated_macro_ident_metavars_are_substituted_before_scan(self):
+        """`$($name:ident),*` with two invocation idents emits both
+        tests (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                ($($name:ident),*) => {
+                    $(
+                        #[test]
+                        fn $name() {}
+                    )*
+                };
+            }
+            generated!(none_auth_scheme_a, none_auth_scheme_b);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(
+            sorted(names),
+            ["none_auth_scheme_a", "none_auth_scheme_b"],
+        )
 
     def test_cfg_disabled_macro_invoke_is_not_counted(self):
         """`#[cfg(windows)] generated!();` on a non-Windows runner is
