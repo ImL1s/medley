@@ -988,6 +988,37 @@ class TransitiveClosure(unittest.TestCase):
         generated = {n for n in names if n.startswith("bundle!")}
         self.assertEqual(len(generated), 1, names)
 
+    def test_macro_invoke_uses_only_the_matching_arm(self):
+        """`cases!(clean)` must not inherit a sibling `(touch)` arm
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                (touch) => {
+                    #[test]
+                    fn generated() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+                (clean) => {
+                    #[test]
+                    fn generated() {}
+                };
+            }
+
+            cases!(touch);
+            cases!(clean);
+            cases!(clean);
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 1, names)
+
     def test_same_named_macros_in_different_files_are_not_combined(self):
         """Invoking a local `cases!` must not inherit another file's
         touching template of the same name (#516 review)."""
@@ -1067,6 +1098,76 @@ class TransitiveClosure(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, set())
+
+    def test_qualified_static_in_another_module_is_not_a_touch(self):
+        """`crate::b::COUNTER` is not the registered `a::COUNTER`
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn uses_other_module_counter_untagged() {
+                        crate::b::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    fn also_uses_other_module_counter_untagged() {
+                        crate::b::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, set())
+
+    def test_qualified_static_in_registered_module_is_a_touch(self):
+        """`crate::a::COUNTER` still reaches the registered static."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn uses_registered_counter_untagged() {
+                        crate::a::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"uses_registered_counter_untagged"})
 
     def test_cross_file_call_into_inline_module_reaches_registered_state(self):
         sources = [
@@ -1370,6 +1471,40 @@ class TransitiveClosure(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_brace_imported_bump_untagged"})
+
+    def test_nested_brace_import_tree_reaches_registered_state(self):
+        """`use crate::{a::{bump}}` must parse nested braces (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    use crate::{a::{bump}};
+
+                    #[test]
+                    fn calls_nested_brace_imported_bump_untagged() {
+                        bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_nested_brace_imported_bump_untagged"})
 
     def test_cfg_gated_same_name_functions_are_all_candidates(self):
         """A later `#[cfg(not(unix))] fn bump` must not hide an earlier

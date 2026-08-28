@@ -283,10 +283,7 @@ USE_BRACE = re.compile(
     r"\buse\s+(crate|super|self)((?:::(?:r#)?[A-Za-z_][A-Za-z0-9_]*)*)"
     r"::\{([^}]+)\}\s*;"
 )
-USE_BRACE_ITEM = re.compile(
-    r"((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(?:r#)?[A-Za-z_][A-Za-z0-9_]*)"
-    r"(?:\s+as\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*))?"
-)
+USE_HEAD = re.compile(r"\buse\s+(crate|super|self)")
 # Any `path::to::name(` call, `crate`-rooted or not. Resolved two ways (see
 # `_resolve_calls`): a `crate`-rooted path by its FULL module path, and every
 # path (rooted or not) by its LAST segment alone against a file's own module
@@ -455,6 +452,46 @@ def _macro_invoke_arity(source: str, bang_end: int) -> int:
     if saw_item:
         items += 1
     return max(items, 1)
+
+
+def _macro_invoke_inner(source: str, bang_end: int) -> str:
+    """Argument text inside `macro!(...)` / `![...]` / `!{...}`."""
+
+    index = bang_end
+    while index < len(source) and source[index].isspace():
+        index += 1
+    if index >= len(source) or source[index] not in "([{":
+        return ""
+    end = _balanced_end(source, index)
+    inner_end = end - 1 if end > index + 1 else index + 1
+    return source[index + 1 : inner_end]
+
+
+_TOKEN = re.compile(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*|[0-9]+|::|[^\sA-Za-z0-9_]")
+
+
+def _token_list(text: str) -> list[str]:
+    return _TOKEN.findall(text)
+
+
+def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
+    """True when this `macro_rules!` matcher would accept the invocation.
+
+    Literal arms (`(touch)` vs `(clean)`) compare tokens; `$name:ident`
+    arms compare top-level arity; `$(...)*|+` arms accept any arity.
+    First matching arm wins (#516 review).
+    """
+
+    if matcher == "*":
+        return True
+    inner = matcher.strip()
+    if len(inner) >= 2 and inner[0] == "(" and inner[-1] == ")":
+        inner = inner[1:-1]
+    if "$" not in inner:
+        return _token_list(inner) == _token_list(invoke_inner)
+    if re.search(r"\$\s*\(", inner):
+        return True
+    return _macro_invoke_arity("!(" + inner + ")", 1) == invoke_arity
 
 
 def _skip_generic_params(source: str, open_index: int) -> int:
@@ -862,6 +899,95 @@ def _raw_ident(name: str) -> str:
     return name[2:] if name.startswith("r#") else name
 
 
+def _skip_ws_code(code: str, i: int) -> int:
+    n = len(code)
+    while i < n and code[i].isspace():
+        i += 1
+    return i
+
+
+def _read_use_ident(code: str, i: int) -> tuple[str | None, int]:
+    i = _skip_ws_code(code, i)
+    if i + 1 < len(code) and code[i : i + 2] == "r#":
+        i += 2
+    match = IDENT.match(code, i)
+    if match is None:
+        return None, i
+    return match.group(0), match.end()
+
+
+def _parse_use_as(code: str, i: int) -> tuple[str | None, int]:
+    j = _skip_ws_code(code, i)
+    if j + 2 <= len(code) and code[j : j + 2] == "as" and (
+        j + 2 == len(code) or not (code[j + 2].isalnum() or code[j + 2] == "_")
+    ):
+        alias, k = _read_use_ident(code, j + 2)
+        if alias is not None:
+            return _raw_ident(alias), k
+    return None, i
+
+
+def _collect_use_leaves(
+    code: str, i: int, prefix: tuple[str, ...], pos: int, out: list
+) -> int:
+    """Parse a use-tree node starting at `i`; append `(mid, fname, local)` leaves."""
+
+    i = _skip_ws_code(code, i)
+    if i < len(code) and code[i] == "{":
+        i += 1
+        n = len(code)
+        while i < n:
+            i = _skip_ws_code(code, i)
+            if i < n and code[i] == "}":
+                return i + 1
+            start = i
+            i = _collect_use_leaves(code, i, prefix, pos, out)
+            if i == start:
+                i += 1
+            i = _skip_ws_code(code, i)
+            if i < n and code[i] == ",":
+                i += 1
+        return i
+    segs: list[str] = []
+    n = len(code)
+    while True:
+        name, j = _read_use_ident(code, i)
+        if name is None:
+            break
+        segs.append(_raw_ident(name))
+        i = _skip_ws_code(code, j)
+        if i + 1 < n and code[i : i + 2] == "::":
+            i += 2
+            i = _skip_ws_code(code, i)
+            if i < n and code[i] == "{":
+                return _collect_use_leaves(code, i, prefix + tuple(segs), pos, out)
+            continue
+        break
+    alias, i = _parse_use_as(code, i)
+    if segs and segs[0] not in ("self", "super"):
+        fname = segs[-1]
+        out.append((prefix + tuple(segs[:-1]), fname, alias or fname))
+    return i
+
+
+def _iter_use_leaves(
+    code: str,
+) -> list[tuple[int, str, tuple[str, ...], str, str]]:
+    """`(pos, root, mid, fname, local)` for every `use` leaf, nested braces included."""
+
+    leaves: list[tuple[int, str, tuple[str, ...], str, str]] = []
+    for match in USE_HEAD.finditer(code):
+        root = match.group(1)
+        i = _skip_ws_code(code, match.end())
+        if i + 1 < len(code) and code[i : i + 2] == "::":
+            i += 2
+        collected: list[tuple[tuple[str, ...], str, str]] = []
+        _collect_use_leaves(code, i, (), match.start(), collected)
+        for mid, fname, local in collected:
+            leaves.append((match.start(), root, mid, fname, local))
+    return leaves
+
+
 def _is_pub_use(code: str, use_start: int) -> bool:
     return re.search(r"\bpub(?:\s*\([^)]*\))?\s*$", code[:use_start]) is not None
 
@@ -916,29 +1042,8 @@ def _use_bindings(path: Path, text: str) -> list[_UseBinding]:
             return
         out.append(_UseBinding(pos, inline, local, module, fname))
 
-    for m in USE_PLAIN.finditer(code):
-        segs = tuple(_raw_ident(s) for s in m.group(2).split("::") if s)
-        if not segs:
-            continue
-        fname = segs[-1]
-        record(m.start(), m.group(1), segs[:-1], fname, _raw_ident(m.group(3) or fname))
-    for m in USE_BRACE.finditer(code):
-        mid = tuple(_raw_ident(s) for s in m.group(2).split("::") if s)
-        for raw in m.group(3).split(","):
-            item = USE_BRACE_ITEM.search(raw.strip())
-            if item is None:
-                continue
-            segs = tuple(s.strip() for s in item.group(1).split("::") if s.strip())
-            if not segs or segs[0] in ("self", "super"):
-                continue
-            fname = _raw_ident(segs[-1])
-            record(
-                m.start(),
-                m.group(1),
-                mid + tuple(_raw_ident(s) for s in segs[:-1]),
-                fname,
-                _raw_ident(item.group(2) or fname),
-            )
+    for pos, root, mid, fname, local in _iter_use_leaves(code):
+        record(pos, root, mid, fname, local)
     return out
 
 
@@ -1005,43 +1110,10 @@ def _pub_reexports(
         dest = file_mod + inline
         out.append((dest, local, src, fname))
 
-    for m in USE_PLAIN.finditer(code):
-        if not _is_pub_use(code, m.start()):
+    for pos, root, mid, fname, local in _iter_use_leaves(code):
+        if not _is_pub_use(code, pos):
             continue
-        segs = tuple(_raw_ident(s) for s in m.group(2).split("::") if s)
-        if not segs:
-            continue
-        fname = segs[-1]
-        record(
-            m.start(),
-            m.group(1),
-            segs[:-1],
-            fname,
-            _raw_ident(m.group(3) or fname),
-        )
-    for m in USE_BRACE.finditer(code):
-        if not _is_pub_use(code, m.start()):
-            continue
-        mid = tuple(_raw_ident(s) for s in m.group(2).split("::") if s)
-        for raw in m.group(3).split(","):
-            item = USE_BRACE_ITEM.search(raw.strip())
-            if item is None:
-                continue
-            segs = tuple(
-                _raw_ident(s.strip())
-                for s in item.group(1).split("::")
-                if s.strip()
-            )
-            if not segs or segs[0] in ("self", "super"):
-                continue
-            fname = segs[-1]
-            record(
-                m.start(),
-                m.group(1),
-                mid + segs[:-1],
-                fname,
-                _raw_ident(item.group(2) or fname),
-            )
+        record(pos, root, mid, fname, local)
     return out
 
 
@@ -1334,8 +1406,69 @@ class FnInfo:
     )
 
 
-def _body_touches(code_only_body: str, identifiers: tuple[str, ...]) -> bool:
-    return any(re.search(rf"\b{re.escape(ident)}\b", code_only_body) for ident in identifiers)
+def _resolve_path_module(
+    segs: tuple[str, ...],
+    fn_module: tuple[str, ...] | None,
+    inline_mods: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    """Module owning the last ident of a `crate::b::COUNTER`-style path."""
+
+    if not segs:
+        return None
+    base = (fn_module or ()) + inline_mods
+    if segs[0] == "crate":
+        return segs[1:]
+    if segs[0] == "self":
+        return base + segs[1:]
+    if segs[0] == "super":
+        cur = base
+        rest = segs
+        while rest and rest[0] == "super":
+            cur = cur[:-1] if cur else ()
+            rest = rest[1:]
+        return cur + rest
+    return base + segs
+
+
+def _body_touches(
+    code_only_body: str,
+    identifiers: tuple[str, ...],
+    *,
+    original: tuple[str, ...] | None = None,
+    static_module: tuple[str, ...] | None = None,
+    fn_module: tuple[str, ...] | None = None,
+    inline_mods: tuple[str, ...] = (),
+    scoped_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
+    | None = None,
+) -> bool:
+    """True if `code_only_body` names this registered static.
+
+    Bare names keep the fail-closed whole-word match. Qualified paths
+    (`crate::b::COUNTER`) only match a static whose module is `b`, not a
+    same-named `a::COUNTER` (#516 review).
+    """
+
+    del original, scoped_imports
+    for ident in identifiers:
+        pattern = re.compile(
+            rf"(?:((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+))"
+            rf"?(?<![A-Za-z0-9_])(?:r#)?{re.escape(ident)}\b"
+        )
+        for match in pattern.finditer(code_only_body):
+            prefix_raw = match.group(1)
+            if prefix_raw:
+                segs = tuple(
+                    _raw_ident(part)
+                    for part in (p.strip() for p in prefix_raw.split("::"))
+                    if part.strip()
+                )
+                if static_module is None:
+                    return True
+                if _resolve_path_module(segs, fn_module, inline_mods) == static_module:
+                    return True
+                continue
+            return True
+    return False
 
 
 def _with_aliases(
@@ -1476,8 +1609,13 @@ def _expand_generated_helper_bodies(fn_body: str, helpers: dict[str, str]) -> st
     return fn_body + "".join(extra)
 
 
-def _macro_rule_arms(body: str) -> list[str]:
-    """Bodies of each `macro_rules!` match arm, or `[body]` if unparsed."""
+def _macro_rule_arms(body: str) -> list[tuple[str, str]]:
+    """`(matcher, arm_body)` for each `macro_rules!` match arm.
+
+    Unparseable bodies yield a single catch-all matcher so one-arm macros
+    keep working. Matcher text is what `_arm_accepts` compares against an
+    invocation (#516 review).
+    """
 
     code = _code_only(body)
     i = 0
@@ -1489,35 +1627,36 @@ def _macro_rule_arms(body: str) -> list[str]:
         code = code[i + 1 : end - 1]
         i = 0
         n = len(code)
-    arms: list[str] = []
+    arms: list[tuple[str, str]] = []
     while i < n:
         while i < n and code[i].isspace():
             i += 1
         if i >= n:
             break
         if code[i] != "(":
-            return [body] if not arms else arms
+            return [("*", body)] if not arms else arms
         matcher_end = _balanced_end(code, i)
+        matcher = code[i:matcher_end]
         j = matcher_end
         while j < n and code[j].isspace():
             j += 1
         if j + 1 >= n or code[j : j + 2] != "=>":
-            return [body] if not arms else arms
+            return [("*", body)] if not arms else arms
         j += 2
         while j < n and code[j].isspace():
             j += 1
         if j >= n or code[j] not in "{(":
-            return [body] if not arms else arms
+            return [("*", body)] if not arms else arms
         end = _balanced_end(code, j)
         inner_start = j + 1
         inner_end = end - 1 if end > inner_start else end
-        arms.append(code[inner_start:inner_end])
+        arms.append((matcher, code[inner_start:inner_end]))
         i = end
         while i < n and code[i].isspace():
             i += 1
         if i < n and code[i] == ";":
             i += 1
-    return arms or [body]
+    return arms or [("*", body)]
 
 
 def _generated_test_templates_in_arm(
@@ -1585,7 +1724,7 @@ def _generated_test_templates(
     """
 
     out: list[tuple[frozenset[str], bool, bool, str]] = []
-    for arm in _macro_rule_arms(body):
+    for _matcher, arm in _macro_rule_arms(body):
         out.extend(_generated_test_templates_in_arm(arm))
     return out
 
@@ -1608,11 +1747,15 @@ class _PendingMacroTest:
     template_index: int
 
 
+@dataclass
+class _MacroArm:
+    matcher: str
+    serials: list[tuple[frozenset[str], bool, bool, int]]
+
+
 def _serials_for_macro_invoke(
     *,
-    generated_by_macro: dict[
-        tuple[Path, str], list[tuple[frozenset[str], bool, bool, int]]
-    ],
+    generated_by_macro: dict[tuple[Path, str], list[_MacroArm]],
     exported_macros: dict[str, Path],
     file_by_module: dict[tuple[str, ...], Path],
     rel: Path,
@@ -1620,8 +1763,8 @@ def _serials_for_macro_invoke(
     invoke_text: str,
     file_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]],
     inline_mods: tuple[str, ...],
-) -> tuple[list[tuple[frozenset[str], bool, bool, int]], Path] | None:
-    """Templates for this invocation, bound to the defining file (#516 review)."""
+) -> tuple[list[_MacroArm], Path] | None:
+    """Arms for this invocation, bound to the defining file (#516 review)."""
 
     full = invoke_text.strip()
     if full.endswith("!"):
@@ -1633,25 +1776,25 @@ def _serials_for_macro_invoke(
         def_file = file_by_module.get(module)
         if def_file is None:
             return None
-        serials = generated_by_macro.get((def_file, fname))
-        if not serials:
+        arms = generated_by_macro.get((def_file, fname))
+        if arms is None:
             return None
-        return serials, def_file
-    serials = generated_by_macro.get((rel, macro_name))
-    if serials:
-        return serials, rel
+        return arms, def_file
+    arms = generated_by_macro.get((rel, macro_name))
+    if arms is not None:
+        return arms, rel
     imported = _lookup_import(file_imports, inline_mods, macro_name)
     if imported is not None:
         module, fname = imported
         def_file = file_by_module.get(module)
         if def_file is not None:
             found = generated_by_macro.get((def_file, fname))
-            if found:
+            if found is not None:
                 return found, def_file
     export_file = exported_macros.get(macro_name)
     if export_file is not None:
         found = generated_by_macro.get((export_file, macro_name))
-        if found:
+        if found is not None:
             return found, export_file
     return None
 
@@ -1665,9 +1808,7 @@ def index_functions(
 ]:
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
-    generated_by_macro: dict[
-        tuple[Path, str], list[tuple[frozenset[str], bool, bool, int]]
-    ] = {}
+    generated_by_macro: dict[tuple[Path, str], list[_MacroArm]] = {}
     exported_macros: dict[str, Path] = {}
     file_by_module: dict[tuple[str, ...], Path] = {}
     for rel, _raw in sources:
@@ -1728,6 +1869,11 @@ def index_functions(
                         item.identifiers,
                         static_module=_module_path(item.file),
                     ),
+                    original=item.identifiers,
+                    static_module=_module_path(item.file),
+                    fn_module=_module_path(rel),
+                    inline_mods=inline_mods,
+                    scoped_imports=scoped,
                 )
             )
             type_name = None
@@ -1778,17 +1924,35 @@ def index_functions(
             macro_attrs = _preceding_attributes(raw, code, match.start())
             is_export = any("macro_export" in a for a in macro_attrs)
             keys = frozenset(
-                item.key for item in registry if _body_touches(body_code, item.identifiers)
+                item.key
+                for item in registry
+                if _body_touches(
+                    body_code,
+                    item.identifiers,
+                    original=item.identifiers,
+                    static_module=_module_path(item.file),
+                    fn_module=_module_path(rel),
+                    scoped_imports=file_imports,
+                )
             )
-            if _macro_generates_tests(body_code):
-                raw_macro_body = raw[body_start:body_end]
-                for held, unkeyed, in_repeat, test_body in _generated_test_templates(
-                    raw_macro_body
+            raw_macro_body = raw[body_start:body_end]
+            arm_list: list[_MacroArm] = []
+            for matcher, arm_body in _macro_rule_arms(raw_macro_body):
+                serials_for_arm: list[tuple[frozenset[str], bool, bool, int]] = []
+                for held, unkeyed, in_repeat, test_body in _generated_test_templates_in_arm(
+                    arm_body
                 ):
                     template_keys = frozenset(
                         item.key
                         for item in registry
-                        if _body_touches(test_body, item.identifiers)
+                        if _body_touches(
+                            test_body,
+                            item.identifiers,
+                            original=item.identifiers,
+                            static_module=_module_path(item.file),
+                            fn_module=_module_path(rel),
+                            scoped_imports=file_imports,
+                        )
                     )
                     template_index = len(out)
                     out.append(
@@ -1808,9 +1972,10 @@ def index_functions(
                             attrs_line=_line(raw, match.start()),
                         )
                     )
-                    generated_by_macro.setdefault((rel, name), []).append(
-                        (held, unkeyed, in_repeat, template_index)
-                    )
+                    serials_for_arm.append((held, unkeyed, in_repeat, template_index))
+                arm_list.append(_MacroArm(matcher, serials_for_arm))
+            if any(arm.serials for arm in arm_list):
+                generated_by_macro[(rel, name)] = arm_list
             if is_export:
                 exported_macros[name] = rel
             out.append(
@@ -1850,9 +2015,18 @@ def index_functions(
             )
             if resolved is None:
                 continue
-            serials, macro_file = resolved
+            arms, macro_file = resolved
             line = _line(raw, invoke.start())
             arity = _macro_invoke_arity(code, invoke.end())
+            inner = _macro_invoke_inner(code, invoke.end())
+            chosen: _MacroArm | None = None
+            for arm in arms:
+                if _arm_accepts(arm.matcher, inner, arity):
+                    chosen = arm
+                    break
+            if chosen is None:
+                continue
+            serials = chosen.serials
             for slot, (serial_held, has_unkeyed, in_repeat, template_index) in enumerate(
                 serials
             ):
