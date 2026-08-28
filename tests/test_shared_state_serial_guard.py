@@ -768,6 +768,39 @@ class TransitiveClosure(unittest.TestCase):
             "semicolon-separated generated tests must not collapse into a sole-member exemption",
         )
 
+    def test_repetition_embedded_in_a_larger_matcher_still_expands(self):
+        """`(prefix; $($name:ident),*)` plus `cases!(prefix; one, two)`
+        must still select the arm and count two tests (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                (prefix; $($name:ident),*) => {
+                    $(
+                        #[test]
+                        fn $name() {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    )*
+                };
+            }
+
+            cases!(prefix; one, two);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+        findings = guard.scan_source(text)
+        self.assertGreaterEqual(
+            len(findings),
+            1,
+            "embedded $(...)* generated tests must not collapse into a sole-member exemption",
+        )
+
     def test_fixed_arity_macro_is_not_multiplied_by_argument_count(self):
         """`case!(name, expected)` emits one test, not one per argument (#516 review)."""
 
@@ -1963,6 +1996,47 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_reexported_bump_untagged"})
 
+    def test_glob_reexport_resolves_through_the_exporting_module(self):
+        """`pub use crate::a::*;` in `b.rs` must make `crate::b::bump()`
+        a toucher (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    pub use crate::a::*;
+                    """
+                ),
+            ),
+            (
+                Path("src/c.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn calls_glob_reexported_bump_untagged() {
+                        crate::b::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_glob_reexported_bump_untagged"})
+
     def test_reexport_chain_resolves_through_each_exporter(self):
         """`pub use` of a `pub use` still has to land on the definition
         (#516 review)."""
@@ -2077,6 +2151,41 @@ class TransitiveClosure(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_super_helpers_untagged"})
+
+    def test_use_consumes_every_leading_super(self):
+        """`use super::super::a::bump` must not drop the leaf because
+        remaining segments start with `super` (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b/c.rs"),
+                src(
+                    """\
+                    use super::super::a::bump;
+
+                    #[test]
+                    fn calls_double_super_import_untagged() {
+                        bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"calls_double_super_import_untagged"})
 
     def test_brace_import_with_nested_path_reaches_registered_state(self):
         """`use crate::{a::bump}` must record `bump`, not the `a` prefix
@@ -3520,6 +3629,85 @@ class DefaultScanRoots(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_path_attribute_module_resolves_super_to_the_declaring_parent(self):
+        """`#[path = "managed_tests.rs"] mod tests;` is `managed::tests`,
+        not a crate-root module named after the file stem (#516 review)."""
+
+        sources = [
+            (
+                Path("src/managed.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn helper() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[path = "managed_tests.rs"]
+                    mod tests;
+                    """
+                ),
+            ),
+            (
+                Path("src/managed_tests.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn first_untagged() {
+                        super::helper();
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        super::helper();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_integration_crate_path_does_not_inherit_library_helpers(self):
+        """`crate::helper()` in `tests/*.rs` is that binary, not
+        `src/lib.rs` (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn helper() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn first_untagged() {
+                        crate::helper();
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        crate::helper();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, set())
 
 
 class ReportFormatting(unittest.TestCase):

@@ -500,6 +500,24 @@ def _matcher_named_parts(
         if inner[index].isspace():
             index += 1
             continue
+        if inner[index] == "$":
+            k = index + 1
+            while k < n and inner[k].isspace():
+                k += 1
+            if k < n and inner[k] == "(":
+                end = _balanced_end(inner, k)
+                body = inner[k + 1 : end - 1]
+                j = end
+                while j < n and inner[j].isspace():
+                    j += 1
+                sep_start = j
+                while j < n and inner[j] not in "*+?":
+                    j += 1
+                if j < n:
+                    sep = inner[sep_start:j].strip()
+                    parts.append((None, "repeat", f"{body}\x1f{sep}\x1f{inner[j]}"))
+                    index = j + 1
+                    continue
         metavar = _METAVAR.match(inner, index)
         if metavar:
             parts.append((None, metavar.group("kind") or "ident", metavar.group("name")))
@@ -514,8 +532,10 @@ def _matcher_named_parts(
     return parts
 
 
-def _matcher_parts(inner: str) -> list[tuple[str | None, str | None]]:
-    return [(literal, kind) for literal, kind, _name in _matcher_named_parts(inner)]
+def _matcher_parts(
+    inner: str,
+) -> list[tuple[str | None, str | None, str | None]]:
+    return _matcher_named_parts(inner)
 
 
 def _consume_fragment(
@@ -542,20 +562,43 @@ def _consume_fragment(
 
 
 def _matcher_consume(
-    parts: list[tuple[str | None, str | None]],
+    parts: list[tuple[str | None, str | None, str | None]],
     tokens: list[str],
     cursor: int,
 ) -> int | None:
     """Advance `cursor` through `tokens` if `parts` match a prefix."""
 
-    for index, (literal, kind) in enumerate(parts):
+    for index, (literal, kind, name) in enumerate(parts):
+        if kind == "repeat":
+            body, sep, rep = (name or "\x1f\x1f*").split("\x1f")
+            body_parts = _matcher_named_parts(body)
+            sep_tokens = _token_list(sep)
+            groups = 0
+            while cursor < len(tokens):
+                saved = cursor
+                if groups and sep_tokens:
+                    width = len(sep_tokens)
+                    if tokens[cursor : cursor + width] != sep_tokens:
+                        break
+                    cursor += width
+                nxt = _matcher_consume(body_parts, tokens, cursor)
+                if nxt is None or nxt == cursor:
+                    cursor = saved
+                    break
+                cursor = nxt
+                groups += 1
+                if rep == "?" and groups >= 1:
+                    break
+            if rep == "+" and groups < 1:
+                return None
+            continue
         if literal is not None:
             if cursor >= len(tokens) or tokens[cursor] != literal:
                 return None
             cursor += 1
             continue
         next_literal = None
-        for later_literal, _later_kind in parts[index + 1 :]:
+        for later_literal, _later_kind, _later_name in parts[index + 1 :]:
             if later_literal is not None:
                 next_literal = later_literal
                 break
@@ -638,7 +681,43 @@ def _invoke_repeat_count(matcher: str, invoke_inner: str) -> int:
         inner = inner[1:-1]
     parsed = _parse_repetition(inner)
     if parsed is None:
-        return 1
+        named = _matcher_named_parts(inner)
+        rep_at = next(
+            (i for i, part in enumerate(named) if part[1] == "repeat"),
+            None,
+        )
+        if rep_at is None:
+            return 1
+        tokens = _token_list(invoke_inner)
+        cursor = _matcher_consume(named[:rep_at], tokens, 0)
+        if cursor is None:
+            return 0
+        body, sep, _rep = (named[rep_at][2] or "\x1f\x1f*").split("\x1f")
+        parts = _matcher_named_parts(body)
+        sep_tokens = _token_list(sep)
+        groups = 0
+        n = len(tokens)
+        suffix = named[rep_at + 1 :]
+        while cursor < n:
+            saved = cursor
+            if groups and sep_tokens:
+                width = len(sep_tokens)
+                if tokens[cursor : cursor + width] != sep_tokens:
+                    break
+                cursor += width
+            nxt = _matcher_consume(parts, tokens, cursor)
+            if nxt is None or nxt == cursor:
+                cursor = saved
+                break
+            if suffix:
+                tail = _matcher_consume(suffix, tokens, nxt)
+                if tail == len(tokens):
+                    cursor = nxt
+                    groups += 1
+                    break
+            cursor = nxt
+            groups += 1
+        return groups
     body, sep, _rep = parsed
     tokens = _token_list(invoke_inner)
     if not tokens:
@@ -677,15 +756,23 @@ def _bind_inner(inner: str, invoke_inner: str) -> dict[str, str]:
     cursor = 0
     bindings: dict[str, str] = {}
     for index, (literal, kind, name) in enumerate(parts):
+        if kind == "repeat":
+            nxt = _matcher_consume([(None, "repeat", name)], tokens, cursor)
+            if nxt is None:
+                return {}
+            cursor = nxt
+            continue
         if literal is not None:
             if cursor >= len(tokens) or tokens[cursor] != literal:
                 return {}
             cursor += 1
             continue
         next_literal = None
-        for later_literal, _later_kind, _later_name in parts[index + 1 :]:
+        for later_literal, later_kind, _later_name in parts[index + 1 :]:
             if later_literal is not None:
                 next_literal = later_literal
+                break
+            if later_kind == "repeat":
                 break
         nxt = _consume_fragment(tokens, cursor, kind or "ident", next_literal)
         if nxt is None:
@@ -733,6 +820,23 @@ def _bindings_for_invoke(
         if parsed is not None:
             body, _sep, _rep = parsed
             groups = _repetition_group_inners(inner, invoke_inner)
+            if 0 <= rep < len(groups):
+                return _bind_inner(body, groups[rep])
+            return {}
+        named = _matcher_named_parts(inner)
+        rep_at = next(
+            (i for i, part in enumerate(named) if part[1] == "repeat"),
+            None,
+        )
+        if rep_at is not None:
+            tokens = _token_list(invoke_inner)
+            cursor = _matcher_consume(named[:rep_at], tokens, 0)
+            if cursor is None:
+                return {}
+            body, sep, _rep = (named[rep_at][2] or "\x1f\x1f*").split("\x1f")
+            groups = _repetition_group_inners(
+                f"$({body}){sep}*", "".join(tokens[cursor:])
+            )
             if 0 <= rep < len(groups):
                 return _bind_inner(body, groups[rep])
             return {}
@@ -1186,7 +1290,47 @@ def _crate_of(path: Path) -> str:
     return parts[2] if len(parts) > 2 else str(path)
 
 
-def _module_path(rel: Path) -> tuple[str, ...] | None:
+def _norm_posix(path: Path) -> str:
+    parts: list[str] = []
+    for part in path.as_posix().split("/"):
+        if part == "..":
+            if parts:
+                parts.pop()
+        elif part not in (".", ""):
+            parts.append(part)
+    return "/".join(parts)
+
+
+_PATH_MOD = re.compile(
+    r"#\[\s*path\s*=\s*\"([^\"]+)\"\s*\]\s*"
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+_PATH_OVERRIDE: dict[str, tuple[str, ...]] = {}
+
+
+def _load_path_overrides(sources: list[tuple[Path, str]]) -> None:
+    """`#[path = \"foo.rs\"] mod bar;` maps foo.rs to this file's module
+    plus `bar`, not foo's filename stem (#516 review)."""
+
+    global _PATH_OVERRIDE
+    _PATH_OVERRIDE = {}
+    for rel, text in sources:
+        parent = _module_path_fs(rel)
+        if parent is None:
+            parent = ()
+        # Scan the raw file: `_code_only` blanks string literals, which
+        # would erase the `#[path = "..."]` value. Skip matches whose
+        # `#` sits inside a comment or string.
+        code = _code_only(text)
+        for match in _PATH_MOD.finditer(text):
+            start = match.start()
+            if start < len(code) and code[start] == " " and text[start] != " ":
+                continue
+            child = _norm_posix(rel.parent / match.group(1))
+            _PATH_OVERRIDE[child] = parent + (match.group(2),)
+
+
+def _module_path_fs(rel: Path) -> tuple[str, ...] | None:
     """`crate::a::b` module path for `.../src/a/b.rs` or `.../src/a/b/mod.rs`.
 
     Integration support modules (`tests/common/mod.rs`) are `("common",)`
@@ -1223,6 +1367,13 @@ def _module_path(rel: Path) -> tuple[str, ...] | None:
         segs = segs[:-1]
     # `()` is the crate root (`src/lib.rs`); do not collapse it to None.
     return tuple(segs)
+
+
+def _module_path(rel: Path) -> tuple[str, ...] | None:
+    found = _PATH_OVERRIDE.get(_norm_posix(rel))
+    if found is not None:
+        return found
+    return _module_path_fs(rel)
 
 
 def _raw_ident(name: str) -> str:
@@ -1304,7 +1455,7 @@ def _collect_use_leaves(
         fname = prefix[-1]
         out.append((prefix[:-1], fname, alias or fname))
         return i
-    if segs and segs[0] not in ("self", "super"):
+    if segs:
         fname = segs[-1]
         out.append((prefix + tuple(segs[:-1]), fname, alias or fname))
     return i
@@ -1346,7 +1497,12 @@ def _use_module_prefix(
     if root == "self":
         return effective + mid
     if root == "super":
-        return (effective[:-1] if effective else ()) + mid
+        cur = effective[:-1] if effective else ()
+        rest = list(mid)
+        while rest and rest[0] == "super":
+            cur = cur[:-1] if cur else ()
+            rest = rest[1:]
+        return tuple(cur) + tuple(rest)
     return None
 
 
@@ -1515,7 +1671,7 @@ def _pub_reexports(
         out.append((dest, local, src, fname))
 
     for pos, root, mid, fname, local in _iter_use_leaves(code):
-        if not _is_pub_use(code, pos) or fname == "*":
+        if not _is_pub_use(code, pos):
             continue
         record(pos, root, mid, fname, local)
     return out
@@ -1531,20 +1687,32 @@ def _copy_reexports_into_indices(
     for _ in range(len(reexports) + 1):
         progressed = False
         for dest, local, src, fname in reexports:
-            js = list(by_module.get(src, {}).get(fname, []))
-            if not js:
+            if fname == "*":
+                exported = list(by_module.get(src, {}).items())
+            else:
+                exported = [(local, list(by_module.get(src, {}).get(fname, [])))]
+            if not exported:
                 continue
-            slot = by_module.setdefault(dest, {}).setdefault(local, [])
-            for j in js:
-                if j not in slot:
-                    slot.append(j)
-                    progressed = True
-            if dest:
-                leaf_slot = by_leaf.setdefault(dest[-1], {}).setdefault(local, [])
+            progressed_here = False
+            for dest_name, js in exported:
+                js = list(js)
+                if not js:
+                    continue
+                slot = by_module.setdefault(dest, {}).setdefault(dest_name, [])
                 for j in js:
-                    if j not in leaf_slot:
-                        leaf_slot.append(j)
+                    if j not in slot:
+                        slot.append(j)
                         progressed = True
+                        progressed_here = True
+                if dest:
+                    leaf_slot = by_leaf.setdefault(dest[-1], {}).setdefault(dest_name, [])
+                    for j in js:
+                        if j not in leaf_slot:
+                            leaf_slot.append(j)
+                            progressed = True
+                            progressed_here = True
+            if progressed_here:
+                continue
         if not progressed:
             break
 
@@ -2428,6 +2596,7 @@ def index_functions(
     dict[Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]],
     dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
 ]:
+    _load_path_overrides(sources)
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
     generated_by_macro: dict[tuple[Path, str], list[_MacroArm]] = {}
@@ -2869,10 +3038,14 @@ def _resolve_calls(
     globs_by_file: dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
     keys_of: list[frozenset[str]],
     self_index: int,
+    by_crate_module: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] | None = None,
+    file_groups: dict[Path, frozenset[str]] | None = None,
 ) -> frozenset[str]:
     gained: set[str] = set()
     file_index = by_file.get(fn.file, {})
     caller_module = _module_path(fn.file)
+    crate_ns = by_crate_module or {}
+    groups_of = file_groups or {}
     for m in FREE_CALL.finditer(fn.body):
         # Resolve a bare call inside the caller's inline module first, then
         # ancestors. File-wide last-definition lookup lets `mod b { fn bump }`
@@ -2935,19 +3108,28 @@ def _resolve_calls(
     for m in QUALIFIED_CALL.finditer(fn.body):
         segs = tuple(s.strip() for s in m.group(1).split("::") if s.strip())
         if segs and segs[0] == "crate":
-            _gain_from(
-                gained,
-                keys_of,
-                self_index,
-                by_module.get(segs[1:], {}).get(m.group(2), []),
-            )
-            if not segs[1:] and caller_module in (None, ()):
-                # Binary/integration crate roots have no `src`-relative
-                # module path; `crate::bump()` is a same-crate-root call
-                # (#516 review).
+            caller_group = _process_group(fn.file)
+            if caller_group.startswith("lib:"):
                 _gain_from(
-                    gained, keys_of, self_index, file_index.get(m.group(2), [])
+                    gained,
+                    keys_of,
+                    self_index,
+                    by_module.get(segs[1:], {}).get(m.group(2), []),
                 )
+            else:
+                # Integration/`src/bin` `crate::` is that target, not the
+                # library's `by_module[()]` (#516 review).
+                for group in groups_of.get(fn.file, frozenset({caller_group})):
+                    _gain_from(
+                        gained,
+                        keys_of,
+                        self_index,
+                        crate_ns.get((group, segs[1:]), {}).get(m.group(2), []),
+                    )
+                if not segs[1:]:
+                    _gain_from(
+                        gained, keys_of, self_index, file_index.get(m.group(2), [])
+                    )
         elif segs and _is_lib_crate_ident(segs[0]):
             _gain_from(
                 gained,
@@ -3027,7 +3209,11 @@ def _resolve_calls(
                     by_module.get(resolved, {}).get(m.group(2), []),
                 )
         leaf = segs[-1] if segs else None
-        if leaf and leaf not in ("crate", "self", "super"):
+        if (
+            leaf
+            and leaf not in ("crate", "self", "super")
+            and not (segs and segs[0] == "crate")
+        ):
             _gain_from(
                 gained,
                 keys_of,
@@ -3086,8 +3272,10 @@ def analyze(
         sources, registry
     )
 
+    file_groups = _file_process_groups(sources)
     by_file: dict[Path, dict[str, list[int]]] = {}
     by_module: dict[tuple[str, ...], dict[str, list[int]]] = {}
+    by_crate_module: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] = {}
     by_leaf: dict[str, dict[str, list[int]]] = {}
     by_type: dict[str, dict[str, list[int]]] = {}
     by_macro: dict[Path, dict[str, int]] = {}
@@ -3106,6 +3294,15 @@ def analyze(
             fn.name, []
         ).append(i)
         module = _module_path(fn.file)
+        crate_mod = module if module is not None else ()
+        for group in file_groups.get(fn.file, frozenset({_process_group(fn.file)})):
+            by_crate_module.setdefault((group, crate_mod), {}).setdefault(
+                fn.name, []
+            ).append(i)
+            if fn.inline_mods:
+                by_crate_module.setdefault(
+                    (group, crate_mod + fn.inline_mods), {}
+                ).setdefault(fn.name, []).append(i)
         if module is not None:
             # `module` is a valid module path even when empty (`()` is the
             # crate root itself, from a function declared directly in
@@ -3151,6 +3348,8 @@ def analyze(
                 globs_by_file=globs_by_file,
                 keys_of=keys_of,
                 self_index=i,
+                by_crate_module=by_crate_module,
+                file_groups=file_groups,
             )
             if not gained:
                 continue
@@ -3212,6 +3411,8 @@ def analyze(
                 globs_by_file=globs_by_file,
                 keys_of=keys_of,
                 self_index=-1,
+                by_crate_module=by_crate_module,
+                file_groups=file_groups,
             )
             for item in registry:
                 if _body_touches(
@@ -3257,7 +3458,6 @@ def analyze(
     # anything else in that process (mirrors `check_envguard_serial.py`'s
     # "sole test in its own integration binary" regime, generalised to "sole
     # test in its own process").
-    file_groups = _file_process_groups(sources)
     members_by_process: dict[tuple[str, str], list[tuple[Path, int, str]]] = {}
     for key, members in membership.items():
         for path, line, name in members:
