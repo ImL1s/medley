@@ -223,13 +223,16 @@ def _mask_rust_literals(text: str) -> str:
 _MACRO_RULES = re.compile(r"\bmacro_rules\s*!")
 
 
-def _balanced_brace_end(text: str, open_index: int) -> int:
+def _balanced_pair_end(text: str, open_index: int) -> int:
+    pairs = {"{": "}", "(": ")", "[": "]"}
+    opener = text[open_index]
+    closer = pairs[opener]
     depth = 0
     for index in range(open_index, len(text)):
         char = text[index]
-        if char == "{":
+        if char == opener:
             depth += 1
-        elif char == "}":
+        elif char == closer:
             depth -= 1
             if depth == 0:
                 return index + 1
@@ -237,10 +240,10 @@ def _balanced_brace_end(text: str, open_index: int) -> int:
 
 
 def _macro_rules_body_spans(masked: str) -> list[tuple[int, int]]:
-    """`macro_rules! name { ... }` body ranges on already-masked source.
+    """`macro_rules! name { ... }` / `(...)` / `[...]` body ranges.
 
     rustc does not register `#[test]` items sitting only in an uninvoked
-    macro definition (#507 review).
+    macro definition, regardless of delimiter (#507 review).
     """
 
     spans: list[tuple[int, int]] = []
@@ -253,8 +256,8 @@ def _macro_rules_body_spans(masked: str) -> list[tuple[int, int]]:
             index += ident.end()
         while index < len(masked) and masked[index].isspace():
             index += 1
-        if index < len(masked) and masked[index] == "{":
-            spans.append((index, _balanced_brace_end(masked, index)))
+        if index < len(masked) and masked[index] in "{([":
+            spans.append((index, _balanced_pair_end(masked, index)))
     return spans
 
 
@@ -492,7 +495,7 @@ def _cargo_test_targets(
                 extra_required = required_feats - default_feats
                 if extra_required:
                     gated.add(target)
-                elif isinstance(path_s, str) and target.is_file():
+                elif target.is_file():
                     extra.add(target)
             continue
         default_feats = set()
@@ -520,7 +523,7 @@ def _cargo_test_targets(
                     extra_required = required_feats - default_feats
                     if extra_required:
                         gated.add(target)
-                    elif path_s and target.is_file():
+                    elif target.is_file():
                         extra.add(target)
             name = None
             path_s = None
@@ -1308,6 +1311,32 @@ class ExternalModulePrefix(unittest.TestCase):
             self.assertIn("kept", names)
             self.assertNotIn("none_auth_scheme_stale", names)
 
+    def test_autotests_false_name_only_explicit_test_is_kept(self):
+        """`[[test]] name = "kept"` with no `path` still seeds
+        `tests/kept.rs` when `autotests = false` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            tests = crate / "tests"
+            tests.mkdir(parents=True)
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+                "autotests = false\n\n"
+                "[[test]]\nname = \"kept\"\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text("#[test]\nfn lib_ok() {}\n")
+            (tests / "kept.rs").write_text("#[test]\nfn kept() {}\n")
+            (tests / "stale.rs").write_text(
+                "#[test]\nfn none_auth_scheme_stale() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("lib_ok", names)
+            self.assertIn("kept", names)
+            self.assertNotIn("none_auth_scheme_stale", names)
+
     def test_explicit_integration_root_resolves_sibling_mod(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -1799,6 +1828,45 @@ class ExternalModulePrefix(unittest.TestCase):
                     fn none_auth_scheme_phantom() {}
                 };
             }
+            #[test]
+            fn none_auth_scheme_live() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_live"])
+        self.assertNotIn("none_auth_scheme_phantom", names)
+
+    def test_unexpanded_macro_rules_paren_body_is_not_counted(self):
+        """`macro_rules! name ( ... )` is a valid delimiter; `#[test]`
+        inside it is still not a libtest case (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! phantom (
+                () => {
+                    #[test]
+                    fn none_auth_scheme_phantom() {}
+                }
+            );
+            #[test]
+            fn none_auth_scheme_live() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_live"])
+        self.assertNotIn("none_auth_scheme_phantom", names)
+
+    def test_unexpanded_macro_rules_bracket_body_is_not_counted(self):
+        """`macro_rules! name [ ... ]` is a valid delimiter (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! phantom [
+                () => {
+                    #[test]
+                    fn none_auth_scheme_phantom() {}
+                }
+            ];
             #[test]
             fn none_auth_scheme_live() {}
             """
