@@ -93,6 +93,91 @@ def _strip_line_comment(line: str) -> str:
 
 
 _RAW_STRING_START = re.compile(r"(?:c|b)?r(#*)\"")
+_MACRO_INVOKE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*!\s*[([{]")
+
+
+def _skip_quoted(text: str, index: int, quote: str) -> int:
+    index += 1
+    n = len(text)
+    while index < n:
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == quote:
+            return index + 1
+        index += 1
+    return n
+
+
+def _attribute_end(text: str, hash_index: int) -> int | None:
+    """End of `#[...]` / `#![...]`, skipping string values."""
+
+    n = len(text)
+    j = hash_index + 1
+    if j < n and text[j] == "!":
+        j += 1
+    if j >= n or text[j] != "[":
+        return None
+    depth = 0
+    while j < n:
+        raw = _RAW_STRING_START.match(text, j)
+        if raw:
+            hashes = raw.group(1)
+            closer = '"' + hashes
+            end = text.find(closer, raw.end())
+            j = n if end < 0 else end + len(closer)
+            continue
+        if text[j] in "\"'":
+            j = _skip_quoted(text, j, text[j])
+            continue
+        if text[j] == "[":
+            depth += 1
+        elif text[j] == "]":
+            depth -= 1
+            j += 1
+            if depth == 0:
+                return j
+            continue
+        j += 1
+    return n
+
+
+def _mask_attr_string_braces(text: str) -> str:
+    """Blank `{`/`}` inside attribute string literals so brace depth
+    ignores `#[doc = "}"]` while cfg strings stay on the unmasked copy
+    (#507 review)."""
+
+    chars = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        end = _attribute_end(text, i) if text[i] == "#" else None
+        if end is None:
+            i += 1
+            continue
+        j = i
+        while j < end:
+            raw = _RAW_STRING_START.match(text, j)
+            if raw:
+                hashes = raw.group(1)
+                closer = '"' + hashes
+                close = text.find(closer, raw.end())
+                close = n if close < 0 else close + len(closer)
+                for t in range(j, min(close, end)):
+                    if chars[t] in "{}":
+                        chars[t] = " "
+                j = close
+                continue
+            if text[j] in "\"'":
+                k = _skip_quoted(text, j, text[j])
+                for t in range(j, min(k, end)):
+                    if chars[t] in "{}":
+                        chars[t] = " "
+                j = k
+                continue
+            j += 1
+        i = end
+    return "".join(chars)
 
 
 def _mask_rust_literals(text: str) -> str:
@@ -110,50 +195,8 @@ def _mask_rust_literals(text: str) -> str:
     def keep_newlines(chunk: str) -> str:
         return "".join("\n" if c == "\n" else " " for c in chunk)
 
-    def skip_quoted(index: int, quote: str) -> int:
-        index += 1
-        while index < n:
-            if text[index] == "\\":
-                index += 2
-                continue
-            if text[index] == quote:
-                return index + 1
-            index += 1
-        return n
-
-    def attribute_end(hash_index: int) -> int | None:
-        """End of `#[...]` / `#![...]`, keeping string values intact."""
-
-        j = hash_index + 1
-        if j < n and text[j] == "!":
-            j += 1
-        if j >= n or text[j] != "[":
-            return None
-        depth = 0
-        while j < n:
-            raw = _RAW_STRING_START.match(text, j)
-            if raw:
-                hashes = raw.group(1)
-                closer = '"' + hashes
-                end = text.find(closer, raw.end())
-                j = n if end < 0 else end + len(closer)
-                continue
-            if text[j] in "\"'":
-                j = skip_quoted(j, text[j])
-                continue
-            if text[j] == "[":
-                depth += 1
-            elif text[j] == "]":
-                depth -= 1
-                j += 1
-                if depth == 0:
-                    return j
-                continue
-            j += 1
-        return n
-
     while i < n:
-        attr_end = attribute_end(i) if text[i] == "#" else None
+        attr_end = _attribute_end(text, i) if text[i] == "#" else None
         if attr_end is not None:
             out.append(text[i:attr_end])
             i = attr_end
@@ -239,26 +282,55 @@ def _balanced_pair_end(text: str, open_index: int) -> int:
     return len(text)
 
 
-def _macro_rules_body_spans(masked: str) -> list[tuple[int, int]]:
-    """`macro_rules! name { ... }` / `(...)` / `[...]` body ranges.
+def _macro_rules_defs(masked: str) -> list[tuple[str, int, int]]:
+    """`(name, body_start, body_end)` for each `macro_rules!` definition."""
 
-    rustc does not register `#[test]` items sitting only in an uninvoked
-    macro definition, regardless of delimiter (#507 review).
-    """
-
-    spans: list[tuple[int, int]] = []
+    defs: list[tuple[str, int, int]] = []
     for match in _MACRO_RULES.finditer(masked):
         index = match.end()
         while index < len(masked) and masked[index].isspace():
             index += 1
         ident = re.match(r"[A-Za-z_][A-Za-z0-9_]*", masked[index:])
-        if ident:
-            index += ident.end()
+        if not ident:
+            continue
+        name = ident.group(0)
+        index += ident.end()
         while index < len(masked) and masked[index].isspace():
             index += 1
         if index < len(masked) and masked[index] in "{([":
-            spans.append((index, _balanced_pair_end(masked, index)))
-    return spans
+            defs.append((name, index, _balanced_pair_end(masked, index)))
+    return defs
+
+
+def _invoked_macro_names(
+    masked: str, defs: list[tuple[str, int, int]]
+) -> set[str]:
+    """Macro names that have a `name!(...)` invocation outside any
+    `macro_rules!` body. Invoked macros emit their `#[test]` items
+    (#507 review)."""
+
+    known = {name for name, _, _ in defs}
+    if not known:
+        return set()
+    bodies = [(start, end) for _, start, end in defs]
+    invoked: set[str] = set()
+    for match in _MACRO_INVOKE.finditer(masked):
+        name = match.group(1)
+        if name not in known:
+            continue
+        if any(start <= match.start() < end for start, end in bodies):
+            continue
+        invoked.add(name)
+    return invoked
+
+
+def _macro_rules_body_spans(masked: str) -> list[tuple[int, int]]:
+    """Uninvoked `macro_rules!` bodies. Invoked macros are expanded by
+    rustc, so their `#[test]` items count (#507 review)."""
+
+    defs = _macro_rules_defs(masked)
+    invoked = _invoked_macro_names(masked, defs)
+    return [(start, end) for name, start, end in defs if name not in invoked]
 
 
 def parse_documented_hot_path(text: str) -> dict[str, int]:
@@ -899,8 +971,12 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
     raw_lines = text.splitlines()
     masked = _mask_rust_literals(text)
     masked_lines = masked.splitlines()
+    brace_masked = _mask_attr_string_braces(masked)
+    brace_lines = brace_masked.splitlines()
     if len(masked_lines) < len(raw_lines):
         masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
+    if len(brace_lines) < len(raw_lines):
+        brace_lines.extend([""] * (len(raw_lines) - len(brace_lines)))
     macro_spans = _macro_rules_body_spans(masked)
     mod_stack: list[tuple[int, str, bool]] = []
     pending: list[str] = []
@@ -966,7 +1042,7 @@ def _tests_in_file(text: str, file_mods: list[str]) -> list[str]:
             if mod_match:
                 mod_stack.append((depth, mod_match.group(1), item_off))
 
-        line = _strip_line_comment(masked_line)
+        line = _strip_line_comment(brace_lines[i])
         if not remainder_masked.strip() or has_test:
             pass
         depth += line.count("{") - line.count("}")
@@ -1835,6 +1911,40 @@ class ExternalModulePrefix(unittest.TestCase):
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_live"])
         self.assertNotIn("none_auth_scheme_phantom", names)
+
+    def test_invoked_macro_rules_test_is_counted(self):
+        """An invoked `macro_rules!` emits its `#[test]` item; rustc
+        registers it (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                () => {
+                    #[test]
+                    fn none_auth_scheme_generated() {}
+                };
+            }
+            generated!();
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_generated"])
+
+    def test_attr_string_brace_does_not_close_the_module(self):
+        """`#[doc = "}"]` must not pop the enclosing inline module
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            mod none_auth_scheme_ {
+                #[doc = "}"]
+                #[test]
+                fn works() {}
+            }
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_::works"])
 
     def test_unexpanded_macro_rules_paren_body_is_not_counted(self):
         """`macro_rules! name ( ... )` is a valid delimiter; `#[test]`
