@@ -380,6 +380,77 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"calls_bump_untagged"})
 
+    def test_unused_nested_fn_body_is_not_a_direct_touch(self):
+        """An unused nested `fn helper() { COUNTER... }` must not mark
+        the enclosing test as a Stage-1 toucher (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn clean_with_unused_helper() {
+                fn helper() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn also_clean_with_unused_helper() {
+                fn helper() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, set())
+
+    def test_called_nested_fn_still_propagates(self):
+        """A nested helper that is actually called still reaches the
+        enclosing test through the call graph (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn calls_nested_helper_untagged() {
+                fn helper() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+                helper();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"calls_nested_helper_untagged"})
+
+    def test_unused_nested_impl_body_is_not_a_direct_touch(self):
+        """An unused nested `impl { fn helper() { COUNTER... } }` must
+        not mark the enclosing test as a Stage-1 toucher (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn clean_with_unused_impl() {
+                struct Local;
+                impl Local {
+                    fn helper() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, set())
+
     def test_block_comment_between_signature_and_body_is_not_the_body(self):
         # `fn bump() /* { } */ { COUNTER... }` — taking the comment's braces
         # as the body hides the real toucher (#516 review).

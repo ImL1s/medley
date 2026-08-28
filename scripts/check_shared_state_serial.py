@@ -1270,6 +1270,45 @@ def _impl_blocks(code: str) -> list[tuple[str, str | None, int, int]]:
     return blocks
 
 
+def _mask_nested_item_bodies(
+    code: str,
+    body_start: int,
+    body_end: int,
+    impls: list[tuple[str, str | None, int, int]] | None = None,
+) -> str:
+    """Replace nested `fn` / `impl` bodies with spaces.
+
+    An unused `fn helper() { COUNTER.fetch_add(...) }` inside a test
+    must not be a Stage-1 touch of the enclosing function; nested items
+    are indexed separately and propagate only when called (#516 review).
+    """
+
+    chars = list(code[body_start:body_end])
+
+    def blank(abs_start: int, abs_end: int) -> None:
+        rel_s = max(0, abs_start - body_start)
+        rel_e = min(len(chars), abs_end - body_start)
+        for i in range(rel_s, rel_e):
+            if chars[i] != "\n":
+                chars[i] = " "
+
+    for match in FN_DEF.finditer(code, body_start, body_end):
+        nested = _fn_body(code, match.end())
+        if nested is None:
+            continue
+        ns, ne = nested
+        if ns < body_start or ne > body_end:
+            continue
+        # Include the signature: `fn helper()` is otherwise a false
+        # `helper()` call in the enclosing Stage-1 / call scan.
+        blank(match.start(), ne)
+    for _type, _trait, impl_open, impl_end in impls or ():
+        if impl_open <= body_start or impl_end > body_end:
+            continue
+        blank(impl_open, impl_end)
+    return "".join(chars)
+
+
 def _lib_crate_idents() -> frozenset[str]:
     """Rust idents for the scanned library (`xai-grok-shell` → both
     hyphen and underscore forms). Integration tests import it as
@@ -2714,7 +2753,9 @@ def index_functions(
                 continue
             body_start, body_end = body_span
             occupied.append((body_start, body_end))
-            body_code = _strip_turbofish(code[body_start:body_end])
+            body_code = _strip_turbofish(
+                _mask_nested_item_bodies(code, body_start, body_end, impls)
+            )
             inline_mods = _inline_path_from_spans(inline_spans, match.start())
             pending_fns.append(
                 (match, name, body_start, body_end, body_code, inline_mods)
