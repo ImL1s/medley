@@ -792,8 +792,42 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         generated = {n for n in names if n.startswith("case!")}
         self.assertEqual(len(generated), 1, names)
+
+    def test_generated_test_path_metavar_is_substituted(self):
+        """`$action:path` in a generated body is the invoked function
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            macro_rules! case {
+                ($name:ident, $action:path) => {
+                    #[test]
+                    fn $name() {
+                        $action();
+                    }
+                };
+            }
+
+            case!(one, bump);
+            case!(two, bump);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("case!")}
+        self.assertEqual(len(generated), 2, names)
         findings = guard.scan_source(text)
-        self.assertEqual(findings, [])
+        self.assertGreaterEqual(
+            len(findings),
+            1,
+            "two generated tests that call a toucher must not be invisible",
+        )
 
     def test_generated_test_keys_are_per_slot_not_macro_union(self):
         """An expansion with one touching test and one unrelated body must
@@ -3277,6 +3311,105 @@ class DefaultScanRoots(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_integration_support_module_helper_reaches_registered_state(self):
+        """`common::helper()` in `tests/*.rs` must resolve helpers under
+        `tests/common/` (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/common/mod.rs"),
+                src(
+                    """\
+                    pub fn helper() {
+                        xai_grok_shell::bump();
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    mod common;
+
+                    #[test]
+                    fn first_untagged() {
+                        common::helper();
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        common::helper();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_support_module_tests_share_the_integration_binary(self):
+        """Tests in `tests/common/mod.rs` run in each binary that
+        `mod common;`s them, not in a fictitious `tests/common` process
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/common/mod.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn support_toucher() {
+                        xai_grok_shell::bump();
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    mod common;
+
+                    #[test]
+                    fn root_toucher() {
+                        xai_grok_shell::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
+        self.assertEqual(errors, [])
+        names = {f.name for f in findings}
+        self.assertEqual(names, {"support_toucher", "root_toucher"})
 
 
 class ReportFormatting(unittest.TestCase):

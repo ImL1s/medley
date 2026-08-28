@@ -480,18 +480,20 @@ def _token_list(text: str) -> list[str]:
 
 
 _METAVAR = re.compile(
-    r"\$[A-Za-z_][A-Za-z0-9_]*(?::(?P<kind>[A-Za-z_][A-Za-z0-9_]*))?"
+    r"\$(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::(?P<kind>[A-Za-z_][A-Za-z0-9_]*))?"
 )
 
 
-def _matcher_parts(inner: str) -> list[tuple[str | None, str | None]]:
-    """(`literal`, None) or (None, fragment_kind) in matcher order.
+def _matcher_named_parts(
+    inner: str,
+) -> list[tuple[str | None, str | None, str | None]]:
+    """(`literal`, kind, metavar_name) in matcher order.
 
     `(clean $name:ident)` vs `(touch $name:ident)` share arity; literals
     distinguish them. `$value:expr` is not a single token (#516 review).
     """
 
-    parts: list[tuple[str | None, str | None]] = []
+    parts: list[tuple[str | None, str | None, str | None]] = []
     index = 0
     n = len(inner)
     while index < n:
@@ -500,16 +502,20 @@ def _matcher_parts(inner: str) -> list[tuple[str | None, str | None]]:
             continue
         metavar = _METAVAR.match(inner, index)
         if metavar:
-            parts.append((None, metavar.group("kind") or "ident"))
+            parts.append((None, metavar.group("kind") or "ident", metavar.group("name")))
             index = metavar.end()
             continue
         token = _TOKEN.match(inner, index)
         if token:
-            parts.append((token.group(0), None))
+            parts.append((token.group(0), None, None))
             index = token.end()
             continue
         index += 1
     return parts
+
+
+def _matcher_parts(inner: str) -> list[tuple[str | None, str | None]]:
+    return [(literal, kind) for literal, kind, _name in _matcher_named_parts(inner)]
 
 
 def _consume_fragment(
@@ -654,6 +660,101 @@ def _invoke_repeat_count(matcher: str, invoke_inner: str) -> int:
         cursor = nxt
         groups += 1
     return groups
+
+
+def _strip_matcher_inner(matcher: str) -> str:
+    inner = matcher.strip()
+    if len(inner) >= 2 and inner[0] in "([{" and inner[-1] in ")]}":
+        return inner[1:-1]
+    return inner
+
+
+def _bind_inner(inner: str, invoke_inner: str) -> dict[str, str]:
+    """Map `$name` captures in `inner` to invocation tokens."""
+
+    tokens = _token_list(invoke_inner)
+    parts = _matcher_named_parts(inner)
+    cursor = 0
+    bindings: dict[str, str] = {}
+    for index, (literal, kind, name) in enumerate(parts):
+        if literal is not None:
+            if cursor >= len(tokens) or tokens[cursor] != literal:
+                return {}
+            cursor += 1
+            continue
+        next_literal = None
+        for later_literal, _later_kind, _later_name in parts[index + 1 :]:
+            if later_literal is not None:
+                next_literal = later_literal
+                break
+        nxt = _consume_fragment(tokens, cursor, kind or "ident", next_literal)
+        if nxt is None:
+            return {}
+        if name:
+            bindings[name] = "".join(tokens[cursor:nxt])
+        cursor = nxt
+    if cursor != len(tokens):
+        return {}
+    return bindings
+
+
+def _repetition_group_inners(matcher_inner: str, invoke_inner: str) -> list[str]:
+    parsed = _parse_repetition(matcher_inner)
+    if parsed is None:
+        return [invoke_inner]
+    body, sep, _rep = parsed
+    tokens = _token_list(invoke_inner)
+    parts = _matcher_parts(body)
+    sep_tokens = _token_list(sep)
+    cursor = 0
+    groups: list[str] = []
+    n = len(tokens)
+    while cursor < n:
+        if groups and sep_tokens:
+            width = len(sep_tokens)
+            if tokens[cursor : cursor + width] != sep_tokens:
+                break
+            cursor += width
+        start = cursor
+        nxt = _matcher_consume(parts, tokens, cursor)
+        if nxt is None or nxt == cursor:
+            break
+        groups.append("".join(tokens[start:nxt]))
+        cursor = nxt
+    return groups
+
+
+def _bindings_for_invoke(
+    matcher: str, invoke_inner: str, *, rep: int, in_repeat: bool
+) -> dict[str, str]:
+    inner = _strip_matcher_inner(matcher)
+    if in_repeat:
+        parsed = _parse_repetition(inner)
+        if parsed is not None:
+            body, _sep, _rep = parsed
+            groups = _repetition_group_inners(inner, invoke_inner)
+            if 0 <= rep < len(groups):
+                return _bind_inner(body, groups[rep])
+            return {}
+    return _bind_inner(inner, invoke_inner)
+
+
+_SUB_METAVAR = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _substitute_metavars(text: str, bindings: dict[str, str]) -> str:
+    """Replace `$name` in a selected arm with this invocation's captures.
+
+    `$crate` is left alone; `$(` repetitions are not `$ident` (#516 review).
+    """
+
+    def repl(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name == "crate":
+            return match.group(0)
+        return bindings.get(name, match.group(0))
+
+    return _SUB_METAVAR.sub(repl, text)
 
 
 def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
@@ -1086,17 +1187,30 @@ def _crate_of(path: Path) -> str:
 
 
 def _module_path(rel: Path) -> tuple[str, ...] | None:
-    """`crate::a::b` module path for `.../src/a/b.rs` or `.../src/a/b/mod.rs`."""
+    """`crate::a::b` module path for `.../src/a/b.rs` or `.../src/a/b/mod.rs`.
+
+    Integration support modules (`tests/common/mod.rs`) are `("common",)`
+    so `common::helper()` resolves; binary roots (`tests/foo.rs`,
+    `tests/foo/main.rs`) are that crate's root and have no extra prefix
+    (#516 review).
+    """
 
     parts = rel.parts
-    if "src" not in parts:
+    root_key = "src" if "src" in parts else "tests" if "tests" in parts else None
+    if root_key is None:
         return None
-    segs = list(parts[parts.index("src") + 1 :])
+    segs = list(parts[parts.index(root_key) + 1 :])
     if not segs:
         return None
+    if root_key == "tests":
+        if len(segs) == 1:
+            return None
+        if len(segs) == 2 and segs[1] == "main.rs":
+            return None
     segs[-1] = Path(segs[-1]).stem
     if segs[-1] in ("mod", "lib", "main"):
         segs = segs[:-1]
+    # `()` is the crate root (`src/lib.rs`); do not collapse it to None.
     return tuple(segs)
 
 
@@ -1454,6 +1568,66 @@ def _process_group(path: Path) -> str:
             return f"bin:{crate}/tests/{root}"
         return f"bin:{crate}/tests"
     return f"lib:{_crate_of(path)}"
+
+
+_MOD_DECL = re.compile(r"\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
+
+
+def _integration_binary_stem(path: Path) -> str | None:
+    """Test-binary name when `path` is that binary's crate root."""
+
+    parts = path.parts
+    if "tests" not in parts or "src" in parts:
+        return None
+    rest = parts[parts.index("tests") + 1 :]
+    if len(rest) == 1 and rest[0].endswith(".rs"):
+        return Path(rest[0]).stem
+    if len(rest) == 2 and rest[1] == "main.rs":
+        return rest[0]
+    return None
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _file_process_groups(
+    sources: list[tuple[Path, str]],
+) -> dict[Path, frozenset[str]]:
+    """Process groups each file's tests actually run in.
+
+    `mod common;` in `tests/race.rs` compiles `tests/common/**` into the
+    `race` binary, not a fictitious `tests/common` process (#516 review).
+    """
+
+    text_of = dict(sources)
+    groups: dict[Path, set[str]] = {path: set() for path, _text in sources}
+    binaries: list[tuple[Path, str]] = []
+    for path, _text in sources:
+        if _integration_binary_stem(path) is None:
+            continue
+        group = _process_group(path)
+        groups[path].add(group)
+        binaries.append((path, group))
+    for bin_path, group in binaries:
+        parent = bin_path.parent
+        for name in _MOD_DECL.findall(_code_only(text_of[bin_path])):
+            file_mod = parent / f"{name}.rs"
+            dir_mod = parent / name
+            for path in groups:
+                if path == bin_path:
+                    continue
+                if path == file_mod or _path_is_relative_to(path, dir_mod):
+                    groups[path].add(group)
+    out: dict[Path, frozenset[str]] = {}
+    for path, _text in sources:
+        found = groups.get(path) or set()
+        out[path] = frozenset(found) if found else frozenset({_process_group(path)})
+    return out
 
 
 def rust_files(scan_root: Path) -> list[Path]:
@@ -2160,6 +2334,7 @@ class _PendingMacroTest:
     has_unkeyed_serial: bool
     slot: int
     template_index: int
+    body: str = ""
 
 
 @dataclass
@@ -2487,7 +2662,15 @@ def index_functions(
                 )
                 if reps < 1:
                     continue
+                template_body = (
+                    out[template_index].body
+                    if 0 <= template_index < len(out)
+                    else ""
+                )
                 for rep in range(reps):
+                    bindings = _bindings_for_invoke(
+                        chosen.matcher, inner, rep=rep, in_repeat=in_repeat
+                    )
                     pending.append(
                         _PendingMacroTest(
                             file=rel,
@@ -2500,6 +2683,7 @@ def index_functions(
                             has_unkeyed_serial=has_unkeyed,
                             slot=rep * len(serials) + slot,
                             template_index=template_index,
+                            body=_substitute_metavars(template_body, bindings),
                         )
                     )
     return out, pending, imports_by_file, globs_by_file
@@ -2951,6 +3135,48 @@ def analyze(
         elif indices:
             for idx in indices:
                 keys = keys | keys_of[idx]
+        if pending.body:
+            synth = FnInfo(
+                name=pending.macro_name,
+                file=pending.file,
+                type_name=None,
+                trait_name=None,
+                is_macro=False,
+                inline_mods=pending.inline_mods,
+                body=pending.body,
+                start=pending.start,
+                keys=frozenset(),
+                is_test=False,
+                serial_held=frozenset(),
+                has_unkeyed_serial=False,
+                attrs_line=pending.line,
+            )
+            keys = keys | _resolve_calls(
+                synth,
+                by_file=by_file,
+                by_module=by_module,
+                by_leaf=by_leaf,
+                by_type=by_type,
+                by_macro=by_macro,
+                by_macro_any=by_macro_any,
+                by_macro_arms=by_macro_arms,
+                by_inline=by_inline,
+                imports_by_file=imports_by_file,
+                globs_by_file=globs_by_file,
+                keys_of=keys_of,
+                self_index=-1,
+            )
+            for item in registry:
+                if _body_touches(
+                    pending.body,
+                    item.identifiers,
+                    original=item.identifiers,
+                    static_module=_item_module(item),
+                    fn_module=_module_path(pending.file),
+                    inline_mods=pending.inline_mods,
+                    scoped_imports=imports_by_file.get(pending.file, {}),
+                ):
+                    keys = keys | {item.key}
         if not keys:
             continue
         functions.append(
@@ -2961,7 +3187,7 @@ def analyze(
                 trait_name=None,
                 is_macro=False,
                 inline_mods=pending.inline_mods,
-                body="",
+                body=pending.body,
                 start=pending.start,
                 keys=keys,
                 is_test=True,
@@ -2984,21 +3210,26 @@ def analyze(
     # anything else in that process (mirrors `check_envguard_serial.py`'s
     # "sole test in its own integration binary" regime, generalised to "sole
     # test in its own process").
+    file_groups = _file_process_groups(sources)
     members_by_process: dict[tuple[str, str], list[tuple[Path, int, str]]] = {}
     for key, members in membership.items():
         for path, line, name in members:
-            members_by_process.setdefault((key, _process_group(path)), []).append(
-                (path, line, name)
-            )
+            for group in file_groups.get(path, frozenset({_process_group(path)})):
+                members_by_process.setdefault((key, group), []).append(
+                    (path, line, name)
+                )
 
     findings: list[Finding] = []
     for i, fn in enumerate(functions):
         if not fn.is_test:
             continue
         for key in sorted(keys_of[i]):
-            group = _process_group(fn.file)
-            if len(members_by_process.get((key, group), [])) <= 1:
-                continue  # sole member in its process: nothing to race
+            fn_groups = file_groups.get(fn.file, frozenset({_process_group(fn.file)}))
+            if all(
+                len(members_by_process.get((key, group), [])) <= 1
+                for group in fn_groups
+            ):
+                continue  # sole member in every process it joins
             if key in fn.serial_held:
                 continue
             if fn.has_unkeyed_serial:
