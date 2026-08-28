@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -1074,6 +1075,40 @@ class TransitiveClosure(unittest.TestCase):
 
             cases!(touch first);
             cases!(touch second);
+            cases!(clean x);
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+
+    def test_macro_invoke_matches_literals_in_repetition_arms(self):
+        """`($(clean $name:ident),*)` must not accept `touch one, touch two`
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($(clean $name:ident),*) => {
+                    $(
+                        #[test]
+                        fn $name() {}
+                    )*
+                };
+                ($(touch $name:ident),*) => {
+                    $(
+                        #[test]
+                        fn $name() {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    )*
+                };
+            }
+
+            cases!(touch one, touch two);
             cases!(clean x);
             """
         )
@@ -3151,6 +3186,24 @@ class SolitaryProcessException(unittest.TestCase):
         findings = guard.scan_source(DIRECT_TOUCH, path="crates/codegen/demo/src/lib_tests.rs")
         names = {f.name for f in findings}
         self.assertIn("untagged_direct_toucher", names)
+
+
+class DefaultScanRoots(unittest.TestCase):
+    def test_default_collect_includes_integration_test_files(self):
+        """CI default must include `tests/*.rs` beside `src` (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src = repo / "crates" / "codegen" / "xai-grok-shell" / "src"
+            tests = repo / "crates" / "codegen" / "xai-grok-shell" / "tests"
+            src.mkdir(parents=True)
+            tests.mkdir(parents=True)
+            (src / "lib.rs").write_text("fn lib() {}\n", encoding="utf-8")
+            (tests / "it.rs").write_text("#[test]\nfn it() {}\n", encoding="utf-8")
+            roots = [repo / path for path in guard.DEFAULT_SCAN_ROOTS]
+            files = {rel.as_posix() for rel, _text in guard.collect_sources(repo, roots)}
+            self.assertIn("crates/codegen/xai-grok-shell/src/lib.rs", files)
+            self.assertIn("crates/codegen/xai-grok-shell/tests/it.rs", files)
 
 
 class ReportFormatting(unittest.TestCase):

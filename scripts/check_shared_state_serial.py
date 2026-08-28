@@ -200,11 +200,12 @@ WHAT THIS DOES NOT CHECK, so a green tick is not read as more than it is:
     function). Measured: zero occurrences of any of those three shapes in
     this crate today.
 
-Scan scope is one crate: `crates/codegen/xai-grok-shell/src/**/*.rs` unless
-`--scan-root` says otherwise -- the same default and the same "one crate"
-assumption `check_envguard_serial.py` documents, for the same reason
-(`crate::`-qualified resolution only ever names something in the same
-crate).
+Scan scope is one crate: `crates/codegen/xai-grok-shell/src/**/*.rs` and
+`crates/codegen/xai-grok-shell/tests/**/*.rs` unless `--scan-root` says
+otherwise -- src unit tests and that crate's integration binaries. The
+same "one crate" assumption `check_envguard_serial.py` documents still
+holds for `crate::` resolution (`crate::` in an integration target is
+that binary, not the library).
 
 There is deliberately no allowlist file, unlike the env checker: this guard
 ships with its full registry (`heap_profile_monitor`) already at zero
@@ -243,6 +244,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_SCAN_ROOT = Path("crates/codegen/xai-grok-shell/src")
+DEFAULT_SCAN_TEST_ROOT = Path("crates/codegen/xai-grok-shell/tests")
+DEFAULT_SCAN_ROOTS = (DEFAULT_SCAN_ROOT, DEFAULT_SCAN_TEST_ROOT)
 
 # --- pure Rust-syntax primitives -------------------------------------------
 # Duplicated from `check_envguard_serial.py` rather than imported -- see the
@@ -530,14 +533,17 @@ def _consume_fragment(
     return None
 
 
-def _matcher_matches_invoke(inner: str, invoke_inner: str) -> bool:
-    parts = _matcher_parts(inner)
-    tokens = _token_list(invoke_inner)
-    cursor = 0
+def _matcher_consume(
+    parts: list[tuple[str | None, str | None]],
+    tokens: list[str],
+    cursor: int,
+) -> int | None:
+    """Advance `cursor` through `tokens` if `parts` match a prefix."""
+
     for index, (literal, kind) in enumerate(parts):
         if literal is not None:
             if cursor >= len(tokens) or tokens[cursor] != literal:
-                return False
+                return None
             cursor += 1
             continue
         next_literal = None
@@ -547,9 +553,69 @@ def _matcher_matches_invoke(inner: str, invoke_inner: str) -> bool:
                 break
         nxt = _consume_fragment(tokens, cursor, kind or "ident", next_literal)
         if nxt is None:
+            return None
+        cursor = nxt
+    return cursor
+
+
+def _matcher_matches_invoke(inner: str, invoke_inner: str) -> bool:
+    tokens = _token_list(invoke_inner)
+    cursor = _matcher_consume(_matcher_parts(inner), tokens, 0)
+    return cursor is not None and cursor == len(tokens)
+
+
+def _parse_repetition(inner: str) -> tuple[str, str, str] | None:
+    """`(body, separator, *|+|?)` when `inner` is exactly `$(body)sep*`.
+
+    `$(clean $name:ident),*` must not accept `touch one, touch two`
+    (#516 review).
+    """
+
+    text = inner.strip()
+    if not text.startswith("$"):
+        return None
+    index = 1
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text) or text[index] != "(":
+        return None
+    end = _balanced_end(text, index)
+    if end <= index + 1:
+        return None
+    body = text[index + 1 : end - 1]
+    rest = text[end:].strip()
+    if not rest or rest[-1] not in "*+?":
+        return None
+    return body, rest[:-1].strip(), rest[-1]
+
+
+def _repetition_matches(body: str, sep: str, rep: str, invoke_inner: str) -> bool:
+    tokens = _token_list(invoke_inner)
+    parts = _matcher_parts(body)
+    sep_tokens = _token_list(sep)
+    if not tokens:
+        return rep in "*?"
+    cursor = 0
+    groups = 0
+    n = len(tokens)
+    while cursor < n:
+        if groups and sep_tokens:
+            width = len(sep_tokens)
+            if tokens[cursor : cursor + width] != sep_tokens:
+                return False
+            cursor += width
+        nxt = _matcher_consume(parts, tokens, cursor)
+        if nxt is None or nxt == cursor:
             return False
         cursor = nxt
-    return cursor == len(tokens)
+        groups += 1
+        if rep == "?" and groups > 1:
+            return False
+    if cursor != n:
+        return False
+    if rep == "+" and groups < 1:
+        return False
+    return True
 
 
 def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
@@ -557,8 +623,9 @@ def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
 
     Literal arms (`(touch)` vs `(clean)`) compare tokens; metavariable
     arms match remaining literals then consume a fragment (`ident` is one
-    token, `expr`/`ty`/`path` run to the next literal); `$(...)*|+` arms
-    accept any arity. First matching arm wins (#516 review).
+    token, `expr`/`ty`/`path` run to the next literal); `$(...)*|+|?`
+    arms match each repetition against the inner matcher rather than
+    accepting any arity. First matching arm wins (#516 review).
     """
 
     if matcher == "*":
@@ -568,9 +635,10 @@ def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
         inner = inner[1:-1]
     if "$" not in inner:
         return _token_list(inner) == _token_list(invoke_inner)
-    if re.search(r"\$\s*\(", inner):
-        return True
     _ = invoke_arity
+    parsed = _parse_repetition(inner)
+    if parsed is not None:
+        return _repetition_matches(*parsed, invoke_inner)
     return _matcher_matches_invoke(inner, invoke_inner)
 
 
@@ -1337,6 +1405,25 @@ def _process_group(path: Path) -> str:
 
 def rust_files(scan_root: Path) -> list[Path]:
     return sorted(path for path in scan_root.rglob("*.rs") if path.is_file())
+
+
+def collect_sources(
+    repo: Path, scan_roots: list[Path]
+) -> list[tuple[Path, str]]:
+    """Rust files under each scan root, relative to `repo`, first root wins."""
+
+    seen: set[Path] = set()
+    sources: list[tuple[Path, str]] = []
+    for scan_root in scan_roots:
+        if not scan_root.is_dir():
+            continue
+        for path in rust_files(scan_root):
+            rel = path.relative_to(repo)
+            if rel in seen:
+                continue
+            seen.add(rel)
+            sources.append((rel, path.read_text(encoding="utf-8")))
+    return sources
 
 
 # --- registry discovery ------------------------------------------------------
@@ -2940,22 +3027,27 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     root = args.repo.resolve()
-    scan_root = (args.scan_root or (root / DEFAULT_SCAN_ROOT)).resolve()
-    sources = [
-        (p.relative_to(root), p.read_text(encoding="utf-8")) for p in rust_files(scan_root)
-    ]
+    if args.scan_root is not None:
+        chosen = args.scan_root
+        scan_roots = [(chosen if chosen.is_absolute() else root / chosen).resolve()]
+    else:
+        scan_roots = [(root / path).resolve() for path in DEFAULT_SCAN_ROOTS]
+    sources = collect_sources(root, scan_roots)
+    existing = [path for path in scan_roots if path.is_dir()]
+    try:
+        scan_rel = ", ".join(path.relative_to(root).as_posix() for path in existing)
+    except ValueError:
+        scan_rel = ", ".join(path.as_posix() for path in existing)
 
     if args.dump:
-        _findings, _errors, membership = analyze(sources, scan_root=scan_root)
+        _findings, _errors, membership = analyze(
+            sources, scan_root=scan_roots[0]
+        )
         sys.stdout.write(format_dump(sources, membership))
         return 0
 
-    findings, errors, _membership = analyze(sources, scan_root=scan_root)
-    try:
-        scan_rel = scan_root.relative_to(root).as_posix()
-    except ValueError:
-        scan_rel = None
-    print(format_report(findings, errors, scan_rel=scan_rel))
+    findings, errors, _membership = analyze(sources, scan_root=scan_roots[0])
+    print(format_report(findings, errors, scan_rel=scan_rel or None))
     if findings or errors:
         return 1
     return 0
