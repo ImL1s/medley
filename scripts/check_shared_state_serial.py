@@ -1190,6 +1190,7 @@ class SharedItem:
     file: Path
     identifiers: tuple[str, ...]
     line: int
+    inline_mods: tuple[str, ...] = ()
 
 
 def _keep_only_line_comments(source: str) -> str:
@@ -1377,8 +1378,21 @@ def find_registry(sources: list[tuple[Path, str]]) -> tuple[list[SharedItem], li
                     "deleted, or misplaced marker"
                 )
                 continue
+            code = _code_only(raw)
+            static_pos = match.end()
+            first = STATIC_DECL.search(code[match.end() :])
+            if first is not None:
+                static_pos = match.end() + first.start()
             items.append(
-                SharedItem(key=key, file=rel, identifiers=tuple(identifiers), line=line)
+                SharedItem(
+                    key=key,
+                    file=rel,
+                    identifiers=tuple(identifiers),
+                    line=line,
+                    inline_mods=_inline_path_from_spans(
+                        _inline_module_spans(code), static_pos
+                    ),
+                )
             )
     return items, errors
 
@@ -1404,6 +1418,20 @@ class FnInfo:
     local_imports: dict[str, tuple[tuple[str, ...], str]] = field(
         default_factory=dict
     )
+
+
+def _item_module(item: SharedItem) -> tuple[str, ...] | None:
+    """Owning module of a registered static, including inline `mod` path.
+
+    A marker inside `mod tests { static COUNTER }` is `file::tests`, not
+    the file module alone; `super::COUNTER` from a nested module must
+    compare against that inline path (#516 review).
+    """
+
+    file_mod = _module_path(item.file)
+    if file_mod is None:
+        return None
+    return file_mod + item.inline_mods
 
 
 def _resolve_path_module(
@@ -1867,10 +1895,10 @@ def index_functions(
                         scoped,
                         inline_mods,
                         item.identifiers,
-                        static_module=_module_path(item.file),
+                        static_module=_item_module(item),
                     ),
                     original=item.identifiers,
-                    static_module=_module_path(item.file),
+                    static_module=_item_module(item),
                     fn_module=_module_path(rel),
                     inline_mods=inline_mods,
                     scoped_imports=scoped,
@@ -1930,7 +1958,7 @@ def index_functions(
                     body_code,
                     item.identifiers,
                     original=item.identifiers,
-                    static_module=_module_path(item.file),
+                    static_module=_item_module(item),
                     fn_module=_module_path(rel),
                     scoped_imports=file_imports,
                 )
@@ -1949,7 +1977,7 @@ def index_functions(
                             test_body,
                             item.identifiers,
                             original=item.identifiers,
-                            static_module=_module_path(item.file),
+                            static_module=_item_module(item),
                             fn_module=_module_path(rel),
                             scoped_imports=file_imports,
                         )
@@ -2301,6 +2329,23 @@ def _resolve_calls(
                         self_index,
                         by_module.get(base + trailing, {}).get(m.group(2), []),
                     )
+        if segs and segs[0] not in ("crate", "self", "super"):
+            # `use crate::a as h; h::bump()` — `h` is not a filename leaf
+            # (#516 review).
+            imported = fn.local_imports.get(segs[0])
+            if imported is None:
+                imported = _lookup_import(
+                    imports_by_file.get(fn.file, {}), fn.inline_mods, segs[0]
+                )
+            if imported is not None:
+                module, fname = imported
+                resolved = module + (fname,) + segs[1:]
+                _gain_from(
+                    gained,
+                    keys_of,
+                    self_index,
+                    by_module.get(resolved, {}).get(m.group(2), []),
+                )
         leaf = segs[-1] if segs else None
         if leaf and leaf not in ("crate", "self", "super"):
             _gain_from(

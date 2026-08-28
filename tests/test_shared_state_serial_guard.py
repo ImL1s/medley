@@ -1169,6 +1169,85 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"uses_registered_counter_untagged"})
 
+    def test_super_path_to_inline_registered_static_is_a_touch(self):
+        """A static inside `mod tests` is owned by that inline module;
+        `super::COUNTER` from a nested module must still match (#516 review)."""
+
+        text = src(
+            """\
+            mod tests {
+                // SERIAL-GROUP: demo_key
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                mod inner {
+                    #[test]
+                    fn uses_super_counter_untagged() {
+                        super::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    fn also_uses_super_counter_untagged() {
+                        super::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        self.assertEqual(
+            names,
+            {
+                "uses_super_counter_untagged",
+                "also_uses_super_counter_untagged",
+            },
+        )
+
+    def test_imported_module_alias_qualified_call_reaches_registered_state(self):
+        """`use crate::a as h; h::bump()` must resolve through the alias
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    use crate::a as h;
+
+                    #[test]
+                    fn calls_aliased_module_untagged() {
+                        h::bump();
+                    }
+
+                    #[test]
+                    fn also_calls_aliased_module_untagged() {
+                        h::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(
+            names,
+            {
+                "calls_aliased_module_untagged",
+                "also_calls_aliased_module_untagged",
+            },
+        )
+
     def test_cross_file_call_into_inline_module_reaches_registered_state(self):
         sources = [
             (
