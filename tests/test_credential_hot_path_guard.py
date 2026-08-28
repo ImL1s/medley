@@ -404,6 +404,56 @@ def _simple_arm_accepts(matcher: str, invoke_inner: str) -> bool:
     return cursor == len(tokens)
 
 
+_ARM_METAVAR = re.compile(
+    r"\$([A-Za-z_][A-Za-z0-9_]*)(?::[A-Za-z_][A-Za-z0-9_]*)?"
+)
+_ARM_SUB = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _bind_simple_arm(matcher: str, invoke_inner: str) -> dict[str, str]:
+    """`$name` captures for the selected arm (#507 review)."""
+
+    inner = matcher.strip()
+    if len(inner) >= 2 and inner[0] in "([{" and inner[-1] in ")]}":
+        inner = inner[1:-1]
+    if "$" not in inner or re.search(r"\$\s*\(", inner):
+        return {}
+    names = _ARM_METAVAR.findall(inner)
+    parts = re.split(r"\$[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?", inner)
+    tokens = _ARM_TOKEN.findall(invoke_inner)
+    cursor = 0
+    bindings: dict[str, str] = {}
+    name_i = 0
+    for index, piece in enumerate(parts):
+        lits = _ARM_TOKEN.findall(piece)
+        for lit in lits:
+            if cursor >= len(tokens) or tokens[cursor] != lit:
+                return {}
+            cursor += 1
+        if index < len(parts) - 1:
+            if cursor >= len(tokens) or name_i >= len(names):
+                return {}
+            bindings[names[name_i]] = tokens[cursor]
+            name_i += 1
+            cursor += 1
+    if cursor != len(tokens):
+        return {}
+    return bindings
+
+
+def _substitute_arm_metavars(arm: str, bindings: dict[str, str]) -> str:
+    if not bindings:
+        return arm
+
+    def repl(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name == "crate":
+            return match.group(0)
+        return bindings.get(name, match.group(0))
+
+    return _ARM_SUB.sub(repl, arm)
+
+
 def _inactive_macro_spans(masked: str) -> list[tuple[int, int]]:
     """Spans rustc does not expand: uninvoked macros and unselected arms.
 
@@ -1016,7 +1066,10 @@ def _selected_arm_source(
             return None
         for matcher, arm_start, arm_end in arms:
             if _simple_arm_accepts(matcher, invoke_inner):
-                return masked[arm_start:arm_end]
+                arm = masked[arm_start:arm_end]
+                return _substitute_arm_metavars(
+                    arm, _bind_simple_arm(matcher, invoke_inner)
+                )
         return None
     return None
 
@@ -1216,6 +1269,9 @@ def _tests_in_file(
             _TEST_ATTR.match(masked_line)
         )
         enclosing_off = any(off for _, _, off in mod_stack)
+        line_cfg_off = enclosing_off or any(
+            _cfg_attr_is_inactive(a, enabled_features) for a in pending + attrs
+        )
 
         if has_test:
             all_attrs = pending + attrs
@@ -1274,9 +1330,11 @@ def _tests_in_file(
             and line_start <= invoke_at[invoke_i][0] <= invoke_end
         ):
             _pos, inv_name, inner = invoke_at[invoke_i]
+            invoke_i += 1
+            if line_cfg_off:
+                continue
             prefix = file_mods + [name for _, name, _ in mod_stack]
             invocations.append((inv_name, inner, prefix))
-            invoke_i += 1
 
         line = _strip_line_comment(brace_lines[i])
         if not remainder_masked.strip() or has_test:
@@ -2361,6 +2419,77 @@ class ExternalModulePrefix(unittest.TestCase):
             [],
         )
         self.assertEqual(names, ["none_auth_scheme_native"])
+
+    def test_macro_ident_metavar_is_substituted_before_scan(self):
+        """`fn $name` with `generated!(none_auth_scheme_generated)` is
+        that test, not an unmatched `$name` (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            generated!(none_auth_scheme_generated);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_generated"])
+
+    def test_cfg_disabled_macro_invoke_is_not_counted(self):
+        """`#[cfg(windows)] generated!();` on a non-Windows runner is
+        not expanded (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                () => {
+                    #[test]
+                    fn none_auth_scheme_generated() {}
+                };
+            }
+            #[cfg(windows)]
+            generated!();
+            #[test]
+            fn none_auth_scheme_live() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        if sys.platform == "win32":
+            self.assertEqual(
+                sorted(names),
+                ["none_auth_scheme_generated", "none_auth_scheme_live"],
+            )
+        else:
+            self.assertEqual(names, ["none_auth_scheme_live"])
+
+    def test_cfg_disabled_mod_macro_invoke_is_not_counted(self):
+        """An invocation inside `#[cfg(windows)] mod` is off on Linux
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                () => {
+                    #[test]
+                    fn none_auth_scheme_generated() {}
+                };
+            }
+            #[cfg(windows)]
+            mod none_auth_scheme_off {
+                generated!();
+            }
+            #[test]
+            fn none_auth_scheme_live() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        if sys.platform == "win32":
+            self.assertIn("none_auth_scheme_off::none_auth_scheme_generated", names)
+        else:
+            self.assertEqual(names, ["none_auth_scheme_live"])
 
     def test_uninvoked_macro_mod_is_not_followed(self):
         """`mod alias;` inside an uninvoked macro is not a live module
