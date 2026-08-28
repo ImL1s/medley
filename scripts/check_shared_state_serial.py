@@ -475,18 +475,18 @@ def _token_list(text: str) -> list[str]:
 
 
 _METAVAR = re.compile(
-    r"\$[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?"
+    r"\$[A-Za-z_][A-Za-z0-9_]*(?::(?P<kind>[A-Za-z_][A-Za-z0-9_]*))?"
 )
 
 
-def _matcher_parts(inner: str) -> list[str | None]:
-    """Literal tokens and `None` metavars in matcher order.
+def _matcher_parts(inner: str) -> list[tuple[str | None, str | None]]:
+    """(`literal`, None) or (None, fragment_kind) in matcher order.
 
-    `(clean $name:ident)` vs `(touch $name:ident)` are both arity 2; the
-    distinguishing tokens are the literals (#516 review).
+    `(clean $name:ident)` vs `(touch $name:ident)` share arity; literals
+    distinguish them. `$value:expr` is not a single token (#516 review).
     """
 
-    parts: list[str | None] = []
+    parts: list[tuple[str | None, str | None]] = []
     index = 0
     n = len(inner)
     while index < n:
@@ -495,41 +495,70 @@ def _matcher_parts(inner: str) -> list[str | None]:
             continue
         metavar = _METAVAR.match(inner, index)
         if metavar:
-            parts.append(None)
+            parts.append((None, metavar.group("kind") or "ident"))
             index = metavar.end()
             continue
         token = _TOKEN.match(inner, index)
         if token:
-            parts.append(token.group(0))
+            parts.append((token.group(0), None))
             index = token.end()
             continue
         index += 1
     return parts
 
 
+def _consume_fragment(
+    tokens: list[str], cursor: int, kind: str, next_literal: str | None
+) -> int | None:
+    if cursor >= len(tokens):
+        return None
+    if kind in {"ident", "lifetime", "literal", "tt"}:
+        return cursor + 1
+    depth = 0
+    index = cursor
+    while index < len(tokens):
+        token = tokens[index]
+        if depth == 0 and next_literal is not None and token == next_literal:
+            return index if index > cursor else None
+        if token in "([{":
+            depth += 1
+        elif token in ")]}" and depth:
+            depth -= 1
+        index += 1
+    if next_literal is None:
+        return index
+    return None
+
+
 def _matcher_matches_invoke(inner: str, invoke_inner: str) -> bool:
     parts = _matcher_parts(inner)
     tokens = _token_list(invoke_inner)
     cursor = 0
-    for part in parts:
-        if cursor >= len(tokens):
-            return False
-        if part is None:
+    for index, (literal, kind) in enumerate(parts):
+        if literal is not None:
+            if cursor >= len(tokens) or tokens[cursor] != literal:
+                return False
             cursor += 1
             continue
-        if tokens[cursor] != part:
+        next_literal = None
+        for later_literal, _later_kind in parts[index + 1 :]:
+            if later_literal is not None:
+                next_literal = later_literal
+                break
+        nxt = _consume_fragment(tokens, cursor, kind or "ident", next_literal)
+        if nxt is None:
             return False
-        cursor += 1
+        cursor = nxt
     return cursor == len(tokens)
 
 
 def _arm_accepts(matcher: str, invoke_inner: str, invoke_arity: int) -> bool:
     """True when this `macro_rules!` matcher would accept the invocation.
 
-    Literal arms (`(touch)` vs `(clean)`) compare tokens; `$name:ident`
-    arms match remaining literals then consume one token per metavar;
-    `$(...)*|+` arms accept any arity. First matching arm wins
-    (#516 review).
+    Literal arms (`(touch)` vs `(clean)`) compare tokens; metavariable
+    arms match remaining literals then consume a fragment (`ident` is one
+    token, `expr`/`ty`/`path` run to the next literal); `$(...)*|+` arms
+    accept any arity. First matching arm wins (#516 review).
     """
 
     if matcher == "*":
@@ -1126,6 +1155,44 @@ def _imports_outside_bodies(
     return scoped, globs
 
 
+def _block_end_containing(text: str, pos: int) -> int:
+    """Innermost `{ ... }` that still contains `pos`."""
+
+    best_start = -1
+    best_end = len(text)
+    index = 0
+    while index < pos:
+        if text[index] == "{":
+            end = _balanced_end(text, index)
+            if index < pos < end and index >= best_start:
+                best_start = index
+                best_end = end
+        index += 1
+    return best_end
+
+
+def _local_uses_from_body(
+    body: str,
+    file_mod: tuple[str, ...] | None,
+    inline_mods: tuple[str, ...],
+) -> tuple[tuple[int, int, str, tuple[str, ...], str], ...]:
+    """Function-local `use` bindings with the brace block they apply in.
+
+    A nested `{ use crate::b::bump; }` must not rewrite outer `bump()`
+    calls (#516 review).
+    """
+
+    out: list[tuple[int, int, str, tuple[str, ...], str]] = []
+    for pos, root, mid, fname, local in _iter_use_leaves(body):
+        if fname == "*":
+            continue
+        module = _use_module_prefix(root, mid, file_mod, inline_mods)
+        if module is None:
+            continue
+        out.append((pos, _block_end_containing(body, pos), local, module, fname))
+    return tuple(out)
+
+
 def _imports_in_span(
     bindings: list[_UseBinding], start: int, end: int
 ) -> tuple[dict[str, tuple[tuple[str, ...], str]], list[tuple[str, ...]]]:
@@ -1502,6 +1569,31 @@ class FnInfo:
         default_factory=dict
     )
     glob_modules: tuple[tuple[str, ...], ...] = ()
+    local_uses: tuple[tuple[int, int, str, tuple[str, ...], str], ...] = ()
+
+
+def _fn_import(
+    fn: FnInfo,
+    name: str,
+    call_pos: int,
+    imports_by_file: dict[
+        Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
+    ],
+) -> tuple[tuple[str, ...], str] | None:
+    """Resolve `name` at `call_pos` in `fn.body`, honoring nested blocks."""
+
+    hits = [
+        entry
+        for entry in fn.local_uses
+        if entry[2] == name and entry[0] <= call_pos < entry[1]
+    ]
+    if hits:
+        hits.sort(key=lambda entry: (entry[1], -entry[0]))
+        return hits[0][3], hits[0][4]
+    imported = fn.local_imports.get(name)
+    if imported is not None:
+        return imported
+    return _lookup_import(imports_by_file.get(fn.file, {}), fn.inline_mods, name)
 
 
 def _item_module(item: SharedItem) -> tuple[str, ...] | None:
@@ -2027,6 +2119,9 @@ def index_functions(
                     attrs_line=_line(raw, match.start()),
                     local_imports=local,
                     glob_modules=tuple(local_globs),
+                    local_uses=_local_uses_from_body(
+                        body_code, _module_path(rel), inline_mods
+                    ),
                 )
             )
         for match in MACRO_DEF.finditer(code):
@@ -2333,11 +2428,7 @@ def _resolve_calls(
                 break
             prefix = prefix[:-1]
         if not js:
-            imported = fn.local_imports.get(name)
-            if imported is None:
-                imported = _lookup_import(
-                    imports_by_file.get(fn.file, {}), fn.inline_mods, name
-                )
+            imported = _fn_import(fn, name, m.start(), imports_by_file)
             if imported is not None:
                 module, fname = imported
                 js = by_module.get(module, {}).get(fname, [])
@@ -2428,11 +2519,7 @@ def _resolve_calls(
         if segs and segs[0] not in ("crate", "self", "super"):
             # `use crate::a as h; h::bump()` — `h` is not a filename leaf
             # (#516 review).
-            imported = fn.local_imports.get(segs[0])
-            if imported is None:
-                imported = _lookup_import(
-                    imports_by_file.get(fn.file, {}), fn.inline_mods, segs[0]
-                )
+            imported = _fn_import(fn, segs[0], m.start(), imports_by_file)
             if imported is not None:
                 module, fname = imported
                 resolved = module + (fname,) + segs[1:]
@@ -2468,11 +2555,7 @@ def _resolve_calls(
         if type_name is None:
             continue
         if raw_type != "Self":
-            imported = fn.local_imports.get(raw_type)
-            if imported is None:
-                imported = _lookup_import(
-                    imports_by_file.get(fn.file, {}), fn.inline_mods, raw_type
-                )
+            imported = _fn_import(fn, raw_type, m.start(), imports_by_file)
             if imported is not None:
                 type_name = imported[1]
         _gain_from(
@@ -2482,11 +2565,7 @@ def _resolve_calls(
             by_type.get(type_name, {}).get(m.group(2), []),
         )
     for type_name, method in _ufcs_calls(fn.body):
-        imported = fn.local_imports.get(type_name)
-        if imported is None:
-            imported = _lookup_import(
-                imports_by_file.get(fn.file, {}), fn.inline_mods, type_name
-            )
+        imported = _fn_import(fn, type_name, 0, imports_by_file)
         if imported is not None:
             type_name = imported[1]
         _gain_from(

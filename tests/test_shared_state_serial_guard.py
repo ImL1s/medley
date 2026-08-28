@@ -1081,6 +1081,39 @@ class TransitiveClosure(unittest.TestCase):
         generated = {n for n in names if n.startswith("cases!")}
         self.assertEqual(len(generated), 2, names)
 
+    def test_macro_invoke_consumes_expr_fragments(self):
+        """`$value:expr` spans `1 + 2`, not one token (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($value:expr, touch) => {
+                    #[test]
+                    fn generated() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                        let _ = $value;
+                    }
+                };
+                ($value:expr, clean) => {
+                    #[test]
+                    fn generated() {
+                        let _ = $value;
+                    }
+                };
+            }
+
+            cases!(1 + 2, touch);
+            cases!(3 + 4, touch);
+            cases!(0, clean);
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+
     def test_same_named_macros_in_different_files_are_not_combined(self):
         """Invoking a local `cases!` must not inherit another file's
         touching template of the same name (#516 review)."""
@@ -1466,6 +1499,53 @@ class TransitiveClosure(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_a_untagged"})
+
+    def test_nested_block_use_does_not_shadow_outer_calls(self):
+        """Inner `{ use crate::b::bump }` must not rewrite outer `bump()`
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    pub fn bump() {}
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn calls_outer_untagged() {
+                        use crate::a::bump;
+                        bump();
+                        {
+                            use crate::b::bump;
+                            bump();
+                        }
+                        bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertIn("calls_outer_untagged", names)
 
     def test_reexported_function_resolves_through_the_exporting_module(self):
         """`pub use crate::a::bump` in `b.rs` must make `crate::b::bump()`
