@@ -3773,6 +3773,55 @@ class DefaultScanRoots(unittest.TestCase):
         names = {f.name for f in findings}
         self.assertEqual(names, {"support_toucher", "root_toucher"})
 
+    def test_path_attr_integration_module_shares_the_binary(self):
+        """`#[path = \"shared.rs\"] mod support;` in an integration root
+        compiles `shared.rs` into that binary (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/shared.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn path_toucher() {
+                        xai_grok_shell::bump();
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    #[path = "shared.rs"]
+                    mod support;
+
+                    #[test]
+                    fn root_toucher() {
+                        xai_grok_shell::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
+        self.assertEqual(errors, [])
+        names = {f.name for f in findings}
+        self.assertEqual(names, {"path_toucher", "root_toucher"})
+
     def test_src_bin_crate_qualified_call_reaches_registered_state(self):
         """`crate::bump()` in `src/bin/tool.rs` is that binary's crate
         root, not `bin::tool` (#516 review)."""

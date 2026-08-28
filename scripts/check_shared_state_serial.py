@@ -1914,6 +1914,29 @@ def _path_is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
+def _path_attr_files(declaring: Path, text: str) -> list[Path]:
+    """Files a `#[path = \"...\"] mod` on `declaring` actually compiles."""
+
+    code = _code_only(text)
+    out: list[Path] = []
+    for match in _PATH_MOD.finditer(text):
+        start = match.start()
+        if start < len(code) and code[start] == " " and text[start] != " ":
+            continue
+        out.append(Path(_norm_posix(declaring.parent / match.group(1))))
+    return out
+
+
+def _path_attr_covers(path: Path, target: Path) -> bool:
+    if _norm_posix(path) == _norm_posix(target):
+        return True
+    if target.name == "mod.rs":
+        return _path_is_relative_to(path, target.parent)
+    if not str(target).endswith(".rs"):
+        return _path_is_relative_to(path, target)
+    return False
+
+
 def _file_process_groups(
     sources: list[tuple[Path, str]],
 ) -> dict[Path, frozenset[str]]:
@@ -1921,6 +1944,8 @@ def _file_process_groups(
 
     `mod common;` in `tests/race.rs` compiles `tests/common/**` into the
     `race` binary, not a fictitious `tests/common` process (#516 review).
+    `#[path = "shared.rs"] mod support;` does the same for the path
+    target (#516 review).
     """
 
     text_of = dict(sources)
@@ -1942,6 +1967,32 @@ def _file_process_groups(
                     continue
                 if path == file_mod or _path_is_relative_to(path, dir_mod):
                     groups[path].add(group)
+        pending = [bin_path]
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            key = _norm_posix(current)
+            if key in seen:
+                continue
+            seen.add(key)
+            text = text_of.get(current)
+            if text is None:
+                for path, body in text_of.items():
+                    if _norm_posix(path) == key:
+                        text = body
+                        current = path
+                        break
+            if text is None:
+                continue
+            for target in _path_attr_files(current, text):
+                for path in groups:
+                    if path == current:
+                        continue
+                    if not _path_attr_covers(path, target):
+                        continue
+                    if group not in groups[path]:
+                        groups[path].add(group)
+                    pending.append(path)
     out: dict[Path, frozenset[str]] = {}
     for path, _text in sources:
         found = groups.get(path) or set()
