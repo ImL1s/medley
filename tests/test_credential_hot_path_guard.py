@@ -841,7 +841,7 @@ def _cargo_test_targets(
                     target = (crate / "tests" / f"{name}.rs").resolve()
                 if target is None:
                     continue
-                if table.get("test") is False:
+                if table.get("test") is False or table.get("harness") is False:
                     gated.add(target)
                     continue
                 extra_required = required_feats - default_feats
@@ -858,9 +858,10 @@ def _cargo_test_targets(
         lib_path: str | None = None
         required_feats: set[str] = set()
         test_enabled = True
+        harness_enabled = True
 
         def flush() -> None:
-            nonlocal name, path_s, required_feats, in_test, in_lib, lib_path, test_enabled
+            nonlocal name, path_s, required_feats, in_test, in_lib, lib_path, test_enabled, harness_enabled
             if in_lib and lib_path:
                 target = (crate / lib_path).resolve()
                 if target.is_file():
@@ -874,7 +875,7 @@ def _cargo_test_targets(
                     target = (crate / "tests" / f"{name}.rs").resolve()
                 if target is not None:
                     extra_required = required_feats - default_feats
-                    if not test_enabled:
+                    if not test_enabled or not harness_enabled:
                         gated.add(target)
                     elif extra_required:
                         gated.add(target)
@@ -885,6 +886,7 @@ def _cargo_test_targets(
             lib_path = None
             required_feats = set()
             test_enabled = True
+            harness_enabled = True
             in_test = False
             in_lib = False
 
@@ -921,6 +923,12 @@ def _cargo_test_targets(
                 continue
             if re.match(r"^test\s*=\s*true\b", stripped):
                 test_enabled = True
+                continue
+            if re.match(r"^harness\s*=\s*false\b", stripped):
+                harness_enabled = False
+                continue
+            if re.match(r"^harness\s*=\s*true\b", stripped):
+                harness_enabled = True
                 continue
             if stripped.startswith("required-features"):
                 inner = stripped.split("=", 1)[-1]
@@ -1104,15 +1112,23 @@ def _iter_module_decls(
     return decls
 
 
-def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
+def _declared_module_overrides(
+    root: Path,
+) -> dict[Path, list[tuple[list[str], str]]]:
     """Logical module prefixes for files reached via `mod` / `#[path]`.
 
     Ordinary `mod common;` from several integration roots counts once per
     target (#507 review). `#[path]` prefixes propagate into descendant
     `mod child;` files so Cargo's logical path is what the scan records.
+    Each occurrence carries the cargo target of the crate root that
+    imported it, so `tests/common/mod.rs` pulled in by
+    `--test shared_http_wire` is `test:shared_http_wire` not
+    `test:common` (#507 review).
     """
-    overrides: dict[Path, list[list[str]]] = {}
-    queue: deque[tuple[Path, tuple[str, ...], tuple[Path, ...], bool]] = deque()
+    overrides: dict[Path, list[tuple[list[str], str]]] = {}
+    queue: deque[
+        tuple[Path, tuple[str, ...], tuple[Path, ...], bool, str]
+    ] = deque()
     texts: dict[Path, str] = {}
 
     def read_rs(rs: Path) -> str | None:
@@ -1139,10 +1155,18 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
             if _is_cargo_crate_root_file(
                 rs, extra_roots, gated_roots, suppressed_libs, no_autotest
             ):
-                queue.append((rs.resolve(), (), (), True))
+                queue.append(
+                    (
+                        rs.resolve(),
+                        (),
+                        (),
+                        True,
+                        _cargo_target_of(rs, extra_roots),
+                    )
+                )
 
     while queue:
-        declaring, prefix, ancestors, as_crate_root = queue.popleft()
+        declaring, prefix, ancestors, as_crate_root, root_target = queue.popleft()
         if declaring in ancestors:
             continue
         text = read_rs(declaring)
@@ -1160,9 +1184,15 @@ def _declared_module_overrides(root: Path) -> dict[Path, list[list[str]]]:
             enabled_features=enabled,
         ):
             child_prefix = list(prefix) + list(inline_names) + [name]
-            overrides.setdefault(child, []).append(child_prefix)
+            overrides.setdefault(child, []).append((child_prefix, root_target))
             queue.append(
-                (child, tuple(child_prefix), ancestors + (declaring,), False)
+                (
+                    child,
+                    tuple(child_prefix),
+                    ancestors + (declaring,),
+                    False,
+                    root_target,
+                )
             )
     return overrides
 
@@ -1652,26 +1682,28 @@ def _module_prefixes_for_source(
     gated_roots: set[Path] | frozenset[Path] | None = None,
     suppressed_libs: set[Path] | frozenset[Path] | None = None,
     no_autotest: set[Path] | frozenset[Path] | None = None,
-) -> list[list[str]] | None:
+) -> list[tuple[list[str], str]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
     Cargo crate roots (`src/lib.rs`, `tests/*.rs`, explicit `[lib] path`
     / `[[test]] path`) are prefixless: libtest reports `fn`, not
     `file_stem::fn`. Nested files must appear in the module graph
     (#507 review); an orphan leftover after a `mod` was removed is not
-    compiled and must not inflate CLAUDE.md counts.
+    compiled and must not inflate CLAUDE.md counts. Each prefix is
+    paired with the cargo target of the crate root that compiled it
+    (#507 review).
     """
 
     key = rs.resolve()
-    prefixes: list[list[str]] = []
+    prefixes: list[tuple[list[str], str]] = []
     if key in overrides:
         prefixes.extend(overrides[key])
     if _is_cargo_crate_root_file(
         rs, extra_roots, gated_roots, suppressed_libs, no_autotest
     ):
-        root_prefix: list[str] = []
-        if root_prefix not in prefixes:
-            prefixes.append(root_prefix)
+        root_entry = ([], _cargo_target_of(rs, extra_roots))
+        if root_entry not in prefixes:
+            prefixes.append(root_entry)
     return prefixes or None
 
 
@@ -1717,8 +1749,7 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
             if prefix_lists is None:
                 continue
             pkg = _package_name_for(rs, pkg_cache)
-            target = _cargo_target_of(rs, extra_roots)
-            for file_mods in prefix_lists:
+            for file_mods, target in prefix_lists:
                 for name in _tests_in_file(text, file_mods, enabled):
                     records.append(_TestRecord(pkg, target, name))
     return records
@@ -1873,6 +1904,38 @@ class CiPackageTargetCounts(unittest.TestCase):
             self.assertEqual(
                 {(r.package, r.target) for r in matched},
                 {("xai-grok-sampler", "test:shared_http_wire")},
+            )
+
+    def test_imported_integration_module_keeps_the_root_target(self):
+        """`mod common;` from `--test shared_http_wire` compiles under
+        `test:shared_http_wire`, not `test:common` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            tests = crate / "tests"
+            (crate / "src").mkdir(parents=True)
+            (tests / "common").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "xai-grok-sampler"\n'
+            )
+            (crate / "src" / "lib.rs").write_text("")
+            (tests / "shared_http_wire.rs").write_text("mod common;\n")
+            (tests / "common" / "mod.rs").write_text(
+                "#[test]\nfn none_auth_scheme_from_common() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --test "
+                "shared_http_wire none_auth_scheme_ -- --nocapture\n"
+            )
+            records = _qualified_test_records(root)
+            scopes = _ci_scopes_for_pattern(
+                parse_workflow(wf, root=root), "none_auth_scheme_"
+            )
+            matched = _hot_path_matches(records, "none_auth_scheme_", scopes)
+            self.assertEqual(
+                [(r.target, r.name) for r in matched],
+                [("test:shared_http_wire", "common::none_auth_scheme_from_common")],
             )
 
     def test_pattern_without_a_ci_invocation_stays_repo_wide(self):
@@ -2216,6 +2279,35 @@ class ExternalModulePrefix(unittest.TestCase):
                 "#[test]\nfn none_auth_scheme_live() {}\n"
             )
             (tests / "off.rs").write_text(
+                "#[test]\nfn none_auth_scheme_off() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_live", names)
+            self.assertNotIn("none_auth_scheme_off", names)
+
+    def test_harness_false_target_is_not_counted(self):
+        """`[[test]] harness = false` is a binary, not libtest
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            tests = crate / "tests"
+            tests.mkdir(parents=True)
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+                "autotests = false\n\n"
+                "[[test]]\nname = \"off\"\n"
+                'path = "tests/off.rs"\n'
+                "harness = false\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[test]\nfn none_auth_scheme_live() {}\n"
+            )
+            (tests / "off.rs").write_text(
+                "fn main() {}\n"
                 "#[test]\nfn none_auth_scheme_off() {}\n"
             )
             names = _qualified_test_names(root)
