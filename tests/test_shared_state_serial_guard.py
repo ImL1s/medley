@@ -1259,6 +1259,102 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, set())
 
+    def test_use_without_access_is_not_a_touch(self):
+        """A function-local `use crate::a::COUNTER` is not a read
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn only_imports_untagged() {
+                        use crate::a::COUNTER;
+                    }
+
+                    #[test]
+                    fn also_only_imports_untagged() {
+                        use crate::a::COUNTER as C;
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, set())
+
+    def test_imported_module_alias_qualified_static_is_a_touch(self):
+        """`use crate::a as state; state::COUNTER` reaches the registered
+        static (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    use crate::a as state;
+
+                    #[test]
+                    fn uses_aliased_module_untagged() {
+                        state::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertIn("uses_aliased_module_untagged", names)
+
+    def test_macro_invoke_does_not_inherit_sibling_arm_keys(self):
+        """`act!(clean)` must not inherit a sibling `(touch)` arm
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! act {
+                (touch) => {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                };
+                (clean) => {};
+            }
+
+            #[test]
+            fn calls_clean_untagged() {
+                act!(clean);
+            }
+
+            #[test]
+            fn real_toucher() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        self.assertIn("real_toucher", names)
+        self.assertNotIn("calls_clean_untagged", names)
+
     def test_qualified_static_in_another_module_is_not_a_touch(self):
         """`crate::b::COUNTER` is not the registered `a::COUNTER`
         (#516 review)."""

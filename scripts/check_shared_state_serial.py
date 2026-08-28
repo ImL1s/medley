@@ -1574,6 +1574,7 @@ class FnInfo:
     )
     glob_modules: tuple[tuple[str, ...], ...] = ()
     local_uses: tuple[tuple[int, int, str, tuple[str, ...], str], ...] = ()
+    macro_arms: tuple[tuple[str, frozenset[str]], ...] = ()
 
 
 def _fn_import(
@@ -1638,6 +1639,36 @@ def _resolve_path_module(
     return base + segs
 
 
+def _mask_use_items(body: str) -> str:
+    """Blank `use ...;` so import paths are not direct touches (#516 review)."""
+
+    chars = list(body)
+    index = 0
+    n = len(body)
+    while index < n:
+        match = re.search(r"\buse\b", body[index:])
+        if match is None:
+            break
+        start = index + match.start()
+        depth = 0
+        cursor = start + 3
+        while cursor < n:
+            char = body[cursor]
+            if char in "{([":
+                depth += 1
+            elif char in "})]":
+                depth = max(0, depth - 1)
+            elif char == ";" and depth == 0:
+                cursor += 1
+                break
+            cursor += 1
+        for pos in range(start, cursor):
+            if chars[pos] != "\n":
+                chars[pos] = " "
+        index = cursor
+    return "".join(chars)
+
+
 def _body_touches(
     code_only_body: str,
     identifiers: tuple[str, ...],
@@ -1657,6 +1688,7 @@ def _body_touches(
     """
 
     del original
+    code_only_body = _mask_use_items(code_only_body)
     for ident in identifiers:
         pattern = re.compile(
             rf"(?:((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+))"
@@ -1670,6 +1702,16 @@ def _body_touches(
                     for part in (p.strip() for p in prefix_raw.split("::"))
                     if part.strip()
                 )
+                if scoped_imports is not None and segs:
+                    imported = _lookup_import(
+                        scoped_imports, inline_mods, segs[0]
+                    )
+                    if imported is not None:
+                        module, fname = imported
+                        resolved = module + (fname,) + segs[1:]
+                        if static_module is None or resolved == static_module:
+                            return True
+                        continue
                 if static_module is None:
                     return True
                 if _resolve_path_module(segs, fn_module, inline_mods) == static_module:
@@ -2158,7 +2200,26 @@ def index_functions(
             )
             raw_macro_body = raw[body_start:body_end]
             arm_list: list[_MacroArm] = []
+            arm_key_pairs: list[tuple[str, frozenset[str]]] = []
             for matcher, arm_body in _macro_rule_arms(raw_macro_body):
+                arm_code = _strip_turbofish(_code_only(arm_body))
+                arm_key_pairs.append(
+                    (
+                        matcher,
+                        frozenset(
+                            item.key
+                            for item in registry
+                            if _body_touches(
+                                arm_code,
+                                item.identifiers,
+                                original=item.identifiers,
+                                static_module=_item_module(item),
+                                fn_module=_module_path(rel),
+                                scoped_imports=file_imports,
+                            )
+                        ),
+                    )
+                )
                 serials_for_arm: list[tuple[frozenset[str], bool, bool, int]] = []
                 for held, unkeyed, in_repeat, test_body in _generated_test_templates_in_arm(
                     arm_body
@@ -2214,6 +2275,7 @@ def index_functions(
                     serial_held=frozenset(),
                     has_unkeyed_serial=False,
                     attrs_line=_line(raw, match.start()),
+                    macro_arms=tuple(arm_key_pairs),
                 )
             )
         scans.append((rel, raw, code, occupied, inline_spans))
@@ -2411,6 +2473,7 @@ def _resolve_calls(
     by_type: dict[str, dict[str, list[int]]],
     by_macro: dict[Path, dict[str, int]],
     by_macro_any: dict[str, list[int]],
+    by_macro_arms: dict[Path, dict[str, tuple[tuple[str, frozenset[str]], ...]]],
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]],
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
@@ -2451,8 +2514,21 @@ def _resolve_calls(
                 js.extend(by_module.get(module, {}).get(name, []))
         _gain_from(gained, keys_of, self_index, js)
     macro_index = by_macro.get(fn.file, {})
+    file_arms = by_macro_arms.get(fn.file, {})
     for m in MACRO_INVOKE.finditer(fn.body):
         name = m.group(1)
+        arms = file_arms.get(name)
+        if arms:
+            inner = _macro_invoke_inner(fn.body, m.end())
+            arity = _macro_invoke_arity(fn.body, m.end())
+            chosen: frozenset[str] | None = None
+            for matcher, arm_keys in arms:
+                if _arm_accepts(matcher, inner, arity):
+                    chosen = arm_keys
+                    break
+            if chosen is not None:
+                gained.update(chosen)
+                continue
         j = macro_index.get(name)
         if j is None:
             _gain_from(gained, keys_of, self_index, by_macro_any.get(name, []))
@@ -2605,11 +2681,14 @@ def analyze(
     by_type: dict[str, dict[str, list[int]]] = {}
     by_macro: dict[Path, dict[str, int]] = {}
     by_macro_any: dict[str, list[int]] = {}
+    by_macro_arms: dict[Path, dict[str, tuple[tuple[str, frozenset[str]], ...]]] = {}
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]] = {}
     for i, fn in enumerate(functions):
         if fn.is_macro:
             by_macro.setdefault(fn.file, {})[fn.name] = i
             by_macro_any.setdefault(fn.name, []).append(i)
+            if fn.macro_arms:
+                by_macro_arms.setdefault(fn.file, {})[fn.name] = fn.macro_arms
             continue
         by_file.setdefault(fn.file, {}).setdefault(fn.name, []).append(i)
         by_inline.setdefault((fn.file, fn.inline_mods), {}).setdefault(
@@ -2655,6 +2734,7 @@ def analyze(
                 by_type=by_type,
                 by_macro=by_macro,
                 by_macro_any=by_macro_any,
+                by_macro_arms=by_macro_arms,
                 by_inline=by_inline,
                 imports_by_file=imports_by_file,
                 globs_by_file=globs_by_file,
