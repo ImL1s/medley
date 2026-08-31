@@ -331,6 +331,34 @@ class SrcHasTests(unittest.TestCase):
             self.assertFalse(src_has_tests(integ))
             self.assertFalse(src_has_tests(comment))
 
+    def test_accepts_module_qualified_and_spaced_test_attributes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, attribute in {
+                "rstest": "#[rstest::test]",
+                "serial": "#[serial_test::test]",
+                "spaced_hash": "# [test]",
+                "spaced_path": "#[ tokio :: test ]",
+                "nested": "#[some :: deeply_nested :: test]",
+            }.items():
+                crate = _crate(root, rel, rel, f"{attribute}\nfn t() {{}}\n")
+                with self.subTest(attribute=attribute):
+                    self.assertTrue(src_has_tests(crate))
+
+    def test_comments_docs_and_strings_do_not_count_as_test_attributes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, source in {
+                "line_comment": "// #[rstest::test]\npub fn f() {}\n",
+                "doc_comment": "/// # [ serial_test :: test ]\npub fn f() {}\n",
+                "block_comment": "/* #[some::test] */\npub fn f() {}\n",
+                "string": 'const SPELLING: &str = "#[rstest::test]";\n',
+                "cfg": "#[cfg(test)]\npub fn f() {}\n",
+            }.items():
+                crate = _crate(root, rel, rel, source)
+                with self.subTest(source=source):
+                    self.assertFalse(src_has_tests(crate))
+
 
 class Evaluate(unittest.TestCase):
     def _tree(self) -> tempfile.TemporaryDirectory:

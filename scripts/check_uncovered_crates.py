@@ -7,8 +7,9 @@ see that: it only asks about newly added tests. This is the crate-level
 ratchet for that gap.
 
 Does not invoke cargo. A crate "has tests" when any `src/**/*.rs` line is a
-`#[test]` or `#[tokio::test]` attribute. It is "named" when a `run_nonzero` /
-`cargo test` line in `ci.yml` contains `-p <crate>`, `--package <crate>`, or
+`#[test]` attribute, optionally qualified by a module path. It is "named" when
+a `run_nonzero` / `cargo test` line in `ci.yml` contains `-p <crate>`,
+`--package <crate>`, or
 `--manifest-path .../<crate>/Cargo.toml`. A `cargo clippy` or `cargo build`
 mention of the same manifest path does NOT count (#437): clippy proves
 nothing about whether the crate's tests run, and crediting it let every test
@@ -38,7 +39,10 @@ from pathlib import Path
 # oldest copy received never reached the others (#494).
 from toml_package_name import package_name
 
-_TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test\b", re.MULTILINE)
+_TEST_ATTR = re.compile(
+    r"^\s*#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b",
+    re.MULTILINE,
+)
 _P_FLAG = re.compile(r"(?:^|[\s\\])(?:-p|--package)\s+([A-Za-z0-9][A-Za-z0-9_-]*)")
 _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
 # A line actually invokes the test binary. Same test as
