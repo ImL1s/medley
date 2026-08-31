@@ -130,6 +130,19 @@ pub enum AgentsModalOutcome {
         path: PathBuf,
         tab: AgentsTab,
     },
+    /// Reuse the provider-aware canonical `/model` picker. The rendered
+    /// generation is carried to the integration boundary so stale rows cannot
+    /// open a mutation surface after the agent/config snapshot changed.
+    OpenModelPicker {
+        intent: AgentModelPickerIntent,
+        generation: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentModelPickerIntent {
+    SessionOnly,
+    PersistentDefault,
 }
 /// User-level vs project-level config files (`~/.grok` vs `{cwd}/.grok`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1121,6 +1134,16 @@ fn build_agents_tab_shortcuts<'a>(state: &AgentsModalState) -> Vec<Shortcut<'a>>
         },
         Shortcut {
             label: "s default (persist)",
+            clickable: false,
+            id: 0,
+        },
+        Shortcut {
+            label: "m model (session)",
+            clickable: false,
+            id: 0,
+        },
+        Shortcut {
+            label: "M model (persist)",
             clickable: false,
             id: 0,
         },
@@ -2295,6 +2318,24 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
             }
             AgentsModalOutcome::Changed
         }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            let Some(entry) = state.agents.get(state.selected) else {
+                return AgentsModalOutcome::Unchanged;
+            };
+            if let Err(err) = admit_generation_bound_mutation(entry.generation, state.generation) {
+                state.message = Some(AgentsModalMessage::error(err.to_string()));
+                return AgentsModalOutcome::Changed;
+            }
+            let intent = if key.code == KeyCode::Char('m') {
+                AgentModelPickerIntent::SessionOnly
+            } else {
+                AgentModelPickerIntent::PersistentDefault
+            };
+            AgentsModalOutcome::OpenModelPicker {
+                intent,
+                generation: entry.generation,
+            }
+        }
         _ => AgentsModalOutcome::Unchanged,
     }
 }
@@ -2708,6 +2749,62 @@ mod tests {
             message.text
         );
         assert!(state.agents[0].enabled);
+    }
+    #[test]
+    fn model_picker_actions_are_generation_bound_and_persistence_explicit() {
+        let def = AgentDefinition::explore();
+        let mut state = make_persona_state(vec![], "", 0);
+        state.active_tab = AgentsTab::Agents;
+        state.agents = vec![AgentListEntry {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            scope: def.scope,
+            source_path: None,
+            enabled: true,
+            is_builtin: true,
+            expanded: false,
+            definition: def,
+            generation: 7,
+        }];
+        state.selected = 0;
+        state.generation = 7;
+
+        let session = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            session,
+            AgentsModalOutcome::OpenModelPicker {
+                intent: AgentModelPickerIntent::SessionOnly,
+                generation: 7,
+            }
+        ));
+
+        let persisted = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT),
+        );
+        assert!(matches!(
+            persisted,
+            AgentsModalOutcome::OpenModelPicker {
+                intent: AgentModelPickerIntent::PersistentDefault,
+                generation: 7,
+            }
+        ));
+
+        state.generation = 8;
+        let stale = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        );
+        assert!(matches!(stale, AgentsModalOutcome::Changed));
+        assert!(
+            state
+                .message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("stale generation"))
+        );
     }
     #[test]
     fn agents_tab_next_cycles() {

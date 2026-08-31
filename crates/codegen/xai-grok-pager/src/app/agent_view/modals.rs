@@ -74,6 +74,10 @@ impl AgentView {
                     refresh_agents_modal: Some(tab),
                 })
             }
+            crate::views::agents_modal::AgentsModalOutcome::OpenModelPicker {
+                intent,
+                generation,
+            } => self.open_model_picker_from_agents(intent, generation),
             crate::views::agents_modal::AgentsModalOutcome::Changed => InputOutcome::Changed,
             crate::views::agents_modal::AgentsModalOutcome::Unchanged => InputOutcome::Unchanged,
         }
@@ -103,13 +107,74 @@ impl AgentView {
             }
             crate::views::agents_modal::AgentsModalOutcome::ViewAgent { .. }
             | crate::views::agents_modal::AgentsModalOutcome::OpenPersonaDetail { .. }
-            | crate::views::agents_modal::AgentsModalOutcome::EditInEditor { .. } => {
+            | crate::views::agents_modal::AgentsModalOutcome::EditInEditor { .. }
+            | crate::views::agents_modal::AgentsModalOutcome::OpenModelPicker { .. } => {
                 // Mouse interactions don't trigger view/edit — ignore.
                 InputOutcome::Unchanged
             }
             crate::views::agents_modal::AgentsModalOutcome::Changed => InputOutcome::Changed,
             crate::views::agents_modal::AgentsModalOutcome::Unchanged => InputOutcome::Unchanged,
         }
+    }
+
+    fn open_model_picker_from_agents(
+        &mut self,
+        intent: crate::views::agents_modal::AgentModelPickerIntent,
+        rendered_generation: u64,
+    ) -> InputOutcome {
+        use crate::views::modal::{ActiveModal, ArgPickerCommitMode};
+
+        let Some(modal) = self.agents_modal.as_mut() else {
+            return InputOutcome::Unchanged;
+        };
+        if let Err(err) =
+            xai_grok_subagent_resolution::native_route::admit_generation_bound_mutation(
+                rendered_generation,
+                modal.generation,
+            )
+        {
+            modal.message = Some(crate::views::agents_modal::AgentsModalMessage::error(
+                err.to_string(),
+            ));
+            return InputOutcome::Changed;
+        }
+
+        let command = "model";
+        let Some(cmd) = self.prompt.slash_controller.registry().get(command) else {
+            modal.message = Some(crate::views::agents_modal::AgentsModalMessage::error(
+                "Canonical model picker is unavailable",
+            ));
+            return InputOutcome::Changed;
+        };
+        let ctx = self.prompt.slash_controller.app_ctx(&self.session.models);
+        let Some(items) = cmd.suggest_args(&ctx, "").filter(|items| !items.is_empty()) else {
+            modal.message = Some(crate::views::agents_modal::AgentsModalMessage::error(
+                "No selectable models are available",
+            ));
+            return InputOutcome::Changed;
+        };
+        let commit_mode = match intent {
+            crate::views::agents_modal::AgentModelPickerIntent::SessionOnly => {
+                ArgPickerCommitMode::ModelSessionOnly
+            }
+            crate::views::agents_modal::AgentModelPickerIntent::PersistentDefault => {
+                ArgPickerCommitMode::ModelPersistentDefault
+            }
+        };
+        let mut state = crate::views::picker::PickerState::input_active();
+        state.selected = crate::slash::command::ArgItem::preferred_index(&items);
+        self.agents_modal = None;
+        self.active_modal = Some(ActiveModal::ArgPicker {
+            command: command.to_string(),
+            commit_mode,
+            args_query: String::new(),
+            items: items.clone(),
+            original_items: items,
+            state,
+            previous_palette: None,
+            window: crate::views::modal_window::ModalWindowState::new(),
+        });
+        InputOutcome::Changed
     }
 
     // -- Persona detail modal input handling --

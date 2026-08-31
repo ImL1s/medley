@@ -189,6 +189,10 @@ pub enum ActiveModal {
     ArgPicker {
         /// Command name (e.g., "model", "theme").
         command: String,
+        /// How accepting an argument should be committed. Model-policy entry
+        /// points use this to make session-only versus persisted-default
+        /// intent explicit without duplicating the canonical `/model` picker.
+        commit_mode: ArgPickerCommitMode,
         /// Args query passed to `suggest_args` (empty = first phase; for `/model`,
         /// a trailing-space query enters the reasoning-effort sub-menu).
         args_query: String,
@@ -316,6 +320,54 @@ pub enum ActiveModal {
         /// different note's review modal.
         rewrite_nonce: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArgPickerCommitMode {
+    #[default]
+    CommandDefault,
+    ModelSessionOnly,
+    ModelPersistentDefault,
+}
+
+impl ArgPickerCommitMode {
+    pub fn command_suffix(self) -> &'static str {
+        match self {
+            Self::ModelSessionOnly => " --session",
+            Self::CommandDefault | Self::ModelPersistentDefault => "",
+        }
+    }
+
+    pub fn allows_chained_args(self) -> bool {
+        matches!(self, Self::CommandDefault)
+    }
+
+    pub fn slash_command(self, command: &str, argument: &str) -> String {
+        format!(
+            "/{command} {}{}",
+            argument.trim_end(),
+            self.command_suffix()
+        )
+    }
+}
+
+#[cfg(test)]
+mod arg_picker_commit_mode_tests {
+    use super::ArgPickerCommitMode;
+
+    #[test]
+    fn model_policy_commit_modes_are_persistence_explicit() {
+        assert_eq!(
+            ArgPickerCommitMode::ModelSessionOnly.slash_command("model", "catalog-id "),
+            "/model catalog-id --session"
+        );
+        assert_eq!(
+            ArgPickerCommitMode::ModelPersistentDefault.slash_command("model", "catalog-id "),
+            "/model catalog-id"
+        );
+        assert!(!ArgPickerCommitMode::ModelSessionOnly.allows_chained_args());
+        assert!(!ArgPickerCommitMode::ModelPersistentDefault.allows_chained_args());
+    }
 }
 /// Snapshot of the command palette state, saved when opening an arg picker
 /// and restored on Esc.
@@ -664,10 +716,17 @@ impl ActiveModal {
             ActiveModal::ArgPicker {
                 command,
                 args_query,
+                commit_mode,
                 ..
             } => match command.as_str() {
                 "model" | "m" if !args_query.is_empty() => "Pick reasoning effort",
-                "model" | "m" => "Pick model",
+                "model" | "m" => match commit_mode {
+                    ArgPickerCommitMode::ModelSessionOnly => "Pick model — this session only",
+                    ArgPickerCommitMode::ModelPersistentDefault => {
+                        "Pick model — persist as default"
+                    }
+                    ArgPickerCommitMode::CommandDefault => "Pick model",
+                },
                 "theme" | "t" => "Pick theme",
                 _ => "Pick option",
             },

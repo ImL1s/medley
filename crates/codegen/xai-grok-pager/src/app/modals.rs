@@ -550,10 +550,11 @@ impl AgentView {
             BlockedToast(String),
         }
 
-        let (command_clone, in_effort_phase, entry_count, non_sel, non_sel_clickable) =
+        let (command_clone, commit_mode, in_effort_phase, entry_count, non_sel, non_sel_clickable) =
             match self.active_modal.as_ref() {
                 Some(ActiveModal::ArgPicker {
                     command,
+                    commit_mode,
                     args_query,
                     items,
                     ..
@@ -563,6 +564,7 @@ impl AgentView {
                     let non_sel_clickable = non_sel.clone();
                     (
                         command.clone(),
+                        *commit_mode,
                         !args_query.is_empty(),
                         items.len(),
                         non_sel,
@@ -682,7 +684,8 @@ impl AgentView {
                 InputOutcome::Changed
             }
             ArgPickerStep::Selected(item) => {
-                let chains_to_effort = matches!(command_clone.as_str(), "model" | "m")
+                let chains_to_effort = commit_mode.allows_chained_args()
+                    && matches!(command_clone.as_str(), "model" | "m")
                     && item.insert_text.ends_with(char::is_whitespace);
                 if chains_to_effort {
                     let next_query = item.insert_text.clone();
@@ -709,7 +712,7 @@ impl AgentView {
                         }
                     }
                 }
-                let full = format!("/{} {}", command_clone, item.insert_text.trim_end());
+                let full = commit_mode.slash_command(&command_clone, &item.insert_text);
                 self.active_modal = None;
                 InputOutcome::Action(Action::SendSlashCommandPreservingDraft(full))
             }
@@ -941,6 +944,7 @@ impl AgentView {
                                             crate::slash::command::ArgItem::preferred_index(&items);
                                         self.active_modal = Some(ActiveModal::ArgPicker {
                                             command: trimmed,
+                                            commit_mode: crate::views::modal::ArgPickerCommitMode::CommandDefault,
                                             args_query: String::new(),
                                             items: items.clone(),
                                             original_items: items,
@@ -1796,6 +1800,7 @@ impl AgentView {
                 }
             } else if let modal::ActiveModal::ArgPicker {
                 command,
+                commit_mode,
                 args_query,
                 items,
                 state,
@@ -1806,7 +1811,15 @@ impl AgentView {
                 // Arg picker: ModalWindow chrome + picker content.
                 let title = match command.as_str() {
                     "model" | "m" if !args_query.is_empty() => "Pick reasoning effort",
-                    "model" | "m" => "Pick model",
+                    "model" | "m" => match commit_mode {
+                        modal::ArgPickerCommitMode::ModelSessionOnly => {
+                            "Pick model — this session only"
+                        }
+                        modal::ArgPickerCommitMode::ModelPersistentDefault => {
+                            "Pick model — persist as default"
+                        }
+                        modal::ArgPickerCommitMode::CommandDefault => "Pick model",
+                    },
                     "theme" | "t" => "Pick theme",
                     _ => "Pick option",
                 };
