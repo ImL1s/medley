@@ -340,6 +340,7 @@ class SrcHasTests(unittest.TestCase):
                 "spaced_hash": "# [test]",
                 "spaced_path": "#[ tokio :: test ]",
                 "nested": "#[some :: deeply_nested :: test]",
+                "absolute": "#[::tokio::test]",
             }.items():
                 crate = _crate(root, rel, rel, f"{attribute}\nfn t() {{}}\n")
                 with self.subTest(attribute=attribute):
@@ -353,11 +354,34 @@ class SrcHasTests(unittest.TestCase):
                 "doc_comment": "/// # [ serial_test :: test ]\npub fn f() {}\n",
                 "block_comment": "/* #[some::test] */\npub fn f() {}\n",
                 "string": 'const SPELLING: &str = "#[rstest::test]";\n',
+                "multiline_block_comment": (
+                    "/* example only:\n#[some::test]\nfn sample() {}\n*/\n"
+                ),
+                "nested_block_comment": (
+                    "/* outer\n/* nested */\n#[some::test]\n*/\npub fn f() {}\n"
+                ),
+                "raw_multiline_string": (
+                    'const EXAMPLE: &str = r##"\n#[some::test]\nfn sample() {}\n"##;\n'
+                ),
+                "multiline_string": (
+                    'const EXAMPLE: &str = "example\n#[some::test]\nstill text";\n'
+                ),
                 "cfg": "#[cfg(test)]\npub fn f() {}\n",
             }.items():
                 crate = _crate(root, rel, rel, source)
                 with self.subTest(source=source):
                     self.assertFalse(src_has_tests(crate))
+
+    def test_real_attribute_after_multiline_non_code_still_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = (
+                'const EXAMPLE: &str = r#"\n#[some::test]\n"#;\n'
+                "/* another fake:\n#[serial_test::test]\n*/\n"
+                "#[::tokio::test]\nasync fn real_test() {}\n"
+            )
+            crate = _crate(root, "real_after_masked", "real_after_masked", source)
+            self.assertTrue(src_has_tests(crate))
 
 
 class Evaluate(unittest.TestCase):
