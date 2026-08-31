@@ -354,6 +354,32 @@ class DirectReference(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
 
+    def test_composite_cfg_attr_test_is_a_test(self):
+        """`#[cfg_attr(all(test, unix), test)]` is a harness test on
+        Unix CI (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[cfg_attr(all(test, unix), test)]
+            fn first_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[cfg_attr(all(test, unix), test)]
+            fn second_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        if sys.platform == "win32":
+            self.assertEqual(names, set())
+        else:
+            self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_unrelated_test_is_not_a_finding(self):
         findings = guard.scan_source(DIRECT_TOUCH)
         names = {f.name for f in findings}
@@ -5042,6 +5068,46 @@ class DefaultScanRoots(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_integration_local_static_does_not_inherit_library_key(self):
+        """Bare COUNTER in `tests/*.rs` is that target's static, not the
+        library crate-root static of the same name (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: lib_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: int_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    #[test]
+                    fn first_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        self.assertEqual(derived_names(sources, "lib_key"), set())
+        self.assertEqual(
+            derived_names(sources, "int_key"),
+            {"first_untagged", "second_untagged"},
+        )
 
     def test_integration_support_module_helper_reaches_registered_state(self):
         """`common::helper()` in `tests/*.rs` must resolve helpers under

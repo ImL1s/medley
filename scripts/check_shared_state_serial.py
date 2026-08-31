@@ -1078,6 +1078,84 @@ def _preceding_attributes(source: str, code: str, position: int) -> list[str]:
     return attrs
 
 
+def _split_top_level(inner: str, sep: str = ",") -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, char in enumerate(inner):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        elif char == sep and depth == 0:
+            parts.append(inner[start:i].strip())
+            start = i + 1
+    tail = inner[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _cfg_atom_active(atom: str) -> bool | None:
+    atom = atom.strip()
+    if atom in {"test", "true"}:
+        return True
+    if atom == "false":
+        return False
+    if atom == "unix":
+        return sys.platform != "win32"
+    if atom == "windows":
+        return sys.platform == "win32"
+    if atom == "macos":
+        return sys.platform == "darwin"
+    if atom == "linux":
+        return sys.platform.startswith("linux")
+    return None
+
+
+def _cfg_pred_active(expr: str) -> bool | None:
+    expr = expr.strip()
+    for kind in ("not", "all", "any"):
+        prefix = f"{kind}("
+        if expr.startswith(prefix) and expr.endswith(")"):
+            inner = expr[len(prefix) : -1]
+            if kind == "not":
+                value = _cfg_pred_active(inner)
+                return None if value is None else (not value)
+            values = [_cfg_pred_active(part) for part in _split_top_level(inner)]
+            if kind == "all":
+                if any(value is False for value in values):
+                    return False
+                if any(value is None for value in values):
+                    return None
+                return True
+            if any(value is True for value in values):
+                return True
+            if any(value is None for value in values):
+                return None
+            return False
+    return _cfg_atom_active(expr)
+
+
+def _cfg_attr_emits_test(attr: str) -> bool:
+    """True when `#[cfg_attr(pred, … test)]` is a harness test here."""
+
+    match = re.match(r"#\[\s*cfg_attr\s*\((.*)\)\s*\]\s*$", attr.strip(), re.DOTALL)
+    if match is None:
+        return False
+    parts = _split_top_level(match.group(1))
+    if len(parts) < 2:
+        return False
+    if _cfg_pred_active(parts[0]) is not True:
+        return False
+    for piece in parts[1:]:
+        if re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test", piece):
+            return True
+        if piece.startswith("cfg_attr(") and _cfg_attr_emits_test(f"#[{piece}]"):
+            return True
+    return False
+
+
 def _is_test_attr(attr: str) -> bool:
     stripped = attr.strip()
     if TEST_ATTR.match(stripped) is not None:
@@ -1085,15 +1163,9 @@ def _is_test_attr(attr: str) -> bool:
     # `#[$attr] fn $name()` — the invocation supplies `test` (#516 review).
     if re.match(r"#\s*\[\s*\$", stripped) is not None:
         return True
-    # `#[cfg_attr(test, test)]` / `#[cfg_attr(test, tokio::test)]` is a
-    # live test under `cargo test` (#516 review).
-    return (
-        re.search(
-            r"cfg_attr\s*\(\s*test\s*,\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b",
-            stripped,
-        )
-        is not None
-    )
+    # `#[cfg_attr(test, test)]` and `#[cfg_attr(all(test, unix), test)]`
+    # are harness tests when the predicate is on (#516 review).
+    return _cfg_attr_emits_test(stripped)
 
 
 def _serial_keys(attr: str) -> tuple[str, ...] | None:
@@ -1982,6 +2054,19 @@ def _is_integration_target(path: Path) -> bool:
     return "src" not in parts and len(parts) >= 2 and parts[-2] == "tests"
 
 
+def _same_process(
+    file_groups: dict[Path, frozenset[str]],
+    fn_file: Path,
+    item_file: Path,
+) -> bool:
+    """True when `fn_file` and `item_file` share a Cargo test process."""
+
+    return bool(
+        file_groups.get(fn_file, frozenset({_process_group(fn_file)}))
+        & file_groups.get(item_file, frozenset({_process_group(item_file)}))
+    )
+
+
 def _process_group(path: Path) -> str:
     parts = path.parts
     if "tests" in parts and "src" not in parts:
@@ -2611,12 +2696,15 @@ def _body_touches(
     scoped_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     | None = None,
     local_uses: tuple[tuple[int, int, str, tuple[str, ...], str], ...] = (),
+    same_process: bool = True,
 ) -> bool:
     """True if `code_only_body` names this registered static.
 
     Bare names keep the fail-closed whole-word match. Qualified paths
     (`crate::b::COUNTER`) only match a static whose module is `b`, not a
-    same-named `a::COUNTER` (#516 review).
+    same-named `a::COUNTER` (#516 review). A bare name in a different
+    Cargo test process is that target's own item, not the library's
+    crate-root static of the same identifier (#516 review).
     """
 
     original_names = frozenset(original or identifiers)
@@ -2677,6 +2765,8 @@ def _body_touches(
                     ):
                         continue
             elif ident not in original_names:
+                continue
+            if not same_process:
                 continue
             return True
     return False
@@ -3050,6 +3140,7 @@ def index_functions(
 ]:
     _load_path_overrides(sources)
     _load_reexports(sources)
+    file_groups = _file_process_groups(sources)
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
     generated_by_macro: dict[tuple[Path, str], list[_MacroArm]] = {}
@@ -3135,6 +3226,7 @@ def index_functions(
                     inline_mods=inline_mods,
                     scoped_imports=file_imports,
                     local_uses=local_uses,
+                    same_process=_same_process(file_groups, rel, item.file),
                 )
             )
             type_name = None
@@ -3204,6 +3296,7 @@ def index_functions(
                     static_module=_item_module(item),
                     fn_module=_module_path(rel),
                     scoped_imports=file_imports,
+                    same_process=_same_process(file_groups, rel, item.file),
                 )
             )
             raw_macro_body = raw[body_start:body_end]
@@ -3242,6 +3335,7 @@ def index_functions(
                         inline_mods=macro_inline_mods,
                         scoped_imports=file_imports,
                         local_uses=arm_local_uses,
+                        same_process=_same_process(file_groups, rel, item.file),
                     )
                 )
                 arm_index = len(out)
@@ -3282,6 +3376,7 @@ def index_functions(
                             static_module=_item_module(item),
                             fn_module=_module_path(rel),
                             scoped_imports=file_imports,
+                            same_process=_same_process(file_groups, rel, item.file),
                         )
                     )
                     template_index = len(out)
@@ -4043,6 +4138,9 @@ def analyze(
                     fn_module=_module_path(pending.file),
                     inline_mods=pending.inline_mods,
                     scoped_imports=imports_by_file.get(pending.file, {}),
+                    same_process=_same_process(
+                        file_groups, pending.file, item.file
+                    ),
                 ):
                     keys = keys | {item.key}
         if not keys:
