@@ -4711,6 +4711,104 @@ class TypeAssociatedResolution(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(findings, [])
 
+    def test_cfg_disabled_helper_does_not_taint_active_twin(self):
+        """`#[cfg(windows)] fn helper()` must not tag unix tests that
+        call the clean `#[cfg(unix)]` twin (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[cfg(windows)]
+            fn helper() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[cfg(unix)]
+            fn helper() {}
+
+            #[test]
+            fn first_untagged() {
+                helper();
+            }
+
+            #[test]
+            fn second_untagged() {
+                helper();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        if sys.platform == "win32":
+            self.assertEqual(names, {"first_untagged", "second_untagged"})
+        else:
+            self.assertEqual(names, set())
+
+    def test_local_closure_binding_shadows_module_helper(self):
+        """`let helper = || {}; helper();` must not inherit the module
+        helper's keys (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn helper() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn first_untagged() {
+                let helper = || {};
+                helper();
+            }
+
+            #[test]
+            fn second_untagged() {
+                let helper = || {};
+                helper();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, set())
+
+    def test_nested_block_let_does_not_shadow_outer_calls(self):
+        """`{ let helper = || {}; } helper();` still reaches the module
+        function (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn helper() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn first_untagged() {
+                {
+                    let helper = || {};
+                    helper();
+                }
+                helper();
+            }
+
+            #[test]
+            fn second_untagged() {
+                {
+                    let helper = || {};
+                    helper();
+                }
+                helper();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_unicode_qualified_static_path_is_a_touch(self):
         """`xai_grok_shell::動作::COUNTER` is the library static
         (#516 review)."""

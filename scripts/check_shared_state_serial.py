@@ -287,6 +287,11 @@ RUST_IDENT = re.compile(RUST_IDENT_BODY)
 FREE_CALL = re.compile(
     rf"(?<![:.\w])(?:r#)?((?:[a-z_]|[^\W\dA-Z_])(?:\w|[^\x00-\x7f\s])*)\s*\("
 )
+# `let helper = || {}` / `let helper: fn() = …` bind a value that shadows
+# a same-named module function for later bare calls (#516 review).
+_LET_BINDING = re.compile(
+    rf"\blet\s+(?:mut\s+)?(?:r#)?({RUST_IDENT_BODY})\s*(?::|=)"
+)
 USE_PLAIN = re.compile(
     r"\buse\s+(crate|super|self)((?:::(?:r#)?[A-Za-z_][A-Za-z0-9_]*)+)"
     r"(?:\s+as\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*))?\s*;"
@@ -2076,6 +2081,80 @@ def _block_span_containing(text: str, pos: int) -> tuple[int, int]:
     return (best_start + 1 if best_start >= 0 else 0), best_end
 
 
+def _let_follows_if_or_while(text: str, let_pos: int) -> bool:
+    """True for `if let` / `while let`, which are not value bindings."""
+
+    index = let_pos
+    while index > 0 and text[index - 1].isspace():
+        index -= 1
+    for kw in ("if", "while"):
+        start = index - len(kw)
+        if start >= 0 and text[start:index] == kw:
+            before = start - 1
+            if before < 0 or not (text[before].isalnum() or text[before] == "_"):
+                return True
+    return False
+
+
+def _statement_end(source: str, start: int) -> int | None:
+    """Index just after the terminating `;` at depth 0, or None."""
+
+    stack: list[str] = []
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    index = start
+    n = len(source)
+    while index < n:
+        comment_end = _skip_comment(source, index)
+        if comment_end is not None:
+            index = comment_end
+            continue
+        raw_end = _skip_raw_string(source, index)
+        if raw_end is not None:
+            index = raw_end
+            continue
+        char = source[index]
+        if char == '"':
+            index = _skip_quoted(source, index, char)
+            continue
+        if char == "'" and (char_end := _skip_char_literal(source, index)) is not None:
+            index = char_end
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+            index += 1
+            continue
+        if stack and char == stack[-1]:
+            stack.pop()
+            index += 1
+            continue
+        if char == ";" and not stack:
+            return index + 1
+        index += 1
+    return None
+
+
+def _local_value_binding_shadows(body: str, name: str, pos: int) -> bool:
+    """True when a `let name = …` / `let name: …` is in scope at `pos`.
+
+    Visibility starts after the statement, matching Rust. A nested
+    `{ let helper = || {}; }` must not rewrite outer `helper()` calls
+    (#516 review).
+    """
+
+    for match in _LET_BINDING.finditer(body):
+        if match.group(1) != name:
+            continue
+        if _let_follows_if_or_while(body, match.start()):
+            continue
+        stmt_end = _statement_end(body, match.end())
+        if stmt_end is None or pos < stmt_end:
+            continue
+        _start, block_end = _block_span_containing(body, match.start())
+        if pos < block_end:
+            return True
+    return False
+
+
 def _local_uses_from_body(
     body: str,
     file_mod: tuple[str, ...] | None,
@@ -3660,13 +3739,17 @@ def index_functions(
                     trait_name = trname
                     break
             attrs = _preceding_attributes(raw, code, match.start())
-            is_test = (
-                any(_is_test_attr(a) for a in attrs)
-                and not any(_attr_cfg_inactive(a) for a in attrs)
-                and not _enclosing_module_cfg_inactive(
+            cfg_inactive = any(_attr_cfg_inactive(a) for a in attrs) or (
+                _enclosing_module_cfg_inactive(
                     raw, code, inline_spans, match.start()
                 )
             )
+            is_test = any(_is_test_attr(a) for a in attrs) and not cfg_inactive
+            # Cfg-off helpers stay out of the call graph so a
+            # `#[cfg(windows)] fn helper` cannot taint the unix twin
+            # (#516 review). Cfg-off tests are already not harness tests.
+            if cfg_inactive:
+                continue
             serial_held: set[str] = set()
             has_unkeyed = False
             for a in attrs:
@@ -4147,9 +4230,12 @@ def _resolve_calls(
     for m in FREE_CALL.finditer(fn.body):
         # Resolve a bare call inside the caller's inline module first, then
         # ancestors. File-wide last-definition lookup lets `mod b { fn bump }`
-        # steal `mod a { bump() }` (#516 review). Same-scope cfg twins are
-        # all kept; callers union their keys (#516 review).
+        # steal `mod a { bump() }` (#516 review). Cfg-inactive same-name
+        # helpers are omitted at index time so they cannot taint the live
+        # twin (#516 review).
         name = m.group(1)
+        if _local_value_binding_shadows(fn.body, name, m.start()):
+            continue
         js: list[int] = []
         local_named = [
             entry
