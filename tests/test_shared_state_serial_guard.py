@@ -6741,6 +6741,73 @@ class DefaultScanRoots(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(findings, [])
 
+    def test_test_const_fn_is_a_harness_member(self):
+        """`#[test] const fn` still belongs to the preceding test attr
+        (#516 review). `FN_DEF` starts at `fn`, so attributes must be
+        collected from before `const`."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    #[test]
+                    const fn first_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    const fn second_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_src_main_unit_tests_do_not_race_library_unit_tests(self):
+        """`src/main.rs` is its own test process, not the library
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    #[test]
+                    fn lib_toucher() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/main.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    #[test]
+                    fn main_toucher() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
+        self.assertEqual(errors, [])
+        self.assertEqual(findings, [])
+
     def test_aliased_macro_invoke_reaches_registered_state(self):
         """`use crate::act as do_it; do_it!()` is `act!` (#516 review)."""
 

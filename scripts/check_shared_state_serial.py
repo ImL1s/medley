@@ -2454,6 +2454,12 @@ def _process_group(path: Path) -> str:
     stem = _src_bin_target_stem(path)
     if stem is not None:
         return f"bin:{_crate_of(path)}/src/bin/{stem}"
+    if "src" in parts:
+        segs = list(parts[parts.index("src") + 1 :])
+        # Cargo builds `src/main.rs` unit tests as a binary crate, not
+        # the library, even when `src/lib.rs` exists (#516 review).
+        if segs == ["main.rs"]:
+            return f"bin:{_crate_of(path)}/src/main"
     return f"lib:{_crate_of(path)}"
 
 
@@ -4023,7 +4029,9 @@ def index_functions(
                     type_name = tname
                     trait_name = trname
                     break
-            attrs = _preceding_attributes(raw, code, match.start())
+            attrs = _preceding_attributes(
+                raw, code, _position_before_vis(code, match.start())
+            )
             cfg_inactive = any(_attr_cfg_inactive(a) for a in attrs) or (
                 _enclosing_module_cfg_inactive(
                     raw, code, inline_spans, match.start()
