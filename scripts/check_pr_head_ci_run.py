@@ -139,30 +139,127 @@ def load_pr_head(repo: str, pr_number: int) -> tuple[str, str, str]:
 
 
 def list_pr_commit_shas(repo: str, pr_number: int) -> list[str]:
-    endpoint = f"repos/{repo}/pulls/{pr_number}/commits?per_page=100"
-    pages = gh_paginated_json(endpoint)
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError as exc:
+        raise CiHeadGateError("repository must use OWNER/REPO form") from exc
+    if not _printable_label(owner) or not _printable_label(name) or "/" in name:
+        raise CiHeadGateError("repository must use OWNER/REPO form")
+
+    # The REST `pulls/{number}/commits` endpoint has a hard 250-commit cap even
+    # when pagination is requested. The GraphQL commits connection is cursor
+    # paginated, so large synchronization PRs still include their current head.
+    query = """
+query($owner:String!,$name:String!,$number:Int!,$endCursor:String) {
+  repository(owner:$owner,name:$name) {
+    pullRequest(number:$number) {
+      commits(first:100,after:$endCursor) {
+        totalCount
+        nodes { commit { oid } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""".strip()
+    result = run_command(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "--paginate",
+            "--slurp",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={pr_number}",
+            "-f",
+            f"query={query}",
+        ]
+    )
+    try:
+        pages = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CiHeadGateError(
+            "`gh api graphql --paginate --slurp` did not return valid JSON"
+        ) from exc
     if not isinstance(pages, list):
-        raise CiHeadGateError("PR commits API returned a non-array page list")
+        raise CiHeadGateError("PR commits GraphQL API returned a non-array page list")
+    if not pages:
+        raise CiHeadGateError("PR commits GraphQL API returned no pages")
 
     shas: list[str] = []
     seen: set[str] = set()
-    for page in pages:
-        if not isinstance(page, list):
-            raise CiHeadGateError("PR commits API returned a non-array page")
-        for row in page:
-            if not isinstance(row, dict):
-                raise CiHeadGateError("PR commits API returned a non-object commit")
-            sha = row.get("sha")
+    total_count: int | None = None
+    for page_index, page in enumerate(pages):
+        try:
+            pull_request = page["data"]["repository"]["pullRequest"]
+            connection = pull_request["commits"]
+            nodes = connection["nodes"]
+            page_info = connection["pageInfo"]
+            page_total = connection["totalCount"]
+        except (KeyError, TypeError) as exc:
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned a malformed page"
+            ) from exc
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise CiHeadGateError("PR commits GraphQL API returned a malformed page")
+        if (
+            not isinstance(page_total, int)
+            or isinstance(page_total, bool)
+            or page_total < 0
+        ):
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned a malformed totalCount"
+            )
+        if total_count is None:
+            total_count = page_total
+        elif page_total != total_count:
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned inconsistent totalCount values"
+            )
+        has_next_page = page_info.get("hasNextPage")
+        end_cursor = page_info.get("endCursor")
+        if not isinstance(has_next_page, bool):
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned malformed pageInfo"
+            )
+        is_last_page = page_index == len(pages) - 1
+        if has_next_page == is_last_page:
+            raise CiHeadGateError(
+                "PR commits GraphQL pagination ended at an inconsistent page"
+            )
+        if has_next_page and not _printable_label(end_cursor):
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned a malformed endCursor"
+            )
+        for row in nodes:
+            if not isinstance(row, dict) or not isinstance(row.get("commit"), dict):
+                raise CiHeadGateError(
+                    "PR commits GraphQL API returned a non-object commit"
+                )
+            sha = row["commit"].get("oid")
             if not isinstance(sha, str) or not _is_sha(sha):
-                raise CiHeadGateError("PR commits API returned a malformed commit SHA")
+                raise CiHeadGateError(
+                    "PR commits GraphQL API returned a malformed commit SHA"
+                )
             sha = sha.lower()
             if sha in seen:
-                raise CiHeadGateError(f"PR commits API repeated commit SHA {sha}")
+                raise CiHeadGateError(
+                    f"PR commits GraphQL API repeated commit SHA {sha}"
+                )
             seen.add(sha)
             shas.append(sha)
 
     if not shas:
-        raise CiHeadGateError("PR commits API returned no commits")
+        raise CiHeadGateError("PR commits GraphQL API returned no commits")
+    if total_count != len(shas):
+        raise CiHeadGateError(
+            "PR commits GraphQL totalCount does not match the paginated commits "
+            f"({total_count} != {len(shas)})"
+        )
     return shas
 
 

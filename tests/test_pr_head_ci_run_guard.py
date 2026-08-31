@@ -660,6 +660,40 @@ class PrHeadHistoryReportTests(unittest.TestCase):
                         }
                     ),
                 )
+            if command[:5] == ["gh", "api", "graphql", "--paginate", "--slurp"]:
+                pages = responses.get("pr_commits")
+                if pages is None:
+                    raise AssertionError("unexpected GraphQL PR commits request")
+                total_count = sum(len(page) for page in pages)
+                wrapped = []
+                for index, page in enumerate(pages):
+                    has_next_page = index < len(pages) - 1
+                    wrapped.append(
+                        {
+                            "data": {
+                                "repository": {
+                                    "pullRequest": {
+                                        "commits": {
+                                            "totalCount": total_count,
+                                            "nodes": [
+                                                {"commit": {"oid": row["sha"]}}
+                                                for row in page
+                                            ],
+                                            "pageInfo": {
+                                                "hasNextPage": has_next_page,
+                                                "endCursor": (
+                                                    f"cursor-{index}"
+                                                    if has_next_page
+                                                    else None
+                                                ),
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    )
+                return completed(command, stdout=json.dumps(wrapped))
             if command[:4] != ["gh", "api", "--paginate", "--slurp"]:
                 raise AssertionError(f"unexpected command: {command}")
             endpoint = command[4]
@@ -669,11 +703,34 @@ class PrHeadHistoryReportTests(unittest.TestCase):
 
         return fake_run
 
+    def test_commit_history_uses_graphql_connection_beyond_rest_cap(self) -> None:
+        shas = [f"{index:040x}" for index in range(1, 252)]
+        responses = {
+            "pr_commits": [
+                [{"sha": sha} for sha in shas[:100]],
+                [{"sha": sha} for sha in shas[100:200]],
+                [{"sha": sha} for sha in shas[200:]],
+            ]
+        }
+        commands: list[list[str]] = []
+
+        def recording_api(command, **kwargs):
+            commands.append(command)
+            return self.fake_api(responses)(command, **kwargs)
+
+        with mock.patch.object(guard.subprocess, "run", side_effect=recording_api):
+            actual = guard.list_pr_commit_shas("ImL1s/medley", 506)
+
+        self.assertEqual(actual, shas)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][:5], ["gh", "api", "graphql", "--paginate", "--slurp"])
+        self.assertNotIn("pulls/506/commits", " ".join(commands[0]))
+
     def test_report_distinguishes_cancelled_queued_and_success_without_blocking(
         self,
     ) -> None:
         responses = {
-            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+            "pr_commits": [
                 [{"sha": self.SHA_1}, {"sha": self.SHA_2}]
             ],
             (
@@ -735,7 +792,7 @@ class PrHeadHistoryReportTests(unittest.TestCase):
 
     def test_report_paginates_and_shows_superseded_rerun_attempts(self) -> None:
         responses = {
-            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+            "pr_commits": [
                 [{"sha": self.SHA_1}],
                 [{"sha": self.SHA_2}],
             ],
@@ -789,7 +846,7 @@ class PrHeadHistoryReportTests(unittest.TestCase):
         self,
     ) -> None:
         responses = {
-            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+            "pr_commits": [
                 [{"sha": self.SHA_2}]
             ],
             (
@@ -845,7 +902,7 @@ class PrHeadHistoryReportTests(unittest.TestCase):
         for bad_row in bad_rows:
             with self.subTest(row=bad_row):
                 responses = {
-                    "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+                    "pr_commits": [
                         [{"sha": self.SHA_2}]
                     ],
                     (
@@ -867,7 +924,7 @@ class PrHeadHistoryReportTests(unittest.TestCase):
 
     def test_report_rejects_check_run_for_a_different_head(self) -> None:
         responses = {
-            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+            "pr_commits": [
                 [{"sha": self.SHA_2}]
             ],
             (
@@ -892,7 +949,7 @@ class PrHeadHistoryReportTests(unittest.TestCase):
 
     def test_report_rejects_commit_pages_that_omit_the_current_head(self) -> None:
         responses = {
-            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+            "pr_commits": [
                 [{"sha": self.SHA_1}]
             ]
         }
