@@ -2828,6 +2828,14 @@ def rust_files(scan_root: Path) -> list[Path]:
                     by_posix,
                 )
             )
+        for invoke_pos, mod_name in _mods_from_invoked_macros(code):
+            pending.extend(
+                _declared_mod_files(
+                    _mod_search_dir_for(current, code, invoke_pos),
+                    mod_name,
+                    by_posix,
+                )
+            )
         for target in _path_attr_files(current, text):
             pending.extend(
                 path
@@ -2835,6 +2843,52 @@ def rust_files(scan_root: Path) -> list[Path]:
                 if _path_attr_covers(path, target)
             )
     return sorted(reachable)
+
+
+def _mods_from_invoked_macros(code: str) -> list[tuple[int, str]]:
+    """`(invoke_pos, mod_name)` for `suite!();` → `mod generated;` (#516).
+
+    `mod` declarations inside uninvoked `macro_rules!` bodies are ignored by
+    the ordinary walk; an invoked arm that emits `mod child;` still compiles
+    `child.rs`, so reachable-source collection must follow it.
+    """
+
+    defs: dict[str, list[tuple[str, str]]] = {}
+    for match in MACRO_DEF.finditer(code):
+        body = _macro_body(code, match.end())
+        if body is None:
+            continue
+        name = match.group("name")
+        if name.startswith("r#"):
+            name = name[2:]
+        defs[name] = _macro_rule_arms(code[body[0] : body[1]])
+    out: list[tuple[int, str]] = []
+    for match in _macro_invoke_matches(code):
+        name = match.group(2)
+        if name.startswith("r#"):
+            name = name[2:]
+        arms = defs.get(name)
+        if not arms:
+            continue
+        bang_end = match.end()
+        inner = _macro_invoke_inner(code, bang_end)
+        arity = _macro_invoke_arity(code, bang_end)
+        arm_body = next(
+            (
+                body
+                for matcher, body in arms
+                if _arm_accepts(matcher, inner, arity)
+            ),
+            None,
+        )
+        if arm_body is None:
+            continue
+        nested_macro_spans = _macro_def_spans(arm_body)
+        for mod_match in _MOD_DECL.finditer(arm_body):
+            if _in_spans(mod_match.start(), nested_macro_spans):
+                continue
+            out.append((match.start(), mod_match.group(1)))
+    return out
 
 
 def collect_sources(

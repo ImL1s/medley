@@ -6589,6 +6589,28 @@ class DefaultScanRoots(unittest.TestCase):
                 ["src/lib.rs"],
             )
 
+    def test_invoked_macro_mod_is_collected(self):
+        """`suite!();` expanding to `mod generated;` compiles
+        `generated.rs` (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            src_dir.mkdir()
+            (src_dir / "lib.rs").write_text(
+                "macro_rules! suite { () => { mod generated; }; }\n"
+                "suite!();\n",
+                encoding="utf-8",
+            )
+            (src_dir / "generated.rs").write_text(
+                "pub fn x() {}\n", encoding="utf-8"
+            )
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                sorted(path.as_posix() for path, _text in sources),
+                ["src/generated.rs", "src/lib.rs"],
+            )
+
     def test_file_module_children_live_in_the_stem_directory(self):
         """`mod bar;` in `src/foo.rs` loads `src/foo/bar.rs`, not
         `src/bar.rs` (#516 review)."""
