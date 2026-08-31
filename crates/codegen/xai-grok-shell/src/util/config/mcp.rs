@@ -803,12 +803,28 @@ async fn mutate_toml_table<R>(
     f: impl FnOnce(&mut TomlMap<String, TomlValue>) -> Result<R>,
 ) -> Result<Option<(bool, R)>> {
     let is_user = path == config_path().as_path();
-    let guard = if is_user {
-        Some(super::persist::lock_config_writes().await?)
+    let user_guard;
+    let project_lock;
+    let dest;
+    if is_user {
+        let guard = super::persist::lock_config_writes().await?;
+        dest = guard.dest.clone();
+        user_guard = Some(guard);
+        project_lock = None;
     } else {
-        None
-    };
-    let io_path = guard.as_ref().map(|g| g.dest.as_path()).unwrap_or(path);
+        user_guard = None;
+        let path_owned = path.to_path_buf();
+        let (os, pinned) = tokio::task::spawn_blocking(move || {
+            xai_grok_config::fs_atomic::lock_config_destination(&path_owned)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to lock {}: {e}", path.display()))?
+        .map_err(|e| anyhow::anyhow!("failed to lock {}: {e}", path.display()))?;
+        project_lock = Some(os);
+        dest = pinned;
+    }
+    let _held = (user_guard, project_lock);
+    let io_path = dest.as_path();
 
     let original = match tokio::fs::read_to_string(io_path).await {
         Ok(s) => s,
@@ -3024,6 +3040,26 @@ enabled = false
             !after.contains("issue532_lock_mcp_svc"),
             "delete must drop the server on dest: {after}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_mcp_mutations_pin_symlink_dest_before_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _real_dir = tempfile::tempdir().unwrap();
+        let target = _real_dir.path().join("config.toml");
+        std::fs::write(&target, "").unwrap();
+        let logical = tmp.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &logical).unwrap();
+        save_mcp_server_config_at(&logical, "proj_symlink_svc", &sample_stdio_server())
+            .await
+            .unwrap();
+        assert!(
+            logical.symlink_metadata().unwrap().file_type().is_symlink(),
+            "project config.toml must remain a symlink"
+        );
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert!(body.contains("proj_symlink_svc"), "{body}");
     }
 
     #[tokio::test]

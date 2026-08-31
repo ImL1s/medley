@@ -1081,6 +1081,10 @@ jobs:
             user_mcp_config_mutations_lock_and_follow_symlink_dest -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             append_marketplace_source_skips_duplicate_identity -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            atomic_write_string_creates_temp_with_destination_mode -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            project_mcp_mutations_pin_symlink_dest_before_read -- --nocapture
 
       - name: Restricted subagent capability boundaries
         run: |

@@ -56,32 +56,7 @@ async fn save_config_locked(config: &Config, dest: &std::path::Path) -> Result<(
     if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    #[cfg(unix)]
-    let prior_mode: Option<u32> = match tokio::fs::metadata(&dest).await {
-        Ok(m) => {
-            use std::os::unix::fs::PermissionsExt;
-            Some(m.permissions().mode())
-        }
-        Err(_) => None,
-    };
-    #[cfg(not(unix))]
-    let prior_mode: Option<u32> = None;
-    let suffix = {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("toml.tmp.{}.{}", std::process::id(), nanos)
-    };
-    let tmp = dest.with_extension(suffix);
-    tokio::fs::write(&tmp, toml_str).await?;
-    #[cfg(unix)]
-    if let Some(mode) = prior_mode {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await;
-    }
-    let _ = prior_mode;
-    tokio::fs::rename(&tmp, &dest).await?;
+    xai_grok_config::fs_atomic::write_atomically(dest, &toml_str, destination_unix_mode(dest))?;
     Ok(())
 }
 /// Acquire the `config.toml` write lock used by [`save_config`], so callers that
@@ -110,43 +85,30 @@ pub(crate) fn read_to_string_or_empty(path: &std::path::Path) -> std::io::Result
         Err(e) => Err(e),
     }
 }
+fn destination_unix_mode(path: &std::path::Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Atomic write via temp file + `rename` (mirrors [`save_config`]) so a crash
-/// mid-write can't truncate `config.toml`. Preserves the dest mode on unix.
+/// mid-write can't truncate `config.toml`. On Unix the temp file is created
+/// with the destination mode so credentials are never briefly world-readable.
 pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     let dest = xai_grok_config::fs_atomic::resolve_write_path(path)?;
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    #[cfg(unix)]
-    let prior_mode: Option<u32> = match std::fs::metadata(path) {
-        Ok(m) => {
-            use std::os::unix::fs::PermissionsExt;
-            Some(m.permissions().mode())
-        }
-        Err(_) => None,
-    };
-    #[cfg(not(unix))]
-    let prior_mode: Option<u32> = None;
-    let suffix = {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("toml.tmp.{}.{}", std::process::id(), nanos)
-    };
-    let tmp = dest.with_extension(suffix);
-    std::fs::write(&tmp, content)?;
-    #[cfg(unix)]
-    if let Some(mode) = prior_mode {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-    }
-    let _ = prior_mode;
-    if let Err(e) = std::fs::rename(&tmp, &dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    xai_grok_config::fs_atomic::write_atomically(&dest, content, destination_unix_mode(&dest))
 }
 /// Merge `[toolset.ask_user_question]` into the root table. `[toolset]` is
 /// deliberately NOT merged wholesale — it carries runtime-only structs
@@ -467,6 +429,25 @@ mod tests {
         merge_section(&mut table, "ui", &cfg);
         let ui = table.get("ui").unwrap().as_table().unwrap();
         assert_eq!(ui.get("yolo").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_string_creates_temp_with_destination_mode() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, "old = true\n").unwrap();
+        atomic_write_string(&path, "new = true\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "destination mode must survive the replace");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new = true\n");
     }
     /// Regression test: pager-side commits of a
     /// [session] field (e.g., `auto_compact_threshold_percent`) must
