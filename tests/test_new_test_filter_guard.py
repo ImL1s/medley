@@ -8,6 +8,8 @@ counted as a test when its attribute was already there, and a module-path
 filter that cannot match a bare function name.
 """
 
+import contextlib
+import io
 import re
 import subprocess
 import sys
@@ -15,6 +17,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
@@ -70,6 +73,119 @@ class ParseWorkflowFeatures(unittest.TestCase):
         self.assertEqual(
             parse_workflow(wf), {"xai-grok-auth": {"lib": {"credential"}}}
         )
+
+
+class FilterCoverageMain(unittest.TestCase):
+    def _run_main(
+        self,
+        workflow: str,
+        *args: str,
+        listed: object = None,
+    ) -> tuple[int, list[tuple[str, frozenset[str]]], str, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Cargo.toml").write_text(
+                "[workspace]\nmembers = []\n", encoding="utf-8"
+            )
+            workflow_path = root / "ci.yml"
+            workflow_path.write_text(workflow, encoding="utf-8")
+            calls: list[tuple[str, frozenset[str]]] = []
+
+            def fake_list(crate, _root, features=frozenset()):
+                calls.append((crate, features))
+                return listed if listed is not None else ["tests::covered"]
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            argv = [
+                "check_test_filter_coverage.py",
+                "--workflow",
+                str(workflow_path),
+                "--root",
+                str(root),
+                *args,
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(coverage, "list_tests", side_effect=fake_list),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = coverage.main()
+            return result, calls, stdout.getvalue(), stderr.getvalue()
+
+    def test_no_lane_defers_without_starting_cargo(self):
+        result, calls, stdout, stderr = self._run_main(
+            "run_nonzero -p lane-crate --lib covered -- --nocapture\n",
+            "--crate",
+            "no-lane-crate",
+        )
+        self.assertEqual(result, 0, stdout + stderr)
+        self.assertEqual(calls, [])
+        self.assertIn("deferring to check_uncovered_crates.py (#280)", stdout)
+
+    def test_lane_keeps_default_and_non_default_feature_listings_separate(self):
+        result, calls, stdout, stderr = self._run_main(
+            "run_nonzero -p lane-crate --features alpha,beta --lib covered -- --nocapture\n",
+            "--crate",
+            "lane-crate",
+        )
+        self.assertEqual(result, 0, stdout + stderr)
+        self.assertEqual(
+            calls,
+            [
+                ("lane-crate", frozenset()),
+                ("lane-crate", frozenset({"alpha", "beta"})),
+            ],
+        )
+
+    def test_required_lane_listing_failure_still_returns_two(self):
+        result, calls, stdout, stderr = self._run_main(
+            "run_nonzero -p lane-crate --lib covered -- --nocapture\n",
+            "--crate",
+            "lane-crate",
+            listed=coverage.LISTING_FAILED,
+        )
+        self.assertEqual(calls, [("lane-crate", frozenset())])
+        self.assertEqual(result, 2, stdout + stderr)
+        self.assertIn("could not list tests for 1 crate(s): lane-crate", stderr)
+
+    def test_no_lane_list_from_and_baseline_remain_delegated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp) / "captures"
+            capture_dir.mkdir()
+            baseline = Path(tmp) / "baseline"
+            baseline.write_text("no-lane-crate::old::test\n", encoding="utf-8")
+            result, calls, stdout, stderr = self._run_main(
+                "run_nonzero -p lane-crate --lib covered -- --nocapture\n",
+                "--crate",
+                "no-lane-crate",
+                "--list-from",
+                str(capture_dir),
+                "--baseline",
+                str(baseline),
+            )
+        self.assertEqual(result, 0, stdout + stderr)
+        self.assertEqual(calls, [])
+        self.assertNotIn("no captured list", stderr)
+        self.assertNotIn("stale", stdout + stderr)
+        self.assertIn("deferring to check_uncovered_crates.py (#280)", stdout)
+
+    def test_write_baseline_does_not_capture_no_lane_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "baseline"
+            result, calls, stdout, stderr = self._run_main(
+                "run_nonzero -p lane-crate --lib covered -- --nocapture\n",
+                "--crate",
+                "no-lane-crate",
+                "--write-baseline",
+                str(output),
+            )
+            written = output.read_text(encoding="utf-8")
+        self.assertEqual(result, 0, stdout + stderr)
+        self.assertEqual(calls, [])
+        self.assertNotIn("no-lane-crate::", written)
+        self.assertIn("wrote 0 entries", stdout)
 
 
 class ParseWorkflow(unittest.TestCase):
@@ -291,6 +407,39 @@ class ParseWorkflowRealCorpus(unittest.TestCase):
 
     def test_the_corpus_is_not_empty(self):
         self.assertGreater(len(self.real_crates), 20, self.real_crates)
+
+    def test_filter_coverage_plans_only_the_42_lane_feature_graphs(self):
+        """Pin #524's command-count oracle without claiming wall-clock speed."""
+        _flat, by_features, _lanes = _parse_workflow(self.text, root=REPO)
+        members = workspace_members(REPO)
+        lane_crates = members & set(by_features)
+        no_lane_crates = members - set(by_features)
+        calls: list[tuple[str, frozenset[str]]] = []
+
+        def fake_list(crate, _root, features=frozenset()):
+            calls.append((crate, features))
+            return []
+
+        argv = [
+            "check_test_filter_coverage.py",
+            "--workflow",
+            str(REPO / ".github" / "workflows" / "ci.yml"),
+            "--root",
+            str(REPO),
+        ]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(coverage, "list_tests", side_effect=fake_list),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = coverage.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(lane_crates), 39, sorted(lane_crates))
+        self.assertEqual(len(no_lane_crates), 42, sorted(no_lane_crates))
+        self.assertEqual(len(calls), 42, calls)
+        self.assertEqual(len(set(calls)), 42, calls)
+        self.assertTrue(all(crate not in no_lane_crates for crate, _ in calls))
 
     def test_every_real_invocation_crate_is_recognised(self):
         parsed_lanes = parse_workflow_lanes(self.text, root=REPO)
