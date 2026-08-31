@@ -1040,7 +1040,7 @@ fn add_marketplace_source(
         marketplace["official_marketplace_auto_installed"] = toml_edit::value(true);
     }
 
-    crate::util::config::atomic_write_string(config_path, &doc.to_string())
+    crate::util::config::atomic_write_string_at(config_path, &doc.to_string())
 }
 
 /// Remove a marketplace source from `~/.grok/config.toml` and uninstall all
@@ -1117,7 +1117,7 @@ fn remove_source_locked(
         } else {
             removed
         };
-        if let Err(e) = crate::util::config::atomic_write_string(config_path, &final_content) {
+        if let Err(e) = crate::util::config::atomic_write_string_at(config_path, &final_content) {
             return ActionOutcome {
                 status: OutcomeStatus::InternalError,
                 message: format!("Failed to write config: {e}"),
@@ -1196,7 +1196,7 @@ fn set_marketplace_bool_flag(config_path: &std::path::Path, key: &str) -> std::i
     }
     let existing = crate::util::config::read_to_string_or_empty(config_path)?;
     let updated = set_marketplace_bool_flag_in_toml(&existing, key)?;
-    crate::util::config::atomic_write_string(config_path, &updated)
+    crate::util::config::atomic_write_string_at(config_path, &updated)
 }
 
 fn read_marketplace_bool_flag(config_path: &std::path::Path, key: &str) -> bool {

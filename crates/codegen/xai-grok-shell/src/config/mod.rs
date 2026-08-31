@@ -2007,7 +2007,7 @@ fn mutate_config_toml_file(
     if !f(&mut config)? {
         return Ok(());
     }
-    crate::util::config::atomic_write_string(&dest, &toml::to_string_pretty(&config)?)?;
+    crate::util::config::atomic_write_string_at(&dest, &toml::to_string_pretty(&config)?)?;
     Ok(())
 }
 

@@ -105,10 +105,16 @@ fn destination_unix_mode(path: &std::path::Path) -> Option<u32> {
 /// with the destination mode so credentials are never briefly world-readable.
 pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     let dest = xai_grok_config::fs_atomic::resolve_write_path(path)?;
-    if let Some(parent) = dest.parent() {
+    atomic_write_string_at(&dest, content)
+}
+
+/// Like [`atomic_write_string`], but writes `path` verbatim (no canonicalize).
+/// Callers that already pinned a destination must use this.
+pub(crate) fn atomic_write_string_at(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    xai_grok_config::fs_atomic::write_atomically_at(&dest, content, destination_unix_mode(&dest))
+    xai_grok_config::fs_atomic::write_atomically_at(path, content, destination_unix_mode(path))
 }
 /// Merge `[toolset.ask_user_question]` into the root table. `[toolset]` is
 /// deliberately NOT merged wholesale — it carries runtime-only structs
@@ -448,6 +454,25 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "destination mode must survive the replace");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new = true\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_string_at_keeps_pinned_destination_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("config.toml");
+        let other = dir.path().join("other.toml");
+        std::fs::write(&dest, "orig\n").unwrap();
+        std::fs::write(&other, "other\n").unwrap();
+        std::fs::remove_file(&dest).unwrap();
+        std::os::unix::fs::symlink(&other, &dest).unwrap();
+        atomic_write_string_at(&dest, "pinned = true\n").unwrap();
+        assert!(
+            !dest.symlink_metadata().unwrap().file_type().is_symlink(),
+            "verbatim write must not follow a dest replaced with a symlink"
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "pinned = true\n");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "other\n");
     }
     /// Regression test: pager-side commits of a
     /// [session] field (e.g., `auto_compact_threshold_percent`) must

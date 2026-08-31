@@ -868,7 +868,7 @@ async fn mutate_toml_table<R>(
     if before == toml_str {
         return Ok(Some((false, value)));
     }
-    super::persist::atomic_write_string(io_path, &toml_str)
+    super::persist::atomic_write_string_at(io_path, &toml_str)
         .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", io_path.display()))?;
     Ok(Some((true, value)))
 }

@@ -1081,6 +1081,8 @@ jobs:
             read_config_text_propagates_unreadable_file -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             write_config_toml_keeps_pinned_destination_verbatim -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            atomic_write_string_at_keeps_pinned_destination_verbatim -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             new_loads_toggle_under_the_same_lock_as_the_snapshot -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
