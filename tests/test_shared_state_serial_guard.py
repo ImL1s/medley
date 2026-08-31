@@ -1250,6 +1250,35 @@ class TransitiveClosure(unittest.TestCase):
             "two generated tests must not collapse into a sole-member exemption",
         )
 
+    def test_trailing_optional_comma_repetition_still_expands(self):
+        """`$($name:ident),* $(,)?` must accept `cases!(one, two)`
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($($name:ident),* $(,)?) => {
+                    $(
+                        #[test]
+                        fn $name() {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    )*
+                };
+            }
+
+            cases!(one, two);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+        findings = guard.scan_source(text)
+        self.assertGreaterEqual(len(findings), 1, findings)
+
     def test_repeated_macro_args_with_semicolon_separator_are_distinct(self):
         """`cases!(one; two)` with `$($name:ident);*` is two tests
         (#516 review)."""

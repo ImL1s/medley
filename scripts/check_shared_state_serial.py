@@ -778,10 +778,21 @@ def _parse_repetition(inner: str) -> tuple[str, str, str] | None:
     if end <= index + 1:
         return None
     body = text[index + 1 : end - 1]
-    rest = text[end:].strip()
-    if not rest or rest[-1] not in "*+?":
+    rest = text[end:].lstrip()
+    # Sole-repetition matchers are `$(body)sep*`. Trailing material after
+    # the operator — especially another `$(,)?` — must not be swallowed as
+    # separator text; fall through so `_matcher_named_parts` can parse
+    # each repetition separately (#516 review).
+    cursor = 0
+    while cursor < len(rest) and rest[cursor] not in "*+?$":
+        cursor += 1
+    if cursor >= len(rest) or rest[cursor] not in "*+?":
         return None
-    return body, rest[:-1].strip(), rest[-1]
+    sep = rest[:cursor].strip()
+    op = rest[cursor]
+    if rest[cursor + 1 :].strip():
+        return None
+    return body, sep, op
 
 
 def _repetition_matches(body: str, sep: str, rep: str, invoke_inner: str) -> bool:
