@@ -2765,6 +2765,17 @@ def _file_process_groups(
                     if group not in groups[path]:
                         groups[path].add(group)
                     pending.append(path)
+            for invoke_pos, mod_name in _mods_from_invoked_macros(code, text):
+                for path in _declared_mod_files(
+                    _mod_search_dir_for(current, code, invoke_pos),
+                    mod_name,
+                    by_posix,
+                ):
+                    if path == current:
+                        continue
+                    if group not in groups[path]:
+                        groups[path].add(group)
+                    pending.append(path)
             for target in _path_attr_files(current, text):
                 for path in groups:
                     if path == current:
@@ -2828,7 +2839,7 @@ def rust_files(scan_root: Path) -> list[Path]:
                     by_posix,
                 )
             )
-        for invoke_pos, mod_name in _mods_from_invoked_macros(code):
+        for invoke_pos, mod_name in _mods_from_invoked_macros(code, text):
             pending.extend(
                 _declared_mod_files(
                     _mod_search_dir_for(current, code, invoke_pos),
@@ -2845,7 +2856,9 @@ def rust_files(scan_root: Path) -> list[Path]:
     return sorted(reachable)
 
 
-def _mods_from_invoked_macros(code: str) -> list[tuple[int, str]]:
+def _mods_from_invoked_macros(
+    code: str, text: str | None = None
+) -> list[tuple[int, str]]:
     """`(invoke_pos, mod_name)` for `suite!();` → `mod generated;` (#516).
 
     `mod` declarations inside uninvoked `macro_rules!` bodies are ignored by
@@ -2862,8 +2875,11 @@ def _mods_from_invoked_macros(code: str) -> list[tuple[int, str]]:
         if name.startswith("r#"):
             name = name[2:]
         defs[name] = _macro_rule_arms(code[body[0] : body[1]])
+    def_spans = _macro_def_spans(code)
     out: list[tuple[int, str]] = []
     for match in _macro_invoke_matches(code):
+        if _in_spans(match.start(), def_spans):
+            continue
         name = match.group(2)
         if name.startswith("r#"):
             name = name[2:]
@@ -2873,20 +2889,33 @@ def _mods_from_invoked_macros(code: str) -> list[tuple[int, str]]:
         bang_end = match.end()
         inner = _macro_invoke_inner(code, bang_end)
         arity = _macro_invoke_arity(code, bang_end)
-        arm_body = next(
+        selected = next(
             (
-                body
+                (matcher, body)
                 for matcher, body in arms
                 if _arm_accepts(matcher, inner, arity)
             ),
             None,
         )
-        if arm_body is None:
+        if selected is None:
             continue
+        matcher, arm_body = selected
+        bindings = _bindings_for_invoke(
+            matcher, inner, rep=0, in_repeat=False
+        )
+        arm_body = _substitute_metavars(arm_body, bindings)
         nested_macro_spans = _macro_def_spans(arm_body)
         for mod_match in _MOD_DECL.finditer(arm_body):
             if _in_spans(mod_match.start(), nested_macro_spans):
                 continue
+            if text is not None:
+                # Evaluate cfg attrs that precede the emitted `mod` inside
+                # the selected arm (reconstructed offsets are arm-local).
+                arm_attrs = _preceding_attributes(
+                    arm_body, arm_body, mod_match.start()
+                )
+                if any(_attr_cfg_inactive(attr) for attr in arm_attrs):
+                    continue
             out.append((match.start(), mod_match.group(1)))
     return out
 

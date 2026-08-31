@@ -6611,6 +6611,75 @@ class DefaultScanRoots(unittest.TestCase):
                 ["src/generated.rs", "src/lib.rs"],
             )
 
+    def test_invoked_macro_mod_metavars_are_substituted(self):
+        """`suite!(generated)` with `mod $name;` collects generated.rs
+        (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            src_dir.mkdir()
+            (src_dir / "lib.rs").write_text(
+                "macro_rules! suite { ($name:ident) => { mod $name; }; }\n"
+                "suite!(generated);\n",
+                encoding="utf-8",
+            )
+            (src_dir / "generated.rs").write_text(
+                "pub fn x() {}\n", encoding="utf-8"
+            )
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                sorted(path.as_posix() for path, _text in sources),
+                ["src/generated.rs", "src/lib.rs"],
+            )
+
+    def test_uninvoked_nested_macro_mod_is_not_collected(self):
+        """An unused wrapper that nests `emit!()` must not collect
+        orphan.rs (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            src_dir.mkdir()
+            (src_dir / "lib.rs").write_text(
+                "macro_rules! emit { () => { mod orphan; }; }\n"
+                "macro_rules! unused { () => { emit!(); }; }\n",
+                encoding="utf-8",
+            )
+            (src_dir / "orphan.rs").write_text("pub fn x() {}\n", encoding="utf-8")
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                [path.as_posix() for path, _text in sources],
+                ["src/lib.rs"],
+            )
+
+    def test_cfg_gated_macro_emitted_mod_is_not_collected(self):
+        """`#[cfg(windows)] mod generated;` from a macro stays off on
+        non-Windows hosts (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            src_dir.mkdir()
+            (src_dir / "lib.rs").write_text(
+                "macro_rules! suite {\n"
+                "    () => { #[cfg(windows)] mod generated; };\n"
+                "}\n"
+                "suite!();\n",
+                encoding="utf-8",
+            )
+            (src_dir / "generated.rs").write_text(
+                "pub fn x() {}\n", encoding="utf-8"
+            )
+            sources = guard.collect_sources(repo, [src_dir])
+            if sys.platform.startswith("win"):
+                self.assertIn("src/generated.rs", [p.as_posix() for p, _ in sources])
+            else:
+                self.assertEqual(
+                    [path.as_posix() for path, _text in sources],
+                    ["src/lib.rs"],
+                )
+
     def test_file_module_children_live_in_the_stem_directory(self):
         """`mod bar;` in `src/foo.rs` loads `src/foo/bar.rs`, not
         `src/bar.rs` (#516 review)."""
