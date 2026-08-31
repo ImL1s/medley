@@ -14,7 +14,7 @@ static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub(crate) struct ConfigWriteGuard {
     _in_process: tokio::sync::MutexGuard<'static, ()>,
     _os: std::fs::File,
-    dest: std::path::PathBuf,
+    pub dest: std::path::PathBuf,
 }
 /// [`save_config`] body; caller must hold [`SAVE_LOCK`].
 async fn save_config_locked(config: &Config, dest: &std::path::Path) -> Result<()> {
@@ -231,8 +231,10 @@ where
     F: FnOnce(&mut Config),
 {
     let guard = lock_config_writes().await?;
-    let root: TomlValue =
-        crate::config::load_from_disk().unwrap_or_else(|_| TomlValue::Table(TomlMap::new()));
+    let root: TomlValue = match std::fs::read_to_string(&guard.dest) {
+        Ok(s) => toml::from_str(&s).unwrap_or_else(|_| TomlValue::Table(TomlMap::new())),
+        Err(_) => TomlValue::Table(TomlMap::new()),
+    };
     let mut cfg = load_config_from_toml(&root);
     f(&mut cfg);
     save_config_locked(&cfg, &guard.dest).await

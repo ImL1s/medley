@@ -911,9 +911,8 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
     };
 
     // Run the write under SAVE_LOCK + flock, off the reactor.
-    let config_path = xai_grok_config::grok_home().join("config.toml");
     let grok_home = xai_grok_config::grok_home();
-    let _save_guard = match crate::util::config::lock_config_writes().await {
+    let save_guard = match crate::util::config::lock_config_writes().await {
         Ok(guard) => guard,
         Err(e) => {
             return ActionOutcome {
@@ -924,11 +923,12 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
             };
         }
     };
+    let dest = save_guard.dest.clone();
     let write = {
         let name = name.clone();
         tokio::task::spawn_blocking(move || {
             let _flock = acquire_init_lock(&grok_home).ok();
-            add_marketplace_source(&config_path, &name, &input, is_official)
+            add_marketplace_source(&dest, &name, &input, is_official)
         })
         .await
     };
@@ -1048,7 +1048,7 @@ fn add_marketplace_source(
 async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_types::ActionOutcome {
     let src = source_url_or_path.to_string();
     // Lock + run the blocking FS work off the reactor.
-    let _save_guard = match crate::util::config::lock_config_writes().await {
+    let save_guard = match crate::util::config::lock_config_writes().await {
         Ok(guard) => guard,
         Err(e) => {
             return xai_hooks_plugins_types::ActionOutcome {
@@ -1059,7 +1059,8 @@ async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_typ
             };
         }
     };
-    match tokio::task::spawn_blocking(move || remove_source_locked(&src)).await {
+    let dest = save_guard.dest.clone();
+    match tokio::task::spawn_blocking(move || remove_source_locked(&src, &dest)).await {
         Ok(outcome) => outcome,
         Err(e) => xai_hooks_plugins_types::ActionOutcome {
             status: xai_hooks_plugins_types::OutcomeStatus::InternalError,
@@ -1073,7 +1074,10 @@ async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_typ
 /// Sync body of [`handle_remove_source`], run on a blocking thread under the
 /// flock for the whole read-modify-write so a concurrent auto-register can't
 /// re-add the source mid-removal.
-fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::ActionOutcome {
+fn remove_source_locked(
+    source_url_or_path: &str,
+    config_path: &std::path::Path,
+) -> xai_hooks_plugins_types::ActionOutcome {
     use crate::plugin;
     use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus};
 
@@ -1084,10 +1088,9 @@ fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::Ac
 
     // Remove the source and (if official) set the flag in ONE atomic write so a
     // crash can't drop the flag and re-add the source next startup.
-    let config_path = grok_home.join("config.toml");
     let is_official = xai_grok_plugin_marketplace::is_official_source_url(source_url_or_path);
     let mut removed_from_config = false;
-    let content = match crate::util::config::read_to_string_or_empty(&config_path) {
+    let content = match crate::util::config::read_to_string_or_empty(config_path) {
         Ok(c) => c,
         Err(e) => {
             return ActionOutcome {
@@ -1114,7 +1117,7 @@ fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::Ac
         } else {
             removed
         };
-        if let Err(e) = crate::util::config::atomic_write_string(&config_path, &final_content) {
+        if let Err(e) = crate::util::config::atomic_write_string(config_path, &final_content) {
             return ActionOutcome {
                 status: OutcomeStatus::InternalError,
                 message: format!("Failed to write config: {e}"),
@@ -1138,7 +1141,7 @@ fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::Ac
     // already set it atomically above).
     if is_official
         && !removed_from_config
-        && let Err(e) = set_official_marketplace_auto_installed(&config_path)
+        && let Err(e) = set_official_marketplace_auto_installed(config_path)
     {
         tracing::warn!(
             error = %e,

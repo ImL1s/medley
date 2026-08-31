@@ -788,13 +788,14 @@ async fn write_toml_table_if_changed(
     f: impl FnOnce(&mut TomlMap<String, TomlValue>),
 ) -> Result<bool> {
     let is_user = path == config_path().as_path();
-    let _guard = if is_user {
+    let guard = if is_user {
         Some(super::persist::lock_config_writes().await?)
     } else {
         None
     };
+    let io_path = guard.as_ref().map(|g| g.dest.as_path()).unwrap_or(path);
 
-    let original = match tokio::fs::read_to_string(path).await {
+    let original = match tokio::fs::read_to_string(io_path).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_user => String::new(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -810,7 +811,7 @@ async fn write_toml_table_if_changed(
             Err(parse_err) => {
                 return Err(anyhow::anyhow!(
                     "refusing to overwrite unparseable {}: {}; fix the syntax before retrying",
-                    path.display(),
+                    io_path.display(),
                     parse_err
                 ));
             }
@@ -834,8 +835,8 @@ async fn write_toml_table_if_changed(
     if before == toml_str {
         return Ok(false);
     }
-    super::persist::atomic_write_string(path, &toml_str)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    super::persist::atomic_write_string(io_path, &toml_str)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", io_path.display()))?;
     Ok(true)
 }
 
