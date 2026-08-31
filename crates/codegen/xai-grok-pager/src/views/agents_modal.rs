@@ -2300,8 +2300,7 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                     return AgentsModalOutcome::Changed;
                 }
                 let name = entry.name.clone();
-                let is_already_default =
-                    state.config_agent_name.as_deref() == Some(name.as_str());
+                let is_already_default = state.config_agent_name.as_deref() == Some(name.as_str());
                 let new_default = if is_already_default {
                     None
                 } else {

@@ -913,7 +913,17 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
     // Run the write under SAVE_LOCK + flock, off the reactor.
     let config_path = xai_grok_config::grok_home().join("config.toml");
     let grok_home = xai_grok_config::grok_home();
-    let _save_guard = crate::util::config::lock_config_writes().await;
+    let _save_guard = match crate::util::config::lock_config_writes().await {
+        Ok(guard) => guard,
+        Err(e) => {
+            return ActionOutcome {
+                status: OutcomeStatus::InternalError,
+                message: format!("Failed to lock config: {e}"),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
     let write = {
         let name = name.clone();
         tokio::task::spawn_blocking(move || {
@@ -1038,7 +1048,17 @@ fn add_marketplace_source(
 async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_types::ActionOutcome {
     let src = source_url_or_path.to_string();
     // Lock + run the blocking FS work off the reactor.
-    let _save_guard = crate::util::config::lock_config_writes().await;
+    let _save_guard = match crate::util::config::lock_config_writes().await {
+        Ok(guard) => guard,
+        Err(e) => {
+            return xai_hooks_plugins_types::ActionOutcome {
+                status: xai_hooks_plugins_types::OutcomeStatus::InternalError,
+                message: format!("Failed to lock config: {e}"),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
     match tokio::task::spawn_blocking(move || remove_source_locked(&src)).await {
         Ok(outcome) => outcome,
         Err(e) => xai_hooks_plugins_types::ActionOutcome {

@@ -613,6 +613,7 @@ pub(crate) fn is_claude_import_marked_at(config_path: &Path) -> bool {
 /// `.tmp`, then rename). Creates the file and parent directory if missing.
 /// Existing content in the file is preserved.
 fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
+    let _lock = xai_grok_config::fs_atomic::lock_config_file(config_path)?;
     // Surface parse errors instead of silently discarding the file: an atomic
     // rewrite would otherwise drop unrelated sections ([model], [ui], etc.)
     // and overwrite a hand-edited config that just happens to have a trailing
@@ -766,6 +767,12 @@ impl ImportResult {
 
 /// Apply items to a single config.toml file using atomic write.
 fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow::Result<usize> {
+    let user_config = xai_grok_config::grok_home().join("config.toml");
+    let _lock = if config_path == user_config.as_path() {
+        Some(xai_grok_config::fs_atomic::lock_config_file(config_path)?)
+    } else {
+        None
+    };
     // Read existing TOML. Surface parse errors instead of silently
     // discarding the file: an atomic rewrite would otherwise drop
     // unrelated sections ([model], [ui], etc.) and overwrite a hand-edited

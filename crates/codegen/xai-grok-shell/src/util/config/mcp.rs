@@ -789,7 +789,7 @@ async fn write_toml_table_if_changed(
 ) -> Result<bool> {
     let is_user = path == config_path().as_path();
     let _guard = if is_user {
-        Some(super::persist::lock_config_writes().await)
+        Some(super::persist::lock_config_writes().await?)
     } else {
         None
     };

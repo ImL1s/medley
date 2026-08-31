@@ -13,7 +13,7 @@ static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// In-process mutex plus the shared sibling `config.toml.lock` (pager + shell).
 pub(crate) struct ConfigWriteGuard {
     _in_process: tokio::sync::MutexGuard<'static, ()>,
-    _os: Option<std::fs::File>,
+    _os: std::fs::File,
 }
 /// [`save_config`] body; caller must hold [`SAVE_LOCK`].
 async fn save_config_locked(config: &Config) -> Result<()> {
@@ -87,28 +87,18 @@ async fn save_config_locked(config: &Config) -> Result<()> {
 /// Acquire the `config.toml` write lock used by [`save_config`], so callers that
 /// mutate the file directly (marketplace add/remove) can't interleave with a
 /// settings save and clobber it.
-pub(crate) async fn lock_config_writes() -> ConfigWriteGuard {
+pub(crate) async fn lock_config_writes() -> std::io::Result<ConfigWriteGuard> {
     let in_process = SAVE_LOCK.lock().await;
     let path = user_config_path();
-    let os = match tokio::task::spawn_blocking(move || {
+    let os = tokio::task::spawn_blocking(move || {
         xai_grok_config::fs_atomic::lock_config_file(&path)
     })
     .await
-    {
-        Ok(Ok(file)) => Some(file),
-        Ok(Err(error)) => {
-            tracing::error!(error = %error, "failed to lock config.toml");
-            None
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "config.toml lock task failed");
-            None
-        }
-    };
-    ConfigWriteGuard {
+    .map_err(std::io::Error::other)??;
+    Ok(ConfigWriteGuard {
         _in_process: in_process,
         _os: os,
-    }
+    })
 }
 /// Read a file, treating only `NotFound` as empty. Hard read errors (EACCES,
 /// EIO) propagate so callers don't clobber an unreadable file on the next write.
@@ -238,7 +228,7 @@ pub async fn update_config<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Config),
 {
-    let _guard = lock_config_writes().await;
+    let _guard = lock_config_writes().await?;
     let root: TomlValue =
         crate::config::load_from_disk().unwrap_or_else(|_| TomlValue::Table(TomlMap::new()));
     let mut cfg = load_config_from_toml(&root);
