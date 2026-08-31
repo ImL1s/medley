@@ -1741,6 +1741,14 @@ def _declared_module_overrides(
         if _file_inner_cfg_inactive(text, enabled):
             continue
         masked = _mask_rust_literals(text)
+        scoped_macros = _scoped_macro_rules_sources(
+            masked, enabled_features=enabled
+        )
+        macro_spans = [
+            (masked.rfind("macro_rules", 0, start), end)
+            for _name, start, end in _macro_rules_defs(masked)
+        ]
+        include_hits: list[tuple[re.Match[str], int, Path]] = []
         for inc in _INCLUDE.finditer(text):
             start = inc.start()
             if start >= len(masked) or not masked[start].isalpha():
@@ -1752,11 +1760,30 @@ def _declared_module_overrides(
                 continue
             if included in ancestors:
                 continue
+            include_hits.append((inc, start, included))
+        include_scopes = (
+            _brace_scopes_at(
+                masked,
+                {start for _inc, start, _included in include_hits},
+                macro_spans,
+            )
+            if include_hits and scoped_macros
+            else {}
+        )
+        for _inc, start, included in include_hits:
             inc_prefix = list(prefix) + list(
                 _inline_mods_at(masked, start, enabled)
             )
+            include_macro_env = (
+                _macro_rules_sources_before(
+                    scoped_macros,
+                    start,
+                    include_scopes.get(start, ()),
+                )
+                + macro_env
+            )
             overrides.setdefault(included, []).append(
-                (inc_prefix, root_target, macro_env, origin_pkg)
+                (inc_prefix, root_target, include_macro_env, origin_pkg)
             )
             queue.append(
                 (
@@ -1765,14 +1792,11 @@ def _declared_module_overrides(
                     ancestors + (declaring,),
                     False,
                     root_target,
-                    macro_env,
+                    include_macro_env,
                     included.parent,
                     origin_pkg,
                 )
             )
-        scoped_macros = _scoped_macro_rules_sources(
-            masked, enabled_features=enabled
-        )
         decls = list(
             _iter_module_decls(
                 text,
@@ -1811,10 +1835,6 @@ def _declared_module_overrides(
             seen_decls.add(key)
             unique_decls.append(decl)
         decls = unique_decls
-        macro_spans = [
-            (masked.rfind("macro_rules", 0, start), end)
-            for _name, start, end in _macro_rules_defs(masked)
-        ]
         decl_scopes = (
             _brace_scopes_at(
                 masked,
@@ -3362,6 +3382,29 @@ class ExternalModulePrefix(unittest.TestCase):
             (src / "lib.rs").write_text('include!("included.rs");\n')
             (src / "included.rs").write_text(
                 "#[test]\nfn none_auth_scheme_included() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_included", names)
+
+    def test_include_sees_macros_defined_in_the_including_file(self):
+        """A `macro_rules!` before `include!` is visible in the included
+        file (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "macro_rules! emit {\n"
+                "    ($name:ident) => {\n"
+                "        #[test]\n"
+                "        fn $name() {}\n"
+                "    };\n"
+                "}\n"
+                'include!("included.rs");\n'
+            )
+            (src / "included.rs").write_text(
+                "emit!(none_auth_scheme_included);\n"
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_included", names)
