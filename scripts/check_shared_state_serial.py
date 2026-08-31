@@ -2175,6 +2175,29 @@ def _local_value_binding_shadows(body: str, name: str, pos: int) -> bool:
     return False
 
 
+_LOCAL_CONST_STATIC = re.compile(
+    rf"\b(?:const|static)\s+(?:mut\s+)?(?:r#)?({RUST_IDENT_BODY})\b"
+)
+
+
+def _local_item_shadows(body: str, name: str, pos: int) -> bool:
+    """True when a block-local `const`/`static`/`let` binds `name` at `pos`.
+
+    Function-local items apply to their whole block, unlike `let`
+    bindings which start after the statement (#516 review).
+    """
+
+    if _local_value_binding_shadows(body, name, pos):
+        return True
+    for match in _LOCAL_CONST_STATIC.finditer(body):
+        if match.group(1) != name:
+            continue
+        start, end = _block_span_containing(body, match.start())
+        if start <= pos < end:
+            return True
+    return False
+
+
 def _local_uses_from_body(
     body: str,
     file_mod: tuple[str, ...] | None,
@@ -2532,8 +2555,15 @@ def _file_process_groups(
             if text is None:
                 continue
             code = _code_only(text)
-            for name in _MOD_DECL.findall(code):
-                for path in _declared_mod_files(current.parent, name, by_posix):
+            for match in _MOD_DECL.finditer(code):
+                if any(
+                    _attr_cfg_inactive(attr)
+                    for attr in _preceding_attributes(text, code, match.start())
+                ):
+                    continue
+                for path in _declared_mod_files(
+                    current.parent, match.group(1), by_posix
+                ):
                     if path == current:
                         continue
                     if group not in groups[path]:
@@ -3080,6 +3110,8 @@ def _body_touches(
     | None = None,
     local_uses: tuple[tuple[int, int, str, tuple[str, ...], str], ...] = (),
     same_process: bool = True,
+    file_globs: dict[tuple[str, ...], list[tuple[str, ...]]] | None = None,
+    local_globs: tuple[tuple[int, int, tuple[str, ...]], ...] = (),
 ) -> bool:
     """True if `code_only_body` names this registered static.
 
@@ -3148,9 +3180,25 @@ def _body_touches(
                     ):
                         continue
                 return True
+            extra_globs = tuple(
+                module
+                for start, end, module in local_globs
+                if start <= match.start() < end
+            )
+            for module in _globs_in_scope(
+                file_globs or {}, inline_mods, extra_globs
+            ):
+                if static_module is not None and module == static_module:
+                    return True
+                if _reexport_reaches(
+                    module, ident, static_module, identifiers
+                ):
+                    return True
             if ident not in original_names:
                 continue
             if not same_process:
+                continue
+            if _local_item_shadows(code_only_body, ident, match.start()):
                 continue
             return True
     return False
@@ -3749,6 +3797,8 @@ def index_functions(
                     scoped_imports=file_imports,
                     local_uses=local_uses,
                     same_process=_same_process(file_groups, rel, item.file),
+                    file_globs=file_globs,
+                    local_globs=local_globs,
                 )
             )
             type_name = None
@@ -3832,6 +3882,7 @@ def index_functions(
                     fn_module=_module_path(rel),
                     scoped_imports=file_imports,
                     same_process=_same_process(file_groups, rel, item.file),
+                    file_globs=file_globs,
                 )
             )
             raw_macro_body = raw[body_start:body_end]
@@ -3871,6 +3922,8 @@ def index_functions(
                         scoped_imports=file_imports,
                         local_uses=arm_local_uses,
                         same_process=_same_process(file_groups, rel, item.file),
+                        file_globs=file_globs,
+                        local_globs=arm_local_globs,
                     )
                 )
                 arm_index = len(out)
@@ -3912,6 +3965,7 @@ def index_functions(
                             fn_module=_module_path(rel),
                             scoped_imports=file_imports,
                             same_process=_same_process(file_groups, rel, item.file),
+                            file_globs=file_globs,
                         )
                     )
                     template_index = len(out)
@@ -4796,6 +4850,7 @@ def analyze(
                     same_process=_same_process(
                         file_groups, pending.file, item.file
                     ),
+                    file_globs=globs_by_file.get(pending.file, {}),
                 ):
                     keys = keys | {item.key}
         if not keys:

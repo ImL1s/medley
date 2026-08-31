@@ -4826,6 +4826,31 @@ class TypeAssociatedResolution(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, set())
 
+    def test_block_local_const_does_not_touch_registered_static(self):
+        """`const COUNTER` inside a test is not the registered static
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn first_untagged() {
+                const COUNTER: u64 = 1;
+                let _ = COUNTER;
+            }
+
+            #[test]
+            fn second_untagged() {
+                const COUNTER: u64 = 1;
+                let _ = COUNTER;
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, set())
+
     def test_nested_block_let_does_not_shadow_outer_calls(self):
         """`{ let helper = || {}; } helper();` still reaches the module
         function (#516 review)."""
@@ -6193,6 +6218,109 @@ class DefaultScanRoots(unittest.TestCase):
         findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
         self.assertEqual(errors, [])
         self.assertEqual(findings, [])
+
+    def test_glob_import_of_library_static_is_a_touch(self):
+        """`use xai_grok_shell::*; COUNTER` in an integration test is
+        the library static (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    use xai_grok_shell::*;
+
+                    #[test]
+                    fn first_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_cfg_disabled_mod_edge_does_not_join_the_binary(self):
+        """`#[cfg(windows)] mod common;` does not put `common.rs` in
+        that integration binary on Linux (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("tests/first.rs"),
+                src(
+                    """\
+                    use xai_grok_shell::COUNTER;
+                    mod common;
+
+                    #[test]
+                    fn first_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/second.rs"),
+                src(
+                    """\
+                    use xai_grok_shell::COUNTER;
+                    #[cfg(windows)]
+                    mod common;
+
+                    #[test]
+                    fn second_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/common.rs"),
+                src(
+                    """\
+                    use xai_grok_shell::COUNTER;
+
+                    #[test]
+                    fn common_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
+        self.assertEqual(errors, [])
+        found = {f.name for f in findings}
+        self.assertIn("first_untagged", found)
+        self.assertIn("common_untagged", found)
+        if sys.platform == "win32":
+            self.assertIn("second_untagged", found)
+        else:
+            self.assertNotIn("second_untagged", found)
 
     def test_src_bin_crate_qualified_call_reaches_registered_state(self):
         """`crate::bump()` in `src/bin/tool.rs` is that binary's crate
