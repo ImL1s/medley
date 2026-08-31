@@ -433,7 +433,13 @@ fn apply_config_writes(flags: &ConnectFlags) {
         tracing::warn!("failed to lock config.toml");
         return;
     };
-    let content = std::fs::read_to_string(&dest).unwrap_or_default();
+    let content = match crate::config_toml_edit::read_config_text(&dest) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read config.toml");
+            return;
+        }
+    };
     let mut doc = content
         .parse::<toml_edit::DocumentMut>()
         .unwrap_or_default();

@@ -76,9 +76,18 @@ pub(crate) fn lock_config_destination(path: &Path) -> std::io::Result<(File, std
 }
 
 pub(crate) fn write_config_toml(path: &Path, contents: &str) -> std::io::Result<()> {
-    let dest = xai_grok_config::fs_atomic::resolve_write_path(path)?;
-    let mode = destination_unix_mode(&dest);
-    xai_grok_config::fs_atomic::write_atomically_at(&dest, contents, mode)
+    let mode = destination_unix_mode(path);
+    xai_grok_config::fs_atomic::write_atomically_at(path, contents, mode)
+}
+
+/// Read config text, treating only `NotFound` as empty. Hard errors (`EACCES`)
+/// propagate so callers cannot replace an unreadable file.
+pub(crate) fn read_config_text(path: &Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
 }
 
 fn overlay_digest_for(path: &Path) -> String {
@@ -767,6 +776,43 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_text_propagates_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[ui]\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&path).is_ok() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+        let err = read_config_text(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[ui]\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_toml_keeps_pinned_destination_verbatim() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("config.toml");
+        let other = dir.path().join("other.toml");
+        fs::write(&dest, "orig\n").unwrap();
+        fs::write(&other, "other\n").unwrap();
+        fs::remove_file(&dest).unwrap();
+        std::os::unix::fs::symlink(&other, &dest).unwrap();
+        write_config_toml(&dest, "[ui]\ncompact_mode = true\n").unwrap();
+        assert!(
+            !dest.symlink_metadata().unwrap().file_type().is_symlink(),
+            "pinned write must not follow a dest replaced with a symlink"
+        );
+        assert!(fs::read_to_string(&dest).unwrap().contains("compact_mode"));
+        assert_eq!(fs::read_to_string(&other).unwrap(), "other\n");
     }
 
     #[test]

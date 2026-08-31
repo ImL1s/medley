@@ -1078,6 +1078,10 @@ jobs:
           run_nonzero -p xai-grok-config --lib \
             mdm_requirements_fingerprint_is_stable_absent_layer -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
+            read_config_text_propagates_unreadable_file -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            write_config_toml_keeps_pinned_destination_verbatim -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
             new_loads_toggle_under_the_same_lock_as_the_snapshot -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             add_dismissed_plugin_cta_uses_shared_config_lock -- --nocapture
