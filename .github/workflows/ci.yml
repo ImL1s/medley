@@ -1490,6 +1490,9 @@ jobs:
           # ran nowhere. 13 tests.
           run_nonzero -p xai-grok-config --lib \
             paths:: -- --nocapture
+          # Portable config.toml sibling lock used by pager CAS and shell save.
+          run_nonzero -p xai-grok-config --lib \
+            lock_config_file_is_exclusive_until_dropped -- --nocapture
           # `xai-grok-config-types` had no filter at all, so every test in it
           # ran nowhere. `BoolFlag`'s `.env_alias()` opt-in (#426) is a choke
           # point ~49 other flags flow through unaliased -- the one place a
