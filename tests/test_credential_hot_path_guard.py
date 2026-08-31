@@ -1115,7 +1115,7 @@ def _cargo_test_targets(
                     if isinstance(lib_path, str)
                     else (crate / "src" / "lib.rs").resolve()
                 )
-                if lib.get("test") is False:
+                if lib.get("test") is False or lib.get("harness") is False:
                     gated.add(lib_target)
                     if isinstance(lib_path, str):
                         suppressed_libs.add(
@@ -1164,13 +1164,14 @@ def _cargo_test_targets(
         test_enabled = True
         harness_enabled = True
         lib_test_enabled = True
+        lib_harness_enabled = True
 
         def flush() -> None:
-            nonlocal name, path_s, required_feats, in_test, in_lib, lib_path, test_enabled, harness_enabled, lib_test_enabled
+            nonlocal name, path_s, required_feats, in_test, in_lib, lib_path, test_enabled, harness_enabled, lib_test_enabled, lib_harness_enabled
             if in_lib:
                 if lib_path:
                     target = (crate / lib_path).resolve()
-                    if not lib_test_enabled:
+                    if not lib_test_enabled or not lib_harness_enabled:
                         gated.add(target)
                         suppressed_libs.add(
                             (crate / "src" / "lib.rs").resolve()
@@ -1181,7 +1182,7 @@ def _cargo_test_targets(
                         suppressed_libs.add(
                             (crate / "src" / "lib.rs").resolve()
                         )
-                elif not lib_test_enabled:
+                elif not lib_test_enabled or not lib_harness_enabled:
                     gated.add((crate / "src" / "lib.rs").resolve())
             if in_test:
                 target = None
@@ -1206,6 +1207,7 @@ def _cargo_test_targets(
             test_enabled = True
             harness_enabled = True
             lib_test_enabled = True
+            lib_harness_enabled = True
             in_test = False
             in_lib = False
 
@@ -1232,6 +1234,12 @@ def _cargo_test_targets(
                     continue
                 if re.match(r"^test\s*=\s*true\b", stripped):
                     lib_test_enabled = True
+                    continue
+                if re.match(r"^harness\s*=\s*false\b", stripped):
+                    lib_harness_enabled = False
+                    continue
+                if re.match(r"^harness\s*=\s*true\b", stripped):
+                    lib_harness_enabled = True
                     continue
                 continue
             if not in_test:
@@ -1385,7 +1393,9 @@ def _iter_module_decls(
             pending_mod = False
             cfg_off = any(
                 _cfg_attr_is_inactive(a, enabled_features)
-                for a in pending_attrs + attrs
+                for a in _effective_attrs(
+                    pending_attrs + attrs, enabled_features
+                )
             )
             skip = enclosing_off or cfg_off or in_macro
             if not skip:
@@ -1430,7 +1440,9 @@ def _iter_module_decls(
         elif not redirected and pending_path_frag is None:
             cfg_off = any(
                 _cfg_attr_is_inactive(a, enabled_features)
-                for a in pending_attrs + attrs
+                for a in _effective_attrs(
+                    pending_attrs + attrs, enabled_features
+                )
             )
             skip = enclosing_off or cfg_off
             brace_mod = (
@@ -1485,15 +1497,32 @@ def _selected_macro_expansions(
         if _macro_name(match) in available_names
         if not any(start <= match.start() < end for start, end in def_spans)
     ]
+    brace_masked = _mask_attr_string_braces(masked)
+    macro_spans = [
+        (masked.rfind("macro_rules", 0, start), end)
+        for _name, start, end in defs
+    ]
+    invoke_scopes = (
+        _brace_scopes_at(
+            brace_masked,
+            {match.start() for match in raw_invocations},
+            macro_spans,
+        )
+        if raw_invocations
+        else {}
+    )
     invoke_at: list[tuple[int, str, str, str]] = []
     for im in raw_invocations:
+        inv_scope = invoke_scopes.get(im.start(), ())
         local = [
-            (end, source)
-            for name, source, end, _scope in scoped_defs
-            if name == _macro_name(im) and end <= im.start()
+            (len(def_scope), end, source)
+            for name, source, end, def_scope in scoped_defs
+            if name == _macro_name(im)
+            and end <= im.start()
+            and inv_scope[: len(def_scope)] == def_scope
         ]
         if local:
-            source = max(local)[1]
+            source = max(local)[2]
         else:
             source = next(
                 (
@@ -3054,6 +3083,24 @@ class ExternalModulePrefix(unittest.TestCase):
             names = _qualified_test_names(root)
             self.assertNotIn("none_auth_scheme_lib", names)
 
+    def test_lib_harness_false_is_not_counted(self):
+        """`[lib] harness = false` is not a libtest target (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[lib]\nharness = false\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[test]\nfn none_auth_scheme_lib() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertNotIn("none_auth_scheme_lib", names)
+
     def test_harness_false_target_is_not_counted(self):
         """`[[test]] harness = false` is a binary, not libtest
         (#507 review)."""
@@ -3606,6 +3653,29 @@ class ExternalModulePrefix(unittest.TestCase):
                 self.assertIn("platform::none_auth_scheme_windows_mod", names)
             else:
                 self.assertNotIn("platform::none_auth_scheme_windows_mod", names)
+
+    def test_cfg_attr_cfg_windows_module_is_not_scanned_on_unix(self):
+        """`#[cfg_attr(test, cfg(windows))] mod child;` is off on Linux
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "#[cfg_attr(test, cfg(windows))]\n"
+                "mod none_auth_scheme_child;\n"
+                "#[test]\nfn none_auth_scheme_everywhere() {}\n"
+            )
+            (src / "none_auth_scheme_child.rs").write_text(
+                "#[test]\nfn phantom() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_everywhere", names)
+            if sys.platform == "win32":
+                self.assertIn("none_auth_scheme_child::phantom", names)
+            else:
+                self.assertNotIn("none_auth_scheme_child::phantom", names)
 
     def test_path_prefix_propagates_to_descendant_modules(self):
         with tempfile.TemporaryDirectory() as d:
@@ -4183,6 +4253,46 @@ class ExternalModulePrefix(unittest.TestCase):
             cargo_names = _cargo_list_test_names(crate)
             self.assertEqual(cargo_names, ["none_auth_scheme_child::works"])
             self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_module_emitting_macro_uses_lexical_scope(self):
+        """A later sibling-block macro must not steal the outer invoke
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    macro_rules! emit_mod {
+                        () => { mod none_auth_scheme_root; };
+                    }
+                    {
+                        macro_rules! emit_mod {
+                            () => { mod none_auth_scheme_block; };
+                        }
+                        emit_mod!();
+                    }
+                    emit_mod!();
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (src / "none_auth_scheme_root.rs").write_text(
+                "#[test]\nfn root_case() {}\n"
+            )
+            (src / "none_auth_scheme_block.rs").write_text(
+                "#[test]\nfn block_case() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_root::root_case", names)
+            self.assertIn("none_auth_scheme_block::block_case", names)
 
     def test_block_local_macro_does_not_leak_into_external_child(self):
         """A function/block macro is not in the later module item's scope."""
