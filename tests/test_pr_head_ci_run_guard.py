@@ -633,6 +633,9 @@ class PrHeadHistoryReportTests(unittest.TestCase):
         *,
         status: str = "completed",
         conclusion: str | None = "success",
+        app_id: int = 15368,
+        app_slug: str = "github-actions",
+        suite_id: int = 100,
     ) -> dict:
         return {
             "id": run_id,
@@ -640,6 +643,8 @@ class PrHeadHistoryReportTests(unittest.TestCase):
             "head_sha": sha,
             "status": status,
             "conclusion": conclusion,
+            "app": {"id": app_id, "slug": app_slug},
+            "check_suite": {"id": suite_id},
         }
 
     def fake_api(self, responses: dict[str, object]):
@@ -775,10 +780,90 @@ class PrHeadHistoryReportTests(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assertIn(
             "Tests (providers hot path): success "
-            "(attempts: cancelled -> success)",
+            "[run=11 attempts: 10=cancelled -> 11=success;",
             text,
         )
         self.assertIn(f"head {self.SHA_2[:8]} (current): absent", text)
+
+    def test_report_does_not_collapse_same_name_checks_from_other_suites(
+        self,
+    ) -> None:
+        responses = {
+            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+                [{"sha": self.SHA_2}]
+            ],
+            (
+                f"repos/ImL1s/medley/commits/{self.SHA_2}/check-runs"
+                "?filter=all&per_page=100"
+            ): [
+                {
+                    "total_count": 2,
+                    "check_runs": [
+                        self.check_run(
+                            10,
+                            "CI",
+                            self.SHA_2,
+                            conclusion="cancelled",
+                            app_id=1,
+                            app_slug="first-app",
+                            suite_id=10,
+                        ),
+                        self.check_run(
+                            11,
+                            "CI",
+                            self.SHA_2,
+                            app_id=2,
+                            app_slug="second-app",
+                            suite_id=20,
+                        ),
+                    ],
+                }
+            ],
+        }
+        with mock.patch.object(
+            guard.subprocess, "run", side_effect=self.fake_api(responses)
+        ):
+            out = io.StringIO()
+            rc = guard.report_pr_head_history(
+                repo="ImL1s/medley", pr_number=506, stream=out
+            )
+
+        text = out.getvalue()
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(text.count("  CI:"), 2)
+        self.assertNotIn("attempts:", text)
+        self.assertIn("app=first-app#1; suite=10", text)
+        self.assertIn("app=second-app#2; suite=20", text)
+
+    def test_report_rejects_unknown_states_and_unsafe_names(self) -> None:
+        bad_rows = [
+            self.check_run(1, "CI", self.SHA_2, status="banana", conclusion=None),
+            self.check_run(1, "CI", self.SHA_2, conclusion="banana"),
+            self.check_run(1, "Format\nhead deadbeef", self.SHA_2),
+            self.check_run(1, "\x1b[31mFormat", self.SHA_2),
+        ]
+        for bad_row in bad_rows:
+            with self.subTest(row=bad_row):
+                responses = {
+                    "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+                        [{"sha": self.SHA_2}]
+                    ],
+                    (
+                        f"repos/ImL1s/medley/commits/{self.SHA_2}/check-runs"
+                        "?filter=all&per_page=100"
+                    ): [{"total_count": 1, "check_runs": [bad_row]}],
+                }
+                with mock.patch.object(
+                    guard.subprocess,
+                    "run",
+                    side_effect=self.fake_api(responses),
+                ):
+                    with self.assertRaises(guard.CiHeadGateError):
+                        guard.report_pr_head_history(
+                            repo="ImL1s/medley",
+                            pr_number=506,
+                            stream=io.StringIO(),
+                        )
 
     def test_report_rejects_check_run_for_a_different_head(self) -> None:
         responses = {

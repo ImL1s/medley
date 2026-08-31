@@ -49,6 +49,22 @@ SKIPPED_CONCLUSIONS = frozenset({"skipped", "neutral", "cancelled"})
 PR_CHECK_PASS_BUCKETS = frozenset({"pass"})
 PR_CHECK_SKIP_BUCKETS = frozenset({"skipping", "skip", "skipped"})
 PR_CHECK_PENDING_BUCKETS = frozenset({"pending"})
+CHECK_RUN_ACTIVE_STATUSES = frozenset(
+    {"queued", "in_progress", "waiting", "requested", "pending"}
+)
+CHECK_RUN_CONCLUSIONS = frozenset(
+    {
+        "action_required",
+        "cancelled",
+        "failure",
+        "neutral",
+        "skipped",
+        "stale",
+        "startup_failure",
+        "success",
+        "timed_out",
+    }
+)
 
 
 class CiHeadGateError(RuntimeError):
@@ -152,18 +168,59 @@ def list_pr_commit_shas(repo: str, pr_number: int) -> list[str]:
 
 def _check_run_state(row: dict[str, Any]) -> str:
     status = row.get("status")
-    if not isinstance(status, str) or not status:
+    if not isinstance(status, str) or status != status.strip():
         raise CiHeadGateError("check-runs API returned a malformed status")
     status = status.lower()
     if status != "completed":
+        if status not in CHECK_RUN_ACTIVE_STATUSES:
+            raise CiHeadGateError(
+                f"check-runs API returned an unknown status {status!r}"
+            )
         return status
 
     conclusion = row.get("conclusion")
-    if not isinstance(conclusion, str) or not conclusion:
+    if not isinstance(conclusion, str) or conclusion != conclusion.strip():
         raise CiHeadGateError(
             "check-runs API returned a completed run without a conclusion"
         )
-    return conclusion.lower()
+    conclusion = conclusion.lower()
+    if conclusion not in CHECK_RUN_CONCLUSIONS:
+        raise CiHeadGateError(
+            f"check-runs API returned an unknown conclusion {conclusion!r}"
+        )
+    return conclusion
+
+
+def _plain_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _printable_label(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and value.isprintable()
+    )
+
+
+def _check_run_identity(row: dict[str, Any]) -> tuple[str, int, int]:
+    """Stable identity shared by reruns of one check-suite check."""
+
+    name = row.get("name")
+    app = row.get("app")
+    suite = row.get("check_suite")
+    if not _printable_label(name):
+        raise CiHeadGateError("check-runs API returned an unsafe check run name")
+    if not isinstance(app, dict) or not _plain_positive_int(app.get("id")):
+        raise CiHeadGateError("check-runs API returned a malformed app identity")
+    if not _printable_label(app.get("slug")):
+        raise CiHeadGateError("check-runs API returned an unsafe app slug")
+    if not isinstance(suite, dict) or not _plain_positive_int(suite.get("id")):
+        raise CiHeadGateError(
+            "check-runs API returned a malformed check-suite identity"
+        )
+    return str(name), int(app["id"]), int(suite["id"])
 
 
 def list_commit_check_runs(repo: str, sha: str) -> list[dict[str, Any]]:
@@ -180,7 +237,11 @@ def list_commit_check_runs(repo: str, sha: str) -> list[dict[str, Any]]:
             raise CiHeadGateError("check-runs API returned a non-object page")
         page_total = page.get("total_count")
         page_rows = page.get("check_runs")
-        if not isinstance(page_total, int) or page_total < 0:
+        if (
+            not isinstance(page_total, int)
+            or isinstance(page_total, bool)
+            or page_total < 0
+        ):
             raise CiHeadGateError("check-runs API returned a malformed total_count")
         if total_count is None:
             total_count = page_total
@@ -193,20 +254,18 @@ def list_commit_check_runs(repo: str, sha: str) -> list[dict[str, Any]]:
             if not isinstance(row, dict):
                 raise CiHeadGateError("check-runs API returned a non-object check run")
             run_id = row.get("id")
-            name = row.get("name")
             run_sha = row.get("head_sha")
-            if not isinstance(run_id, int) or run_id <= 0:
+            if not _plain_positive_int(run_id):
                 raise CiHeadGateError("check-runs API returned a malformed check run ID")
             if run_id in seen_ids:
                 raise CiHeadGateError(f"check-runs API repeated check run ID {run_id}")
-            if not isinstance(name, str) or not name:
-                raise CiHeadGateError("check-runs API returned a nameless check run")
             if not isinstance(run_sha, str) or not _is_sha(run_sha):
                 raise CiHeadGateError("check-runs API returned a malformed head SHA")
             if run_sha.lower() != sha:
                 raise CiHeadGateError(
                     f"check run {run_id} belongs to a different head SHA"
                 )
+            _check_run_identity(row)
             _check_run_state(row)
             seen_ids.add(run_id)
             rows.append(row)
@@ -243,16 +302,32 @@ def report_pr_head_history(
             continue
 
         print(label, file=stream)
-        attempts_by_name: dict[str, list[dict[str, Any]]] = {}
+        attempts_by_identity: dict[
+            tuple[str, int, int], list[dict[str, Any]]
+        ] = {}
         for row in runs:
-            attempts_by_name.setdefault(str(row["name"]), []).append(row)
-        for name in sorted(attempts_by_name):
-            attempts = sorted(attempts_by_name[name], key=lambda row: int(row["id"]))
+            identity = _check_run_identity(row)
+            attempts_by_identity.setdefault(identity, []).append(row)
+        for name, app_id, suite_id in sorted(attempts_by_identity):
+            attempts = sorted(
+                attempts_by_identity[(name, app_id, suite_id)],
+                key=lambda row: int(row["id"]),
+            )
             states = [_check_run_state(row) for row in attempts]
-            suffix = ""
+            run_ids = [int(row["id"]) for row in attempts]
+            suffix = f"run={run_ids[-1]}"
             if len(states) > 1:
-                suffix = f" (attempts: {' -> '.join(states)})"
-            print(f"  {name}: {states[-1]}{suffix}", file=stream)
+                chain = " -> ".join(
+                    f"{run_id}={state}"
+                    for run_id, state in zip(run_ids, states, strict=True)
+                )
+                suffix += f" attempts: {chain}"
+            app_slug = str(attempts[-1]["app"]["slug"])
+            print(
+                f"  {name}: {states[-1]} "
+                f"[{suffix}; app={app_slug}#{app_id}; suite={suite_id}]",
+                file=stream,
+            )
 
     print(
         "note: historical states are report-only; the exact current-head gates "
