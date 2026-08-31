@@ -1109,10 +1109,20 @@ def _cargo_test_targets(
             lib = data.get("lib")
             if isinstance(lib, dict):
                 lib_path = lib.get("path")
-                if isinstance(lib_path, str):
-                    target = (crate / lib_path).resolve()
-                    if target.is_file():
-                        extra.add(target)
+                lib_target = (
+                    (crate / lib_path).resolve()
+                    if isinstance(lib_path, str)
+                    else (crate / "src" / "lib.rs").resolve()
+                )
+                if lib.get("test") is False:
+                    gated.add(lib_target)
+                    if isinstance(lib_path, str):
+                        suppressed_libs.add(
+                            (crate / "src" / "lib.rs").resolve()
+                        )
+                elif isinstance(lib_path, str):
+                    if lib_target.is_file():
+                        extra.add(lib_target)
                     suppressed_libs.add((crate / "src" / "lib.rs").resolve())
             tests = data.get("test")
             if isinstance(tests, dict):
@@ -1152,14 +1162,26 @@ def _cargo_test_targets(
         required_feats: set[str] = set()
         test_enabled = True
         harness_enabled = True
+        lib_test_enabled = True
 
         def flush() -> None:
-            nonlocal name, path_s, required_feats, in_test, in_lib, lib_path, test_enabled, harness_enabled
-            if in_lib and lib_path:
-                target = (crate / lib_path).resolve()
-                if target.is_file():
-                    extra.add(target)
-                suppressed_libs.add((crate / "src" / "lib.rs").resolve())
+            nonlocal name, path_s, required_feats, in_test, in_lib, lib_path, test_enabled, harness_enabled, lib_test_enabled
+            if in_lib:
+                if lib_path:
+                    target = (crate / lib_path).resolve()
+                    if not lib_test_enabled:
+                        gated.add(target)
+                        suppressed_libs.add(
+                            (crate / "src" / "lib.rs").resolve()
+                        )
+                    else:
+                        if target.is_file():
+                            extra.add(target)
+                        suppressed_libs.add(
+                            (crate / "src" / "lib.rs").resolve()
+                        )
+                elif not lib_test_enabled:
+                    gated.add((crate / "src" / "lib.rs").resolve())
             if in_test:
                 target = None
                 if path_s:
@@ -1182,6 +1204,7 @@ def _cargo_test_targets(
             required_feats = set()
             test_enabled = True
             harness_enabled = True
+            lib_test_enabled = True
             in_test = False
             in_lib = False
 
@@ -1202,6 +1225,13 @@ def _cargo_test_targets(
                 match = re.match(r'^path\s*=\s*"([^"]+)"', stripped)
                 if match:
                     lib_path = match.group(1)
+                    continue
+                if re.match(r"^test\s*=\s*false\b", stripped):
+                    lib_test_enabled = False
+                    continue
+                if re.match(r"^test\s*=\s*true\b", stripped):
+                    lib_test_enabled = True
+                    continue
                 continue
             if not in_test:
                 continue
@@ -2012,8 +2042,10 @@ def _tests_in_file(
     file_mods: list[str],
     enabled_features: set[str] | frozenset[str] | None = None,
     inherited_macros: tuple[tuple[str, str], ...] = (),
+    *,
+    _expand_depth: int = 0,
 ) -> list[str]:
-    if _file_inner_cfg_inactive(text, enabled_features):
+    if _expand_depth > 8 or _file_inner_cfg_inactive(text, enabled_features):
         return []
     names: list[str] = []
     raw_lines = text.splitlines()
@@ -2216,7 +2248,10 @@ def _tests_in_file(
             invoke_i += 1
             if line_cfg_off:
                 continue
-            prefix = file_mods + [name for _, name, _ in mod_stack]
+            col_stack = _mod_stack_at_column(
+                masked_line, _pos - line_start, line_stack, line_depth
+            )
+            prefix = file_mods + [name for _, name, _ in col_stack]
             invocations.append((inv_name, inner, source, prefix))
 
         line = _strip_line_comment(brace_lines[i])
@@ -2226,13 +2261,23 @@ def _tests_in_file(
         while mod_stack and depth <= mod_stack[-1][0]:
             mod_stack.pop()
         line_start += len(masked_line) + 1
+    file_macros = inherited_macros + tuple(
+        (name, src) for name, src, _end, _scope in scoped_defs
+    )
     for inv_name, inner, source, prefix in invocations:
-        arm_text = _selected_arm_source(
-            source, _macro_rules_defs(source), inv_name, inner
-        )
+        defs = _macro_rules_defs(source)
+        arm_text = _selected_arm_source(source, defs, inv_name, inner)
         if not arm_text:
             continue
-        names.extend(_tests_in_file(arm_text, prefix, enabled_features))
+        names.extend(
+            _tests_in_file(
+                arm_text,
+                prefix,
+                enabled_features,
+                file_macros,
+                _expand_depth=_expand_depth + 1,
+            )
+        )
     return names
 
 
@@ -2909,6 +2954,24 @@ class ExternalModulePrefix(unittest.TestCase):
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_live", names)
             self.assertNotIn("none_auth_scheme_off", names)
+
+    def test_lib_test_false_is_not_counted(self):
+        """`[lib] test = false` is not a cargo test target (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[lib]\ntest = false\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[test]\nfn none_auth_scheme_lib() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertNotIn("none_auth_scheme_lib", names)
 
     def test_harness_false_target_is_not_counted(self):
         """`[[test]] harness = false` is a binary, not libtest
@@ -4172,6 +4235,47 @@ class ExternalModulePrefix(unittest.TestCase):
             sorted(names),
             ["none_auth_scheme_a::works", "none_auth_scheme_b::works"],
         )
+
+    def test_same_line_macro_invocation_uses_column_module(self):
+        """`mod { generated!(inside); } generated!(outside);` must not
+        qualify `outside` (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            mod none_auth_scheme_ { generated!(inside); } generated!(outside);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(sorted(names), ["none_auth_scheme_::inside", "outside"])
+
+    def test_wrapper_macro_expands_nested_emit_test(self):
+        """`wrapper!($name)` -> `emit_test!($name)` still registers the
+        test (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! emit_test {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            macro_rules! wrapper {
+                ($name:ident) => {
+                    emit_test!($name);
+                };
+            }
+            wrapper!(none_auth_scheme_nested);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_nested"])
 
     def test_foreign_target_arch_cfg_is_not_counted(self):
         """`#[cfg(target_arch = \"wasm32\")]` is off on the CI hosts
