@@ -282,11 +282,12 @@ fn set_hint_at(path: &Path, key: &str, value: impl Into<toml_edit::Value>) -> st
         std::fs::create_dir_all(parent)?;
     }
     let _lock = lock_config_file(path)?;
-    let Some(mut doc) = read_config_document_for_edit(path) else {
+    let dest = xai_grok_config::fs_atomic::resolve_write_path(path)?;
+    let Some(mut doc) = read_config_document_for_edit(&dest) else {
         return Ok(());
     };
     doc["hints"][key] = toml_edit::value(value);
-    write_config_toml(path, &doc.to_string())
+    write_config_toml(&dest, &doc.to_string())
 }
 
 #[cfg(test)]

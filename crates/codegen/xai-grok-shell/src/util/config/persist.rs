@@ -18,14 +18,15 @@ pub(crate) struct ConfigWriteGuard {
 /// [`save_config`] body; caller must hold [`SAVE_LOCK`].
 async fn save_config_locked(config: &Config) -> Result<()> {
     let path = user_config_path();
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
+    let dest = xai_grok_config::fs_atomic::resolve_write_path(&path)?;
+    let mut root: TomlValue = match tokio::fs::read_to_string(&dest).await {
         Ok(s) => match toml::from_str::<TomlValue>(&s) {
             Ok(v) => v,
             Err(parse_err) => {
                 return Err(anyhow::anyhow!(
                     "refusing to overwrite unparseable {}: {}; save a backup \
                          and fix the syntax error before retrying",
-                    path.display(),
+                    dest.display(),
                     parse_err,
                 ));
             }
@@ -53,12 +54,11 @@ async fn save_config_locked(config: &Config) -> Result<()> {
         merge_section(table, "skills", &config.skills);
     }
     let toml_str = toml::to_string_pretty(&root)?;
-    let dest = xai_grok_config::fs_atomic::resolve_write_path(&path)?;
     if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
     #[cfg(unix)]
-    let prior_mode: Option<u32> = match tokio::fs::metadata(&path).await {
+    let prior_mode: Option<u32> = match tokio::fs::metadata(&dest).await {
         Ok(m) => {
             use std::os::unix::fs::PermissionsExt;
             Some(m.permissions().mode())

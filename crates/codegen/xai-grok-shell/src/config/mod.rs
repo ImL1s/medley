@@ -1994,7 +1994,8 @@ fn mutate_config_toml_file(
     f: impl FnOnce(&mut toml::Value) -> Result<bool, Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _lock = xai_grok_config::fs_atomic::lock_config_file(config_path)?;
-    let content = match std::fs::read_to_string(config_path) {
+    let dest = xai_grok_config::fs_atomic::resolve_write_path(config_path)?;
+    let content = match std::fs::read_to_string(&dest) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
@@ -2007,7 +2008,7 @@ fn mutate_config_toml_file(
     if !f(&mut config)? {
         return Ok(());
     }
-    crate::util::config::atomic_write_string(config_path, &toml::to_string_pretty(&config)?)?;
+    crate::util::config::atomic_write_string(&dest, &toml::to_string_pretty(&config)?)?;
     Ok(())
 }
 
