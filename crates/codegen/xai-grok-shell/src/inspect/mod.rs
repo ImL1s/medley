@@ -5,12 +5,14 @@
 //! LSP config, and config.toml sources. Supports `--json` for machine output.
 
 mod compat;
+mod native_route;
 
 pub use compat::{CompatEntryStatus, CompatSource, ExternalCompatEntry, ExternalCompatReport};
 use compat::{
     derive_vendor, instruction_compat_status, resolve_inspect_compat, vendor_compat_status,
     vendor_tag,
 };
+pub use native_route::inspect_native_subagent_route;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

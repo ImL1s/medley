@@ -2630,7 +2630,17 @@ async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> R
             Command::Doctor(_) => {
                 unreachable!("doctor was consumed before runtime startup")
             }
-            Command::Inspect { json } => {
+            Command::Inspect {
+                json,
+                native_subagent_route,
+            } => {
+                if let Some(parent_session_id) = native_subagent_route {
+                    xai_grok_shell::inspect::inspect_native_subagent_route(
+                        &parent_session_id,
+                        json,
+                    )?;
+                    return Ok(());
+                }
                 let cwd = std::env::current_dir().unwrap_or_default();
                 xai_grok_shell::inspect::inspect(&cwd, json).await?;
                 return Ok(());

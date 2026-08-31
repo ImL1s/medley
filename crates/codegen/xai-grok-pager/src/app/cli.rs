@@ -100,6 +100,9 @@ pub enum Command {
         /// Emit machine-readable JSON output.
         #[arg(long)]
         json: bool,
+        /// Inspect native subagent route receipts for a persisted parent session.
+        #[arg(long = "native-subagent-route", value_name = "PARENT_SESSION_ID")]
+        native_subagent_route: Option<String>,
     },
     /// Check terminal, clipboard, color, and input support without starting Grok
     Doctor(crate::doctor_cmd::DoctorArgs),
