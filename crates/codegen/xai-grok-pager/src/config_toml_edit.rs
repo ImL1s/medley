@@ -108,10 +108,10 @@ fn destination_unix_mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        return Some(match std::fs::metadata(path) {
+        Some(match std::fs::metadata(path) {
             Ok(metadata) => metadata.permissions().mode() & 0o777,
             Err(_) => 0o600,
-        });
+        })
     }
     #[cfg(not(unix))]
     {
