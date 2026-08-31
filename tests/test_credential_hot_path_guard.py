@@ -1752,13 +1752,16 @@ def _declared_module_overrides(
                 continue
             if included in ancestors:
                 continue
+            inc_prefix = list(prefix) + list(
+                _inline_mods_at(masked, start, enabled)
+            )
             overrides.setdefault(included, []).append(
-                (list(prefix), root_target, macro_env, origin_pkg)
+                (inc_prefix, root_target, macro_env, origin_pkg)
             )
             queue.append(
                 (
                     included,
-                    prefix,
+                    tuple(inc_prefix),
                     ancestors + (declaring,),
                     False,
                     root_target,
@@ -2098,6 +2101,36 @@ def _position_cfg_inactive(
         depth += ml.count("{") - ml.count("}")
         offset = line_end
     return any(off for _, _, off in stack)
+
+
+def _inline_mods_at(
+    masked: str,
+    pos: int,
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> tuple[str, ...]:
+    """Inline `mod name { ... }` names enclosing ``pos``."""
+
+    stack: list[tuple[int, str, bool]] = []
+    depth = 0
+    offset = 0
+    for mline in masked.splitlines(keepends=True):
+        ml = mline.rstrip("\n")
+        line_start = offset
+        line_end = offset + len(mline)
+        if pos < line_start:
+            break
+        if line_start <= pos < line_end:
+            col = max(0, min(pos - line_start, len(ml)))
+            stack = _mod_stack_at_column(
+                ml, col, stack, depth, enabled_features
+            )
+            break
+        stack = _mod_stack_at_column(
+            ml, len(ml), stack, depth, enabled_features
+        )
+        depth += ml.count("{") - ml.count("}")
+        offset = line_end
+    return tuple(name for _, name, off in stack if not off)
 
 
 def _cfg_attr_is_inactive(
@@ -3332,6 +3365,26 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_included", names)
+
+    def test_include_inside_inline_module_keeps_prefix(self):
+        """`mod none_auth_scheme_ { include!(...) }` is
+        `none_auth_scheme_::works` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "mod none_auth_scheme_ {\n"
+                '    include!("included.rs");\n'
+                "}\n"
+            )
+            (src / "included.rs").write_text(
+                "#[test]\nfn works() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_::works", names)
+            self.assertNotIn("works", names)
 
     def test_cfg_gated_include_is_not_scanned(self):
         """`#[cfg(windows)] include!(\"win.rs\")` is off on Unix
