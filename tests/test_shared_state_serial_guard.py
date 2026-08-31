@@ -704,6 +704,69 @@ class TransitiveClosure(unittest.TestCase):
         self.assertTrue(any(n.startswith("case!") for n in names), names)
         self.assertEqual(len(names), 2, names)
 
+    def test_wrapper_macro_delegates_to_test_generating_macro(self):
+        """`wrapper!($name)` -> `make_test!($name)` still registers
+        generated tests (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! make_test {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+            macro_rules! wrapper {
+                ($name:ident) => {
+                    make_test!($name);
+                };
+            }
+
+            wrapper!(first_untagged);
+            wrapper!(second_untagged);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(len(names), 2, names)
+        self.assertTrue(all(n.startswith("wrapper!") for n in names), names)
+
+    def test_function_local_macros_do_not_share_keys(self):
+        """Same-named `macro_rules!` in two functions stay distinct
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn dirty_untagged() {
+                macro_rules! act {
+                    () => {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    };
+                }
+                act!();
+            }
+
+            #[test]
+            fn clean_untagged() {
+                macro_rules! act {
+                    () => {};
+                }
+                act!();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertIn("dirty_untagged", names)
+        self.assertNotIn("clean_untagged", names)
+
     def test_comment_between_generated_test_attr_and_fn_is_still_a_test(self):
         """`#[test]` then `// note` then `fn $name` must still count
         (#516 review)."""

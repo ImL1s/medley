@@ -2755,6 +2755,28 @@ def _fn_import(
     return _lookup_import(imports_by_file.get(fn.file, {}), fn.inline_mods, name)
 
 
+def _macros_visible_to(
+    fn: "FnInfo", indices: list[int], functions: list["FnInfo"]
+) -> list[int]:
+    """Prefer same-function `macro_rules!`; skip another function's locals."""
+
+    local: list[int] = []
+    module_level: list[int] = []
+    other: list[int] = []
+    for index in indices:
+        if index < 0 or index >= len(functions):
+            continue
+        macro = functions[index]
+        if not macro.is_macro:
+            other.append(index)
+            continue
+        if macro.file == fn.file and macro.enclosing_start == fn.start:
+            local.append(index)
+        elif macro.enclosing_start is None:
+            module_level.append(index)
+    return local or module_level or other
+
+
 def _macro_candidates(
     fn: FnInfo,
     match: re.Match[str],
@@ -2763,6 +2785,7 @@ def _macro_candidates(
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     ],
     globs_by_file: dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
+    functions: list[FnInfo],
 ) -> list[int]:
     """Resolve an invocation to macro definitions before selecting its arm.
 
@@ -2774,6 +2797,10 @@ def _macro_candidates(
 
     qualifier = match.group(1)
     name = _raw_ident(match.group(2))
+
+    def finish(indices: list[int]) -> list[int]:
+        return _macros_visible_to(fn, indices, functions)
+
     if qualifier:
         absolute = qualifier.lstrip().startswith("::")
         segs = tuple(
@@ -2784,7 +2811,7 @@ def _macro_candidates(
         if not segs and not absolute:
             return []
         if not segs:
-            return list(macro_defs_by_module.get(((), name), ()))
+            return finish(list(macro_defs_by_module.get(((), name), ())))
         imported = None
         if segs[0] not in ("crate", "self", "super") and not _is_lib_crate_ident(
             segs[0]
@@ -2800,7 +2827,7 @@ def _macro_candidates(
             target_module = _resolve_path_module(
                 segs, _module_path(fn.file), fn.inline_mods
             )
-        return list(macro_defs_by_module.get((target_module or (), name), ()))
+        return finish(list(macro_defs_by_module.get((target_module or (), name), ())))
 
     local_named = [
         entry
@@ -2820,20 +2847,20 @@ def _macro_candidates(
     ):
         named = local_by_scope.get(scope)
         if named is not None:
-            return list(macro_defs_by_module.get((named[3], named[4]), ()))
+            return finish(list(macro_defs_by_module.get((named[3], named[4]), ())))
         definitions = [
             definition
             for module in glob_by_scope.get(scope, [])
             for definition in macro_defs_by_module.get((module, name), ())
         ]
         if definitions:
-            return list(dict.fromkeys(definitions))
+            return finish(list(dict.fromkeys(definitions)))
 
     imported = _lookup_import(
         imports_by_file.get(fn.file, {}), fn.inline_mods, name
     )
     if imported is not None:
-        return list(macro_defs_by_module.get(imported, ()))
+        return finish(list(macro_defs_by_module.get(imported, ())))
 
     file_module = _module_path(fn.file)
     if file_module is not None:
@@ -2841,7 +2868,7 @@ def _macro_candidates(
         while True:
             definitions = macro_defs_by_module.get((file_module + prefix, name), ())
             if definitions:
-                return list(definitions)
+                return finish(list(definitions))
             if not prefix:
                 break
             prefix = prefix[:-1]
@@ -2853,7 +2880,7 @@ def _macro_candidates(
         )
         for definition in macro_defs_by_module.get((module, name), ())
     ]
-    return list(dict.fromkeys(definitions))
+    return finish(list(dict.fromkeys(definitions)))
 
 
 def _local_glob_scopes(
@@ -3350,6 +3377,15 @@ class _PendingMacroTest:
 class _MacroArm:
     matcher: str
     serials: list[tuple[frozenset[str], bool, bool, int, tuple[str, ...]]]
+    body: str = ""
+
+
+@dataclass
+class _ScopedMacro:
+    name: str
+    enclosing: tuple[int, int] | None
+    def_pos: int
+    arms: list[_MacroArm]
 
 
 def _serials_for_macro_invoke(
@@ -3414,6 +3450,102 @@ def _serials_for_macro_invoke(
     return resolved
 
 
+def _innermost_span(
+    spans: list[tuple[int, int]], pos: int
+) -> tuple[int, int] | None:
+    hit: tuple[int, int] | None = None
+    for start, end in spans:
+        if start <= pos < end and (hit is None or start >= hit[0]):
+            hit = (start, end)
+    return hit
+
+
+def _local_macro_arms(
+    scoped: list[_ScopedMacro],
+    name: str,
+    enclosing: tuple[int, int] | None,
+    invoke_pos: int,
+) -> list[_MacroArm] | None:
+    """Innermost function-local `macro_rules!` visible at `invoke_pos`."""
+
+    if enclosing is None:
+        return None
+    hit: _ScopedMacro | None = None
+    for item in scoped:
+        if item.name != name or item.enclosing != enclosing:
+            continue
+        if item.def_pos >= invoke_pos:
+            continue
+        hit = item
+    return None if hit is None else hit.arms
+
+
+def _inherit_nested_macro_serials(
+    generated_by_macro: dict[tuple[Path, str], list[_MacroArm]],
+    local_macros: dict[Path, list[_ScopedMacro]],
+) -> None:
+    """Copy generated-test templates through `wrapper! -> make_test!`."""
+
+    def lookup(
+        rel: Path,
+        invoke: re.Match[str],
+        enclosing: tuple[int, int] | None,
+    ) -> list[_MacroArm]:
+        nested = _raw_ident(invoke.group(2))
+        if not invoke.group(1):
+            if enclosing is not None:
+                for item in local_macros.get(rel, []):
+                    if item.name == nested and item.enclosing == enclosing:
+                        return item.arms
+            found = generated_by_macro.get((rel, nested))
+            if found:
+                return found
+        return generated_by_macro.get((rel, nested), [])
+
+    def inherit_into(
+        rel: Path,
+        arms: list[_MacroArm],
+        enclosing: tuple[int, int] | None,
+    ) -> bool:
+        progressed = False
+        for arm in arms:
+            for invoke in _macro_invoke_matches(arm.body):
+                nested_arms = lookup(rel, invoke, enclosing)
+                if not nested_arms:
+                    continue
+                inner = _macro_invoke_inner(arm.body, invoke.end())
+                arity = _macro_invoke_arity(arm.body, invoke.end())
+                chosen: _MacroArm | None = None
+                for nested in nested_arms:
+                    if _arm_accepts(nested.matcher, inner, arity) or "$" in inner:
+                        chosen = nested
+                        break
+                if chosen is None:
+                    for nested in nested_arms:
+                        if nested.serials:
+                            chosen = nested
+                            break
+                if chosen is None:
+                    continue
+                for serial in chosen.serials:
+                    if serial not in arm.serials:
+                        arm.serials.append(serial)
+                        progressed = True
+        return progressed
+
+    work = [(rel, arms, None) for (rel, _name), arms in generated_by_macro.items()]
+    for rel, scoped in local_macros.items():
+        for item in scoped:
+            work.append((rel, item.arms, item.enclosing))
+    for _ in range(len(work) + 1):
+        progressed = False
+        for rel, arms, enclosing in work:
+            if inherit_into(rel, arms, enclosing):
+                progressed = True
+        if not progressed:
+            break
+
+
 def index_functions(
     sources: list[tuple[Path, str]], registry: list[SharedItem]
 ) -> tuple[
@@ -3429,6 +3561,8 @@ def index_functions(
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
     generated_by_macro: dict[tuple[Path, str], list[_MacroArm]] = {}
+    local_macros: dict[Path, list[_ScopedMacro]] = {}
+    fn_spans: dict[Path, list[tuple[int, int]]] = {}
     exported_macros: dict[str, list[tuple[Path, str]]] = {}
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
@@ -3469,6 +3603,7 @@ def index_functions(
             pending_fns.append(
                 (match, name, body_start, body_end, body_code, inline_mods)
             )
+            fn_spans.setdefault(rel, []).append((body_start, body_end))
         for match in _macro_def_matches(code):
             body_span = _macro_body(raw, match.end())
             if body_span is not None:
@@ -3697,9 +3832,18 @@ def index_functions(
                     serials_for_arm.append(
                         (held, unkeyed, in_repeat, template_index, attrs)
                     )
-                arm_list.append(_MacroArm(matcher, serials_for_arm))
-            if any(arm.serials for arm in arm_list):
+                arm_list.append(_MacroArm(matcher, serials_for_arm, arm_code))
+            enclosing: tuple[int, int] | None = None
+            for _om, _on, other_bs, other_be, _oc, _oi in pending_fns:
+                if other_bs <= match.start() < other_be:
+                    if enclosing is None or other_bs >= enclosing[0]:
+                        enclosing = (other_bs, other_be)
+            if enclosing is None:
                 generated_by_macro[(rel, name)] = arm_list
+            else:
+                local_macros.setdefault(rel, []).append(
+                    _ScopedMacro(name, enclosing, match.start(), arm_list)
+                )
             if is_export:
                 exported_macros.setdefault(name, []).append((rel, name))
             out.append(
@@ -3719,9 +3863,17 @@ def index_functions(
                     attrs_line=_line(raw, match.start()),
                     macro_arms=tuple(arm_indices),
                     is_macro_export=is_export,
+                    enclosing_start=None if enclosing is None else enclosing[0],
                 )
             )
         scans.append((rel, raw, code, occupied, inline_spans))
+
+    _inherit_nested_macro_serials(generated_by_macro, local_macros)
+    generated_by_macro = {
+        key: arms
+        for key, arms in generated_by_macro.items()
+        if any(arm.serials for arm in arms)
+    }
 
     generated_by_module: dict[
         tuple[tuple[str, ...], str], list[tuple[Path, str]]
@@ -3745,15 +3897,25 @@ def index_functions(
             if any(start <= invoke.start() < end for start, end in occupied):
                 continue
             inline_mods = _inline_path_from_spans(inline_spans, invoke.start())
-            resolved_candidates = _serials_for_macro_invoke(
-                generated_by_macro=generated_by_macro,
-                generated_by_module=generated_by_module,
-                exported_macros=exported_macros,
-                rel=rel,
-                invoke=invoke,
-                file_imports=file_imports,
-                inline_mods=inline_mods,
+            fn_span = _innermost_span(fn_spans.get(rel, []), invoke.start())
+            local_arms = _local_macro_arms(
+                local_macros.get(rel, []),
+                macro_name,
+                fn_span,
+                invoke.start(),
             )
+            if local_arms is not None:
+                resolved_candidates = [(local_arms, rel, macro_name)]
+            else:
+                resolved_candidates = _serials_for_macro_invoke(
+                    generated_by_macro=generated_by_macro,
+                    generated_by_module=generated_by_module,
+                    exported_macros=exported_macros,
+                    rel=rel,
+                    invoke=invoke,
+                    file_imports=file_imports,
+                    inline_mods=inline_mods,
+                )
             if not resolved_candidates:
                 continue
             line = _line(raw, invoke.start())
@@ -3973,6 +4135,7 @@ def _resolve_calls(
     globs_by_file: dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
     keys_of: list[frozenset[str]],
     self_index: int,
+    functions: list[FnInfo],
     by_crate_module: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] | None = None,
     file_groups: dict[Path, frozenset[str]] | None = None,
 ) -> frozenset[str]:
@@ -4054,6 +4217,7 @@ def _resolve_calls(
             macro_defs_by_module,
             imports_by_file,
             globs_by_file,
+            functions,
         )
         if candidates:
             inner = _macro_invoke_inner(fn.body, m.end())
@@ -4079,7 +4243,7 @@ def _resolve_calls(
                 gained,
                 keys_of,
                 self_index,
-                by_macro_any.get(name, []),
+                _macros_visible_to(fn, by_macro_any.get(name, []), functions),
             )
     for m in QUALIFIED_CALL.finditer(fn.body):
         segs = tuple(s.strip() for s in m.group(1).split("::") if s.strip())
@@ -4441,6 +4605,7 @@ def analyze(
                 globs_by_file=globs_by_file,
                 keys_of=keys_of,
                 self_index=i,
+                functions=functions,
                 by_crate_module=by_crate_module,
                 file_groups=file_groups,
             )
@@ -4509,6 +4674,7 @@ def analyze(
                 globs_by_file=globs_by_file,
                 keys_of=keys_of,
                 self_index=-1,
+                functions=functions,
                 by_crate_module=by_crate_module,
                 file_groups=file_groups,
             )
