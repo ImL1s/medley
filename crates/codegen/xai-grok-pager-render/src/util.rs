@@ -4,7 +4,8 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub use xai_grok_config::grok_home;
 pub use xai_grok_tools::util::format_bytes;
@@ -204,8 +205,8 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> Cow<'_, str> {
 /// Byte offset at which display width would exceed `max_width`, or `s.len()`.
 pub fn byte_offset_at_width(s: &str, max_width: usize) -> usize {
     let mut width = 0;
-    for (i, ch) in s.char_indices() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (i, grapheme) in s.grapheme_indices(true) {
+        let cw = UnicodeWidthStr::width(grapheme);
         if width + cw > max_width {
             return i;
         }
@@ -259,6 +260,10 @@ mod tests {
         assert_eq!(truncate_to_width("日本語ラベル", 5).as_ref(), "日本…");
         assert_eq!(truncate_to_width("hello", 1).as_ref(), "…");
         assert_eq!(truncate_to_width("hello", 0).as_ref(), "");
+        let emoji = "A👩🏽\u{200d}💻B";
+        assert_eq!(truncate_to_width(emoji, 3).as_ref(), "A…");
+        assert_eq!(truncate_to_width(emoji, 4).as_ref(), "A👩🏽\u{200d}💻B");
+        assert!(!truncate_to_width(emoji, 3).contains('👩'));
     }
 
     #[test]

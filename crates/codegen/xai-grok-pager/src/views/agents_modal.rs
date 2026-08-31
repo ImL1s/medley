@@ -1053,6 +1053,11 @@ pub fn render_agents_modal(
     compact: bool,
     theme: &Theme,
 ) {
+    // Hit targets belong to one rendered frame. Clear them before asking the
+    // shared modal chrome for a layout so a resize that is temporarily too
+    // small cannot leave stale, clickable rows behind.
+    state.content_rect = None;
+    state.row_map.clear();
     let active_idx = AgentsTab::ALL
         .iter()
         .position(|t| *t == state.active_tab)
@@ -1080,7 +1085,6 @@ pub fn render_agents_modal(
         ..
     } = content;
     state.content_rect = Some(content_area);
-    state.row_map.clear();
     match state.active_tab {
         AgentsTab::Agents => render_agents_tab(buf, &content_area, state, theme),
         AgentsTab::Personas => render_personas_tab(buf, &content_area, state, theme),
@@ -1435,7 +1439,7 @@ fn render_agents_tab(
                 x += 2;
                 let name_w = entry.name.width();
                 let remaining = (content_area.x + content_area.width).saturating_sub(x) as usize;
-                let name_display: String = entry.name.chars().take(remaining).collect();
+                let name_display = crate::render::line_utils::truncate_str(&entry.name, remaining);
                 let mut name_style = Style::default()
                     .fg(theme.text_primary)
                     .add_modifier(Modifier::BOLD);
@@ -1528,23 +1532,8 @@ fn render_agents_tab(
                     if let Some(bg_color) = bg {
                         route_style = route_style.bg(bg_color);
                     }
-                    let display = if unicode_width::UnicodeWidthStr::width(route_label.as_str())
-                        > route_remaining
-                    {
-                        let mut out = String::new();
-                        let mut used = 0usize;
-                        for ch in route_label.chars() {
-                            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                            if used.saturating_add(width) > route_remaining {
-                                break;
-                            }
-                            out.push(ch);
-                            used += width;
-                        }
-                        out
-                    } else {
-                        route_label
-                    };
+                    let display =
+                        crate::render::line_utils::truncate_str(&route_label, route_remaining);
                     buf.set_string(x, row_y, &display, route_style);
                 }
             }
@@ -1570,7 +1559,7 @@ fn render_agents_tab(
             }
             FlatRow::Detail(text) => {
                 let detail_style = Style::default().fg(theme.gray);
-                let display: String = text.chars().take(w).collect();
+                let display = crate::render::line_utils::truncate_str(text, w);
                 buf.set_string(content_area.x, row_y, &display, detail_style);
             }
         }
@@ -3021,6 +3010,136 @@ mod tests {
                 scope_label: None,
             },
         ]
+    }
+    fn make_agent_entry(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        enabled: bool,
+    ) -> AgentListEntry {
+        let name = name.into();
+        let description = description.into();
+        let mut definition = BuiltinAgentName::GeneralPurpose.definition();
+        definition.name = name.clone();
+        definition.description = description.clone();
+        AgentListEntry {
+            name,
+            description,
+            scope: AgentScope::BuiltIn,
+            source_path: None,
+            enabled,
+            is_builtin: true,
+            expanded: false,
+            definition,
+            generation: 1,
+        }
+    }
+    fn make_agents_state(agents: Vec<AgentListEntry>) -> AgentsModalState {
+        AgentsModalState {
+            window: ModalWindowState::with_tabs(2),
+            active_tab: AgentsTab::Agents,
+            agents,
+            selected: 0,
+            scroll: 0,
+            search: LineEditor::default(),
+            search_active: false,
+            row_map: Vec::new(),
+            content_rect: None,
+            persona_input: None,
+            persona_confirm: None,
+            message: None,
+            cwd: PathBuf::new(),
+            bundle: BundleState::default(),
+            default_agent: String::new(),
+            active_agent: None,
+            model_agent_type: None,
+            personas: Vec::new(),
+            persona_selected: 0,
+            persona_scroll: 0,
+            persona_expanded: std::collections::HashSet::new(),
+            generation: 1,
+        }
+    }
+    fn buffer_text(buffer: &Buffer) -> String {
+        let area = buffer.area;
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn agents_render_does_not_split_multi_codepoint_emoji_grapheme() {
+        let grapheme = "👩🏽\u{200d}💻";
+        let name = format!("A{grapheme}B");
+        let mut state = make_agents_state(vec![make_agent_entry(&name, "", true)]);
+        for width in 44..60 {
+            let area = Rect::new(0, 0, width, 16);
+            let mut buffer = Buffer::empty(area);
+            render_agents_modal(&mut buffer, area, &mut state, false, &Theme::default());
+            let rendered = buffer_text(&buffer);
+            assert!(
+                !rendered.contains('👩') || rendered.contains(grapheme),
+                "width {width} split grapheme: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_mouse_targets_clear_on_tiny_resize_and_restore_focus() {
+        let mut state = make_agents_state(vec![
+            make_agent_entry("alpha", "first", true),
+            make_agent_entry("beta", "second", true),
+        ]);
+        state.selected = 1;
+        let normal = Rect::new(0, 0, 100, 28);
+        render_agents_modal(
+            &mut Buffer::empty(normal),
+            normal,
+            &mut state,
+            false,
+            &Theme::default(),
+        );
+        let tiny = Rect::new(0, 0, 8, 3);
+        render_agents_modal(
+            &mut Buffer::empty(tiny),
+            tiny,
+            &mut state,
+            false,
+            &Theme::default(),
+        );
+        assert!(state.content_rect.is_none());
+        assert!(state.row_map.is_empty());
+        render_agents_modal(
+            &mut Buffer::empty(normal),
+            normal,
+            &mut state,
+            false,
+            &Theme::default(),
+        );
+        assert_eq!(state.selected, 1);
+        assert!(!state.row_map.is_empty());
+    }
+
+    #[test]
+    fn agents_render_one_thousand_entries_with_bounded_frame_work() {
+        let agents = (0..1_000)
+            .map(|idx| make_agent_entry(format!("agent-{idx:04}"), "", true))
+            .collect();
+        let mut state = make_agents_state(agents);
+        state.selected = 999;
+        let area = Rect::new(0, 0, 120, 36);
+        let mut buffer = Buffer::empty(area);
+        let started = std::time::Instant::now();
+        render_agents_modal(&mut buffer, area, &mut state, false, &Theme::default());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(buffer_text(&buffer).contains("agent-0999"));
+        assert!(state.row_map.len() <= state.content_rect.unwrap().height as usize);
     }
     #[test]
     fn persona_select_next_advances() {
