@@ -96,7 +96,10 @@ _IDENT_OPEN = re.compile(rf"^\s*(?:r#)?({_RUST_IDENT})\s*\{{")
 _INLINE_MOD_OPEN = re.compile(
     rf"(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?({_RUST_IDENT})\s*\{{"
 )
-_PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]', re.DOTALL)
+_PATH_ATTR = re.compile(
+    r'#\[\s*path\s*=\s*(?:"([^"]*)"|r(#*)"((?:.|\n)*?)"\2)\s*\]',
+    re.DOTALL,
+)
 
 _HOT_PATH_MARKER = "CI's hot path is exactly this suite"
 _DOC_ENTRY = re.compile(r"`([a-z][a-z0-9_]*)`\s*\((\d+)\)")
@@ -1949,6 +1952,11 @@ def _host_target_vendor() -> str:
     return "unknown"
 
 
+def _path_attr_value(match: re.Match[str]) -> str:
+    quoted = match.group(1)
+    return quoted if quoted is not None else (match.group(3) or "")
+
+
 def _live_path_redirect(
     raw_for_path: str,
     mask_for_path: str,
@@ -1971,12 +1979,12 @@ def _live_path_redirect(
         start = raw_for_path.find("#[")
         if start < 0 or start >= len(mask_for_path) or mask_for_path[start] != "#":
             continue
-        return match.group(1), False
+        return _path_attr_value(match), False
     path_match = _PATH_ATTR.search(raw_for_path)
     if path_match:
         start = path_match.start()
         if start < len(mask_for_path) and mask_for_path[start] == "#":
-            return path_match.group(1), False
+            return _path_attr_value(path_match), False
     return None, False
 
 
@@ -2379,7 +2387,11 @@ def _file_inner_cfg_inactive(
         if stripped.startswith("#!["):
             if "cfg" in stripped:
                 attr = stripped.replace("#![", "#[", 1)
-                if _cfg_attr_is_inactive(attr, enabled_features):
+                expanded = _effective_attrs([attr], enabled_features)
+                if any(
+                    _cfg_attr_is_inactive(item, enabled_features)
+                    for item in expanded
+                ):
                     return True
             continue
         return False
@@ -2534,7 +2546,8 @@ def _tests_in_file(
             ) or bool(_TEST_ATTR.match(masked_line))
         enclosing_off = any(off for _, _, off in mod_stack)
         line_cfg_off = enclosing_off or any(
-            _cfg_attr_is_inactive(a, enabled_features) for a in pending + attrs
+            _cfg_attr_is_inactive(a, enabled_features)
+            for a in _effective_attrs(pending + attrs, enabled_features)
         )
         pushed_mod = False
         found = None
@@ -2590,7 +2603,8 @@ def _tests_in_file(
             pending.extend(attrs)
         elif remainder_masked.strip():
             item_off = enclosing_off or any(
-                _cfg_attr_is_inactive(a, enabled_features) for a in pending + attrs
+                _cfg_attr_is_inactive(a, enabled_features)
+                for a in _effective_attrs(pending + attrs, enabled_features)
             )
             pending = []
             line = _strip_line_comment(masked_line)
@@ -3085,6 +3099,26 @@ class ExternalModulePrefix(unittest.TestCase):
             (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_regressions::works", names)
+
+    def test_raw_string_path_attr_overrides_the_file_stem(self):
+        """`#[path = r\"actual.rs\"]` is a live redirect (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                '#[path = r"actual.rs"]\nmod child;\n'
+            )
+            (src / "actual.rs").write_text(
+                "#[test]\nfn none_auth_scheme_actual() {}\n"
+            )
+            (src / "child.rs").write_text(
+                "#[test]\nfn none_auth_scheme_child() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("child::none_auth_scheme_actual", names)
+            self.assertNotIn("child::none_auth_scheme_child", names)
 
     def test_path_attr_split_across_lines_is_followed(self):
         """`#[path =\\n\"actual.rs\"]` still redirects the module
@@ -5152,6 +5186,51 @@ class ExternalModulePrefix(unittest.TestCase):
             )
         else:
             self.assertEqual(names, ["none_auth_scheme_live"])
+
+    def test_cfg_attr_disabled_macro_invoke_is_not_counted(self):
+        """`#[cfg_attr(test, cfg(windows))] generated!();` is off on
+        Linux (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                () => {
+                    #[test]
+                    fn none_auth_scheme_phantom() {}
+                };
+            }
+            #[cfg_attr(test, cfg(windows))]
+            generated!();
+            #[test]
+            fn none_auth_scheme_live() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        if sys.platform == "win32":
+            self.assertEqual(
+                sorted(names),
+                ["none_auth_scheme_live", "none_auth_scheme_phantom"],
+            )
+        else:
+            self.assertEqual(names, ["none_auth_scheme_live"])
+
+    def test_inner_cfg_attr_gates_the_whole_file(self):
+        """`#![cfg_attr(test, cfg(windows))]` excludes the file on Linux
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "#![cfg_attr(test, cfg(windows))]\n"
+                "#[test]\nfn none_auth_scheme_phantom() {}\n"
+            )
+            names = _qualified_test_names(root)
+            if sys.platform == "win32":
+                self.assertIn("none_auth_scheme_phantom", names)
+            else:
+                self.assertNotIn("none_auth_scheme_phantom", names)
 
     def test_cfg_disabled_module_emitting_macro_is_not_followed(self):
         """`#[cfg(windows)] generated!();` emitting `mod child;` is off
