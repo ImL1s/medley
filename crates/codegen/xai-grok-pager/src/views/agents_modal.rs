@@ -617,19 +617,53 @@ fn persona_detail_from_local_file(
 /// Load the `[subagents.toggle]` map from config.toml.
 pub fn load_agent_toggle() -> Result<HashMap<String, bool>, String> {
     let root = xai_grok_shell::config::load_effective_config().map_err(|e| e.to_string())?;
+    Ok(toggle_map_from_effective_root(&root))
+}
+
+/// Effective `[subagents.toggle]` with the user layer taken from a pinned
+/// destination (the same path the mutation CAS snapshot locks).
+///
+/// `ConfigLayers::load` reads the user file through the logical
+/// `$GROK_HOME/config.toml` path. After `lock_config_destination` pins
+/// destination A, a retarget of that logical path would otherwise pair rows
+/// from B with a snapshot of A (#532 review).
+fn load_agent_toggle_with_pinned_user(dest: &Path) -> Result<HashMap<String, bool>, String> {
+    let mut layers = xai_grok_config::ConfigLayers::load().map_err(|e| e.to_string())?;
+    let text = crate::config_toml_edit::read_config_text(dest).map_err(|e| e.to_string())?;
+    let mut user = if text.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str(&text).map_err(|e| format!("parse pinned user config: {e}"))?
+    };
+    let user_campaigns = xai_grok_config::campaigns::take_campaign_entries(&mut user, "user");
+    layers.user = user;
+    layers.campaigns.user = user_campaigns;
+    Ok(toggle_map_from_effective_root(
+        &layers.effective_config_disk_only(),
+    ))
+}
+
+fn toggle_map_from_effective_root(root: &toml::Value) -> HashMap<String, bool> {
     let Some(subagents) = root.get("subagents") else {
-        return Ok(HashMap::new());
+        return HashMap::new();
     };
     let Some(toggle_table) = subagents.get("toggle") else {
-        return Ok(HashMap::new());
+        return HashMap::new();
     };
     let Some(table) = toggle_table.as_table() else {
-        return Ok(HashMap::new());
+        return HashMap::new();
     };
-    Ok(table
+    table
         .iter()
         .filter_map(|(k, v)| v.as_bool().map(|b| (k.to_string(), b)))
-        .collect())
+        .collect()
+}
+
+fn logical_destination_still_pinned(logical: &Path, dest: &Path) -> bool {
+    matches!(
+        xai_grok_config::fs_atomic::resolve_write_path(logical),
+        Ok(current) if current == *dest
+    )
 }
 /// Sanitize a name for use as a filename: replace non-alphanumeric chars
 /// (except `-` and `_`) with `-`, require at least one alphanumeric char.
@@ -809,13 +843,22 @@ fn capture_locked_config_state(
         );
     };
     // Hold the pinned destination lock. Overlay writers are not covered by that
-    // lock — load effective toggles inside the overlay digest window so rows
-    // pair with the mutation snapshot. Fail closed (no snapshot) if effective
-    // config cannot be read (#532 review).
+    // lock — load effective toggles (user layer from `dest`) inside the overlay
+    // digest window so rows pair with the mutation snapshot. Fail closed (no
+    // snapshot) if effective config cannot be read or the logical path no
+    // longer resolves to `dest` (#532 review).
     const MAX_ATTEMPTS: usize = 4;
     for _ in 0..MAX_ATTEMPTS {
+        if !logical_destination_still_pinned(&path, &dest) {
+            return (
+                None,
+                None,
+                resolve_default_agent_name(cwd, model_agent_type),
+                HashMap::new(),
+            );
+        }
         let before_overlay = crate::config_toml_edit::overlay_digest_for(&path);
-        let effective_toggle = match load_agent_toggle() {
+        let effective_toggle = match load_agent_toggle_with_pinned_user(&dest) {
             Ok(toggle) => toggle,
             Err(_) => {
                 return (
@@ -844,6 +887,9 @@ fn capture_locked_config_state(
             continue;
         };
         if snapshot.overlay_digest != before_overlay {
+            continue;
+        }
+        if !logical_destination_still_pinned(&path, &dest) {
             continue;
         }
         return (
