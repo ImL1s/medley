@@ -816,12 +816,10 @@ fn capture_locked_config_state(
         let before_overlay = crate::config_toml_edit::overlay_digest_for(&path);
         match load_toggle_and_agent_name_at(&dest) {
             Ok((toggle, agent_name)) => {
-                let Some(snapshot) =
-                    crate::config_toml_edit::config_mutation_snapshot_for_dest(
-                        &path, &dest, generation,
-                    )
-                    .ok()
-                else {
+                let Some(snapshot) = crate::config_toml_edit::config_mutation_snapshot_for_dest(
+                    &path, &dest, generation,
+                )
+                .ok() else {
                     continue;
                 };
                 if snapshot.overlay_digest != before_overlay {
