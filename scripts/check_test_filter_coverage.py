@@ -51,6 +51,7 @@ _VALUED_FLAGS = {"-p", "--package", "--manifest-path", "--features", "--test", "
 # Valueless flags.
 _BARE_FLAGS = {"--lib", "--all-targets", "--no-run", "--release", "--all-features", "--no-default-features"}
 ALL_FEATURES_TOKEN = "\x00all"
+NO_DEFAULT_FEATURES_TOKEN = "\x00nodefault"
 
 # Seen (token, line) pairs, so the shell-variable warning is emitted once per distinct
 # workflow line rather than once per occurrence.
@@ -211,6 +212,10 @@ def _parse_workflow(text: str, root: Path | None = None):
                 continue
             if a == "--all-features":
                 features.append(ALL_FEATURES_TOKEN)
+                i += 1
+                continue
+            if a == "--no-default-features":
+                features.append(NO_DEFAULT_FEATURES_TOKEN)
                 i += 1
                 continue
             if a in _BARE_FLAGS or a.startswith("-"):

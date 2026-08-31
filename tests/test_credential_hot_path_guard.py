@@ -73,6 +73,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from check_test_filter_coverage import (  # noqa: E402
     ALL_FEATURES_TOKEN,
     EXACT_PREFIX,
+    NO_DEFAULT_FEATURES_TOKEN,
     parse_workflow,
     parse_workflow_by_features,
 )
@@ -1243,6 +1244,7 @@ def _cargo_test_targets(
     root: Path,
     extra_features: frozenset[str] | set[str] | None = None,
     all_features: bool = False,
+    no_default_features: bool = False,
 ) -> tuple[
     set[Path],
     set[Path],
@@ -1303,12 +1305,12 @@ def _cargo_test_targets(
                 feat_table, _toml_str_list(feat_table.get("default"))
             )
             if all_features:
-                enabled = _feature_closure(
-                    feat_table, {name for name in feat_table if name != "default"}
-                )
+                enabled = _feature_closure(feat_table, set(feat_table))
+            elif no_default_features:
+                enabled = _feature_closure(feat_table, set(extra_features))
             else:
                 enabled = _feature_closure(
-                    feat_table, default_feats | set(extra_features)
+                    feat_table, default_feats | {"default"} | set(extra_features)
                 )
             crate_feats[crate.resolve()] = enabled
             lib = data.get("lib")
@@ -1397,11 +1399,12 @@ def _cargo_test_targets(
                 elif name:
                     target = (crate / "tests" / f"{name}.rs").resolve()
                 if target is not None:
-                    enabled_feats = (
-                        set(extra_features)
-                        if all_features
-                        else default_feats | set(extra_features)
-                    )
+                    if all_features:
+                        enabled_feats = set(extra_features) | default_feats | {"default"}
+                    elif no_default_features:
+                        enabled_feats = set(extra_features)
+                    else:
+                        enabled_feats = default_feats | {"default"} | set(extra_features)
                     extra_required = set() if all_features else required_feats - enabled_feats
                     if name:
                         test_names[target.resolve()] = name
@@ -1479,11 +1482,12 @@ def _cargo_test_targets(
                 inner = stripped.split("=", 1)[-1]
                 required_feats = set(re.findall(r'"([^"]+)"', inner))
         flush()
-        crate_feats[crate.resolve()] = (
-            set(extra_features)
-            if all_features
-            else default_feats | set(extra_features)
-        )
+        if all_features:
+            crate_feats[crate.resolve()] = set(extra_features) | default_feats | {"default"}
+        elif no_default_features:
+            crate_feats[crate.resolve()] = set(extra_features)
+        else:
+            crate_feats[crate.resolve()] = default_feats | {"default"} | set(extra_features)
     return extra, gated, suppressed_libs, no_autotest, crate_feats, test_names, lib_roots
 
 
@@ -1882,16 +1886,24 @@ def _include_concat_hits(text: str) -> list[tuple[int, str]]:
     return out
 
 
-def _lane_feature_args(feat: frozenset[str]) -> tuple[frozenset[str], bool]:
+def _lane_feature_args(
+    feat: frozenset[str],
+) -> tuple[frozenset[str], bool, bool]:
     all_features = ALL_FEATURES_TOKEN in feat
-    named = frozenset(name for name in feat if name != ALL_FEATURES_TOKEN)
-    return named, all_features
+    no_default = NO_DEFAULT_FEATURES_TOKEN in feat
+    named = frozenset(
+        name
+        for name in feat
+        if name not in {ALL_FEATURES_TOKEN, NO_DEFAULT_FEATURES_TOKEN}
+    )
+    return named, all_features, no_default
 
 
 def _declared_module_overrides(
     root: Path,
     extra_features: frozenset[str] | None = None,
     all_features: bool = False,
+    no_default_features: bool = False,
 ) -> dict[Path, list[tuple[list[str], str, tuple[tuple[str, str], ...]]]]:
     """Logical module prefixes for files reached via `mod` / `#[path]`.
 
@@ -1938,7 +1950,10 @@ def _declared_module_overrides(
 
     extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names, lib_roots = (
         _cargo_test_targets(
-            root, extra_features=extra_features, all_features=all_features
+            root,
+            extra_features=extra_features,
+            all_features=all_features,
+            no_default_features=no_default_features,
         )
     )
     for base in _CRATE_ROOTS:
@@ -3003,12 +3018,22 @@ def _qualified_test_records(
     all-features sentinel) so cfg-gated tests in that lane are counted
     (#507 review).
     """
-    named, all_features = _lane_feature_args(extra_features or frozenset())
+    named, all_features, no_default = _lane_feature_args(
+        extra_features or frozenset()
+    )
     overrides = _declared_module_overrides(
-        root, extra_features=named, all_features=all_features
+        root,
+        extra_features=named,
+        all_features=all_features,
+        no_default_features=no_default,
     )
     extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names, lib_roots = (
-        _cargo_test_targets(root, extra_features=named, all_features=all_features)
+        _cargo_test_targets(
+            root,
+            extra_features=named,
+            all_features=all_features,
+            no_default_features=no_default,
+        )
     )
     records: list[_TestRecord] = []
     pkg_cache: dict[Path, str] = {}
@@ -3430,6 +3455,76 @@ class CiPackageTargetCounts(unittest.TestCase):
                 records_for_feat, "none_auth_scheme_", lanes
             )
             self.assertEqual([r.name for r in matched], ["none_auth_scheme_hot"])
+
+    def test_default_cfg_name_is_enabled_with_manifest_defaults(self):
+        """Cargo enables `feature = \"default\"` when defaults are on
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"xai-grok-sampler\"\n\n"
+                "[features]\ndefault = [\"hot\"]\nhot = []\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[cfg(feature = \"default\")]\n"
+                "#[test]\nfn none_auth_scheme_default_cfg() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --lib "
+                "none_auth_scheme_ -- --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
+            feat = frozenset()
+            records_for_feat = {
+                feat: _qualified_test_records(root, extra_features=feat)
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "none_auth_scheme_", lanes
+            )
+            self.assertEqual(
+                [r.name for r in matched], ["none_auth_scheme_default_cfg"]
+            )
+
+    def test_no_default_features_lane_does_not_count_default_cfg(self):
+        """`--no-default-features` must not reuse the default-feature
+        lane key (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"xai-grok-sampler\"\n\n"
+                "[features]\ndefault = [\"hot\"]\nhot = []\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[cfg(feature = \"hot\")]\n"
+                "#[test]\nfn none_auth_scheme_hot() {}\n"
+                "#[cfg(not(feature = \"hot\"))]\n"
+                "#[test]\nfn none_auth_scheme_off() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler "
+                "--no-default-features --lib none_auth_scheme_ "
+                "-- --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
+            self.assertTrue(any(NO_DEFAULT_FEATURES_TOKEN in feat for _c, feat, _t in lanes))
+            feat = frozenset({NO_DEFAULT_FEATURES_TOKEN})
+            records_for_feat = {
+                feat: _qualified_test_records(root, extra_features=feat)
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "none_auth_scheme_", lanes
+            )
+            self.assertEqual([r.name for r in matched], ["none_auth_scheme_off"])
 
 
 class ExternalModulePrefix(unittest.TestCase):
