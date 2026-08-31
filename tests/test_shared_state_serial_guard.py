@@ -704,6 +704,31 @@ class TransitiveClosure(unittest.TestCase):
         self.assertTrue(any(n.startswith("case!") for n in names), names)
         self.assertEqual(len(names), 2, names)
 
+    def test_unicode_ident_macro_invocation_is_a_member(self):
+        """`make!(prémier)` is a `$name:ident` invocation (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! make {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            make!(prémier);
+            make!(deuxième);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertTrue(any(n.startswith("make!") for n in names), names)
+        self.assertEqual(len(names), 2, names)
+
     def test_wrapper_macro_delegates_to_test_generating_macro(self):
         """`wrapper!($name)` -> `make_test!($name)` still registers
         generated tests (#516 review)."""
@@ -4745,6 +4770,33 @@ class TypeAssociatedResolution(unittest.TestCase):
         else:
             self.assertEqual(names, set())
 
+    def test_crate_level_cfg_skips_the_whole_file(self):
+        """`#![cfg(windows)]` on an integration file is empty on Linux
+        (#516 review)."""
+
+        text = src(
+            """\
+            #![cfg(windows)]
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn first_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn second_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names([(Path("tests/win.rs"), text)], "demo_key")
+        if sys.platform == "win32":
+            self.assertEqual(names, {"first_untagged", "second_untagged"})
+        else:
+            self.assertEqual(names, set())
+
     def test_local_closure_binding_shadows_module_helper(self):
         """`let helper = || {}; helper();` must not inherit the module
         helper's keys (#516 review)."""
@@ -6093,6 +6145,54 @@ class DefaultScanRoots(unittest.TestCase):
         self.assertEqual(errors, [])
         names = {f.name for f in findings}
         self.assertEqual(names, {"path_toucher", "root_toucher"})
+
+    def test_path_mod_rs_does_not_pull_in_undeclared_orphans(self):
+        """`#[path = \"support/mod.rs\"]` compiles declared children,
+        not `support/orphan.rs` (#516 review)."""
+
+        sources = [
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    #[path = "support/mod.rs"]
+                    mod support;
+
+                    #[test]
+                    fn only_real() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/support/mod.rs"),
+                src(
+                    """\
+                    pub fn helper() {}
+                    """
+                ),
+            ),
+            (
+                Path("tests/support/orphan.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn orphan_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"only_real"})
+        findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
+        self.assertEqual(errors, [])
+        self.assertEqual(findings, [])
 
     def test_src_bin_crate_qualified_call_reaches_registered_state(self):
         """`crate::bump()` in `src/bin/tool.rs` is that binary's crate

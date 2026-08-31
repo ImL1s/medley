@@ -496,7 +496,9 @@ def _macro_invoke_inner(source: str, bang_end: int) -> str:
     return source[index + 1 : inner_end]
 
 
-_TOKEN = re.compile(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*|[0-9]+|::|[^\sA-Za-z0-9_]")
+_TOKEN = re.compile(
+    rf"(?:r#)?{RUST_IDENT_BODY}|[0-9]+|::|[^\sA-Za-z0-9_]"
+)
 
 
 def _token_list(text: str) -> list[str]:
@@ -568,7 +570,7 @@ def _fragment_token_ok(token: str, kind: str) -> bool:
     if kind == "tt":
         return True
     if kind == "ident":
-        return bool(re.fullmatch(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*", token))
+        return bool(re.fullmatch(rf"(?:r#)?{RUST_IDENT_BODY}", token))
     if kind == "lifetime":
         return bool(re.fullmatch(r"'(?:_|[A-Za-z_][A-Za-z0-9_]*)", token))
     if kind == "literal":
@@ -1237,6 +1239,24 @@ def _enclosing_module_cfg_inactive(
             attrs = _preceding_attributes(source, code, start)
             if any(_attr_cfg_inactive(a) for a in attrs):
                 return True
+    return False
+
+
+def _file_inner_cfg_inactive(text: str) -> bool:
+    """True when a leading `#![cfg(...)]` gates the whole file off."""
+
+    code = _code_only(text)
+    for raw in code.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#!["):
+            if "cfg" in stripped:
+                attr = stripped.replace("#![", "#[", 1)
+                if _attr_cfg_inactive(attr):
+                    return True
+            continue
+        return False
     return False
 
 
@@ -2389,14 +2409,6 @@ def _integration_binary_stem(path: Path) -> str | None:
     return None
 
 
-def _path_is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
 def _path_attr_files(declaring: Path, text: str) -> list[Path]:
     """Files a `#[path = \"...\"] mod` on `declaring` actually compiles."""
 
@@ -2407,12 +2419,20 @@ def _path_attr_files(declaring: Path, text: str) -> list[Path]:
 
 
 def _path_attr_covers(path: Path, target: Path) -> bool:
+    """True when `path` is the `#[path]` file Cargo actually compiles.
+
+    Descendants of `#[path = \"dir/mod.rs\"]` join the binary only
+    through `mod` declarations walked from that file (#516 review).
+    `#[path = \"support\"]` still selects `support.rs` / `support/mod.rs`.
+    """
+
     if _norm_posix(path) == _norm_posix(target):
         return True
-    if target.name == "mod.rs":
-        return _path_is_relative_to(path, target.parent)
-    if not str(target).endswith(".rs"):
-        return _path_is_relative_to(path, target)
+    if str(target).endswith(".rs"):
+        return False
+    for candidate in (Path(str(target) + ".rs"), target / "mod.rs"):
+        if _norm_posix(path) == _norm_posix(candidate):
+            return True
     return False
 
 
@@ -3651,7 +3671,7 @@ def index_functions(
         tuple[Path, str, str, list[tuple[int, int]], list[tuple[int, int, int, str]]]
     ] = []
     for rel, raw in sources:
-        if rel in inactive_files:
+        if rel in inactive_files or _file_inner_cfg_inactive(raw):
             continue
         code = _code_only(raw)
         impls = _impl_blocks(code)
