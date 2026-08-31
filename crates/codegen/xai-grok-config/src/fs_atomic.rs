@@ -4,15 +4,41 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-/// Sibling lock path for a config document (`config.toml` → `config.toml.lock`).
-pub fn config_lock_path(path: &Path) -> PathBuf {
+fn sibling_config_lock_path(path: &Path) -> PathBuf {
     match path.file_name() {
         Some(name) => path.with_file_name(format!("{}.lock", name.to_string_lossy())),
         None => path.with_extension("lock"),
     }
 }
 
-/// Exclusive advisory lock on a sibling `*.lock` file.
+fn path_is_under_grok_home(path: &Path, home: &Path) -> bool {
+    if path.starts_with(home) {
+        return true;
+    }
+    match (dunce::canonicalize(path), dunce::canonicalize(home)) {
+        (Ok(canonical), Ok(home)) => canonical.starts_with(&home),
+        _ => false,
+    }
+}
+
+/// Lock path for a config document.
+///
+/// User/managed files under [`crate::grok_home`] keep a sibling
+/// `config.toml.lock`. Project-scoped configs (e.g. `<repo>/.grok/config.toml`)
+/// use a hashed lock under `$GROK_HOME/locks/config/` so MCP mutations never
+/// leave untracked `.lock` artifacts in the working tree (#532 review).
+pub fn config_lock_path(path: &Path) -> PathBuf {
+    let home = crate::grok_home();
+    if path_is_under_grok_home(path, &home) {
+        return sibling_config_lock_path(path);
+    }
+    let digest = blake3::hash(path.to_string_lossy().as_bytes());
+    home.join("locks")
+        .join("config")
+        .join(format!("{}.lock", digest.to_hex()))
+}
+
+/// Exclusive advisory lock on the path from [`config_lock_path`].
 ///
 /// Released when the returned [`File`] is dropped. Portable: Unix `flock` and
 /// Windows `LockFileEx` via `fs2`.
@@ -138,11 +164,17 @@ mod tests {
 
     #[test]
     fn lock_config_file_is_exclusive_until_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let home = tempfile::tempdir().unwrap();
+        let _pin = crate::state_home::StateHomeGuard::pin(home.path());
+        let path = home.path().join("config.toml");
         std::fs::write(&path, "[ui]\n").unwrap();
         let held = lock_config_file(&path).unwrap();
         assert!(config_lock_path(&path).is_file());
+        assert_eq!(
+            config_lock_path(&path),
+            sibling_config_lock_path(&path),
+            "locks under grok_home stay as siblings"
+        );
         let second = OpenOptions::new()
             .read(true)
             .write(true)
@@ -154,9 +186,29 @@ mod tests {
     }
 
     #[test]
+    fn project_config_locks_live_outside_the_working_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let _pin = crate::state_home::StateHomeGuard::pin(home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let project = repo.path().join(".grok").join("config.toml");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "[mcp_servers]\n").unwrap();
+        let held = lock_config_file(&project).unwrap();
+        let lock = config_lock_path(&project);
+        assert!(lock.starts_with(home.path().join("locks").join("config")));
+        assert!(
+            !lock.starts_with(repo.path()),
+            "project locks must not land in the working tree"
+        );
+        assert!(!repo.path().join(".grok").join("config.toml.lock").exists());
+        drop(held);
+    }
+
+    #[test]
     fn lock_config_destination_pins_resolved_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let home = tempfile::tempdir().unwrap();
+        let _pin = crate::state_home::StateHomeGuard::pin(home.path());
+        let path = home.path().join("config.toml");
         std::fs::write(&path, "[ui]\n").unwrap();
         let (held, dest) = lock_config_destination(&path).unwrap();
         assert_eq!(dest, resolve_write_path(&path).unwrap());
