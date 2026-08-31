@@ -490,6 +490,33 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"calls_bump_untagged"})
 
+    def test_uppercase_bare_call_is_a_member(self):
+        """`Bump()` is a Rust identifier call (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[allow(non_snake_case)]
+            fn Bump() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn first_untagged() {
+                Bump();
+            }
+
+            #[test]
+            fn second_untagged() {
+                Bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_unused_nested_fn_body_is_not_a_direct_touch(self):
         """An unused nested `fn helper() { COUNTER... }` must not mark
         the enclosing test as a Stage-1 toucher (#516 review)."""
@@ -6218,6 +6245,62 @@ class DefaultScanRoots(unittest.TestCase):
         findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
         self.assertEqual(errors, [])
         self.assertEqual(findings, [])
+
+    def test_same_path_file_keeps_every_module_alias(self):
+        """`#[path = \"shared.rs\"] mod support` and `mod common` both
+        reach the helper (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("tests/shared.rs"),
+                src(
+                    """\
+                    pub fn bump() {
+                        xai_grok_shell::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/a.rs"),
+                src(
+                    """\
+                    #[path = "shared.rs"]
+                    mod support;
+
+                    #[test]
+                    fn first_untagged() {
+                        support::bump();
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/b.rs"),
+                src(
+                    """\
+                    #[path = "shared.rs"]
+                    mod common;
+
+                    #[test]
+                    fn second_untagged() {
+                        common::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
 
     def test_glob_import_of_library_static_is_a_touch(self):
         """`use xai_grok_shell::*; COUNTER` in an integration test is

@@ -285,7 +285,7 @@ IMPL_KW = re.compile(r"\bimpl\b")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 RUST_IDENT = re.compile(RUST_IDENT_BODY)
 FREE_CALL = re.compile(
-    rf"(?<![:.\w])(?:r#)?((?:[a-z_]|[^\W\dA-Z_])(?:\w|[^\x00-\x7f\s])*)\s*\("
+    rf"(?<![:.\w])(?:r#)?({RUST_IDENT_BODY})\s*\("
 )
 # `let helper = || {}` / `let helper: fn() = …` bind a value that shadows
 # a same-named module function for later bare calls (#516 review).
@@ -1672,7 +1672,7 @@ _PATH_ATTR_START = re.compile(r"#\[\s*path\s*=\s*")
 _PATH_MOD_TAIL = re.compile(
     rf"\s*\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?P<name>{RUST_IDENT_TOKEN})"
 )
-_PATH_OVERRIDE: dict[str, tuple[str, ...]] = {}
+_PATH_OVERRIDE: dict[str, tuple[tuple[str, ...], ...]] = {}
 _REEXPORTS: list[tuple[tuple[str, ...], str, tuple[str, ...], str]] = []
 _REEXPORT_EXACT: dict[
     tuple[tuple[str, ...], str], list[tuple[tuple[str, ...], str]]
@@ -1726,13 +1726,14 @@ def _load_path_overrides(sources: list[tuple[Path, str]]) -> None:
     for _ in range(len(decls) + 1):
         progressed = False
         for declaring, child, mod_name in decls:
-            parent = _module_path(declaring)
-            if parent is None:
-                parent = ()
-            new = parent + (mod_name,)
-            if _PATH_OVERRIDE.get(child) != new:
-                _PATH_OVERRIDE[child] = new
-                progressed = True
+            for parent in _module_paths(declaring):
+                prefix = () if parent is None else parent
+                new = prefix + (mod_name,)
+                existing = list(_PATH_OVERRIDE.get(child, ()))
+                if new not in existing:
+                    existing.append(new)
+                    _PATH_OVERRIDE[child] = tuple(existing)
+                    progressed = True
         if not progressed:
             break
 
@@ -1846,11 +1847,21 @@ def _module_path_fs(rel: Path) -> tuple[str, ...] | None:
     return tuple(segs)
 
 
-def _module_path(rel: Path) -> tuple[str, ...] | None:
+def _module_paths(rel: Path) -> tuple[tuple[str, ...] | None, ...]:
+    """Every logical module identity for `rel`.
+
+    The same `#[path]` file can be `mod support` in one target and
+    `mod common` in another; both aliases must stay (#516 review).
+    """
+
     found = _PATH_OVERRIDE.get(_norm_posix(rel))
-    if found is not None:
+    if found:
         return found
-    return _module_path_fs(rel)
+    return (_module_path_fs(rel),)
+
+
+def _module_path(rel: Path) -> tuple[str, ...] | None:
+    return _module_paths(rel)[0]
 
 
 def _raw_ident(name: str) -> str:
@@ -4036,10 +4047,10 @@ def index_functions(
         tuple[tuple[str, ...], str], list[tuple[Path, str]]
     ] = {}
     for rel, name in generated_by_macro:
-        module = _module_path(rel)
-        if module is None:
-            continue
-        generated_by_module.setdefault((module, name), []).append((rel, name))
+        for module in _module_paths(rel):
+            if module is None:
+                continue
+            generated_by_module.setdefault((module, name), []).append((rel, name))
     for name, definitions in exported_macros.items():
         root = generated_by_module.setdefault(((), name), [])
         root.extend(
@@ -4685,8 +4696,9 @@ def analyze(
             by_macro_any.setdefault(fn.name, []).append(i)
             if fn.macro_arms:
                 by_macro_arms[i] = fn.macro_arms
-            module = _module_path(fn.file)
-            if module is not None:
+            for module in _module_paths(fn.file):
+                if module is None:
+                    continue
                 definition_module = module + fn.inline_mods
                 macro_defs_by_module.setdefault(
                     (definition_module, fn.name), []
@@ -4700,16 +4712,8 @@ def analyze(
         by_inline.setdefault(
             (fn.file, fn.inline_mods, fn.enclosing_start), {}
         ).setdefault(fn.name, []).append(i)
-        module = _module_path(fn.file)
-        crate_mod = module if module is not None else ()
-        for group in file_groups.get(fn.file, frozenset({_process_group(fn.file)})):
-            by_crate_module.setdefault((group, crate_mod), {}).setdefault(
-                fn.name, []
-            ).append(i)
-            if fn.inline_mods:
-                by_crate_module.setdefault(
-                    (group, crate_mod + fn.inline_mods), {}
-                ).setdefault(fn.name, []).append(i)
+        groups = file_groups.get(fn.file, frozenset({_process_group(fn.file)}))
+        for group in groups:
             if fn.type_name is not None:
                 by_type.setdefault((group, fn.type_name), {}).setdefault(
                     fn.name, []
@@ -4722,7 +4726,18 @@ def analyze(
                 by_typed_trait.setdefault(
                     (group, fn.type_name, fn.trait_name), {}
                 ).setdefault(fn.name, []).append(i)
-        if module is not None:
+        for module in _module_paths(fn.file):
+            crate_mod = module if module is not None else ()
+            for group in groups:
+                by_crate_module.setdefault((group, crate_mod), {}).setdefault(
+                    fn.name, []
+                ).append(i)
+                if fn.inline_mods:
+                    by_crate_module.setdefault(
+                        (group, crate_mod + fn.inline_mods), {}
+                    ).setdefault(fn.name, []).append(i)
+            if module is None:
+                continue
             # `module` is a valid module path even when empty (`()` is the
             # crate root itself, from a function declared directly in
             # `src/lib.rs`/`src/main.rs` -- reachable as `crate::name()`,
