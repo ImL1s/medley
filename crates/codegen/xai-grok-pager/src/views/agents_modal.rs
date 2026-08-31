@@ -311,16 +311,16 @@ impl AgentsModalState {
     /// populating personas from `bundle`.
     pub fn new(
         cwd: &Path,
-        toggle: &HashMap<String, bool>,
+        _toggle: &HashMap<String, bool>,
         bundle: &BundleState,
         model_agent_type: Option<&str>,
         active_agent: Option<String>,
     ) -> Self {
-        let mut agents = build_agent_list(cwd, toggle);
+        let (config_snapshot, config_agent_name, default_agent, locked_toggle) =
+            capture_locked_config_state(1, cwd, model_agent_type);
+        let mut agents = build_agent_list(cwd, &locked_toggle);
         stamp_entry_generation(&mut agents, 1);
         let personas = merge_persona_lists(bundle, cwd);
-        let (config_snapshot, config_agent_name, default_agent) =
-            capture_locked_config_state(1, cwd, model_agent_type);
         Self {
             window: ModalWindowState::with_tabs(AgentsTab::ALL.len()),
             active_tab: AgentsTab::Agents,
@@ -350,9 +350,8 @@ impl AgentsModalState {
     }
     /// Rebuild agent list from disk after a mutation.
     fn rebuild_agents(&mut self) {
-        let toggle = load_agent_toggle();
         self.generation = self.generation.saturating_add(1);
-        let (snapshot, agent_name, default_agent) = capture_locked_config_state(
+        let (snapshot, agent_name, default_agent, toggle) = capture_locked_config_state(
             self.generation,
             &self.cwd,
             self.model_agent_type.as_deref(),
@@ -774,6 +773,26 @@ fn capture_config_snapshot(
     crate::config_toml_edit::config_mutation_snapshot(&path, generation).ok()
 }
 
+fn load_user_config_toggle(path: &Path) -> HashMap<String, bool> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
+        return HashMap::new();
+    };
+    let Some(table) = doc
+        .get("subagents")
+        .and_then(|v| v.get("toggle"))
+        .and_then(|v| v.as_table())
+    else {
+        return HashMap::new();
+    };
+    table
+        .iter()
+        .filter_map(|(k, v)| v.as_bool().map(|b| (k.to_string(), b)))
+        .collect()
+}
+
 fn capture_locked_config_state(
     generation: u64,
     cwd: &Path,
@@ -782,6 +801,7 @@ fn capture_locked_config_state(
     Option<crate::config_toml_edit::ConfigMutationSnapshot>,
     Option<String>,
     String,
+    HashMap<String, bool>,
 ) {
     let path = xai_grok_config::grok_home().join("config.toml");
     let _lock = crate::config_toml_edit::lock_config_file(&path).ok();
@@ -789,6 +809,7 @@ fn capture_locked_config_state(
         capture_config_snapshot(generation),
         load_config_agent_name(),
         resolve_default_agent_name(cwd, model_agent_type),
+        load_user_config_toggle(&path),
     )
 }
 /// Set or clear the default agent via `[agent] name` in config.toml.
@@ -2314,7 +2335,7 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                 };
                 match set_default_agent(new_default, rendered, state.generation) {
                     Ok(()) => {
-                        let (snapshot, agent_name, default_agent) = capture_locked_config_state(
+                        let (snapshot, agent_name, default_agent, _) = capture_locked_config_state(
                             state.generation,
                             &state.cwd,
                             state.model_agent_type.as_deref(),
@@ -2803,6 +2824,30 @@ mod tests {
             message.text
         );
         assert!(state.agents[0].enabled);
+    }
+    #[test]
+    fn new_loads_toggle_under_the_same_lock_as_the_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let _pin = xai_grok_config::state_home::StateHomeGuard::pin(home.path());
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[subagents.toggle]\nexplore = false\n",
+        )
+        .unwrap();
+        let mut supplied = HashMap::new();
+        supplied.insert("explore".to_string(), true);
+        let state =
+            AgentsModalState::new(home.path(), &supplied, &BundleState::default(), None, None);
+        let explore = state
+            .agents
+            .iter()
+            .find(|entry| entry.name == "explore")
+            .expect("explore agent");
+        assert!(
+            !explore.enabled,
+            "toggle must come from locked config.toml, not the caller map"
+        );
+        assert!(state.config_snapshot.is_some());
     }
     #[test]
     fn model_picker_actions_are_generation_bound_and_persistence_explicit() {

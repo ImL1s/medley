@@ -1395,6 +1395,18 @@ pub(crate) fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
         return;
     }
 
+    // Same lock order as `handle_add_source`: config.toml.lock then init lock.
+    let _cfg = match xai_grok_config::fs_atomic::lock_config_file(&config_path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %config_path.display(),
+                "skipping official marketplace auto-register: failed to lock config.toml"
+            );
+            return;
+        }
+    };
     let _lock = match acquire_init_lock(grok_home) {
         Ok(f) => f,
         Err(e) => {

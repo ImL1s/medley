@@ -69,10 +69,6 @@ fn read_config_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn config_lock_path(path: &Path) -> std::path::PathBuf {
-    xai_grok_config::fs_atomic::config_lock_path(path)
-}
-
 pub(crate) fn lock_config_file(path: &Path) -> std::io::Result<File> {
     xai_grok_config::fs_atomic::lock_config_file(path)
 }
@@ -582,7 +578,7 @@ mod tests {
             assert!(body.contains("memory_modal_fullscreen"));
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
-            assert!(config_lock_path(&path).is_file());
+            assert!(xai_grok_config::fs_atomic::config_lock_path(&path).is_file());
         }
         #[cfg(not(unix))]
         {
@@ -590,7 +586,7 @@ mod tests {
             let path = dir.path().join("config.toml");
             fs::write(&path, "[ui]\ntheme = \"dark\"\n").unwrap();
             set_hint_at(&path, "memory_modal_fullscreen", true).unwrap();
-            assert!(config_lock_path(&path).is_file());
+            assert!(xai_grok_config::fs_atomic::config_lock_path(&path).is_file());
         }
     }
 

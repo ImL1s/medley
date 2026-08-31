@@ -3191,6 +3191,14 @@ fn add_dismissed_plugin_cta_preserves_other_config() {
     assert!(dismissed_plugin_ctas_in_file(&config_path).contains("figma"));
 }
 #[test]
+fn add_dismissed_plugin_cta_uses_shared_config_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    add_dismissed_plugin_cta_to_file("figma", &config_path).unwrap();
+    assert!(xai_grok_config::fs_atomic::config_lock_path(&config_path).is_file());
+    assert!(dismissed_plugin_ctas_in_file(&config_path).contains("figma"));
+}
+#[test]
 fn config_layers_user_overrides_managed() {
     let layers = ConfigLayers {
         system_managed: toml::Value::Table(Default::default()),
