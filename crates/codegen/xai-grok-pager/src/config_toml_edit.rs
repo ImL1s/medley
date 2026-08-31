@@ -182,6 +182,28 @@ where
     Ok(outcome)
 }
 
+fn restore_original_if_unchanged<R, W>(
+    path: &Path,
+    original: &[u8],
+    intended: &[u8],
+    read: &mut R,
+    write: &mut W,
+) -> Result<bool, ConfigMutationError>
+where
+    R: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+    W: FnMut(&Path, &str) -> std::io::Result<()>,
+{
+    match read(path) {
+        Ok(bytes) if bytes == intended => {
+            let original = std::str::from_utf8(original).expect("validated UTF-8 above");
+            write(path, original).map_err(ConfigMutationError::Rollback)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(error) => Err(ConfigMutationError::Rollback(error)),
+    }
+}
+
 fn mutate_config_document_at_with<F, R, W>(
     path: &Path,
     overlay_path: &Path,
@@ -224,8 +246,13 @@ where
     match read(path) {
         Ok(bytes) if bytes == intended.as_bytes() => {
             if overlay_digest_for(overlay_path) != rendered.overlay_digest {
-                let original = String::from_utf8(original).expect("validated UTF-8 above");
-                write(path, &original).map_err(ConfigMutationError::Rollback)?;
+                restore_original_if_unchanged(
+                    path,
+                    &original,
+                    intended.as_bytes(),
+                    &mut read,
+                    &mut write,
+                )?;
                 return Err(ConfigMutationError::ConcurrentEdit);
             }
             Ok(ConfigMutationOutcome {
@@ -242,9 +269,18 @@ where
         Ok(_) => Err(ConfigMutationError::ConcurrentEdit),
         Err(error) => match read(path) {
             Ok(bytes) if bytes == intended.as_bytes() => {
-                let original = String::from_utf8(original).expect("validated UTF-8 above");
-                write(path, &original).map_err(ConfigMutationError::Rollback)?;
-                Err(ConfigMutationError::Readback(error))
+                let restored = restore_original_if_unchanged(
+                    path,
+                    &original,
+                    intended.as_bytes(),
+                    &mut read,
+                    &mut write,
+                )?;
+                if restored {
+                    Err(ConfigMutationError::Readback(error))
+                } else {
+                    Err(ConfigMutationError::ConcurrentEdit)
+                }
             }
             Ok(bytes) if bytes.as_slice() == original.as_slice() => {
                 Err(ConfigMutationError::Readback(error))
@@ -584,6 +620,44 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, ConfigMutationError::ConcurrentEdit));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn transaction_does_not_rollback_over_a_newer_editor_after_overlay_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[ui]\ntheme = \"dark\"\n";
+        fs::write(&path, original).unwrap();
+        let rendered = config_mutation_snapshot(&path, 1).unwrap();
+        let campaign = dir.path().join("campaigns_state.json");
+        let reads = Cell::new(0);
+        let error = mutate_config_document_at_with(
+            &path,
+            &path,
+            &rendered,
+            1,
+            set_agent_enabled,
+            |path| {
+                let n = reads.get();
+                reads.set(n + 1);
+                if n >= 2 {
+                    return Ok(b"newer-from-editor\n".to_vec());
+                }
+                fs::read(path)
+            },
+            |path, contents| {
+                fs::write(&campaign, "{\"dismissed_ids\":[\"camp-1\"]}\n").unwrap();
+                fs::write(path, contents)
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigMutationError::ConcurrentEdit));
+        let body = fs::read_to_string(&path).unwrap();
+        assert_ne!(body, original);
+        assert!(
+            body.contains("verifier"),
+            "newer editor reread must skip rollback: {body}"
+        );
     }
 
     #[test]

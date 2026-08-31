@@ -1084,6 +1084,8 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             atomic_write_string_at_keeps_pinned_destination_verbatim -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
+            transaction_does_not_rollback_over_a_newer_editor_after_overlay_mismatch -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
             new_loads_toggle_under_the_same_lock_as_the_snapshot -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             add_dismissed_plugin_cta_uses_shared_config_lock -- --nocapture
