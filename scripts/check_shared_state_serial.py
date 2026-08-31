@@ -2326,19 +2326,19 @@ def _fn_import(
 
 def _local_glob_scopes(
     globs: tuple[tuple[int, int, tuple[str, ...]], ...], pos: int
-) -> list[list[tuple[str, ...]]]:
+) -> list[tuple[int, int, list[tuple[str, ...]]]]:
     """Applicable local glob modules, grouped innermost lexical scope first."""
 
     hits = [entry for entry in globs if entry[0] <= pos < entry[1]]
     hits.sort(key=lambda entry: (entry[1] - entry[0], -entry[0]))
-    scopes: list[list[tuple[str, ...]]] = []
+    scopes: list[tuple[int, int, list[tuple[str, ...]]]] = []
     previous: tuple[int, int] | None = None
     for start, end, module in hits:
         scope = (start, end)
         if scope != previous:
-            scopes.append([])
+            scopes.append((start, end, []))
             previous = scope
-        scopes[-1].append(module)
+        scopes[-1][2].append(module)
     return scopes
 
 
@@ -2429,7 +2429,7 @@ def _body_touches(
     same-named `a::COUNTER` (#516 review).
     """
 
-    del original
+    original_names = frozenset(original or identifiers)
     code_only_body = _mask_use_items(code_only_body)
 
     def imported_at(name: str, pos: int) -> tuple[tuple[str, ...], str] | None:
@@ -2486,6 +2486,8 @@ def _body_touches(
                         module, fname, static_module, identifiers
                     ):
                         continue
+            elif ident not in original_names:
+                continue
             return True
     return False
 
@@ -2970,6 +2972,9 @@ def index_functions(
             body_start, body_end = body_span
             occupied.append((body_start, body_end))
             body_code = _strip_turbofish(code[body_start:body_end])
+            macro_inline_mods = _inline_path_from_spans(
+                inline_spans, match.start()
+            )
             macro_attrs = _preceding_attributes(raw, code, match.start())
             is_export = any("macro_export" in a for a in macro_attrs)
             keys = frozenset(
@@ -2989,16 +2994,28 @@ def index_functions(
             arm_indices: list[tuple[str, int]] = []
             for matcher, arm_body in _macro_rule_arms(raw_macro_body):
                 arm_code = _strip_turbofish(_code_only(arm_body))
+                arm_local_uses, arm_local_globs = _local_uses_from_body(
+                    arm_code, _module_path(rel), macro_inline_mods
+                )
                 arm_keys = frozenset(
                     item.key
                     for item in registry
                     if _body_touches(
                         arm_code,
-                        item.identifiers,
+                        item.identifiers
+                        + tuple(
+                            {
+                                use[2]
+                                for use in arm_local_uses
+                                if use[4] in item.identifiers
+                            }
+                        ),
                         original=item.identifiers,
                         static_module=_item_module(item),
                         fn_module=_module_path(rel),
+                        inline_mods=macro_inline_mods,
                         scoped_imports=file_imports,
+                        local_uses=arm_local_uses,
                     )
                 )
                 arm_index = len(out)
@@ -3009,7 +3026,7 @@ def index_functions(
                         type_name=None,
                         trait_name=None,
                         is_macro=False,
-                        inline_mods=(),
+                        inline_mods=macro_inline_mods,
                         body=arm_code,
                         start=body_start,
                         keys=arm_keys,
@@ -3017,6 +3034,8 @@ def index_functions(
                         serial_held=frozenset(),
                         has_unkeyed_serial=False,
                         attrs_line=_line(raw, match.start()),
+                        local_uses=arm_local_uses,
+                        local_globs=arm_local_globs,
                         is_macro_arm=True,
                     )
                 )
@@ -3072,7 +3091,7 @@ def index_functions(
                     type_name=None,
                     trait_name=None,
                     is_macro=True,
-                    inline_mods=(),
+                    inline_mods=macro_inline_mods,
                     body=body_code,
                     start=body_start,
                     keys=keys,
@@ -3297,7 +3316,7 @@ def _resolve_calls(
     by_macro: dict[Path, dict[str, int]],
     by_macro_any: dict[str, list[int]],
     by_macro_arms: dict[tuple[Path, str], tuple[tuple[str, int], ...]],
-    macro_files_by_module: dict[tuple[str, ...], Path],
+    macro_defs_by_module: dict[tuple[tuple[str, ...], str], tuple[Path, str]],
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]],
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
@@ -3320,16 +3339,42 @@ def _resolve_calls(
         # all kept; callers union their keys (#516 review).
         name = m.group(1)
         js: list[int] = []
-        imported = _fn_import(fn, name, m.start(), imports_by_file)
-        if imported is not None:
-            module, fname = imported
-            js = by_module.get(module, {}).get(fname, [])
-        if not js:
-            for modules in _local_glob_scopes(fn.local_globs, m.start()):
-                for module in modules:
-                    js.extend(by_module.get(module, {}).get(name, []))
+        local_named = [
+            entry
+            for entry in fn.local_uses
+            if entry[2] == name and entry[0] <= m.start() < entry[1]
+        ]
+        local_by_scope = {
+            (entry[0], entry[1]): entry for entry in local_named
+        }
+        glob_by_scope = {
+            (start, end): modules
+            for start, end, modules in _local_glob_scopes(
+                fn.local_globs, m.start()
+            )
+        }
+        local_scopes = sorted(
+            set(local_by_scope) | set(glob_by_scope),
+            key=lambda scope: (scope[1] - scope[0], -scope[0]),
+        )
+        for scope in local_scopes:
+            named = local_by_scope.get(scope)
+            if named is not None:
+                js.extend(by_module.get(named[3], {}).get(named[4], []))
                 if js:
                     break
+                continue
+            for module in glob_by_scope.get(scope, []):
+                js.extend(by_module.get(module, {}).get(name, []))
+            if js:
+                break
+        if not js:
+            imported = _lookup_import(
+                imports_by_file.get(fn.file, {}), fn.inline_mods, name
+            )
+            if imported is not None:
+                module, fname = imported
+                js = by_module.get(module, {}).get(fname, [])
         if not js:
             prefix = fn.inline_mods
             while True:
@@ -3353,7 +3398,9 @@ def _resolve_calls(
         resolved = name
         if imported is not None:
             module, resolved = imported
-            def_file = macro_files_by_module.get(module, def_file)
+            definition = macro_defs_by_module.get((module, resolved))
+            if definition is not None:
+                def_file, resolved = definition
         arms = by_macro_arms.get((def_file, resolved))
         if arms:
             inner = _macro_invoke_inner(fn.body, m.end())
@@ -3567,11 +3614,9 @@ def analyze(
     by_macro: dict[Path, dict[str, int]] = {}
     by_macro_any: dict[str, list[int]] = {}
     by_macro_arms: dict[tuple[Path, str], tuple[tuple[str, int], ...]] = {}
-    macro_files_by_module = {
-        module: path
-        for path, _text in sources
-        if (module := _module_path(path)) is not None
-    }
+    macro_defs_by_module: dict[
+        tuple[tuple[str, ...], str], tuple[Path, str]
+    ] = {}
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]] = {}
     for i, fn in enumerate(functions):
         if fn.is_macro:
@@ -3579,6 +3624,12 @@ def analyze(
             by_macro_any.setdefault(fn.name, []).append(i)
             if fn.macro_arms:
                 by_macro_arms[(fn.file, fn.name)] = fn.macro_arms
+            module = _module_path(fn.file)
+            if module is not None:
+                macro_defs_by_module[(module + fn.inline_mods, fn.name)] = (
+                    fn.file,
+                    fn.name,
+                )
             continue
         if fn.is_macro_arm:
             continue
@@ -3625,6 +3676,28 @@ def analyze(
     for path, text in sources:
         reexports.extend(_pub_reexports(path, text))
     _copy_reexports_into_indices(reexports, by_module, by_leaf)
+    for _ in range(len(reexports) + 1):
+        changed = False
+        for dest, local, src, fname in reexports:
+            if fname == "*":
+                candidates = [
+                    (name, definition)
+                    for (module, name), definition in macro_defs_by_module.items()
+                    if module == src
+                ]
+            else:
+                definition = macro_defs_by_module.get((src, fname))
+                candidates = (
+                    [(local, definition)] if definition is not None else []
+                )
+            for dest_name, definition in candidates:
+                key = (dest, dest_name)
+                if macro_defs_by_module.get(key) == definition:
+                    continue
+                macro_defs_by_module[key] = definition
+                changed = True
+        if not changed:
+            break
 
     keys_of: list[frozenset[str]] = [fn.keys for fn in functions]
     converged = False
@@ -3640,7 +3713,7 @@ def analyze(
                 by_macro=by_macro,
                 by_macro_any=by_macro_any,
                 by_macro_arms=by_macro_arms,
-                macro_files_by_module=macro_files_by_module,
+                macro_defs_by_module=macro_defs_by_module,
                 by_inline=by_inline,
                 imports_by_file=imports_by_file,
                 globs_by_file=globs_by_file,
@@ -3704,7 +3777,7 @@ def analyze(
                 by_macro=by_macro,
                 by_macro_any=by_macro_any,
                 by_macro_arms=by_macro_arms,
-                macro_files_by_module=macro_files_by_module,
+                macro_defs_by_module=macro_defs_by_module,
                 by_inline=by_inline,
                 imports_by_file=imports_by_file,
                 globs_by_file=globs_by_file,

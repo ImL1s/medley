@@ -1746,6 +1746,110 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"first_touching", "second_touching"})
 
+    def test_reexported_macro_keeps_selected_arm_keys(self):
+        """A macro imported through `pub use` must not fall back to the
+        definition's macro-wide dirty-arm union (#516 review)."""
+
+        sources = [
+            (
+                Path("src/inner.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    macro_rules! inner {
+                        (touch) => { COUNTER.fetch_add(1, Ordering::SeqCst); };
+                        (clean) => {};
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/bridge.rs"),
+                src("pub use crate::inner::inner as relay;\n"),
+            ),
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    use crate::bridge::relay;
+
+                    #[test]
+                    fn first_clean() { relay!(clean); }
+
+                    #[test]
+                    fn second_clean() { relay!(clean); }
+
+                    #[test]
+                    fn first_touching() { relay!(touch); }
+
+                    #[test]
+                    fn second_touching() { relay!(touch); }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_touching", "second_touching"})
+
+    def test_macro_arm_local_imports_reach_helper_keys(self):
+        """Selected macro arms carry their own named and glob imports into
+        call-graph closure (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn helper() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    macro_rules! named {
+                        (touch) => {{
+                            use crate::a::helper;
+                            helper();
+                        }};
+                    }
+
+                    macro_rules! globbed {
+                        (touch) => {{
+                            use crate::a::*;
+                            helper();
+                        }};
+                    }
+
+                    #[test]
+                    fn first_named() { named!(touch); }
+
+                    #[test]
+                    fn second_named() { named!(touch); }
+
+                    #[test]
+                    fn first_globbed() { globbed!(touch); }
+
+                    #[test]
+                    fn second_globbed() { globbed!(touch); }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(
+            names,
+            {"first_named", "second_named", "first_globbed", "second_globbed"},
+        )
+
     def test_qualified_static_in_another_module_is_not_a_touch(self):
         """`crate::b::COUNTER` is not the registered `a::COUNTER`
         (#516 review)."""
@@ -2339,6 +2443,54 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, set())
 
+    def test_inner_local_glob_precedes_outer_named_imports(self):
+        """An innermost local glob wins over both module-level and outer-block
+        named imports of the same function (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (Path("src/b.rs"), src("pub fn bump() {}\n")),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    use crate::b::bump;
+
+                    #[test]
+                    fn module_named_untagged() {
+                        use crate::a::*;
+                        bump();
+                    }
+
+                    #[test]
+                    fn outer_local_named_untagged() {
+                        use crate::b::bump;
+                        {
+                            use crate::a::*;
+                            bump();
+                        }
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(
+            names, {"module_named_untagged", "outer_local_named_untagged"}
+        )
+
     def test_nested_block_static_use_does_not_shadow_outer_access(self):
         """Outer `use crate::a::COUNTER` then inner `use crate::b::COUNTER`
         must keep the outer access (#516 review)."""
@@ -2380,6 +2532,44 @@ class TransitiveClosure(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertIn("uses_outer_counter_untagged", names)
+
+    def test_nested_block_static_alias_does_not_escape_its_scope(self):
+        """A local alias from a nested block must not turn an outer local
+        variable with the same name into a registered-static touch."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn first_clean() {
+                        let C = local_counter();
+                        C.load(Ordering::SeqCst);
+                        { use crate::a::COUNTER as C; }
+                    }
+
+                    #[test]
+                    fn second_clean() {
+                        let C = local_counter();
+                        C.load(Ordering::SeqCst);
+                        { use crate::a::COUNTER as C; }
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, set())
 
     def test_reexported_function_resolves_through_the_exporting_module(self):
         """`pub use crate::a::bump` in `b.rs` must make `crate::b::bump()`
