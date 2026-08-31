@@ -696,6 +696,10 @@ pub enum SessionUpdate {
         /// Catalog id selected by native route resolution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selected_catalog_id: Option<String>,
+        /// Canonical secret-free route/lifecycle projection. Generation `0`
+        /// denotes a read-only receipt snapshot and cannot admit mutation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route_snapshot: Option<Box<xai_grok_subagent_resolution::AgentRouteUxSnapshot>>,
     },
     /// Periodic progress update for a running subagent.
     ///
@@ -1653,6 +1657,7 @@ mod tests {
             workflow_run_id: None,
             route_receipt_digest: None,
             selected_catalog_id: None,
+            route_snapshot: None,
         })
         .unwrap();
         let progress = serde_json::to_value(SessionUpdate::SubagentProgress {

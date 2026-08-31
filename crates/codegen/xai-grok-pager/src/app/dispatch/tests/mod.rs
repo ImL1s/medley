@@ -424,6 +424,7 @@ fn make_test_subagent(child_sid: &str, sa_id: &str) -> crate::app::subagent::Sub
         persona: None,
         role: None,
         model: None,
+        route_snapshot: None,
         context_source: None,
         resumed_from: None,
         capability_mode: None,

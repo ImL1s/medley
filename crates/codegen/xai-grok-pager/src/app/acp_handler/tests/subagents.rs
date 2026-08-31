@@ -1,6 +1,60 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
     use super::*;
 
+    #[test]
+    fn spawned_route_snapshot_survives_acp_into_tui_state() {
+        let mut app = make_app_with_agent("sess-1");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .session
+            .loading_replay = true;
+        let spawned = subagent_ext_replay(
+            "sess-1",
+            serde_json::json!({
+                "sessionUpdate": "subagent_spawned",
+                "subagent_id": "sa-route",
+                "parent_session_id": "sess-1",
+                "child_session_id": "child-route",
+                "subagent_type": "verifier",
+                "description": "review",
+                "route_snapshot": {
+                    "generation": 0,
+                    "agentId": "verifier",
+                    "displayName": "Verifier",
+                    "scope": "session",
+                    "enabled": true,
+                    "active": true,
+                    "defaultForNewSessions": false,
+                    "selectionMode": "exact",
+                    "requestedModelRefs": ["review-primary"],
+                    "routeStatus": "ready",
+                    "selectedCatalogId": "review-primary",
+                    "selectedWireModel": "wire-review",
+                    "routeReceiptDigest": "receipt-abc",
+                    "attempt": 2,
+                    "rejectedCandidates": [],
+                    "lastFallbackAdmitted": false
+                }
+            }),
+            "sess-1-route",
+        );
+        handle_ext_notification(&spawned, &mut app);
+
+        let info = app.agents[&AgentId(0)]
+            .subagent_sessions
+            .get("child-route")
+            .unwrap();
+        let route = info.route_snapshot.as_ref().unwrap();
+        assert_eq!(route.selected_catalog_id.as_deref(), Some("review-primary"));
+        assert_eq!(route.route_receipt_digest.as_deref(), Some("receipt-abc"));
+        assert_eq!(route.attempt, Some(2));
+        assert_eq!(
+            crate::app::subagent::format_route_lifecycle_label(info),
+            "review-primary · ready · fallback refused"
+        );
+    }
+
     /// On resume, a replayed spawn+finish pair leaves the subagent terminal.
     #[test]
     fn replayed_subagent_finished_marks_orphan_terminal() {
@@ -866,4 +920,3 @@
             "ext notification routed to a non-active agent must not request a redraw"
         );
     }
-

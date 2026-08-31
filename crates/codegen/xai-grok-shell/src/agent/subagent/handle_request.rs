@@ -1057,6 +1057,23 @@ pub(crate) async fn run_shell_child(
             .map(|m| format!("{m:?}")),
         depth: child_depth,
     };
+    let capability_mode = effective_runtime
+        .capability_mode
+        .and_then(|mode| serde_json::to_value(mode).ok())
+        .and_then(|value| value.as_str().map(String::from));
+    let route_snapshot = native_route_receipt.as_ref().map(|receipt| {
+        Box::new(xai_grok_subagent_resolution::snapshot_from_receipt(
+            &request.subagent_type,
+            &request.subagent_type,
+            "session",
+            true,
+            true,
+            false,
+            receipt,
+            capability_mode.as_deref(),
+            0,
+        ))
+    });
     emit_subagent_notification(
         gateway,
         &ctx.parent_session_id,
@@ -1069,10 +1086,7 @@ pub(crate) async fn run_shell_child(
             description: request.description.clone(),
             effective_context_source: Some(effective_source_str.to_string()),
             context_normalized: fork_context_normalized(&context_source, context_verbatim_fork),
-            capability_mode: effective_runtime
-                .capability_mode
-                .and_then(|m| serde_json::to_value(m).ok())
-                .and_then(|v| v.as_str().map(String::from)),
+            capability_mode,
             persona: effective_runtime.persona.clone(),
             role: effective_runtime.role_name.clone(),
             model: Some(effective_model_id.0.to_string()),
@@ -1084,6 +1098,7 @@ pub(crate) async fn run_shell_child(
             selected_catalog_id: native_route_receipt
                 .as_ref()
                 .map(|receipt| receipt.selected_catalog_id.clone()),
+            route_snapshot,
         },
         ctx.parent_cmd_tx.as_ref(),
     );

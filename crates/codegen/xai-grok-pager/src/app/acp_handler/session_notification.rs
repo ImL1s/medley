@@ -344,6 +344,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             context_normalized,
             parent_prompt_id,
             workflow_run_id,
+            route_snapshot,
             ..
         } => {
             if meta.is_replay {
@@ -375,6 +376,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     persona: persona.map(Arc::from),
                     role: role.map(Arc::from),
                     model: model.map(Arc::from),
+                    route_snapshot: route_snapshot.map(|snapshot| *snapshot),
                     context_source: effective_context_source.map(Arc::from),
                     resumed_from: resumed_from.map(Arc::from),
                     capability_mode: capability_mode.map(Arc::from),

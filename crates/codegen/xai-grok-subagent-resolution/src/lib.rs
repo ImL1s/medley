@@ -46,7 +46,8 @@ pub use native_route::{
     FallbackAdmission, LifecyclePhase, NativeModelSelection, NativeRouteError,
     NativeSubagentRouteRequest, NativeSubagentRouteResult, RejectionCode, RouteReceipt,
     SyntheticCatalog, WorkerRoute, discover_capabilities, inspect_document, parse_declarative_spec,
-    request_from_agent_definition, resolve_native_route, usage_facts_from_receipt,
+    request_from_agent_definition, resolve_native_route, snapshot_from_receipt,
+    usage_facts_from_receipt,
 };
 pub use overrides::{
     intersect_capability_mode_ceiling, intersect_capability_modes, resolve_effective_overrides,

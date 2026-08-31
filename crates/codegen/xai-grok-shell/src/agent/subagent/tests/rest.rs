@@ -1785,6 +1785,7 @@ fn notification_subagent_spawned_includes_resumed_from() {
         workflow_run_id: None,
         route_receipt_digest: None,
         selected_catalog_id: None,
+        route_snapshot: None,
     };
     let json = serde_json::to_value(&notification).unwrap();
     assert_eq!(json["resumed_from"], "prev-agent-id");
@@ -1808,6 +1809,7 @@ fn notification_subagent_spawned_includes_resumed_from() {
         workflow_run_id: None,
         route_receipt_digest: None,
         selected_catalog_id: None,
+        route_snapshot: None,
     };
     let json = serde_json::to_value(&fresh).unwrap();
     assert!(json.get("resumed_from").is_none());

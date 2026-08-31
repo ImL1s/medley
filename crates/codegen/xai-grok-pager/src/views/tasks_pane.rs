@@ -18,7 +18,9 @@ use std::time::{Instant, SystemTime};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::agent::{BgTaskState, BgTaskStatus, ScheduledTaskInfo};
-use crate::app::subagent::{SubagentInfo, format_context_badge, format_subagent_label};
+use crate::app::subagent::{
+    SubagentInfo, format_context_badge, format_route_lifecycle_label, format_subagent_label,
+};
 use crate::appearance::LayoutConfig;
 use crate::scrollback::layout::HorizontalLayout;
 use crate::syntax::get_syntect;
@@ -363,12 +365,7 @@ impl TaskEntry {
         // Single consolidated label (persona > role > subagent_type > tag >
         // "general") plus description with any `[tag]` prefix stripped.
         let (type_label, description) = format_subagent_label(info);
-        let model_suffix = info
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("");
+        let model_suffix = format_route_lifecycle_label(info);
 
         // Label color is state-driven: pending_kill / running stay vivid;
         // completed / failed keep their hue (green / red) but blend toward
@@ -1756,12 +1753,7 @@ impl TasksPane {
 
         // Clear overlay area to prevent label text bleeding through.
         let badge = format_context_badge(info);
-        let model_text = info
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("");
+        let model_text = format_route_lifecycle_label(info);
         let right_text_w = right_text.width() as u16;
         let kill_w: u16 = if info.is_running() { 3 } else { 0 };
         let badge_w: u16 = if badge.is_empty() {
@@ -1945,6 +1937,7 @@ mod tests {
             persona: None,
             role: None,
             model: None,
+            route_snapshot: None,
             context_source: None,
             resumed_from: None,
             capability_mode: None,
@@ -3074,6 +3067,45 @@ mod tests {
             label.contains("grok-3"),
             "label should contain model: {label}",
         );
+    }
+
+    #[test]
+    fn entry_label_uses_typed_route_and_lifecycle_instead_of_model_inference() {
+        let mut info = make_info();
+        info.model = Some("ambiguous-wire-slug".into());
+        let mut route = xai_grok_subagent_resolution::native_route::snapshot_from_model_override(
+            "verifier",
+            "Verifier",
+            "session",
+            true,
+            true,
+            false,
+            &xai_grok_agent::config::ModelOverride::Override("catalog-route-a".into()),
+            Some("read-only"),
+            0,
+        );
+        route.route_status = xai_grok_subagent_resolution::native_route::RouteStatus::Ready;
+        route.selected_catalog_id = Some("catalog-route-a".into());
+        route.attempt = Some(2);
+        info.route_snapshot = Some(route);
+
+        let entry = TaskEntry::from_subagent(&info);
+        let TaskEntry::Agent { label, .. } = entry else {
+            panic!("expected Agent variant");
+        };
+        assert!(label.contains("catalog-route-a · ready · retrying same route"));
+        assert!(!label.contains("ambiguous-wire-slug"));
+
+        info.finished = true;
+        for status in ["completed", "failed", "cancelled"] {
+            info.status = Some(status.into());
+            let terminal = TaskEntry::from_subagent(&info);
+            let TaskEntry::Agent { label, .. } = terminal else {
+                panic!("expected Agent variant");
+            };
+            assert!(label.contains(&format!("catalog-route-a · ready · {status}")));
+            assert!(!label.contains("retrying same route"));
+        }
     }
 
     #[test]

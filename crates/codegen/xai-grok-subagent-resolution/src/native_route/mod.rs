@@ -36,7 +36,8 @@ pub use types::{
 pub use ux::{
     AgentRouteUxSnapshot, AgentSelectionMode, LifecyclePhase, RouteStatus, format_compact_row,
     format_lifecycle_line, format_route_detail, lifecycle_phase_for_snapshot,
-    snapshot_from_agent_definition, snapshot_from_model_override, snapshot_from_resolution,
+    snapshot_from_agent_definition, snapshot_from_model_override, snapshot_from_receipt,
+    snapshot_from_resolution,
 };
 
 #[cfg(test)]

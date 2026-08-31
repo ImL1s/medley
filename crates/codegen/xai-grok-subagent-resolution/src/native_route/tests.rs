@@ -649,6 +649,42 @@ fn ux_snapshot_from_resolution_carries_receipt_digest() {
 }
 
 #[test]
+fn receipt_snapshot_keeps_human_json_and_lifecycle_facts_in_parity() {
+    let result = resolve_native_route(
+        &request(NativeModelSelection::OrderedCandidates {
+            catalog_ids: vec!["review-cold".into(), "review-primary".into()],
+        }),
+        &catalog(),
+        42,
+        2,
+    )
+    .unwrap();
+    let snapshot = snapshot_from_receipt(
+        "verifier",
+        "Verifier",
+        "session",
+        true,
+        true,
+        false,
+        &result.receipt,
+        Some("read-only"),
+        0,
+    );
+
+    let json = serde_json::to_value(&snapshot).unwrap();
+    let human = format_route_detail(&snapshot).join("\n");
+    assert_eq!(json["generation"], 0);
+    assert_eq!(json["selectedCatalogId"], "review-primary");
+    assert_eq!(json["attempt"], 2);
+    assert_eq!(json["routeReceiptDigest"], result.receipt.route_digest);
+    assert!(json["lastFallbackAdmitted"].is_null());
+    assert!(human.contains("Selected catalog: review-primary"));
+    assert!(human.contains("Attempt: 2"));
+    assert!(human.contains("retrying same route"));
+    assert!(human.contains(&result.receipt.route_digest));
+}
+
+#[test]
 fn ux_snapshot_rejects_forged_receipt_digest() {
     let mut result = resolve_native_route(
         &request(NativeModelSelection::Exact {
