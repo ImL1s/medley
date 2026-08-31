@@ -53,8 +53,7 @@ fn cached_remote_campaigns() -> Vec<CampaignEntry> {
 /// Stable bytes covering the process-global remote campaign cache so CAS
 /// snapshots can reject Actions after the cache is seeded or cleared.
 pub fn remote_campaign_cache_fingerprint() -> Vec<u8> {
-    let mut entries = cached_remote_campaigns();
-    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    let entries = cached_remote_campaigns();
     let mut out = Vec::new();
     for entry in entries {
         let patch = toml::to_string(&toml::Value::Table(entry.patch)).unwrap_or_default();

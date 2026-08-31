@@ -160,6 +160,7 @@ where
     let mode = destination_unix_mode(&dest);
     let mut outcome = mutate_config_document_at_with(
         &dest,
+        path,
         rendered,
         current_generation,
         edit,
@@ -172,6 +173,7 @@ where
 
 fn mutate_config_document_at_with<F, R, W>(
     path: &Path,
+    overlay_path: &Path,
     rendered: &ConfigMutationSnapshot,
     current_generation: u64,
     edit: F,
@@ -209,13 +211,20 @@ where
     }
     write(path, &intended).map_err(ConfigMutationError::Write)?;
     match read(path) {
-        Ok(bytes) if bytes == intended.as_bytes() => Ok(ConfigMutationOutcome {
-            generation: current_generation,
-            byte_digest: digest_bytes(&bytes),
-            overlay_digest: overlay_digest_for(path),
-            persistence: ConfigMutationPersistence::PersistedForNewSessions,
-            active_session_changed: false,
-        }),
+        Ok(bytes) if bytes == intended.as_bytes() => {
+            if overlay_digest_for(overlay_path) != rendered.overlay_digest {
+                let original = String::from_utf8(original).expect("validated UTF-8 above");
+                write(path, &original).map_err(ConfigMutationError::Rollback)?;
+                return Err(ConfigMutationError::ConcurrentEdit);
+            }
+            Ok(ConfigMutationOutcome {
+                generation: current_generation,
+                byte_digest: digest_bytes(&bytes),
+                overlay_digest: overlay_digest_for(overlay_path),
+                persistence: ConfigMutationPersistence::PersistedForNewSessions,
+                active_session_changed: false,
+            })
+        }
         Ok(bytes) if bytes.as_slice() == original.as_slice() => {
             Err(ConfigMutationError::ReadbackMismatch)
         }
@@ -336,6 +345,7 @@ mod tests {
 
         let read_error = mutate_config_document_at_with(
             &path,
+            &path,
             &rendered,
             1,
             set_agent_enabled,
@@ -346,6 +356,7 @@ mod tests {
         assert!(matches!(read_error, ConfigMutationError::Read(_)));
 
         let write_error = mutate_config_document_at_with(
+            &path,
             &path,
             &rendered,
             1,
@@ -375,6 +386,7 @@ mod tests {
         let reads = Cell::new(0);
 
         let error = mutate_config_document_at_with(
+            &path,
             &path,
             &rendered,
             2,
@@ -456,6 +468,7 @@ mod tests {
         let rendered = config_mutation_snapshot(&path, 1).unwrap();
         let error = mutate_config_document_at_with(
             &path,
+            &path,
             &rendered,
             1,
             set_agent_enabled,
@@ -520,6 +533,31 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "[ui]\ntheme = \"dark\"\n"
         );
+    }
+
+    #[test]
+    fn transaction_rolls_back_when_overlay_changes_during_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[ui]\ntheme = \"dark\"\n";
+        fs::write(&path, original).unwrap();
+        let rendered = config_mutation_snapshot(&path, 1).unwrap();
+        let campaign = dir.path().join("campaigns_state.json");
+        let error = mutate_config_document_at_with(
+            &path,
+            &path,
+            &rendered,
+            1,
+            set_agent_enabled,
+            |path| fs::read(path),
+            |path, contents| {
+                fs::write(&campaign, "{\"dismissed_ids\":[\"camp-1\"]}\n").unwrap();
+                fs::write(path, contents)
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigMutationError::ConcurrentEdit));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
