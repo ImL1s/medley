@@ -771,5 +771,37 @@ class CIConcurrencyContract(unittest.TestCase):
         )
 
 
+class CICompileFollowupContract(unittest.TestCase):
+    WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+
+    @staticmethod
+    def _named_step(workflow: str, name: str) -> str:
+        marker = f"      - name: {name}\n"
+        start = workflow.index(marker)
+        end = workflow.find("\n      - ", start + len(marker))
+        return workflow[start:] if end == -1 else workflow[start:end]
+
+    def test_compile_failure_does_not_silence_followup_verdicts(self):
+        workflow = self.WORKFLOW.read_text(encoding="utf-8")
+        followups = {
+            "Tests no filter selects (#408)": "filter_coverage",
+            "cargo test -p xai-grok-shell --features test-support --no-run":
+                "test_support_compile",
+        }
+        for name, step_id in followups.items():
+            with self.subTest(step=name):
+                step = self._named_step(workflow, name)
+                self.assertIn("        if: ${{ !cancelled() }}\n", step)
+                self.assertIn(f"        id: {step_id}\n", step)
+                self.assertNotIn("continue-on-error:", step)
+
+        summary = self._named_step(
+            workflow, "Summarize compile-test follow-up verdicts (#518)"
+        )
+        self.assertIn("        if: ${{ !cancelled() }}\n", summary)
+        self.assertIn("steps.filter_coverage.outcome", summary)
+        self.assertIn("steps.test_support_compile.outcome", summary)
+
+
 if __name__ == "__main__":
     unittest.main()
