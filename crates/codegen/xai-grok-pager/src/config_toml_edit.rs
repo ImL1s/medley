@@ -1,7 +1,7 @@
 //! Load `config.toml` as a [`toml_edit::DocumentMut`] for in-place edits.
 //! A non-empty file that does not parse is left untouched (`None`).
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,33 +70,11 @@ fn read_config_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 fn config_lock_path(path: &Path) -> std::path::PathBuf {
-    match path.file_name() {
-        Some(name) => path.with_file_name(format!("{}.lock", name.to_string_lossy())),
-        None => path.with_extension("lock"),
-    }
+    xai_grok_config::fs_atomic::config_lock_path(path)
 }
 
 pub(crate) fn lock_config_file(path: &Path) -> std::io::Result<File> {
-    let lock_path = config_lock_path(path);
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd as _;
-        // SAFETY: `file` is an open local lock fd; flock(2) on that fd is valid.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(file)
+    xai_grok_config::fs_atomic::lock_config_file(path)
 }
 
 pub(crate) fn write_config_toml(path: &Path, contents: &str) -> std::io::Result<()> {

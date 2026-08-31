@@ -13387,6 +13387,7 @@ dependencies = [
  "blake3",
  "core-foundation",
  "dunce",
+ "fs2",
  "prod-mc-cli-chat-proxy-types",
  "ring",
  "semver",
