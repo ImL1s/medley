@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import platform
 import re
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -326,33 +327,31 @@ def _macro_rules_defs(masked: str) -> list[tuple[str, int, int]]:
     return defs
 
 
-def _macro_inline_scopes(
-    masked: str, macro_spans: list[tuple[int, int]]
-) -> dict[int, tuple[str, ...]]:
-    """Inline-module scope at each macro start, in one source pass."""
+def _brace_scopes_at(
+    masked: str,
+    offsets: set[int],
+    macro_spans: list[tuple[int, int]],
+) -> dict[int, tuple[int, ...]]:
+    """Lexical brace scope at source offsets, skipping macro bodies."""
 
+    if not offsets:
+        return {}
     spans_by_start = dict(macro_spans)
-    scopes: dict[int, tuple[str, ...]] = {}
-    stack: list[tuple[int, str]] = []
-    depth = 0
+    scopes: dict[int, tuple[int, ...]] = {}
+    stack: list[int] = []
+    limit = max(offsets)
     i = 0
-    while i < len(masked):
+    while i <= limit and i < len(masked):
+        if i in offsets:
+            scopes[i] = tuple(stack)
         macro_end = spans_by_start.get(i)
         if macro_end is not None:
-            scopes[i] = tuple(name for _, name in stack)
             i = macro_end
             continue
-        mod_open = _INLINE_MOD_OPEN.match(masked, i)
-        if mod_open:
-            stack.append((depth, mod_open.group(1)))
-            depth += 1
-            i = mod_open.end()
-            continue
         if masked[i] == "{":
-            depth += 1
+            stack.append(i)
         elif masked[i] == "}":
-            depth -= 1
-            while stack and depth <= stack[-1][0]:
+            if stack:
                 stack.pop()
         i += 1
     return scopes
@@ -360,10 +359,12 @@ def _macro_inline_scopes(
 
 def _scoped_macro_rules_sources(
     masked: str,
-) -> tuple[tuple[str, int, tuple[str, ...]], ...]:
-    """`(source, end, inline scope)` for this file's macro definitions."""
+    defs: list[tuple[str, int, int]] | None = None,
+) -> tuple[tuple[str, str, int, tuple[int, ...]], ...]:
+    """`(name, source, end, lexical brace scope)` macro definitions."""
 
-    defs = _macro_rules_defs(masked)
+    if defs is None:
+        defs = _macro_rules_defs(masked)
     if not defs:
         return ()
     starts = [masked.rfind("macro_rules", 0, start) for _, start, _ in defs]
@@ -372,23 +373,24 @@ def _scoped_macro_rules_sources(
         for start, (_name, _body_start, end) in zip(starts, defs)
         if start >= 0
     )
-    scopes = _macro_inline_scopes(masked, spans)
+    scopes = _brace_scopes_at(masked, set(starts), spans)
     return tuple(
         (
+            name,
             masked[start:body_end],
             body_end,
             scopes.get(start, ()),
         )
-        for start, (_name, _body_start, body_end) in zip(starts, defs)
+        for start, (name, _body_start, body_end) in zip(starts, defs)
         if start >= 0
     )
 
 
 def _macro_rules_sources_before(
-    definitions: tuple[tuple[str, int, tuple[str, ...]], ...],
+    definitions: tuple[tuple[str, str, int, tuple[int, ...]], ...],
     before: int,
-    scope: tuple[str, ...],
-) -> tuple[str, ...]:
+    scope: tuple[int, ...],
+) -> tuple[tuple[str, str], ...]:
     """Macro definitions lexically available before a child `mod` item.
 
     External module files inherit the parent's textual `macro_rules!` scope.
@@ -396,12 +398,12 @@ def _macro_rules_sources_before(
     earlier definition with the same name, as rustc does.
     """
 
-    sources: list[str] = []
-    for source, body_end, def_scope in definitions:
+    sources: list[tuple[str, str]] = []
+    for name, source, body_end, def_scope in definitions:
         if body_end > before:
             continue
         if scope[: len(def_scope)] == def_scope:
-            sources.append(source)
+            sources.append((name, source))
     sources.reverse()
     return tuple(sources)
 
@@ -1206,8 +1208,12 @@ def _iter_module_decls(
     as_crate_root: bool = False,
     enabled_features: set[str] | frozenset[str] | None = None,
     masked: str | None = None,
-) -> list[tuple[str, Path, tuple[str, ...], int]]:
-    """`(name, child file, enclosing inline modules, source offset)` for `#[path]` and
+    module_search_dir: Path | None = None,
+) -> list[tuple[str, Path, tuple[str, ...], int, Path]]:
+    """Resolved child modules plus offset and the child's search directory.
+
+    Each tuple is `(name, child file, enclosing inline modules, source offset,
+    child search directory)` for `#[path]` and
     ordinary `mod name;` that resolve.
 
     `mod inner;` inside `mod outer { ... }` is loaded from `outer/inner.rs`
@@ -1216,7 +1222,7 @@ def _iter_module_decls(
     it as `outer::inner::...` (#507 review).
     """
 
-    decls: list[tuple[str, Path, tuple[str, ...], int]] = []
+    decls: list[tuple[str, Path, tuple[str, ...], int, Path]] = []
     pending_path: str | None = None
     pending_attrs: list[str] = []
     pending_mod = False
@@ -1279,7 +1285,7 @@ def _iter_module_decls(
             if not skip:
                 name = semi.group(1)
                 inline_names = tuple(n for _, n, _ in inline_stack)
-                search = _mod_search_dir(
+                search = module_search_dir or _mod_search_dir(
                     declaring,
                     extra_roots,
                     gated_roots,
@@ -1293,11 +1299,26 @@ def _iter_module_decls(
                     # rustc loads `outer/<path>` (#507 review).
                     base = search if inline_names else declaring.parent
                     child = (base / pending_path).resolve()
-                    decls.append((name, child, inline_names, line_start))
+                    decls.append(
+                        (name, child, inline_names, line_start, child.parent)
+                    )
                 else:
                     child = _existing_mod_file(search, name)
                     if child is not None:
-                        decls.append((name, child, inline_names, line_start))
+                        child_search = (
+                            child.parent
+                            if child.name == "mod.rs"
+                            else child.parent / child.stem
+                        )
+                        decls.append(
+                            (
+                                name,
+                                child,
+                                inline_names,
+                                line_start,
+                                child_search,
+                            )
+                        )
             pending_path = None
             pending_attrs = []
         elif not path_match:
@@ -1334,7 +1355,7 @@ def _iter_module_decls(
 
 def _declared_module_overrides(
     root: Path,
-) -> dict[Path, list[tuple[list[str], str, tuple[str, ...]]]]:
+) -> dict[Path, list[tuple[list[str], str, tuple[tuple[str, str], ...]]]]:
     """Logical module prefixes for files reached via `mod` / `#[path]`.
 
     Ordinary `mod common;` from several integration roots counts once per
@@ -1345,7 +1366,9 @@ def _declared_module_overrides(
     `--test shared_http_wire` is `test:shared_http_wire` not
     `test:common` (#507 review).
     """
-    overrides: dict[Path, list[tuple[list[str], str, tuple[str, ...]]]] = {}
+    overrides: dict[
+        Path, list[tuple[list[str], str, tuple[tuple[str, str], ...]]]
+    ] = {}
     queue: deque[
         tuple[
             Path,
@@ -1353,7 +1376,8 @@ def _declared_module_overrides(
             tuple[Path, ...],
             bool,
             str,
-            tuple[str, ...],
+            tuple[tuple[str, str], ...],
+            Path,
         ]
     ] = deque()
     texts: dict[Path, str] = {}
@@ -1390,13 +1414,20 @@ def _declared_module_overrides(
                         True,
                         _cargo_target_of(rs, extra_roots, test_names),
                         (),
+                        rs.resolve().parent,
                     )
                 )
 
     while queue:
-        declaring, prefix, ancestors, as_crate_root, root_target, macro_env = (
-            queue.popleft()
-        )
+        (
+            declaring,
+            prefix,
+            ancestors,
+            as_crate_root,
+            root_target,
+            macro_env,
+            module_search_dir,
+        ) = queue.popleft()
         if declaring in ancestors:
             continue
         text = read_rs(declaring)
@@ -1407,7 +1438,7 @@ def _declared_module_overrides(
             continue
         masked = _mask_rust_literals(text)
         scoped_macros = _scoped_macro_rules_sources(masked)
-        for name, child, inline_names, decl_offset in _iter_module_decls(
+        decls = _iter_module_decls(
             text,
             declaring,
             extra_roots,
@@ -1415,11 +1446,28 @@ def _declared_module_overrides(
             as_crate_root=as_crate_root,
             enabled_features=enabled,
             masked=masked,
-        ):
+            module_search_dir=module_search_dir,
+        )
+        macro_spans = [
+            (masked.rfind("macro_rules", 0, start), end)
+            for _name, start, end in _macro_rules_defs(masked)
+        ]
+        decl_scopes = (
+            _brace_scopes_at(
+                masked,
+                {decl_offset for _, _, _, decl_offset, _ in decls},
+                macro_spans,
+            )
+            if scoped_macros
+            else {}
+        )
+        for name, child, inline_names, decl_offset, child_search_dir in decls:
             child_prefix = list(prefix) + list(inline_names) + [name]
             child_macro_env = (
                 _macro_rules_sources_before(
-                    scoped_macros, decl_offset, inline_names
+                    scoped_macros,
+                    decl_offset,
+                    decl_scopes.get(decl_offset, ()),
                 )
                 + macro_env
             )
@@ -1434,6 +1482,7 @@ def _declared_module_overrides(
                     False,
                     root_target,
                     child_macro_env,
+                    child_search_dir,
                 )
             )
     return overrides
@@ -1769,7 +1818,7 @@ def _tests_in_file(
     text: str,
     file_mods: list[str],
     enabled_features: set[str] | frozenset[str] | None = None,
-    inherited_macros: tuple[str, ...] = (),
+    inherited_macros: tuple[tuple[str, str], ...] = (),
 ) -> list[str]:
     if _file_inner_cfg_inactive(text, enabled_features):
         return []
@@ -1784,37 +1833,64 @@ def _tests_in_file(
     if len(brace_lines) < len(raw_lines):
         brace_lines.extend([""] * (len(raw_lines) - len(brace_lines)))
     defs = _macro_rules_defs(masked)
-    macro_env = masked
-    env_defs = defs
-    if inherited_macros:
-        invoked_names = {
-            match.group(1) for match in _MACRO_INVOKE.finditer(masked)
-        }
-        needed_inherited = [
-            source
-            for source in inherited_macros
-            if any(
-                name in invoked_names
-                for name, _start, _end in _macro_rules_defs(source)
-            )
-        ]
-        if needed_inherited:
-            macro_env = masked + "\n" + "\n".join(needed_inherited)
-            env_defs = _macro_rules_defs(macro_env)
+    scoped_defs = _scoped_macro_rules_sources(masked, defs)
     def_spans = [(start, end) for _, start, end in defs]
-    known_macros = {name for name, _, _ in env_defs}
-    invoke_at: list[tuple[int, str, str]] = []
-    for im in _MACRO_INVOKE.finditer(masked):
-        if im.group(1) not in known_macros:
-            continue
-        if any(start <= im.start() < end for start, end in def_spans):
+    macro_spans = [
+        (masked.rfind("macro_rules", 0, start), end)
+        for _name, start, end in defs
+    ]
+    available_names = {name for name, _start, _end in defs} | {
+        name for name, _source in inherited_macros
+    }
+    raw_invocations = [
+        match
+        for match in _MACRO_INVOKE.finditer(masked)
+        if match.group(1) in available_names
+        if not any(start <= match.start() < end for start, end in def_spans)
+    ]
+    invoke_scopes = (
+        _brace_scopes_at(
+            masked, {match.start() for match in raw_invocations}, macro_spans
+        )
+        if raw_invocations
+        else {}
+    )
+    invoke_at: list[tuple[int, str, str, str]] = []
+    for im in raw_invocations:
+        inv_scope = invoke_scopes.get(im.start(), ())
+        local = [
+            (len(def_scope), end, source)
+            for name, source, end, def_scope in scoped_defs
+            if name == im.group(1)
+            and end <= im.start()
+            and inv_scope[: len(def_scope)] == def_scope
+        ]
+        if local:
+            source = max(local)[2]
+        else:
+            source = next(
+                (
+                    inherited_source
+                    for name, inherited_source in inherited_macros
+                    if name == im.group(1)
+                ),
+                "",
+            )
+        if not source:
             continue
         delim = im.end() - 1
         end = _balanced_pair_end(masked, delim)
-        invoke_at.append((im.start(), im.group(1), masked[delim + 1 : end - 1]))
+        invoke_at.append(
+            (
+                im.start(),
+                im.group(1),
+                masked[delim + 1 : end - 1],
+                source,
+            )
+        )
     invoke_at.sort()
     invoke_i = 0
-    invocations: list[tuple[str, str, list[str]]] = []
+    invocations: list[tuple[str, str, str, list[str]]] = []
     mod_stack: list[tuple[int, str, bool]] = []
     pending: list[str] = []
     pending_open_attr = ""
@@ -1940,12 +2016,12 @@ def _tests_in_file(
             invoke_i < len(invoke_at)
             and line_start <= invoke_at[invoke_i][0] <= invoke_end
         ):
-            _pos, inv_name, inner = invoke_at[invoke_i]
+            _pos, inv_name, inner, source = invoke_at[invoke_i]
             invoke_i += 1
             if line_cfg_off:
                 continue
             prefix = file_mods + [name for _, name, _ in mod_stack]
-            invocations.append((inv_name, inner, prefix))
+            invocations.append((inv_name, inner, source, prefix))
 
         line = _strip_line_comment(brace_lines[i])
         if not remainder_masked.strip() or has_test:
@@ -1954,8 +2030,10 @@ def _tests_in_file(
         while mod_stack and depth <= mod_stack[-1][0]:
             mod_stack.pop()
         line_start += len(masked_line) + 1
-    for inv_name, inner, prefix in invocations:
-        arm_text = _selected_arm_source(macro_env, env_defs, inv_name, inner)
+    for inv_name, inner, source, prefix in invocations:
+        arm_text = _selected_arm_source(
+            source, _macro_rules_defs(source), inv_name, inner
+        )
         if not arm_text:
             continue
         names.extend(_tests_in_file(arm_text, prefix, enabled_features))
@@ -1964,13 +2042,15 @@ def _tests_in_file(
 
 def _module_prefixes_for_source(
     rs: Path,
-    overrides: dict[Path, list[tuple[list[str], str, tuple[str, ...]]]],
+    overrides: dict[
+        Path, list[tuple[list[str], str, tuple[tuple[str, str], ...]]]
+    ],
     extra_roots: set[Path] | frozenset[Path] | None = None,
     gated_roots: set[Path] | frozenset[Path] | None = None,
     suppressed_libs: set[Path] | frozenset[Path] | None = None,
     no_autotest: set[Path] | frozenset[Path] | None = None,
     test_names: dict[Path, str] | None = None,
-) -> list[tuple[list[str], str, tuple[str, ...]]] | None:
+) -> list[tuple[list[str], str, tuple[tuple[str, str], ...]]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
     Cargo crate roots (`src/lib.rs`, `tests/*.rs`, explicit `[lib] path`
@@ -1983,7 +2063,9 @@ def _module_prefixes_for_source(
     """
 
     key = rs.resolve()
-    prefixes: list[tuple[list[str], str, tuple[str, ...]]] = []
+    prefixes: list[
+        tuple[list[str], str, tuple[tuple[str, str], ...]]
+    ] = []
     if key in overrides:
         prefixes.extend(overrides[key])
     if _is_cargo_crate_root_file(
@@ -2053,6 +2135,23 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
 
 def _qualified_test_names(root: Path) -> list[str]:
     return [record.name for record in _qualified_test_records(root)]
+
+
+def _cargo_list_test_names(crate: Path) -> list[str]:
+    """libtest names from Cargo, used as the oracle for parser fixtures."""
+
+    completed = subprocess.run(
+        ["cargo", "test", "--quiet", "--", "--list"],
+        cwd=crate,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return sorted(
+        line.removesuffix(": test")
+        for line in completed.stdout.splitlines()
+        if line.endswith(": test")
+    )
 
 
 class CredentialHotPathCorpus(unittest.TestCase):
@@ -3173,7 +3272,7 @@ class ExternalModulePrefix(unittest.TestCase):
             root = Path(d)
             session = root / "crates" / "codegen" / "demo" / "src" / "session"
             impl = session / "acp_session_impl"
-            (impl / "extensions").mkdir(parents=True)
+            impl.mkdir(parents=True)
             (root / "crates" / "codegen" / "demo" / "src" / "lib.rs").write_text(
                 "mod session;\n"
             )
@@ -3182,7 +3281,7 @@ class ExternalModulePrefix(unittest.TestCase):
                 '#[path = "acp_session_impl/extensions.rs"]\nmod extensions;\n'
             )
             (impl / "extensions.rs").write_text("mod idle_prompt;\n")
-            (impl / "extensions" / "idle_prompt.rs").write_text(
+            (impl / "idle_prompt.rs").write_text(
                 "#[test]\nfn none_auth_scheme_sends() {}\n"
             )
             names = _qualified_test_names(root)
@@ -3459,6 +3558,134 @@ class ExternalModulePrefix(unittest.TestCase):
                 "child::none_auth_scheme_inherited",
                 _qualified_test_names(root),
             )
+
+    def test_external_child_macros_resolve_at_each_invocation(self):
+        """Local/inline definitions shadow only after and inside their scope."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    macro_rules! generated {
+                        () => {
+                            #[test]
+                            fn parent_case() {}
+                        };
+                    }
+                    mod child;
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (src / "child.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    generated!();
+                    macro_rules! generated {
+                        () => { #[test] fn local_case() {} };
+                    }
+                    mod inner {
+                        macro_rules! generated {
+                            () => { #[test] fn inner_case() {} };
+                        }
+                        generated!();
+                    }
+                    generated!();
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            cargo_names = _cargo_list_test_names(crate)
+            self.assertEqual(
+                cargo_names,
+                [
+                    "child::inner::inner_case",
+                    "child::local_case",
+                    "child::parent_case",
+                ],
+            )
+            self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_block_local_macro_does_not_leak_into_external_child(self):
+        """A function/block macro is not in the later module item's scope."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    macro_rules! generated {
+                        () => {
+                            #[test]
+                            fn parent_case() {}
+                        };
+                    }
+                    fn helper() {
+                        macro_rules! generated {
+                            () => {
+                                #[test]
+                                fn block_case() {}
+                            };
+                        }
+                    }
+                    mod child;
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (src / "child.rs").write_text(
+                "generated!();\n",
+                encoding="utf-8",
+            )
+
+            cargo_names = _cargo_list_test_names(crate)
+            self.assertEqual(cargo_names, ["child::parent_case"])
+            self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_path_module_descendant_uses_path_parent_search_base(self):
+        """A `#[path]` module's children resolve beside the renamed file."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            alt = src / "alt"
+            alt.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                "macro_rules! generated {\n"
+                "    () => { #[test] fn inherited_path_case() {} };\n"
+                "}\n"
+                '#[path = "alt/renamed.rs"]\nmod logical;\n',
+                encoding="utf-8",
+            )
+            (alt / "renamed.rs").write_text("mod grand;\n", encoding="utf-8")
+            (alt / "grand.rs").write_text("generated!();\n", encoding="utf-8")
+
+            cargo_names = _cargo_list_test_names(crate)
+            self.assertEqual(
+                cargo_names, ["logical::grand::inherited_path_case"]
+            )
+            self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
 
     def test_unselected_macro_arm_test_is_not_counted(self):
         """`generated!(cold)` must not count a sibling `(hot)` arm
