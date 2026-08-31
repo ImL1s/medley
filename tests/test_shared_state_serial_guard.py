@@ -6356,6 +6356,30 @@ class DefaultScanRoots(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(findings, [])
 
+    def test_src_bin_roots_are_collected(self):
+        """`src/bin/*.rs` and `src/bin/*/main.rs` are crate roots
+        (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            (src_dir / "bin" / "nested").mkdir(parents=True)
+            (src_dir / "lib.rs").write_text("pub fn f() {}\n", encoding="utf-8")
+            (src_dir / "bin" / "tool.rs").write_text(
+                "fn main() {}\n", encoding="utf-8"
+            )
+            (src_dir / "bin" / "nested" / "main.rs").write_text(
+                "fn main() {}\n", encoding="utf-8"
+            )
+            (src_dir / "bin" / "nested" / "orphan.rs").write_text(
+                "fn unused() {}\n", encoding="utf-8"
+            )
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                sorted(path.as_posix() for path, _text in sources),
+                ["src/bin/nested/main.rs", "src/bin/tool.rs", "src/lib.rs"],
+            )
+
     def test_same_path_file_keeps_every_module_alias(self):
         """`#[path = \"shared.rs\"] mod support` and `mod common` both
         reach the helper (#516 review)."""

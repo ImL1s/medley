@@ -2538,7 +2538,17 @@ def _is_always_compiled_root(path: Path) -> bool:
     if "src" not in parts:
         return False
     segs = list(parts[parts.index("src") + 1 :])
-    return segs in (["lib.rs"], ["main.rs"])
+    if segs in (["lib.rs"], ["main.rs"]):
+        return True
+    # Conventional binary crate roots: `src/bin/foo.rs` and
+    # `src/bin/foo/main.rs` (#516 review).
+    if len(segs) >= 2 and segs[0] == "bin":
+        rest = segs[1:]
+        if len(rest) == 1 and rest[0].endswith(".rs"):
+            return True
+        if len(rest) == 2 and rest[1] == "main.rs":
+            return True
+    return False
 
 
 def _cfg_inactive_out_of_line_files(
