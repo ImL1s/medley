@@ -1178,6 +1178,48 @@ class TransitiveClosure(unittest.TestCase):
         generated = {n for n in names if n.startswith("cases!")}
         self.assertEqual(len(generated), 2, names)
 
+    def test_generated_tests_from_a_reexported_macro_are_derived_members(self):
+        """Generated-test discovery must use the same re-export graph as
+        invocations inside ordinary functions (#516 review)."""
+
+        sources = [
+            (
+                Path("src/inner.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    macro_rules! cases {
+                        () => {
+                            #[test]
+                            fn first() {
+                                COUNTER.fetch_add(1, Ordering::SeqCst);
+                            }
+
+                            #[test]
+                            fn second() {
+                                COUNTER.fetch_add(1, Ordering::SeqCst);
+                            }
+                        };
+                    }
+                    pub(crate) use cases;
+                    """
+                ),
+            ),
+            (
+                Path("src/bridge.rs"),
+                src("pub(crate) use crate::inner::cases as relay;\n"),
+            ),
+            (
+                Path("src/lib.rs"),
+                src("crate::bridge::relay!();\n"),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        generated = {name for name in names if name.startswith("relay!")}
+        self.assertEqual(len(generated), 2, names)
+
     def test_generated_helpers_stay_in_their_macro_arm(self):
         """A later arm's `fn helper` must not replace an earlier arm's
         touching helper (#516 review)."""
@@ -3218,6 +3260,96 @@ class TransitiveClosure(unittest.TestCase):
                 "second_unicode_qualified_untagged",
                 "first_raw_untagged",
                 "second_raw_untagged",
+            },
+        )
+
+    def test_unicode_macro_reexport_reaches_registered_state(self):
+        sources = [
+            (
+                Path("src/inner.rs"),
+                src(
+                    """\
+                    use std::sync::atomic::AtomicU64;
+
+                    // SERIAL-GROUP: demo_key
+                    pub(crate) static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    macro_rules! 觸碰 {
+                        () => { $crate::inner::COUNTER.fetch_add(
+                            1, ::std::sync::atomic::Ordering::SeqCst
+                        ); };
+                    }
+                    pub(crate) use 觸碰;
+                    """
+                ),
+            ),
+            (
+                Path("src/bridge.rs"),
+                src("pub(crate) use crate::inner::觸碰 as 轉送;\n"),
+            ),
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn first_unicode_reexport_untagged() {
+                        crate::bridge::轉送!();
+                    }
+
+                    #[test]
+                    fn second_unicode_reexport_untagged() {
+                        crate::bridge::轉送!();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(
+            names,
+            {
+                "first_unicode_reexport_untagged",
+                "second_unicode_reexport_untagged",
+            },
+        )
+
+    def test_absolute_macro_path_reaches_registered_state(self):
+        text = src(
+            """\
+            extern crate self as xai_grok_shell;
+
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            mod inner {
+                macro_rules! act {
+                    () => { crate::COUNTER.fetch_add(
+                        1, ::std::sync::atomic::Ordering::SeqCst
+                    ); };
+                }
+                pub(crate) use act;
+            }
+
+            #[test]
+            fn first_absolute_macro_untagged() {
+                ::xai_grok_shell::inner::act!();
+            }
+
+            #[test]
+            fn second_absolute_macro_untagged() {
+                ::xai_grok_shell::inner::act!();
+            }
+            """
+        )
+        names = derived_names(
+            [(Path("crates/codegen/xai-grok-shell/src/lib.rs"), text)],
+            "demo_key",
+        )
+        self.assertEqual(
+            names,
+            {
+                "first_absolute_macro_untagged",
+                "second_absolute_macro_untagged",
             },
         )
 

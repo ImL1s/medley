@@ -261,7 +261,7 @@ FN_DEF = re.compile(
 RUST_IDENT_TOKEN = r"(?:r#)?[^\W\d]\w*"
 MACRO_DEF = re.compile(rf"macro_rules!\s+(?P<name>{RUST_IDENT_TOKEN})")
 MACRO_INVOKE = re.compile(
-    rf"(?<![:.\w])((?:{RUST_IDENT_TOKEN}\s*::\s*)*)"
+    rf"(?<![:.\w])((?:\:\:\s*)?(?:{RUST_IDENT_TOKEN}\s*::\s*)*)"
     rf"({RUST_IDENT_TOKEN})\s*!"
 )
 INLINE_MOD = re.compile(
@@ -280,6 +280,7 @@ SERIAL_ATTR = re.compile(
 )
 IMPL_KW = re.compile(r"\bimpl\b")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+RUST_IDENT = re.compile(r"[^\W\d]\w*")
 FREE_CALL = re.compile(r"(?<![:.\w])(?:r#)?([a-z_][a-z0-9_]*)\s*\(")
 USE_PLAIN = re.compile(
     r"\buse\s+(crate|super|self)((?:::(?:r#)?[A-Za-z_][A-Za-z0-9_]*)+)"
@@ -290,7 +291,7 @@ USE_BRACE = re.compile(
     r"::\{([^}]+)\}\s*;"
 )
 USE_HEAD = re.compile(
-    r"\buse\s+(crate|super|self|(?:r#)?[A-Za-z_][A-Za-z0-9_]*)"
+    rf"\buse\s+(crate|super|self|{RUST_IDENT_TOKEN})"
 )
 # Any `path::to::name(` call, `crate`-rooted or not. Resolved two ways (see
 # `_resolve_calls`): a `crate`-rooted path by its FULL module path, and every
@@ -1467,6 +1468,35 @@ def _load_reexports(sources: list[tuple[Path, str]]) -> None:
             _REEXPORT_EXACT.setdefault((dest, local), []).append((src, src_fname))
 
 
+def _copy_macro_reexports_into_index(
+    index: dict[tuple[tuple[str, ...], str], list],
+) -> None:
+    """Extend a macro-definition index through the shared pub-use graph."""
+
+    for _ in range(len(_REEXPORTS) + 1):
+        changed = False
+        for dest, local, src, fname in _REEXPORTS:
+            if fname == "*":
+                candidates = [
+                    (name, definitions)
+                    for (module, name), definitions in list(index.items())
+                    if module == src
+                ]
+            else:
+                definitions = index.get((src, fname), [])
+                candidates = [(local, definitions)] if definitions else []
+            for dest_name, definitions in candidates:
+                key = (dest, dest_name)
+                current = index.get(key, [])
+                merged = list(dict.fromkeys([*current, *definitions]))
+                if current == merged:
+                    continue
+                index[key] = merged
+                changed = True
+        if not changed:
+            break
+
+
 def _reexport_reaches(
     module: tuple[str, ...],
     fname: str,
@@ -1578,12 +1608,15 @@ def _skip_ws_code(code: str, i: int) -> int:
 
 def _read_use_ident(code: str, i: int) -> tuple[str | None, int]:
     i = _skip_ws_code(code, i)
+    raw = False
     if i + 1 < len(code) and code[i : i + 2] == "r#":
+        raw = True
         i += 2
-    match = IDENT.match(code, i)
-    if match is None:
+    match = RUST_IDENT.match(code, i)
+    if match is None or not match.group(0).isidentifier():
         return None, i
-    return match.group(0), match.end()
+    name = match.group(0)
+    return (f"r#{name}" if raw else name), match.end()
 
 
 def _parse_use_as(code: str, i: int) -> tuple[str | None, int]:
@@ -1657,7 +1690,9 @@ def _iter_use_leaves(
 
     leaves: list[tuple[int, str, tuple[str, ...], str, str]] = []
     for match in USE_HEAD.finditer(code):
-        root = match.group(1)
+        root = _raw_ident(match.group(1))
+        if root not in ("crate", "super", "self") and not root.isidentifier():
+            continue
         i = _skip_ws_code(code, match.end())
         if i + 1 < len(code) and code[i : i + 2] == "::":
             i += 2
@@ -2375,13 +2410,16 @@ def _macro_candidates(
     qualifier = match.group(1)
     name = _raw_ident(match.group(2))
     if qualifier:
+        absolute = qualifier.lstrip().startswith("::")
         segs = tuple(
             _raw_ident(part)
             for part in (piece.strip() for piece in qualifier.split("::"))
             if part
         )
-        if not segs:
+        if not segs and not absolute:
             return []
+        if not segs:
+            return list(macro_defs_by_module.get(((), name), ()))
         imported = None
         if segs[0] not in ("crate", "self", "super") and not _is_lib_crate_ident(
             segs[0]
@@ -2897,6 +2935,7 @@ class _PendingMacroTest:
     file: Path
     macro_name: str
     macro_file: Path
+    definition_name: str
     line: int
     start: int
     inline_mods: tuple[str, ...]
@@ -2916,47 +2955,54 @@ class _MacroArm:
 def _serials_for_macro_invoke(
     *,
     generated_by_macro: dict[tuple[Path, str], list[_MacroArm]],
-    exported_macros: dict[str, Path],
-    file_by_module: dict[tuple[str, ...], Path],
+    generated_by_module: dict[
+        tuple[tuple[str, ...], str], list[tuple[Path, str]]
+    ],
+    exported_macros: dict[str, list[tuple[Path, str]]],
     rel: Path,
-    macro_name: str,
-    invoke_text: str,
+    invoke: re.Match[str],
     file_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]],
     inline_mods: tuple[str, ...],
-) -> tuple[list[_MacroArm], Path] | None:
-    """Arms for this invocation, bound to the defining file (#516 review)."""
+) -> list[tuple[list[_MacroArm], Path, str]]:
+    """Candidate generated-test arms, using the shared re-export graph."""
 
-    full = invoke_text.strip()
-    if full.endswith("!"):
-        full = full[:-1]
-    segs = tuple(s.strip() for s in full.split("::") if s.strip())
-    if len(segs) >= 2 and segs[0] == "crate":
-        module = segs[1:-1]
-        fname = segs[-1]
-        def_file = file_by_module.get(module)
-        if def_file is None:
-            return None
-        arms = generated_by_macro.get((def_file, fname))
-        if arms is None:
-            return None
-        return arms, def_file
-    arms = generated_by_macro.get((rel, macro_name))
-    if arms is not None:
-        return arms, rel
+    qualifier = invoke.group(1)
+    macro_name = _raw_ident(invoke.group(2))
+    candidates: list[tuple[Path, str]] = []
+    if qualifier:
+        segs = tuple(
+            _raw_ident(piece.strip())
+            for piece in qualifier.split("::")
+            if piece.strip()
+        )
+        absolute = qualifier.lstrip().startswith("::")
+        if segs:
+            module = _resolve_path_module(
+                segs, _module_path(rel), inline_mods
+            )
+        elif absolute:
+            module = ()
+        else:
+            module = None
+        if module is not None:
+            candidates.extend(generated_by_module.get((module, macro_name), ()))
+    else:
+        direct = (rel, macro_name)
+        if direct in generated_by_macro:
+            candidates.append(direct)
+
     imported = _lookup_import(file_imports, inline_mods, macro_name)
     if imported is not None:
-        module, fname = imported
-        def_file = file_by_module.get(module)
-        if def_file is not None:
-            found = generated_by_macro.get((def_file, fname))
-            if found is not None:
-                return found, def_file
-    export_file = exported_macros.get(macro_name)
-    if export_file is not None:
-        found = generated_by_macro.get((export_file, macro_name))
-        if found is not None:
-            return found, export_file
-    return None
+        candidates.extend(generated_by_module.get(imported, ()))
+    if not candidates and not qualifier:
+        candidates.extend(exported_macros.get(macro_name, ()))
+
+    resolved: list[tuple[list[_MacroArm], Path, str]] = []
+    for key in dict.fromkeys(candidates):
+        arms = generated_by_macro.get(key)
+        if arms is not None:
+            resolved.append((arms, key[0], key[1]))
+    return resolved
 
 
 def index_functions(
@@ -2972,12 +3018,7 @@ def index_functions(
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
     generated_by_macro: dict[tuple[Path, str], list[_MacroArm]] = {}
-    exported_macros: dict[str, Path] = {}
-    file_by_module: dict[tuple[str, ...], Path] = {}
-    for rel, _raw in sources:
-        module = _module_path(rel)
-        if module is not None:
-            file_by_module[module] = rel
+    exported_macros: dict[str, list[tuple[Path, str]]] = {}
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     ] = {}
@@ -3227,7 +3268,7 @@ def index_functions(
             if any(arm.serials for arm in arm_list):
                 generated_by_macro[(rel, name)] = arm_list
             if is_export:
-                exported_macros[name] = rel
+                exported_macros.setdefault(name, []).append((rel, name))
             out.append(
                 FnInfo(
                     name=name,
@@ -3247,6 +3288,17 @@ def index_functions(
                 )
             )
         scans.append((rel, raw, code, occupied, inline_spans))
+
+    generated_by_module: dict[
+        tuple[tuple[str, ...], str], list[tuple[Path, str]]
+    ] = {}
+    for rel, name in generated_by_macro:
+        module = _module_path(rel)
+        if module is None:
+            continue
+        generated_by_module.setdefault((module, name), []).append((rel, name))
+    _copy_macro_reexports_into_index(generated_by_module)
+
     for rel, raw, code, occupied, inline_spans in scans:
         file_imports = imports_by_file.get(rel, {})
         for invoke in _macro_invoke_matches(code):
@@ -3254,65 +3306,74 @@ def index_functions(
             if any(start <= invoke.start() < end for start, end in occupied):
                 continue
             inline_mods = _inline_path_from_spans(inline_spans, invoke.start())
-            resolved = _serials_for_macro_invoke(
+            resolved_candidates = _serials_for_macro_invoke(
                 generated_by_macro=generated_by_macro,
+                generated_by_module=generated_by_module,
                 exported_macros=exported_macros,
-                file_by_module=file_by_module,
                 rel=rel,
-                macro_name=macro_name,
-                invoke_text=invoke.group(0),
+                invoke=invoke,
                 file_imports=file_imports,
                 inline_mods=inline_mods,
             )
-            if resolved is None:
+            if not resolved_candidates:
                 continue
-            arms, macro_file = resolved
             line = _line(raw, invoke.start())
             arity = _macro_invoke_arity(code, invoke.end())
             inner = _macro_invoke_inner(code, invoke.end())
-            chosen: _MacroArm | None = None
-            for arm in arms:
-                if _arm_accepts(arm.matcher, inner, arity):
-                    chosen = arm
-                    break
-            if chosen is None:
-                continue
-            serials = chosen.serials
-            for slot, (_serial_held, _has_unkeyed, in_repeat, template_index, attrs) in enumerate(
-                serials
-            ):
-                reps = (
-                    _invoke_repeat_count(chosen.matcher, inner)
-                    if in_repeat
-                    else 1
-                )
-                if reps < 1:
+            for arms, macro_file, definition_name in resolved_candidates:
+                chosen: _MacroArm | None = None
+                for arm in arms:
+                    if _arm_accepts(arm.matcher, inner, arity):
+                        chosen = arm
+                        break
+                if chosen is None:
                     continue
-                template_body = (
-                    out[template_index].body
-                    if 0 <= template_index < len(out)
-                    else ""
-                )
-                for rep in range(reps):
-                    bindings = _bindings_for_invoke(
-                        chosen.matcher, inner, rep=rep, in_repeat=in_repeat
+                serials = chosen.serials
+                for slot, (
+                    _serial_held,
+                    _has_unkeyed,
+                    in_repeat,
+                    template_index,
+                    attrs,
+                ) in enumerate(serials):
+                    reps = (
+                        _invoke_repeat_count(chosen.matcher, inner)
+                        if in_repeat
+                        else 1
                     )
-                    held, unkeyed = _serial_from_attrs(attrs, bindings)
-                    pending.append(
-                        _PendingMacroTest(
-                            file=rel,
-                            macro_name=macro_name,
-                            macro_file=macro_file,
-                            line=line,
-                            start=invoke.start(),
-                            inline_mods=inline_mods,
-                            serial_held=held,
-                            has_unkeyed_serial=unkeyed,
-                            slot=rep * len(serials) + slot,
-                            template_index=template_index,
-                            body=_substitute_metavars(template_body, bindings),
+                    if reps < 1:
+                        continue
+                    template_body = (
+                        out[template_index].body
+                        if 0 <= template_index < len(out)
+                        else ""
+                    )
+                    for rep in range(reps):
+                        bindings = _bindings_for_invoke(
+                            chosen.matcher,
+                            inner,
+                            rep=rep,
+                            in_repeat=in_repeat,
                         )
-                    )
+                        held, unkeyed = _serial_from_attrs(attrs, bindings)
+                        pending.append(
+                            _PendingMacroTest(
+                                file=rel,
+                                macro_name=macro_name,
+                                macro_file=macro_file,
+                                definition_name=definition_name,
+                                line=line,
+                                start=invoke.start(),
+                                inline_mods=inline_mods,
+                                serial_held=held,
+                                has_unkeyed_serial=unkeyed,
+                                slot=rep * len(serials) + slot,
+                                template_index=template_index,
+                                body=_substitute_metavars(
+                                    template_body, bindings
+                                ),
+                            )
+                        )
     return out, pending, imports_by_file, globs_by_file
 
 
@@ -3816,30 +3877,7 @@ def analyze(
     for path, text in sources:
         reexports.extend(_pub_reexports(path, text))
     _copy_reexports_into_indices(reexports, by_module, by_leaf)
-    for _ in range(len(reexports) + 1):
-        changed = False
-        for dest, local, src, fname in reexports:
-            if fname == "*":
-                candidates = [
-                    (name, definitions)
-                    for (module, name), definitions in list(
-                        macro_defs_by_module.items()
-                    )
-                    if module == src
-                ]
-            else:
-                definitions = macro_defs_by_module.get((src, fname), [])
-                candidates = [(local, definitions)] if definitions else []
-            for dest_name, definitions in candidates:
-                key = (dest, dest_name)
-                current = macro_defs_by_module.get(key, [])
-                merged = list(dict.fromkeys([*current, *definitions]))
-                if current == merged:
-                    continue
-                macro_defs_by_module[key] = merged
-                changed = True
-        if not changed:
-            break
+    _copy_macro_reexports_into_index(macro_defs_by_module)
 
     keys_of: list[frozenset[str]] = [fn.keys for fn in functions]
     converged = False
@@ -3886,7 +3924,9 @@ def analyze(
         if fn.is_macro:
             macro_index.setdefault((fn.file, fn.name), []).append(i)
     for pending in pending_macro_tests:
-        indices = macro_index.get((pending.macro_file, pending.macro_name), [])
+        indices = macro_index.get(
+            (pending.macro_file, pending.definition_name), []
+        )
         if not indices:
             continue
         keys: frozenset[str] = frozenset()
