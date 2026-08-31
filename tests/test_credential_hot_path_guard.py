@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import platform
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1362,16 +1363,16 @@ def _iter_module_decls(
             mask_for_path = (pending_path_mask or "") + "\n" + masked_lines[i]
             pending_path_frag = None
             pending_path_mask = None
-        path_match = _PATH_ATTR.search(raw_for_path)
-        if path_match:
-            start = path_match.start()
-            if start >= len(mask_for_path) or mask_for_path[start] != "#":
-                path_match = None
-        elif re.search(r"#\[\s*path\b", raw_for_path) and "]" not in raw_for_path:
+        redirected, unclosed_path = _live_path_redirect(
+            raw_for_path, mask_for_path, enabled_features
+        )
+        if unclosed_path and re.search(
+            r"#\[\s*(?:path|cfg_attr)\b", raw_for_path
+        ):
             pending_path_frag = raw_for_path
             pending_path_mask = mask_for_path
-        if path_match:
-            pending_path = path_match.group(1)
+        elif redirected:
+            pending_path = redirected
             pending_attrs.extend(attrs)
         ident_semi = None
         ident_open = None
@@ -1426,7 +1427,7 @@ def _iter_module_decls(
                         )
             pending_path = None
             pending_attrs = []
-        elif not path_match:
+        elif not redirected and pending_path_frag is None:
             cfg_off = any(
                 _cfg_attr_is_inactive(a, enabled_features)
                 for a in pending_attrs + attrs
@@ -1725,6 +1726,43 @@ def _host_target_arch() -> str:
     return machine
 
 
+def _host_pointer_width() -> str:
+    """Host pointer width as rustc `target_pointer_width` (decimal bits)."""
+
+    return str(struct.calcsize("P") * 8)
+
+
+def _live_path_redirect(
+    raw_for_path: str,
+    mask_for_path: str,
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> tuple[str | None, bool]:
+    """Live `#[path]` or `#[cfg_attr(..., path = ...)]` value.
+
+    `#[cfg_attr(test, path = "actual.rs")]` is `#[path]` under cargo test,
+    so rustc loads `actual.rs` rather than the ordinary `child.rs`
+    (#507 review). Returns `(path, unclosed)`.
+    """
+
+    attrs, _remainder, unclosed = _leading_attrs(raw_for_path)
+    if unclosed:
+        return None, True
+    for attr in _effective_attrs(attrs, enabled_features):
+        match = _PATH_ATTR.search(attr)
+        if match is None:
+            continue
+        start = raw_for_path.find("#[")
+        if start < 0 or start >= len(mask_for_path) or mask_for_path[start] != "#":
+            continue
+        return match.group(1), False
+    path_match = _PATH_ATTR.search(raw_for_path)
+    if path_match:
+        start = path_match.start()
+        if start < len(mask_for_path) and mask_for_path[start] == "#":
+            return path_match.group(1), False
+    return None, False
+
+
 def _selected_arm_source(
     masked: str,
     defs: list[tuple[str, int, int]],
@@ -1816,6 +1854,9 @@ def _cfg_atom(
     arch_eq = re.fullmatch(r'target_arch\s*=\s*"([^"]+)"', atom)
     if arch_eq:
         return _host_target_arch() == arch_eq.group(1)
+    width_eq = re.fullmatch(r'target_pointer_width\s*=\s*"([^"]+)"', atom)
+    if width_eq:
+        return _host_pointer_width() == width_eq.group(1)
     if atom == "debug_assertions":
         # `cargo test` is the debug profile; the documented hot path is
         # never `--release` (#507 review).
@@ -2714,6 +2755,46 @@ class ExternalModulePrefix(unittest.TestCase):
             (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_alias::works", names)
+
+    def test_cfg_attr_path_overrides_the_file_stem(self):
+        """`#[cfg_attr(test, path = \"actual.rs\")]` is `#[path]` under
+        cargo test (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                '#[cfg_attr(test, path = "elsewhere.rs")]\n'
+                "mod none_auth_scheme_regressions;\n"
+            )
+            (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
+            (src / "none_auth_scheme_regressions.rs").write_text(
+                "#[test]\nfn decoy() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_regressions::works", names)
+            self.assertNotIn("none_auth_scheme_regressions::decoy", names)
+
+    def test_inactive_cfg_attr_path_keeps_the_file_stem(self):
+        """`#[cfg_attr(false, path = ...)]` does not redirect rustc
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                '#[cfg_attr(false, path = "elsewhere.rs")]\n'
+                "mod none_auth_scheme_regressions;\n"
+            )
+            (src / "elsewhere.rs").write_text("#[test]\nfn works() {}\n")
+            (src / "none_auth_scheme_regressions.rs").write_text(
+                "#[test]\nfn decoy() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_regressions::decoy", names)
+            self.assertNotIn("none_auth_scheme_regressions::works", names)
 
     def test_nested_src_tests_dir_keeps_the_crate_root_prefix(self):
         with tempfile.TemporaryDirectory() as d:
@@ -4294,6 +4375,25 @@ class ExternalModulePrefix(unittest.TestCase):
             [],
         )
         self.assertEqual(names, ["none_auth_scheme_native"])
+
+    def test_foreign_pointer_width_cfg_is_not_counted(self):
+        """`#[cfg(target_pointer_width = \"32\")]` is off on 64-bit CI
+        hosts (#507 review)."""
+
+        foreign = "32" if _host_pointer_width() != "32" else "64"
+        names = _tests_in_file(
+            f'#[cfg(target_pointer_width = "{foreign}")]\n'
+            "#[test]\nfn none_auth_scheme_foreign_width() {}\n"
+            "#[test]\nfn none_auth_scheme_host() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_host"])
+        names = _tests_in_file(
+            f'#[cfg(target_pointer_width = "{_host_pointer_width()}")]\n'
+            "#[test]\nfn none_auth_scheme_native_width() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["none_auth_scheme_native_width"])
 
     def test_macro_ident_metavar_is_substituted_before_scan(self):
         """`fn $name` with `generated!(none_auth_scheme_generated)` is
