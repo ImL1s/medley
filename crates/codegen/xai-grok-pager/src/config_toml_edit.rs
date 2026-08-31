@@ -143,11 +143,21 @@ pub(crate) fn config_mutation_snapshot(
     path: &Path,
     generation: u64,
 ) -> Result<ConfigMutationSnapshot, ConfigMutationError> {
-    let bytes = read_config_bytes(path).map_err(ConfigMutationError::Read)?;
+    config_mutation_snapshot_for_dest(path, path, generation)
+}
+
+/// Snapshot bytes from a pinned destination while hashing overlays from the
+/// logical config path (managed/requirements/campaigns live beside it).
+pub(crate) fn config_mutation_snapshot_for_dest(
+    logical_path: &Path,
+    dest: &Path,
+    generation: u64,
+) -> Result<ConfigMutationSnapshot, ConfigMutationError> {
+    let bytes = read_config_bytes(dest).map_err(ConfigMutationError::Read)?;
     Ok(ConfigMutationSnapshot {
         generation,
         byte_digest: digest_bytes(&bytes),
-        overlay_digest: overlay_digest_for(path),
+        overlay_digest: overlay_digest_for(logical_path),
     })
 }
 

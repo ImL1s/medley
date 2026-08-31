@@ -763,11 +763,30 @@ pub fn resolve_default_agent_name(cwd: &Path, model_agent_type: Option<&str>) ->
     )
     .name
 }
-fn capture_config_snapshot(
-    generation: u64,
-) -> Option<crate::config_toml_edit::ConfigMutationSnapshot> {
-    let path = xai_grok_config::grok_home().join("config.toml");
-    crate::config_toml_edit::config_mutation_snapshot(&path, generation).ok()
+fn load_toggle_and_agent_name_at(
+    path: &Path,
+) -> Result<(HashMap<String, bool>, Option<String>), String> {
+    let doc = crate::config_toml_edit::read_config_document_for_edit(path)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let toggle = doc
+        .get("subagents")
+        .and_then(|v| v.get("toggle"))
+        .and_then(|v| v.as_table())
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.to_string(), b)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let agent_name = doc
+        .get("agent")
+        .and_then(|v| v.get("name"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    Ok((toggle, agent_name))
 }
 
 fn capture_locked_config_state(
@@ -781,16 +800,28 @@ fn capture_locked_config_state(
     HashMap<String, bool>,
 ) {
     let path = xai_grok_config::grok_home().join("config.toml");
-    let _lock = crate::config_toml_edit::lock_config_destination(&path).ok();
-    // Overlay writers (managed/requirements/campaigns/remote cache) are not covered by
-    // the config.toml lock. Stabilize by hashing overlays before and after loading
-    // effective toggles; retry briefly, then reject a mismatched pair.
+    let Ok((_lock, dest)) = crate::config_toml_edit::lock_config_destination(&path) else {
+        return (
+            None,
+            None,
+            resolve_default_agent_name(cwd, model_agent_type),
+            HashMap::new(),
+        );
+    };
+    // Hold the pinned destination lock and read that same file. Overlay writers
+    // (managed/requirements/campaigns/remote cache) are not covered by the
+    // config.toml lock — stabilize by hashing overlays before/after the load.
     const MAX_ATTEMPTS: usize = 4;
     for _ in 0..MAX_ATTEMPTS {
         let before_overlay = crate::config_toml_edit::overlay_digest_for(&path);
-        match load_agent_toggle() {
-            Ok(toggle) => {
-                let Some(snapshot) = capture_config_snapshot(generation) else {
+        match load_toggle_and_agent_name_at(&dest) {
+            Ok((toggle, agent_name)) => {
+                let Some(snapshot) =
+                    crate::config_toml_edit::config_mutation_snapshot_for_dest(
+                        &path, &dest, generation,
+                    )
+                    .ok()
+                else {
                     continue;
                 };
                 if snapshot.overlay_digest != before_overlay {
@@ -798,7 +829,7 @@ fn capture_locked_config_state(
                 }
                 return (
                     Some(snapshot),
-                    load_config_agent_name(),
+                    agent_name,
                     resolve_default_agent_name(cwd, model_agent_type),
                     toggle,
                 );
