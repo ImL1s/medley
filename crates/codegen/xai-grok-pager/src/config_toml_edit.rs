@@ -1,6 +1,7 @@
 //! Load `config.toml` as a [`toml_edit::DocumentMut`] for in-place edits.
 //! A non-empty file that does not parse is left untouched (`None`).
 
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +69,52 @@ fn read_config_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
+fn config_lock_path(path: &Path) -> std::path::PathBuf {
+    match path.file_name() {
+        Some(name) => path.with_file_name(format!("{}.lock", name.to_string_lossy())),
+        None => path.with_extension("lock"),
+    }
+}
+
+fn lock_config_file(path: &Path) -> std::io::Result<File> {
+    let lock_path = config_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: `file` is an open local lock fd; flock(2) on that fd is valid.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(file)
+}
+
+fn destination_unix_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        return Some(match std::fs::metadata(path) {
+            Ok(metadata) => metadata.permissions().mode() & 0o777,
+            Err(_) => 0o600,
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 pub(crate) fn config_mutation_snapshot(
     path: &Path,
     generation: u64,
@@ -91,13 +138,15 @@ pub(crate) fn mutate_config_document_at<F>(
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
 {
+    let _lock = lock_config_file(path).map_err(ConfigMutationError::Write)?;
+    let mode = destination_unix_mode(path);
     mutate_config_document_at_with(
         path,
         rendered,
         current_generation,
         edit,
         read_config_bytes,
-        |path, contents| xai_grok_config::fs_atomic::write_atomically(path, contents, None),
+        move |path, contents| xai_grok_config::fs_atomic::write_atomically(path, contents, mode),
     )
 }
 
@@ -139,25 +188,30 @@ where
         std::fs::create_dir_all(parent).map_err(ConfigMutationError::Write)?;
     }
     write(path, &intended).map_err(ConfigMutationError::Write)?;
-    let readback = match read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let original = String::from_utf8(original).expect("validated UTF-8 above");
-            write(path, &original).map_err(ConfigMutationError::Rollback)?;
-            return Err(ConfigMutationError::Readback(error));
+    match read(path) {
+        Ok(bytes) if bytes == intended.as_bytes() => Ok(ConfigMutationOutcome {
+            generation: current_generation,
+            byte_digest: digest_bytes(&bytes),
+            persistence: ConfigMutationPersistence::PersistedForNewSessions,
+            active_session_changed: false,
+        }),
+        Ok(bytes) if bytes.as_slice() == original.as_slice() => {
+            Err(ConfigMutationError::ReadbackMismatch)
         }
-    };
-    if readback != intended.as_bytes() {
-        let original = String::from_utf8(original).expect("validated UTF-8 above");
-        write(path, &original).map_err(ConfigMutationError::Rollback)?;
-        return Err(ConfigMutationError::ReadbackMismatch);
+        Ok(_) => Err(ConfigMutationError::ConcurrentEdit),
+        Err(error) => match read(path) {
+            Ok(bytes) if bytes == intended.as_bytes() => {
+                let original = String::from_utf8(original).expect("validated UTF-8 above");
+                write(path, &original).map_err(ConfigMutationError::Rollback)?;
+                Err(ConfigMutationError::Readback(error))
+            }
+            Ok(bytes) if bytes.as_slice() == original.as_slice() => {
+                Err(ConfigMutationError::Readback(error))
+            }
+            Ok(_) => Err(ConfigMutationError::ConcurrentEdit),
+            Err(_) => Err(ConfigMutationError::Readback(error)),
+        },
     }
-    Ok(ConfigMutationOutcome {
-        generation: current_generation,
-        byte_digest: digest_bytes(&readback),
-        persistence: ConfigMutationPersistence::PersistedForNewSessions,
-        active_session_changed: false,
-    })
 }
 
 #[must_use]
@@ -345,6 +399,79 @@ mod tests {
         );
         assert!(!outcome.active_session_changed);
         assert_eq!(outcome.byte_digest, digest_bytes(body.as_bytes()));
+    }
+
+    #[test]
+    fn transaction_second_mutation_uses_post_write_digest() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[ui]\ntheme = \"dark\"\n").unwrap();
+        let first = config_mutation_snapshot(&path, 4).unwrap();
+        let outcome = mutate_config_document_at(&path, &first, 4, set_agent_enabled).unwrap();
+        let second = ConfigMutationSnapshot {
+            generation: 4,
+            byte_digest: outcome.byte_digest,
+        };
+        let outcome = mutate_config_document_at(&path, &second, 4, |document| {
+            document["agent"]["name"] = toml_edit::value("explore");
+            Ok(())
+        })
+        .unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("verifier = true"));
+        assert!(body.contains("name = \"explore\""));
+        assert_eq!(outcome.byte_digest, digest_bytes(body.as_bytes()));
+    }
+
+    #[test]
+    fn transaction_does_not_restore_original_over_a_newer_writer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[ui]\ntheme = \"dark\"\n";
+        let concurrent = "# concurrent\n[ui]\ntheme = \"light\"\n";
+        fs::write(&path, original).unwrap();
+        let rendered = config_mutation_snapshot(&path, 1).unwrap();
+        let error = mutate_config_document_at_with(
+            &path,
+            &rendered,
+            1,
+            set_agent_enabled,
+            |path| fs::read(path),
+            |path, _contents| fs::write(path, concurrent),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigMutationError::ConcurrentEdit));
+        assert_eq!(fs::read_to_string(path).unwrap(), concurrent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_preserves_existing_unix_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[ui]\ntheme = \"dark\"\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let rendered = config_mutation_snapshot(&path, 2).unwrap();
+
+        mutate_config_document_at(&path, &rendered, 2, set_agent_enabled).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_creates_missing_file_as_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let rendered = config_mutation_snapshot(&path, 1).unwrap();
+
+        mutate_config_document_at(&path, &rendered, 1, set_agent_enabled).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

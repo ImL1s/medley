@@ -2289,6 +2289,7 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                 };
                 match set_default_agent(new_default, rendered, state.generation) {
                     Ok(()) => {
+                        state.config_snapshot = capture_config_snapshot(state.generation);
                         refresh_default_agent(state);
                         state.message = Some(if is_already_default {
                             AgentsModalMessage::info(format!(
