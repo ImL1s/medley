@@ -371,6 +371,12 @@ class SrcHasTests(unittest.TestCase):
                 "multiline_string": (
                     'const EXAMPLE: &str = "example\n#[some::test]\nstill text";\n'
                 ),
+                "lifetime_before_ordinary_string": r'''macro_rules! m { ($($tt:tt)*) => {} }
+m!('r"fake \"
+#[some::test]
+");
+pub fn f() {}
+''',
                 "nonterminal_test_segment": "#[test::fixture]\npub fn f() {}\n",
                 "cfg": "#[cfg(test)]\npub fn f() {}\n",
             }.items():

@@ -129,6 +129,13 @@ def _skip_raw_string(source: str, index: int) -> int | None:
     match = _RUST_RAW_STRING_START.match(source, index)
     if not match:
         return None
+    if index:
+        previous = source[index - 1]
+        # A raw prefix is a token start, not a suffix inside an identifier or
+        # lifetime.  Without this boundary, valid `'r"..."` token adjacency
+        # is mistaken for a raw string beginning at the lifetime's `r`.
+        if previous == "'" or ("a" + previous).isidentifier():
+            return None
     hashes = match.group("hashes") or ""
     terminator = '"' + hashes
     end = source.find(terminator, match.end())
