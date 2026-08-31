@@ -55,6 +55,7 @@ import sys
 import tempfile
 import textwrap
 import tomllib
+import unicodedata
 import unittest
 from bisect import bisect_right
 from collections import deque
@@ -119,9 +120,25 @@ def _strip_line_comment(line: str) -> str:
 
 
 _RAW_STRING_START = re.compile(r"(?:c|b)?r(#*)\"")
-_RUST_IDENT = r"[^\W\d]\w*"
+_RUST_IDENT = r"(?:[A-Za-z_]|[^\W\d_])(?:[A-Za-z0-9_]|[^\x00-\x7f])*"
 _MACRO_IDENT = re.compile(rf"(?:r#)?({_RUST_IDENT})")
-_MACRO_INVOKE = re.compile(rf"(?<!\w)(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]")
+_MACRO_INVOKE = re.compile(rf"(?<![\w:])(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]")
+
+
+def _macro_name(match: re.Match[str]) -> str:
+    """Rust identifiers compare after NFC normalization."""
+
+    name = unicodedata.normalize("NFC", match.group(1))
+    return name if name.isidentifier() else ""
+
+
+def _qualified_macro_invocation(masked: str, start: int) -> bool:
+    """Whether the identifier is preceded by a possibly spaced `::`."""
+
+    index = start - 1
+    while index >= 0 and masked[index].isspace():
+        index -= 1
+    return index > 0 and masked[index - 1 : index + 1] == "::"
 
 
 def _skip_quoted(text: str, index: int, quote: str) -> int:
@@ -321,7 +338,9 @@ def _macro_rules_defs(masked: str) -> list[tuple[str, int, int]]:
         ident = _MACRO_IDENT.match(masked, index)
         if not ident:
             continue
-        name = ident.group(1)
+        name = _macro_name(ident)
+        if not name:
+            continue
         index = ident.end()
         while index < len(masked) and masked[index].isspace():
             index += 1
@@ -377,7 +396,9 @@ def _scoped_macro_rules_sources(
         for start, (_name, _body_start, end) in zip(starts, defs)
         if start >= 0
     )
-    scopes = _brace_scopes_at(masked, set(starts), spans)
+    scopes = _brace_scopes_at(
+        _mask_attr_string_braces(masked), set(starts), spans
+    )
     attr_spans = _outer_attr_spans(masked)
     attr_ends = [end for _start, end, _attr in attr_spans]
     return tuple(
@@ -484,7 +505,9 @@ def _macro_invoke_inners(
     bodies = [(start, end) for _, start, end in defs]
     out: list[tuple[str, str]] = []
     for match in _MACRO_INVOKE.finditer(masked):
-        name = match.group(1)
+        if _qualified_macro_invocation(masked, match.start()):
+            continue
+        name = _macro_name(match)
         if name not in known:
             continue
         if any(start <= match.start() < end for start, end in bodies):
@@ -1899,12 +1922,15 @@ def _tests_in_file(
     raw_invocations = [
         match
         for match in _MACRO_INVOKE.finditer(masked)
-        if match.group(1) in available_names
+        if not _qualified_macro_invocation(masked, match.start())
+        if _macro_name(match) in available_names
         if not any(start <= match.start() < end for start, end in def_spans)
     ]
     invoke_scopes = (
         _brace_scopes_at(
-            masked, {match.start() for match in raw_invocations}, macro_spans
+            brace_masked,
+            {match.start() for match in raw_invocations},
+            macro_spans,
         )
         if raw_invocations
         else {}
@@ -1915,7 +1941,7 @@ def _tests_in_file(
         local = [
             (len(def_scope), end, source)
             for name, source, end, def_scope in scoped_defs
-            if name == im.group(1)
+            if name == _macro_name(im)
             and end <= im.start()
             and inv_scope[: len(def_scope)] == def_scope
         ]
@@ -1926,7 +1952,7 @@ def _tests_in_file(
                 (
                     inherited_source
                     for name, inherited_source in inherited_macros
-                    if name == im.group(1)
+                    if name == _macro_name(im)
                 ),
                 "",
             )
@@ -1937,7 +1963,7 @@ def _tests_in_file(
         invoke_at.append(
             (
                 im.start(),
-                im.group(1),
+                _macro_name(im),
                 masked[delim + 1 : end - 1],
                 source,
             )
@@ -3761,6 +3787,107 @@ class ExternalModulePrefix(unittest.TestCase):
                     "unicode_child::none_auth_scheme_unicode",
                 ],
             )
+            self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_unicode_xid_macro_names_match_after_nfc_normalization(self):
+        """Rust normalizes XID identifiers, including combining marks, to NFC."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    macro_rules! fanto\u0302me {
+                        () => { #[test] fn phantom_case() {} };
+                    }
+                    macro_rules! cafe\u0301 {
+                        () => { #[test] fn invoked_case() {} };
+                    }
+                    caf\u00e9!();
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            cargo_names = _cargo_list_test_names(crate)
+            self.assertEqual(cargo_names, ["invoked_case"])
+            self.assertNotIn("phantom_case", cargo_names)
+            self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_attr_string_brace_does_not_corrupt_macro_lexical_scope(self):
+        """Attribute string braces cannot change macro shadowing scope."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    '''\
+                    macro_rules! generated {
+                        () => { #[test] fn outer_case() {} };
+                    }
+                    mod nested {
+                        #[doc = "}"]
+                        macro_rules! generated {
+                            () => { #[test] fn nested_case() {} };
+                        }
+                        generated!();
+                    }
+                    generated!();
+                    '''
+                ),
+                encoding="utf-8",
+            )
+
+            cargo_names = _cargo_list_test_names(crate)
+            self.assertEqual(cargo_names, ["nested::nested_case", "outer_case"])
+            self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_qualified_macro_does_not_resolve_to_lexical_same_name(self):
+        """A path-qualified invocation cannot select an unrelated local macro."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    macro_rules! generated {
+                        () => { #[test] fn lexical_case() {} };
+                    }
+                    mod macros {
+                        macro_rules! generated {
+                            () => {};
+                        }
+                        pub(crate) use generated;
+                    }
+                    macros :: generated!();
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            cargo_names = _cargo_list_test_names(crate)
+            self.assertEqual(cargo_names, [])
             self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
 
     def test_block_local_macro_does_not_leak_into_external_child(self):
