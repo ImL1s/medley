@@ -32,10 +32,23 @@ pub fn lock_config_file(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
+/// If `path` exists as a symlink, return its canonical target so a later
+/// rename updates the referent instead of replacing the link. A missing path
+/// is returned unchanged. A dangling symlink is an error.
+pub fn resolve_write_path(path: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path),
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Atomic temp + rename so a torn write can't leave a half-written file. The temp
 /// name is unique per writer (pid + counter) and `create_new`, so concurrent
 /// writers don't collide. `mode` (unix only) is applied at temp-file creation, so
-/// the final file never exists with looser permissions.
+/// the final file never exists with looser permissions. Existing symlinks are
+/// followed so the write updates the target instead of replacing the link.
 pub fn write_atomically(
     final_path: &Path,
     contents: &str,
@@ -45,6 +58,7 @@ pub fn write_atomically(
     use std::sync::atomic::{AtomicU64, Ordering};
     static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+    let final_path = resolve_write_path(final_path)?;
     let dir = final_path.parent().unwrap_or_else(|| Path::new("."));
     let name = final_path
         .file_name()
@@ -91,5 +105,40 @@ mod tests {
         assert!(second.try_lock_exclusive().is_err());
         drop(held);
         second.try_lock_exclusive().unwrap();
+    }
+
+    #[test]
+    fn resolve_write_path_leaves_missing_path_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(resolve_write_path(&path).unwrap(), path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_follows_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("dotfiles");
+        std::fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("config.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&target, "old\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_atomically(&link, "new\n", Some(0o600)).unwrap();
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_rejects_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("missing.toml");
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_atomically(&link, "new\n", None).is_err());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!target.exists());
     }
 }

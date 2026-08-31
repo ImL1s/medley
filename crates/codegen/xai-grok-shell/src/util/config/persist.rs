@@ -53,7 +53,8 @@ async fn save_config_locked(config: &Config) -> Result<()> {
         merge_section(table, "skills", &config.skills);
     }
     let toml_str = toml::to_string_pretty(&root)?;
-    if let Some(parent) = path.parent() {
+    let dest = xai_grok_config::fs_atomic::resolve_write_path(&path)?;
+    if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
     #[cfg(unix)]
@@ -73,7 +74,7 @@ async fn save_config_locked(config: &Config) -> Result<()> {
             .unwrap_or(0);
         format!("toml.tmp.{}.{}", std::process::id(), nanos)
     };
-    let tmp = path.with_extension(suffix);
+    let tmp = dest.with_extension(suffix);
     tokio::fs::write(&tmp, toml_str).await?;
     #[cfg(unix)]
     if let Some(mode) = prior_mode {
@@ -81,7 +82,7 @@ async fn save_config_locked(config: &Config) -> Result<()> {
         let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await;
     }
     let _ = prior_mode;
-    tokio::fs::rename(&tmp, &path).await?;
+    tokio::fs::rename(&tmp, &dest).await?;
     Ok(())
 }
 /// Acquire the `config.toml` write lock used by [`save_config`], so callers that
@@ -111,7 +112,8 @@ pub(crate) fn read_to_string_or_empty(path: &std::path::Path) -> std::io::Result
 /// Atomic write via temp file + `rename` (mirrors [`save_config`]) so a crash
 /// mid-write can't truncate `config.toml`. Preserves the dest mode on unix.
 pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    let dest = xai_grok_config::fs_atomic::resolve_write_path(path)?;
+    if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     #[cfg(unix)]
@@ -131,7 +133,7 @@ pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std:
             .unwrap_or(0);
         format!("toml.tmp.{}.{}", std::process::id(), nanos)
     };
-    let tmp = path.with_extension(suffix);
+    let tmp = dest.with_extension(suffix);
     std::fs::write(&tmp, content)?;
     #[cfg(unix)]
     if let Some(mode) = prior_mode {
@@ -139,7 +141,7 @@ pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std:
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
     }
     let _ = prior_mode;
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }

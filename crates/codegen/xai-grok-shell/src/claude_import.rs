@@ -643,10 +643,11 @@ fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
     compat_table.insert("imported".to_string(), TomlValue::Boolean(true));
 
     let toml_str = toml::to_string_pretty(&root)?;
-    if let Some(parent) = config_path.parent() {
+    let dest = xai_grok_config::fs_atomic::resolve_write_path(config_path)?;
+    if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = config_path.with_extension("toml.tmp");
+    let tmp = dest.with_extension("toml.tmp");
     // Best-effort cleanup of the .tmp file if either write or rename fails so
     // a failed marker write doesn't leave a stale artefact next to the real
     // config (otherwise the next attempt would inherit a half-written file
@@ -655,7 +656,7 @@ fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
-    if let Err(e) = std::fs::rename(&tmp, config_path) {
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
@@ -840,12 +841,13 @@ fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow
     if count > 0 {
         // Atomic write: write to .tmp, then rename.
         let toml_str = toml::to_string_pretty(&root)?;
-        let tmp = config_path.with_extension("toml.tmp");
-        if let Some(parent) = config_path.parent() {
+        let dest = xai_grok_config::fs_atomic::resolve_write_path(config_path)?;
+        let tmp = dest.with_extension("toml.tmp");
+        if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&tmp, &toml_str)?;
-        std::fs::rename(&tmp, config_path)?;
+        std::fs::rename(&tmp, &dest)?;
         info!(
             path = %config_path.display(),
             count,

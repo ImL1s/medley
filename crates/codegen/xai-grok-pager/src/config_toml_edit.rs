@@ -446,6 +446,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn transaction_writes_through_symlink_target() {
+        let dir = tempdir().unwrap();
+        let target_dir = dir.path().join("dotfiles");
+        fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("config.toml");
+        let path = dir.path().join("config.toml");
+        fs::write(&target, "[ui]\ntheme = \"dark\"\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let rendered = config_mutation_snapshot(&path, 1).unwrap();
+
+        mutate_config_document_at(&path, &rendered, 1, set_agent_enabled).unwrap();
+
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        let body = fs::read_to_string(&target).unwrap();
+        assert!(body.contains("verifier = true"));
+        assert!(body.contains("theme = \"dark\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn transaction_creates_missing_file_as_0600() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempdir().unwrap();
