@@ -283,6 +283,8 @@ pub struct AgentsModalState {
     model_agent_type: Option<String>,
     /// Generation for stale-action admission. Bumped on rebuild/refresh.
     pub generation: u64,
+    /// Bytes+generation snapshot taken when this modal was last rendered.
+    config_snapshot: Option<crate::config_toml_edit::ConfigMutationSnapshot>,
     pub personas: Vec<PersonaDetail>,
     pub persona_selected: usize,
     pub persona_scroll: usize,
@@ -335,6 +337,7 @@ impl AgentsModalState {
             active_agent,
             model_agent_type: model_agent_type.map(str::to_owned),
             generation: 1,
+            config_snapshot: capture_config_snapshot(1),
             personas,
             persona_selected: 0,
             persona_scroll: 0,
@@ -345,6 +348,7 @@ impl AgentsModalState {
     fn rebuild_agents(&mut self) {
         let toggle = load_agent_toggle();
         self.generation = self.generation.saturating_add(1);
+        self.config_snapshot = capture_config_snapshot(self.generation);
         self.agents = build_agent_list(&self.cwd, &toggle);
         stamp_entry_generation(&mut self.agents, self.generation);
         if self.selected >= self.agents.len() {
@@ -756,57 +760,74 @@ fn refresh_default_agent(state: &mut AgentsModalState) {
     let model_agent_type = state.model_agent_type.as_deref();
     state.default_agent = resolve_default_agent_name(&state.cwd, model_agent_type);
 }
+fn capture_config_snapshot(
+    generation: u64,
+) -> Option<crate::config_toml_edit::ConfigMutationSnapshot> {
+    let path = xai_grok_config::grok_home().join("config.toml");
+    crate::config_toml_edit::config_mutation_snapshot(&path, generation).ok()
+}
 /// Set or clear the default agent via `[agent] name` in config.toml.
 ///
 /// Pass `Some(name)` to set, `None` to clear (remove the key).
-pub fn set_default_agent(name: Option<&str>) -> Result<(), String> {
+pub(crate) fn set_default_agent(
+    name: Option<&str>,
+    rendered: &crate::config_toml_edit::ConfigMutationSnapshot,
+    current_generation: u64,
+) -> Result<(), String> {
     let config_path = xai_grok_config::grok_home().join("config.toml");
-    if let Some(parent) = config_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Some(mut doc) = crate::config_toml_edit::read_config_document_for_edit(&config_path) else {
-        return Err("Could not read or parse config.toml".to_string());
-    };
-    if let Some(agent_name) = name {
-        if !doc.contains_key("agent") {
-            doc["agent"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        let agent_table = doc["agent"]
-            .as_table_mut()
-            .ok_or("[agent] is not a table")?;
-        agent_table["name"] = toml_edit::value(agent_name);
-    } else if let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
-        agent_table.remove("name");
-    }
-    std::fs::write(&config_path, doc.to_string())
-        .map_err(|e| format!("Failed to write config.toml: {e}"))?;
-    Ok(())
+    crate::config_toml_edit::mutate_config_document_at(
+        &config_path,
+        rendered,
+        current_generation,
+        |doc| {
+            if let Some(agent_name) = name {
+                if !doc.contains_key("agent") {
+                    doc["agent"] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                let agent_table = doc["agent"]
+                    .as_table_mut()
+                    .ok_or("[agent] is not a table")?;
+                agent_table["name"] = toml_edit::value(agent_name);
+            } else if let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
+                agent_table.remove("name");
+            }
+            Ok(())
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 /// Toggle an agent's enabled state via `[subagents.toggle]` in config.toml.
-pub fn toggle_agent(name: &str, enabled: bool) -> Result<(), String> {
+pub(crate) fn toggle_agent(
+    name: &str,
+    enabled: bool,
+    rendered: &crate::config_toml_edit::ConfigMutationSnapshot,
+    current_generation: u64,
+) -> Result<(), String> {
     let config_path = xai_grok_config::grok_home().join("config.toml");
-    if let Some(parent) = config_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Some(mut doc) = crate::config_toml_edit::read_config_document_for_edit(&config_path) else {
-        return Err("Could not read or parse config.toml".to_string());
-    };
-    if !doc.contains_key("subagents") {
-        doc["subagents"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let subagents = doc["subagents"]
-        .as_table_mut()
-        .ok_or("subagents is not a table")?;
-    if !subagents.contains_key("toggle") {
-        subagents["toggle"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let toggle_table = subagents["toggle"]
-        .as_table_mut()
-        .ok_or("subagents.toggle is not a table")?;
-    toggle_table[name] = toml_edit::value(enabled);
-    std::fs::write(&config_path, doc.to_string())
-        .map_err(|e| format!("Failed to write config.toml: {e}"))?;
-    Ok(())
+    crate::config_toml_edit::mutate_config_document_at(
+        &config_path,
+        rendered,
+        current_generation,
+        |doc| {
+            if !doc.contains_key("subagents") {
+                doc["subagents"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let subagents = doc["subagents"]
+                .as_table_mut()
+                .ok_or("subagents is not a table")?;
+            if !subagents.contains_key("toggle") {
+                subagents["toggle"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let toggle_table = subagents["toggle"]
+                .as_table_mut()
+                .ok_or("subagents.toggle is not a table")?;
+            toggle_table[name] = toml_edit::value(enabled);
+            Ok(())
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 fn route_snapshot_for_entry(entry: &AgentListEntry) -> AgentRouteUxSnapshot {
     let floor = entry.definition.capability_mode.map(|mode| mode.as_str());
@@ -2260,7 +2281,13 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                 } else {
                     Some(name.as_str())
                 };
-                match set_default_agent(new_default) {
+                let Some(rendered) = state.config_snapshot.as_ref() else {
+                    state.message = Some(AgentsModalMessage::error(
+                        "config.toml snapshot is unavailable".to_string(),
+                    ));
+                    return AgentsModalOutcome::Changed;
+                };
+                match set_default_agent(new_default, rendered, state.generation) {
                     Ok(()) => {
                         refresh_default_agent(state);
                         state.message = Some(if is_already_default {
@@ -2292,7 +2319,13 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                 }
                 let new_enabled = !entry.enabled;
                 let name = entry.name.clone();
-                match toggle_agent(&name, new_enabled) {
+                let Some(rendered) = state.config_snapshot.as_ref() else {
+                    state.message = Some(AgentsModalMessage::error(
+                        "config.toml snapshot is unavailable".to_string(),
+                    ));
+                    return AgentsModalOutcome::Changed;
+                };
+                match toggle_agent(&name, new_enabled, rendered, state.generation) {
                     Ok(()) => {
                         state.rebuild_agents();
                         state.message = Some(AgentsModalMessage::info(format!(
@@ -3034,6 +3067,7 @@ mod tests {
                 persona_scroll: 0,
                 persona_expanded: std::collections::HashSet::new(),
                 generation: 1,
+                config_snapshot: None,
             };
             state.set_search_query(query);
             state
@@ -3076,6 +3110,7 @@ mod tests {
             persona_scroll: 0,
             persona_expanded: std::collections::HashSet::new(),
             generation: 1,
+            config_snapshot: None,
         };
         state.set_search_query(query);
         state
@@ -3154,6 +3189,7 @@ mod tests {
             persona_scroll: 0,
             persona_expanded: std::collections::HashSet::new(),
             generation: 1,
+            config_snapshot: None,
         }
     }
     fn buffer_text(buffer: &Buffer) -> String {
