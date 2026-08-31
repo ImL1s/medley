@@ -106,6 +106,42 @@ class RegistryDiscovery(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(items[0].identifiers, ("A", "B", "C"))
 
+    def test_unicode_static_in_contiguous_block_is_registered(self):
+        """ASCII-only static names used to end the block before `ÉTAT`
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            static ÉTAT: AtomicU64 = AtomicU64::new(0);
+            """
+        )
+        items, errors = guard.find_registry([(Path("f.rs"), text)])
+        self.assertEqual(errors, [])
+        self.assertEqual(items[0].identifiers, ("COUNTER", "ÉTAT"))
+
+    def test_unicode_static_touchers_are_members(self):
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            static ÉTAT: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn first_untagged() {
+                ÉTAT.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn second_untagged() {
+                ÉTAT.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_doc_comment_and_attr_between_marker_and_static_are_skipped(self):
         text = src(
             """\
@@ -4714,6 +4750,72 @@ class TypeAssociatedResolution(unittest.TestCase):
             "nested integration mods must share the race process group",
         )
 
+    def test_undeclared_integration_descendant_is_not_in_binary_group(self):
+        """`mod support;` compiles `support/mod.rs`, not `support/orphan.rs`
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    mod support;
+
+                    #[test]
+                    fn only_race() {
+                        xai_grok_shell::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/support/mod.rs"),
+                src(
+                    """\
+                    mod nested;
+                    """
+                ),
+            ),
+            (
+                Path("tests/support/nested.rs"),
+                src(
+                    """\
+                    pub fn helper() {}
+                    """
+                ),
+            ),
+            (
+                Path("tests/support/orphan.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn orphan_untagged() {
+                        xai_grok_shell::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        findings, errors, membership = guard.analyze(sources, scan_root=Path("."))
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            findings,
+            [],
+            "an undeclared tests/support/orphan.rs test must not defeat "
+            "the sole-member exemption on tests/race.rs",
+        )
+        names = {name for _path, _line, name in membership.get("demo_key", [])}
+        self.assertIn("only_race", names)
+
     def test_imported_library_type_assoc_counts_in_integration_tests(self):
         """`use xai_grok_shell::State; State::bump()` in tests/ is
         the library impl (#516 review)."""
@@ -5471,6 +5573,46 @@ class DefaultScanRoots(unittest.TestCase):
                 src(
                     """\
                     use xai_grok_shell as shell;
+
+                    #[test]
+                    fn first_untagged() {
+                        shell::bump();
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        shell::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_integration_extern_crate_alias_reaches_registered_state(self):
+        """`extern crate xai_grok_shell as shell;` is the library root
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    extern crate xai_grok_shell as shell;
 
                     #[test]
                     fn first_untagged() {

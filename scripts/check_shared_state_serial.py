@@ -298,6 +298,10 @@ USE_BRACE = re.compile(
 USE_HEAD = re.compile(
     rf"\buse\s+(crate|super|self|{RUST_IDENT_TOKEN})"
 )
+EXTERN_CRATE = re.compile(
+    rf"\bextern\s+crate\s+(?P<name>{RUST_IDENT_TOKEN})"
+    rf"(?:\s+as\s+(?P<alias>{RUST_IDENT_TOKEN}))?\s*;"
+)
 # Any `path::to::name(` call, `crate`-rooted or not. Resolved two ways (see
 # `_resolve_calls`): a `crate`-rooted path by its FULL module path, and every
 # path (rooted or not) by its LAST segment alone against a file's own module
@@ -326,7 +330,7 @@ REGISTRY_MARKER = re.compile(
 )
 STATIC_DECL = re.compile(
     r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?static[ \t]+(?:mut[ \t]+)?"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*:"
+    rf"(?P<name>{RUST_IDENT_TOKEN})[ \t]*:"
 )
 # A line the block-scan may pass THROUGH without ending the block: blank, a
 # comment (plain or doc), or an attribute. Not a static decl itself.
@@ -1565,7 +1569,8 @@ def _is_lib_crate_ident(name: str) -> bool:
 
 
 def _is_crate_root_alias(module: tuple[str, ...], fname: str) -> bool:
-    """`use xai_grok_shell as shell` / `use crate as foo` bind the crate root."""
+    """`use xai_grok_shell as shell` / `extern crate xai_grok_shell as shell`
+    / `use crate as foo` bind the crate root."""
 
     return not module and (_is_lib_crate_ident(fname) or fname == "crate")
 
@@ -1998,12 +2003,13 @@ class _UseBinding:
 
 
 def _use_bindings(path: Path, text: str) -> list[_UseBinding]:
-    """Every `use` binding with its source offset.
+    """Every `use` / `extern crate` binding with its source offset.
 
     File-wide last-write let `mod second { use … as bump }` steal
     `mod first`'s import (#516 review). Function-local `use` is split
     out later so two tests in one module cannot overwrite each other
-    (#516 review).
+    (#516 review). `extern crate xai_grok_shell as shell;` is the same
+    crate-root alias as `use xai_grok_shell as shell` (#516 review).
     """
 
     code = _code_only(text)
@@ -2022,6 +2028,13 @@ def _use_bindings(path: Path, text: str) -> list[_UseBinding]:
 
     for pos, root, mid, fname, local in _iter_use_leaves(code):
         record(pos, root, mid, fname, local)
+    for match in EXTERN_CRATE.finditer(code):
+        name = _raw_ident(match.group("name"))
+        alias = match.group("alias")
+        local = _raw_ident(alias) if alias else name
+        if not name.isidentifier() or not local.isidentifier():
+            continue
+        record(match.start(), name, (), name, local)
     return out
 
 
@@ -2260,6 +2273,29 @@ def _src_bin_target_stem(path: Path) -> str | None:
 _MOD_DECL = re.compile(r"\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
 
 
+def _declared_mod_files(
+    parent: Path, name: str, by_posix: dict[str, Path]
+) -> list[Path]:
+    """Files `mod name;` from `parent` actually compiles.
+
+    Only `name.rs` or `name/mod.rs`, not every descendant of `name/`
+    (#516 review). Nested files join the binary only when a later `mod`
+    declaration reaches them.
+    """
+
+    found: list[Path] = []
+    seen: set[str] = set()
+    for candidate in (parent / f"{name}.rs", parent / name / "mod.rs"):
+        key = _norm_posix(candidate)
+        if key in seen:
+            continue
+        path = by_posix.get(key)
+        if path is not None:
+            seen.add(key)
+            found.append(path)
+    return found
+
+
 def _integration_binary_stem(path: Path) -> str | None:
     """Test-binary name when `path` is that binary's crate root."""
 
@@ -2313,6 +2349,7 @@ def _file_process_groups(
     """
 
     text_of = dict(sources)
+    by_posix = {_norm_posix(path): path for path, _text in sources}
     groups: dict[Path, set[str]] = {path: set() for path, _text in sources}
     binaries: list[tuple[Path, str]] = []
     for path, _text in sources:
@@ -2322,15 +2359,6 @@ def _file_process_groups(
         groups[path].add(group)
         binaries.append((path, group))
     for bin_path, group in binaries:
-        parent = bin_path.parent
-        for name in _MOD_DECL.findall(_code_only(text_of[bin_path])):
-            file_mod = parent / f"{name}.rs"
-            dir_mod = parent / name
-            for path in groups:
-                if path == bin_path:
-                    continue
-                if path == file_mod or _path_is_relative_to(path, dir_mod):
-                    groups[path].add(group)
         pending = [bin_path]
         seen: set[str] = set()
         while pending:
@@ -2341,24 +2369,21 @@ def _file_process_groups(
             seen.add(key)
             text = text_of.get(current)
             if text is None:
-                for path, body in text_of.items():
-                    if _norm_posix(path) == key:
-                        text = body
-                        current = path
-                        break
+                resolved = by_posix.get(key)
+                if resolved is None:
+                    continue
+                current = resolved
+                text = text_of.get(current)
             if text is None:
                 continue
             code = _code_only(text)
             for name in _MOD_DECL.findall(code):
-                file_mod = current.parent / f"{name}.rs"
-                dir_mod = current.parent / name
-                for path in groups:
+                for path in _declared_mod_files(current.parent, name, by_posix):
                     if path == current:
                         continue
-                    if path == file_mod or _path_is_relative_to(path, dir_mod):
-                        if group not in groups[path]:
-                            groups[path].add(group)
-                        pending.append(path)
+                    if group not in groups[path]:
+                        groups[path].add(group)
+                    pending.append(path)
             for target in _path_attr_files(current, text):
                 for path in groups:
                     if path == current:
@@ -2523,11 +2548,14 @@ def _consume_static_decl(lines: list[str], start: int) -> tuple[str | None, int]
     decl = STATIC_DECL.match(lines[start])
     if not decl:
         return None, start
+    name = _raw_ident(decl.group("name"))
+    if not name.isidentifier():
+        return None, start
     remainder = "".join(lines[start:])
     end = _static_decl_semicolon_end(remainder)
     if end is None:
-        return decl.group("name"), start + 1
-    return decl.group("name"), start + max(_lines_spanned(remainder, end), 1)
+        return name, start + 1
+    return name, start + max(_lines_spanned(remainder, end), 1)
 
 
 def _skip_registry_filler(lines: list[str], start: int) -> int | None:
