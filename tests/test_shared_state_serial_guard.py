@@ -1644,6 +1644,40 @@ class TransitiveClosure(unittest.TestCase):
         self.assertIn("real_toucher", names)
         self.assertNotIn("calls_clean_untagged", names)
 
+    def test_macro_arm_call_inherits_callee_keys(self):
+        """`(touch) => { helper(); }` must inherit `helper`'s keys after
+        call-graph closure (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            fn helper() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            macro_rules! act {
+                (touch) => {
+                    helper();
+                };
+                (clean) => {};
+            }
+
+            #[test]
+            fn first_untagged() {
+                act!(touch);
+            }
+
+            #[test]
+            fn second_untagged() {
+                act!(touch);
+            }
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_qualified_static_in_another_module_is_not_a_touch(self):
         """`crate::b::COUNTER` is not the registered `a::COUNTER`
         (#516 review)."""
@@ -1996,6 +2030,52 @@ class TransitiveClosure(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertIn("calls_outer_untagged", names)
+
+    def test_nested_use_does_not_rewrite_outer_same_file_calls(self):
+        """Outer `bump()` is the same-file helper; a nested
+        `use crate::b::bump` must not steal it (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    fn first_untagged() {
+                        bump();
+                        {
+                            use crate::b::bump;
+                        }
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        bump();
+                        {
+                            use crate::b::bump;
+                        }
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/b.rs"),
+                src(
+                    """\
+                    pub fn bump() {}
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
 
     def test_brace_self_alias_qualified_call_reaches_registered_state(self):
         """`use crate::a::{self as h}; h::bump()` must resolve (#516 review)."""

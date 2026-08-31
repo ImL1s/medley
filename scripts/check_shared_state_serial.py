@@ -241,7 +241,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_SCAN_ROOT = Path("crates/codegen/xai-grok-shell/src")
@@ -2295,12 +2295,10 @@ class FnInfo:
     serial_held: frozenset[str]  # keys held by any #[serial(..)] on this fn
     has_unkeyed_serial: bool
     attrs_line: int
-    local_imports: dict[str, tuple[tuple[str, ...], str]] = field(
-        default_factory=dict
-    )
     glob_modules: tuple[tuple[str, ...], ...] = ()
     local_uses: tuple[tuple[int, int, str, tuple[str, ...], str], ...] = ()
-    macro_arms: tuple[tuple[str, frozenset[str]], ...] = ()
+    macro_arms: tuple[tuple[str, int], ...] = ()
+    is_macro_arm: bool = False
 
 
 def _import_from_uses(
@@ -2328,9 +2326,6 @@ def _fn_import(
     """Resolve `name` at `call_pos` in `fn.body`, honoring nested blocks."""
 
     imported = _import_from_uses(fn.local_uses, name, call_pos)
-    if imported is not None:
-        return imported
-    imported = fn.local_imports.get(name)
     if imported is not None:
         return imported
     return _lookup_import(imports_by_file.get(fn.file, {}), fn.inline_mods, name)
@@ -2889,7 +2884,7 @@ def index_functions(
         imports_by_file[rel] = file_imports
         globs_by_file[rel] = file_globs
         for match, name, body_start, body_end, body_code, inline_mods in pending_fns:
-            local, local_globs = _imports_in_span(bindings, body_start, body_end)
+            _local, local_globs = _imports_in_span(bindings, body_start, body_end)
             local_uses = _local_uses_from_body(
                 body_code, _module_path(rel), inline_mods
             )
@@ -2953,7 +2948,6 @@ def index_functions(
                     serial_held=frozenset(serial_held),
                     has_unkeyed_serial=has_unkeyed,
                     attrs_line=_line(raw, match.start()),
-                    local_imports=local,
                     glob_modules=tuple(local_globs),
                     local_uses=local_uses,
                 )
@@ -2982,26 +2976,41 @@ def index_functions(
             )
             raw_macro_body = raw[body_start:body_end]
             arm_list: list[_MacroArm] = []
-            arm_key_pairs: list[tuple[str, frozenset[str]]] = []
+            arm_indices: list[tuple[str, int]] = []
             for matcher, arm_body in _macro_rule_arms(raw_macro_body):
                 arm_code = _strip_turbofish(_code_only(arm_body))
-                arm_key_pairs.append(
-                    (
-                        matcher,
-                        frozenset(
-                            item.key
-                            for item in registry
-                            if _body_touches(
-                                arm_code,
-                                item.identifiers,
-                                original=item.identifiers,
-                                static_module=_item_module(item),
-                                fn_module=_module_path(rel),
-                                scoped_imports=file_imports,
-                            )
-                        ),
+                arm_keys = frozenset(
+                    item.key
+                    for item in registry
+                    if _body_touches(
+                        arm_code,
+                        item.identifiers,
+                        original=item.identifiers,
+                        static_module=_item_module(item),
+                        fn_module=_module_path(rel),
+                        scoped_imports=file_imports,
                     )
                 )
+                arm_index = len(out)
+                out.append(
+                    FnInfo(
+                        name=f"{name}#arm{len(arm_indices)}",
+                        file=rel,
+                        type_name=None,
+                        trait_name=None,
+                        is_macro=False,
+                        inline_mods=(),
+                        body=arm_code,
+                        start=body_start,
+                        keys=arm_keys,
+                        is_test=False,
+                        serial_held=frozenset(),
+                        has_unkeyed_serial=False,
+                        attrs_line=_line(raw, match.start()),
+                        is_macro_arm=True,
+                    )
+                )
+                arm_indices.append((matcher, arm_index))
                 serials_for_arm: list[
                     tuple[frozenset[str], bool, bool, int, tuple[str, ...]]
                 ] = []
@@ -3061,7 +3070,7 @@ def index_functions(
                     serial_held=frozenset(),
                     has_unkeyed_serial=False,
                     attrs_line=_line(raw, match.start()),
-                    macro_arms=tuple(arm_key_pairs),
+                    macro_arms=tuple(arm_indices),
                 )
             )
         scans.append((rel, raw, code, occupied, inline_spans))
@@ -3277,7 +3286,7 @@ def _resolve_calls(
     by_type: dict[tuple[str, str], dict[str, list[int]]],
     by_macro: dict[Path, dict[str, int]],
     by_macro_any: dict[str, list[int]],
-    by_macro_arms: dict[Path, dict[str, tuple[tuple[str, frozenset[str]], ...]]],
+    by_macro_arms: dict[Path, dict[str, tuple[tuple[str, int], ...]]],
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]],
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
@@ -3332,9 +3341,9 @@ def _resolve_calls(
             inner = _macro_invoke_inner(fn.body, m.end())
             arity = _macro_invoke_arity(fn.body, m.end())
             chosen: frozenset[str] | None = None
-            for matcher, arm_keys in arms:
+            for matcher, arm_index in arms:
                 if _arm_accepts(matcher, inner, arity):
-                    chosen = arm_keys
+                    chosen = keys_of[arm_index]
                     break
             if chosen is not None:
                 gained.update(chosen)
@@ -3541,7 +3550,7 @@ def analyze(
     by_type: dict[tuple[str, str], dict[str, list[int]]] = {}
     by_macro: dict[Path, dict[str, int]] = {}
     by_macro_any: dict[str, list[int]] = {}
-    by_macro_arms: dict[Path, dict[str, tuple[tuple[str, frozenset[str]], ...]]] = {}
+    by_macro_arms: dict[Path, dict[str, tuple[tuple[str, int], ...]]] = {}
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]] = {}
     for i, fn in enumerate(functions):
         if fn.is_macro:
@@ -3549,6 +3558,8 @@ def analyze(
             by_macro_any.setdefault(fn.name, []).append(i)
             if fn.macro_arms:
                 by_macro_arms.setdefault(fn.file, {})[fn.name] = fn.macro_arms
+            continue
+        if fn.is_macro_arm:
             continue
         by_file.setdefault(fn.file, {}).setdefault(fn.name, []).append(i)
         by_inline.setdefault((fn.file, fn.inline_mods), {}).setdefault(
