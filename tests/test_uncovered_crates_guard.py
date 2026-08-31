@@ -377,6 +377,24 @@ m!('r"fake \"
 ");
 pub fn f() {}
 ''',
+                "literal_suffix_before_ordinary_string": r'''macro_rules! m { ($($tt:tt)*) => {} }
+m!(""r"fake \"
+#[some::test]
+");
+pub fn f() {}
+''',
+                "raw_literal_suffix_before_ordinary_string": r'''macro_rules! m { ($($tt:tt)*) => {} }
+m!(r""r"fake \"
+#[some::test]
+");
+pub fn f() {}
+''',
+                "char_literal_suffix_before_ordinary_string": r'''macro_rules! m { ($($tt:tt)*) => {} }
+m!('x'r"fake \"
+#[some::test]
+");
+pub fn f() {}
+''',
                 "nonterminal_test_segment": "#[test::fixture]\npub fn f() {}\n",
                 "cfg": "#[cfg(test)]\npub fn f() {}\n",
             }.items():

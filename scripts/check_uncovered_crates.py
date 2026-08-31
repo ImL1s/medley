@@ -113,13 +113,24 @@ class Report:
     stale: frozenset[str]
 
 
+def _skip_literal_suffix(source: str, index: int) -> int:
+    """Consume an identifier suffix attached to a Rust literal token."""
+
+    if index >= len(source) or not source[index].isidentifier():
+        return index
+    index += 1
+    while index < len(source) and ("a" + source[index]).isidentifier():
+        index += 1
+    return index
+
+
 def _skip_quoted(source: str, index: int) -> int:
     index += 1
     while index < len(source):
         if source[index] == "\\":
             index += 2
         elif source[index] == '"':
-            return index + 1
+            return _skip_literal_suffix(source, index + 1)
         else:
             index += 1
     return len(source)
@@ -139,7 +150,9 @@ def _skip_raw_string(source: str, index: int) -> int | None:
     hashes = match.group("hashes") or ""
     terminator = '"' + hashes
     end = source.find(terminator, match.end())
-    return len(source) if end < 0 else end + len(terminator)
+    if end < 0:
+        return len(source)
+    return _skip_literal_suffix(source, end + len(terminator))
 
 
 def _skip_comment(source: str, index: int) -> int | None:
@@ -176,7 +189,7 @@ def _code_only(source: str) -> str:
             end = _skip_quoted(source, index)
         if end is None and source[index] == "'":
             match = _RUST_CHAR_LITERAL.match(source, index)
-            end = match.end() if match else None
+            end = _skip_literal_suffix(source, match.end()) if match else None
         if end is None:
             index += 1
             continue
