@@ -1085,6 +1085,8 @@ jobs:
             atomic_write_string_at_keeps_pinned_destination_verbatim -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             transaction_does_not_rollback_over_a_newer_editor_after_overlay_mismatch -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            apply_items_to_config_writes_path_entries -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             new_loads_toggle_under_the_same_lock_as_the_snapshot -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

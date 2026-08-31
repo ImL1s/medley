@@ -767,15 +767,8 @@ impl ImportResult {
 
 /// Apply items to a single config.toml file using atomic write.
 fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow::Result<usize> {
-    let user_config = xai_grok_config::grok_home().join("config.toml");
-    let mut _lock = None;
-    let dest = if config_path == user_config.as_path() {
-        let (lock, dest) = xai_grok_config::fs_atomic::lock_config_destination(config_path)?;
-        _lock = Some(lock);
-        dest
-    } else {
-        xai_grok_config::fs_atomic::resolve_write_path(config_path)?
-    };
+    let (lock, dest) = xai_grok_config::fs_atomic::lock_config_destination(config_path)?;
+    let _lock = lock;
     // Read existing TOML. Surface parse errors instead of silently
     // discarding the file: an atomic rewrite would otherwise drop
     // unrelated sections ([model], [ui], etc.) and overwrite a hand-edited
@@ -841,14 +834,8 @@ fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow
     }
 
     if count > 0 {
-        // Atomic write: write to .tmp, then rename.
         let toml_str = toml::to_string_pretty(&root)?;
-        let tmp = dest.with_extension("toml.tmp");
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&tmp, &toml_str)?;
-        std::fs::rename(&tmp, &dest)?;
+        crate::util::config::atomic_write_string_at(&dest, &toml_str)?;
         info!(
             path = %config_path.display(),
             count,

@@ -878,56 +878,39 @@ async fn clear_sticky_project_disabled_at(
     path: &std::path::Path,
     server_name: &str,
 ) -> Result<bool> {
-    let original = match tokio::fs::read_to_string(path).await {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => {
-            return Err(anyhow::anyhow!("failed to read {}: {e}", path.display()));
-        }
-    };
-    let mut doc: toml_edit::DocumentMut = original
-        .parse()
-        .map_err(|e| anyhow::anyhow!("refusing to rewrite unparseable {}: {e}", path.display()))?;
-
-    let Some(servers) = doc
-        .get_mut("mcp_servers")
-        .and_then(|item| item.as_table_like_mut())
-    else {
-        return Ok(false);
-    };
-    let Some(entry) = servers.get_mut(server_name) else {
-        return Ok(false);
-    };
-    let Some(server_table) = entry.as_table_like_mut() else {
-        return Ok(false);
-    };
-    if server_table.get("enabled").and_then(|v| v.as_bool()) != Some(false) {
-        return Ok(false);
-    }
-    server_table.insert("enabled", toml_edit::value(true));
-
-    let updated = doc.to_string();
-    if updated == original {
-        return Ok(false);
-    }
-    super::persist::atomic_write_string(path, &updated)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
-    Ok(true)
+    rewrite_sticky_project_enabled(path, server_name, false, true).await
 }
 
 /// Flip sticky project `enabled = true` → false with toml_edit (comments kept).
 /// Inverse of [`clear_sticky_project_disabled_at`].
 async fn set_sticky_project_disabled_at(path: &std::path::Path, server_name: &str) -> Result<bool> {
-    let original = match tokio::fs::read_to_string(path).await {
+    rewrite_sticky_project_enabled(path, server_name, true, false).await
+}
+
+async fn rewrite_sticky_project_enabled(
+    path: &std::path::Path,
+    server_name: &str,
+    from_enabled: bool,
+    to_enabled: bool,
+) -> Result<bool> {
+    let path_owned = path.to_path_buf();
+    let (lock, dest) = tokio::task::spawn_blocking(move || {
+        xai_grok_config::fs_atomic::lock_config_destination(&path_owned)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to lock {}: {e}", path.display()))?
+    .map_err(|e| anyhow::anyhow!("failed to lock {}: {e}", path.display()))?;
+    let _lock = lock;
+    let original = match tokio::fs::read_to_string(&dest).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => {
-            return Err(anyhow::anyhow!("failed to read {}: {e}", path.display()));
+            return Err(anyhow::anyhow!("failed to read {}: {e}", dest.display()));
         }
     };
     let mut doc: toml_edit::DocumentMut = original
         .parse()
-        .map_err(|e| anyhow::anyhow!("refusing to rewrite unparseable {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("refusing to rewrite unparseable {}: {e}", dest.display()))?;
 
     let Some(servers) = doc
         .get_mut("mcp_servers")
@@ -941,17 +924,17 @@ async fn set_sticky_project_disabled_at(path: &std::path::Path, server_name: &st
     let Some(server_table) = entry.as_table_like_mut() else {
         return Ok(false);
     };
-    if server_table.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+    if server_table.get("enabled").and_then(|v| v.as_bool()) != Some(from_enabled) {
         return Ok(false);
     }
-    server_table.insert("enabled", toml_edit::value(false));
+    server_table.insert("enabled", toml_edit::value(to_enabled));
 
     let updated = doc.to_string();
     if updated == original {
         return Ok(false);
     }
-    super::persist::atomic_write_string(path, &updated)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    super::persist::atomic_write_string_at(&dest, &updated)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", dest.display()))?;
     Ok(true)
 }
 
@@ -3054,12 +3037,24 @@ enabled = false
         save_mcp_server_config_at(&logical, "proj_symlink_svc", &sample_stdio_server())
             .await
             .unwrap();
+        set_sticky_project_disabled_at(&logical, "proj_symlink_svc")
+            .await
+            .unwrap();
+        let stuck = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            stuck.contains("enabled = false"),
+            "sticky disable must write dest: {stuck}"
+        );
+        clear_sticky_project_disabled_at(&logical, "proj_symlink_svc")
+            .await
+            .unwrap();
         assert!(
             logical.symlink_metadata().unwrap().file_type().is_symlink(),
             "project config.toml must remain a symlink"
         );
         let body = std::fs::read_to_string(&target).unwrap();
         assert!(body.contains("proj_symlink_svc"), "{body}");
+        assert!(body.contains("enabled = true"), "{body}");
     }
 
     #[tokio::test]
