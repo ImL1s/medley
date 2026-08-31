@@ -234,7 +234,12 @@ fn resolve_dismissable_campaigns() -> Vec<CampaignEntry> {
 /// Effective config with remote/override-aware campaign overlay
 /// (base → resolve [override/kill/merge/dismiss] → apply), one `ConfigLayers::load`.
 pub fn load_effective_config() -> std::io::Result<toml::Value> {
-    let layers = ConfigLayers::load()?;
+    load_effective_config_from_layers(ConfigLayers::load()?)
+}
+
+/// Like [`load_effective_config`], but with a caller-supplied layer set (e.g. a
+/// pinned user `config.toml` destination for Agents modal CAS (#532 review)).
+pub fn load_effective_config_from_layers(layers: ConfigLayers) -> std::io::Result<toml::Value> {
     let dismissed = load_dismissed_ids();
     let remote = cached_remote_campaigns();
     let mut effective = layers.effective_config_base();

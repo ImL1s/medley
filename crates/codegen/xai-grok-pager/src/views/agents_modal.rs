@@ -638,9 +638,11 @@ fn load_agent_toggle_with_pinned_user(dest: &Path) -> Result<HashMap<String, boo
     let user_campaigns = xai_grok_config::campaigns::take_campaign_entries(&mut user, "user");
     layers.user = user;
     layers.campaigns.user = user_campaigns;
-    Ok(toggle_map_from_effective_root(
-        &layers.effective_config_disk_only(),
-    ))
+    // Match runtime `load_effective_config`: remote cache + GROK_CAMPAIGNS_OVERRIDE
+    // must still apply on top of the pinned user layer (#532 review).
+    let root = xai_grok_shell::config::load_effective_config_from_layers(layers)
+        .map_err(|e| e.to_string())?;
+    Ok(toggle_map_from_effective_root(&root))
 }
 
 fn toggle_map_from_effective_root(root: &toml::Value) -> HashMap<String, bool> {
