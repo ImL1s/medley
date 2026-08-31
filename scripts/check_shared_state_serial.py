@@ -306,6 +306,12 @@ QUALIFIED_CALL = re.compile(
 TYPE_ASSOC_CALL = re.compile(
     r"\b([A-Z][A-Za-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>\s*)?\("
 )
+TYPE_ALIAS = re.compile(
+    r"\b(?:pub(?:\s*\([^)]*\))?\s+)?type\s+([A-Z][A-Za-z0-9_]*)\s*=\s*"
+    r"(?:(?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*)"
+    r"([A-Z][A-Za-z0-9_]*)"
+    r"(?:\s*<[^;>]*>)?\s*;"
+)
 # `<Type as Trait>::method(` is scanned by `_ufcs_calls`, not a regex:
 # `[^\>]*` cannot cross nested generics (`<Box<Vec<u8>> as Bump>::bump()`)
 # (#516 review).
@@ -1450,6 +1456,48 @@ def _is_lib_crate_ident(name: str) -> bool:
     return rust in {ident.replace("-", "_") for ident in _lib_crate_idents()}
 
 
+def _is_crate_root_alias(module: tuple[str, ...], fname: str) -> bool:
+    """`use xai_grok_shell as shell` / `use crate as foo` bind the crate root."""
+
+    return not module and (_is_lib_crate_ident(fname) or fname == "crate")
+
+
+def _rewrite_crate_root_segs(
+    segs: tuple[str, ...],
+    imported: tuple[tuple[str, ...], str] | None,
+) -> tuple[str, ...]:
+    """`shell::bump()` with `use xai_grok_shell as shell` is the library root."""
+
+    if not segs or imported is None:
+        return segs
+    module, fname = imported
+    if not _is_crate_root_alias(module, fname):
+        return segs
+    root = fname if _is_lib_crate_ident(fname) else "crate"
+    return (root,) + segs[1:]
+
+
+def _type_alias_map(
+    code: str, occupied: list[tuple[int, int]] | None = None
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for match in TYPE_ALIAS.finditer(code):
+        if occupied and any(start <= match.start() < end for start, end in occupied):
+            continue
+        out[match.group(1)] = match.group(2)
+    return out
+
+
+def _resolve_type_alias(fn: "FnInfo", name: str) -> str:
+    mapping = dict(fn.type_aliases)
+    seen: set[str] = set()
+    current = name
+    while current in mapping and current not in seen:
+        seen.add(current)
+        current = mapping[current]
+    return current
+
+
 def _crate_of(path: Path) -> str:
     """Owning crate name for process-group keys.
 
@@ -1794,10 +1842,14 @@ def _iter_use_leaves(
         if root not in ("crate", "super", "self") and not root.isidentifier():
             continue
         i = _skip_ws_code(code, match.end())
+        collected: list[tuple[tuple[str, ...], str, str]] = []
         if i + 1 < len(code) and code[i : i + 2] == "::":
             i += 2
-        collected: list[tuple[tuple[str, ...], str, str]] = []
-        _collect_use_leaves(code, i, (), match.start(), collected)
+            _collect_use_leaves(code, i, (), match.start(), collected)
+        else:
+            # `use xai_grok_shell as shell;` has no `::` tail (#516 review).
+            alias, _ = _parse_use_as(code, i)
+            collected.append(((), root, alias or root))
         for mid, fname, local in collected:
             leaves.append((match.start(), root, mid, fname, local))
     return leaves
@@ -2469,6 +2521,7 @@ class FnInfo:
     is_macro_arm: bool = False
     is_macro_export: bool = False
     enclosing_start: int | None = None
+    type_aliases: tuple[tuple[str, str], ...] = ()
 
 
 def _import_from_uses(
@@ -2536,6 +2589,9 @@ def _macro_candidates(
             segs[0]
         ):
             imported = _fn_import(fn, segs[0], match.start(), imports_by_file)
+            segs = _rewrite_crate_root_segs(segs, imported)
+            if imported is not None and _is_crate_root_alias(*imported):
+                imported = None
         if imported is not None:
             module, imported_name = imported
             target_module = module + (imported_name,) + segs[1:]
@@ -3189,6 +3245,7 @@ def index_functions(
         file_imports, file_globs = _imports_outside_bodies(bindings, occupied)
         imports_by_file[rel] = file_imports
         globs_by_file[rel] = file_globs
+        file_aliases = _type_alias_map(code, occupied)
         for match, name, body_start, body_end, body_code, inline_mods in pending_fns:
             local_uses, local_globs = _local_uses_from_body(
                 body_code, _module_path(rel), inline_mods
@@ -3271,6 +3328,9 @@ def index_functions(
                     local_uses=local_uses,
                     local_globs=local_globs,
                     enclosing_start=enclosing_start,
+                    type_aliases=tuple(
+                        {**file_aliases, **_type_alias_map(body_code)}.items()
+                    ),
                 )
             )
         for match in _macro_def_matches(code):
@@ -3782,6 +3842,12 @@ def _resolve_calls(
             )
     for m in QUALIFIED_CALL.finditer(fn.body):
         segs = tuple(s.strip() for s in m.group(1).split("::") if s.strip())
+        if segs and segs[0] not in ("crate", "self", "super") and not _is_lib_crate_ident(
+            segs[0]
+        ):
+            segs = _rewrite_crate_root_segs(
+                segs, _fn_import(fn, segs[0], m.start(), imports_by_file)
+            )
         if segs and segs[0] == "crate":
             caller_group = _process_group(fn.file)
             if caller_group.startswith("lib:"):
@@ -3915,11 +3981,11 @@ def _resolve_calls(
         # (which is never a real registered type name -- `by_type` is
         # keyed by concrete type names from `_impl_blocks`).
         raw_type = m.group(1)
-        type_name = fn.type_name if raw_type == "Self" else raw_type
+        type_name = fn.type_name if raw_type == "Self" else _resolve_type_alias(fn, raw_type)
         if type_name is None:
             continue
         if raw_type != "Self":
-            imported = _fn_import(fn, raw_type, m.start(), imports_by_file)
+            imported = _fn_import(fn, type_name, m.start(), imports_by_file)
             if imported is not None:
                 type_name = imported[1]
         caller_groups = groups_of.get(
@@ -3937,6 +4003,7 @@ def _resolve_calls(
             slots,
         )
     for type_name, method in _ufcs_calls(fn.body):
+        type_name = _resolve_type_alias(fn, type_name)
         imported = _fn_import(fn, type_name, 0, imports_by_file)
         if imported is not None:
             type_name = imported[1]

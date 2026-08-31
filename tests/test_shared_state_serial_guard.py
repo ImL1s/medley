@@ -4332,6 +4332,39 @@ class TypeAssociatedResolution(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertIn("calls_aliased_type_untagged", names)
 
+    def test_local_type_alias_assoc_call_resolves(self):
+        """`type S = State; S::bump()` must resolve through the alias
+        before `by_type` (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct State;
+
+            impl State {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            type S = State;
+
+            #[test]
+            fn first_untagged() {
+                S::bump();
+            }
+
+            #[test]
+            fn second_untagged() {
+                S::bump();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_ufcs_trait_call_resolves_like_type_assoc(self):
         """`<Type as Trait>::method(` does not match QUALIFIED_CALL or
         TYPE_ASSOC_CALL; without a dedicated pattern the call never
@@ -5025,6 +5058,46 @@ class DefaultScanRoots(unittest.TestCase):
                     #[test]
                     fn second_untagged() {
                         bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_integration_library_crate_alias_reaches_registered_state(self):
+        """`use xai_grok_shell as shell; shell::bump()` is the library
+        helper (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    use xai_grok_shell as shell;
+
+                    #[test]
+                    fn first_untagged() {
+                        shell::bump();
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        shell::bump();
                     }
                     """
                 ),
