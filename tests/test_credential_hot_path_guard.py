@@ -141,6 +141,11 @@ _MACRO_INVOKE = re.compile(rf"(?<![\w:])(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]")
 _CRATE_MACRO_INVOKE = re.compile(
     rf"\b(?:crate|self|super)\s*::\s*(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]"
 )
+_MODULE_MACRO_INVOKE = re.compile(
+    rf"\b(?!(?:crate|self|super)\b)"
+    rf"((?:(?:r#)?{_RUST_IDENT}\s*::\s*)+)"
+    rf"(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]"
+)
 _MACRO_USE_ALIAS = re.compile(
     rf"\buse\s+(?:(?:crate|self|super)\s*::\s*)?(?:(?:r#)?{_RUST_IDENT}\s*::\s*)*"
     rf"(?:r#)?({_RUST_IDENT})\s+as\s+(?:r#)?({_RUST_IDENT})\s*;"
@@ -235,6 +240,22 @@ def _fn_name(match: re.Match[str]) -> str:
     return unicodedata.normalize("NFC", match.group(1))
 
 
+def _path_prefix_segments(path: str) -> tuple[str, ...]:
+    """Normalize `macros ::` / `foo::bar::` into identifier segments."""
+
+    out: list[str] = []
+    for raw in path.split("::"):
+        seg = raw.strip()
+        if not seg:
+            continue
+        if seg.startswith("r#"):
+            seg = seg[2:]
+        seg = unicodedata.normalize("NFC", seg)
+        if seg.isidentifier():
+            out.append(seg)
+    return tuple(out)
+
+
 def _append_crate_qualified_invokes(
     masked: str,
     scoped_defs: tuple[tuple[str, str, int, tuple[int, ...]], ...],
@@ -242,7 +263,13 @@ def _append_crate_qualified_invokes(
     def_spans: list[tuple[int, int]],
     invoke_at: list[tuple[int, str, str, str]],
 ) -> None:
-    """`crate::`/`self::`/`super::` invocations (#507 review)."""
+    """Module- or crate-qualified macro invocations (#507 review).
+
+    `crate::`/`self::`/`super::` keep the root/inherited lookup. Ordinary
+    module paths such as `macros::emit!` resolve only to macros whose
+    enclosing inline-module path matches the qualifier — they must not
+    fall back to an unrelated same-named root macro.
+    """
 
     available = {name for name, _source, _end, _scope in scoped_defs} | {
         name for name, _source in inherited_macros
@@ -271,6 +298,30 @@ def _append_crate_qualified_invokes(
             )
         if not source:
             continue
+        delim = match.end() - 1
+        end = _balanced_pair_end(masked, delim)
+        invoke_at.append(
+            (match.start(), name, masked[delim + 1 : end - 1], source)
+        )
+    for match in _MODULE_MACRO_INVOKE.finditer(masked):
+        name = unicodedata.normalize("NFC", match.group(2))
+        if not name.isidentifier():
+            continue
+        if any(start <= match.start() < end for start, end in def_spans):
+            continue
+        segs = _path_prefix_segments(match.group(1))
+        if not segs:
+            continue
+        module_defs = [
+            (end, source)
+            for def_name, source, end, _def_scope in scoped_defs
+            if def_name == name
+            and end <= match.start()
+            and _inline_mods_at(masked, max(0, end - 1)) == segs
+        ]
+        if not module_defs:
+            continue
+        source = max(module_defs)[1]
         delim = match.end() - 1
         end = _balanced_pair_end(masked, delim)
         invoke_at.append(
@@ -5504,6 +5555,27 @@ class ExternalModulePrefix(unittest.TestCase):
                 };
             }
             crate::generated!(none_auth_scheme_case);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_case"])
+
+    def test_module_qualified_macro_is_counted(self):
+        """`macros::emit!(name)` expands a module-reexported macro
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            mod macros {
+                macro_rules! emit {
+                    ($name:ident) => {
+                        #[test]
+                        fn $name() {}
+                    };
+                }
+                pub(crate) use emit;
+            }
+            macros::emit!(none_auth_scheme_case);
             """
         )
         names = _tests_in_file(text, [])
