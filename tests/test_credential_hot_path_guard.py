@@ -4179,14 +4179,10 @@ class CiPackageTargetCounts(unittest.TestCase):
             by_feat = parse_workflow_by_features(wf, root=root)
             lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
             self.assertTrue(
-<<<<<<< HEAD
-                any(NO_DEFAULT_FEATURES_TOKEN in feat for _c, feat, _t, _e, _f in lanes)
-=======
                 any(
                     NO_DEFAULT_FEATURES_TOKEN in feat
                     for _c, feat, _t, _e, _f in lanes
                 )
->>>>>>> bccdf278 (fix(ci): fix hot-path lane unpacking and covering filters)
             )
             feat = frozenset({NO_DEFAULT_FEATURES_TOKEN})
             records_for_feat = {
