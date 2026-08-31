@@ -1056,6 +1056,24 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             prepared_new_session_plan_preserves_selected_effort_with_implicit_menu -- --nocapture
 
+      - name: "Generation CAS config.toml persist (issue #290)"
+        run: |
+          set -o pipefail
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          # Unique module path so #171 proves the five CAS tests are selected.
+          run_nonzero -p xai-grok-pager --lib config_toml_edit:: -- --nocapture
+
       - name: Restricted subagent capability boundaries
         run: |
           run_nonzero() {
