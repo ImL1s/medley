@@ -145,6 +145,12 @@ _MACRO_USE_ALIAS = re.compile(
     rf"\buse\s+(?:(?:crate|self|super)\s*::\s*)?(?:(?:r#)?{_RUST_IDENT}\s*::\s*)*"
     rf"(?:r#)?({_RUST_IDENT})\s+as\s+(?:r#)?({_RUST_IDENT})\s*;"
 )
+_MACRO_USE_GROUP_START = re.compile(
+    rf"\buse\s+(?:(?:crate|self|super)\s*::\s*)?(?:(?:r#)?{_RUST_IDENT}\s*::\s*)*\{{"
+)
+_MACRO_USE_ALIAS_IN_TREE = re.compile(
+    rf"(?:r#)?({_RUST_IDENT})\s+as\s+(?:r#)?({_RUST_IDENT})"
+)
 
 
 def _macro_name(match: re.Match[str]) -> str:
@@ -154,19 +160,74 @@ def _macro_name(match: re.Match[str]) -> str:
     return name if name.isidentifier() else ""
 
 
-def _macro_use_aliases(masked: str) -> dict[str, str]:
-    """`use path::emit as aliased;` → `{aliased: emit}` (#507 review)."""
+def _macro_use_alias_entries(
+    masked: str,
+    *,
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> list[tuple[str, str, int, tuple[int, ...]]]:
+    """`(alias, original, start, brace_scope)` for macro `use` imports.
 
-    out: dict[str, str] = {}
+    Handles both `use crate::emit as aliased;` and grouped
+    `use crate::{emit as aliased};`. Cfg-gated imports are dropped.
+    Scope is the brace path containing the `use` (#507 review).
+    """
+
+    attr_spans = _outer_attr_spans(masked)
+    attr_ends = [end for _s, end, _a in attr_spans]
+    pairs: list[tuple[str, str, int]] = []
     for match in _MACRO_USE_ALIAS.finditer(masked):
         original = unicodedata.normalize("NFC", match.group(1))
         alias = unicodedata.normalize("NFC", match.group(2))
         if original.isidentifier() and alias.isidentifier():
-            out[alias] = original
+            pairs.append((alias, original, match.start()))
+    for match in _MACRO_USE_GROUP_START.finditer(masked):
+        end = _balanced_pair_end(masked, match.end() - 1)
+        inner = masked[match.end() : end - 1]
+        for alias_match in _MACRO_USE_ALIAS_IN_TREE.finditer(inner):
+            original = unicodedata.normalize("NFC", alias_match.group(1))
+            alias = unicodedata.normalize("NFC", alias_match.group(2))
+            if original.isidentifier() and alias.isidentifier():
+                pairs.append((alias, original, match.start()))
+    starts = {start for _a, _o, start in pairs}
+    scopes = _brace_scopes_at(masked, starts, []) if starts else {}
+    out: list[tuple[str, str, int, tuple[int, ...]]] = []
+    for alias, original, start in pairs:
+        attrs = _outer_attrs_before(masked, start, attr_spans, attr_ends)
+        if any(_cfg_attr_is_inactive(a, enabled_features) for a in attrs):
+            continue
+        out.append((alias, original, start, scopes.get(start, ())))
     return out
 
 
-def _resolve_macro_alias(name: str, aliases: dict[str, str]) -> str:
+def _macro_use_aliases(
+    masked: str,
+    *,
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> dict[str, str]:
+    """File-wide alias map for call sites that lack an invoke position."""
+
+    return {
+        alias: original
+        for alias, original, _start, _scope in _macro_use_alias_entries(
+            masked, enabled_features=enabled_features
+        )
+    }
+
+
+def _resolve_macro_alias(
+    name: str,
+    aliases: dict[str, str],
+    *,
+    entries: list[tuple[str, str, int, tuple[int, ...]]] | None = None,
+    invoke_scope: tuple[int, ...] | None = None,
+) -> str:
+    if entries is not None and invoke_scope is not None:
+        for alias, original, _start, scope in reversed(entries):
+            if alias != name:
+                continue
+            if invoke_scope[: len(scope)] == scope:
+                return original
+        return name
     return aliases.get(name, name)
 
 
@@ -726,19 +787,35 @@ def _macro_invoke_inners(
     """`(name, invoke_inner)` for invocations outside macro definitions."""
 
     known_defs = {name for name, _, _ in defs}
-    aliases = {
-        alias: original
-        for alias, original in _macro_use_aliases(masked).items()
-        if original in known_defs
-    }
+    alias_entries = [
+        entry
+        for entry in _macro_use_alias_entries(
+            masked, enabled_features=enabled_features
+        )
+        if entry[1] in known_defs
+    ]
+    aliases = {alias: original for alias, original, _s, _sc in alias_entries}
     if not known_defs:
         return []
     bodies = [(start, end) for _, start, end in defs]
+    invoke_starts = {
+        match.start()
+        for match in _MACRO_INVOKE.finditer(masked)
+        if not _qualified_macro_invocation(masked, match.start())
+    }
+    invoke_scopes = (
+        _brace_scopes_at(masked, invoke_starts) if invoke_starts else {}
+    )
     out: list[tuple[str, str]] = []
     for match in _MACRO_INVOKE.finditer(masked):
         if _qualified_macro_invocation(masked, match.start()):
             continue
-        name = _resolve_macro_alias(_macro_name(match), aliases)
+        name = _resolve_macro_alias(
+            _macro_name(match),
+            aliases,
+            entries=alias_entries,
+            invoke_scope=invoke_scopes.get(match.start(), ()),
+        )
         if name not in known_defs:
             continue
         if any(start <= match.start() < end for start, end in bodies):
@@ -1887,9 +1964,18 @@ def _selected_macro_expansions(
     }
     aliases = {
         alias: original
-        for alias, original in _macro_use_aliases(masked).items()
+        for alias, original in _macro_use_aliases(
+            masked, enabled_features=enabled_features
+        ).items()
         if original in base_names
     }
+    alias_entries = [
+        entry
+        for entry in _macro_use_alias_entries(
+            masked, enabled_features=enabled_features
+        )
+        if entry[1] in base_names
+    ]
     available_names = base_names | set(aliases)
     raw_invocations = [
         match
@@ -1915,7 +2001,12 @@ def _selected_macro_expansions(
     invoke_at: list[tuple[int, str, str, str]] = []
     for im in raw_invocations:
         inv_scope = invoke_scopes.get(im.start(), ())
-        resolved = _resolve_macro_alias(_macro_name(im), aliases)
+        resolved = _resolve_macro_alias(
+            _macro_name(im),
+            aliases,
+            entries=alias_entries,
+            invoke_scope=inv_scope,
+        )
         local = [
             (len(def_scope), end, source)
             for name, source, end, def_scope in scoped_defs
@@ -2908,9 +2999,18 @@ def _tests_in_file(
     }
     aliases = {
         alias: original
-        for alias, original in _macro_use_aliases(masked).items()
+        for alias, original in _macro_use_aliases(
+            masked, enabled_features=enabled_features
+        ).items()
         if original in available_names
     }
+    alias_entries = [
+        entry
+        for entry in _macro_use_alias_entries(
+            masked, enabled_features=enabled_features
+        )
+        if entry[1] in available_names
+    ]
     available_names = available_names | set(aliases)
     raw_invocations = [
         match
@@ -2931,7 +3031,12 @@ def _tests_in_file(
     invoke_at: list[tuple[int, str, str, str]] = []
     for im in raw_invocations:
         inv_scope = invoke_scopes.get(im.start(), ())
-        resolved = _resolve_macro_alias(_macro_name(im), aliases)
+        resolved = _resolve_macro_alias(
+            _macro_name(im),
+            aliases,
+            entries=alias_entries,
+            invoke_scope=inv_scope,
+        )
         local = [
             (len(def_scope), end, source)
             for name, source, end, def_scope in scoped_defs
@@ -5438,6 +5543,80 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_case"])
+
+    def test_grouped_macro_use_alias_is_counted(self):
+        """`use crate::{emit as aliased};` still expands (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! emit {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            use crate::{emit as aliased};
+            aliased!(none_auth_scheme_group);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_group"])
+
+    def test_cfg_disabled_macro_alias_is_ignored(self):
+        """`#[cfg(windows)] use crate::emit as aliased;` does not rewrite
+        on non-Windows hosts (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! emit {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            #[cfg(windows)]
+            use crate::emit as aliased;
+            macro_rules! aliased {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            aliased!(harmless);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["harmless"])
+
+    def test_macro_alias_stays_in_lexical_scope(self):
+        """An alias inside `mod inner` does not rewrite root invocations
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! emit {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            mod inner {
+                use crate::emit as aliased;
+                aliased!(inner_hot);
+            }
+            macro_rules! aliased {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            aliased!(harmless);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(
+            sorted(names), ["harmless", "inner::inner_hot"]
+        )
 
     def test_parent_macro_rules_test_in_external_child_is_counted(self):
         """A parent macro defined before `mod child;` is lexically visible
