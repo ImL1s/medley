@@ -40,11 +40,8 @@ from pathlib import Path
 # oldest copy received never reached the others (#494).
 from toml_package_name import package_name
 
-_RUST_ATTR_IDENT = r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*"
-_TEST_ATTR = re.compile(
-    rf"^\s*#\s*\[\s*(?:::\s*)?(?:{_RUST_ATTR_IDENT}\s*::\s*)*"
-    r"(?:r#)?test\b(?=\s*(?:\(|\]))",
-    re.MULTILINE,
+_ATTRIBUTE_PATH = re.compile(
+    r"^\s*#\s*\[\s*(?P<path>[^\(\]]+?)(?=\s*(?:\(|\]))", re.MULTILINE
 )
 _RUST_RAW_STRING_START = re.compile(r'(?:br|cr|r)(?P<hashes>#+)?"')
 _RUST_CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'\n])'")
@@ -183,6 +180,26 @@ def _code_only(source: str) -> str:
     return "".join(result)
 
 
+def _has_test_attribute(code: str) -> bool:
+    """Whether a code-only Rust source contains an attribute ending in `test`."""
+
+    for match in _ATTRIBUTE_PATH.finditer(code):
+        path = "".join(match.group("path").split())
+        if path.startswith("::"):
+            path = path[2:]
+        segments = path.split("::")
+        identifiers: list[str] = []
+        for segment in segments:
+            identifier = segment[2:] if segment.startswith("r#") else segment
+            if not identifier.isidentifier():
+                break
+            identifiers.append(identifier)
+        else:
+            if identifiers and identifiers[-1] == "test":
+                return True
+    return False
+
+
 def iter_crates(root: Path) -> list[Crate]:
     found: list[Crate] = []
     for base in _CRATE_ROOTS:
@@ -210,7 +227,7 @@ def src_has_tests(crate_dir: Path) -> bool:
             text = rs.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        if _TEST_ATTR.search(_code_only(text)):
+        if _has_test_attribute(_code_only(text)):
             return True
     return False
 

@@ -344,6 +344,8 @@ class SrcHasTests(unittest.TestCase):
                 "with_args": '#[tokio::test(flavor = "current_thread")]',
                 "raw_module": "#[r#async::test]",
                 "raw_test": "#[r#test]",
+                "unicode_module": "#[异步::test]",
+                "raw_unicode_module": "#[r#异步::test]",
             }.items():
                 crate = _crate(root, rel, rel, f"{attribute}\nfn t() {{}}\n")
                 with self.subTest(attribute=attribute):
