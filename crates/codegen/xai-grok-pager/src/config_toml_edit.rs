@@ -242,6 +242,10 @@ where
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(ConfigMutationError::Write)?;
     }
+    let current = read(path).map_err(ConfigMutationError::Read)?;
+    if current != original {
+        return Err(ConfigMutationError::ConcurrentEdit);
+    }
     write(path, &intended).map_err(ConfigMutationError::Write)?;
     match read(path) {
         Ok(bytes) if bytes == intended.as_bytes() => {
@@ -380,6 +384,40 @@ mod tests {
 
         assert!(matches!(error, ConfigMutationError::ConcurrentEdit));
         assert_eq!(fs::read_to_string(path).unwrap(), concurrent);
+    }
+
+    #[test]
+    fn transaction_rechecks_bytes_before_replace() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[ui]\ntheme = \"dark\"\n";
+        fs::write(&path, original).unwrap();
+        let rendered = config_mutation_snapshot(&path, 1).unwrap();
+        let reads = Cell::new(0);
+        let writes = Cell::new(0);
+        let error = mutate_config_document_at_with(
+            &path,
+            &path,
+            &rendered,
+            1,
+            set_agent_enabled,
+            |path| {
+                let n = reads.get();
+                reads.set(n + 1);
+                if n == 1 {
+                    return Ok(b"# editor\n[ui]\ntheme = \"light\"\n".to_vec());
+                }
+                fs::read(path)
+            },
+            |path, contents| {
+                writes.set(writes.get() + 1);
+                fs::write(path, contents)
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigMutationError::ConcurrentEdit));
+        assert_eq!(writes.get(), 0, "must not replace after a stale recheck");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]

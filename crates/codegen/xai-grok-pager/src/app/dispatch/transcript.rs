@@ -539,7 +539,7 @@ pub(super) fn dispatch_open_config_agents_modal(
     agent.extensions_modal = None;
 
     let cwd = agent.session.cwd.clone();
-    let toggle = load_agent_toggle();
+    let toggle = load_agent_toggle().unwrap_or_default();
     let model_agent_type = agent
         .session
         .models

@@ -612,24 +612,21 @@ fn persona_detail_from_local_file(
     })
 }
 /// Load the `[subagents.toggle]` map from config.toml.
-pub fn load_agent_toggle() -> HashMap<String, bool> {
-    let root = match xai_grok_shell::config::load_effective_config() {
-        Ok(r) => r,
-        Err(_) => return HashMap::new(),
-    };
+pub fn load_agent_toggle() -> Result<HashMap<String, bool>, String> {
+    let root = xai_grok_shell::config::load_effective_config().map_err(|e| e.to_string())?;
     let Some(subagents) = root.get("subagents") else {
-        return HashMap::new();
+        return Ok(HashMap::new());
     };
     let Some(toggle_table) = subagents.get("toggle") else {
-        return HashMap::new();
+        return Ok(HashMap::new());
     };
     let Some(table) = toggle_table.as_table() else {
-        return HashMap::new();
+        return Ok(HashMap::new());
     };
-    table
+    Ok(table
         .iter()
         .filter_map(|(k, v)| v.as_bool().map(|b| (k.to_string(), b)))
-        .collect()
+        .collect())
 }
 /// Sanitize a name for use as a filename: replace non-alphanumeric chars
 /// (except `-` and `_`) with `-`, require at least one alphanumeric char.
@@ -785,12 +782,20 @@ fn capture_locked_config_state(
 ) {
     let path = xai_grok_config::grok_home().join("config.toml");
     let _lock = crate::config_toml_edit::lock_config_destination(&path).ok();
-    (
-        capture_config_snapshot(generation),
-        load_config_agent_name(),
-        resolve_default_agent_name(cwd, model_agent_type),
-        load_agent_toggle(),
-    )
+    match load_agent_toggle() {
+        Ok(toggle) => (
+            capture_config_snapshot(generation),
+            load_config_agent_name(),
+            resolve_default_agent_name(cwd, model_agent_type),
+            toggle,
+        ),
+        Err(_) => (
+            None,
+            None,
+            resolve_default_agent_name(cwd, model_agent_type),
+            HashMap::new(),
+        ),
+    }
 }
 /// Set or clear the default agent via `[agent] name` in config.toml.
 ///
