@@ -35,7 +35,11 @@ plus live spawn in `xai-grok-shell`):
 - exact / inherit / ordered-candidate request types;
 - deterministic resolver over a synthetic catalog and the live session catalog;
 - immutable secret-free route receipts and digests;
-- inspect JSON (`medley.native-subagent-route.inspect/v1`);
+- inspect JSON (`medley.native-subagent-route.inspect/v1`) via
+  `medley inspect --native-subagent-route <PARENT_SESSION_ID>` (and `--json`),
+  using `find_persisted_session_dir_by_id_result` plus bounded no-follow
+  `subagents/<id>/meta.json` reads; surviving receipts are checked with
+  shipped `inspect_document`;
 - declarative `model` / `models` / `routingRequirements` parse on real
   `AgentDefinition` files;
 - typed `AgentRouteUxSnapshot` plus compact/detail formatters used by `/agents`;
@@ -64,7 +68,8 @@ plus live spawn in `xai-grok-shell`):
 - the full #290 interaction matrix (mouse/resize/suspend, 1,000-entry TUI
   latency, NO_COLOR terminal snapshots);
 - qualified model-family metadata;
-- bounded live evidence at exact SHAs.
+- bounded live evidence at exact SHAs (spawn a real child, capture ACP/meta,
+  then `inspect --native-subagent-route` plus `omg agents explain --host-inspect`).
 
 `medley.native-model-family-metadata.v1` and
 `medley.native-replay-safe-fallback.v1` advertise `unsupported` because live
