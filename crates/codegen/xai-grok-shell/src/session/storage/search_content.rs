@@ -30,8 +30,32 @@ pub(super) enum UpsertOutcome {
     Unchanged {
         bytes_read: u64,
     },
+    /// Bootstrap lease changed before the document reached SQLite.
+    ClaimLost,
     /// Storage backend doesn't expose an updates file path.
     NoContent,
+}
+
+/// Upsert `doc` only while `claim_token` still owns the bootstrap lease.
+///
+/// The unchanged fast path is safe without ownership because it does not
+/// write. A changed document crosses an atomic ownership fence in SQLite.
+pub(super) fn upsert_unless_unchanged_if_claim_owner(
+    index: &SessionSearchIndex,
+    doc: &SessionDoc,
+    bytes_read: u64,
+    claim_token: &str,
+) -> Result<UpsertOutcome, rusqlite::Error> {
+    if let Ok(Some(existing_hash)) = index.get_content_hash(&doc.session_id)
+        && existing_hash == doc.content_hash
+    {
+        return Ok(UpsertOutcome::Unchanged { bytes_read });
+    }
+    if index.upsert_doc_if_claim_owner(doc, claim_token)? {
+        Ok(UpsertOutcome::Indexed { bytes_read })
+    } else {
+        Ok(UpsertOutcome::ClaimLost)
+    }
 }
 
 /// Upsert `doc` unless the stored content hash already matches.

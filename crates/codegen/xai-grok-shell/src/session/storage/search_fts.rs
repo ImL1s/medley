@@ -291,6 +291,42 @@ impl SessionSearchIndex {
         Ok(())
     }
 
+    /// Insert or update a session document only while `token` owns the
+    /// bootstrap claim. The ownership check and document write are one SQL
+    /// statement so a lease takeover cannot interleave between them.
+    pub(super) fn upsert_doc_if_claim_owner(
+        &self,
+        doc: &SessionDoc,
+        token: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let changed = self.db.execute(
+            &format!(
+                "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE EXISTS (
+                     SELECT 1 FROM meta WHERE key = ?7 AND {CLAIM_TOKEN_SQL} = ?8
+                 )
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     cwd = excluded.cwd,
+                     updated_at = excluded.updated_at,
+                     title = excluded.title,
+                     content = excluded.content,
+                     content_hash = excluded.content_hash"
+            ),
+            params![
+                doc.session_id,
+                doc.cwd,
+                doc.updated_at_unix,
+                doc.title,
+                doc.content,
+                doc.content_hash,
+                META_KEY_BOOTSTRAP_CLAIM,
+                token,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Insert a session document only if no row exists for its `session_id`.
     ///
     /// Atomic alternative to a check-then-insert: the index DB is shared
