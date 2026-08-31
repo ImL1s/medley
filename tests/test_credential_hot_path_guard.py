@@ -553,6 +553,45 @@ def _invoked_macro_names(
 _ARM_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[^\sA-Za-z0-9_]")
 
 
+def _consume_kind(tokens: list[str], cursor: int, kind: str) -> int | None:
+    """Advance past one `macro_rules` fragment starting at `cursor`."""
+
+    if cursor >= len(tokens):
+        return None
+    kind = kind or "ident"
+    if kind == "block":
+        if tokens[cursor] != "{":
+            return None
+        depth = 0
+        index = cursor
+        while index < len(tokens):
+            if tokens[index] == "{":
+                depth += 1
+            elif tokens[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+            index += 1
+        return None
+    if kind == "expr":
+        depth = 0
+        index = cursor
+        while index < len(tokens):
+            token = tokens[index]
+            if token in "([{":
+                depth += 1
+            elif token in ")]}":
+                if depth:
+                    depth -= 1
+                elif index > cursor:
+                    return index
+            elif token == "," and depth == 0:
+                return index if index > cursor else None
+            index += 1
+        return index if index > cursor else None
+    return cursor + 1
+
+
 def _macro_invoke_inners(
     masked: str,
     defs: list[tuple[str, int, int]],
@@ -635,6 +674,7 @@ def _simple_arm_accepts(matcher: str, invoke_inner: str) -> bool:
         return True
     parts = re.split(r"\$[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?", inner)
     tokens = _ARM_TOKEN.findall(invoke_inner)
+    metavars = _ARM_METAVAR.findall(inner)
     cursor = 0
     for index, piece in enumerate(parts):
         lits = _ARM_TOKEN.findall(piece)
@@ -643,14 +683,16 @@ def _simple_arm_accepts(matcher: str, invoke_inner: str) -> bool:
                 return False
             cursor += 1
         if index < len(parts) - 1:
-            if cursor >= len(tokens):
+            kind = metavars[index][1] if index < len(metavars) else "ident"
+            nxt = _consume_kind(tokens, cursor, kind)
+            if nxt is None:
                 return False
-            cursor += 1
+            cursor = nxt
     return cursor == len(tokens)
 
 
 _ARM_METAVAR = re.compile(
-    r"\$([A-Za-z_][A-Za-z0-9_]*)(?::[A-Za-z_][A-Za-z0-9_]*)?"
+    r"\$([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*))?"
 )
 _ARM_SUB = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
@@ -678,9 +720,13 @@ def _bind_simple_arm(matcher: str, invoke_inner: str) -> dict[str, str]:
         if index < len(parts) - 1:
             if cursor >= len(tokens) or name_i >= len(names):
                 return {}
-            bindings[names[name_i]] = tokens[cursor]
+            kind = names[name_i][1]
+            nxt = _consume_kind(tokens, cursor, kind)
+            if nxt is None:
+                return {}
+            bindings[names[name_i][0]] = "".join(tokens[cursor:nxt])
             name_i += 1
-            cursor += 1
+            cursor = nxt
     if cursor != len(tokens):
         return {}
     return bindings
@@ -779,7 +825,7 @@ def _bind_repeat_rows(
     start, rep_inner, sep, _kind, end = found
     if inner[:start].strip() or inner[end:].strip():
         return None
-    names = _ARM_METAVAR.findall(rep_inner)
+    names = [pair[0] for pair in _ARM_METAVAR.findall(rep_inner)]
     if not names:
         return []
     raw = invoke_inner.strip()
@@ -1667,6 +1713,103 @@ def _selected_macro_expansions(
     return expansions
 
 
+_EXPORTED_MACROS: dict[Path, tuple[tuple[str, str], ...]] = {}
+
+
+def _exported_macro_sources(
+    text: str,
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """`#[macro_export] macro_rules!` sources, crate-root visible."""
+
+    masked = _mask_rust_literals(text)
+    defs = _macro_rules_defs(masked)
+    if not defs:
+        return ()
+    starts = [masked.rfind("macro_rules", 0, start) for _, start, _ in defs]
+    spans = _outer_attr_spans(masked)
+    ends = [end for _start, end, _attr in spans]
+    out: list[tuple[str, str]] = []
+    for start, (name, _body_start, body_end) in zip(starts, defs):
+        if start < 0:
+            continue
+        attrs = _outer_attrs_before(masked, start, spans, ends)
+        if not any(re.search(r"#\[\s*macro_export\b", attr) for attr in attrs):
+            continue
+        if any(
+            _cfg_attr_is_inactive(attr, enabled_features)
+            for attr in _effective_attrs(attrs, enabled_features)
+        ):
+            continue
+        out.append((name, masked[start:body_end]))
+    return tuple(out)
+
+
+def _cargo_manifest_dir(path: Path) -> Path | None:
+    current = path if path.is_dir() else path.parent
+    for parent in (current, *current.parents):
+        if (parent / "Cargo.toml").is_file():
+            return parent
+    return None
+
+
+def _eval_concat_include_args(inner: str, declaring: Path) -> Path | None:
+    """Resolve `concat!(env!("CARGO_MANIFEST_DIR"), \"/x.rs\")`."""
+
+    manifest = _cargo_manifest_dir(declaring)
+    pieces: list[str] = []
+    for piece in _split_depth_sep(inner, ","):
+        stripped = piece.strip()
+        env = re.fullmatch(
+            r'env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)', stripped
+        )
+        if env is not None:
+            if manifest is None:
+                return None
+            pieces.append(str(manifest))
+            continue
+        quoted = re.fullmatch(r'"([^"]*)"', stripped)
+        if quoted is not None:
+            pieces.append(quoted.group(1))
+            continue
+        raw = re.fullmatch(r'r(#*)"(.*?)"\1', stripped, re.DOTALL)
+        if raw is not None:
+            pieces.append(raw.group(2))
+            continue
+        return None
+    if not pieces:
+        return None
+    joined = Path("".join(pieces))
+    return joined if joined.is_file() else None
+
+
+def _include_concat_hits(text: str) -> list[tuple[int, str]]:
+    """`(offset, concat! args)` for `include!(concat!(...))`."""
+
+    out: list[tuple[int, str]] = []
+    index = 0
+    while True:
+        start = text.find("include!", index)
+        if start < 0:
+            break
+        cursor = start + len("include!")
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text) or text[cursor] != "(":
+            index = cursor + 1
+            continue
+        end = _balanced_pair_end(text, cursor)
+        inner = text[cursor + 1 : end - 1].strip()
+        if inner.startswith("concat!"):
+            bang = inner.find("!")
+            paren = inner.find("(", bang)
+            if paren >= 0:
+                close = _balanced_pair_end(inner, paren)
+                out.append((start, inner[paren + 1 : close - 1]))
+        index = end
+    return out
+
+
 def _declared_module_overrides(
     root: Path,
 ) -> dict[Path, list[tuple[list[str], str, tuple[tuple[str, str], ...]]]]:
@@ -1699,6 +1842,8 @@ def _declared_module_overrides(
     ] = deque()
     pkg_cache: dict[Path, str] = {}
     texts: dict[Path, str] = {}
+    global _EXPORTED_MACROS
+    _EXPORTED_MACROS = {}
 
     def read_rs(rs: Path) -> str | None:
         key = rs.resolve()
@@ -1765,7 +1910,7 @@ def _declared_module_overrides(
             (masked.rfind("macro_rules", 0, start), end)
             for _name, start, end in _macro_rules_defs(masked)
         ]
-        include_hits: list[tuple[re.Match[str], int, Path]] = []
+        include_hits: list[tuple[re.Match[str] | None, int, Path]] = []
         for inc in _INCLUDE.finditer(text):
             start = inc.start()
             if start >= len(masked) or not masked[start].isalpha():
@@ -1778,6 +1923,18 @@ def _declared_module_overrides(
             if included in ancestors:
                 continue
             include_hits.append((inc, start, included))
+        for start, concat_args in _include_concat_hits(text):
+            if start >= len(masked) or not masked[start].isalpha():
+                continue
+            if _position_cfg_inactive(text, masked, start, enabled):
+                continue
+            included = _eval_concat_include_args(concat_args, declaring)
+            if included is None or included == declaring:
+                continue
+            included = included.resolve()
+            if included in ancestors:
+                continue
+            include_hits.append((None, start, included))
         include_scopes = (
             _brace_scopes_at(
                 masked,
@@ -1827,8 +1984,18 @@ def _declared_module_overrides(
                 module_search_dir=module_search_dir,
             )
         )
+        child_exports: list[tuple[str, str]] = []
+        for _name, child, _inline, _off, _search in decls:
+            child_text = read_rs(child)
+            if child_text is None:
+                continue
+            child_exports.extend(
+                _exported_macro_sources(child_text, enabled)
+            )
+        child_export_t = tuple(child_exports)
+        _EXPORTED_MACROS[declaring.resolve()] = child_export_t
         for arm_text, expansion_inline in _selected_macro_expansions(
-            masked, enabled, macro_env, text=text
+            masked, enabled, macro_env + child_export_t, text=text
         ):
             arm_search = module_search_dir
             for inline_name in expansion_inline:
@@ -2773,8 +2940,9 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
                 if _file_inner_cfg_inactive(text, enabled):
                     continue
                 pkg = origin_pkg or _package_name_for(rs, pkg_cache)
+                extra_macros = _EXPORTED_MACROS.get(rs.resolve(), ())
                 for name in _tests_in_file(
-                    text, file_mods, enabled, inherited_macros
+                    text, file_mods, enabled, inherited_macros + extra_macros
                 ):
                     records.append(_TestRecord(pkg, target, name))
     return records
@@ -3483,6 +3651,27 @@ class ExternalModulePrefix(unittest.TestCase):
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_included", names)
 
+    def test_concat_env_include_is_scanned(self):
+        """`include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/included.rs\"))`
+        splices tests (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n'
+            )
+            (src / "lib.rs").write_text(
+                'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/included.rs"));\n'
+            )
+            (crate / "included.rs").write_text(
+                "#[test]\nfn none_auth_scheme_concat() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_concat", names)
+
     def test_raw_string_include_literal_is_scanned(self):
         """`include!(r\"included.rs\")` splices tests into this module
         (#507 review)."""
@@ -3520,6 +3709,30 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_included", names)
+
+    def test_macro_export_from_child_module_is_invocable(self):
+        """`mod macros; crate::emit!(...)` sees `#[macro_export]`
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "mod macros;\n"
+                "crate::emit!(none_auth_scheme_hot);\n"
+            )
+            (src / "macros.rs").write_text(
+                "#[macro_export]\n"
+                "macro_rules! emit {\n"
+                "    ($name:ident) => {\n"
+                "        #[test]\n"
+                "        fn $name() {}\n"
+                "    };\n"
+                "}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_hot", names)
 
     def test_include_inside_inline_module_keeps_prefix(self):
         """`mod none_auth_scheme_ { include!(...) }` is
@@ -5169,6 +5382,24 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_generated"])
+
+    def test_macro_block_fragment_selects_the_arm(self):
+        """`($name:ident, $body:block)` accepts `{ assert!(true); }`
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! make_test {
+                ($name:ident, $body:block) => {
+                    #[test]
+                    fn $name() $body
+                };
+            }
+            make_test!(none_auth_scheme_case, { assert!(true); });
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_case"])
 
     def test_repeated_macro_ident_metavars_are_substituted_before_scan(self):
         """`$($name:ident),*` with two invocation idents emits both
