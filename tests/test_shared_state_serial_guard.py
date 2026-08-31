@@ -1678,6 +1678,74 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
 
+    def test_imported_nested_macro_selects_transitive_arm_keys(self):
+        """An imported macro invocation inside another selected arm must
+        keep the imported macro's arm selection after closure (#516 review)."""
+
+        sources = [
+            (
+                Path("src/inner.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    fn helper() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    macro_rules! inner {
+                        (touch) => { helper(); };
+                        (clean) => {};
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/outer.rs"),
+                src(
+                    """\
+                    use crate::inner::inner;
+
+                    macro_rules! outer {
+                        (touch) => { inner!(touch); };
+                        (clean) => { inner!(clean); };
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    use crate::outer::outer;
+
+                    #[test]
+                    fn first_clean() {
+                        outer!(clean);
+                    }
+
+                    #[test]
+                    fn second_clean() {
+                        outer!(clean);
+                    }
+
+                    #[test]
+                    fn first_touching() {
+                        outer!(touch);
+                    }
+
+                    #[test]
+                    fn second_touching() {
+                        outer!(touch);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_touching", "second_touching"})
+
     def test_qualified_static_in_another_module_is_not_a_touch(self):
         """`crate::b::COUNTER` is not the registered `a::COUNTER`
         (#516 review)."""
@@ -2146,6 +2214,130 @@ class TransitiveClosure(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertIn("calls_imported_bump_untagged", names)
+
+    def test_function_local_import_applies_before_its_declaration(self):
+        """Rust `use` items apply to their whole lexical block, including
+        calls textually before the declaration (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn first_untagged() {
+                        bump();
+                        use crate::a::bump;
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        bump();
+                        use crate::a::bump;
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_function_local_glob_precedes_same_file_helper_before_declaration(self):
+        """A lexical glob applies before its declaration and must resolve
+        before a clean same-file helper (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    fn bump() {}
+
+                    #[test]
+                    fn first_untagged() {
+                        bump();
+                        use crate::a::*;
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        bump();
+                        use crate::a::*;
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_nested_function_local_glob_does_not_affect_outer_calls(self):
+        """A glob in a nested block must not rewrite calls in the outer
+        function block (#516 review)."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub fn bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    fn bump() {}
+
+                    #[test]
+                    fn first_clean() {
+                        bump();
+                        { use crate::a::*; }
+                    }
+
+                    #[test]
+                    fn second_clean() {
+                        bump();
+                        { use crate::a::*; }
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, set())
 
     def test_nested_block_static_use_does_not_shadow_outer_access(self):
         """Outer `use crate::a::COUNTER` then inner `use crate::b::COUNTER`

@@ -1723,8 +1723,8 @@ def _imports_outside_bodies(
     return scoped, globs
 
 
-def _block_end_containing(text: str, pos: int) -> int:
-    """Innermost `{ ... }` that still contains `pos`."""
+def _block_span_containing(text: str, pos: int) -> tuple[int, int]:
+    """Innermost lexical block containing `pos`, or the whole function body."""
 
     best_start = -1
     best_end = len(text)
@@ -1736,43 +1736,36 @@ def _block_end_containing(text: str, pos: int) -> int:
                 best_start = index
                 best_end = end
         index += 1
-    return best_end
+    return (best_start + 1 if best_start >= 0 else 0), best_end
 
 
 def _local_uses_from_body(
     body: str,
     file_mod: tuple[str, ...] | None,
     inline_mods: tuple[str, ...],
-) -> tuple[tuple[int, int, str, tuple[str, ...], str], ...]:
+) -> tuple[
+    tuple[tuple[int, int, str, tuple[str, ...], str], ...],
+    tuple[tuple[int, int, tuple[str, ...]], ...],
+]:
     """Function-local `use` bindings with the brace block they apply in.
 
     A nested `{ use crate::b::bump; }` must not rewrite outer `bump()`
-    calls (#516 review).
+    calls. Rust items apply throughout that block, including before the
+    declaration itself (#516 review).
     """
 
     out: list[tuple[int, int, str, tuple[str, ...], str]] = []
+    globs: list[tuple[int, int, tuple[str, ...]]] = []
     for pos, root, mid, fname, local in _iter_use_leaves(body):
-        if fname == "*":
-            continue
         module = _use_module_prefix(root, mid, file_mod, inline_mods)
         if module is None:
             continue
-        out.append((pos, _block_end_containing(body, pos), local, module, fname))
-    return tuple(out)
-
-
-def _imports_in_span(
-    bindings: list[_UseBinding], start: int, end: int
-) -> tuple[dict[str, tuple[tuple[str, ...], str]], list[tuple[str, ...]]]:
-    local: dict[str, tuple[tuple[str, ...], str]] = {}
-    globs: list[tuple[str, ...]] = []
-    for b in bindings:
-        if start <= b.pos < end:
-            if b.fname == "*":
-                globs.append(b.module)
-            else:
-                local[b.local] = (b.module, b.fname)
-    return local, globs
+        start, end = _block_span_containing(body, pos)
+        if fname == "*":
+            globs.append((start, end, module))
+        else:
+            out.append((start, end, local, module, fname))
+    return tuple(out), tuple(globs)
 
 
 def _globs_in_scope(
@@ -2295,8 +2288,8 @@ class FnInfo:
     serial_held: frozenset[str]  # keys held by any #[serial(..)] on this fn
     has_unkeyed_serial: bool
     attrs_line: int
-    glob_modules: tuple[tuple[str, ...], ...] = ()
     local_uses: tuple[tuple[int, int, str, tuple[str, ...], str], ...] = ()
+    local_globs: tuple[tuple[int, int, tuple[str, ...]], ...] = ()
     macro_arms: tuple[tuple[str, int], ...] = ()
     is_macro_arm: bool = False
 
@@ -2311,7 +2304,7 @@ def _import_from_uses(
     ]
     if not hits:
         return None
-    hits.sort(key=lambda entry: (entry[1], -entry[0]))
+    hits.sort(key=lambda entry: (entry[1] - entry[0], -entry[0]))
     return hits[0][3], hits[0][4]
 
 
@@ -2329,6 +2322,24 @@ def _fn_import(
     if imported is not None:
         return imported
     return _lookup_import(imports_by_file.get(fn.file, {}), fn.inline_mods, name)
+
+
+def _local_glob_scopes(
+    globs: tuple[tuple[int, int, tuple[str, ...]], ...], pos: int
+) -> list[list[tuple[str, ...]]]:
+    """Applicable local glob modules, grouped innermost lexical scope first."""
+
+    hits = [entry for entry in globs if entry[0] <= pos < entry[1]]
+    hits.sort(key=lambda entry: (entry[1] - entry[0], -entry[0]))
+    scopes: list[list[tuple[str, ...]]] = []
+    previous: tuple[int, int] | None = None
+    for start, end, module in hits:
+        scope = (start, end)
+        if scope != previous:
+            scopes.append([])
+            previous = scope
+        scopes[-1].append(module)
+    return scopes
 
 
 def _item_module(item: SharedItem) -> tuple[str, ...] | None:
@@ -2884,8 +2895,7 @@ def index_functions(
         imports_by_file[rel] = file_imports
         globs_by_file[rel] = file_globs
         for match, name, body_start, body_end, body_code, inline_mods in pending_fns:
-            _local, local_globs = _imports_in_span(bindings, body_start, body_end)
-            local_uses = _local_uses_from_body(
+            local_uses, local_globs = _local_uses_from_body(
                 body_code, _module_path(rel), inline_mods
             )
             keys = frozenset(
@@ -2948,8 +2958,8 @@ def index_functions(
                     serial_held=frozenset(serial_held),
                     has_unkeyed_serial=has_unkeyed,
                     attrs_line=_line(raw, match.start()),
-                    glob_modules=tuple(local_globs),
                     local_uses=local_uses,
+                    local_globs=local_globs,
                 )
             )
         for match in MACRO_DEF.finditer(code):
@@ -3286,7 +3296,8 @@ def _resolve_calls(
     by_type: dict[tuple[str, str], dict[str, list[int]]],
     by_macro: dict[Path, dict[str, int]],
     by_macro_any: dict[str, list[int]],
-    by_macro_arms: dict[Path, dict[str, tuple[tuple[str, int], ...]]],
+    by_macro_arms: dict[tuple[Path, str], tuple[tuple[str, int], ...]],
+    macro_files_by_module: dict[tuple[str, ...], Path],
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]],
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
@@ -3314,6 +3325,12 @@ def _resolve_calls(
             module, fname = imported
             js = by_module.get(module, {}).get(fname, [])
         if not js:
+            for modules in _local_glob_scopes(fn.local_globs, m.start()):
+                for module in modules:
+                    js.extend(by_module.get(module, {}).get(name, []))
+                if js:
+                    break
+        if not js:
             prefix = fn.inline_mods
             while True:
                 js = by_inline.get((fn.file, prefix), {}).get(name, [])
@@ -3326,17 +3343,18 @@ def _resolve_calls(
             for module in _globs_in_scope(
                 globs_by_file.get(fn.file, {}),
                 fn.inline_mods,
-                fn.glob_modules,
             ):
                 js.extend(by_module.get(module, {}).get(name, []))
         _gain_from(gained, keys_of, self_index, js)
-    macro_index = by_macro.get(fn.file, {})
-    file_arms = by_macro_arms.get(fn.file, {})
     for m in MACRO_INVOKE.finditer(fn.body):
         name = m.group(1)
+        def_file = fn.file
         imported = _fn_import(fn, name, m.start(), imports_by_file)
-        resolved = imported[1] if imported is not None else name
-        arms = file_arms.get(name) or file_arms.get(resolved)
+        resolved = name
+        if imported is not None:
+            module, resolved = imported
+            def_file = macro_files_by_module.get(module, def_file)
+        arms = by_macro_arms.get((def_file, resolved))
         if arms:
             inner = _macro_invoke_inner(fn.body, m.end())
             arity = _macro_invoke_arity(fn.body, m.end())
@@ -3348,9 +3366,7 @@ def _resolve_calls(
             if chosen is not None:
                 gained.update(chosen)
                 continue
-        j = macro_index.get(name)
-        if j is None:
-            j = macro_index.get(resolved)
+        j = by_macro.get(def_file, {}).get(resolved)
         if j is None:
             _gain_from(
                 gained,
@@ -3550,14 +3566,19 @@ def analyze(
     by_type: dict[tuple[str, str], dict[str, list[int]]] = {}
     by_macro: dict[Path, dict[str, int]] = {}
     by_macro_any: dict[str, list[int]] = {}
-    by_macro_arms: dict[Path, dict[str, tuple[tuple[str, int], ...]]] = {}
+    by_macro_arms: dict[tuple[Path, str], tuple[tuple[str, int], ...]] = {}
+    macro_files_by_module = {
+        module: path
+        for path, _text in sources
+        if (module := _module_path(path)) is not None
+    }
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]] = {}
     for i, fn in enumerate(functions):
         if fn.is_macro:
             by_macro.setdefault(fn.file, {})[fn.name] = i
             by_macro_any.setdefault(fn.name, []).append(i)
             if fn.macro_arms:
-                by_macro_arms.setdefault(fn.file, {})[fn.name] = fn.macro_arms
+                by_macro_arms[(fn.file, fn.name)] = fn.macro_arms
             continue
         if fn.is_macro_arm:
             continue
@@ -3619,6 +3640,7 @@ def analyze(
                 by_macro=by_macro,
                 by_macro_any=by_macro_any,
                 by_macro_arms=by_macro_arms,
+                macro_files_by_module=macro_files_by_module,
                 by_inline=by_inline,
                 imports_by_file=imports_by_file,
                 globs_by_file=globs_by_file,
@@ -3682,6 +3704,7 @@ def analyze(
                 by_macro=by_macro,
                 by_macro_any=by_macro_any,
                 by_macro_arms=by_macro_arms,
+                macro_files_by_module=macro_files_by_module,
                 by_inline=by_inline,
                 imports_by_file=imports_by_file,
                 globs_by_file=globs_by_file,
