@@ -2707,16 +2707,19 @@ def _integration_binary_stem(path: Path) -> str | None:
 def _path_attr_search_dir(declaring: Path, code: str, pos: int) -> Path:
     """Directory a `#[path]` literal is resolved against.
 
-    Rust resolves the literal relative to the directory containing the
-    declaring file, then under enclosing inline modules (#516 review).
-    This differs from ordinary `mod name;` lookup, which uses the stem
-    directory for file modules.
+    Top-level `#[path]` joins the directory containing the declaring file.
+    Inside an inline module of a file module (`foo.rs` → `mod outer { … }`),
+    rustc resolves under the file-module directory plus the inline path
+    (`foo/outer/…`) (#516 review).
     """
 
-    search = declaring.parent
-    for seg in _inline_path_at(code, pos):
-        search = search / seg
-    return search
+    inline = _inline_path_at(code, pos)
+    if inline:
+        search = _child_mod_dir(declaring)
+        for seg in inline:
+            search = search / seg
+        return search
+    return declaring.parent
 
 
 def _path_attr_files(declaring: Path, text: str) -> list[Path]:

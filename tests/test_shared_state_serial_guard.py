@@ -6730,6 +6730,34 @@ class DefaultScanRoots(unittest.TestCase):
                 ["src/lib.rs", "src/outer/generated.rs"],
             )
 
+    def test_path_attr_in_file_module_inline_uses_stem_directory(self):
+        """`foo.rs` + `mod outer { #[path] }` → `foo/outer/` (#516)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            (src_dir / "foo" / "outer").mkdir(parents=True)
+            (src_dir / "lib.rs").write_text("mod foo;\n", encoding="utf-8")
+            (src_dir / "foo.rs").write_text(
+                "mod outer {\n"
+                '    #[path = "special.rs"]\n'
+                "    mod generated;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (src_dir / "foo" / "outer" / "special.rs").write_text(
+                "pub fn x() {}\n", encoding="utf-8"
+            )
+            (src_dir / "outer" / "special.rs").parent.mkdir(parents=True, exist_ok=True)
+            (src_dir / "outer" / "special.rs").write_text(
+                "pub fn wrong() {}\n", encoding="utf-8"
+            )
+            sources = guard.collect_sources(repo, [src_dir])
+            paths = sorted(path.as_posix() for path, _text in sources)
+            self.assertIn("src/foo.rs", paths)
+            self.assertIn("src/foo/outer/special.rs", paths)
+            self.assertNotIn("src/outer/special.rs", paths)
+
     def test_fn_parameter_does_not_touch_registered_static(self):
         """`fn helper(COUNTER: u64)` uses a parameter, not the static
         (#516 review)."""
