@@ -81,7 +81,10 @@ _FN = re.compile(
     r"(?:(?:async|const|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
     rf"fn\s+(?:r#)?({_RUST_IDENT})"
 )
-_INCLUDE = re.compile(r'\binclude!\s*\(\s*"([^"]+)"\s*\)')
+_INCLUDE = re.compile(
+    r'\binclude!\s*\(\s*(?:"([^"]*)"|r(#*)"((?:.|\n)*?)"\2)\s*\)',
+    re.DOTALL,
+)
 _MOD_OPEN = re.compile(
     rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?({_RUST_IDENT})\s*\{{"
 )
@@ -1647,37 +1650,20 @@ def _selected_macro_expansions(
     )
     invoke_at.sort()
     expansions: list[tuple[str, tuple[str, ...]]] = []
-    invoke_i = 0
-    depth = 0
-    inline_stack: list[tuple[int, str]] = []
-    line_start = 0
-    for line in masked.splitlines():
-        invoke_end = line_start + len(line)
-        while (
-            invoke_i < len(invoke_at)
-            and line_start <= invoke_at[invoke_i][0] <= invoke_end
+    for _pos, inv_name, inner, source in invoke_at:
+        if text is not None and _position_cfg_inactive(
+            text, masked, _pos, enabled_features
         ):
-            _pos, inv_name, inner, source = invoke_at[invoke_i]
-            invoke_i += 1
-            if text is not None and _position_cfg_inactive(
-                text, masked, _pos, enabled_features
-            ):
-                continue
-            arm_text = _selected_arm_source(
-                source, _macro_rules_defs(source), inv_name, inner
+            continue
+        arm_text = _selected_arm_source(
+            source, _macro_rules_defs(source), inv_name, inner
+        )
+        if arm_text:
+            # Scope at the invocation column so `mod outer { emit!(); }`
+            # loads `outer/child.rs`, not `child.rs` (#507 review).
+            expansions.append(
+                (arm_text, _inline_mods_at(masked, _pos, enabled_features))
             )
-            if arm_text:
-                expansions.append(
-                    (arm_text, tuple(name for _, name in inline_stack))
-                )
-        stripped = _strip_line_comment(line)
-        brace_mod = _MOD_OPEN.match(stripped)
-        if brace_mod:
-            inline_stack.append((depth, _fn_name(brace_mod)))
-        depth += line.count("{") - line.count("}")
-        while inline_stack and depth <= inline_stack[-1][0]:
-            inline_stack.pop()
-        line_start += len(line) + 1
     return expansions
 
 
@@ -1786,7 +1772,7 @@ def _declared_module_overrides(
                 continue
             if _position_cfg_inactive(text, masked, start, enabled):
                 continue
-            included = (declaring.parent / inc.group(1)).resolve()
+            included = (declaring.parent / _path_attr_value(inc)).resolve()
             if not included.is_file() or included == declaring:
                 continue
             if included in ancestors:
@@ -1841,23 +1827,31 @@ def _declared_module_overrides(
                 module_search_dir=module_search_dir,
             )
         )
-        for arm_text, inline_names in _selected_macro_expansions(
+        for arm_text, expansion_inline in _selected_macro_expansions(
             masked, enabled, macro_env, text=text
         ):
             arm_search = module_search_dir
-            for inline_name in inline_names:
+            for inline_name in expansion_inline:
                 arm_search = arm_search / inline_name
-            decls.extend(
-                _iter_module_decls(
-                    arm_text,
-                    declaring,
-                    extra_roots,
-                    gated_roots,
-                    as_crate_root=as_crate_root and not inline_names,
-                    enabled_features=enabled,
-                    module_search_dir=arm_search,
+            for decl in _iter_module_decls(
+                arm_text,
+                declaring,
+                extra_roots,
+                gated_roots,
+                as_crate_root=as_crate_root and not expansion_inline,
+                enabled_features=enabled,
+                module_search_dir=arm_search,
+            ):
+                name, child, inner_inline, decl_offset, child_search_dir = decl
+                decls.append(
+                    (
+                        name,
+                        child,
+                        expansion_inline + inner_inline,
+                        decl_offset,
+                        child_search_dir,
+                    )
                 )
-            )
         unique_decls = []
         seen_decls: set[tuple[str, Path, tuple[str, ...]]] = set()
         for decl in decls:
@@ -3489,6 +3483,21 @@ class ExternalModulePrefix(unittest.TestCase):
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_included", names)
 
+    def test_raw_string_include_literal_is_scanned(self):
+        """`include!(r\"included.rs\")` splices tests into this module
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text('include!(r"included.rs");\n')
+            (src / "included.rs").write_text(
+                "#[test]\nfn none_auth_scheme_raw_include() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_raw_include", names)
+
     def test_include_sees_macros_defined_in_the_including_file(self):
         """A `macro_rules!` before `include!` is visible in the included
         file (#507 review)."""
@@ -4849,6 +4858,30 @@ class ExternalModulePrefix(unittest.TestCase):
             cargo_names = _cargo_list_test_names(crate)
             self.assertEqual(cargo_names, ["none_auth_scheme_child::works"])
             self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_same_line_module_emitting_macro_uses_column_scope(self):
+        """`mod outer { emit!(); }` loads `outer/child.rs` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "macro_rules! emit {\n"
+                "    () => {\n"
+                "        mod child;\n"
+                "    };\n"
+                "}\n"
+                "mod outer { emit!(); }\n"
+            )
+            child = src / "outer"
+            child.mkdir()
+            (child / "child.rs").write_text(
+                "#[test]\nfn none_auth_scheme_child() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("outer::child::none_auth_scheme_child", names)
+            self.assertNotIn("child::none_auth_scheme_child", names)
 
     def test_module_emitting_macro_uses_lexical_scope(self):
         """A later sibling-block macro must not steal the outer invoke
