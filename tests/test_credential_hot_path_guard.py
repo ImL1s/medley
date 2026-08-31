@@ -1300,6 +1300,24 @@ def _load_manifest_toml(text: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _optional_dep_features(data: dict) -> set[str]:
+    """Implicit features Cargo synthesizes for `optional = true` deps."""
+
+    names: set[str] = set()
+    for table_name in (
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies",
+    ):
+        table = data.get(table_name)
+        if not isinstance(table, dict):
+            continue
+        for name, spec in table.items():
+            if isinstance(spec, dict) and spec.get("optional") is True:
+                names.add(name)
+    return names
+
+
 def _toml_str_list(value: object) -> set[str]:
     if not isinstance(value, list):
         return set()
@@ -1399,7 +1417,9 @@ def _cargo_test_targets(
                 feat_table, _toml_str_list(feat_table.get("default"))
             )
             if all_features:
-                enabled = _feature_closure(feat_table, set(feat_table))
+                enabled = _feature_closure(
+                    feat_table, set(feat_table) | _optional_dep_features(data)
+                )
             elif no_default_features:
                 enabled = _feature_closure(feat_table, set(extra_features))
             else:
@@ -3551,6 +3571,39 @@ class CiPackageTargetCounts(unittest.TestCase):
                 records_for_feat, "none_auth_scheme_", lanes
             )
             self.assertEqual([r.name for r in matched], ["none_auth_scheme_hot"])
+
+    def test_all_features_includes_optional_dependency_features(self):
+        """`--all-features` enables implicit optional-dep features
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"xai-grok-sampler\"\n\n"
+                "[dependencies]\n"
+                'dep = { version = "1.0", optional = true }\n',
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[cfg(feature = \"dep\")]\n"
+                "#[test]\nfn none_auth_scheme_dep() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --all-features "
+                "--lib none_auth_scheme_ -- --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
+            feat = frozenset({ALL_FEATURES_TOKEN})
+            records_for_feat = {
+                feat: _qualified_test_records(root, extra_features=feat)
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "none_auth_scheme_", lanes
+            )
+            self.assertEqual([r.name for r in matched], ["none_auth_scheme_dep"])
 
     def test_default_cfg_name_is_enabled_with_manifest_defaults(self):
         """Cargo enables `feature = \"default\"` when defaults are on
