@@ -2315,14 +2315,7 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                 };
                 match set_default_agent(new_default, rendered, state.generation) {
                     Ok(()) => {
-                        let (snapshot, agent_name, default_agent, _) = capture_locked_config_state(
-                            state.generation,
-                            &state.cwd,
-                            state.model_agent_type.as_deref(),
-                        );
-                        state.config_snapshot = snapshot;
-                        state.config_agent_name = agent_name;
-                        state.default_agent = default_agent;
+                        state.rebuild_agents();
                         state.message = Some(if is_already_default {
                             AgentsModalMessage::info(format!(
                                 "Persisted: cleared default in config.toml (generation {}). New sessions use '{}'. This session is unchanged.",
