@@ -258,10 +258,11 @@ FN_DEF = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+"
     r"(?:r#)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
 )
-MACRO_DEF = re.compile(r"macro_rules!\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
+RUST_IDENT_TOKEN = r"(?:r#)?[^\W\d]\w*"
+MACRO_DEF = re.compile(rf"macro_rules!\s+(?P<name>{RUST_IDENT_TOKEN})")
 MACRO_INVOKE = re.compile(
-    r"(?<![:.\w])((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*)"
-    r"((?:r#)?[A-Za-z_][A-Za-z0-9_]*)\s*!"
+    rf"(?<![:.\w])((?:{RUST_IDENT_TOKEN}\s*::\s*)*)"
+    rf"({RUST_IDENT_TOKEN})\s*!"
 )
 INLINE_MOD = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
@@ -1541,6 +1542,33 @@ def _raw_ident(name: str) -> str:
     return name[2:] if name.startswith("r#") else name
 
 
+def _macro_def_matches(source: str) -> list[re.Match[str]]:
+    """Rust-identifier-valid macro definitions, including raw/Unicode names."""
+
+    return [
+        match
+        for match in MACRO_DEF.finditer(source)
+        if _raw_ident(match.group("name")).isidentifier()
+    ]
+
+
+def _macro_invoke_matches(source: str) -> list[re.Match[str]]:
+    """Rust-identifier-valid macro invocations and qualified paths."""
+
+    matches: list[re.Match[str]] = []
+    for match in MACRO_INVOKE.finditer(source):
+        qualifier = match.group(1)
+        segments = [
+            piece.strip()
+            for piece in qualifier.split("::")
+            if piece.strip()
+        ]
+        segments.append(match.group(2))
+        if all(_raw_ident(segment).isidentifier() for segment in segments):
+            matches.append(match)
+    return matches
+
+
 def _skip_ws_code(code: str, i: int) -> int:
     n = len(code)
     while i < n and code[i].isspace():
@@ -2330,12 +2358,12 @@ def _fn_import(
 def _macro_candidates(
     fn: FnInfo,
     match: re.Match[str],
-    macro_defs_by_module: dict[tuple[tuple[str, ...], str], tuple[Path, str]],
+    macro_defs_by_module: dict[tuple[tuple[str, ...], str], list[int]],
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     ],
     globs_by_file: dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
-) -> list[tuple[Path, str]]:
+) -> list[int]:
     """Resolve an invocation to macro definitions before selecting its arm.
 
     Qualified paths name their module directly (or through an imported module
@@ -2366,8 +2394,7 @@ def _macro_candidates(
             target_module = _resolve_path_module(
                 segs, _module_path(fn.file), fn.inline_mods
             )
-        definition = macro_defs_by_module.get((target_module or (), name))
-        return [definition] if definition is not None else []
+        return list(macro_defs_by_module.get((target_module or (), name), ()))
 
     local_named = [
         entry
@@ -2387,12 +2414,11 @@ def _macro_candidates(
     ):
         named = local_by_scope.get(scope)
         if named is not None:
-            definition = macro_defs_by_module.get((named[3], named[4]))
-            return [definition] if definition is not None else []
+            return list(macro_defs_by_module.get((named[3], named[4]), ()))
         definitions = [
             definition
             for module in glob_by_scope.get(scope, [])
-            if (definition := macro_defs_by_module.get((module, name))) is not None
+            for definition in macro_defs_by_module.get((module, name), ())
         ]
         if definitions:
             return list(dict.fromkeys(definitions))
@@ -2401,16 +2427,15 @@ def _macro_candidates(
         imports_by_file.get(fn.file, {}), fn.inline_mods, name
     )
     if imported is not None:
-        definition = macro_defs_by_module.get(imported)
-        return [definition] if definition is not None else []
+        return list(macro_defs_by_module.get(imported, ()))
 
     file_module = _module_path(fn.file)
     if file_module is not None:
         prefix = fn.inline_mods
         while True:
-            definition = macro_defs_by_module.get((file_module + prefix, name))
-            if definition is not None:
-                return [definition]
+            definitions = macro_defs_by_module.get((file_module + prefix, name), ())
+            if definitions:
+                return list(definitions)
             if not prefix:
                 break
             prefix = prefix[:-1]
@@ -2420,7 +2445,7 @@ def _macro_candidates(
         for module in _globs_in_scope(
             globs_by_file.get(fn.file, {}), fn.inline_mods
         )
-        if (definition := macro_defs_by_module.get((module, name))) is not None
+        for definition in macro_defs_by_module.get((module, name), ())
     ]
     return list(dict.fromkeys(definitions))
 
@@ -2970,7 +2995,7 @@ def index_functions(
             tuple[re.Match[str], str, int, int, str, tuple[str, ...]]
         ] = []
         macro_bodies: list[tuple[int, int]] = []
-        for macro_match in MACRO_DEF.finditer(code):
+        for macro_match in _macro_def_matches(code):
             body_span = _macro_body(raw, macro_match.end())
             if body_span is not None:
                 macro_bodies.append(body_span)
@@ -2990,7 +3015,7 @@ def index_functions(
             pending_fns.append(
                 (match, name, body_start, body_end, body_code, inline_mods)
             )
-        for match in MACRO_DEF.finditer(code):
+        for match in _macro_def_matches(code):
             body_span = _macro_body(raw, match.end())
             if body_span is not None:
                 occupied.append(body_span)
@@ -3074,8 +3099,8 @@ def index_functions(
                     local_globs=local_globs,
                 )
             )
-        for match in MACRO_DEF.finditer(code):
-            name = match.group("name")
+        for match in _macro_def_matches(code):
+            name = _raw_ident(match.group("name"))
             body_span = _macro_body(raw, match.end())
             if body_span is None:
                 continue
@@ -3224,7 +3249,7 @@ def index_functions(
         scans.append((rel, raw, code, occupied, inline_spans))
     for rel, raw, code, occupied, inline_spans in scans:
         file_imports = imports_by_file.get(rel, {})
-        for invoke in MACRO_INVOKE.finditer(code):
+        for invoke in _macro_invoke_matches(code):
             macro_name = _raw_ident(invoke.group(2))
             if any(start <= invoke.start() < end for start, end in occupied):
                 continue
@@ -3432,10 +3457,9 @@ def _resolve_calls(
     by_module: dict[tuple[str, ...], dict[str, list[int]]],
     by_leaf: dict[str, dict[str, list[int]]],
     by_type: dict[tuple[str, str], dict[str, list[int]]],
-    by_macro: dict[Path, dict[str, int]],
     by_macro_any: dict[str, list[int]],
-    by_macro_arms: dict[tuple[Path, str], tuple[tuple[str, int], ...]],
-    macro_defs_by_module: dict[tuple[tuple[str, ...], str], tuple[Path, str]],
+    by_macro_arms: dict[int, tuple[tuple[str, int], ...]],
+    macro_defs_by_module: dict[tuple[tuple[str, ...], str], list[int]],
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]],
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
@@ -3510,7 +3534,7 @@ def _resolve_calls(
             ):
                 js.extend(by_module.get(module, {}).get(name, []))
         _gain_from(gained, keys_of, self_index, js)
-    for m in MACRO_INVOKE.finditer(fn.body):
+    for m in _macro_invoke_matches(fn.body):
         name = _raw_ident(m.group(2))
         candidates = _macro_candidates(
             fn,
@@ -3522,8 +3546,8 @@ def _resolve_calls(
         if candidates:
             inner = _macro_invoke_inner(fn.body, m.end())
             arity = _macro_invoke_arity(fn.body, m.end())
-            for def_file, resolved in candidates:
-                arms = by_macro_arms.get((def_file, resolved))
+            for macro_index in candidates:
+                arms = by_macro_arms.get(macro_index)
                 chosen: frozenset[str] | None = None
                 for matcher, arm_index in arms or ():
                     if _arm_accepts(matcher, inner, arity):
@@ -3532,9 +3556,8 @@ def _resolve_calls(
                 if chosen is not None:
                     gained.update(chosen)
                     continue
-                j = by_macro.get(def_file, {}).get(resolved)
-                if j is not None and j != self_index:
-                    gained.update(keys_of[j])
+                if macro_index != self_index:
+                    gained.update(keys_of[macro_index])
             continue
         # Unresolved unqualified macro_export invocations retain the prior
         # sound cross-file fallback. A qualified path must never discard its
@@ -3733,25 +3756,20 @@ def analyze(
     by_crate_module: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] = {}
     by_leaf: dict[str, dict[str, list[int]]] = {}
     by_type: dict[tuple[str, str], dict[str, list[int]]] = {}
-    by_macro: dict[Path, dict[str, int]] = {}
     by_macro_any: dict[str, list[int]] = {}
-    by_macro_arms: dict[tuple[Path, str], tuple[tuple[str, int], ...]] = {}
-    macro_defs_by_module: dict[
-        tuple[tuple[str, ...], str], tuple[Path, str]
-    ] = {}
+    by_macro_arms: dict[int, tuple[tuple[str, int], ...]] = {}
+    macro_defs_by_module: dict[tuple[tuple[str, ...], str], list[int]] = {}
     by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]] = {}
     for i, fn in enumerate(functions):
         if fn.is_macro:
-            by_macro.setdefault(fn.file, {})[fn.name] = i
             by_macro_any.setdefault(fn.name, []).append(i)
             if fn.macro_arms:
-                by_macro_arms[(fn.file, fn.name)] = fn.macro_arms
+                by_macro_arms[i] = fn.macro_arms
             module = _module_path(fn.file)
             if module is not None:
-                macro_defs_by_module[(module + fn.inline_mods, fn.name)] = (
-                    fn.file,
-                    fn.name,
-                )
+                macro_defs_by_module.setdefault(
+                    (module + fn.inline_mods, fn.name), []
+                ).append(i)
             continue
         if fn.is_macro_arm:
             continue
@@ -3803,20 +3821,22 @@ def analyze(
         for dest, local, src, fname in reexports:
             if fname == "*":
                 candidates = [
-                    (name, definition)
-                    for (module, name), definition in macro_defs_by_module.items()
+                    (name, definitions)
+                    for (module, name), definitions in list(
+                        macro_defs_by_module.items()
+                    )
                     if module == src
                 ]
             else:
-                definition = macro_defs_by_module.get((src, fname))
-                candidates = (
-                    [(local, definition)] if definition is not None else []
-                )
-            for dest_name, definition in candidates:
+                definitions = macro_defs_by_module.get((src, fname), [])
+                candidates = [(local, definitions)] if definitions else []
+            for dest_name, definitions in candidates:
                 key = (dest, dest_name)
-                if macro_defs_by_module.get(key) == definition:
+                current = macro_defs_by_module.get(key, [])
+                merged = list(dict.fromkeys([*current, *definitions]))
+                if current == merged:
                     continue
-                macro_defs_by_module[key] = definition
+                macro_defs_by_module[key] = merged
                 changed = True
         if not changed:
             break
@@ -3832,7 +3852,6 @@ def analyze(
                 by_module=by_module,
                 by_leaf=by_leaf,
                 by_type=by_type,
-                by_macro=by_macro,
                 by_macro_any=by_macro_any,
                 by_macro_arms=by_macro_arms,
                 macro_defs_by_module=macro_defs_by_module,
@@ -3862,10 +3881,12 @@ def analyze(
     # Synthesize macro-generated tests only after the call-graph closure, so
     # a `#[test] fn $name() { helper(); }` expansion inherits keys `helper`
     # acquired transitively (#516 review).
-    macro_index = {(fn.file, fn.name): i for i, fn in enumerate(functions) if fn.is_macro}
+    macro_index: dict[tuple[Path, str], list[int]] = {}
+    for i, fn in enumerate(functions):
+        if fn.is_macro:
+            macro_index.setdefault((fn.file, fn.name), []).append(i)
     for pending in pending_macro_tests:
-        j = macro_index.get((pending.macro_file, pending.macro_name))
-        indices = [j] if j is not None else []
+        indices = macro_index.get((pending.macro_file, pending.macro_name), [])
         if not indices:
             continue
         keys: frozenset[str] = frozenset()
@@ -3896,7 +3917,6 @@ def analyze(
                 by_module=by_module,
                 by_leaf=by_leaf,
                 by_type=by_type,
-                by_macro=by_macro,
                 by_macro_any=by_macro_any,
                 by_macro_arms=by_macro_arms,
                 macro_defs_by_module=macro_defs_by_module,

@@ -3118,6 +3118,109 @@ class TransitiveClosure(unittest.TestCase):
             names, {"calls_cfg_unix_untagged", "calls_cfg_not_unix_untagged"}
         )
 
+    def test_cfg_gated_same_name_macros_are_all_candidates(self):
+        """A clean cfg twin must not overwrite a touching macro definition."""
+
+        text = src(
+            """\
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[cfg(unix)]
+            macro_rules! act {
+                (go) => { COUNTER.fetch_add(1, Ordering::SeqCst); };
+            }
+
+            #[cfg(not(unix))]
+            macro_rules! act {
+                (go) => {};
+            }
+
+            #[test]
+            fn first_cfg_call_untagged() {
+                act!(go);
+            }
+
+            #[test]
+            fn second_cfg_call_untagged() {
+                act!(go);
+            }
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        self.assertEqual(
+            names, {"first_cfg_call_untagged", "second_cfg_call_untagged"}
+        )
+
+    def test_unicode_and_raw_macro_identifiers_reach_registered_state(self):
+        sources = [
+            (
+                Path("src/動作.rs"),
+                src(
+                    """\
+                    use std::sync::atomic::AtomicU64;
+
+                    // SERIAL-GROUP: demo_key
+                    pub(crate) static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    macro_rules! 觸碰 {
+                        () => { $crate::動作::COUNTER.fetch_add(
+                            1, ::std::sync::atomic::Ordering::SeqCst
+                        ); };
+                    }
+                    pub(crate) use 觸碰;
+                    """
+                ),
+            ),
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    #[path = "動作.rs"]
+                    mod 動作;
+
+                    macro_rules! r#type {
+                        () => { crate::動作::COUNTER.fetch_add(
+                            1, ::std::sync::atomic::Ordering::SeqCst
+                        ); };
+                    }
+
+                    #[test]
+                    fn first_unicode_qualified_untagged() {
+                        crate::動作::觸碰!();
+                    }
+
+                    #[test]
+                    fn second_unicode_qualified_untagged() {
+                        crate::動作::觸碰!();
+                    }
+
+                    #[test]
+                    fn first_raw_untagged() {
+                        r#type!();
+                    }
+
+                    #[test]
+                    fn second_raw_untagged() {
+                        r#type!();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(
+            names,
+            {
+                "first_unicode_qualified_untagged",
+                "second_unicode_qualified_untagged",
+                "first_raw_untagged",
+                "second_raw_untagged",
+            },
+        )
+
     def test_imported_bare_call_is_scoped_to_the_inline_module(self):
         """A later `mod second { use … as bump }` must not steal `mod first`
         (#516 review)."""
