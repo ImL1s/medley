@@ -1077,6 +1077,10 @@ jobs:
             new_loads_toggle_under_the_same_lock_as_the_snapshot -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             add_dismissed_plugin_cta_uses_shared_config_lock -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            user_mcp_config_mutations_lock_and_follow_symlink_dest -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            append_marketplace_source_skips_duplicate_identity -- --nocapture
 
       - name: Restricted subagent capability boundaries
         run: |
