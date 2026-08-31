@@ -469,6 +469,11 @@ jobs:
       # regenerate it to make a red build green -- that is the one edit that
       # turns the guard back into decoration.
       - name: Tests no filter selects (#408)
+        # A compile failure is when a removed filter is most likely to be
+        # hiding. Keep producing this independent verdict, but still stop on a
+        # deliberate workflow cancellation instead of burning runner time.
+        if: ${{ !cancelled() }}
+        id: filter_coverage
         run: |
           python3 scripts/check_test_filter_coverage.py \
             --workflow .github/workflows/ci.yml \
@@ -484,7 +489,28 @@ jobs:
       # neither alone reaches all seven (`--benches` alone skips the
       # `[[test]]` targets, and plain `--no-run` skips `[[bench]]`).
       - name: cargo test -p xai-grok-shell --features test-support --no-run
+        if: ${{ !cancelled() }}
+        id: test_support_compile
         run: cargo test -p xai-grok-shell --tests --benches --features test-support --no-run
+
+      # These two steps intentionally remain fatal. The summary only makes
+      # their independent verdicts visible when the earlier workspace compile
+      # has already made the job red; it does not convert a partial sweep into
+      # a pass.
+      - name: Summarize compile-test follow-up verdicts (#518)
+        if: ${{ !cancelled() }}
+        env:
+          FILTER_COVERAGE_OUTCOME: ${{ steps.filter_coverage.outcome }}
+          TEST_SUPPORT_COMPILE_OUTCOME: ${{ steps.test_support_compile.outcome }}
+        run: |
+          {
+            echo "### Compile-test follow-up verdicts"
+            echo
+            echo "| Check | Outcome |"
+            echo "| --- | --- |"
+            echo "| #408 filter coverage | ${FILTER_COVERAGE_OUTCOME} |"
+            echo "| #474 test-support compile | ${TEST_SUPPORT_COMPILE_OUTCOME} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
     name: Clippy (hot path)
