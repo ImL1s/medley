@@ -1382,11 +1382,13 @@ impl AgentView {
                         state.selected = crate::slash::command::ArgItem::preferred_index(&items);
                         self.active_modal = Some(crate::views::modal::ActiveModal::ArgPicker {
                             command: command.to_string(),
+                            commit_mode: crate::views::modal::ArgPickerCommitMode::CommandDefault,
                             args_query: String::new(),
                             items: items.clone(),
                             original_items: items,
                             state,
                             previous_palette: None,
+                            previous_agents_modal: None,
                             window: crate::views::modal_window::ModalWindowState::new(),
                         });
                         return InputOutcome::Changed;
