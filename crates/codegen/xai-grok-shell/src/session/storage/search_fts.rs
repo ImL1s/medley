@@ -993,6 +993,69 @@ mod tests {
     }
 
     #[test]
+    fn test_claim_fenced_insert_distinguishes_insert_conflict_and_claim_loss() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        assert!(index.try_claim_bootstrap(1_000, LEASE, "owner").unwrap());
+
+        let full_doc = SessionDoc {
+            session_id: "existing-session".to_string(),
+            cwd: "/workspace/完整\0path".to_string(),
+            updated_at_unix: -1_234_567_890,
+            title: "successor title 🧪".to_string(),
+            content: "full\0content\nwith every stored field".to_string(),
+            content_hash: "full-content-hash-not-a-placeholder".to_string(),
+        };
+        assert!(matches!(
+            index
+                .insert_doc_if_absent_if_claim_owner(&full_doc, "owner")
+                .unwrap(),
+            ClaimFencedInsertOutcome::Inserted
+        ));
+
+        let conflicting_placeholder = SessionDoc {
+            session_id: full_doc.session_id.clone(),
+            cwd: "/stale/workspace".to_string(),
+            updated_at_unix: 9_999_999_999,
+            title: "stale placeholder".to_string(),
+            content: String::new(),
+            content_hash: "stale-placeholder-hash".to_string(),
+        };
+        assert!(matches!(
+            index
+                .insert_doc_if_absent_if_claim_owner(&conflicting_placeholder, "owner")
+                .unwrap(),
+            ClaimFencedInsertOutcome::AlreadyPresent
+        ));
+
+        let stored = index
+            .get_doc(&full_doc.session_id)
+            .unwrap()
+            .expect("the original full document remains present");
+        assert_eq!(stored.session_id.as_bytes(), full_doc.session_id.as_bytes());
+        assert_eq!(stored.cwd.as_bytes(), full_doc.cwd.as_bytes());
+        assert_eq!(stored.updated_at_unix, full_doc.updated_at_unix);
+        assert_eq!(stored.title.as_bytes(), full_doc.title.as_bytes());
+        assert_eq!(stored.content.as_bytes(), full_doc.content.as_bytes());
+        assert_eq!(
+            stored.content_hash.as_bytes(),
+            full_doc.content_hash.as_bytes()
+        );
+
+        let absent_doc = SessionDoc {
+            session_id: "stale-absent-session".to_string(),
+            ..conflicting_placeholder
+        };
+        assert!(matches!(
+            index
+                .insert_doc_if_absent_if_claim_owner(&absent_doc, "stale")
+                .unwrap(),
+            ClaimFencedInsertOutcome::ClaimLost
+        ));
+        assert_eq!(index.get_doc(&absent_doc.session_id).unwrap(), None);
+    }
+
+    #[test]
     fn test_bootstrap_claim_takes_over_garbage_and_future_stamps() {
         let tmp = TempDir::new().unwrap();
         let index = open(&tmp);
