@@ -3602,17 +3602,31 @@ def _module_item_shadows_registered(
     ident: str,
     static_module: tuple[str, ...] | None,
     fn_module: tuple[str, ...] | None,
+    static_inline_mods: tuple[str, ...] | None = None,
 ) -> bool:
-    """True when bare `ident` resolves to a local module item, not `static_module`."""
+    """True when bare `ident` resolves to a local module item, not the registered static.
+
+    When `_module_path` is unknown (`static_module` / `fn_module` are
+    `None`), compare inline-module paths so a registered declaration in
+    the same file is not treated as a foreign shadow (#516 review).
+    """
 
     for depth in range(len(inline_mods), -1, -1):
         prefix = inline_mods[:depth]
         if ident not in module_items.get(prefix, ()):
             continue
-        owning = (fn_module or ()) + prefix
-        if static_module is None or owning != static_module:
+        if static_module is not None:
+            owning = (fn_module or ()) + prefix
+            if owning == static_module:
+                return False
             return True
-        return False
+        # Unknown file module: inline path is the only stable identity.
+        if static_inline_mods is not None and prefix == static_inline_mods:
+            return False
+        if static_inline_mods is None:
+            # Cannot tell registered from sibling — keep the touch.
+            return False
+        return True
     return False
 
 
@@ -3631,6 +3645,7 @@ def _body_touches(
     file_globs: dict[tuple[str, ...], list[tuple[str, ...]]] | None = None,
     local_globs: tuple[tuple[int, int, tuple[str, ...]], ...] = (),
     module_items: dict[tuple[str, ...], set[str]] | None = None,
+    static_inline_mods: tuple[str, ...] | None = None,
 ) -> bool:
     """True if `code_only_body` names this registered static.
 
@@ -3699,6 +3714,17 @@ def _body_touches(
                     ):
                         continue
                 return True
+            # Local module items beat globs and the same-process fallback
+            # (#516 review).
+            if _module_item_shadows_registered(
+                module_items or {},
+                inline_mods=inline_mods,
+                ident=ident,
+                static_module=static_module,
+                fn_module=fn_module,
+                static_inline_mods=static_inline_mods,
+            ):
+                continue
             extra_globs = tuple(
                 module
                 for start, end, module in local_globs
@@ -3720,14 +3746,6 @@ def _body_touches(
             if _is_binding_occurrence(code_only_body, ident, match.start()):
                 continue
             if _local_item_shadows(code_only_body, ident, match.start()):
-                continue
-            if _module_item_shadows_registered(
-                module_items or {},
-                inline_mods=inline_mods,
-                ident=ident,
-                static_module=static_module,
-                fn_module=fn_module,
-            ):
                 continue
             return True
     return False
@@ -4356,6 +4374,7 @@ def index_functions(
                     file_globs=file_globs,
                     local_globs=local_globs,
                     module_items=module_items,
+                    static_inline_mods=item.inline_mods,
                 )
             )
             type_name = None
@@ -4446,6 +4465,7 @@ def index_functions(
                     same_process=_same_process(file_groups, rel, item.file),
                     file_globs=file_globs,
                     module_items=module_items,
+                    static_inline_mods=item.inline_mods,
                 )
             )
             raw_macro_body = raw[body_start:body_end]
@@ -4488,6 +4508,7 @@ def index_functions(
                         file_globs=file_globs,
                         local_globs=arm_local_globs,
                         module_items=module_items,
+                        static_inline_mods=item.inline_mods,
                     )
                 )
                 arm_index = len(out)
@@ -4531,6 +4552,7 @@ def index_functions(
                             same_process=_same_process(file_groups, rel, item.file),
                             file_globs=file_globs,
                             module_items=module_items,
+                            static_inline_mods=item.inline_mods,
                         )
                     )
                     template_index = len(out)
@@ -5428,6 +5450,7 @@ def analyze(
                     ),
                     file_globs=globs_by_file.get(pending.file, {}),
                     module_items=module_items_by_file.get(pending.file, {}),
+                    static_inline_mods=item.inline_mods,
                 ):
                     keys = keys | {item.key}
         if not keys:

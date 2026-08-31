@@ -6114,6 +6114,58 @@ class SolitaryProcessException(unittest.TestCase):
         )
         self.assertEqual(names, {"touches_untagged", "other_untagged"})
 
+    def test_unknown_module_path_keeps_registered_bare_touches(self):
+        """Fixtures where `_module_path` is None must still see bare
+        references to the registered static (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn touches_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"touches_untagged"})
+
+    def test_local_static_beats_glob_of_registered_name(self):
+        """`use super::registered::*;` plus a local `static COUNTER` must
+        not count as the registered item (#516 review)."""
+
+        text = src(
+            """\
+            mod registered {
+                // SERIAL-GROUP: demo_key
+                pub(crate) static COUNTER: AtomicU64 = AtomicU64::new(0);
+            }
+
+            mod other {
+                use super::registered::*;
+                static COUNTER: u64 = 0;
+
+                #[test]
+                fn a_untagged() {
+                    let _ = COUNTER;
+                }
+
+                #[test]
+                fn b_untagged() {
+                    let _ = COUNTER;
+                }
+            }
+            """
+        )
+        findings = guard.scan_source(text, path="crates/codegen/demo/src/lib.rs")
+        self.assertEqual(findings, [])
+        names = derived_names(
+            [(Path("crates/codegen/demo/src/lib.rs"), text)], "demo_key"
+        )
+        self.assertEqual(names, set())
+
 
 class DefaultScanRoots(unittest.TestCase):
     def test_default_collect_includes_integration_test_files(self):
