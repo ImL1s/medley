@@ -1562,6 +1562,26 @@ def _manifest_default_features(text: str) -> set[str]:
     return _toml_str_list(feats.get("default"))
 
 
+def _normalize_package_features(
+    package: str, features: set[str] | frozenset[str]
+) -> set[str]:
+    """Map Cargo package-qualified selectors onto this package's feature names.
+
+    `--features demo/hot` activates feature `hot` in package `demo`. Other
+    packages' `name/feat` selectors are ignored for this manifest (#507).
+    """
+
+    out: set[str] = set()
+    for feat in features:
+        if "/" not in feat:
+            out.add(feat)
+            continue
+        pkg, name = feat.split("/", 1)
+        if pkg == package and name:
+            out.add(name)
+    return out
+
+
 def _cargo_test_targets(
     root: Path,
     extra_features: frozenset[str] | set[str] | None = None,
@@ -1605,10 +1625,15 @@ def _cargo_test_targets(
             continue
         crate = manifest.parent
         data = _load_manifest_toml(text)
+        pkg_name = crate.name
         if data is not None:
             pkg = data.get("package")
-            if isinstance(pkg, dict) and pkg.get("autotests") is False:
-                no_autotest.add(crate.resolve())
+            if isinstance(pkg, dict):
+                name = pkg.get("name")
+                if isinstance(name, str) and name:
+                    pkg_name = name
+                if pkg.get("autotests") is False:
+                    no_autotest.add(crate.resolve())
             lib = data.get("lib") if data is not None else None
             if (
                 isinstance(pkg, dict)
@@ -1618,6 +1643,9 @@ def _cargo_test_targets(
                 lib_rs = (crate / "src" / "lib.rs").resolve()
                 suppressed_libs.add(lib_rs)
                 gated.add(lib_rs)
+            normalized_extra = _normalize_package_features(
+                pkg_name, extra_features
+            )
             feat_table = (
                 data.get("features")
                 if isinstance(data.get("features"), dict)
@@ -1636,10 +1664,11 @@ def _cargo_test_targets(
                     ),
                 )
             elif no_default_features:
-                enabled = _feature_closure(feat_table, set(extra_features))
+                enabled = _feature_closure(feat_table, set(normalized_extra))
             else:
                 enabled = _feature_closure(
-                    feat_table, default_feats | {"default"} | set(extra_features)
+                    feat_table,
+                    default_feats | {"default"} | set(normalized_extra),
                 )
             crate_feats[crate.resolve()] = enabled
             lib = data.get("lib")
@@ -3881,6 +3910,43 @@ class CiPackageTargetCounts(unittest.TestCase):
             self.assertEqual(
                 [r.name for r in matched],
                 ["provider_error_body_preview_is_secret_free_and_bounded"],
+            )
+
+    def test_package_qualified_feature_activates_cfg_gated_tests(self):
+        """`--features demo/hot` enables feature `hot` in package `demo`
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "demo"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\n\n'
+                "[features]\nhot = []\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                '#[cfg(feature = "hot")]\n'
+                "#[test]\nfn none_auth_scheme_hot() {}\n"
+                "#[test]\nfn none_auth_scheme_cold() {}\n",
+                encoding="utf-8",
+            )
+            wf = (
+                "          run_nonzero -p demo --features demo/hot "
+                "--lib none_auth_scheme_ -- --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
+            feat = frozenset({"demo/hot"})
+            records_for_feat = {
+                feat: _qualified_test_records(root, extra_features=feat)
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "none_auth_scheme_", lanes
+            )
+            self.assertEqual(
+                sorted(r.name for r in matched),
+                ["none_auth_scheme_cold", "none_auth_scheme_hot"],
             )
 
     def test_features_lane_counts_cfg_gated_and_required_feature_tests(self):
