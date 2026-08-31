@@ -1793,6 +1793,97 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"first_touching", "second_touching"})
 
+    def test_qualified_macro_paths_keep_selected_arm_keys(self):
+        """Qualified macro calls resolve their module/re-export before arm
+        selection instead of falling back to a macro-wide key union."""
+
+        sources = [
+            (
+                Path("src/inner.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub(crate) static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    macro_rules! inner {
+                        (touch) => { $crate::inner::COUNTER.fetch_add(
+                            1, std::sync::atomic::Ordering::SeqCst
+                        ); };
+                        (clean) => {};
+                    }
+                    pub(crate) use inner;
+                    """
+                ),
+            ),
+            (
+                Path("src/bridge.rs"),
+                src("pub(crate) use crate::inner::inner as relay;\n"),
+            ),
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn direct_clean() { crate::inner::inner!(clean); }
+                    #[test]
+                    fn direct_touch() { crate::inner::inner!(touch); }
+                    #[test]
+                    fn relay_clean() { crate::bridge::relay!(clean); }
+                    #[test]
+                    fn relay_touch() { crate::bridge::relay!(touch); }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"direct_touch", "relay_touch"})
+
+    def test_macro_arm_local_glob_keeps_nested_macro_arm_precision(self):
+        """A macro arm's lexical glob resolves macros in that module and
+        still selects only the invoked nested arm."""
+
+        sources = [
+            (
+                Path("src/inner.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub(crate) static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    macro_rules! relay {
+                        (touch) => { $crate::inner::COUNTER.fetch_add(
+                            1, std::sync::atomic::Ordering::SeqCst
+                        ); };
+                        (clean) => {};
+                    }
+                    pub(crate) use relay;
+                    """
+                ),
+            ),
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    macro_rules! outer {
+                        (touch) => {{ use crate::inner::*; relay!(touch); }};
+                        (clean) => {{ use crate::inner::*; relay!(clean); }};
+                    }
+
+                    #[test]
+                    fn first_clean() { outer!(clean); }
+                    #[test]
+                    fn second_clean() { outer!(clean); }
+                    #[test]
+                    fn first_touch() { outer!(touch); }
+                    #[test]
+                    fn second_touch() { outer!(touch); }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_touch", "second_touch"})
+
     def test_macro_arm_local_imports_reach_helper_keys(self):
         """Selected macro arms carry their own named and glob imports into
         call-graph closure (#516 review)."""
@@ -2696,6 +2787,84 @@ class TransitiveClosure(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_local_static_imports_follow_reexports_and_aliases(self):
+        """Function-local named, aliased, and nested-block imports are
+        checked through their re-export source path."""
+
+        sources = [
+            (
+                Path("src/a.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("src/bridge.rs"),
+                src("pub use crate::a::COUNTER as EXPORTED;\n"),
+            ),
+            (
+                Path("src/t.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn named() {
+                        use crate::bridge::EXPORTED;
+                        EXPORTED.load(Ordering::SeqCst);
+                    }
+                    #[test]
+                    fn aliased() {
+                        use crate::bridge::EXPORTED as LOCAL;
+                        LOCAL.load(Ordering::SeqCst);
+                    }
+                    #[test]
+                    fn nested() {
+                        { use crate::bridge::EXPORTED as LOCAL; LOCAL.load(Ordering::SeqCst); }
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"named", "aliased", "nested"})
+
+    def test_reexport_search_explores_all_matching_edges_and_cycles(self):
+        """A dead/cyclic first edge must not hide a later path to the static."""
+
+        previous = (guard._REEXPORTS, guard._REEXPORT_EXACT, guard._REEXPORT_GLOBS)
+        try:
+            guard._REEXPORTS = [
+                (("bridge",), "EXPORTED", ("dead",), "LOOP"),
+                (("bridge",), "EXPORTED", ("a",), "COUNTER"),
+                (("dead",), "LOOP", ("bridge",), "EXPORTED"),
+            ]
+            guard._REEXPORT_EXACT = {
+                (("bridge",), "EXPORTED"): [
+                    (("dead",), "LOOP"),
+                    (("a",), "COUNTER"),
+                ],
+                (("dead",), "LOOP"): [(("bridge",), "EXPORTED")],
+            }
+            guard._REEXPORT_GLOBS = {}
+            self.assertTrue(
+                guard._reexport_reaches(
+                    ("bridge",), "EXPORTED", ("a",), ("COUNTER",)
+                )
+            )
+            self.assertFalse(
+                guard._reexport_reaches(
+                    ("bridge",), "EXPORTED", ("missing",), ("COUNTER",)
+                )
+            )
+        finally:
+            (
+                guard._REEXPORTS,
+                guard._REEXPORT_EXACT,
+                guard._REEXPORT_GLOBS,
+            ) = previous
 
     def test_reexport_chain_resolves_through_each_exporter(self):
         """`pub use` of a `pub use` still has to land on the definition

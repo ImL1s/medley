@@ -260,7 +260,8 @@ FN_DEF = re.compile(
 )
 MACRO_DEF = re.compile(r"macro_rules!\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
 MACRO_INVOKE = re.compile(
-    r"(?<![:.\w])(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*([A-Za-z_][A-Za-z0-9_]*)\s*!"
+    r"(?<![:.\w])((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*)"
+    r"((?:r#)?[A-Za-z_][A-Za-z0-9_]*)\s*!"
 )
 INLINE_MOD = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
@@ -1411,6 +1412,10 @@ _PATH_MOD = re.compile(
 )
 _PATH_OVERRIDE: dict[str, tuple[str, ...]] = {}
 _REEXPORTS: list[tuple[tuple[str, ...], str, tuple[str, ...], str]] = []
+_REEXPORT_EXACT: dict[
+    tuple[tuple[str, ...], str], list[tuple[tuple[str, ...], str]]
+] = {}
+_REEXPORT_GLOBS: dict[tuple[str, ...], list[tuple[str, ...]]] = {}
 
 
 def _load_path_overrides(sources: list[tuple[Path, str]]) -> None:
@@ -1448,10 +1453,17 @@ def _load_path_overrides(sources: list[tuple[Path, str]]) -> None:
 def _load_reexports(sources: list[tuple[Path, str]]) -> None:
     """Index `pub use` so a re-exported static still matches (#516 review)."""
 
-    global _REEXPORTS
+    global _REEXPORTS, _REEXPORT_EXACT, _REEXPORT_GLOBS
     _REEXPORTS = []
     for path, text in sources:
         _REEXPORTS.extend(_pub_reexports(path, text))
+    _REEXPORT_EXACT = {}
+    _REEXPORT_GLOBS = {}
+    for dest, local, src, src_fname in _REEXPORTS:
+        if local == "*":
+            _REEXPORT_GLOBS.setdefault(dest, []).append(src)
+        else:
+            _REEXPORT_EXACT.setdefault((dest, local), []).append((src, src_fname))
 
 
 def _reexport_reaches(
@@ -1465,27 +1477,18 @@ def _reexport_reaches(
     if static_module is None:
         return False
     seen: set[tuple[tuple[str, ...], str]] = set()
-    cur_mod, cur_name = module, fname
-    while True:
+    pending = [(module, fname)]
+    while pending:
+        cur_mod, cur_name = pending.pop()
         if cur_mod == static_module and cur_name in identifiers:
             return True
         key = (cur_mod, cur_name)
         if key in seen:
-            return False
+            continue
         seen.add(key)
-        nxt: tuple[tuple[str, ...], str] | None = None
-        for dest, local, src, src_fname in _REEXPORTS:
-            if dest != cur_mod:
-                continue
-            if local == "*":
-                nxt = (src, cur_name)
-                break
-            if local == cur_name:
-                nxt = (src, src_fname)
-                break
-        if nxt is None:
-            return False
-        cur_mod, cur_name = nxt
+        pending.extend(_REEXPORT_EXACT.get(key, ()))
+        pending.extend((src, cur_name) for src in _REEXPORT_GLOBS.get(cur_mod, ()))
+    return False
 
 
 def _module_path_fs(rel: Path) -> tuple[str, ...] | None:
@@ -2324,6 +2327,104 @@ def _fn_import(
     return _lookup_import(imports_by_file.get(fn.file, {}), fn.inline_mods, name)
 
 
+def _macro_candidates(
+    fn: FnInfo,
+    match: re.Match[str],
+    macro_defs_by_module: dict[tuple[tuple[str, ...], str], tuple[Path, str]],
+    imports_by_file: dict[
+        Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
+    ],
+    globs_by_file: dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
+) -> list[tuple[Path, str]]:
+    """Resolve an invocation to macro definitions before selecting its arm.
+
+    Qualified paths name their module directly (or through an imported module
+    alias). Bare names follow lexical named/glob precedence, then module-level
+    imports. Returning every candidate from the winning glob scope is
+    deliberately sound for cfg-exclusive definitions.
+    """
+
+    qualifier = match.group(1)
+    name = _raw_ident(match.group(2))
+    if qualifier:
+        segs = tuple(
+            _raw_ident(part)
+            for part in (piece.strip() for piece in qualifier.split("::"))
+            if part
+        )
+        if not segs:
+            return []
+        imported = None
+        if segs[0] not in ("crate", "self", "super") and not _is_lib_crate_ident(
+            segs[0]
+        ):
+            imported = _fn_import(fn, segs[0], match.start(), imports_by_file)
+        if imported is not None:
+            module, imported_name = imported
+            target_module = module + (imported_name,) + segs[1:]
+        else:
+            target_module = _resolve_path_module(
+                segs, _module_path(fn.file), fn.inline_mods
+            )
+        definition = macro_defs_by_module.get((target_module or (), name))
+        return [definition] if definition is not None else []
+
+    local_named = [
+        entry
+        for entry in fn.local_uses
+        if entry[2] == name and entry[0] <= match.start() < entry[1]
+    ]
+    local_by_scope = {(entry[0], entry[1]): entry for entry in local_named}
+    glob_by_scope = {
+        (start, end): modules
+        for start, end, modules in _local_glob_scopes(
+            fn.local_globs, match.start()
+        )
+    }
+    for scope in sorted(
+        set(local_by_scope) | set(glob_by_scope),
+        key=lambda item: (item[1] - item[0], -item[0]),
+    ):
+        named = local_by_scope.get(scope)
+        if named is not None:
+            definition = macro_defs_by_module.get((named[3], named[4]))
+            return [definition] if definition is not None else []
+        definitions = [
+            definition
+            for module in glob_by_scope.get(scope, [])
+            if (definition := macro_defs_by_module.get((module, name))) is not None
+        ]
+        if definitions:
+            return list(dict.fromkeys(definitions))
+
+    imported = _lookup_import(
+        imports_by_file.get(fn.file, {}), fn.inline_mods, name
+    )
+    if imported is not None:
+        definition = macro_defs_by_module.get(imported)
+        return [definition] if definition is not None else []
+
+    file_module = _module_path(fn.file)
+    if file_module is not None:
+        prefix = fn.inline_mods
+        while True:
+            definition = macro_defs_by_module.get((file_module + prefix, name))
+            if definition is not None:
+                return [definition]
+            if not prefix:
+                break
+            prefix = prefix[:-1]
+
+    definitions = [
+        definition
+        for module in _globs_in_scope(
+            globs_by_file.get(fn.file, {}), fn.inline_mods
+        )
+        if (definition := macro_defs_by_module.get((module, name))) is not None
+    ]
+    return list(dict.fromkeys(definitions))
+
+
 def _local_glob_scopes(
     globs: tuple[tuple[int, int, tuple[str, ...]], ...], pos: int
 ) -> list[tuple[int, int, list[tuple[str, ...]]]]:
@@ -2915,7 +3016,16 @@ def index_functions(
                         {
                             use[2]
                             for use in local_uses
-                            if use[4] in item.identifiers
+                            if (
+                                use[3] == _item_module(item)
+                                and use[4] in item.identifiers
+                            )
+                            or _reexport_reaches(
+                                use[3],
+                                use[4],
+                                _item_module(item),
+                                item.identifiers,
+                            )
                         }
                     ),
                     original=item.identifiers,
@@ -3007,7 +3117,16 @@ def index_functions(
                             {
                                 use[2]
                                 for use in arm_local_uses
-                                if use[4] in item.identifiers
+                                if (
+                                    use[3] == _item_module(item)
+                                    and use[4] in item.identifiers
+                                )
+                                or _reexport_reaches(
+                                    use[3],
+                                    use[4],
+                                    _item_module(item),
+                                    item.identifiers,
+                                )
                             }
                         ),
                         original=item.identifiers,
@@ -3106,7 +3225,7 @@ def index_functions(
     for rel, raw, code, occupied, inline_spans in scans:
         file_imports = imports_by_file.get(rel, {})
         for invoke in MACRO_INVOKE.finditer(code):
-            macro_name = invoke.group(1)
+            macro_name = _raw_ident(invoke.group(2))
             if any(start <= invoke.start() < end for start, end in occupied):
                 continue
             inline_mods = _inline_path_from_spans(inline_spans, invoke.start())
@@ -3392,38 +3511,41 @@ def _resolve_calls(
                 js.extend(by_module.get(module, {}).get(name, []))
         _gain_from(gained, keys_of, self_index, js)
     for m in MACRO_INVOKE.finditer(fn.body):
-        name = m.group(1)
-        def_file = fn.file
-        imported = _fn_import(fn, name, m.start(), imports_by_file)
-        resolved = name
-        if imported is not None:
-            module, resolved = imported
-            definition = macro_defs_by_module.get((module, resolved))
-            if definition is not None:
-                def_file, resolved = definition
-        arms = by_macro_arms.get((def_file, resolved))
-        if arms:
+        name = _raw_ident(m.group(2))
+        candidates = _macro_candidates(
+            fn,
+            m,
+            macro_defs_by_module,
+            imports_by_file,
+            globs_by_file,
+        )
+        if candidates:
             inner = _macro_invoke_inner(fn.body, m.end())
             arity = _macro_invoke_arity(fn.body, m.end())
-            chosen: frozenset[str] | None = None
-            for matcher, arm_index in arms:
-                if _arm_accepts(matcher, inner, arity):
-                    chosen = keys_of[arm_index]
-                    break
-            if chosen is not None:
-                gained.update(chosen)
-                continue
-        j = by_macro.get(def_file, {}).get(resolved)
-        if j is None:
+            for def_file, resolved in candidates:
+                arms = by_macro_arms.get((def_file, resolved))
+                chosen: frozenset[str] | None = None
+                for matcher, arm_index in arms or ():
+                    if _arm_accepts(matcher, inner, arity):
+                        chosen = keys_of[arm_index]
+                        break
+                if chosen is not None:
+                    gained.update(chosen)
+                    continue
+                j = by_macro.get(def_file, {}).get(resolved)
+                if j is not None and j != self_index:
+                    gained.update(keys_of[j])
+            continue
+        # Unresolved unqualified macro_export invocations retain the prior
+        # sound cross-file fallback. A qualified path must never discard its
+        # qualifier and accidentally union every same-named macro.
+        if not m.group(1):
             _gain_from(
                 gained,
                 keys_of,
                 self_index,
-                by_macro_any.get(resolved, []) or by_macro_any.get(name, []),
+                by_macro_any.get(name, []),
             )
-            continue
-        if j != self_index:
-            gained.update(keys_of[j])
     for m in QUALIFIED_CALL.finditer(fn.body):
         segs = tuple(s.strip() for s in m.group(1).split("::") if s.strip())
         if segs and segs[0] == "crate":
