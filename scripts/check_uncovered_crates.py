@@ -42,7 +42,7 @@ from pathlib import Path
 from toml_package_name import package_name
 
 _ATTRIBUTE_PATH = re.compile(
-    r"^\s*#\s*\[\s*(?P<path>[^\(\]]+?)(?=\s*(?:\(|\]))", re.MULTILINE
+    r"^\s*#\s*\[\s*(?P<path>[^\(\{\[\]]+?)(?=\s*[\(\{\[\]])", re.MULTILINE
 )
 _RUST_RAW_STRING_START = re.compile(r'(?:br|cr|r)(?P<hashes>#+)?"')
 _RUST_CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'\n])'")

@@ -342,6 +342,8 @@ class SrcHasTests(unittest.TestCase):
                 "nested": "#[some :: deeply_nested :: test]",
                 "absolute": "#[::tokio::test]",
                 "with_args": '#[tokio::test(flavor = "current_thread")]',
+                "brace_args": "#[pm::test{}]",
+                "bracket_args": "#[pm::test[args]]",
                 "raw_module": "#[r#async::test]",
                 "raw_test": "#[r#test]",
                 "unicode_module": "#[异步::test]",
