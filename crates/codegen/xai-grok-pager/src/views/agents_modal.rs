@@ -285,6 +285,8 @@ pub struct AgentsModalState {
     pub generation: u64,
     /// Bytes+generation snapshot taken when this modal was last rendered.
     config_snapshot: Option<crate::config_toml_edit::ConfigMutationSnapshot>,
+    /// `[agent] name` captured with [`Self::config_snapshot`].
+    config_agent_name: Option<String>,
     pub personas: Vec<PersonaDetail>,
     pub persona_selected: usize,
     pub persona_scroll: usize,
@@ -317,7 +319,8 @@ impl AgentsModalState {
         let mut agents = build_agent_list(cwd, toggle);
         stamp_entry_generation(&mut agents, 1);
         let personas = merge_persona_lists(bundle, cwd);
-        let default_agent = resolve_default_agent_name(cwd, model_agent_type);
+        let (config_snapshot, config_agent_name, default_agent) =
+            capture_locked_config_state(1, cwd, model_agent_type);
         Self {
             window: ModalWindowState::with_tabs(AgentsTab::ALL.len()),
             active_tab: AgentsTab::Agents,
@@ -337,7 +340,8 @@ impl AgentsModalState {
             active_agent,
             model_agent_type: model_agent_type.map(str::to_owned),
             generation: 1,
-            config_snapshot: capture_config_snapshot(1),
+            config_snapshot,
+            config_agent_name,
             personas,
             persona_selected: 0,
             persona_scroll: 0,
@@ -348,7 +352,14 @@ impl AgentsModalState {
     fn rebuild_agents(&mut self) {
         let toggle = load_agent_toggle();
         self.generation = self.generation.saturating_add(1);
-        self.config_snapshot = capture_config_snapshot(self.generation);
+        let (snapshot, agent_name, default_agent) = capture_locked_config_state(
+            self.generation,
+            &self.cwd,
+            self.model_agent_type.as_deref(),
+        );
+        self.config_snapshot = snapshot;
+        self.config_agent_name = agent_name;
+        self.default_agent = default_agent;
         self.agents = build_agent_list(&self.cwd, &toggle);
         stamp_entry_generation(&mut self.agents, self.generation);
         if self.selected >= self.agents.len() {
@@ -756,15 +767,29 @@ pub fn resolve_default_agent_name(cwd: &Path, model_agent_type: Option<&str>) ->
     )
     .name
 }
-fn refresh_default_agent(state: &mut AgentsModalState) {
-    let model_agent_type = state.model_agent_type.as_deref();
-    state.default_agent = resolve_default_agent_name(&state.cwd, model_agent_type);
-}
 fn capture_config_snapshot(
     generation: u64,
 ) -> Option<crate::config_toml_edit::ConfigMutationSnapshot> {
     let path = xai_grok_config::grok_home().join("config.toml");
     crate::config_toml_edit::config_mutation_snapshot(&path, generation).ok()
+}
+
+fn capture_locked_config_state(
+    generation: u64,
+    cwd: &Path,
+    model_agent_type: Option<&str>,
+) -> (
+    Option<crate::config_toml_edit::ConfigMutationSnapshot>,
+    Option<String>,
+    String,
+) {
+    let path = xai_grok_config::grok_home().join("config.toml");
+    let _lock = crate::config_toml_edit::lock_config_file(&path).ok();
+    (
+        capture_config_snapshot(generation),
+        load_config_agent_name(),
+        resolve_default_agent_name(cwd, model_agent_type),
+    )
 }
 /// Set or clear the default agent via `[agent] name` in config.toml.
 ///
@@ -2275,7 +2300,8 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                     return AgentsModalOutcome::Changed;
                 }
                 let name = entry.name.clone();
-                let is_already_default = load_config_agent_name().as_deref() == Some(name.as_str());
+                let is_already_default =
+                    state.config_agent_name.as_deref() == Some(name.as_str());
                 let new_default = if is_already_default {
                     None
                 } else {
@@ -2289,8 +2315,14 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                 };
                 match set_default_agent(new_default, rendered, state.generation) {
                     Ok(()) => {
-                        state.config_snapshot = capture_config_snapshot(state.generation);
-                        refresh_default_agent(state);
+                        let (snapshot, agent_name, default_agent) = capture_locked_config_state(
+                            state.generation,
+                            &state.cwd,
+                            state.model_agent_type.as_deref(),
+                        );
+                        state.config_snapshot = snapshot;
+                        state.config_agent_name = agent_name;
+                        state.default_agent = default_agent;
                         state.message = Some(if is_already_default {
                             AgentsModalMessage::info(format!(
                                 "Persisted: cleared default in config.toml (generation {}). New sessions use '{}'. This session is unchanged.",
@@ -3069,6 +3101,7 @@ mod tests {
                 persona_expanded: std::collections::HashSet::new(),
                 generation: 1,
                 config_snapshot: None,
+                config_agent_name: None,
             };
             state.set_search_query(query);
             state
@@ -3112,6 +3145,7 @@ mod tests {
             persona_expanded: std::collections::HashSet::new(),
             generation: 1,
             config_snapshot: None,
+            config_agent_name: None,
         };
         state.set_search_query(query);
         state
@@ -3191,6 +3225,7 @@ mod tests {
             persona_expanded: std::collections::HashSet::new(),
             generation: 1,
             config_snapshot: None,
+            config_agent_name: None,
         }
     }
     fn buffer_text(buffer: &Buffer) -> String {
