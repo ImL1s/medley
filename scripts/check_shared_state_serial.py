@@ -1410,7 +1410,7 @@ def _norm_posix(path: Path) -> str:
 
 _PATH_MOD = re.compile(
     r"#\[\s*path\s*=\s*\"([^\"]+)\"\s*\]\s*"
-    r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)"
+    rf"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+({RUST_IDENT_TOKEN})"
 )
 _PATH_OVERRIDE: dict[str, tuple[str, ...]] = {}
 _REEXPORTS: list[tuple[tuple[str, ...], str, tuple[str, ...], str]] = []
@@ -1435,7 +1435,7 @@ def _load_path_overrides(sources: list[tuple[Path, str]]) -> None:
             if start < len(code) and code[start] == " " and text[start] != " ":
                 continue
             child = _norm_posix(rel.parent / match.group(1))
-            decls.append((rel, child, match.group(2)))
+            decls.append((rel, child, _raw_ident(match.group(2))))
     if not decls:
         return
     for _ in range(len(decls) + 1):
@@ -2358,6 +2358,7 @@ class FnInfo:
     local_globs: tuple[tuple[int, int, tuple[str, ...]], ...] = ()
     macro_arms: tuple[tuple[str, int], ...] = ()
     is_macro_arm: bool = False
+    is_macro_export: bool = False
 
 
 def _import_from_uses(
@@ -2991,9 +2992,9 @@ def _serials_for_macro_invoke(
         if direct in generated_by_macro:
             candidates.append(direct)
 
-    imported = _lookup_import(file_imports, inline_mods, macro_name)
-    if imported is not None:
-        candidates.extend(generated_by_module.get(imported, ()))
+        imported = _lookup_import(file_imports, inline_mods, macro_name)
+        if imported is not None:
+            candidates.extend(generated_by_module.get(imported, ()))
     if not candidates and not qualifier:
         candidates.extend(exported_macros.get(macro_name, ()))
 
@@ -3285,6 +3286,7 @@ def index_functions(
                     has_unkeyed_serial=False,
                     attrs_line=_line(raw, match.start()),
                     macro_arms=tuple(arm_indices),
+                    is_macro_export=is_export,
                 )
             )
         scans.append((rel, raw, code, occupied, inline_spans))
@@ -3297,6 +3299,11 @@ def index_functions(
         if module is None:
             continue
         generated_by_module.setdefault((module, name), []).append((rel, name))
+    for name, definitions in exported_macros.items():
+        root = generated_by_module.setdefault(((), name), [])
+        root.extend(
+            definition for definition in definitions if definition not in root
+        )
     _copy_macro_reexports_into_index(generated_by_module)
 
     for rel, raw, code, occupied, inline_spans in scans:
@@ -3828,9 +3835,12 @@ def analyze(
                 by_macro_arms[i] = fn.macro_arms
             module = _module_path(fn.file)
             if module is not None:
+                definition_module = module + fn.inline_mods
                 macro_defs_by_module.setdefault(
-                    (module + fn.inline_mods, fn.name), []
+                    (definition_module, fn.name), []
                 ).append(i)
+                if fn.is_macro_export and definition_module:
+                    macro_defs_by_module.setdefault(((), fn.name), []).append(i)
             continue
         if fn.is_macro_arm:
             continue

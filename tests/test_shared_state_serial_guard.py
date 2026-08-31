@@ -11,6 +11,7 @@ docstring names for its sibling guard (#455/#458).
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -50,6 +51,30 @@ def derived_names(sources: list[tuple[Path, str]], key: str) -> set[str]:
     _findings, errors, membership = guard.analyze(sources, scan_root=Path("."))
     assert not errors, errors
     return {name for _path, _line, name in membership.get(key, [])}
+
+
+def cargo_test_names(files: dict[str, str]) -> set[str]:
+    """Compile a dependency-free Rust fixture and return Cargo's test list."""
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        for relative, text in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(src(text))
+        result = subprocess.run(
+            ["cargo", "test", "--quiet", "--", "--list"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    return {
+        line.removesuffix(": test")
+        for line in result.stdout.splitlines()
+        if line.endswith(": test")
+    }
 
 
 class RegistryDiscovery(unittest.TestCase):
@@ -1139,6 +1164,98 @@ class TransitiveClosure(unittest.TestCase):
             [(Path("crates/codegen/demo/src/lib.rs"), text)], "demo_key"
         )
         self.assertIn("calls_crate_qualified_bump_untagged", names)
+
+    def test_child_macro_export_is_resolved_at_crate_root(self):
+        lib = src(
+            """\
+            use std::sync::atomic::AtomicU64;
+
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            mod exported;
+
+            #[cfg(test)]
+            crate::exported_cases!();
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn first_child_export_untagged() {
+                    crate::touch!();
+                }
+
+                #[test]
+                fn second_child_export_untagged() {
+                    crate::touch!();
+                }
+            }
+            """
+        )
+        exported = src(
+            """\
+            #[macro_export]
+            macro_rules! touch {
+                () => { $crate::COUNTER.fetch_add(
+                    1, ::std::sync::atomic::Ordering::SeqCst
+                ); };
+            }
+
+            #[macro_export]
+            macro_rules! exported_cases {
+                () => {
+                    #[test]
+                    fn first_exported_case() {
+                        $crate::COUNTER.fetch_add(
+                            1, ::std::sync::atomic::Ordering::SeqCst
+                        );
+                    }
+
+                    #[test]
+                    fn second_exported_case() {
+                        $crate::COUNTER.fetch_add(
+                            1, ::std::sync::atomic::Ordering::SeqCst
+                        );
+                    }
+                };
+            }
+            """
+        )
+        oracle = cargo_test_names(
+            {
+                "Cargo.toml": """
+                    [package]
+                    name = "child-macro-export"
+                    version = "0.1.0"
+                    edition = "2021"
+                """,
+                "src/lib.rs": lib,
+                "src/exported.rs": exported,
+            }
+        )
+        self.assertEqual(
+            oracle,
+            {
+                "first_exported_case",
+                "second_exported_case",
+                "tests::first_child_export_untagged",
+                "tests::second_child_export_untagged",
+            },
+        )
+        names = derived_names(
+            [(Path("src/lib.rs"), lib), (Path("src/exported.rs"), exported)],
+            "demo_key",
+        )
+        self.assertTrue(
+            {"first_child_export_untagged", "second_child_export_untagged"}
+            <= names,
+            names,
+        )
+        self.assertEqual(
+            len({name for name in names if name.startswith("exported_cases!")}),
+            2,
+            names,
+        )
 
     def test_generated_tests_from_an_imported_macro_are_derived_members(self):
         """A test-generating macro defined in another file is still the
@@ -3261,6 +3378,140 @@ class TransitiveClosure(unittest.TestCase):
                 "first_raw_untagged",
                 "second_raw_untagged",
             },
+        )
+
+    def test_unicode_path_module_name_can_differ_from_filename(self):
+        lib = src(
+            """\
+            #[path = "impls.rs"]
+            mod 動作;
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn first_unicode_path_untagged() {
+                    crate::動作::觸碰!();
+                }
+
+                #[test]
+                fn second_unicode_path_untagged() {
+                    crate::動作::觸碰!();
+                }
+            }
+            """
+        )
+        impls = src(
+            """\
+            use std::sync::atomic::AtomicU64;
+
+            // SERIAL-GROUP: demo_key
+            pub(crate) static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! 觸碰 {
+                () => { $crate::動作::COUNTER.fetch_add(
+                    1, ::std::sync::atomic::Ordering::SeqCst
+                ); };
+            }
+            pub(crate) use 觸碰;
+            """
+        )
+        oracle = cargo_test_names(
+            {
+                "Cargo.toml": """
+                    [package]
+                    name = "unicode-path-module"
+                    version = "0.1.0"
+                    edition = "2021"
+                """,
+                "src/lib.rs": lib,
+                "src/impls.rs": impls,
+            }
+        )
+        self.assertEqual(
+            oracle,
+            {
+                "tests::first_unicode_path_untagged",
+                "tests::second_unicode_path_untagged",
+            },
+        )
+        self.assertEqual(
+            derived_names(
+                [(Path("src/lib.rs"), lib), (Path("src/impls.rs"), impls)],
+                "demo_key",
+            ),
+            {"first_unicode_path_untagged", "second_unicode_path_untagged"},
+        )
+
+    def test_qualified_generated_macro_ignores_same_name_bare_import(self):
+        lib = src(
+            """\
+            use std::sync::atomic::AtomicU64;
+
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[cfg(test)]
+            mod touching;
+            #[cfg(test)]
+            mod clean;
+
+            #[cfg(test)]
+            use crate::touching::cases;
+
+            #[cfg(test)]
+            crate::clean::cases!();
+            """
+        )
+        touching = src(
+            """\
+            macro_rules! cases {
+                () => {
+                    #[test]
+                    fn touching_generated() {
+                        crate::COUNTER.fetch_add(
+                            1, ::std::sync::atomic::Ordering::SeqCst
+                        );
+                    }
+                };
+            }
+            pub(crate) use cases;
+            """
+        )
+        clean = src(
+            """\
+            macro_rules! cases {
+                () => {
+                    #[test]
+                    fn clean_generated() {}
+                };
+            }
+            pub(crate) use cases;
+            """
+        )
+        oracle = cargo_test_names(
+            {
+                "Cargo.toml": """
+                    [package]
+                    name = "qualified-generated-macro"
+                    version = "0.1.0"
+                    edition = "2021"
+                """,
+                "src/lib.rs": lib,
+                "src/touching.rs": touching,
+                "src/clean.rs": clean,
+            }
+        )
+        self.assertEqual(oracle, {"clean_generated"})
+        self.assertEqual(
+            derived_names(
+                [
+                    (Path("src/lib.rs"), lib),
+                    (Path("src/touching.rs"), touching),
+                    (Path("src/clean.rs"), clean),
+                ],
+                "demo_key",
+            ),
+            set(),
         )
 
     def test_unicode_macro_reexport_reaches_registered_state(self):
