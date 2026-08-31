@@ -71,8 +71,8 @@ fn read_config_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-pub(crate) fn lock_config_file(path: &Path) -> std::io::Result<File> {
-    xai_grok_config::fs_atomic::lock_config_file(path)
+pub(crate) fn lock_config_destination(path: &Path) -> std::io::Result<(File, std::path::PathBuf)> {
+    xai_grok_config::fs_atomic::lock_config_destination(path)
 }
 
 pub(crate) fn write_config_toml(path: &Path, contents: &str) -> std::io::Result<()> {

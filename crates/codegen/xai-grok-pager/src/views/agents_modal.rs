@@ -784,7 +784,7 @@ fn capture_locked_config_state(
     HashMap<String, bool>,
 ) {
     let path = xai_grok_config::grok_home().join("config.toml");
-    let _lock = crate::config_toml_edit::lock_config_file(&path).ok();
+    let _lock = crate::config_toml_edit::lock_config_destination(&path).ok();
     (
         capture_config_snapshot(generation),
         load_config_agent_name(),

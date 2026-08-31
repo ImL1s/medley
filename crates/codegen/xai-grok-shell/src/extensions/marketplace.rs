@@ -1311,8 +1311,8 @@ fn purge_default_skills_installs_impl(
 
     // Same lock order as `handle_add_source` / official auto-register:
     // config.toml.lock then init lock, then the marker write.
-    let _cfg = match xai_grok_config::fs_atomic::lock_config_file(&config_path) {
-        Ok(f) => f,
+    let (_cfg, dest) = match xai_grok_config::fs_atomic::lock_config_destination(&config_path) {
+        Ok(pair) => pair,
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -1385,7 +1385,7 @@ fn purge_default_skills_installs_impl(
         );
     }
 
-    if let Err(e) = set_default_skills_installs_purged(&config_path) {
+    if let Err(e) = set_default_skills_installs_purged(&dest) {
         tracing::warn!(
             error = %e,
             path = %config_path.display(),
@@ -1408,9 +1408,9 @@ pub(crate) fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
         return;
     }
 
-    // Same lock order as `handle_add_source`: config.toml.lock then init lock.
-    let _cfg = match xai_grok_config::fs_atomic::lock_config_file(&config_path) {
-        Ok(f) => f,
+    // Same lock order as `handle_add_source`: pinned dest lock then init lock.
+    let (_cfg, dest) = match xai_grok_config::fs_atomic::lock_config_destination(&config_path) {
+        Ok(pair) => pair,
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -1433,11 +1433,11 @@ pub(crate) fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
     };
 
     // Re-check under the lock: another process may have registered meanwhile.
-    if read_official_marketplace_auto_installed(&config_path) {
+    if read_official_marketplace_auto_installed(&dest) {
         return;
     }
 
-    let raw = match crate::util::config::read_to_string_or_empty(&config_path) {
+    let raw = match crate::util::config::read_to_string_or_empty(&dest) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "skipping official marketplace auto-register: cannot read config.toml");
@@ -1468,10 +1468,10 @@ pub(crate) fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
 
     let write_result = if already_present {
         // Already present: just set the flag.
-        set_official_marketplace_auto_installed(&config_path)
+        set_official_marketplace_auto_installed(&dest)
     } else {
         add_marketplace_source(
-            &config_path,
+            &dest,
             xai_grok_plugin_marketplace::OFFICIAL_SOURCE_NAME,
             &crate::plugin::MarketplaceAddInput::GitUrl(
                 xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL.to_string(),

@@ -429,11 +429,11 @@ fn apply_config_writes(flags: &ConnectFlags) {
     if let Some(parent) = config_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(_lock) = crate::config_toml_edit::lock_config_file(&config_path) else {
+    let Ok((_lock, dest)) = crate::config_toml_edit::lock_config_destination(&config_path) else {
         tracing::warn!("failed to lock config.toml");
         return;
     };
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let content = std::fs::read_to_string(&dest).unwrap_or_default();
     let mut doc = content
         .parse::<toml_edit::DocumentMut>()
         .unwrap_or_default();
@@ -442,7 +442,7 @@ fn apply_config_writes(flags: &ConnectFlags) {
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
     if let Some(tbl) = cli.as_table_mut() {
         tbl["installer"] = toml_edit::value(installer.as_str());
-        if let Err(e) = crate::config_toml_edit::write_config_toml(&config_path, &doc.to_string()) {
+        if let Err(e) = crate::config_toml_edit::write_config_toml(&dest, &doc.to_string()) {
             tracing::warn!(error = %e, "failed to write config.toml");
         }
     }

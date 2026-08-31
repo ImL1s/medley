@@ -934,9 +934,9 @@ fn marketplace_add(
         MarketplaceAddInput::LocalPath(p) => plugin::name_from_path(p),
     };
     let config_path = xai_grok_config::grok_home().join("config.toml");
-    let _lock = crate::config_toml_edit::lock_config_file(&config_path)?;
+    let (_lock, dest) = crate::config_toml_edit::lock_config_destination(&config_path)?;
 
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let content = std::fs::read_to_string(&dest).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| anyhow::anyhow!("Failed to parse config.toml: {e}"))?;
@@ -965,7 +965,7 @@ fn marketplace_add(
     }
     sources.push(entry);
 
-    crate::config_toml_edit::write_config_toml(&config_path, &doc.to_string())?;
+    crate::config_toml_edit::write_config_toml(&dest, &doc.to_string())?;
 
     println!("Added marketplace source: {name}");
     Ok(())
@@ -1049,12 +1049,12 @@ fn marketplace_remove(
 
     let config_path = xai_grok_config::grok_home().join("config.toml");
     let mut removed_from_config = false;
-    match crate::config_toml_edit::lock_config_file(&config_path) {
-        Ok(_lock) => {
-            if let Ok(content) = std::fs::read_to_string(&config_path)
+    match crate::config_toml_edit::lock_config_destination(&config_path) {
+        Ok((_lock, dest)) => {
+            if let Ok(content) = std::fs::read_to_string(&dest)
                 && let Some(new) = plugin::remove_toml_marketplace_block(&content, &identity)
             {
-                if let Err(e) = crate::config_toml_edit::write_config_toml(&config_path, &new) {
+                if let Err(e) = crate::config_toml_edit::write_config_toml(&dest, &new) {
                     tracing::warn!("failed to write config.toml: {e}");
                 } else {
                     removed_from_config = true;
