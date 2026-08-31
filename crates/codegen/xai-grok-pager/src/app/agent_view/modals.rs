@@ -163,7 +163,7 @@ impl AgentView {
         };
         let mut state = crate::views::picker::PickerState::input_active();
         state.selected = crate::slash::command::ArgItem::preferred_index(&items);
-        self.agents_modal = None;
+        let previous_agents_modal = self.agents_modal.take().map(Box::new);
         self.active_modal = Some(ActiveModal::ArgPicker {
             command: command.to_string(),
             commit_mode,
@@ -172,6 +172,7 @@ impl AgentView {
             original_items: items,
             state,
             previous_palette: None,
+            previous_agents_modal,
             window: crate::views::modal_window::ModalWindowState::new(),
         });
         InputOutcome::Changed
@@ -2124,6 +2125,143 @@ impl AgentView {
             }
         }
         InputOutcome::Changed
+    }
+}
+
+#[cfg(test)]
+mod agents_model_picker_restore_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use agent_client_protocol as acp;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::layout::Rect;
+
+    use super::test_fixtures::make_agent;
+    use crate::actions::ActionRegistry;
+    use crate::app::app_view::InputOutcome;
+    use crate::app::bundle::BundleState;
+    use crate::views::agents_modal::{
+        AgentModelPickerIntent, AgentsModalState, AgentsTab, handle_agents_key,
+    };
+    use crate::views::modal::ActiveModal;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AgentsStateSnapshot {
+        active_tab: AgentsTab,
+        search_query: String,
+        selected: usize,
+        scroll: usize,
+        generation: u64,
+    }
+
+    fn open_picker(intent: AgentModelPickerIntent) -> (super::AgentView, AgentsStateSnapshot) {
+        let mut agent = make_agent();
+        let model_id = acp::ModelId::new(Arc::from("test-model"));
+        agent.session.models.available.insert(
+            model_id.clone(),
+            acp::ModelInfo::new(model_id, "Test Model".to_owned()),
+        );
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut agents = AgentsModalState::new(
+            cwd.path(),
+            &HashMap::new(),
+            &BundleState::default(),
+            None,
+            None,
+        );
+        assert!(matches!(
+            handle_agents_key(
+                &mut agents,
+                &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            ),
+            crate::views::agents_modal::AgentsModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_agents_key(
+                &mut agents,
+                &KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            ),
+            crate::views::agents_modal::AgentsModalOutcome::Changed
+        ));
+        agents.selected = agents.agents.len().saturating_sub(1);
+        agents.scroll = 2;
+        let expected = AgentsStateSnapshot {
+            active_tab: agents.active_tab,
+            search_query: agents.search_query().to_owned(),
+            selected: agents.selected,
+            scroll: agents.scroll,
+            generation: agents.generation,
+        };
+        let generation = agents.generation;
+        agent.agents_modal = Some(agents);
+
+        assert!(matches!(
+            agent.open_model_picker_from_agents(intent, generation),
+            InputOutcome::Changed
+        ));
+        assert!(agent.agents_modal.is_none());
+        assert!(matches!(
+            agent.active_modal,
+            Some(ActiveModal::ArgPicker {
+                previous_agents_modal: Some(_),
+                ..
+            })
+        ));
+        (agent, expected)
+    }
+
+    fn assert_agents_state_restored(agent: &super::AgentView, expected: &AgentsStateSnapshot) {
+        assert!(agent.active_modal.is_none());
+        let restored = agent
+            .agents_modal
+            .as_ref()
+            .expect("cancelling the model picker must restore /agents");
+        assert_eq!(restored.active_tab, expected.active_tab);
+        assert_eq!(restored.search_query(), expected.search_query);
+        assert_eq!(restored.selected, expected.selected);
+        assert_eq!(restored.scroll, expected.scroll);
+        assert_eq!(restored.generation, expected.generation);
+    }
+
+    #[test]
+    fn agents_model_picker_escape_restores_modal_state() {
+        let (mut agent, expected) = open_picker(AgentModelPickerIntent::SessionOnly);
+
+        assert!(matches!(
+            agent.handle_modal_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            InputOutcome::Changed
+        ));
+
+        assert_agents_state_restored(&agent, &expected);
+    }
+
+    #[test]
+    fn agents_model_picker_close_button_restores_modal_state() {
+        let (mut agent, expected) = open_picker(AgentModelPickerIntent::PersistentDefault);
+        let close_rect = Rect::new(20, 2, 3, 1);
+        match agent.active_modal.as_mut() {
+            Some(ActiveModal::ArgPicker { window, .. }) => {
+                window.close_button_rect = Some(close_rect);
+            }
+            _ => panic!("expected model argument picker"),
+        }
+        let close = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: close_rect.x,
+            row: close_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(matches!(
+            agent.handle_modal_mouse_with_registry(&close, &ActionRegistry::defaults()),
+            InputOutcome::Changed
+        ));
+
+        assert_agents_state_restored(&agent, &expected);
     }
 }
 

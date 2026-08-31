@@ -204,6 +204,9 @@ pub enum ActiveModal {
         state: crate::views::picker::PickerState,
         /// Previous command palette state (if opened from palette). Restored on Esc.
         previous_palette: Option<PaletteSnapshot>,
+        /// Previous `/agents` modal state. Restored on cancel without losing
+        /// the selected tab, search query, or row position.
+        previous_agents_modal: Option<Box<crate::views::agents_modal::AgentsModalState>>,
         /// Shared modal window chrome state.
         window: ModalWindowState,
     },

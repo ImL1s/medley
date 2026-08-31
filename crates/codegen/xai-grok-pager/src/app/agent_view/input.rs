@@ -1388,6 +1388,7 @@ impl AgentView {
                             original_items: items,
                             state,
                             previous_palette: None,
+                            previous_agents_modal: None,
                             window: crate::views::modal_window::ModalWindowState::new(),
                         });
                         return InputOutcome::Changed;

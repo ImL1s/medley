@@ -666,13 +666,18 @@ impl AgentView {
                 if in_effort_phase && self.try_arg_picker_step_back_from_effort() {
                     return InputOutcome::Changed;
                 }
-                let snapshot = match self.active_modal.as_mut() {
+                let (snapshot, agents_modal) = match self.active_modal.as_mut() {
                     Some(ActiveModal::ArgPicker {
-                        previous_palette, ..
-                    }) => previous_palette.take(),
-                    _ => None,
+                        previous_palette,
+                        previous_agents_modal,
+                        ..
+                    }) => (previous_palette.take(), previous_agents_modal.take()),
+                    _ => (None, None),
                 };
-                if let Some(snapshot) = snapshot {
+                if let Some(agents_modal) = agents_modal {
+                    self.active_modal = None;
+                    self.agents_modal = Some(*agents_modal);
+                } else if let Some(snapshot) = snapshot {
                     self.active_modal = Some(ActiveModal::CommandPalette {
                         entries: snapshot.entries,
                         state: snapshot.state,
@@ -951,6 +956,7 @@ impl AgentView {
                                             // Type-to-find: open in input mode (vim: Esc→nav, i→input).
                                             state: picker,
                                             previous_palette: prev,
+                                            previous_agents_modal: None,
                                             window:
                                                 crate::views::modal_window::ModalWindowState::new(),
                                         });
@@ -1465,6 +1471,12 @@ impl AgentView {
                                 self.active_modal =
                                     Some(crate::views::modal::howto_list_modal(previous_palette));
                             }
+                        }
+                        Some(ActiveModal::ArgPicker {
+                            previous_agents_modal: Some(agents_modal),
+                            ..
+                        }) => {
+                            self.agents_modal = Some(*agents_modal);
                         }
                         Some(
                             ActiveModal::ArgPicker {
