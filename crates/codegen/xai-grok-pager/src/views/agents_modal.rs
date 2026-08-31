@@ -311,14 +311,16 @@ impl AgentsModalState {
     /// populating personas from `bundle`.
     pub fn new(
         cwd: &Path,
-        _toggle: &HashMap<String, bool>,
+        toggle: &HashMap<String, bool>,
         bundle: &BundleState,
         model_agent_type: Option<&str>,
         active_agent: Option<String>,
     ) -> Self {
-        let (config_snapshot, config_agent_name, default_agent, locked_toggle) =
+        // Mutation CAS snapshots the pinned user file; row enablement must use
+        // the caller-supplied effective toggle map (managed/requirements/campaign).
+        let (config_snapshot, config_agent_name, default_agent, _user_toggle) =
             capture_locked_config_state(1, cwd, model_agent_type);
-        let mut agents = build_agent_list(cwd, &locked_toggle);
+        let mut agents = build_agent_list(cwd, toggle);
         stamp_entry_generation(&mut agents, 1);
         let personas = merge_persona_lists(bundle, cwd);
         Self {
@@ -351,7 +353,7 @@ impl AgentsModalState {
     /// Rebuild agent list from disk after a mutation.
     fn rebuild_agents(&mut self) {
         self.generation = self.generation.saturating_add(1);
-        let (snapshot, agent_name, default_agent, toggle) = capture_locked_config_state(
+        let (snapshot, agent_name, default_agent, _user_toggle) = capture_locked_config_state(
             self.generation,
             &self.cwd,
             self.model_agent_type.as_deref(),
@@ -359,7 +361,8 @@ impl AgentsModalState {
         self.config_snapshot = snapshot;
         self.config_agent_name = agent_name;
         self.default_agent = default_agent;
-        self.agents = build_agent_list(&self.cwd, &toggle);
+        let effective_toggle = load_agent_toggle().unwrap_or_default();
+        self.agents = build_agent_list(&self.cwd, &effective_toggle);
         stamp_entry_generation(&mut self.agents, self.generation);
         if self.selected >= self.agents.len() {
             self.selected = self.agents.len().saturating_sub(1);
@@ -747,9 +750,6 @@ fn load_agent_selection_config() -> AgentSelectionConfig {
         .unwrap_or_default()
 }
 /// Explicit `[agent] name` in config.toml (not env/CLI overrides).
-fn load_config_agent_name() -> Option<String> {
-    load_agent_selection_config().name.filter(|s| !s.is_empty())
-}
 /// Resolve the agent name new sessions would start with — mirrors
 /// `MvpAgent::resolve_agent_definition` in xai-grok-shell.
 pub fn resolve_default_agent_name(cwd: &Path, model_agent_type: Option<&str>) -> String {

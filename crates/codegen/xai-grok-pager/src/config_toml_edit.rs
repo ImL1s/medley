@@ -139,6 +139,10 @@ fn destination_unix_mode(path: &Path) -> Option<u32> {
     }
 }
 
+/// Snapshot bytes from `path` (logical == destination). Prefer
+/// [`config_mutation_snapshot_for_dest`] when the write destination was pinned
+/// separately from the logical config path.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn config_mutation_snapshot(
     path: &Path,
     generation: u64,
