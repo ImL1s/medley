@@ -2072,7 +2072,7 @@ fn is_hash_key(key: &KeyEvent) -> bool {
 /// Check `[features] remember_mode` in config.toml. Defaults to `false`.
 fn remember_mode_enabled() -> bool {
     let path = xai_grok_tools::util::grok_home::grok_home().join("config.toml");
-    let Some(doc) = crate::config_toml_edit::read_config_document_for_edit(&path) else {
+    let Ok(Some(doc)) = crate::config_toml_edit::read_config_document_for_edit(&path) else {
         return false;
     };
     doc.get("features")

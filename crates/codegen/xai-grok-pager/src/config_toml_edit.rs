@@ -243,25 +243,29 @@ where
     }
 }
 
-#[must_use]
-pub(crate) fn read_config_document_for_edit(path: &Path) -> Option<toml_edit::DocumentMut> {
-    #[allow(clippy::manual_unwrap_or_default)]
+/// Load `config.toml` for a read-modify-write. `Ok(None)` means the file is
+/// non-empty but unparseable (callers must not overwrite). Hard read errors
+/// other than `NotFound` are returned so an unreadable file is not replaced.
+pub(crate) fn read_config_document_for_edit(
+    path: &Path,
+) -> std::io::Result<Option<toml_edit::DocumentMut>> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => String::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
     };
     match content.parse() {
-        Ok(d) => Some(d),
+        Ok(d) => Ok(Some(d)),
         Err(e) => {
             if content.is_empty() {
-                return Some(toml_edit::DocumentMut::new());
+                return Ok(Some(toml_edit::DocumentMut::new()));
             }
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
                 "config.toml is not valid TOML; refusing to overwrite"
             );
-            None
+            Ok(None)
         }
     }
 }
@@ -281,7 +285,7 @@ fn set_hint_at(path: &Path, key: &str, value: impl Into<toml_edit::Value>) -> st
         std::fs::create_dir_all(parent)?;
     }
     let (_lock, dest) = xai_grok_config::fs_atomic::lock_config_destination(path)?;
-    let Some(mut doc) = read_config_document_for_edit(&dest) else {
+    let Some(mut doc) = read_config_document_for_edit(&dest)? else {
         return Ok(());
     };
     doc["hints"][key] = toml_edit::value(value);
@@ -602,7 +606,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut doc = read_config_document_for_edit(&path).expect("parse");
+        let mut doc = read_config_document_for_edit(&path)
+            .expect("read")
+            .expect("parse");
         doc["ui"]["show_timestamps"] = toml_edit::value(false);
         fs::write(&path, doc.to_string()).unwrap();
 
@@ -620,7 +626,11 @@ mod tests {
         let bad = "this is [not valid toml\n";
         fs::write(&path, bad).unwrap();
 
-        assert!(read_config_document_for_edit(&path).is_none());
+        assert!(
+            read_config_document_for_edit(&path)
+                .expect("read")
+                .is_none()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), bad);
     }
 
@@ -628,7 +638,9 @@ mod tests {
     fn missing_file_is_editable_empty_doc() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("absent.toml");
-        let doc = read_config_document_for_edit(&path).expect("editable");
+        let doc = read_config_document_for_edit(&path)
+            .expect("read")
+            .expect("editable");
         assert!(!doc.contains_key("ui"));
     }
 
@@ -640,7 +652,9 @@ mod tests {
 
         set_hint_at(&path, "memory_modal_fullscreen", true).unwrap();
 
-        let doc = read_config_document_for_edit(&path).expect("reparse");
+        let doc = read_config_document_for_edit(&path)
+            .expect("read")
+            .expect("reparse");
         assert_eq!(
             doc.get("hints")
                 .and_then(|h| h.get("memory_modal_fullscreen"))
@@ -672,7 +686,9 @@ mod tests {
 
         set_hint_at(&path, "memory_modal_fullscreen", true).unwrap();
 
-        let doc = read_config_document_for_edit(&path).expect("reparse");
+        let doc = read_config_document_for_edit(&path)
+            .expect("read")
+            .expect("reparse");
         let disabled = doc
             .get("hints")
             .and_then(|h| h.get("memory_modal_fullscreen"))
@@ -720,17 +736,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), bad);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn set_hint_at_propagates_unreadable_file_without_replace() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[ui]\ncompact_mode = false\n";
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&path).is_ok() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+        let err = set_hint_at(&path, "memory_modal_fullscreen", true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
     #[test]
     fn vim_mode_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "[ui]\ncompact_mode = false\n").unwrap();
 
-        let mut doc = read_config_document_for_edit(&path).expect("parse");
+        let mut doc = read_config_document_for_edit(&path)
+            .expect("read")
+            .expect("parse");
         doc["ui"]["vim_mode"] = toml_edit::value(true);
         fs::write(&path, doc.to_string()).unwrap();
 
-        let doc2 = read_config_document_for_edit(&path).expect("reparse");
+        let doc2 = read_config_document_for_edit(&path)
+            .expect("read")
+            .expect("reparse");
         let enabled = doc2
             .get("ui")
             .and_then(|h| h.get("vim_mode"))

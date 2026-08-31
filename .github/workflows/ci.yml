@@ -1074,6 +1074,8 @@ jobs:
           # Unique module path so #171 proves the five CAS tests are selected.
           run_nonzero -p xai-grok-pager --lib config_toml_edit:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
+            set_hint_at_propagates_unreadable_file_without_replace -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
             new_loads_toggle_under_the_same_lock_as_the_snapshot -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             add_dismissed_plugin_cta_uses_shared_config_lock -- --nocapture
