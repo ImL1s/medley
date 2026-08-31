@@ -559,12 +559,101 @@ def _invoked_macro_names(
 _ARM_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[^\sA-Za-z0-9_]")
 
 
+def _is_ident_token(token: str) -> bool:
+    return bool(token) and (token[:1].isalpha() or token[:1] == "_" or ord(token[0]) > 127)
+
+
+def _consume_generic_args(tokens: list[str], index: int) -> int | None:
+    """Consume `<...>` including nested generics; `->` is not a close."""
+
+    if index >= len(tokens) or tokens[index] != "<":
+        return None
+    depth = 0
+    i = index
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok == "<":
+            depth += 1
+            i += 1
+            continue
+        if tok == ">":
+            depth -= 1
+            i += 1
+            if depth == 0:
+                return i
+            continue
+        if tok == "-" and i + 1 < n and tokens[i + 1] == ">":
+            i += 2
+            continue
+        i += 1
+    return None
+
+
+def _consume_ty(tokens: list[str], cursor: int) -> int | None:
+    """One `$ty:ty` / `$path:path` fragment (`Option<u8>`, paths)."""
+
+    n = len(tokens)
+    i = cursor
+    if i >= n:
+        return None
+    while i < n and tokens[i] in {"&", "*"}:
+        i += 1
+        if i < n and tokens[i] == "'":
+            i += 1
+            if i < n:
+                i += 1
+        if i < n and tokens[i] in {"mut", "const"}:
+            i += 1
+    if i < n and tokens[i] in {"dyn", "impl"}:
+        i += 1
+    if i >= n:
+        return None
+    if tokens[i] in "([":
+        opener = tokens[i]
+        closer = ")" if opener == "(" else "]"
+        depth = 0
+        while i < n:
+            if tokens[i] == opener:
+                depth += 1
+            elif tokens[i] == closer:
+                depth -= 1
+                i += 1
+                if depth == 0:
+                    return i
+                continue
+            i += 1
+        return None
+    if not _is_ident_token(tokens[i]):
+        return None
+    i += 1
+    while i + 1 < n and tokens[i] == ":" and tokens[i + 1] == ":":
+        i += 2
+        if i < n and tokens[i] == "<":
+            nxt = _consume_generic_args(tokens, i)
+            if nxt is None:
+                return None
+            i = nxt
+            continue
+        if i >= n or not _is_ident_token(tokens[i]):
+            return None
+        i += 1
+    if i < n and tokens[i] == "<":
+        nxt = _consume_generic_args(tokens, i)
+        if nxt is None:
+            return None
+        i = nxt
+    return i if i > cursor else None
+
+
 def _consume_kind(tokens: list[str], cursor: int, kind: str) -> int | None:
     """Advance past one `macro_rules` fragment starting at `cursor`."""
 
     if cursor >= len(tokens):
         return None
     kind = kind or "ident"
+    if kind in {"ty", "path"}:
+        return _consume_ty(tokens, cursor)
     if kind == "block":
         if tokens[cursor] != "{":
             return None
@@ -5789,6 +5878,25 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_case"])
+
+    def test_macro_ty_fragment_consumes_generic_type(self):
+        """`($ty:ty, $name:ident)` accepts `Option<u8>` (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! make_test {
+                ($ty:ty, $name:ident) => {
+                    #[test]
+                    fn $name() {
+                        let _: $ty = None;
+                    }
+                };
+            }
+            make_test!(Option<u8>, none_auth_scheme_from_type);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_from_type"])
 
     def test_repeated_macro_ident_metavars_are_substituted_before_scan(self):
         """`$($name:ident),*` with two invocation idents emits both
