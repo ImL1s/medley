@@ -53,6 +53,7 @@ import re
 import struct
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import textwrap
 import tomllib
@@ -547,7 +548,11 @@ _ARM_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[^\sA-Za-z0-9_]")
 
 
 def _macro_invoke_inners(
-    masked: str, defs: list[tuple[str, int, int]]
+    masked: str,
+    defs: list[tuple[str, int, int]],
+    *,
+    text: str | None = None,
+    enabled_features: set[str] | frozenset[str] | None = None,
 ) -> list[tuple[str, str]]:
     """`(name, invoke_inner)` for invocations outside macro definitions."""
 
@@ -563,6 +568,10 @@ def _macro_invoke_inners(
         if name not in known:
             continue
         if any(start <= match.start() < end for start, end in bodies):
+            continue
+        if text is not None and _position_cfg_inactive(
+            text, masked, match.start(), enabled_features
+        ):
             continue
         delim = match.end() - 1
         end = _balanced_pair_end(masked, delim)
@@ -809,16 +818,24 @@ def _expand_arm_repeats(arm: str, rows: list[dict[str, str]]) -> str:
     return "".join(out)
 
 
-def _inactive_macro_spans(masked: str) -> list[tuple[int, int]]:
+def _inactive_macro_spans(
+    masked: str,
+    *,
+    text: str | None = None,
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> list[tuple[int, int]]:
     """Spans rustc does not expand: uninvoked macros and unselected arms.
 
     One `generated!(cold)` must not unmask a sibling `(hot)` arm
+    (#507 review). Cfg-disabled invocations do not select an arm
     (#507 review).
     """
 
     defs = _macro_rules_defs(masked)
     invokes_by_name: dict[str, list[str]] = {}
-    for name, inner in _macro_invoke_inners(masked, defs):
+    for name, inner in _macro_invoke_inners(
+        masked, defs, text=text, enabled_features=enabled_features
+    ):
         invokes_by_name.setdefault(name, []).append(inner)
     inactive: list[tuple[int, int]] = []
     for name, start, end in defs:
@@ -1422,7 +1439,9 @@ def _iter_module_decls(
     masked_lines = masked.splitlines()
     if len(masked_lines) < len(raw_lines):
         masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
-    inactive = _inactive_macro_spans(masked)
+    inactive = _inactive_macro_spans(
+        masked, text=text, enabled_features=enabled_features
+    )
     depth = 0
     inline_stack: list[tuple[int, str, bool]] = []
     line_start = 0
@@ -1549,6 +1568,8 @@ def _selected_macro_expansions(
     masked: str,
     enabled_features: set[str] | frozenset[str] | None = None,
     inherited_macros: tuple[tuple[str, str], ...] = (),
+    *,
+    text: str | None = None,
 ) -> list[tuple[str, tuple[str, ...]]]:
     """Selected `macro_rules!` arm bodies, with enclosing inline modules.
 
@@ -1635,6 +1656,10 @@ def _selected_macro_expansions(
         ):
             _pos, inv_name, inner, source = invoke_at[invoke_i]
             invoke_i += 1
+            if text is not None and _position_cfg_inactive(
+                text, masked, _pos, enabled_features
+            ):
+                continue
             arm_text = _selected_arm_source(
                 source, _macro_rules_defs(source), inv_name, inner
             )
@@ -1667,7 +1692,8 @@ def _declared_module_overrides(
     `test:common` (#507 review).
     """
     overrides: dict[
-        Path, list[tuple[list[str], str, tuple[tuple[str, str], ...], str]]
+        Path,
+        list[tuple[list[str], str, tuple[tuple[str, str], ...], str, frozenset[str]]],
     ] = {}
     queue: deque[
         tuple[
@@ -1679,6 +1705,7 @@ def _declared_module_overrides(
             tuple[tuple[str, str], ...],
             Path,
             str,
+            frozenset[str],
         ]
     ] = deque()
     pkg_cache: dict[Path, str] = {}
@@ -1718,6 +1745,7 @@ def _declared_module_overrides(
                         (),
                         rs.resolve().parent,
                         _package_name_for(rs, pkg_cache),
+                        frozenset(_features_for(rs, crate_feats)),
                     )
                 )
 
@@ -1731,13 +1759,13 @@ def _declared_module_overrides(
             macro_env,
             module_search_dir,
             origin_pkg,
+            enabled,
         ) = queue.popleft()
         if declaring in ancestors:
             continue
         text = read_rs(declaring)
         if text is None:
             continue
-        enabled = _features_for(declaring, crate_feats)
         if _file_inner_cfg_inactive(text, enabled):
             continue
         masked = _mask_rust_literals(text)
@@ -1783,7 +1811,7 @@ def _declared_module_overrides(
                 + macro_env
             )
             overrides.setdefault(included, []).append(
-                (inc_prefix, root_target, include_macro_env, origin_pkg)
+                (inc_prefix, root_target, include_macro_env, origin_pkg, enabled)
             )
             queue.append(
                 (
@@ -1795,6 +1823,7 @@ def _declared_module_overrides(
                     include_macro_env,
                     included.parent,
                     origin_pkg,
+                    enabled,
                 )
             )
         decls = list(
@@ -1810,7 +1839,7 @@ def _declared_module_overrides(
             )
         )
         for arm_text, inline_names in _selected_macro_expansions(
-            masked, enabled, macro_env
+            masked, enabled, macro_env, text=text
         ):
             arm_search = module_search_dir
             for inline_name in inline_names:
@@ -1855,7 +1884,7 @@ def _declared_module_overrides(
                 + macro_env
             )
             overrides.setdefault(child, []).append(
-                (child_prefix, root_target, child_macro_env, origin_pkg)
+                (child_prefix, root_target, child_macro_env, origin_pkg, enabled)
             )
             queue.append(
                 (
@@ -1867,6 +1896,7 @@ def _declared_module_overrides(
                     child_macro_env,
                     child_search_dir,
                     origin_pkg,
+                    enabled,
                 )
             )
     return overrides
@@ -1890,6 +1920,33 @@ def _host_pointer_width() -> str:
     """Host pointer width as rustc `target_pointer_width` (decimal bits)."""
 
     return str(struct.calcsize("P") * 8)
+
+
+def _host_target_env() -> str:
+    """rustc `target_env` for this host (`gnu` / `msvc` / `musl` / empty)."""
+
+    if sys.platform == "win32":
+        return "msvc"
+    if sys.platform == "darwin":
+        return ""
+    try:
+        host = (sysconfig.get_config_var("HOST_GNU_TYPE") or "").lower()
+        abi = (sysconfig.get_config_var("SOABI") or "").lower()
+        if "musl" in host or "musl" in abi:
+            return "musl"
+    except (TypeError, ValueError):
+        pass
+    return "gnu"
+
+
+def _host_target_vendor() -> str:
+    """rustc `target_vendor` for this host."""
+
+    if sys.platform == "darwin":
+        return "apple"
+    if sys.platform == "win32":
+        return "pc"
+    return "unknown"
 
 
 def _live_path_redirect(
@@ -2017,6 +2074,15 @@ def _cfg_atom(
     width_eq = re.fullmatch(r'target_pointer_width\s*=\s*"([^"]+)"', atom)
     if width_eq:
         return _host_pointer_width() == width_eq.group(1)
+    env_eq = re.fullmatch(r'target_env\s*=\s*"([^"]+)"', atom)
+    if env_eq:
+        return _host_target_env() == env_eq.group(1)
+    vendor_eq = re.fullmatch(r'target_vendor\s*=\s*"([^"]+)"', atom)
+    if vendor_eq:
+        return _host_target_vendor() == vendor_eq.group(1)
+    endian_eq = re.fullmatch(r'target_endian\s*=\s*"([^"]+)"', atom)
+    if endian_eq:
+        return sys.byteorder == endian_eq.group(1)
     if atom == "debug_assertions":
         # `cargo test` is the debug profile; the documented hot path is
         # never `--release` (#507 review).
@@ -2606,7 +2672,8 @@ def _tests_in_file(
 def _module_prefixes_for_source(
     rs: Path,
     overrides: dict[
-        Path, list[tuple[list[str], str, tuple[tuple[str, str], ...], str]]
+        Path,
+        list[tuple[list[str], str, tuple[tuple[str, str], ...], str, frozenset[str]]],
     ],
     extra_roots: set[Path] | frozenset[Path] | None = None,
     gated_roots: set[Path] | frozenset[Path] | None = None,
@@ -2614,7 +2681,8 @@ def _module_prefixes_for_source(
     no_autotest: set[Path] | frozenset[Path] | None = None,
     test_names: dict[Path, str] | None = None,
     lib_roots: set[Path] | frozenset[Path] | None = None,
-) -> list[tuple[list[str], str, tuple[tuple[str, str], ...], str]] | None:
+    crate_feats: dict[Path, set[str]] | None = None,
+) -> list[tuple[list[str], str, tuple[tuple[str, str], ...], str, frozenset[str]]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
     Cargo crate roots (`src/lib.rs`, `tests/*.rs`, explicit `[lib] path`
@@ -2628,7 +2696,7 @@ def _module_prefixes_for_source(
 
     key = rs.resolve()
     prefixes: list[
-        tuple[list[str], str, tuple[tuple[str, str], ...], str]
+        tuple[list[str], str, tuple[tuple[str, str], ...], str, frozenset[str]]
     ] = []
     if key in overrides:
         prefixes.extend(overrides[key])
@@ -2640,6 +2708,7 @@ def _module_prefixes_for_source(
             _cargo_target_of(rs, extra_roots, test_names, lib_roots),
             (),
             _package_name_for(rs, {}),
+            frozenset(_features_for(rs, crate_feats or {})),
         )
         if root_entry not in prefixes:
             prefixes.append(root_entry)
@@ -2679,9 +2748,6 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
                 text = rs.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            enabled = _features_for(rs, crate_feats)
-            if _file_inner_cfg_inactive(text, enabled):
-                continue
             prefix_lists = _module_prefixes_for_source(
                 rs,
                 overrides,
@@ -2691,10 +2757,13 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
                 no_autotest,
                 test_names,
                 lib_roots,
+                crate_feats,
             )
             if prefix_lists is None:
                 continue
-            for file_mods, target, inherited_macros, origin_pkg in prefix_lists:
+            for file_mods, target, inherited_macros, origin_pkg, enabled in prefix_lists:
+                if _file_inner_cfg_inactive(text, enabled):
+                    continue
                 pkg = origin_pkg or _package_name_for(rs, pkg_cache)
                 for name in _tests_in_file(
                     text, file_mods, enabled, inherited_macros
@@ -4252,6 +4321,47 @@ class ExternalModulePrefix(unittest.TestCase):
                 [("a", "lib", "helper::none_auth_scheme_imported")],
             )
 
+    def test_path_imported_file_uses_declaring_crate_features(self):
+        """`#[path]` from crate A evaluates `cfg(feature)` with A's
+        defaults, not the physical crate B (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            a_src = root / "crates" / "a" / "src"
+            b_src = root / "crates" / "b" / "src"
+            a_src.mkdir(parents=True)
+            b_src.mkdir(parents=True)
+            (root / "crates" / "a" / "Cargo.toml").write_text(
+                "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n"
+                "[features]\ndefault = [\"hot\"]\nhot = []\n",
+                encoding="utf-8",
+            )
+            (root / "crates" / "b" / "Cargo.toml").write_text(
+                "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n"
+                "[features]\nhot = []\n",
+                encoding="utf-8",
+            )
+            (a_src / "lib.rs").write_text(
+                '#[path = "../../b/src/helper.rs"]\nmod helper;\n'
+            )
+            (b_src / "lib.rs").write_text("\n")
+            (b_src / "helper.rs").write_text(
+                "#[cfg(feature = \"hot\")]\n"
+                "#[test]\nfn none_auth_scheme_hot() {}\n"
+            )
+            records = _qualified_test_records(root)
+            scoped = _hot_path_matches(
+                records, "none_auth_scheme_hot", {("a", "lib")}
+            )
+            self.assertEqual(
+                [(r.package, r.target, r.name) for r in scoped],
+                [("a", "lib", "helper::none_auth_scheme_hot")],
+            )
+            b_scoped = _hot_path_matches(
+                records, "none_auth_scheme_hot", {("b", "lib")}
+            )
+            self.assertEqual(b_scoped, [])
+
     def test_raw_identifier_module_prefix_is_counted(self):
         """`mod r#none_auth_scheme_ { #[test] fn works() }` is
         `none_auth_scheme_::works` (#507 review)."""
@@ -4938,6 +5048,24 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         self.assertEqual(names, ["none_auth_scheme_native"])
 
+    def test_foreign_target_env_cfg_is_not_counted(self):
+        """`#[cfg(target_env = \"msvc\")]` is off on gnu/apple hosts
+        (#507 review)."""
+
+        names = _tests_in_file(
+            '#[cfg(target_env = "msvc")]\n'
+            "#[test]\nfn none_auth_scheme_msvc() {}\n"
+            "#[test]\nfn none_auth_scheme_host() {}\n",
+            [],
+        )
+        if _host_target_env() == "msvc":
+            self.assertEqual(
+                sorted(names),
+                ["none_auth_scheme_host", "none_auth_scheme_msvc"],
+            )
+        else:
+            self.assertEqual(names, ["none_auth_scheme_host"])
+
     def test_foreign_pointer_width_cfg_is_not_counted(self):
         """`#[cfg(target_pointer_width = \"32\")]` is off on 64-bit CI
         hosts (#507 review)."""
@@ -5024,6 +5152,36 @@ class ExternalModulePrefix(unittest.TestCase):
             )
         else:
             self.assertEqual(names, ["none_auth_scheme_live"])
+
+    def test_cfg_disabled_module_emitting_macro_is_not_followed(self):
+        """`#[cfg(windows)] generated!();` emitting `mod child;` is off
+        on Linux (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "macro_rules! generated {\n"
+                "    () => {\n"
+                "        mod none_auth_scheme_child;\n"
+                "    };\n"
+                "}\n"
+                "#[cfg(windows)]\n"
+                "generated!();\n"
+                "#[test]\nfn none_auth_scheme_live() {}\n"
+            )
+            (src / "none_auth_scheme_child.rs").write_text(
+                "#[test]\nfn none_auth_scheme_child() {}\n"
+            )
+            names = _qualified_test_names(root)
+            if sys.platform == "win32":
+                self.assertIn("none_auth_scheme_child::none_auth_scheme_child", names)
+            else:
+                self.assertIn("none_auth_scheme_live", names)
+                self.assertNotIn(
+                    "none_auth_scheme_child::none_auth_scheme_child", names
+                )
 
     def test_cfg_disabled_mod_macro_invoke_is_not_counted(self):
         """An invocation inside `#[cfg(windows)] mod` is off on Linux
