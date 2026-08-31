@@ -3442,6 +3442,113 @@ class TransitiveClosure(unittest.TestCase):
             {"first_unicode_path_untagged", "second_unicode_path_untagged"},
         )
 
+    def test_decomposed_unicode_macro_identifier_is_one_xid_token(self):
+        text = src(
+            """\
+            use std::sync::atomic::AtomicU64;
+
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! café {
+                () => { crate::COUNTER.fetch_add(
+                    1, ::std::sync::atomic::Ordering::SeqCst
+                ); };
+            }
+
+            #[test]
+            fn first_decomposed_xid_untagged() {
+                café!();
+            }
+
+            #[test]
+            fn second_decomposed_xid_untagged() {
+                café!();
+            }
+            """
+        )
+        oracle = cargo_test_names(
+            {
+                "Cargo.toml": """
+                    [package]
+                    name = "decomposed-xid-macro"
+                    version = "0.1.0"
+                    edition = "2021"
+                """,
+                "src/lib.rs": text,
+            }
+        )
+        self.assertEqual(
+            oracle,
+            {"first_decomposed_xid_untagged", "second_decomposed_xid_untagged"},
+        )
+        self.assertEqual(
+            derived_names([(Path("src/lib.rs"), text)], "demo_key"),
+            {"first_decomposed_xid_untagged", "second_decomposed_xid_untagged"},
+        )
+
+    def test_raw_string_path_attributes_resolve_logical_modules(self):
+        lib = src(
+            '''\
+            use std::sync::atomic::AtomicU64;
+
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[path = r"impls.rs"]
+            mod raw_logic;
+            #[path = r##"hash_impls.rs"##]
+            mod hash_logic;
+
+            #[test]
+            fn first_raw_path_untagged() {
+                crate::raw_logic::touch!();
+            }
+
+            #[test]
+            fn second_hash_raw_path_untagged() {
+                crate::hash_logic::touch!();
+            }
+            '''
+        )
+        raw_impl = src(
+            """\
+            macro_rules! touch {
+                () => { crate::COUNTER.fetch_add(
+                    1, ::std::sync::atomic::Ordering::SeqCst
+                ); };
+            }
+            pub(crate) use touch;
+            """
+        )
+        hash_impl = raw_impl
+        files = {
+            "Cargo.toml": """
+                [package]
+                name = "raw-path-modules"
+                version = "0.1.0"
+                edition = "2021"
+            """,
+            "src/lib.rs": lib,
+            "src/impls.rs": raw_impl,
+            "src/hash_impls.rs": hash_impl,
+        }
+        self.assertEqual(
+            cargo_test_names(files),
+            {"first_raw_path_untagged", "second_hash_raw_path_untagged"},
+        )
+        self.assertEqual(
+            derived_names(
+                [
+                    (Path("src/lib.rs"), lib),
+                    (Path("src/impls.rs"), raw_impl),
+                    (Path("src/hash_impls.rs"), hash_impl),
+                ],
+                "demo_key",
+            ),
+            {"first_raw_path_untagged", "second_hash_raw_path_untagged"},
+        )
+
     def test_qualified_generated_macro_ignores_same_name_bare_import(self):
         lib = src(
             """\
@@ -3512,6 +3619,64 @@ class TransitiveClosure(unittest.TestCase):
                 "demo_key",
             ),
             set(),
+        )
+
+    def test_generated_macro_resolves_qualified_module_alias(self):
+        lib = src(
+            """\
+            use std::sync::atomic::AtomicU64;
+
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            mod touching;
+            use crate::touching as aliased;
+            aliased::cases!();
+            """
+        )
+        touching = src(
+            """\
+            macro_rules! cases {
+                () => {
+                    #[test]
+                    fn first_alias_generated() {
+                        crate::COUNTER.fetch_add(
+                            1, ::std::sync::atomic::Ordering::SeqCst
+                        );
+                    }
+
+                    #[test]
+                    fn second_alias_generated() {
+                        crate::COUNTER.fetch_add(
+                            1, ::std::sync::atomic::Ordering::SeqCst
+                        );
+                    }
+                };
+            }
+            pub(crate) use cases;
+            """
+        )
+        self.assertEqual(
+            cargo_test_names(
+                {
+                    "Cargo.toml": """
+                        [package]
+                        name = "qualified-macro-alias"
+                        version = "0.1.0"
+                        edition = "2021"
+                    """,
+                    "src/lib.rs": lib,
+                    "src/touching.rs": touching,
+                }
+            ),
+            {"first_alias_generated", "second_alias_generated"},
+        )
+        names = derived_names(
+            [(Path("src/lib.rs"), lib), (Path("src/touching.rs"), touching)],
+            "demo_key",
+        )
+        self.assertEqual(
+            len({name for name in names if name.startswith("cases!")}), 2, names
         )
 
     def test_unicode_macro_reexport_reaches_registered_state(self):

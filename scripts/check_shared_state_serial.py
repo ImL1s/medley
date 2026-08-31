@@ -241,6 +241,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -258,7 +259,8 @@ FN_DEF = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+"
     r"(?:r#)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
 )
-RUST_IDENT_TOKEN = r"(?:r#)?[^\W\d]\w*"
+RUST_IDENT_BODY = r"[^\W\d](?:\w|[^\x00-\x7f\s])*"
+RUST_IDENT_TOKEN = rf"(?:r#)?{RUST_IDENT_BODY}"
 MACRO_DEF = re.compile(rf"macro_rules!\s+(?P<name>{RUST_IDENT_TOKEN})")
 MACRO_INVOKE = re.compile(
     rf"(?<![:.\w])((?:\:\:\s*)?(?:{RUST_IDENT_TOKEN}\s*::\s*)*)"
@@ -280,7 +282,7 @@ SERIAL_ATTR = re.compile(
 )
 IMPL_KW = re.compile(r"\bimpl\b")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-RUST_IDENT = re.compile(r"[^\W\d]\w*")
+RUST_IDENT = re.compile(RUST_IDENT_BODY)
 FREE_CALL = re.compile(r"(?<![:.\w])(?:r#)?([a-z_][a-z0-9_]*)\s*\(")
 USE_PLAIN = re.compile(
     r"\buse\s+(crate|super|self)((?:::(?:r#)?[A-Za-z_][A-Za-z0-9_]*)+)"
@@ -1408,9 +1410,9 @@ def _norm_posix(path: Path) -> str:
     return "/".join(parts)
 
 
-_PATH_MOD = re.compile(
-    r"#\[\s*path\s*=\s*\"([^\"]+)\"\s*\]\s*"
-    rf"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+({RUST_IDENT_TOKEN})"
+_PATH_ATTR_START = re.compile(r"#\[\s*path\s*=\s*")
+_PATH_MOD_TAIL = re.compile(
+    rf"\s*\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?P<name>{RUST_IDENT_TOKEN})"
 )
 _PATH_OVERRIDE: dict[str, tuple[str, ...]] = {}
 _REEXPORTS: list[tuple[tuple[str, ...], str, tuple[str, ...], str]] = []
@@ -1418,6 +1420,35 @@ _REEXPORT_EXACT: dict[
     tuple[tuple[str, ...], str], list[tuple[tuple[str, ...], str]]
 ] = {}
 _REEXPORT_GLOBS: dict[tuple[str, ...], list[tuple[str, ...]]] = {}
+
+
+def _path_mod_decls(text: str) -> list[tuple[int, str, str]]:
+    """Start offset, literal path, and logical name for `#[path] mod` items."""
+
+    code = _code_only(text)
+    out: list[tuple[int, str, str]] = []
+    for attr in _PATH_ATTR_START.finditer(text):
+        start = attr.start()
+        if start < len(code) and code[start] == " " and text[start] != " ":
+            continue
+        literal_start = attr.end()
+        if literal_start < len(text) and text[literal_start] == '"':
+            literal_end = _skip_quoted(text, literal_start, '"')
+            path = text[literal_start + 1 : literal_end - 1]
+        else:
+            raw_start = RAW_STRING_START.match(text, literal_start)
+            literal_end = _skip_raw_string(text, literal_start)
+            if raw_start is None or literal_end is None:
+                continue
+            hashes = raw_start.group(1) or ""
+            path = text[raw_start.end() : literal_end - 1 - len(hashes)]
+        tail = _PATH_MOD_TAIL.match(text, literal_end)
+        if tail is None:
+            continue
+        name = _raw_ident(tail.group("name"))
+        if name.isidentifier():
+            out.append((start, path, name))
+    return out
 
 
 def _load_path_overrides(sources: list[tuple[Path, str]]) -> None:
@@ -1429,13 +1460,9 @@ def _load_path_overrides(sources: list[tuple[Path, str]]) -> None:
     _PATH_OVERRIDE = {}
     decls: list[tuple[Path, str, str]] = []
     for rel, text in sources:
-        code = _code_only(text)
-        for match in _PATH_MOD.finditer(text):
-            start = match.start()
-            if start < len(code) and code[start] == " " and text[start] != " ":
-                continue
-            child = _norm_posix(rel.parent / match.group(1))
-            decls.append((rel, child, _raw_ident(match.group(2))))
+        for _start, path, name in _path_mod_decls(text):
+            child = _norm_posix(rel.parent / path)
+            decls.append((rel, child, name))
     if not decls:
         return
     for _ in range(len(decls) + 1):
@@ -1569,7 +1596,8 @@ def _module_path(rel: Path) -> tuple[str, ...] | None:
 
 
 def _raw_ident(name: str) -> str:
-    return name[2:] if name.startswith("r#") else name
+    raw = name[2:] if name.startswith("r#") else name
+    return unicodedata.normalize("NFC", raw)
 
 
 def _macro_def_matches(source: str) -> list[re.Match[str]]:
@@ -2014,14 +2042,10 @@ def _path_is_relative_to(path: Path, parent: Path) -> bool:
 def _path_attr_files(declaring: Path, text: str) -> list[Path]:
     """Files a `#[path = \"...\"] mod` on `declaring` actually compiles."""
 
-    code = _code_only(text)
-    out: list[Path] = []
-    for match in _PATH_MOD.finditer(text):
-        start = match.start()
-        if start < len(code) and code[start] == " " and text[start] != " ":
-            continue
-        out.append(Path(_norm_posix(declaring.parent / match.group(1))))
-    return out
+    return [
+        Path(_norm_posix(declaring.parent / path))
+        for _start, path, _name in _path_mod_decls(text)
+    ]
 
 
 def _path_attr_covers(path: Path, target: Path) -> bool:
@@ -2978,9 +3002,18 @@ def _serials_for_macro_invoke(
         )
         absolute = qualifier.lstrip().startswith("::")
         if segs:
-            module = _resolve_path_module(
-                segs, _module_path(rel), inline_mods
-            )
+            imported = None
+            if segs[0] not in ("crate", "self", "super") and not _is_lib_crate_ident(
+                segs[0]
+            ):
+                imported = _lookup_import(file_imports, inline_mods, segs[0])
+            if imported is not None:
+                imported_module, imported_name = imported
+                module = imported_module + (imported_name,) + segs[1:]
+            else:
+                module = _resolve_path_module(
+                    segs, _module_path(rel), inline_mods
+                )
         elif absolute:
             module = ()
         else:
