@@ -78,21 +78,52 @@ pub fn lock_config_destination(path: &Path) -> std::io::Result<(File, PathBuf)> 
 
 /// If `path` exists as a symlink, return its canonical target so a later
 /// rename updates the referent instead of replacing the link. A missing path
-/// is returned unchanged. A dangling symlink is an error.
+/// is resolved through the nearest existing ancestor so symlink aliases of
+/// that ancestor hash to the same lock destination (#532 review). A dangling
+/// symlink is an error.
 pub fn resolve_write_path(path: &Path) -> std::io::Result<PathBuf> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => dunce::canonicalize(path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => match dunce::canonicalize(parent) {
-                Ok(parent) => Ok(parent.join(path.file_name().unwrap_or_default())),
-                Err(parent_err) if parent_err.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(path.to_path_buf())
-                }
-                Err(parent_err) => Err(parent_err),
-            },
-            _ => Ok(path.to_path_buf()),
-        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(canonicalize_missing_path(path)?)
+        }
         Err(e) => Err(e),
+    }
+}
+
+/// Walk up from a missing `path` until an existing ancestor can be
+/// canonicalized, then re-append the missing suffix.
+fn canonicalize_missing_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match dunce::canonicalize(&cursor) {
+            Ok(canonical) => {
+                let mut out = canonical;
+                for part in suffix.iter().rev() {
+                    out.push(part);
+                }
+                return Ok(out);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let name = cursor
+                    .file_name()
+                    .map(|n| n.to_os_string())
+                    .filter(|n| !n.is_empty());
+                let Some(name) = name else {
+                    return Ok(path.to_path_buf());
+                };
+                let Some(parent) = cursor.parent() else {
+                    return Ok(path.to_path_buf());
+                };
+                if parent.as_os_str().is_empty() {
+                    return Ok(path.to_path_buf());
+                }
+                suffix.push(name);
+                cursor = parent.to_path_buf();
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -222,6 +253,32 @@ mod tests {
         assert_eq!(
             resolve_write_path(&path).unwrap(),
             dunce::canonicalize(dir.path()).unwrap().join("config.toml")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_write_path_canonicalizes_missing_path_via_symlinked_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real-root");
+        let alias = dir.path().join("alias-root");
+        std::fs::create_dir(&real_root).unwrap();
+        std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+        // No `.grok/` yet — canonicalize through the symlinked ancestor and
+        // keep the missing suffix so both aliases share one lock hash.
+        let via_alias = alias.join(".grok").join("config.toml");
+        let via_real = real_root.join(".grok").join("config.toml");
+        let pinned_alias = resolve_write_path(&via_alias).unwrap();
+        let pinned_real = resolve_write_path(&via_real).unwrap();
+        assert_eq!(pinned_alias, pinned_real);
+        assert_eq!(
+            pinned_alias,
+            dunce::canonicalize(&real_root).unwrap().join(".grok").join("config.toml")
+        );
+        assert_eq!(
+            config_lock_path(&pinned_alias),
+            config_lock_path(&pinned_real),
+            "project locks must not diverge across symlink aliases"
         );
     }
 
