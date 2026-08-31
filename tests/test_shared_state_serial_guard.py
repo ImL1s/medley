@@ -362,6 +362,36 @@ class DirectReference(unittest.TestCase):
         names = {f.name for f in findings}
         self.assertNotIn("tagged_direct_toucher", names)
 
+    def test_let_binding_of_registered_name_is_not_a_touch(self):
+        """`let COUNTER = 1;` binds a local; the declaration is not a
+        use of the registered static (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn first_clean() {
+                let COUNTER = 1;
+                let _ = COUNTER;
+            }
+
+            #[test]
+            fn second_clean() {
+                let COUNTER = 1;
+                let _ = COUNTER;
+            }
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        self.assertEqual(names, set())
+        findings, errors, _membership = guard.analyze(
+            [(Path("src/lib.rs"), text)], scan_root=Path(".")
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(findings, [])
+
     def test_untagged_toucher_is_a_finding(self):
         findings = guard.scan_source(DIRECT_TOUCH)
         names = {f.name for f in findings}
@@ -6378,6 +6408,26 @@ class DefaultScanRoots(unittest.TestCase):
             self.assertEqual(
                 sorted(path.as_posix() for path, _text in sources),
                 ["src/bin/nested/main.rs", "src/bin/tool.rs", "src/lib.rs"],
+            )
+
+    def test_file_module_children_live_in_the_stem_directory(self):
+        """`mod bar;` in `src/foo.rs` loads `src/foo/bar.rs`, not
+        `src/bar.rs` (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            (src_dir / "foo").mkdir(parents=True)
+            (src_dir / "lib.rs").write_text("mod foo;\n", encoding="utf-8")
+            (src_dir / "foo.rs").write_text("mod bar;\n", encoding="utf-8")
+            (src_dir / "foo" / "bar.rs").write_text(
+                "pub fn nested() {}\n", encoding="utf-8"
+            )
+            (src_dir / "bar.rs").write_text("pub fn sibling() {}\n", encoding="utf-8")
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                sorted(path.as_posix() for path, _text in sources),
+                ["src/foo.rs", "src/foo/bar.rs", "src/lib.rs"],
             )
 
     def test_same_path_file_keeps_every_module_alias(self):

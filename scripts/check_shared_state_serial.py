@@ -2250,6 +2250,18 @@ _LOCAL_CONST_STATIC = re.compile(
 )
 
 
+def _is_binding_occurrence(body: str, name: str, pos: int) -> bool:
+    """True when `pos` is the identifier being bound, not a use (#516)."""
+
+    for match in _LET_BINDING.finditer(body):
+        if match.group(1) == name and match.start(1) <= pos < match.end(1):
+            return True
+    for match in _LOCAL_CONST_STATIC.finditer(body):
+        if match.group(1) == name and match.start(1) <= pos < match.end(1):
+            return True
+    return False
+
+
 def _local_item_shadows(body: str, name: str, pos: int) -> bool:
     """True when a block-local `const`/`static`/`let` binds `name` at `pos`.
 
@@ -2465,6 +2477,18 @@ def _src_bin_target_stem(path: Path) -> str | None:
 _MOD_DECL = re.compile(r"\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
 
 
+def _child_mod_dir(declaring: Path) -> Path:
+    """Directory `mod name;` from `declaring` searches (#516 review).
+
+    Crate roots and `mod.rs` look beside the file. A file module
+    `foo.rs` looks in `foo/`.
+    """
+
+    if declaring.name == "mod.rs" or _is_always_compiled_root(declaring):
+        return declaring.parent
+    return declaring.parent / declaring.stem
+
+
 def _declared_mod_files(
     parent: Path, name: str, by_posix: dict[str, Path]
 ) -> list[Path]:
@@ -2570,7 +2594,7 @@ def _cfg_inactive_out_of_line_files(
                 _attr_cfg_inactive(attr)
                 for attr in _preceding_attributes(text, code, match.start())
             )
-            for child in _declared_mod_files(path.parent, match.group(1), by_posix):
+            for child in _declared_mod_files(_child_mod_dir(path), match.group(1), by_posix):
                 incoming[child].append(inactive)
     inactive_files = {
         path
@@ -2586,7 +2610,7 @@ def _cfg_inactive_out_of_line_files(
                 continue
             code = _code_only(text)
             for name in _MOD_DECL.findall(code):
-                for child in _declared_mod_files(path.parent, name, by_posix):
+                for child in _declared_mod_files(_child_mod_dir(path), name, by_posix):
                     if _is_always_compiled_root(child):
                         continue
                     if child not in inactive_files:
@@ -2642,7 +2666,7 @@ def _file_process_groups(
                 ):
                     continue
                 for path in _declared_mod_files(
-                    current.parent, match.group(1), by_posix
+                    _child_mod_dir(current), match.group(1), by_posix
                 ):
                     if path == current:
                         continue
@@ -2703,7 +2727,7 @@ def rust_files(scan_root: Path) -> list[Path]:
             ):
                 continue
             pending.extend(
-                _declared_mod_files(current.parent, match.group(1), by_posix)
+                _declared_mod_files(_child_mod_dir(current), match.group(1), by_posix)
             )
         for target in _path_attr_files(current, text):
             pending.extend(
@@ -3322,6 +3346,8 @@ def _body_touches(
             if ident not in original_names:
                 continue
             if not same_process:
+                continue
+            if _is_binding_occurrence(code_only_body, ident, match.start()):
                 continue
             if _local_item_shadows(code_only_body, ident, match.start()):
                 continue
