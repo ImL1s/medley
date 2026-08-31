@@ -341,6 +341,7 @@ class SrcHasTests(unittest.TestCase):
                 "spaced_path": "#[ tokio :: test ]",
                 "nested": "#[some :: deeply_nested :: test]",
                 "absolute": "#[::tokio::test]",
+                "with_args": '#[tokio::test(flavor = "current_thread")]',
             }.items():
                 crate = _crate(root, rel, rel, f"{attribute}\nfn t() {{}}\n")
                 with self.subTest(attribute=attribute):
@@ -366,6 +367,7 @@ class SrcHasTests(unittest.TestCase):
                 "multiline_string": (
                     'const EXAMPLE: &str = "example\n#[some::test]\nstill text";\n'
                 ),
+                "nonterminal_test_segment": "#[test::fixture]\npub fn f() {}\n",
                 "cfg": "#[cfg(test)]\npub fn f() {}\n",
             }.items():
                 crate = _crate(root, rel, rel, source)

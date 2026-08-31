@@ -41,7 +41,8 @@ from pathlib import Path
 from toml_package_name import package_name
 
 _TEST_ATTR = re.compile(
-    r"^\s*#\s*\[\s*(?:::\s*)?(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b",
+    r"^\s*#\s*\[\s*(?:::\s*)?(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*"
+    r"test\b(?=\s*(?:\(|\]))",
     re.MULTILINE,
 )
 _RUST_RAW_STRING_START = re.compile(r'(?:br|cr|r)(?P<hashes>#+)?"')
