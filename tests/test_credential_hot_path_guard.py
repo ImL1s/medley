@@ -4166,7 +4166,7 @@ class CiPackageTargetCounts(unittest.TestCase):
             by_feat = parse_workflow_by_features(wf, root=root)
             lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
             self.assertTrue(
-                any(NO_DEFAULT_FEATURES_TOKEN in feat for _c, feat, _t, _e in lanes)
+                any(NO_DEFAULT_FEATURES_TOKEN in feat for _c, feat, _t, _e, _f in lanes)
             )
             feat = frozenset({NO_DEFAULT_FEATURES_TOKEN})
             records_for_feat = {
@@ -4198,7 +4198,7 @@ class CiPackageTargetCounts(unittest.TestCase):
             )
             by_feat = parse_workflow_by_features(wf, root=root)
             lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_exact")
-            self.assertTrue(any(exact for _c, _f, _t, exact in lanes))
+            self.assertTrue(any(exact for _c, _f, _t, exact, _filt in lanes))
             feat = frozenset()
             records_for_feat = {
                 feat: _qualified_test_records(root, extra_features=feat)
