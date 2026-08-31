@@ -124,6 +124,9 @@ _RAW_STRING_START = re.compile(r"(?:c|b)?r(#*)\"")
 _RUST_IDENT = r"(?:[A-Za-z_]|[^\W\d_])(?:[A-Za-z0-9_]|[^\x00-\x7f])*"
 _MACRO_IDENT = re.compile(rf"(?:r#)?({_RUST_IDENT})")
 _MACRO_INVOKE = re.compile(rf"(?<![\w:])(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]")
+_CRATE_MACRO_INVOKE = re.compile(
+    rf"\bcrate\s*::\s*(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]"
+)
 
 
 def _macro_name(match: re.Match[str]) -> str:
@@ -131,6 +134,49 @@ def _macro_name(match: re.Match[str]) -> str:
 
     name = unicodedata.normalize("NFC", match.group(1))
     return name if name.isidentifier() else ""
+
+
+def _append_crate_qualified_invokes(
+    masked: str,
+    scoped_defs: tuple[tuple[str, str, int, tuple[int, ...]], ...],
+    inherited_macros: tuple[tuple[str, str], ...],
+    def_spans: list[tuple[int, int]],
+    invoke_at: list[tuple[int, str, str, str]],
+) -> None:
+    """`crate::generated!(...)` is a crate-root invocation (#507 review)."""
+
+    available = {name for name, _source, _end, _scope in scoped_defs} | {
+        name for name, _source in inherited_macros
+    }
+    for match in _CRATE_MACRO_INVOKE.finditer(masked):
+        name = unicodedata.normalize("NFC", match.group(1))
+        if not name.isidentifier() or name not in available:
+            continue
+        if any(start <= match.start() < end for start, end in def_spans):
+            continue
+        root = [
+            (end, source)
+            for def_name, source, end, def_scope in scoped_defs
+            if def_name == name and not def_scope and end <= match.start()
+        ]
+        if root:
+            source = max(root)[1]
+        else:
+            source = next(
+                (
+                    inherited
+                    for def_name, inherited in inherited_macros
+                    if def_name == name
+                ),
+                "",
+            )
+        if not source:
+            continue
+        delim = match.end() - 1
+        end = _balanced_pair_end(masked, delim)
+        invoke_at.append(
+            (match.start(), name, masked[delim + 1 : end - 1], source)
+        )
 
 
 def _qualified_macro_invocation(masked: str, start: int) -> bool:
@@ -1544,6 +1590,9 @@ def _selected_macro_expansions(
                 source,
             )
         )
+    _append_crate_qualified_invokes(
+        masked, scoped_defs, inherited_macros, def_spans, invoke_at
+    )
     invoke_at.sort()
     expansions: list[tuple[str, tuple[str, ...]]] = []
     invoke_i = 0
@@ -2026,11 +2075,13 @@ def _mod_stack_at_column(
     column: int,
     start_stack: list[tuple[int, str, bool]],
     start_depth: int,
+    enabled_features: set[str] | frozenset[str] | None = None,
 ) -> list[tuple[int, str, bool]]:
     """Module nest at `column` on this line, not the line-wide stack.
 
     `mod name { #[test] fn inner() {} } #[test] fn outer() {}` must
-    qualify only `inner` (#507 review).
+    qualify only `inner` (#507 review). `#[cfg(windows)] mod name { #[test]
+    fn works() {} }` keeps the cfg inactive flag (#507 review).
     """
 
     stack = list(start_stack)
@@ -2041,7 +2092,16 @@ def _mod_stack_at_column(
     while i < n:
         matched = mod_open.match(masked_line, i)
         if matched:
-            stack.append((depth, matched.group(1), False))
+            prefix = masked_line[: matched.start()]
+            attr_at = prefix.rfind("#[")
+            inactive = False
+            if attr_at >= 0:
+                attrs, _rest, _unclosed = _leading_attrs(prefix[attr_at:])
+                inactive = any(
+                    _cfg_attr_is_inactive(a, enabled_features)
+                    for a in _effective_attrs(attrs, enabled_features)
+                )
+            stack.append((depth, matched.group(1), inactive))
             depth += 1
             i = matched.end()
             continue
@@ -2186,6 +2246,9 @@ def _tests_in_file(
                 source,
             )
         )
+    _append_crate_qualified_invokes(
+        masked, scoped_defs, inherited_macros, def_spans, invoke_at
+    )
     invoke_at.sort()
     invoke_i = 0
     invocations: list[tuple[str, str, str, list[str]]] = []
@@ -2302,8 +2365,10 @@ def _tests_in_file(
             if enclosing_off or cinactive or cignored or in_macro_def:
                 continue
             col_stack = _mod_stack_at_column(
-                masked_line, col, line_stack, line_depth
+                masked_line, col, line_stack, line_depth, enabled_features
             )
+            if any(off for _, _, off in col_stack):
+                continue
             prefix_parts = file_mods + [name for _, name, _ in col_stack]
             prefix = "::".join(prefix_parts)
             names.append(f"{prefix}::{fname}" if prefix else fname)
@@ -2319,7 +2384,11 @@ def _tests_in_file(
             if line_cfg_off:
                 continue
             col_stack = _mod_stack_at_column(
-                masked_line, _pos - line_start, line_stack, line_depth
+                masked_line,
+                _pos - line_start,
+                line_stack,
+                line_depth,
+                enabled_features,
             )
             prefix = file_mods + [name for _, name, _ in col_stack]
             invocations.append((inv_name, inner, source, prefix))
@@ -3873,6 +3942,21 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         self.assertEqual(sorted(names), ["none_auth_scheme_::works", "plain"])
 
+    def test_same_line_cfg_inactive_mod_is_not_counted(self):
+        """`#[cfg(windows)] mod name { #[test] fn works() {} }` is off
+        on Unix (#507 review)."""
+
+        names = _tests_in_file(
+            "#[cfg(windows)] mod none_auth_scheme_ { #[test] fn works() {} }\n"
+            "#[test] fn none_auth_scheme_live() {}\n",
+            [],
+        )
+        self.assertIn("none_auth_scheme_live", names)
+        if sys.platform == "win32":
+            self.assertIn("none_auth_scheme_::works", names)
+        else:
+            self.assertNotIn("none_auth_scheme_::works", names)
+
     def test_debug_assertions_cfg_is_active_under_cargo_test(self):
         """The documented hot path is debug `cargo test` (#507 review)."""
 
@@ -3931,6 +4015,23 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_generated"])
+
+    def test_crate_qualified_local_macro_is_counted(self):
+        """`crate::generated!(name)` is a crate-root invocation (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            crate::generated!(none_auth_scheme_case);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_case"])
 
     def test_parent_macro_rules_test_in_external_child_is_counted(self):
         """A parent macro defined before `mod child;` is lexically visible
