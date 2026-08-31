@@ -76,6 +76,14 @@ jobs:
       - name: Enforce credential-safe observability
         run: python3 -B -m unittest tests.test_credential_observability_guard -v
 
+      # CLAUDE.md documents a five-pattern "credential hot path" for
+      # verifying a change before it lands. One pattern used to read as a
+      # family and select one third of it (#487) -- this pins what each
+      # pattern/name actually selects so a rename or an unrecorded new
+      # member reddens here instead of only shrinking a trusted count.
+      - name: Pin the documented credential hot-path counts
+        run: python3 -B -m unittest tests.test_credential_hot_path_guard -v
+
       # The `new-test-filters` job below is the thing that notices a Rust test
       # no filter selects. These are its own tests -- without them it would be
       # an unverified checker guarding against unverified tests (#171).

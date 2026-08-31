@@ -57,7 +57,9 @@ There are **~145 hand-written `Debug` impls** whose only job is to report `*_pre
 
 Same rule for log fields: log `command_present`, not `cmd = %command`.
 
-CI's hot path is exactly this suite (`*_never_emit_credential_bytes`, `*_is_secret_free_*`, `omits_xai_identity`, `hostile_injector`, `none_auth_scheme_`). If a change is going to break something, that is where it shows.
+CI's hot path is exactly this suite, each entry the exact count of qualified (`module::path::fn`) test names selected by that substring inside the `run_nonzero` `-p` package and `--lib`/`--test` target that actually invoke it (read from `.github/workflows/ci.yml`): `is_secret_free_` (4), `omits_xai_identity` (3), `hostile_injector` (2), `none_auth_scheme_` (3), `sampler_request_logs_never_emit_credential_bytes` (1), `transport_failure_never_emits_query_credential_bytes` (1), `subagent_resolution_diagnostics_never_emit_parent_or_child_credentials` (1). The last three are named individually rather than covered by one pattern: the obvious single pattern for that family, `never_emit_credential_bytes`, selected only the first (#487) — no substring narrower than bare `never_emit` reaches all three, and that one also selects 6 unrelated tests elsewhere in the tree. If a change is going to break something, that is where it shows.
+
+A pattern that names a `run_nonzero` filter is counted only in that invocation's package and cargo target — a repo-wide total is how a sampler-lib test can vanish while a same-pattern test appears in another crate and both this paragraph and `run_nonzero` stay green (#507 review). Patterns with no dedicated invocation (today `is_secret_free_` and the subagent diagnostics name) still scan every lib and integration target, which is how #487 first undercounted 3 of 5 with `--lib` only. `tests.test_credential_hot_path_guard` parses the seven counts straight out of this paragraph and re-derives them independently from source plus `ci.yml`: it is the counts here it checks, not a copy of them, so an edit to this line is itself part of what the guard verifies.
 
 ## Paths in user-facing strings
 
