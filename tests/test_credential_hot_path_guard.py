@@ -1270,16 +1270,35 @@ def _ci_feature_lanes(
     by_features: dict[str, dict[frozenset[str], dict[str, set[str]]]],
     pattern: str,
 ) -> list[tuple[str, frozenset[str], str, bool]]:
-    """`(package, --features set, target, exact)` lanes whose filter is `pattern`."""
+    """`(package, --features set, target, exact)` lanes whose filter is `pattern`.
+
+    A longer CI filter that contains `pattern` (for example
+    `provider_error_body_preview_is_secret_free_and_bounded` covering
+    documented `is_secret_free_`) still selects that lane's feature set
+    so cfg-gated matches are counted (#507 review).
+    """
 
     found: list[tuple[str, frozenset[str], str, bool]] = []
     for crate, featmap in by_features.items():
         for feat, targets in featmap.items():
             for target, filters in targets.items():
+                matched_exact: bool | None = None
                 if (EXACT_PREFIX + pattern) in filters:
-                    found.append((crate, feat, target, True))
+                    matched_exact = True
                 elif pattern in filters:
-                    found.append((crate, feat, target, False))
+                    matched_exact = False
+                else:
+                    for filt in filters:
+                        if filt.startswith(EXACT_PREFIX):
+                            token = filt[len(EXACT_PREFIX) :]
+                            if pattern != token and pattern in token:
+                                matched_exact = False
+                                break
+                        elif pattern != filt and pattern in filt:
+                            matched_exact = False
+                            break
+                if matched_exact is not None:
+                    found.append((crate, feat, target, matched_exact))
     return found
 
 
@@ -2121,6 +2140,28 @@ def _exported_macro_sources(
 ) -> tuple[tuple[str, str], ...]:
     """`#[macro_export] macro_rules!` sources, crate-root visible."""
 
+    return _child_macro_sources(
+        text, enabled_features=enabled_features, require_export=True
+    )
+
+
+def _macro_use_module_sources(
+    text: str,
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Ordinary `macro_rules!` from a `#[macro_use] mod` child (#507)."""
+
+    return _child_macro_sources(
+        text, enabled_features=enabled_features, require_export=False
+    )
+
+
+def _child_macro_sources(
+    text: str,
+    *,
+    enabled_features: set[str] | frozenset[str] | None = None,
+    require_export: bool,
+) -> tuple[tuple[str, str], ...]:
     masked = _mask_rust_literals(text)
     defs = _macro_rules_defs(masked)
     if not defs:
@@ -2133,7 +2174,9 @@ def _exported_macro_sources(
         if start < 0:
             continue
         attrs = _outer_attrs_before(masked, start, spans, ends)
-        if not any(re.search(r"#\[\s*macro_export\b", attr) for attr in attrs):
+        if require_export and not any(
+            re.search(r"#\[\s*macro_export\b", attr) for attr in attrs
+        ):
             continue
         if any(
             _cfg_attr_is_inactive(attr, enabled_features)
@@ -2142,6 +2185,23 @@ def _exported_macro_sources(
             continue
         out.append((name, masked[start:body_end]))
     return tuple(out)
+
+
+def _mod_decl_has_macro_use(
+    masked: str,
+    offset: int,
+    enabled_features: set[str] | frozenset[str] | None = None,
+) -> bool:
+    """True when `#[macro_use]` precedes a `mod` declaration."""
+
+    spans = _outer_attr_spans(masked)
+    ends = [end for _start, end, _attr in spans]
+    attrs = _outer_attrs_before(masked, offset, spans, ends)
+    return any(
+        re.search(r"#\[\s*macro_use\b", attr)
+        and not _cfg_attr_is_inactive(attr, enabled_features)
+        for attr in _effective_attrs(attrs, enabled_features)
+    )
 
 
 def _cargo_manifest_dir(path: Path) -> Path | None:
@@ -2405,13 +2465,19 @@ def _declared_module_overrides(
             )
         )
         child_exports: list[tuple[str, str]] = []
-        for _name, child, _inline, _off, _search in decls:
+        seen_export_names: set[str] = set()
+        for _name, child, _inline, off, _search in decls:
             child_text = read_rs(child)
             if child_text is None:
                 continue
-            child_exports.extend(
-                _exported_macro_sources(child_text, enabled)
-            )
+            pieces = list(_exported_macro_sources(child_text, enabled))
+            if _mod_decl_has_macro_use(masked, off, enabled):
+                pieces.extend(_macro_use_module_sources(child_text, enabled))
+            for mac_name, source in pieces:
+                if mac_name in seen_export_names:
+                    continue
+                seen_export_names.add(mac_name)
+                child_exports.append((mac_name, source))
         child_export_t = tuple(child_exports)
         _EXPORTED_MACROS[declaring.resolve()] = child_export_t
         for arm_text, expansion_inline in _selected_macro_expansions(
@@ -3734,6 +3800,49 @@ class CiPackageTargetCounts(unittest.TestCase):
                 ],
             )
 
+    def test_longer_feature_filter_covers_documented_pattern(self):
+        """A `--features hot` lane whose filter contains
+        `is_secret_free_` counts cfg-gated matches (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"xai-grok-sampler\"\n\n"
+                "[features]\nhot = []\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[cfg(feature = \"hot\")]\n"
+                "#[test]\n"
+                "fn provider_error_body_preview_is_secret_free_and_bounded() {}\n"
+                "#[test]\n"
+                "fn unrelated_cold_case() {}\n",
+                encoding="utf-8",
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --features hot "
+                "--lib provider_error_body_preview_is_secret_free_and_bounded "
+                "-- --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "is_secret_free_")
+            self.assertTrue(lanes)
+            records_for_feat = {
+                frozenset(): _qualified_test_records(root),
+                frozenset({"hot"}): _qualified_test_records(
+                    root, extra_features=frozenset({"hot"})
+                ),
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "is_secret_free_", lanes
+            )
+            self.assertEqual(
+                [r.name for r in matched],
+                ["provider_error_body_preview_is_secret_free_and_bounded"],
+            )
+
     def test_features_lane_counts_cfg_gated_and_required_feature_tests(self):
         """A `--features hot` lane must count `#[cfg(feature = \"hot\")]`
         tests and `required-features` targets that those features
@@ -4543,6 +4652,30 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_hot", names)
+
+    def test_macro_use_from_child_module_is_invocable(self):
+        """`#[macro_use] mod macros;` imports ordinary child macros
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "#[macro_use]\n"
+                "mod macros;\n"
+                "emit!(none_auth_scheme_child_import);\n"
+            )
+            (src / "macros.rs").write_text(
+                "macro_rules! emit {\n"
+                "    ($name:ident) => {\n"
+                "        #[test]\n"
+                "        fn $name() {}\n"
+                "    };\n"
+                "}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_child_import", names)
 
     def test_include_inside_inline_module_keeps_prefix(self):
         """`mod none_auth_scheme_ { include!(...) }` is
