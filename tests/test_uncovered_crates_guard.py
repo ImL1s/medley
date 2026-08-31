@@ -351,6 +351,24 @@ class SrcHasTests(unittest.TestCase):
                 with self.subTest(attribute=attribute):
                     self.assertTrue(src_has_tests(crate))
 
+    def test_accepts_hygienic_crate_test_attribute_in_macro(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crate = _crate(
+                root,
+                "macro_crate",
+                "macro_crate",
+                "pub use core::prelude::v1::test;\n"
+                "macro_rules! generated_test {\n"
+                "    () => {\n"
+                "        #[$crate::test]\n"
+                "        fn generated() {}\n"
+                "    };\n"
+                "}\n"
+                "generated_test!();\n",
+            )
+            self.assertTrue(src_has_tests(crate))
+
     def test_comments_docs_and_strings_do_not_count_as_test_attributes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

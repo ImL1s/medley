@@ -7,8 +7,9 @@ see that: it only asks about newly added tests. This is the crate-level
 ratchet for that gap.
 
 Does not invoke cargo. A crate "has tests" when any `src/**/*.rs` code line is
-a `#[test]` attribute, optionally qualified by a module path. Comments and
-string literals are masked before this check. It is "named" when a
+a `#[test]` attribute, optionally qualified by a module path (including a
+hygienic leading `$crate`). Comments and string literals are masked before
+this check. It is "named" when a
 `run_nonzero` / `cargo test` line in `ci.yml` contains `-p <crate>`,
 `--package <crate>`, or
 `--manifest-path .../<crate>/Cargo.toml`. A `cargo clippy` or `cargo build`
@@ -209,7 +210,12 @@ def _has_test_attribute(code: str) -> bool:
             path = path[2:]
         segments = path.split("::")
         identifiers: list[str] = []
-        for segment in segments:
+        for index, segment in enumerate(segments):
+            # `$crate` is macro_rules!'s hygienic crate-root token. It is
+            # accepted only in the leading path position, just as rustc does.
+            if index == 0 and segment == "$crate":
+                identifiers.append(segment)
+                continue
             identifier = segment[2:] if segment.startswith("r#") else segment
             if not identifier.isidentifier():
                 break
