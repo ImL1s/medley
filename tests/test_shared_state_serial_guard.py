@@ -1127,6 +1127,32 @@ class TransitiveClosure(unittest.TestCase):
         self.assertEqual(len(membership["demo_key"]), 2)
         self.assertEqual({f.name for f in findings}, set())
 
+    def test_async_generated_tokio_test_is_a_member(self):
+        """`#[tokio::test] async fn $name` still has the test attr
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($name:ident) => {
+                    #[tokio::test]
+                    async fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            cases!(one);
+            cases!(two);
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+
     def test_repeated_macro_args_are_distinct_members_not_sole_exempt(self):
         """`cases!(one, two)` expands twice from one `fn $name` (#516 review)."""
 
@@ -6408,6 +6434,63 @@ class DefaultScanRoots(unittest.TestCase):
             self.assertEqual(
                 sorted(path.as_posix() for path, _text in sources),
                 ["src/bin/nested/main.rs", "src/bin/tool.rs", "src/lib.rs"],
+            )
+
+    def test_inline_module_children_use_inline_directory(self):
+        """`mod outer { mod nested; }` loads `src/outer/nested.rs`
+        (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            (src_dir / "outer").mkdir(parents=True)
+            (src_dir / "lib.rs").write_text(
+                "mod outer { mod nested; }\n", encoding="utf-8"
+            )
+            (src_dir / "outer" / "nested.rs").write_text(
+                "pub fn x() {}\n", encoding="utf-8"
+            )
+            (src_dir / "nested.rs").write_text(
+                "pub fn sibling() {}\n", encoding="utf-8"
+            )
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                sorted(path.as_posix() for path, _text in sources),
+                ["src/lib.rs", "src/outer/nested.rs"],
+            )
+
+    def test_unicode_out_of_line_module_is_collected(self):
+        """`mod 動作;` loads `動作.rs` (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            src_dir.mkdir()
+            (src_dir / "lib.rs").write_text("mod 動作;\n", encoding="utf-8")
+            (src_dir / "動作.rs").write_text("pub fn x() {}\n", encoding="utf-8")
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                sorted(path.as_posix() for path, _text in sources),
+                ["src/lib.rs", "src/動作.rs"],
+            )
+
+    def test_unused_macro_mod_is_not_collected(self):
+        """`macro_rules! unused { () => { mod orphan; } }` does not
+        compile `orphan.rs` (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            src_dir.mkdir()
+            (src_dir / "lib.rs").write_text(
+                "macro_rules! unused { () => { mod orphan; } }\n",
+                encoding="utf-8",
+            )
+            (src_dir / "orphan.rs").write_text("pub fn x() {}\n", encoding="utf-8")
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                [path.as_posix() for path, _text in sources],
+                ["src/lib.rs"],
             )
 
     def test_file_module_children_live_in_the_stem_directory(self):

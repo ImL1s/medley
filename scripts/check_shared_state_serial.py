@@ -2474,7 +2474,7 @@ def _src_bin_target_stem(path: Path) -> str | None:
     return rest[0]
 
 
-_MOD_DECL = re.compile(r"\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
+_MOD_DECL = re.compile(rf"\bmod\s+(?:r#)?({RUST_IDENT_BODY})\s*;")
 
 
 def _child_mod_dir(declaring: Path) -> Path:
@@ -2487,6 +2487,30 @@ def _child_mod_dir(declaring: Path) -> Path:
     if declaring.name == "mod.rs" or _is_always_compiled_root(declaring):
         return declaring.parent
     return declaring.parent / declaring.stem
+
+
+def _macro_def_spans(code: str) -> list[tuple[int, int]]:
+    """`macro_rules!` token trees; `mod` inside them is not compiled."""
+
+    spans: list[tuple[int, int]] = []
+    for match in MACRO_DEF.finditer(code):
+        index = match.end()
+        while index < len(code) and code[index].isspace():
+            index += 1
+        if index < len(code) and code[index] in "{([":
+            spans.append((match.start(), _balanced_end(code, index)))
+    return spans
+
+
+def _in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= pos < end for start, end in spans)
+
+
+def _mod_search_dir_for(declaring: Path, code: str, pos: int) -> Path:
+    search = _child_mod_dir(declaring)
+    for seg in _inline_path_at(code, pos):
+        search = search / seg
+    return search
 
 
 def _declared_mod_files(
@@ -2589,12 +2613,19 @@ def _cfg_inactive_out_of_line_files(
     incoming: dict[Path, list[bool]] = {path: [] for path, _text in sources}
     for path, text in sources:
         code = _code_only(text)
+        macro_spans = _macro_def_spans(code)
         for match in _MOD_DECL.finditer(code):
+            if _in_spans(match.start(), macro_spans):
+                continue
             inactive = any(
                 _attr_cfg_inactive(attr)
                 for attr in _preceding_attributes(text, code, match.start())
             )
-            for child in _declared_mod_files(_child_mod_dir(path), match.group(1), by_posix):
+            for child in _declared_mod_files(
+                _mod_search_dir_for(path, code, match.start()),
+                match.group(1),
+                by_posix,
+            ):
                 incoming[child].append(inactive)
     inactive_files = {
         path
@@ -2659,14 +2690,19 @@ def _file_process_groups(
             if text is None:
                 continue
             code = _code_only(text)
+            macro_spans = _macro_def_spans(code)
             for match in _MOD_DECL.finditer(code):
+                if _in_spans(match.start(), macro_spans):
+                    continue
                 if any(
                     _attr_cfg_inactive(attr)
                     for attr in _preceding_attributes(text, code, match.start())
                 ):
                     continue
                 for path in _declared_mod_files(
-                    _child_mod_dir(current), match.group(1), by_posix
+                    _mod_search_dir_for(current, code, match.start()),
+                    match.group(1),
+                    by_posix,
                 ):
                     if path == current:
                         continue
@@ -2720,14 +2756,21 @@ def rust_files(scan_root: Path) -> list[Path]:
                 texts[current] = ""
         text = texts[current]
         code = _code_only(text)
+        macro_spans = _macro_def_spans(code)
         for match in _MOD_DECL.finditer(code):
+            if _in_spans(match.start(), macro_spans):
+                continue
             if any(
                 _attr_cfg_inactive(attr)
                 for attr in _preceding_attributes(text, code, match.start())
             ):
                 continue
             pending.extend(
-                _declared_mod_files(_child_mod_dir(current), match.group(1), by_posix)
+                _declared_mod_files(
+                    _mod_search_dir_for(current, code, match.start()),
+                    match.group(1),
+                    by_posix,
+                )
             )
         for target in _path_attr_files(current, text):
             pending.extend(
@@ -3553,25 +3596,46 @@ def _macro_rule_arms(body: str) -> list[tuple[str, str]]:
 
 
 def _position_before_vis(code: str, fn_start: int) -> int:
-    """Skip `$vis` / `$vis:vis` immediately before a generated `fn`.
+    """Skip `$vis` / `async` / `const` / `unsafe` immediately before `fn`.
 
-    `#[test] $visibility fn $name()` still belongs to that `#[test]`
-    (#516 review).
+    `#[test] $visibility fn $name()` and `#[tokio::test] async fn $name()`
+    still belong to that test attribute (#516 review).
     """
 
     index = fn_start
-    while index > 0 and code[index - 1].isspace():
-        index -= 1
-    if index >= 4 and code[index - 4 : index] == ":vis":
-        index -= 4
+    while True:
         while index > 0 and code[index - 1].isspace():
             index -= 1
-    ident_end = index
-    while index > 0 and (code[index - 1].isalnum() or code[index - 1] == "_"):
-        index -= 1
-    if index > 0 and code[index - 1] == "$" and ident_end > index:
-        return index - 1
-    return fn_start
+        if index >= 4 and code[index - 4 : index] == ":vis":
+            index -= 4
+            while index > 0 and code[index - 1].isspace():
+                index -= 1
+            ident_end = index
+            while index > 0 and (code[index - 1].isalnum() or code[index - 1] == "_"):
+                index -= 1
+            if index > 0 and code[index - 1] == "$" and ident_end > index:
+                index -= 1
+            continue
+        skipped = False
+        for kw in ("async", "const", "unsafe", "extern"):
+            n = len(kw)
+            if index >= n and code[index - n : index] == kw:
+                before = index - n
+                if before == 0 or not (
+                    code[before - 1].isalnum() or code[before - 1] in "_$"
+                ):
+                    index = before
+                    skipped = True
+                    break
+        if skipped:
+            continue
+        ident_end = index
+        cursor = index
+        while cursor > 0 and (code[cursor - 1].isalnum() or code[cursor - 1] == "_"):
+            cursor -= 1
+        if cursor > 0 and code[cursor - 1] == "$" and ident_end > cursor:
+            return cursor - 1
+        return index
 
 
 def _generated_test_templates_in_arm(
