@@ -6055,6 +6055,65 @@ class SolitaryProcessException(unittest.TestCase):
         names = {f.name for f in findings}
         self.assertIn("untagged_direct_toucher", names)
 
+    def test_sibling_module_static_does_not_match_registered_name(self):
+        """A sibling inline module's own `static COUNTER` is not the
+        registered `registered::COUNTER` (#516 review)."""
+
+        text = src(
+            """\
+            mod registered {
+                // SERIAL-GROUP: demo_key
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+            }
+
+            mod other {
+                static COUNTER: u64 = 0;
+
+                #[test]
+                fn a_untagged() {
+                    let _ = COUNTER;
+                }
+
+                #[test]
+                fn b_untagged() {
+                    let _ = COUNTER;
+                }
+            }
+            """
+        )
+        findings = guard.scan_source(text, path="crates/codegen/demo/src/lib.rs")
+        self.assertEqual(findings, [])
+        names = derived_names(
+            [(Path("crates/codegen/demo/src/lib.rs"), text)], "demo_key"
+        )
+        self.assertEqual(names, set())
+
+    def test_registered_module_bare_name_still_matches(self):
+        """Bare `COUNTER` inside the registered module remains a touch."""
+
+        text = src(
+            """\
+            mod registered {
+                // SERIAL-GROUP: demo_key
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                #[test]
+                fn touches_untagged() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn other_untagged() {
+                registered::COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names(
+            [(Path("crates/codegen/demo/src/lib.rs"), text)], "demo_key"
+        )
+        self.assertEqual(names, {"touches_untagged", "other_untagged"})
+
 
 class DefaultScanRoots(unittest.TestCase):
     def test_default_collect_includes_integration_test_files(self):

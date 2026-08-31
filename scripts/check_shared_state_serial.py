@@ -3574,6 +3574,48 @@ def _mask_use_items(body: str) -> str:
     return "".join(chars)
 
 
+def _module_level_item_names(
+    code: str, occupied: list[tuple[int, int]]
+) -> dict[tuple[str, ...], set[str]]:
+    """Inline-module path → names of module-level `const`/`static` items.
+
+    Function bodies are excluded so a `let`/`const` inside a test does not
+    look like a module item. Used to stop the same-process bare-name
+    fallback from attributing a sibling module's own static to a
+    registered one (#516 review).
+    """
+
+    out: dict[tuple[str, ...], set[str]] = {}
+    for match in _LOCAL_CONST_STATIC.finditer(code):
+        pos = match.start()
+        if any(start <= pos < end for start, end in occupied):
+            continue
+        path = _inline_path_at(code, pos)
+        out.setdefault(path, set()).add(_raw_ident(match.group(1)))
+    return out
+
+
+def _module_item_shadows_registered(
+    module_items: dict[tuple[str, ...], set[str]],
+    *,
+    inline_mods: tuple[str, ...],
+    ident: str,
+    static_module: tuple[str, ...] | None,
+    fn_module: tuple[str, ...] | None,
+) -> bool:
+    """True when bare `ident` resolves to a local module item, not `static_module`."""
+
+    for depth in range(len(inline_mods), -1, -1):
+        prefix = inline_mods[:depth]
+        if ident not in module_items.get(prefix, ()):
+            continue
+        owning = (fn_module or ()) + prefix
+        if static_module is None or owning != static_module:
+            return True
+        return False
+    return False
+
+
 def _body_touches(
     code_only_body: str,
     identifiers: tuple[str, ...],
@@ -3588,6 +3630,7 @@ def _body_touches(
     same_process: bool = True,
     file_globs: dict[tuple[str, ...], list[tuple[str, ...]]] | None = None,
     local_globs: tuple[tuple[int, int, tuple[str, ...]], ...] = (),
+    module_items: dict[tuple[str, ...], set[str]] | None = None,
 ) -> bool:
     """True if `code_only_body` names this registered static.
 
@@ -3677,6 +3720,14 @@ def _body_touches(
             if _is_binding_occurrence(code_only_body, ident, match.start()):
                 continue
             if _local_item_shadows(code_only_body, ident, match.start()):
+                continue
+            if _module_item_shadows_registered(
+                module_items or {},
+                inline_mods=inline_mods,
+                ident=ident,
+                static_module=static_module,
+                fn_module=fn_module,
+            ):
                 continue
             return True
     return False
@@ -4201,6 +4252,7 @@ def index_functions(
     list[_PendingMacroTest],
     dict[Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]],
     dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]],
+    dict[Path, dict[tuple[str, ...], set[str]]],
 ]:
     _load_path_overrides(sources)
     _load_reexports(sources)
@@ -4216,6 +4268,7 @@ def index_functions(
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     ] = {}
     globs_by_file: dict[Path, dict[tuple[str, ...], list[tuple[str, ...]]]] = {}
+    module_items_by_file: dict[Path, dict[tuple[str, ...], set[str]]] = {}
     scans: list[
         tuple[Path, str, str, list[tuple[int, int]], list[tuple[int, int, int, str]]]
     ] = []
@@ -4259,6 +4312,8 @@ def index_functions(
         file_imports, file_globs = _imports_outside_bodies(bindings, occupied)
         imports_by_file[rel] = file_imports
         globs_by_file[rel] = file_globs
+        module_items = _module_level_item_names(code, occupied)
+        module_items_by_file[rel] = module_items
         file_aliases = _type_alias_map(code, occupied)
         for match, name, body_start, body_end, body_code, inline_mods in pending_fns:
             local_uses, local_globs = _local_uses_from_body(
@@ -4300,6 +4355,7 @@ def index_functions(
                     same_process=_same_process(file_groups, rel, item.file),
                     file_globs=file_globs,
                     local_globs=local_globs,
+                    module_items=module_items,
                 )
             )
             type_name = None
@@ -4389,6 +4445,7 @@ def index_functions(
                     scoped_imports=file_imports,
                     same_process=_same_process(file_groups, rel, item.file),
                     file_globs=file_globs,
+                    module_items=module_items,
                 )
             )
             raw_macro_body = raw[body_start:body_end]
@@ -4430,6 +4487,7 @@ def index_functions(
                         same_process=_same_process(file_groups, rel, item.file),
                         file_globs=file_globs,
                         local_globs=arm_local_globs,
+                        module_items=module_items,
                     )
                 )
                 arm_index = len(out)
@@ -4472,6 +4530,7 @@ def index_functions(
                             scoped_imports=file_imports,
                             same_process=_same_process(file_groups, rel, item.file),
                             file_globs=file_globs,
+                            module_items=module_items,
                         )
                     )
                     template_index = len(out)
@@ -4645,7 +4704,7 @@ def index_functions(
                                 ),
                             )
                         )
-    return out, pending, imports_by_file, globs_by_file
+    return out, pending, imports_by_file, globs_by_file, module_items_by_file
 
 
 # --- membership: a monotonic fixpoint over the call graph -------------------
@@ -5176,7 +5235,7 @@ def analyze(
     if errors:
         return [], errors, {}
 
-    functions, pending_macro_tests, imports_by_file, globs_by_file = index_functions(
+    functions, pending_macro_tests, imports_by_file, globs_by_file, module_items_by_file = index_functions(
         sources, registry
     )
 
@@ -5368,6 +5427,7 @@ def analyze(
                         file_groups, pending.file, item.file
                     ),
                     file_globs=globs_by_file.get(pending.file, {}),
+                    module_items=module_items_by_file.get(pending.file, {}),
                 ):
                     keys = keys | {item.key}
         if not keys:
