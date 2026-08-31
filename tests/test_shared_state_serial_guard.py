@@ -1153,6 +1153,71 @@ class TransitiveClosure(unittest.TestCase):
         generated = {n for n in names if n.startswith("cases!")}
         self.assertEqual(len(generated), 2, names)
 
+    def test_aliased_test_attr_is_a_harness_member(self):
+        """`use tokio::test as async_case; #[async_case]` is a test
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    use tokio::test as async_case;
+
+                    #[async_case]
+                    async fn first_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[async_case]
+                    async fn second_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_aliased_serial_attr_holds_the_key(self):
+        """`use serial_test::serial as isolated; #[isolated(demo_key)]`
+        still holds the key (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    use serial_test::serial as isolated;
+
+                    #[isolated(demo_key)]
+                    #[test]
+                    fn first() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[isolated(demo_key)]
+                    #[test]
+                    fn second() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        findings, errors, _membership = guard.analyze(
+            sources, scan_root=Path(".")
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(findings, [])
+
     def test_repeated_macro_args_are_distinct_members_not_sole_exempt(self):
         """`cases!(one, two)` expands twice from one `fn $name` (#516 review)."""
 
@@ -4637,6 +4702,37 @@ class TypeAssociatedResolution(unittest.TestCase):
             """
         )
         names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_lowercase_type_assoc_call_is_a_touch(self):
+        """`struct worker; worker::bump()` is a type-method call
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct worker;
+
+            impl worker {
+                fn bump() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            fn first_untagged() {
+                worker::bump();
+            }
+
+            #[test]
+            fn second_untagged() {
+                worker::bump();
+            }
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
 
     def test_ufcs_trait_call_resolves_like_type_assoc(self):

@@ -281,6 +281,12 @@ SERIAL_ATTR = re.compile(
     r"#\s*\[\s*(?:serial_test\s*::\s*)?serial\s*(?:\((?P<args>.*)\))?\s*\]",
     re.DOTALL,
 )
+_ATTR_HEAD = re.compile(
+    rf"#\s*\[\s*(?P<path>(?:(?:r#)?{RUST_IDENT_BODY}\s*::\s*)*)"
+    rf"(?:r#)?(?P<leaf>{RUST_IDENT_BODY})"
+    rf"(?:\s*\((?P<args>.*)\))?\s*\]",
+    re.DOTALL,
+)
 IMPL_KW = re.compile(r"\bimpl\b")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 RUST_IDENT = re.compile(RUST_IDENT_BODY)
@@ -316,7 +322,8 @@ QUALIFIED_CALL = re.compile(
     rf"\b((?:(?:r#)?{RUST_IDENT_BODY}\s*::\s*)+)(?:r#)?({RUST_IDENT_BODY})\s*\("
 )
 TYPE_ASSOC_CALL = re.compile(
-    r"\b([A-Z][A-Za-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>\s*)?\("
+    rf"\b(?:r#)?({RUST_IDENT_BODY})\s*::\s*(?:r#)?({RUST_IDENT_BODY})\s*"
+    rf"(?:::\s*<[^>]*>\s*)?\("
 )
 TYPE_ALIAS = re.compile(
     r"\b(?:pub(?:\s*\([^)]*\))?\s+)?type\s+([A-Z][A-Za-z0-9_]*)\s*=\s*"
@@ -1358,7 +1365,33 @@ def _cfg_attr_emits_test(attr: str) -> bool:
     return False
 
 
-def _is_test_attr(attr: str) -> bool:
+def _resolved_attr_leaf(
+    attr: str,
+    file_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
+    | None = None,
+    inline_mods: tuple[str, ...] = (),
+) -> str | None:
+    """Last ident of `#[path::name]` after resolving a file-local alias."""
+
+    parsed = _ATTR_HEAD.fullmatch(attr.strip())
+    if parsed is None:
+        return None
+    leaf = _raw_ident(parsed.group("leaf"))
+    path = (parsed.group("path") or "").strip()
+    if path or file_imports is None:
+        return leaf
+    imported = _lookup_import(file_imports, inline_mods, leaf)
+    if imported is None:
+        return leaf
+    return imported[1]
+
+
+def _is_test_attr(
+    attr: str,
+    file_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
+    | None = None,
+    inline_mods: tuple[str, ...] = (),
+) -> bool:
     stripped = attr.strip()
     if TEST_ATTR.match(stripped) is not None:
         return True
@@ -1367,16 +1400,33 @@ def _is_test_attr(attr: str) -> bool:
         return True
     # `#[cfg_attr(test, test)]` and `#[cfg_attr(all(test, unix), test)]`
     # are harness tests when the predicate is on (#516 review).
-    return _cfg_attr_emits_test(stripped)
+    if _cfg_attr_emits_test(stripped):
+        return True
+    # `use tokio::test as async_case; #[async_case]` (#516 review).
+    return _resolved_attr_leaf(stripped, file_imports, inline_mods) == "test"
 
 
-def _serial_keys(attr: str) -> tuple[str, ...] | None:
+def _serial_keys(
+    attr: str,
+    file_imports: dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
+    | None = None,
+    inline_mods: tuple[str, ...] = (),
+) -> tuple[str, ...] | None:
     """`None` = not a `#[serial]` attribute. `()` = unkeyed. Else the keys."""
 
-    match = SERIAL_ATTR.fullmatch(attr.strip())
+    stripped = attr.strip()
+    match = SERIAL_ATTR.fullmatch(stripped)
+    parsed = None if match is not None else _ATTR_HEAD.fullmatch(stripped)
     if match is None:
-        return None
-    args = (match.group("args") or "").strip()
+        if parsed is None:
+            return None
+        if (parsed.group("path") or "").strip():
+            return None
+        if _resolved_attr_leaf(stripped, file_imports, inline_mods) != "serial":
+            return None
+        args = (parsed.group("args") or "").strip()
+    else:
+        args = (match.group("args") or "").strip()
     if not args:
         return ()
     return tuple(a.strip().strip('"').strip("'") for a in args.split(",") if a.strip())
@@ -4037,7 +4087,10 @@ def index_functions(
                     raw, code, inline_spans, match.start()
                 )
             )
-            is_test = any(_is_test_attr(a) for a in attrs) and not cfg_inactive
+            is_test = (
+                any(_is_test_attr(a, file_imports, inline_mods) for a in attrs)
+                and not cfg_inactive
+            )
             # Cfg-off helpers stay out of the call graph so a
             # `#[cfg(windows)] fn helper` cannot taint the unix twin
             # (#516 review). Cfg-off tests are already not harness tests.
@@ -4046,7 +4099,7 @@ def index_functions(
             serial_held: set[str] = set()
             has_unkeyed = False
             for a in attrs:
-                parsed = _serial_keys(a)
+                parsed = _serial_keys(a, file_imports, inline_mods)
                 if parsed is None:
                     continue
                 if not parsed:
