@@ -90,7 +90,7 @@ pub(crate) fn read_config_text(path: &Path) -> std::io::Result<String> {
     }
 }
 
-fn overlay_digest_for(path: &Path) -> String {
+pub(crate) fn overlay_digest_for(path: &Path) -> String {
     let mut payload = Vec::new();
     let mut dirs = Vec::new();
     if let Some(parent) = path.parent() {
@@ -474,6 +474,8 @@ mod tests {
         let rendered = config_mutation_snapshot(&path, 2).unwrap();
         let reads = Cell::new(0);
 
+        // Read call order in mutate_config_document_at_with:
+        // 0 = initial CAS load, 1 = pre-write byte recheck, 2 = post-write readback.
         let error = mutate_config_document_at_with(
             &path,
             &path,
@@ -483,7 +485,7 @@ mod tests {
             |path| {
                 let call = reads.get();
                 reads.set(call + 1);
-                if call == 1 {
+                if call == 2 {
                     Err(io::Error::other("readback failed"))
                 } else {
                     fs::read(path)

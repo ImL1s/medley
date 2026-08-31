@@ -782,20 +782,43 @@ fn capture_locked_config_state(
 ) {
     let path = xai_grok_config::grok_home().join("config.toml");
     let _lock = crate::config_toml_edit::lock_config_destination(&path).ok();
-    match load_agent_toggle() {
-        Ok(toggle) => (
-            capture_config_snapshot(generation),
-            load_config_agent_name(),
-            resolve_default_agent_name(cwd, model_agent_type),
-            toggle,
-        ),
-        Err(_) => (
-            None,
-            None,
-            resolve_default_agent_name(cwd, model_agent_type),
-            HashMap::new(),
-        ),
+    // Overlay writers (managed/requirements/campaigns/remote cache) are not covered by
+    // the config.toml lock. Stabilize by hashing overlays before and after loading
+    // effective toggles; retry briefly, then reject a mismatched pair.
+    const MAX_ATTEMPTS: usize = 4;
+    for _ in 0..MAX_ATTEMPTS {
+        let before_overlay = crate::config_toml_edit::overlay_digest_for(&path);
+        match load_agent_toggle() {
+            Ok(toggle) => {
+                let Some(snapshot) = capture_config_snapshot(generation) else {
+                    continue;
+                };
+                if snapshot.overlay_digest != before_overlay {
+                    continue;
+                }
+                return (
+                    Some(snapshot),
+                    load_config_agent_name(),
+                    resolve_default_agent_name(cwd, model_agent_type),
+                    toggle,
+                );
+            }
+            Err(_) => {
+                return (
+                    None,
+                    None,
+                    resolve_default_agent_name(cwd, model_agent_type),
+                    HashMap::new(),
+                );
+            }
+        }
     }
+    (
+        None,
+        None,
+        resolve_default_agent_name(cwd, model_agent_type),
+        HashMap::new(),
+    )
 }
 /// Set or clear the default agent via `[agent] name` in config.toml.
 ///
