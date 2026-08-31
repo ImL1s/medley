@@ -1105,33 +1105,38 @@ def _filters_contain_pattern(filters: set[str], pattern: str) -> bool:
 def _ci_feature_lanes(
     by_features: dict[str, dict[frozenset[str], dict[str, set[str]]]],
     pattern: str,
-) -> list[tuple[str, frozenset[str], str]]:
-    """`(package, --features set, target)` lanes whose filter is `pattern`."""
+) -> list[tuple[str, frozenset[str], str, bool]]:
+    """`(package, --features set, target, exact)` lanes whose filter is `pattern`."""
 
-    found: list[tuple[str, frozenset[str], str]] = []
+    found: list[tuple[str, frozenset[str], str, bool]] = []
     for crate, featmap in by_features.items():
         for feat, targets in featmap.items():
             for target, filters in targets.items():
-                if _filters_contain_pattern(filters, pattern):
-                    found.append((crate, feat, target))
+                if (EXACT_PREFIX + pattern) in filters:
+                    found.append((crate, feat, target, True))
+                elif pattern in filters:
+                    found.append((crate, feat, target, False))
     return found
 
 
 def _hot_path_matches_for_lanes(
     records_for_feat: dict[frozenset[str], list[_TestRecord]],
     pattern: str,
-    lanes: list[tuple[str, frozenset[str], str]],
+    lanes: list[tuple[str, frozenset[str], str, bool]],
 ) -> list[_TestRecord]:
     """Count tests that actually exist in each matching CI lane's feature set."""
 
     hits: list[_TestRecord] = []
     seen: set[tuple[str, str, str]] = set()
-    for crate, feat, target in lanes:
+    for crate, feat, target, exact in lanes:
         records = records_for_feat.get(feat)
         if records is None:
             continue
         for record in records:
-            if pattern not in record.name:
+            if exact:
+                if record.name != pattern:
+                    continue
+            elif pattern not in record.name:
                 continue
             if record.package != crate:
                 continue
@@ -3202,7 +3207,7 @@ class CredentialHotPathCorpus(unittest.TestCase):
         )
         needed: set[frozenset[str]] = set()
         for pattern in cls.documented:
-            for _crate, feat, _target in _ci_feature_lanes(
+            for _crate, feat, _target, _exact in _ci_feature_lanes(
                 cls.ci_by_features, pattern
             ):
                 if feat:
@@ -3260,7 +3265,9 @@ class CredentialHotPathCorpus(unittest.TestCase):
                 matched = _hot_path_matches_for_lanes(
                     self.records_for_feat, pattern, lanes
                 )
-                scopes = {(crate, target) for crate, _feat, target in lanes}
+                scopes = {
+                    (crate, target) for crate, _feat, target, _exact in lanes
+                }
             else:
                 scopes = _ci_scopes_for_pattern(self.ci_filters, pattern)
                 matched = _hot_path_matches(self.records, pattern, scopes)
@@ -3605,7 +3612,9 @@ class CiPackageTargetCounts(unittest.TestCase):
             )
             by_feat = parse_workflow_by_features(wf, root=root)
             lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
-            self.assertTrue(any(NO_DEFAULT_FEATURES_TOKEN in feat for _c, feat, _t in lanes))
+            self.assertTrue(
+                any(NO_DEFAULT_FEATURES_TOKEN in feat for _c, feat, _t, _e in lanes)
+            )
             feat = frozenset({NO_DEFAULT_FEATURES_TOKEN})
             records_for_feat = {
                 feat: _qualified_test_records(root, extra_features=feat)
@@ -3614,6 +3623,37 @@ class CiPackageTargetCounts(unittest.TestCase):
                 records_for_feat, "none_auth_scheme_", lanes
             )
             self.assertEqual([r.name for r in matched], ["none_auth_scheme_off"])
+
+    def test_exact_lane_counts_only_the_equal_name(self):
+        """`--exact` must not count substring superstrings (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "xai-grok-sampler"\n',
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[test]\nfn none_auth_scheme_exact() {}\n"
+                "#[test]\nfn none_auth_scheme_exact_extra() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --lib "
+                "none_auth_scheme_exact -- --exact --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_exact")
+            self.assertTrue(any(exact for _c, _f, _t, exact in lanes))
+            feat = frozenset()
+            records_for_feat = {
+                feat: _qualified_test_records(root, extra_features=feat)
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "none_auth_scheme_exact", lanes
+            )
+            self.assertEqual([r.name for r in matched], ["none_auth_scheme_exact"])
 
 
 class ExternalModulePrefix(unittest.TestCase):
