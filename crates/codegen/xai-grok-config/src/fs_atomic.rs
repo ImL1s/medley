@@ -32,6 +32,24 @@ pub fn lock_config_file(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
+/// Resolve `path` to a stable destination, then lock that destination.
+///
+/// Retries if the logical path retargets while the lock is being acquired so
+/// the held lock and the I/O path always refer to the same file.
+pub fn lock_config_destination(path: &Path) -> std::io::Result<(File, PathBuf)> {
+    for _ in 0..8 {
+        let dest = resolve_write_path(path)?;
+        let lock = lock_config_file(&dest)?;
+        let dest2 = resolve_write_path(path)?;
+        if dest == dest2 {
+            return Ok((lock, dest));
+        }
+    }
+    Err(std::io::Error::other(
+        "config destination changed while acquiring lock",
+    ))
+}
+
 /// If `path` exists as a symlink, return its canonical target so a later
 /// rename updates the referent instead of replacing the link. A missing path
 /// is returned unchanged. A dangling symlink is an error.
@@ -113,6 +131,16 @@ mod tests {
         assert!(second.try_lock_exclusive().is_err());
         drop(held);
         second.try_lock_exclusive().unwrap();
+    }
+
+    #[test]
+    fn lock_config_destination_pins_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[ui]\n").unwrap();
+        let (held, dest) = lock_config_destination(&path).unwrap();
+        assert_eq!(dest, resolve_write_path(&path).unwrap());
+        drop(held);
     }
 
     #[test]

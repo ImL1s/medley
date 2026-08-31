@@ -1993,8 +1993,7 @@ fn mutate_config_toml_file(
     config_path: &std::path::Path,
     f: impl FnOnce(&mut toml::Value) -> Result<bool, Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = xai_grok_config::fs_atomic::lock_config_file(config_path)?;
-    let dest = xai_grok_config::fs_atomic::resolve_write_path(config_path)?;
+    let (_lock, dest) = xai_grok_config::fs_atomic::lock_config_destination(config_path)?;
     let content = match std::fs::read_to_string(&dest) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

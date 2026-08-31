@@ -14,11 +14,10 @@ static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub(crate) struct ConfigWriteGuard {
     _in_process: tokio::sync::MutexGuard<'static, ()>,
     _os: std::fs::File,
+    dest: std::path::PathBuf,
 }
 /// [`save_config`] body; caller must hold [`SAVE_LOCK`].
-async fn save_config_locked(config: &Config) -> Result<()> {
-    let path = user_config_path();
-    let dest = xai_grok_config::fs_atomic::resolve_write_path(&path)?;
+async fn save_config_locked(config: &Config, dest: &std::path::Path) -> Result<()> {
     let mut root: TomlValue = match tokio::fs::read_to_string(&dest).await {
         Ok(s) => match toml::from_str::<TomlValue>(&s) {
             Ok(v) => v,
@@ -91,13 +90,15 @@ async fn save_config_locked(config: &Config) -> Result<()> {
 pub(crate) async fn lock_config_writes() -> std::io::Result<ConfigWriteGuard> {
     let in_process = SAVE_LOCK.lock().await;
     let path = user_config_path();
-    let os =
-        tokio::task::spawn_blocking(move || xai_grok_config::fs_atomic::lock_config_file(&path))
-            .await
-            .map_err(std::io::Error::other)??;
+    let (os, dest) = tokio::task::spawn_blocking(move || {
+        xai_grok_config::fs_atomic::lock_config_destination(&path)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
     Ok(ConfigWriteGuard {
         _in_process: in_process,
         _os: os,
+        dest,
     })
 }
 /// Read a file, treating only `NotFound` as empty. Hard read errors (EACCES,
@@ -229,12 +230,12 @@ pub async fn update_config<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Config),
 {
-    let _guard = lock_config_writes().await?;
+    let guard = lock_config_writes().await?;
     let root: TomlValue =
         crate::config::load_from_disk().unwrap_or_else(|_| TomlValue::Table(TomlMap::new()));
     let mut cfg = load_config_from_toml(&root);
     f(&mut cfg);
-    save_config_locked(&cfg).await
+    save_config_locked(&cfg, &guard.dest).await
 }
 #[cfg(test)]
 mod tests {

@@ -151,12 +151,11 @@ pub(crate) fn mutate_config_document_at<F>(
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
 {
-    let _lock = lock_config_file(path).map_err(ConfigMutationError::Write)?;
+    let (_lock, dest) = xai_grok_config::fs_atomic::lock_config_destination(path)
+        .map_err(ConfigMutationError::Write)?;
     if overlay_digest_for(path) != rendered.overlay_digest {
         return Err(ConfigMutationError::ConcurrentEdit);
     }
-    let dest =
-        xai_grok_config::fs_atomic::resolve_write_path(path).map_err(ConfigMutationError::Write)?;
     let mode = destination_unix_mode(&dest);
     let mut outcome = mutate_config_document_at_with(
         &dest,
@@ -281,8 +280,7 @@ fn set_hint_at(path: &Path, key: &str, value: impl Into<toml_edit::Value>) -> st
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _lock = lock_config_file(path)?;
-    let dest = xai_grok_config::fs_atomic::resolve_write_path(path)?;
+    let (_lock, dest) = xai_grok_config::fs_atomic::lock_config_destination(path)?;
     let Some(mut doc) = read_config_document_for_edit(&dest) else {
         return Ok(());
     };
