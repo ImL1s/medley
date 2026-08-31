@@ -3871,6 +3871,7 @@ def _resolve_calls(
     by_module: dict[tuple[str, ...], dict[str, list[int]]],
     by_leaf: dict[str, dict[str, list[int]]],
     by_type: dict[tuple[str, str], dict[str, list[int]]],
+    by_typed_trait: dict[tuple[str, str, str], dict[str, list[int]]],
     by_macro_any: dict[str, list[int]],
     by_macro_arms: dict[int, tuple[tuple[str, int], ...]],
     macro_defs_by_module: dict[tuple[tuple[str, ...], str], list[int]],
@@ -4164,15 +4165,25 @@ def _resolve_calls(
             trait_imported = _fn_import(fn, trait, 0, imports_by_file)
             if trait_imported is not None:
                 trait = trait_imported[1]
-        lookup = trait if trait is not None else type_name
-        slots = _type_method_slots(
-            fn,
-            lookup,
-            method,
-            trait_imported if trait is not None else imported,
-            groups_of,
-            by_type,
-        )
+        if trait is not None:
+            slots = _typed_trait_slots(
+                fn,
+                type_name,
+                trait,
+                method,
+                trait_imported if trait_imported is not None else imported,
+                groups_of,
+                by_typed_trait,
+            )
+        else:
+            slots = _type_method_slots(
+                fn,
+                type_name,
+                method,
+                imported,
+                groups_of,
+                by_type,
+            )
         _gain_from(
             gained,
             keys_of,
@@ -4204,6 +4215,32 @@ def _type_method_slots(
     return slots
 
 
+def _typed_trait_slots(
+    fn: FnInfo,
+    type_name: str,
+    trait: str,
+    method: str,
+    imported: tuple[tuple[str, ...], str] | None,
+    groups_of: dict[Path, frozenset[str]],
+    by_typed_trait: dict[tuple[str, str, str], dict[str, list[int]]],
+) -> list[int]:
+    """Slots for `<Type as Trait>::method`, not every Type that impls Trait."""
+
+    groups = set(groups_of.get(fn.file, frozenset({_process_group(fn.file)})))
+    if imported is not None:
+        groups.update(
+            group
+            for group, tname, trname in by_typed_trait
+            if tname == type_name and trname == trait and group.startswith("lib:")
+        )
+    slots: list[int] = []
+    for group in groups:
+        slots.extend(
+            by_typed_trait.get((group, type_name, trait), {}).get(method, [])
+        )
+    return slots
+
+
 def analyze(
     sources: list[tuple[Path, str]], *, scan_root: Path
 ) -> tuple[list[Finding], list[str], dict[str, list[tuple[Path, int, str]]]]:
@@ -4223,6 +4260,7 @@ def analyze(
     by_crate_module: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] = {}
     by_leaf: dict[str, dict[str, list[int]]] = {}
     by_type: dict[tuple[str, str], dict[str, list[int]]] = {}
+    by_typed_trait: dict[tuple[str, str, str], dict[str, list[int]]] = {}
     by_macro_any: dict[str, list[int]] = {}
     by_macro_arms: dict[int, tuple[tuple[str, int], ...]] = {}
     macro_defs_by_module: dict[tuple[tuple[str, ...], str], list[int]] = {}
@@ -4267,6 +4305,10 @@ def analyze(
                 by_type.setdefault((group, fn.trait_name), {}).setdefault(
                     fn.name, []
                 ).append(i)
+            if fn.type_name is not None and fn.trait_name is not None:
+                by_typed_trait.setdefault(
+                    (group, fn.type_name, fn.trait_name), {}
+                ).setdefault(fn.name, []).append(i)
         if module is not None:
             # `module` is a valid module path even when empty (`()` is the
             # crate root itself, from a function declared directly in
@@ -4301,6 +4343,7 @@ def analyze(
                 by_module=by_module,
                 by_leaf=by_leaf,
                 by_type=by_type,
+                by_typed_trait=by_typed_trait,
                 by_macro_any=by_macro_any,
                 by_macro_arms=by_macro_arms,
                 macro_defs_by_module=macro_defs_by_module,
@@ -4368,6 +4411,7 @@ def analyze(
                 by_module=by_module,
                 by_leaf=by_leaf,
                 by_type=by_type,
+                by_typed_trait=by_typed_trait,
                 by_macro_any=by_macro_any,
                 by_macro_arms=by_macro_arms,
                 macro_defs_by_module=macro_defs_by_module,

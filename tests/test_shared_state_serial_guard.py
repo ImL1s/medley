@@ -4444,6 +4444,44 @@ class TypeAssociatedResolution(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, set())
 
+    def test_ufcs_trait_lookup_is_type_and_trait(self):
+        """`<Clean as Action>::act()` must not inherit Dirty::act
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct Dirty;
+            struct Clean;
+            trait Action {
+                fn act();
+            }
+
+            impl Action for Dirty {
+                fn act() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            impl Action for Clean {
+                fn act() {}
+            }
+
+            #[test]
+            fn first_untagged() {
+                <Clean as Action>::act();
+            }
+
+            #[test]
+            fn second_untagged() {
+                <Clean as Action>::act();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, set())
+
     def test_cfg_disabled_test_is_not_a_member(self):
         """`#[cfg(windows)] #[test]` is not a harness test on Unix
         (#516 review)."""
