@@ -108,6 +108,9 @@ fn overlay_digest_for(path: &Path) -> String {
     let remote = xai_grok_shell::util::config::remote_campaign_cache_fingerprint();
     payload.extend_from_slice(&(remote.len() as u64).to_le_bytes());
     payload.extend_from_slice(&remote);
+    let mdm = xai_grok_config::mdm_requirements_fingerprint();
+    payload.extend_from_slice(&(mdm.len() as u64).to_le_bytes());
+    payload.extend_from_slice(&mdm);
     digest_bytes(&payload)
 }
 
@@ -517,6 +520,17 @@ mod tests {
         let body = fs::read_to_string(&target).unwrap();
         assert!(body.contains("verifier = true"));
         assert!(body.contains("theme = \"dark\""));
+    }
+
+    #[test]
+    fn overlay_digest_includes_mdm_requirements_fingerprint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[ui]\ntheme = \"dark\"\n").unwrap();
+        let first = overlay_digest_for(&path);
+        let second = overlay_digest_for(&path);
+        assert_eq!(first, second);
+        assert!(!xai_grok_config::mdm_requirements_fingerprint().is_empty());
     }
 
     #[test]

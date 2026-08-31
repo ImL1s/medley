@@ -92,7 +92,8 @@ pub use paths::explicit_xai_auth_override;
 pub use paths::resolved_xai_auth_path;
 pub use validation::{
     RequirementsError, RequirementsLayer, RequirementsLayerLoad, RequirementsSource,
-    load_merged_requirements, requirements_layers, try_requirements_layers, validate_requirements,
+    load_merged_requirements, mdm_requirements_fingerprint, requirements_layers,
+    try_requirements_layers, validate_requirements,
 };
 pub use version_overrides::{VersionOverrideError, apply_version_overrides};
 

@@ -1075,6 +1075,8 @@ jobs:
           run_nonzero -p xai-grok-pager --lib config_toml_edit:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             set_hint_at_propagates_unreadable_file_without_replace -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
+            mdm_requirements_fingerprint_is_stable_absent_layer -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             new_loads_toggle_under_the_same_lock_as_the_snapshot -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
