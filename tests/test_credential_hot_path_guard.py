@@ -1428,6 +1428,94 @@ def _iter_module_decls(
     return decls
 
 
+def _selected_macro_expansions(
+    masked: str,
+    enabled_features: set[str] | frozenset[str] | None = None,
+    inherited_macros: tuple[tuple[str, str], ...] = (),
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Selected `macro_rules!` arm bodies, with enclosing inline modules.
+
+    Invoked expansions can emit `mod child;` items that rustc then loads
+    beside the invocation. `_iter_module_decls` skips unexpanded
+    `macro_rules!` bodies, so those children have to be recovered from
+    the selected arm (#507 review).
+    """
+
+    defs = _macro_rules_defs(masked)
+    scoped_defs = _scoped_macro_rules_sources(masked, defs, enabled_features)
+    def_spans = [(start, end) for _, start, end in defs]
+    available_names = {name for name, _source, _end, _scope in scoped_defs} | {
+        name for name, _source in inherited_macros
+    }
+    raw_invocations = [
+        match
+        for match in _MACRO_INVOKE.finditer(masked)
+        if not _qualified_macro_invocation(masked, match.start())
+        if _macro_name(match) in available_names
+        if not any(start <= match.start() < end for start, end in def_spans)
+    ]
+    invoke_at: list[tuple[int, str, str, str]] = []
+    for im in raw_invocations:
+        local = [
+            (end, source)
+            for name, source, end, _scope in scoped_defs
+            if name == _macro_name(im) and end <= im.start()
+        ]
+        if local:
+            source = max(local)[1]
+        else:
+            source = next(
+                (
+                    inherited_source
+                    for name, inherited_source in inherited_macros
+                    if name == _macro_name(im)
+                ),
+                "",
+            )
+        if not source:
+            continue
+        delim = im.end() - 1
+        end = _balanced_pair_end(masked, delim)
+        invoke_at.append(
+            (
+                im.start(),
+                _macro_name(im),
+                masked[delim + 1 : end - 1],
+                source,
+            )
+        )
+    invoke_at.sort()
+    expansions: list[tuple[str, tuple[str, ...]]] = []
+    invoke_i = 0
+    depth = 0
+    inline_stack: list[tuple[int, str]] = []
+    line_start = 0
+    for line in masked.splitlines():
+        invoke_end = line_start + len(line)
+        while (
+            invoke_i < len(invoke_at)
+            and line_start <= invoke_at[invoke_i][0] <= invoke_end
+        ):
+            _pos, inv_name, inner, source = invoke_at[invoke_i]
+            invoke_i += 1
+            arm_text = _selected_arm_source(
+                source, _macro_rules_defs(source), inv_name, inner
+            )
+            if arm_text:
+                expansions.append(
+                    (arm_text, tuple(name for _, name in inline_stack))
+                )
+        stripped = _strip_line_comment(line)
+        brace_mod = _MOD_OPEN.match(stripped)
+        if brace_mod:
+            inline_stack.append((depth, brace_mod.group(1)))
+        depth += line.count("{") - line.count("}")
+        while inline_stack and depth <= inline_stack[-1][0]:
+            inline_stack.pop()
+        line_start += len(line) + 1
+    return expansions
+
+
 def _declared_module_overrides(
     root: Path,
 ) -> dict[Path, list[tuple[list[str], str, tuple[tuple[str, str], ...]]]]:
@@ -1515,16 +1603,44 @@ def _declared_module_overrides(
         scoped_macros = _scoped_macro_rules_sources(
             masked, enabled_features=enabled
         )
-        decls = _iter_module_decls(
-            text,
-            declaring,
-            extra_roots,
-            gated_roots,
-            as_crate_root=as_crate_root,
-            enabled_features=enabled,
-            masked=masked,
-            module_search_dir=module_search_dir,
+        decls = list(
+            _iter_module_decls(
+                text,
+                declaring,
+                extra_roots,
+                gated_roots,
+                as_crate_root=as_crate_root,
+                enabled_features=enabled,
+                masked=masked,
+                module_search_dir=module_search_dir,
+            )
         )
+        for arm_text, inline_names in _selected_macro_expansions(
+            masked, enabled, macro_env
+        ):
+            arm_search = module_search_dir
+            for inline_name in inline_names:
+                arm_search = arm_search / inline_name
+            decls.extend(
+                _iter_module_decls(
+                    arm_text,
+                    declaring,
+                    extra_roots,
+                    gated_roots,
+                    as_crate_root=as_crate_root and not inline_names,
+                    enabled_features=enabled,
+                    module_search_dir=arm_search,
+                )
+            )
+        unique_decls = []
+        seen_decls: set[tuple[str, Path, tuple[str, ...]]] = set()
+        for decl in decls:
+            key = (decl[0], decl[1], decl[2])
+            if key in seen_decls:
+                continue
+            seen_decls.add(key)
+            unique_decls.append(decl)
+        decls = unique_decls
         macro_spans = [
             (masked.rfind("macro_rules", 0, start), end)
             for _name, start, end in _macro_rules_defs(masked)
@@ -3888,6 +4004,40 @@ class ExternalModulePrefix(unittest.TestCase):
 
             cargo_names = _cargo_list_test_names(crate)
             self.assertEqual(cargo_names, [])
+            self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_invoked_macro_emits_external_child_module(self):
+        """A selected expansion's `mod child;` is a live module (#507)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    macro_rules! generated {
+                        () => {
+                            mod none_auth_scheme_child;
+                        };
+                    }
+                    generated!();
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (src / "none_auth_scheme_child.rs").write_text(
+                "#[test]\nfn works() {}\n",
+                encoding="utf-8",
+            )
+
+            cargo_names = _cargo_list_test_names(crate)
+            self.assertEqual(cargo_names, ["none_auth_scheme_child::works"])
             self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
 
     def test_block_local_macro_does_not_leak_into_external_child(self):
