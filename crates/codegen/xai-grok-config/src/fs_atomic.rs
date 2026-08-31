@@ -37,9 +37,17 @@ pub fn lock_config_file(path: &Path) -> std::io::Result<File> {
 /// is returned unchanged. A dangling symlink is an error.
 pub fn resolve_write_path(path: &Path) -> std::io::Result<PathBuf> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => dunce::canonicalize(path),
-        Ok(_) => Ok(path.to_path_buf()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Ok(_) => dunce::canonicalize(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => match dunce::canonicalize(parent) {
+                Ok(parent) => Ok(parent.join(path.file_name().unwrap_or_default())),
+                Err(parent_err) if parent_err.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(path.to_path_buf())
+                }
+                Err(parent_err) => Err(parent_err),
+            },
+            _ => Ok(path.to_path_buf()),
+        },
         Err(e) => Err(e),
     }
 }
@@ -111,7 +119,10 @@ mod tests {
     fn resolve_write_path_leaves_missing_path_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        assert_eq!(resolve_write_path(&path).unwrap(), path);
+        assert_eq!(
+            resolve_write_path(&path).unwrap(),
+            dunce::canonicalize(dir.path()).unwrap().join("config.toml")
+        );
     }
 
     #[cfg(unix)]
@@ -159,5 +170,33 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "pinned\n");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "two\n");
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "two\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_write_path_canonicalizes_symlinked_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_home = dir.path().join("dotfiles");
+        let linked_home = dir.path().join("home");
+        std::fs::create_dir(&real_home).unwrap();
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let file = linked_home.join("config.toml");
+        std::fs::write(&file, "old\n").unwrap();
+        let pinned = resolve_write_path(&file).unwrap();
+        assert_eq!(pinned, dunce::canonicalize(&file).unwrap());
+        std::fs::remove_file(&linked_home).unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("config.toml"), "other\n").unwrap();
+        std::os::unix::fs::symlink(&other, &linked_home).unwrap();
+        write_atomically(&pinned, "pinned\n", None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(real_home.join("config.toml")).unwrap(),
+            "pinned\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.join("config.toml")).unwrap(),
+            "other\n"
+        );
     }
 }
