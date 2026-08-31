@@ -50,6 +50,22 @@ fn cached_remote_campaigns() -> Vec<CampaignEntry> {
         .unwrap_or_default()
 }
 
+/// Stable bytes covering the process-global remote campaign cache so CAS
+/// snapshots can reject Actions after the cache is seeded or cleared.
+pub fn remote_campaign_cache_fingerprint() -> Vec<u8> {
+    let mut entries = cached_remote_campaigns();
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut out = Vec::new();
+    for entry in entries {
+        let patch = toml::to_string(&toml::Value::Table(entry.patch)).unwrap_or_default();
+        out.extend_from_slice(&(entry.id.len() as u64).to_le_bytes());
+        out.extend_from_slice(entry.id.as_bytes());
+        out.extend_from_slice(&(patch.len() as u64).to_le_bytes());
+        out.extend_from_slice(patch.as_bytes());
+    }
+    out
+}
+
 /// Fail-open dismissed campaign ids from `campaigns_state.json`.
 pub(crate) fn load_dismissed_ids() -> HashSet<String> {
     load_dismissed_ids_from_home()

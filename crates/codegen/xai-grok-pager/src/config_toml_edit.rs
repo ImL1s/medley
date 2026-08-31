@@ -94,6 +94,7 @@ fn overlay_digest_for(path: &Path) -> String {
         for name in [
             xai_grok_config::MANAGED_CONFIG_FILENAME,
             xai_grok_config::REQUIREMENTS_FILENAME,
+            "campaigns_state.json",
         ] {
             match std::fs::read(dir.join(name)) {
                 Ok(bytes) => {
@@ -104,6 +105,9 @@ fn overlay_digest_for(path: &Path) -> String {
             }
         }
     }
+    let remote = xai_grok_shell::util::config::remote_campaign_cache_fingerprint();
+    payload.extend_from_slice(&(remote.len() as u64).to_le_bytes());
+    payload.extend_from_slice(&remote);
     digest_bytes(&payload)
 }
 
@@ -508,6 +512,25 @@ mod tests {
         fs::write(
             dir.path().join(xai_grok_config::MANAGED_CONFIG_FILENAME),
             "[subagents.toggle]\nexplore = false\n",
+        )
+        .unwrap();
+        let error = mutate_config_document_at(&path, &rendered, 1, set_agent_enabled).unwrap_err();
+        assert!(matches!(error, ConfigMutationError::ConcurrentEdit));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[ui]\ntheme = \"dark\"\n"
+        );
+    }
+
+    #[test]
+    fn transaction_rejects_campaign_state_change_as_concurrent_edit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[ui]\ntheme = \"dark\"\n").unwrap();
+        let rendered = config_mutation_snapshot(&path, 1).unwrap();
+        fs::write(
+            dir.path().join("campaigns_state.json"),
+            "{\"dismissed_ids\":[\"camp-1\"]}\n",
         )
         .unwrap();
         let error = mutate_config_document_at(&path, &rendered, 1, set_agent_enabled).unwrap_err();
