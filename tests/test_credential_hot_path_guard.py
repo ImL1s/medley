@@ -326,6 +326,86 @@ def _macro_rules_defs(masked: str) -> list[tuple[str, int, int]]:
     return defs
 
 
+def _macro_inline_scopes(
+    masked: str, macro_spans: list[tuple[int, int]]
+) -> dict[int, tuple[str, ...]]:
+    """Inline-module scope at each macro start, in one source pass."""
+
+    spans_by_start = dict(macro_spans)
+    scopes: dict[int, tuple[str, ...]] = {}
+    stack: list[tuple[int, str]] = []
+    depth = 0
+    i = 0
+    while i < len(masked):
+        macro_end = spans_by_start.get(i)
+        if macro_end is not None:
+            scopes[i] = tuple(name for _, name in stack)
+            i = macro_end
+            continue
+        mod_open = _INLINE_MOD_OPEN.match(masked, i)
+        if mod_open:
+            stack.append((depth, mod_open.group(1)))
+            depth += 1
+            i = mod_open.end()
+            continue
+        if masked[i] == "{":
+            depth += 1
+        elif masked[i] == "}":
+            depth -= 1
+            while stack and depth <= stack[-1][0]:
+                stack.pop()
+        i += 1
+    return scopes
+
+
+def _scoped_macro_rules_sources(
+    masked: str,
+) -> tuple[tuple[str, int, tuple[str, ...]], ...]:
+    """`(source, end, inline scope)` for this file's macro definitions."""
+
+    defs = _macro_rules_defs(masked)
+    if not defs:
+        return ()
+    starts = [masked.rfind("macro_rules", 0, start) for _, start, _ in defs]
+    spans = sorted(
+        (start, end)
+        for start, (_name, _body_start, end) in zip(starts, defs)
+        if start >= 0
+    )
+    scopes = _macro_inline_scopes(masked, spans)
+    return tuple(
+        (
+            masked[start:body_end],
+            body_end,
+            scopes.get(start, ()),
+        )
+        for start, (_name, _body_start, body_end) in zip(starts, defs)
+        if start >= 0
+    )
+
+
+def _macro_rules_sources_before(
+    definitions: tuple[tuple[str, int, tuple[str, ...]], ...],
+    before: int,
+    scope: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Macro definitions lexically available before a child `mod` item.
+
+    External module files inherit the parent's textual `macro_rules!` scope.
+    Keep the nearest definition first so a later parent definition shadows an
+    earlier definition with the same name, as rustc does.
+    """
+
+    sources: list[str] = []
+    for source, body_end, def_scope in definitions:
+        if body_end > before:
+            continue
+        if scope[: len(def_scope)] == def_scope:
+            sources.append(source)
+    sources.reverse()
+    return tuple(sources)
+
+
 def _invoked_macro_names(
     masked: str, defs: list[tuple[str, int, int]]
 ) -> set[str]:
@@ -1125,8 +1205,9 @@ def _iter_module_decls(
     *,
     as_crate_root: bool = False,
     enabled_features: set[str] | frozenset[str] | None = None,
-) -> list[tuple[str, Path, tuple[str, ...]]]:
-    """`(name, child file, enclosing inline modules)` for `#[path]` and
+    masked: str | None = None,
+) -> list[tuple[str, Path, tuple[str, ...], int]]:
+    """`(name, child file, enclosing inline modules, source offset)` for `#[path]` and
     ordinary `mod name;` that resolve.
 
     `mod inner;` inside `mod outer { ... }` is loaded from `outer/inner.rs`
@@ -1135,14 +1216,15 @@ def _iter_module_decls(
     it as `outer::inner::...` (#507 review).
     """
 
-    decls: list[tuple[str, Path, tuple[str, ...]]] = []
+    decls: list[tuple[str, Path, tuple[str, ...], int]] = []
     pending_path: str | None = None
     pending_attrs: list[str] = []
     pending_mod = False
     pending_path_frag: str | None = None
     pending_path_mask: str | None = None
     raw_lines = text.splitlines()
-    masked = _mask_rust_literals(text)
+    if masked is None:
+        masked = _mask_rust_literals(text)
     masked_lines = masked.splitlines()
     if len(masked_lines) < len(raw_lines):
         masked_lines.extend([""] * (len(raw_lines) - len(masked_lines)))
@@ -1211,11 +1293,11 @@ def _iter_module_decls(
                     # rustc loads `outer/<path>` (#507 review).
                     base = search if inline_names else declaring.parent
                     child = (base / pending_path).resolve()
-                    decls.append((name, child, inline_names))
+                    decls.append((name, child, inline_names, line_start))
                 else:
                     child = _existing_mod_file(search, name)
                     if child is not None:
-                        decls.append((name, child, inline_names))
+                        decls.append((name, child, inline_names, line_start))
             pending_path = None
             pending_attrs = []
         elif not path_match:
@@ -1252,7 +1334,7 @@ def _iter_module_decls(
 
 def _declared_module_overrides(
     root: Path,
-) -> dict[Path, list[tuple[list[str], str]]]:
+) -> dict[Path, list[tuple[list[str], str, tuple[str, ...]]]]:
     """Logical module prefixes for files reached via `mod` / `#[path]`.
 
     Ordinary `mod common;` from several integration roots counts once per
@@ -1263,9 +1345,16 @@ def _declared_module_overrides(
     `--test shared_http_wire` is `test:shared_http_wire` not
     `test:common` (#507 review).
     """
-    overrides: dict[Path, list[tuple[list[str], str]]] = {}
+    overrides: dict[Path, list[tuple[list[str], str, tuple[str, ...]]]] = {}
     queue: deque[
-        tuple[Path, tuple[str, ...], tuple[Path, ...], bool, str]
+        tuple[
+            Path,
+            tuple[str, ...],
+            tuple[Path, ...],
+            bool,
+            str,
+            tuple[str, ...],
+        ]
     ] = deque()
     texts: dict[Path, str] = {}
 
@@ -1300,11 +1389,14 @@ def _declared_module_overrides(
                         (),
                         True,
                         _cargo_target_of(rs, extra_roots, test_names),
+                        (),
                     )
                 )
 
     while queue:
-        declaring, prefix, ancestors, as_crate_root, root_target = queue.popleft()
+        declaring, prefix, ancestors, as_crate_root, root_target, macro_env = (
+            queue.popleft()
+        )
         if declaring in ancestors:
             continue
         text = read_rs(declaring)
@@ -1313,16 +1405,27 @@ def _declared_module_overrides(
         enabled = _features_for(declaring, crate_feats)
         if _file_inner_cfg_inactive(text, enabled):
             continue
-        for name, child, inline_names in _iter_module_decls(
+        masked = _mask_rust_literals(text)
+        scoped_macros = _scoped_macro_rules_sources(masked)
+        for name, child, inline_names, decl_offset in _iter_module_decls(
             text,
             declaring,
             extra_roots,
             gated_roots,
             as_crate_root=as_crate_root,
             enabled_features=enabled,
+            masked=masked,
         ):
             child_prefix = list(prefix) + list(inline_names) + [name]
-            overrides.setdefault(child, []).append((child_prefix, root_target))
+            child_macro_env = (
+                _macro_rules_sources_before(
+                    scoped_macros, decl_offset, inline_names
+                )
+                + macro_env
+            )
+            overrides.setdefault(child, []).append(
+                (child_prefix, root_target, child_macro_env)
+            )
             queue.append(
                 (
                     child,
@@ -1330,6 +1433,7 @@ def _declared_module_overrides(
                     ancestors + (declaring,),
                     False,
                     root_target,
+                    child_macro_env,
                 )
             )
     return overrides
@@ -1665,6 +1769,7 @@ def _tests_in_file(
     text: str,
     file_mods: list[str],
     enabled_features: set[str] | frozenset[str] | None = None,
+    inherited_macros: tuple[str, ...] = (),
 ) -> list[str]:
     if _file_inner_cfg_inactive(text, enabled_features):
         return []
@@ -1679,8 +1784,25 @@ def _tests_in_file(
     if len(brace_lines) < len(raw_lines):
         brace_lines.extend([""] * (len(raw_lines) - len(brace_lines)))
     defs = _macro_rules_defs(masked)
+    macro_env = masked
+    env_defs = defs
+    if inherited_macros:
+        invoked_names = {
+            match.group(1) for match in _MACRO_INVOKE.finditer(masked)
+        }
+        needed_inherited = [
+            source
+            for source in inherited_macros
+            if any(
+                name in invoked_names
+                for name, _start, _end in _macro_rules_defs(source)
+            )
+        ]
+        if needed_inherited:
+            macro_env = masked + "\n" + "\n".join(needed_inherited)
+            env_defs = _macro_rules_defs(macro_env)
     def_spans = [(start, end) for _, start, end in defs]
-    known_macros = {name for name, _, _ in defs}
+    known_macros = {name for name, _, _ in env_defs}
     invoke_at: list[tuple[int, str, str]] = []
     for im in _MACRO_INVOKE.finditer(masked):
         if im.group(1) not in known_macros:
@@ -1833,7 +1955,7 @@ def _tests_in_file(
             mod_stack.pop()
         line_start += len(masked_line) + 1
     for inv_name, inner, prefix in invocations:
-        arm_text = _selected_arm_source(masked, defs, inv_name, inner)
+        arm_text = _selected_arm_source(macro_env, env_defs, inv_name, inner)
         if not arm_text:
             continue
         names.extend(_tests_in_file(arm_text, prefix, enabled_features))
@@ -1842,13 +1964,13 @@ def _tests_in_file(
 
 def _module_prefixes_for_source(
     rs: Path,
-    overrides: dict[Path, list[tuple[list[str], str]]],
+    overrides: dict[Path, list[tuple[list[str], str, tuple[str, ...]]]],
     extra_roots: set[Path] | frozenset[Path] | None = None,
     gated_roots: set[Path] | frozenset[Path] | None = None,
     suppressed_libs: set[Path] | frozenset[Path] | None = None,
     no_autotest: set[Path] | frozenset[Path] | None = None,
     test_names: dict[Path, str] | None = None,
-) -> list[tuple[list[str], str]] | None:
+) -> list[tuple[list[str], str, tuple[str, ...]]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
     Cargo crate roots (`src/lib.rs`, `tests/*.rs`, explicit `[lib] path`
@@ -1861,13 +1983,13 @@ def _module_prefixes_for_source(
     """
 
     key = rs.resolve()
-    prefixes: list[tuple[list[str], str]] = []
+    prefixes: list[tuple[list[str], str, tuple[str, ...]]] = []
     if key in overrides:
         prefixes.extend(overrides[key])
     if _is_cargo_crate_root_file(
         rs, extra_roots, gated_roots, suppressed_libs, no_autotest
     ):
-        root_entry = ([], _cargo_target_of(rs, extra_roots, test_names))
+        root_entry = ([], _cargo_target_of(rs, extra_roots, test_names), ())
         if root_entry not in prefixes:
             prefixes.append(root_entry)
     return prefixes or None
@@ -1921,8 +2043,10 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
             if prefix_lists is None:
                 continue
             pkg = _package_name_for(rs, pkg_cache)
-            for file_mods, target in prefix_lists:
-                for name in _tests_in_file(text, file_mods, enabled):
+            for file_mods, target, inherited_macros in prefix_lists:
+                for name in _tests_in_file(
+                    text, file_mods, enabled, inherited_macros
+                ):
                     records.append(_TestRecord(pkg, target, name))
     return records
 
@@ -3298,6 +3422,43 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_generated"])
+
+    def test_parent_macro_rules_test_in_external_child_is_counted(self):
+        """A parent macro defined before `mod child;` is lexically visible
+        inside the external child module (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    macro_rules! generated {
+                        ($name:ident) => {
+                            #[test]
+                            fn $name() {}
+                        };
+                    }
+                    mod child;
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (src / "child.rs").write_text(
+                "generated!(none_auth_scheme_inherited);\n",
+                encoding="utf-8",
+            )
+
+            self.assertIn(
+                "child::none_auth_scheme_inherited",
+                _qualified_test_names(root),
+            )
 
     def test_unselected_macro_arm_test_is_not_counted(self):
         """`generated!(cold)` must not count a sibling `(hot)` arm
