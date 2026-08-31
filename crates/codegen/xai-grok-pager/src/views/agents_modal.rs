@@ -773,26 +773,6 @@ fn capture_config_snapshot(
     crate::config_toml_edit::config_mutation_snapshot(&path, generation).ok()
 }
 
-fn load_user_config_toggle(path: &Path) -> HashMap<String, bool> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
-        return HashMap::new();
-    };
-    let Some(table) = doc
-        .get("subagents")
-        .and_then(|v| v.get("toggle"))
-        .and_then(|v| v.as_table())
-    else {
-        return HashMap::new();
-    };
-    table
-        .iter()
-        .filter_map(|(k, v)| v.as_bool().map(|b| (k.to_string(), b)))
-        .collect()
-}
-
 fn capture_locked_config_state(
     generation: u64,
     cwd: &Path,
@@ -809,7 +789,7 @@ fn capture_locked_config_state(
         capture_config_snapshot(generation),
         load_config_agent_name(),
         resolve_default_agent_name(cwd, model_agent_type),
-        load_user_config_toggle(&path),
+        load_agent_toggle(),
     )
 }
 /// Set or clear the default agent via `[agent] name` in config.toml.
@@ -2845,7 +2825,7 @@ mod tests {
             .expect("explore agent");
         assert!(
             !explore.enabled,
-            "toggle must come from locked config.toml, not the caller map"
+            "effective toggle must be loaded under the CAS lock, not the caller map"
         );
         assert!(state.config_snapshot.is_some());
     }

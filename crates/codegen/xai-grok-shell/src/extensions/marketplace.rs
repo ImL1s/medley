@@ -1309,6 +1309,19 @@ fn purge_default_skills_installs_impl(
         return;
     }
 
+    // Same lock order as `handle_add_source` / official auto-register:
+    // config.toml.lock then init lock, then the marker write.
+    let _cfg = match xai_grok_config::fs_atomic::lock_config_file(&config_path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %config_path.display(),
+                "skipping default-skills purge: failed to lock config.toml"
+            );
+            return;
+        }
+    };
     let _lock = match acquire_init_lock(grok_home) {
         Ok(f) => f,
         Err(e) => {
@@ -1876,6 +1889,7 @@ mod default_skills_purge_tests {
         });
         let config_path = home.join("config.toml");
         assert!(read_default_skills_installs_purged(&config_path));
+        assert!(xai_grok_config::fs_atomic::config_lock_path(&config_path).is_file());
 
         let after_first = std::fs::read_to_string(&config_path).unwrap();
         purge_default_skills_installs_impl(home, || Ok(InstallRegistry::empty(install_dir)));
