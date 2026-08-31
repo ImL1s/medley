@@ -682,6 +682,15 @@ def _consume_kind(tokens: list[str], cursor: int, kind: str) -> int | None:
                     return index
             elif token == "," and depth == 0:
                 return index if index > cursor else None
+            elif (
+                depth == 0
+                and token == "="
+                and index + 1 < len(tokens)
+                and tokens[index + 1] == ">"
+            ):
+                # `($e:expr => $name:ident)`: `_ARM_TOKEN` splits `=>`
+                # into `=` and `>` (#507 review).
+                return index if index > cursor else None
             index += 1
         return index if index > cursor else None
     return cursor + 1
@@ -1334,10 +1343,29 @@ def _feature_closure(features: object, roots: set[str]) -> set[str]:
     while stack:
         name = stack.pop()
         for dep in _toml_str_list(table.get(name)):
+            if dep.startswith("dep:"):
+                continue
             if dep not in enabled:
                 enabled.add(dep)
                 stack.append(dep)
     return enabled
+
+
+def _suppressed_optional_features(data: dict) -> set[str]:
+    """Optional-dep names referenced as `dep:name` in `[features]`.
+
+    That form suppresses Cargo's implicit same-named feature (#507 review).
+    """
+
+    names: set[str] = set()
+    feats = data.get("features")
+    if not isinstance(feats, dict):
+        return names
+    for value in feats.values():
+        for item in _toml_str_list(value):
+            if item.startswith("dep:"):
+                names.add(item[4:])
+    return names
 
 
 def _manifest_default_features(text: str) -> set[str]:
@@ -1418,7 +1446,12 @@ def _cargo_test_targets(
             )
             if all_features:
                 enabled = _feature_closure(
-                    feat_table, set(feat_table) | _optional_dep_features(data)
+                    feat_table,
+                    set(feat_table)
+                    | (
+                        _optional_dep_features(data)
+                        - _suppressed_optional_features(data)
+                    ),
                 )
             elif no_default_features:
                 enabled = _feature_closure(feat_table, set(extra_features))
@@ -3151,42 +3184,56 @@ def _qualified_test_records(
     )
     records: list[_TestRecord] = []
     pkg_cache: dict[Path, str] = {}
+    candidates: list[Path] = []
+    seen: set[Path] = set()
     for base in _CRATE_ROOTS:
         base_dir = root / base
         if not base_dir.is_dir():
             continue
         for rs in base_dir.rglob("*.rs"):
-            if (
-                not _is_lib_or_integration_source(rs, extra_roots)
-                and rs.resolve() not in overrides
+            key = rs.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(rs)
+    for extra in overrides:
+        key = extra.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(extra)
+    for rs in candidates:
+        if (
+            not _is_lib_or_integration_source(rs, extra_roots)
+            and rs.resolve() not in overrides
+        ):
+            continue
+        try:
+            text = rs.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        prefix_lists = _module_prefixes_for_source(
+            rs,
+            overrides,
+            extra_roots,
+            gated_roots,
+            suppressed_libs,
+            no_autotest,
+            test_names,
+            lib_roots,
+            crate_feats,
+        )
+        if prefix_lists is None:
+            continue
+        for file_mods, target, inherited_macros, origin_pkg, enabled in prefix_lists:
+            if _file_inner_cfg_inactive(text, enabled):
+                continue
+            pkg = origin_pkg or _package_name_for(rs, pkg_cache)
+            extra_macros = _EXPORTED_MACROS.get(rs.resolve(), ())
+            for name in _tests_in_file(
+                text, file_mods, enabled, inherited_macros + extra_macros
             ):
-                continue
-            try:
-                text = rs.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            prefix_lists = _module_prefixes_for_source(
-                rs,
-                overrides,
-                extra_roots,
-                gated_roots,
-                suppressed_libs,
-                no_autotest,
-                test_names,
-                lib_roots,
-                crate_feats,
-            )
-            if prefix_lists is None:
-                continue
-            for file_mods, target, inherited_macros, origin_pkg, enabled in prefix_lists:
-                if _file_inner_cfg_inactive(text, enabled):
-                    continue
-                pkg = origin_pkg or _package_name_for(rs, pkg_cache)
-                extra_macros = _EXPORTED_MACROS.get(rs.resolve(), ())
-                for name in _tests_in_file(
-                    text, file_mods, enabled, inherited_macros + extra_macros
-                ):
-                    records.append(_TestRecord(pkg, target, name))
+                records.append(_TestRecord(pkg, target, name))
     return records
 
 
@@ -3604,6 +3651,42 @@ class CiPackageTargetCounts(unittest.TestCase):
                 records_for_feat, "none_auth_scheme_", lanes
             )
             self.assertEqual([r.name for r in matched], ["none_auth_scheme_dep"])
+
+    def test_all_features_suppresses_dep_colon_optional_features(self):
+        """`hot = [\"dep:dep\"]` does not enable `feature = \"dep\"`
+        under `--all-features` (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"xai-grok-sampler\"\n\n"
+                "[features]\nhot = [\"dep:dep\"]\n\n"
+                "[dependencies]\n"
+                'dep = { version = "1.0", optional = true }\n',
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[cfg(feature = \"hot\")]\n"
+                "#[test]\nfn none_auth_scheme_hot() {}\n"
+                "#[cfg(feature = \"dep\")]\n"
+                "#[test]\nfn none_auth_scheme_dep() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --all-features "
+                "--lib none_auth_scheme_ -- --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
+            feat = frozenset({ALL_FEATURES_TOKEN})
+            records_for_feat = {
+                feat: _qualified_test_records(root, extra_features=feat)
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "none_auth_scheme_", lanes
+            )
+            self.assertEqual([r.name for r in matched], ["none_auth_scheme_hot"])
 
     def test_default_cfg_name_is_enabled_with_manifest_defaults(self):
         """Cargo enables `feature = \"default\"` when defaults are on
@@ -4152,6 +4235,20 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_included", names)
+
+    def test_include_non_rs_extension_is_scanned(self):
+        """`include!(\"tests.inc\")` still contributes tests (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text('include!("tests.inc");\n')
+            (src / "tests.inc").write_text(
+                "#[test]\nfn none_auth_scheme_inc() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_inc", names)
 
     def test_braced_include_literal_is_scanned(self):
         """`include! { \"included.rs\" }` splices tests (#507 review)."""
@@ -5990,6 +6087,25 @@ class ExternalModulePrefix(unittest.TestCase):
         )
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_from_type"])
+
+    def test_macro_expr_fragment_stops_at_fat_arrow(self):
+        """`($e:expr => $name:ident)` accepts `1 + 2 => name` (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! make_test {
+                ($e:expr => $name:ident) => {
+                    #[test]
+                    fn $name() {
+                        let _ = $e;
+                    }
+                };
+            }
+            make_test!(1 + 2 => none_auth_scheme_expr);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_expr"])
 
     def test_repeated_macro_ident_metavars_are_substituted_before_scan(self):
         """`$($name:ident),*` with two invocation idents emits both
