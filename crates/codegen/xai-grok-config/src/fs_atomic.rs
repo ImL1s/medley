@@ -72,9 +72,10 @@ pub fn resolve_write_path(path: &Path) -> std::io::Result<PathBuf> {
 
 /// Atomic temp + rename so a torn write can't leave a half-written file. The temp
 /// name is unique per writer (pid + counter) and `create_new`, so concurrent
-/// writers don't collide. `mode` (unix only) is applied at temp-file creation, so
-/// the final file never exists with looser permissions. Existing symlinks are
-/// followed so the write updates the target instead of replacing the link.
+/// writers don't collide. `mode` (unix only) is applied at temp-file creation
+/// and then again with `set_permissions` so umask cannot strip group bits
+/// (e.g. 0640 with umask 077). Existing symlinks are followed so the write
+/// updates the target instead of replacing the link.
 pub fn write_atomically(
     final_path: &Path,
     contents: &str,
@@ -101,10 +102,17 @@ pub fn write_atomically(
     }
     #[cfg(not(unix))]
     let _ = mode;
-    let result = options
-        .open(&tmp)
-        .and_then(|mut f| f.write_all(contents.as_bytes()))
-        .and_then(|()| std::fs::rename(&tmp, final_path));
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        drop(file);
+        std::fs::rename(&tmp, final_path)
+    })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -179,6 +187,26 @@ mod tests {
         assert!(write_atomically(&link, "new\n", None).is_err());
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
         assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_applies_saved_mode_after_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        unsafe extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        let prev = unsafe { umask(0o077) };
+        let result = write_atomically(&path, "new\n", Some(0o640));
+        unsafe { umask(prev) };
+        result.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "umask must not strip dest group bits");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
     }
 
     #[cfg(unix)]

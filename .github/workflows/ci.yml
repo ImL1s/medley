@@ -1085,6 +1085,8 @@ jobs:
             atomic_write_string_creates_temp_with_destination_mode -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             project_mcp_mutations_pin_symlink_dest_before_read -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
+            write_atomically_applies_saved_mode_after_umask -- --nocapture
 
       - name: Restricted subagent capability boundaries
         run: |

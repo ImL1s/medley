@@ -1337,7 +1337,7 @@ fn purge_default_skills_installs_impl(
         }
     };
 
-    if read_default_skills_installs_purged(&config_path) {
+    if read_default_skills_installs_purged(&dest) {
         return;
     }
 
