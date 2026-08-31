@@ -16,6 +16,8 @@ Why this exists:
 This script is a pre-merge guard meant to run on a developer machine (or merge
 orchestrator), not inside CI itself. `--evaluate-pr-checks` is the fail-closed
 wrapper for `gh pr checks --json` used by `scripts/merge-pr.sh`.
+`--report-pr-heads` reconciles every commit in a PR with its check runs so a
+cancelled historical run cannot be mistaken for a still-pending current run.
 """
 
 from __future__ import annotations
@@ -47,6 +49,22 @@ SKIPPED_CONCLUSIONS = frozenset({"skipped", "neutral", "cancelled"})
 PR_CHECK_PASS_BUCKETS = frozenset({"pass"})
 PR_CHECK_SKIP_BUCKETS = frozenset({"skipping", "skip", "skipped"})
 PR_CHECK_PENDING_BUCKETS = frozenset({"pending"})
+CHECK_RUN_ACTIVE_STATUSES = frozenset(
+    {"queued", "in_progress", "waiting", "requested", "pending"}
+)
+CHECK_RUN_CONCLUSIONS = frozenset(
+    {
+        "action_required",
+        "cancelled",
+        "failure",
+        "neutral",
+        "skipped",
+        "stale",
+        "startup_failure",
+        "success",
+        "timed_out",
+    }
+)
 
 
 class CiHeadGateError(RuntimeError):
@@ -78,6 +96,18 @@ def gh_json(args: list[str]) -> Any:
         ) from exc
 
 
+def gh_paginated_json(endpoint: str) -> Any:
+    """Load every REST page while preserving page boundaries for validation."""
+
+    result = run_command(["gh", "api", "--paginate", "--slurp", endpoint])
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CiHeadGateError(
+            f"`gh api --paginate --slurp {endpoint}` did not return valid JSON"
+        ) from exc
+
+
 def _is_sha(value: str) -> bool:
     return len(value) == 40 and all(c in string.hexdigits for c in value)
 
@@ -106,6 +136,302 @@ def load_pr_head(repo: str, pr_number: int) -> tuple[str, str, str]:
     if not isinstance(pr_url, str) or not pr_url:
         raise CiHeadGateError("PR URL is missing from `gh pr view`")
     return branch, head_sha.lower(), pr_url
+
+
+def list_pr_commit_shas(repo: str, pr_number: int) -> list[str]:
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError as exc:
+        raise CiHeadGateError("repository must use OWNER/REPO form") from exc
+    if not _printable_label(owner) or not _printable_label(name) or "/" in name:
+        raise CiHeadGateError("repository must use OWNER/REPO form")
+
+    # The REST `pulls/{number}/commits` endpoint has a hard 250-commit cap even
+    # when pagination is requested. The GraphQL commits connection is cursor
+    # paginated, so large synchronization PRs still include their current head.
+    query = """
+query($owner:String!,$name:String!,$number:Int!,$endCursor:String) {
+  repository(owner:$owner,name:$name) {
+    pullRequest(number:$number) {
+      commits(first:100,after:$endCursor) {
+        totalCount
+        nodes { commit { oid } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""".strip()
+    result = run_command(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "--paginate",
+            "--slurp",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={pr_number}",
+            "-f",
+            f"query={query}",
+        ]
+    )
+    try:
+        pages = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CiHeadGateError(
+            "`gh api graphql --paginate --slurp` did not return valid JSON"
+        ) from exc
+    if not isinstance(pages, list):
+        raise CiHeadGateError("PR commits GraphQL API returned a non-array page list")
+    if not pages:
+        raise CiHeadGateError("PR commits GraphQL API returned no pages")
+
+    shas: list[str] = []
+    seen: set[str] = set()
+    total_count: int | None = None
+    for page_index, page in enumerate(pages):
+        try:
+            pull_request = page["data"]["repository"]["pullRequest"]
+            connection = pull_request["commits"]
+            nodes = connection["nodes"]
+            page_info = connection["pageInfo"]
+            page_total = connection["totalCount"]
+        except (KeyError, TypeError) as exc:
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned a malformed page"
+            ) from exc
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise CiHeadGateError("PR commits GraphQL API returned a malformed page")
+        if (
+            not isinstance(page_total, int)
+            or isinstance(page_total, bool)
+            or page_total < 0
+        ):
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned a malformed totalCount"
+            )
+        if total_count is None:
+            total_count = page_total
+        elif page_total != total_count:
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned inconsistent totalCount values"
+            )
+        has_next_page = page_info.get("hasNextPage")
+        end_cursor = page_info.get("endCursor")
+        if not isinstance(has_next_page, bool):
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned malformed pageInfo"
+            )
+        is_last_page = page_index == len(pages) - 1
+        if has_next_page == is_last_page:
+            raise CiHeadGateError(
+                "PR commits GraphQL pagination ended at an inconsistent page"
+            )
+        if has_next_page and not _printable_label(end_cursor):
+            raise CiHeadGateError(
+                "PR commits GraphQL API returned a malformed endCursor"
+            )
+        for row in nodes:
+            if not isinstance(row, dict) or not isinstance(row.get("commit"), dict):
+                raise CiHeadGateError(
+                    "PR commits GraphQL API returned a non-object commit"
+                )
+            sha = row["commit"].get("oid")
+            if not isinstance(sha, str) or not _is_sha(sha):
+                raise CiHeadGateError(
+                    "PR commits GraphQL API returned a malformed commit SHA"
+                )
+            sha = sha.lower()
+            if sha in seen:
+                raise CiHeadGateError(
+                    f"PR commits GraphQL API repeated commit SHA {sha}"
+                )
+            seen.add(sha)
+            shas.append(sha)
+
+    if not shas:
+        raise CiHeadGateError("PR commits GraphQL API returned no commits")
+    if total_count != len(shas):
+        raise CiHeadGateError(
+            "PR commits GraphQL totalCount does not match the paginated commits "
+            f"({total_count} != {len(shas)})"
+        )
+    return shas
+
+
+def _check_run_state(row: dict[str, Any]) -> str:
+    status = row.get("status")
+    if not isinstance(status, str) or status != status.strip():
+        raise CiHeadGateError("check-runs API returned a malformed status")
+    status = status.lower()
+    if status != "completed":
+        if status not in CHECK_RUN_ACTIVE_STATUSES:
+            raise CiHeadGateError(
+                f"check-runs API returned an unknown status {status!r}"
+            )
+        return status
+
+    conclusion = row.get("conclusion")
+    if not isinstance(conclusion, str) or conclusion != conclusion.strip():
+        raise CiHeadGateError(
+            "check-runs API returned a completed run without a conclusion"
+        )
+    conclusion = conclusion.lower()
+    if conclusion not in CHECK_RUN_CONCLUSIONS:
+        raise CiHeadGateError(
+            f"check-runs API returned an unknown conclusion {conclusion!r}"
+        )
+    return conclusion
+
+
+def _plain_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _printable_label(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and value.isprintable()
+    )
+
+
+def _check_run_identity(row: dict[str, Any]) -> tuple[str, int, int]:
+    """Stable identity shared by reruns of one check-suite check."""
+
+    name = row.get("name")
+    app = row.get("app")
+    suite = row.get("check_suite")
+    if not _printable_label(name):
+        raise CiHeadGateError("check-runs API returned an unsafe check run name")
+    if not isinstance(app, dict) or not _plain_positive_int(app.get("id")):
+        raise CiHeadGateError("check-runs API returned a malformed app identity")
+    if not _printable_label(app.get("slug")):
+        raise CiHeadGateError("check-runs API returned an unsafe app slug")
+    if not isinstance(suite, dict) or not _plain_positive_int(suite.get("id")):
+        raise CiHeadGateError(
+            "check-runs API returned a malformed check-suite identity"
+        )
+    return str(name), int(app["id"]), int(suite["id"])
+
+
+def list_commit_check_runs(repo: str, sha: str) -> list[dict[str, Any]]:
+    endpoint = f"repos/{repo}/commits/{sha}/check-runs?filter=all&per_page=100"
+    pages = gh_paginated_json(endpoint)
+    if not isinstance(pages, list):
+        raise CiHeadGateError("check-runs API returned a non-array page list")
+
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    total_count: int | None = None
+    for page in pages:
+        if not isinstance(page, dict):
+            raise CiHeadGateError("check-runs API returned a non-object page")
+        page_total = page.get("total_count")
+        page_rows = page.get("check_runs")
+        if (
+            not isinstance(page_total, int)
+            or isinstance(page_total, bool)
+            or page_total < 0
+        ):
+            raise CiHeadGateError("check-runs API returned a malformed total_count")
+        if total_count is None:
+            total_count = page_total
+        elif page_total != total_count:
+            raise CiHeadGateError("check-runs API returned inconsistent total_count values")
+        if not isinstance(page_rows, list):
+            raise CiHeadGateError("check-runs API returned a non-array check_runs value")
+
+        for row in page_rows:
+            if not isinstance(row, dict):
+                raise CiHeadGateError("check-runs API returned a non-object check run")
+            run_id = row.get("id")
+            run_sha = row.get("head_sha")
+            if not _plain_positive_int(run_id):
+                raise CiHeadGateError("check-runs API returned a malformed check run ID")
+            if run_id in seen_ids:
+                raise CiHeadGateError(f"check-runs API repeated check run ID {run_id}")
+            if not isinstance(run_sha, str) or not _is_sha(run_sha):
+                raise CiHeadGateError("check-runs API returned a malformed head SHA")
+            if run_sha.lower() != sha:
+                raise CiHeadGateError(
+                    f"check run {run_id} belongs to a different head SHA"
+                )
+            _check_run_identity(row)
+            _check_run_state(row)
+            seen_ids.add(run_id)
+            rows.append(row)
+
+    if total_count is None:
+        raise CiHeadGateError("check-runs API returned no pages")
+    if len(rows) != total_count:
+        raise CiHeadGateError(
+            "check-runs API total_count does not match the paginated rows "
+            f"({total_count} != {len(rows)})"
+        )
+    return rows
+
+
+def report_pr_head_history(
+    *, repo: str, pr_number: int, stream: TextIO
+) -> int:
+    """Print check-run states for every commit without gating on old states."""
+
+    _branch, current_head, pr_url = load_pr_head(repo, pr_number)
+    commit_shas = list_pr_commit_shas(repo, pr_number)
+    if current_head not in commit_shas:
+        raise CiHeadGateError("PR commit history omits the current head")
+    if commit_shas[-1] != current_head:
+        raise CiHeadGateError("PR commit history does not end at the current head")
+
+    print(f"PR #{pr_number} head history: {pr_url}", file=stream)
+    for sha in commit_shas:
+        current = " (current)" if sha == current_head else ""
+        label = f"head {_short_sha(sha)}{current}"
+        runs = list_commit_check_runs(repo, sha)
+        if not runs:
+            print(f"{label}: absent", file=stream)
+            continue
+
+        print(label, file=stream)
+        attempts_by_identity: dict[
+            tuple[str, int, int], list[dict[str, Any]]
+        ] = {}
+        for row in runs:
+            identity = _check_run_identity(row)
+            attempts_by_identity.setdefault(identity, []).append(row)
+        for name, app_id, suite_id in sorted(attempts_by_identity):
+            attempts = sorted(
+                attempts_by_identity[(name, app_id, suite_id)],
+                key=lambda row: int(row["id"]),
+            )
+            states = [_check_run_state(row) for row in attempts]
+            run_ids = [int(row["id"]) for row in attempts]
+            suffix = f"run={run_ids[-1]}"
+            if len(states) > 1:
+                chain = " -> ".join(
+                    f"{run_id}={state}"
+                    for run_id, state in zip(run_ids, states, strict=True)
+                )
+                suffix += f" attempts: {chain}"
+            app_slug = str(attempts[-1]["app"]["slug"])
+            print(
+                f"  {name}: {states[-1]} "
+                f"[{suffix}; app={app_slug}#{app_id}; suite={suite_id}]",
+                file=stream,
+            )
+
+    print(
+        "note: historical states are report-only; the exact current-head gates "
+        "below remain authoritative",
+        file=stream,
+    )
+    return 0
 
 
 def remote_head_sha(remote: str, branch: str) -> str:
@@ -555,6 +881,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     target.add_argument("--pr", type=int, help="Pull request number")
     target.add_argument("--branch", help="Branch name to probe directly")
     target.add_argument(
+        "--report-pr-heads",
+        type=int,
+        metavar="PR",
+        help="Report check-run states for every commit in a pull request",
+    )
+    target.add_argument(
         "--evaluate-pr-checks",
         action="store_true",
         help=(
@@ -594,6 +926,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.head_sha is not None:
             raise CiHeadGateError("--head-sha cannot be used with --evaluate-pr-checks")
         return run_evaluate_pr_checks(sys.stdin, sys.stdout, sys.stderr)
+    if args.report_pr_heads is not None:
+        if args.head_sha is not None:
+            raise CiHeadGateError("--head-sha cannot be used with --report-pr-heads")
+        if args.report_pr_heads <= 0:
+            raise CiHeadGateError("--report-pr-heads must be a positive integer")
+        return report_pr_head_history(
+            repo=args.repo,
+            pr_number=args.report_pr_heads,
+            stream=sys.stdout,
+        )
     if args.limit <= 0:
         raise CiHeadGateError("--limit must be a positive integer")
     if args.pr is not None and args.head_sha is not None:
