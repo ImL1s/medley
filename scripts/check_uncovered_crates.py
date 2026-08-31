@@ -40,9 +40,10 @@ from pathlib import Path
 # oldest copy received never reached the others (#494).
 from toml_package_name import package_name
 
+_RUST_ATTR_IDENT = r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*"
 _TEST_ATTR = re.compile(
-    r"^\s*#\s*\[\s*(?:::\s*)?(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*"
-    r"test\b(?=\s*(?:\(|\]))",
+    rf"^\s*#\s*\[\s*(?:::\s*)?(?:{_RUST_ATTR_IDENT}\s*::\s*)*"
+    r"(?:r#)?test\b(?=\s*(?:\(|\]))",
     re.MULTILINE,
 )
 _RUST_RAW_STRING_START = re.compile(r'(?:br|cr|r)(?P<hashes>#+)?"')

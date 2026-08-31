@@ -342,6 +342,8 @@ class SrcHasTests(unittest.TestCase):
                 "nested": "#[some :: deeply_nested :: test]",
                 "absolute": "#[::tokio::test]",
                 "with_args": '#[tokio::test(flavor = "current_thread")]',
+                "raw_module": "#[r#async::test]",
+                "raw_test": "#[r#test]",
             }.items():
                 crate = _crate(root, rel, rel, f"{attribute}\nfn t() {{}}\n")
                 with self.subTest(attribute=attribute):
