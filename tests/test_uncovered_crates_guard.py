@@ -331,6 +331,108 @@ class SrcHasTests(unittest.TestCase):
             self.assertFalse(src_has_tests(integ))
             self.assertFalse(src_has_tests(comment))
 
+    def test_accepts_module_qualified_and_spaced_test_attributes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, attribute in {
+                "rstest": "#[rstest::test]",
+                "serial": "#[serial_test::test]",
+                "spaced_hash": "# [test]",
+                "spaced_path": "#[ tokio :: test ]",
+                "nested": "#[some :: deeply_nested :: test]",
+                "absolute": "#[::tokio::test]",
+                "with_args": '#[tokio::test(flavor = "current_thread")]',
+                "brace_args": "#[pm::test{}]",
+                "bracket_args": "#[pm::test[args]]",
+                "raw_module": "#[r#async::test]",
+                "raw_test": "#[r#test]",
+                "unicode_module": "#[异步::test]",
+                "raw_unicode_module": "#[r#异步::test]",
+            }.items():
+                crate = _crate(root, rel, rel, f"{attribute}\nfn t() {{}}\n")
+                with self.subTest(attribute=attribute):
+                    self.assertTrue(src_has_tests(crate))
+
+    def test_accepts_hygienic_crate_test_attribute_in_macro(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crate = _crate(
+                root,
+                "macro_crate",
+                "macro_crate",
+                "pub use core::prelude::v1::test;\n"
+                "macro_rules! generated_test {\n"
+                "    () => {\n"
+                "        #[$crate::test]\n"
+                "        fn generated() {}\n"
+                "    };\n"
+                "}\n"
+                "generated_test!();\n",
+            )
+            self.assertTrue(src_has_tests(crate))
+
+    def test_comments_docs_and_strings_do_not_count_as_test_attributes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, source in {
+                "line_comment": "// #[rstest::test]\npub fn f() {}\n",
+                "doc_comment": "/// # [ serial_test :: test ]\npub fn f() {}\n",
+                "block_comment": "/* #[some::test] */\npub fn f() {}\n",
+                "string": 'const SPELLING: &str = "#[rstest::test]";\n',
+                "multiline_block_comment": (
+                    "/* example only:\n#[some::test]\nfn sample() {}\n*/\n"
+                ),
+                "nested_block_comment": (
+                    "/* outer\n/* nested */\n#[some::test]\n*/\npub fn f() {}\n"
+                ),
+                "raw_multiline_string": (
+                    'const EXAMPLE: &str = r##"\n#[some::test]\nfn sample() {}\n"##;\n'
+                ),
+                "multiline_string": (
+                    'const EXAMPLE: &str = "example\n#[some::test]\nstill text";\n'
+                ),
+                "lifetime_before_ordinary_string": r'''macro_rules! m { ($($tt:tt)*) => {} }
+m!('r"fake \"
+#[some::test]
+");
+pub fn f() {}
+''',
+                "literal_suffix_before_ordinary_string": r'''macro_rules! m { ($($tt:tt)*) => {} }
+m!(""r"fake \"
+#[some::test]
+");
+pub fn f() {}
+''',
+                "raw_literal_suffix_before_ordinary_string": r'''macro_rules! m { ($($tt:tt)*) => {} }
+m!(r""r"fake \"
+#[some::test]
+");
+pub fn f() {}
+''',
+                "char_literal_suffix_before_ordinary_string": r'''macro_rules! m { ($($tt:tt)*) => {} }
+m!('x'r"fake \"
+#[some::test]
+");
+pub fn f() {}
+''',
+                "nonterminal_test_segment": "#[test::fixture]\npub fn f() {}\n",
+                "cfg": "#[cfg(test)]\npub fn f() {}\n",
+            }.items():
+                crate = _crate(root, rel, rel, source)
+                with self.subTest(source=source):
+                    self.assertFalse(src_has_tests(crate))
+
+    def test_real_attribute_after_multiline_non_code_still_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = (
+                'const EXAMPLE: &str = r#"\n#[some::test]\n"#;\n'
+                "/* another fake:\n#[serial_test::test]\n*/\n"
+                "#[::tokio::test]\nasync fn real_test() {}\n"
+            )
+            crate = _crate(root, "real_after_masked", "real_after_masked", source)
+            self.assertTrue(src_has_tests(crate))
+
 
 class Evaluate(unittest.TestCase):
     def _tree(self) -> tempfile.TemporaryDirectory:

@@ -6,9 +6,12 @@
 see that: it only asks about newly added tests. This is the crate-level
 ratchet for that gap.
 
-Does not invoke cargo. A crate "has tests" when any `src/**/*.rs` line is a
-`#[test]` or `#[tokio::test]` attribute. It is "named" when a `run_nonzero` /
-`cargo test` line in `ci.yml` contains `-p <crate>`, `--package <crate>`, or
+Does not invoke cargo. A crate "has tests" when any `src/**/*.rs` code line is
+a `#[test]` attribute, optionally qualified by a module path (including a
+hygienic leading `$crate`). Comments and string literals are masked before
+this check. It is "named" when a
+`run_nonzero` / `cargo test` line in `ci.yml` contains `-p <crate>`,
+`--package <crate>`, or
 `--manifest-path .../<crate>/Cargo.toml`. A `cargo clippy` or `cargo build`
 mention of the same manifest path does NOT count (#437): clippy proves
 nothing about whether the crate's tests run, and crediting it let every test
@@ -38,7 +41,11 @@ from pathlib import Path
 # oldest copy received never reached the others (#494).
 from toml_package_name import package_name
 
-_TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test\b", re.MULTILINE)
+_ATTRIBUTE_PATH = re.compile(
+    r"^\s*#\s*\[\s*(?P<path>[^\(\{\[\]]+?)(?=\s*[\(\{\[\]])", re.MULTILINE
+)
+_RUST_RAW_STRING_START = re.compile(r'(?:br|cr|r)(?P<hashes>#+)?"')
+_RUST_CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'\n])'")
 _P_FLAG = re.compile(r"(?:^|[\s\\])(?:-p|--package)\s+([A-Za-z0-9][A-Za-z0-9_-]*)")
 _MANIFEST = re.compile(r"--manifest-path\s+(\S+)")
 # A line actually invokes the test binary. Same test as
@@ -107,6 +114,118 @@ class Report:
     stale: frozenset[str]
 
 
+def _skip_literal_suffix(source: str, index: int) -> int:
+    """Consume an identifier suffix attached to a Rust literal token."""
+
+    if index >= len(source) or not source[index].isidentifier():
+        return index
+    index += 1
+    while index < len(source) and ("a" + source[index]).isidentifier():
+        index += 1
+    return index
+
+
+def _skip_quoted(source: str, index: int) -> int:
+    index += 1
+    while index < len(source):
+        if source[index] == "\\":
+            index += 2
+        elif source[index] == '"':
+            return _skip_literal_suffix(source, index + 1)
+        else:
+            index += 1
+    return len(source)
+
+
+def _skip_raw_string(source: str, index: int) -> int | None:
+    match = _RUST_RAW_STRING_START.match(source, index)
+    if not match:
+        return None
+    if index:
+        previous = source[index - 1]
+        # A raw prefix is a token start, not a suffix inside an identifier or
+        # lifetime.  Without this boundary, valid `'r"..."` token adjacency
+        # is mistaken for a raw string beginning at the lifetime's `r`.
+        if previous == "'" or ("a" + previous).isidentifier():
+            return None
+    hashes = match.group("hashes") or ""
+    terminator = '"' + hashes
+    end = source.find(terminator, match.end())
+    if end < 0:
+        return len(source)
+    return _skip_literal_suffix(source, end + len(terminator))
+
+
+def _skip_comment(source: str, index: int) -> int | None:
+    if source.startswith("//", index):
+        end = source.find("\n", index + 2)
+        return len(source) if end < 0 else end
+    if not source.startswith("/*", index):
+        return None
+
+    depth = 1
+    cursor = index + 2
+    while cursor < len(source) and depth:
+        if source.startswith("/*", cursor):
+            depth += 1
+            cursor += 2
+        elif source.startswith("*/", cursor):
+            depth -= 1
+            cursor += 2
+        else:
+            cursor += 1
+    return cursor
+
+
+def _code_only(source: str) -> str:
+    """Mask Rust comments and literals while retaining line boundaries."""
+
+    result = list(source)
+    index = 0
+    while index < len(source):
+        end = _skip_comment(source, index)
+        if end is None:
+            end = _skip_raw_string(source, index)
+        if end is None and source[index] == '"':
+            end = _skip_quoted(source, index)
+        if end is None and source[index] == "'":
+            match = _RUST_CHAR_LITERAL.match(source, index)
+            end = _skip_literal_suffix(source, match.end()) if match else None
+        if end is None:
+            index += 1
+            continue
+        for masked in range(index, end):
+            if result[masked] != "\n":
+                result[masked] = " "
+        index = end
+    return "".join(result)
+
+
+def _has_test_attribute(code: str) -> bool:
+    """Whether a code-only Rust source contains an attribute ending in `test`."""
+
+    for match in _ATTRIBUTE_PATH.finditer(code):
+        path = "".join(match.group("path").split())
+        if path.startswith("::"):
+            path = path[2:]
+        segments = path.split("::")
+        identifiers: list[str] = []
+        for index, segment in enumerate(segments):
+            # `$crate` is macro_rules!'s hygienic crate-root token. It is
+            # accepted only in the leading path position, just as rustc does.
+            if index == 0 and segment == "$crate":
+                identifiers.append(segment)
+                continue
+            identifier = segment[2:] if segment.startswith("r#") else segment
+            if not identifier.isidentifier():
+                break
+            identifiers.append(identifier)
+        else:
+            if identifiers and identifiers[-1] == "test":
+                return True
+    return False
+
+
 def iter_crates(root: Path) -> list[Crate]:
     found: list[Crate] = []
     for base in _CRATE_ROOTS:
@@ -134,7 +253,7 @@ def src_has_tests(crate_dir: Path) -> bool:
             text = rs.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        if _TEST_ATTR.search(text):
+        if _has_test_attribute(_code_only(text)):
             return True
     return False
 
