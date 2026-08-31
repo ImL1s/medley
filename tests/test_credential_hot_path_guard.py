@@ -3590,23 +3590,43 @@ class CredentialHotPathCorpus(unittest.TestCase):
         # another crate without reddening the count (#507 review).
         wrong = {}
         for pattern, expected in self.documented.items():
+            # Dedicated `run_nonzero` tokens stay package/target-scoped.
+            # Patterns with no dedicated invocation (today
+            # `is_secret_free_`) stay repo-wide, while covering longer
+            # filters still contribute cfg-gated feature-lane hits
+            # (#507 review / CLAUDE.md).
+            scopes = _ci_scopes_for_pattern(self.ci_filters, pattern)
             lanes = _ci_feature_lanes(self.ci_by_features, pattern)
-            if lanes:
+            if scopes is not None:
                 matched = _hot_path_matches_for_lanes(
                     self.records_for_feat, pattern, lanes
                 )
-                scopes = {
-                    (crate, target) for crate, _feat, target, _exact in lanes
-                }
             else:
-                scopes = _ci_scopes_for_pattern(self.ci_filters, pattern)
-                matched = _hot_path_matches(self.records, pattern, scopes)
+                matched = list(
+                    _hot_path_matches(self.records, pattern, None)
+                )
+                seen = {
+                    (r.package, r.target, r.name) for r in matched
+                }
+                for record in _hot_path_matches_for_lanes(
+                    self.records_for_feat, pattern, lanes
+                ):
+                    key = (record.package, record.target, record.name)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    matched.append(record)
             if len(matched) != expected:
                 wrong[pattern] = (
                     len(matched),
                     expected,
                     [(r.package, r.target, r.name) for r in matched],
-                    scopes,
+                    scopes
+                    if scopes is not None
+                    else {
+                        (crate, target)
+                        for crate, _feat, target, _exact in lanes
+                    },
                 )
         self.assertEqual(
             wrong,
