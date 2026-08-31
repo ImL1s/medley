@@ -1827,8 +1827,11 @@ def _load_path_overrides(sources: list[tuple[Path, str]]) -> None:
     _PATH_OVERRIDE = {}
     decls: list[tuple[Path, str, str]] = []
     for rel, text in sources:
-        for _start, path, name in _path_mod_decls(text):
-            child = _norm_posix(rel.parent / path)
+        code = _code_only(text)
+        for start, path, name in _path_mod_decls(text):
+            child = _norm_posix(
+                _path_attr_search_dir(rel, code, start) / path
+            )
             decls.append((rel, child, name))
     if not decls:
         return
@@ -2298,6 +2301,77 @@ def _local_value_binding_shadows(body: str, name: str, pos: int) -> bool:
 _LOCAL_CONST_STATIC = re.compile(
     rf"\b(?:const|static)\s+(?:mut\s+)?(?:r#)?({RUST_IDENT_BODY})\b"
 )
+_FN_HEADER = re.compile(rf"\bfn\s+(?:r#)?{RUST_IDENT_BODY}\b")
+_PARAM_BINDING = re.compile(
+    rf"(?<![:.\w])(?:r#)?({RUST_IDENT_BODY})\s*:"
+)
+
+
+def _fn_param_names(params: str) -> set[str]:
+    """Identifiers bound in a function parameter list."""
+
+    names: set[str] = set()
+    depth = 0
+    i = 0
+    n = len(params)
+    while i < n:
+        ch = params[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            i += 1
+            continue
+        if depth == 0:
+            match = _PARAM_BINDING.match(params, i)
+            if match is not None:
+                names.add(_raw_ident(match.group(1)))
+                i = match.end()
+                continue
+        i += 1
+    return names
+
+
+def _fn_param_shadows(body: str, name: str, pos: int) -> bool:
+    """True when `name` is a parameter of the enclosing function (#516)."""
+
+    for header in _FN_HEADER.finditer(body):
+        i = _skip_ws(body, header.end())
+        if i < len(body) and body[i] == "<":
+            depth = 0
+            while i < len(body):
+                if body[i] == "<":
+                    depth += 1
+                elif body[i] == ">":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            i = _skip_ws(body, i)
+        if i >= len(body) or body[i] != "(":
+            continue
+        close = _balanced_end(body, i)
+        params = body[i + 1 : close - 1]
+        if name not in _fn_param_names(params):
+            continue
+        # Binding site in the parameter list itself.
+        if i <= pos < close:
+            return True
+        rest = _skip_ws(body, close)
+        # Skip `-> …` / `where …` until the body brace.
+        while rest < len(body) and body[rest] != "{":
+            if body[rest] in "([{":
+                rest = _balanced_end(body, rest)
+                continue
+            rest += 1
+        if rest >= len(body) or body[rest] != "{":
+            continue
+        body_end = _balanced_end(body, rest)
+        if rest < pos < body_end:
+            return True
+    return False
 
 
 def _is_binding_occurrence(body: str, name: str, pos: int) -> bool:
@@ -2309,6 +2383,27 @@ def _is_binding_occurrence(body: str, name: str, pos: int) -> bool:
     for match in _LOCAL_CONST_STATIC.finditer(body):
         if match.group(1) == name and match.start(1) <= pos < match.end(1):
             return True
+    if _fn_param_shadows(body, name, pos):
+        # Parameter binding sites are not "uses" of a registered static.
+        for header in _FN_HEADER.finditer(body):
+            i = _skip_ws(body, header.end())
+            if i < len(body) and body[i] == "<":
+                depth = 0
+                while i < len(body):
+                    if body[i] == "<":
+                        depth += 1
+                    elif body[i] == ">":
+                        depth -= 1
+                        if depth == 0:
+                            i += 1
+                            break
+                    i += 1
+                i = _skip_ws(body, i)
+            if i >= len(body) or body[i] != "(":
+                continue
+            close = _balanced_end(body, i)
+            if i <= pos < close:
+                return True
     return False
 
 
@@ -2316,9 +2411,12 @@ def _local_item_shadows(body: str, name: str, pos: int) -> bool:
     """True when a block-local `const`/`static`/`let` binds `name` at `pos`.
 
     Function-local items apply to their whole block, unlike `let`
-    bindings which start after the statement (#516 review).
+    bindings which start after the statement (#516 review). Function
+    parameters also shadow registered statics for the fn body (#516).
     """
 
+    if _fn_param_shadows(body, name, pos):
+        return True
     if _local_value_binding_shadows(body, name, pos):
         return True
     for match in _LOCAL_CONST_STATIC.finditer(body):
@@ -2606,12 +2704,36 @@ def _integration_binary_stem(path: Path) -> str | None:
     return None
 
 
-def _path_attr_files(declaring: Path, text: str) -> list[Path]:
-    """Files a `#[path = \"...\"] mod` on `declaring` actually compiles."""
+def _path_attr_search_dir(declaring: Path, code: str, pos: int) -> Path:
+    """Directory a `#[path]` literal is resolved against.
 
+    Rust resolves the literal relative to the directory containing the
+    declaring file, then under enclosing inline modules (#516 review).
+    This differs from ordinary `mod name;` lookup, which uses the stem
+    directory for file modules.
+    """
+
+    search = declaring.parent
+    for seg in _inline_path_at(code, pos):
+        search = search / seg
+    return search
+
+
+def _path_attr_files(declaring: Path, text: str) -> list[Path]:
+    """Files a `#[path = \"...\"] mod` on `declaring` actually compiles.
+
+    Resolve the literal relative to the enclosing inline-module directory
+    under the declaring file's parent (#516 review).
+    """
+
+    code = _code_only(text)
     return [
-        Path(_norm_posix(declaring.parent / path))
-        for _start, path, _name in _path_mod_decls(text)
+        Path(
+            _norm_posix(
+                _path_attr_search_dir(declaring, code, start) / path
+            )
+        )
+        for start, path, _name in _path_mod_decls(text)
     ]
 
 
@@ -2728,10 +2850,12 @@ def _file_process_groups(
         groups[path].add(group)
         binaries.append((path, group))
     for bin_path, group in binaries:
-        pending = [bin_path]
+        pending: list[tuple[Path, dict[str, list[tuple[str, str]]]]] = [
+            (bin_path, {})
+        ]
         seen: set[str] = set()
         while pending:
-            current = pending.pop()
+            current, inherited = pending.pop()
             key = _norm_posix(current)
             if key in seen:
                 continue
@@ -2746,6 +2870,8 @@ def _file_process_groups(
             if text is None:
                 continue
             code = _code_only(text)
+            local_defs = _macro_defs_in_code(code)
+            visible = {**inherited, **local_defs}
             macro_spans = _macro_def_spans(code)
             for match in _MOD_DECL.finditer(code):
                 if _in_spans(match.start(), macro_spans):
@@ -2764,8 +2890,10 @@ def _file_process_groups(
                         continue
                     if group not in groups[path]:
                         groups[path].add(group)
-                    pending.append(path)
-            for invoke_pos, mod_name in _mods_from_invoked_macros(code, text):
+                    pending.append((path, visible))
+            for invoke_pos, mod_name in _mods_from_invoked_macros(
+                code, text, defs=visible
+            ):
                 for path in _declared_mod_files(
                     _mod_search_dir_for(current, code, invoke_pos),
                     mod_name,
@@ -2775,7 +2903,7 @@ def _file_process_groups(
                         continue
                     if group not in groups[path]:
                         groups[path].add(group)
-                    pending.append(path)
+                    pending.append((path, visible))
             for target in _path_attr_files(current, text):
                 for path in groups:
                     if path == current:
@@ -2784,7 +2912,7 @@ def _file_process_groups(
                         continue
                     if group not in groups[path]:
                         groups[path].add(group)
-                    pending.append(path)
+                    pending.append((path, visible))
     out: dict[Path, frozenset[str]] = {}
     for path, _text in sources:
         found = groups.get(path) or set()
@@ -2803,14 +2931,14 @@ def rust_files(scan_root: Path) -> list[Path]:
     for path in scan_root.rglob("*.rs"):
         if path.is_file():
             by_posix[_norm_posix(path)] = path
-    pending: list[Path] = [
-        path for path in by_posix.values() if _is_always_compiled_root(path)
+    pending: list[tuple[Path, dict[str, list[tuple[str, str]]]]] = [
+        (path, {}) for path in by_posix.values() if _is_always_compiled_root(path)
     ]
     seen: set[str] = set()
     reachable: list[Path] = []
     texts: dict[Path, str] = {}
     while pending:
-        current = pending.pop()
+        current, inherited = pending.pop()
         key = _norm_posix(current)
         if key in seen:
             continue
@@ -2823,6 +2951,8 @@ def rust_files(scan_root: Path) -> list[Path]:
                 texts[current] = ""
         text = texts[current]
         code = _code_only(text)
+        local_defs = _macro_defs_in_code(code)
+        visible = {**inherited, **local_defs}
         macro_spans = _macro_def_spans(code)
         for match in _MOD_DECL.finditer(code):
             if _in_spans(match.start(), macro_spans):
@@ -2832,39 +2962,30 @@ def rust_files(scan_root: Path) -> list[Path]:
                 for attr in _preceding_attributes(text, code, match.start())
             ):
                 continue
-            pending.extend(
-                _declared_mod_files(
-                    _mod_search_dir_for(current, code, match.start()),
-                    match.group(1),
-                    by_posix,
-                )
-            )
-        for invoke_pos, mod_name in _mods_from_invoked_macros(code, text):
-            pending.extend(
-                _declared_mod_files(
-                    _mod_search_dir_for(current, code, invoke_pos),
-                    mod_name,
-                    by_posix,
-                )
-            )
+            for child in _declared_mod_files(
+                _mod_search_dir_for(current, code, match.start()),
+                match.group(1),
+                by_posix,
+            ):
+                pending.append((child, visible))
+        for invoke_pos, mod_name in _mods_from_invoked_macros(
+            code, text, defs=visible
+        ):
+            for child in _declared_mod_files(
+                _mod_search_dir_for(current, code, invoke_pos),
+                mod_name,
+                by_posix,
+            ):
+                pending.append((child, visible))
         for target in _path_attr_files(current, text):
-            pending.extend(
-                path
-                for path in by_posix.values()
-                if _path_attr_covers(path, target)
-            )
+            for path in by_posix.values():
+                if _path_attr_covers(path, target):
+                    pending.append((path, visible))
     return sorted(reachable)
 
 
-def _mods_from_invoked_macros(
-    code: str, text: str | None = None
-) -> list[tuple[int, str]]:
-    """`(invoke_pos, mod_name)` for `suite!();` → `mod generated;` (#516).
-
-    `mod` declarations inside uninvoked `macro_rules!` bodies are ignored by
-    the ordinary walk; an invoked arm that emits `mod child;` still compiles
-    `child.rs`, so reachable-source collection must follow it.
-    """
+def _macro_defs_in_code(code: str) -> dict[str, list[tuple[str, str]]]:
+    """`macro_rules!` name → selected arms for the current file."""
 
     defs: dict[str, list[tuple[str, str]]] = {}
     for match in MACRO_DEF.finditer(code):
@@ -2875,6 +2996,27 @@ def _mods_from_invoked_macros(
         if name.startswith("r#"):
             name = name[2:]
         defs[name] = _macro_rule_arms(code[body[0] : body[1]])
+    return defs
+
+
+def _mods_from_invoked_macros(
+    code: str,
+    text: str | None = None,
+    *,
+    defs: dict[str, list[tuple[str, str]]] | None = None,
+) -> list[tuple[int, str]]:
+    """`(invoke_pos, mod_name)` for `suite!();` → `mod generated;` (#516).
+
+    `mod` declarations inside uninvoked `macro_rules!` bodies are ignored by
+    the ordinary walk; an invoked arm that emits `mod child;` still compiles
+    `child.rs`, so reachable-source collection must follow it.
+
+    `defs` may include macros visible from a parent file (`src/lib.rs`
+    defining `suite!` before `mod foo;`, invoked from `src/foo.rs`).
+    """
+
+    if defs is None:
+        defs = _macro_defs_in_code(code)
     def_spans = _macro_def_spans(code)
     out: list[tuple[int, str]] = []
     for match in _macro_invoke_matches(code):
@@ -3787,6 +3929,8 @@ def _generated_test_templates_in_arm(
             arm, code, _position_before_vis(code, match.start())
         )
         is_test = any(_is_test_attr(a) for a in attrs)
+        if any(_attr_cfg_inactive(a) for a in attrs):
+            continue
         held: set[str] = set()
         has_unkeyed = False
         for attr in attrs:
@@ -4412,6 +4556,13 @@ def index_functions(
             macro_name = _raw_ident(invoke.group(2))
             if any(start <= invoke.start() < end for start, end in occupied):
                 continue
+            invoke_attrs = _preceding_attributes(raw, code, invoke.start())
+            if any(_attr_cfg_inactive(a) for a in invoke_attrs):
+                continue
+            if _enclosing_module_cfg_inactive(
+                raw, code, inline_spans, invoke.start()
+            ):
+                continue
             inline_mods = _inline_path_from_spans(inline_spans, invoke.start())
             fn_span = _innermost_span(fn_spans.get(rel, []), invoke.start())
             local_arms = _local_macro_arms(
@@ -4607,7 +4758,7 @@ def _ufcs_calls(body: str) -> list[tuple[str, str, str | None]]:
             index = lt + 1
             continue
         i = _skip_ws(body, i + 2)
-        method = IDENT.match(body, i)
+        method = RUST_IDENT.match(body, i)
         if method is None:
             index = lt + 1
             continue

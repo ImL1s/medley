@@ -6680,6 +6680,72 @@ class DefaultScanRoots(unittest.TestCase):
                     ["src/lib.rs"],
                 )
 
+    def test_parent_defined_macro_mod_is_collected_in_child(self):
+        """`suite!` in lib.rs invoked from foo.rs still emits
+        foo/generated.rs (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            (src_dir / "foo").mkdir(parents=True)
+            (src_dir / "lib.rs").write_text(
+                "macro_rules! suite { () => { mod generated; }; }\n"
+                "mod foo;\n",
+                encoding="utf-8",
+            )
+            (src_dir / "foo.rs").write_text("suite!();\n", encoding="utf-8")
+            (src_dir / "foo" / "generated.rs").write_text(
+                "pub fn x() {}\n", encoding="utf-8"
+            )
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                sorted(path.as_posix() for path, _text in sources),
+                ["src/foo.rs", "src/foo/generated.rs", "src/lib.rs"],
+            )
+
+    def test_path_attr_inside_inline_module_uses_inline_directory(self):
+        """`mod outer { #[path] mod generated; }` resolves under
+        outer/ (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            (src_dir / "outer").mkdir(parents=True)
+            (src_dir / "lib.rs").write_text(
+                "mod outer {\n"
+                '    #[path = "generated.rs"]\n'
+                "    mod generated;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (src_dir / "outer" / "generated.rs").write_text(
+                "pub fn x() {}\n", encoding="utf-8"
+            )
+            (src_dir / "generated.rs").write_text(
+                "pub fn sibling() {}\n", encoding="utf-8"
+            )
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                sorted(path.as_posix() for path, _text in sources),
+                ["src/lib.rs", "src/outer/generated.rs"],
+            )
+
+    def test_fn_parameter_does_not_touch_registered_static(self):
+        """`fn helper(COUNTER: u64)` uses a parameter, not the static
+        (#516 review)."""
+
+        body = "fn assert_value(COUNTER: u64) { let _ = COUNTER; }"
+        pos = body.rindex("COUNTER")
+        self.assertTrue(guard._local_item_shadows(body, "COUNTER", pos))
+
+    def test_ufcs_unicode_method_is_recognized(self):
+        """UFCS method names use the Rust identifier grammar (#516)."""
+
+        self.assertEqual(
+            guard._ufcs_calls("<State>::incrément()"),
+            [("State", "incrément", None)],
+        )
+
     def test_file_module_children_live_in_the_stem_directory(self):
         """`mod bar;` in `src/foo.rs` loads `src/foo/bar.rs`, not
         `src/bar.rs` (#516 review)."""
