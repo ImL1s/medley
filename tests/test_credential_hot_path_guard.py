@@ -1269,57 +1269,65 @@ def _filters_contain_pattern(filters: set[str], pattern: str) -> bool:
 def _ci_feature_lanes(
     by_features: dict[str, dict[frozenset[str], dict[str, set[str]]]],
     pattern: str,
-) -> list[tuple[str, frozenset[str], str, bool]]:
-    """`(package, --features set, target, exact)` lanes whose filter is `pattern`.
+) -> list[tuple[str, frozenset[str], str, bool, str]]:
+    """`(package, --features set, target, exact, filter)` lanes for `pattern`.
 
     A longer CI filter that contains `pattern` (for example
     `provider_error_body_preview_is_secret_free_and_bounded` covering
     documented `is_secret_free_`) still selects that lane's feature set
-    so cfg-gated matches are counted (#507 review).
+    so cfg-gated matches are counted. Matching uses the lane's actual
+    filter token, not the shorter documented pattern (#507 review).
     """
 
-    found: list[tuple[str, frozenset[str], str, bool]] = []
+    found: list[tuple[str, frozenset[str], str, bool, str]] = []
     for crate, featmap in by_features.items():
         for feat, targets in featmap.items():
             for target, filters in targets.items():
-                matched_exact: bool | None = None
+                hit: tuple[bool, str] | None = None
                 if (EXACT_PREFIX + pattern) in filters:
-                    matched_exact = True
+                    hit = (True, pattern)
                 elif pattern in filters:
-                    matched_exact = False
+                    hit = (False, pattern)
                 else:
                     for filt in filters:
                         if filt.startswith(EXACT_PREFIX):
                             token = filt[len(EXACT_PREFIX) :]
                             if pattern != token and pattern in token:
-                                matched_exact = False
+                                hit = (True, token)
                                 break
                         elif pattern != filt and pattern in filt:
-                            matched_exact = False
+                            hit = (False, filt)
                             break
-                if matched_exact is not None:
-                    found.append((crate, feat, target, matched_exact))
+                if hit is not None:
+                    exact, token = hit
+                    found.append((crate, feat, target, exact, token))
     return found
 
 
 def _hot_path_matches_for_lanes(
     records_for_feat: dict[frozenset[str], list[_TestRecord]],
     pattern: str,
-    lanes: list[tuple[str, frozenset[str], str, bool]],
+    lanes: list[tuple[str, frozenset[str], str, bool, str]],
 ) -> list[_TestRecord]:
-    """Count tests that actually exist in each matching CI lane's feature set."""
+    """Count tests selected by each lane's actual CI filter under its features.
 
+    `pattern` is retained for call-site clarity; matching uses each lane's
+    `filter` token so a covering longer filter cannot also select unrelated
+    names that only share the documented substring (#507 review).
+    """
+
+    _ = pattern
     hits: list[_TestRecord] = []
     seen: set[tuple[str, str, str]] = set()
-    for crate, feat, target, exact in lanes:
+    for crate, feat, target, exact, filt in lanes:
         records = records_for_feat.get(feat)
         if records is None:
             continue
         for record in records:
             if exact:
-                if record.name != pattern:
+                if record.name != filt:
                     continue
-            elif pattern not in record.name:
+            elif filt not in record.name:
                 continue
             if record.package != crate:
                 continue
@@ -3537,7 +3545,7 @@ class CredentialHotPathCorpus(unittest.TestCase):
         )
         needed: set[frozenset[str]] = set()
         for pattern in cls.documented:
-            for _crate, feat, _target, _exact in _ci_feature_lanes(
+            for _crate, feat, _target, _exact, _filt in _ci_feature_lanes(
                 cls.ci_by_features, pattern
             ):
                 if feat:
@@ -3625,7 +3633,7 @@ class CredentialHotPathCorpus(unittest.TestCase):
                     if scopes is not None
                     else {
                         (crate, target)
-                        for crate, _feat, target, _exact in lanes
+                        for crate, _feat, target, _exact, _filt in lanes
                     },
                 )
         self.assertEqual(
@@ -3837,6 +3845,9 @@ class CiPackageTargetCounts(unittest.TestCase):
                 "#[cfg(feature = \"hot\")]\n"
                 "#[test]\n"
                 "fn provider_error_body_preview_is_secret_free_and_bounded() {}\n"
+                "#[cfg(feature = \"hot\")]\n"
+                "#[test]\n"
+                "fn unrelated_is_secret_free_case() {}\n"
                 "#[test]\n"
                 "fn unrelated_cold_case() {}\n",
                 encoding="utf-8",
@@ -3849,6 +3860,15 @@ class CiPackageTargetCounts(unittest.TestCase):
             by_feat = parse_workflow_by_features(wf, root=root)
             lanes = _ci_feature_lanes(by_feat, "is_secret_free_")
             self.assertTrue(lanes)
+            self.assertEqual(
+                {(exact, filt) for _c, _f, _t, exact, filt in lanes},
+                {
+                    (
+                        False,
+                        "provider_error_body_preview_is_secret_free_and_bounded",
+                    )
+                },
+            )
             records_for_feat = {
                 frozenset(): _qualified_test_records(root),
                 frozenset({"hot"}): _qualified_test_records(
