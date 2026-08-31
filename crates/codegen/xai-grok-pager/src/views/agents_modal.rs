@@ -311,16 +311,17 @@ impl AgentsModalState {
     /// populating personas from `bundle`.
     pub fn new(
         cwd: &Path,
-        toggle: &HashMap<String, bool>,
+        _toggle: &HashMap<String, bool>,
         bundle: &BundleState,
         model_agent_type: Option<&str>,
         active_agent: Option<String>,
     ) -> Self {
-        // Mutation CAS snapshots the pinned user file; row enablement must use
-        // the caller-supplied effective toggle map (managed/requirements/campaign).
-        let (config_snapshot, config_agent_name, default_agent, _user_toggle) =
+        // Effective toggles are loaded inside capture_locked_config_state's
+        // overlay digest window so rows and the mutation snapshot stay paired.
+        // The caller-supplied map is ignored (kept for API stability).
+        let (config_snapshot, config_agent_name, default_agent, effective_toggle) =
             capture_locked_config_state(1, cwd, model_agent_type);
-        let mut agents = build_agent_list(cwd, toggle);
+        let mut agents = build_agent_list(cwd, &effective_toggle);
         stamp_entry_generation(&mut agents, 1);
         let personas = merge_persona_lists(bundle, cwd);
         Self {
@@ -353,7 +354,7 @@ impl AgentsModalState {
     /// Rebuild agent list from disk after a mutation.
     fn rebuild_agents(&mut self) {
         self.generation = self.generation.saturating_add(1);
-        let (snapshot, agent_name, default_agent, _user_toggle) = capture_locked_config_state(
+        let (snapshot, agent_name, default_agent, effective_toggle) = capture_locked_config_state(
             self.generation,
             &self.cwd,
             self.model_agent_type.as_deref(),
@@ -361,7 +362,6 @@ impl AgentsModalState {
         self.config_snapshot = snapshot;
         self.config_agent_name = agent_name;
         self.default_agent = default_agent;
-        let effective_toggle = load_agent_toggle().unwrap_or_default();
         self.agents = build_agent_list(&self.cwd, &effective_toggle);
         stamp_entry_generation(&mut self.agents, self.generation);
         if self.selected >= self.agents.len() {
@@ -808,30 +808,15 @@ fn capture_locked_config_state(
             HashMap::new(),
         );
     };
-    // Hold the pinned destination lock and read that same file. Overlay writers
-    // (managed/requirements/campaigns/remote cache) are not covered by the
-    // config.toml lock — stabilize by hashing overlays before/after the load.
+    // Hold the pinned destination lock. Overlay writers are not covered by that
+    // lock — load effective toggles inside the overlay digest window so rows
+    // pair with the mutation snapshot. Fail closed (no snapshot) if effective
+    // config cannot be read (#532 review).
     const MAX_ATTEMPTS: usize = 4;
     for _ in 0..MAX_ATTEMPTS {
         let before_overlay = crate::config_toml_edit::overlay_digest_for(&path);
-        match load_toggle_and_agent_name_at(&dest) {
-            Ok((toggle, agent_name)) => {
-                let Some(snapshot) = crate::config_toml_edit::config_mutation_snapshot_for_dest(
-                    &path, &dest, generation,
-                )
-                .ok() else {
-                    continue;
-                };
-                if snapshot.overlay_digest != before_overlay {
-                    continue;
-                }
-                return (
-                    Some(snapshot),
-                    agent_name,
-                    resolve_default_agent_name(cwd, model_agent_type),
-                    toggle,
-                );
-            }
+        let effective_toggle = match load_agent_toggle() {
+            Ok(toggle) => toggle,
             Err(_) => {
                 return (
                     None,
@@ -840,7 +825,33 @@ fn capture_locked_config_state(
                     HashMap::new(),
                 );
             }
+        };
+        let agent_name = match load_toggle_and_agent_name_at(&dest) {
+            Ok((_user_toggle, agent_name)) => agent_name,
+            Err(_) => {
+                return (
+                    None,
+                    None,
+                    resolve_default_agent_name(cwd, model_agent_type),
+                    HashMap::new(),
+                );
+            }
+        };
+        let Some(snapshot) =
+            crate::config_toml_edit::config_mutation_snapshot_for_dest(&path, &dest, generation)
+                .ok()
+        else {
+            continue;
+        };
+        if snapshot.overlay_digest != before_overlay {
+            continue;
         }
+        return (
+            Some(snapshot),
+            agent_name,
+            resolve_default_agent_name(cwd, model_agent_type),
+            effective_toggle,
+        );
     }
     (
         None,
