@@ -56,7 +56,7 @@ async fn save_config_locked(config: &Config, dest: &std::path::Path) -> Result<(
     if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    xai_grok_config::fs_atomic::write_atomically(dest, &toml_str, destination_unix_mode(dest))?;
+    xai_grok_config::fs_atomic::write_atomically_at(dest, &toml_str, destination_unix_mode(dest))?;
     Ok(())
 }
 /// Acquire the `config.toml` write lock used by [`save_config`], so callers that
@@ -108,7 +108,7 @@ pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std:
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    xai_grok_config::fs_atomic::write_atomically(&dest, content, destination_unix_mode(&dest))
+    xai_grok_config::fs_atomic::write_atomically_at(&dest, content, destination_unix_mode(&dest))
 }
 /// Merge `[toolset.ask_user_question]` into the root table. `[toolset]` is
 /// deliberately NOT merged wholesale — it carries runtime-only structs

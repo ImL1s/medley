@@ -1087,6 +1087,8 @@ jobs:
             project_mcp_mutations_pin_symlink_dest_before_read -- --nocapture
           run_nonzero -p xai-grok-config --lib \
             write_atomically_applies_saved_mode_after_umask -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
+            write_atomically_at_does_not_follow_dest_replaced_with_symlink -- --nocapture
 
       - name: Restricted subagent capability boundaries
         run: |

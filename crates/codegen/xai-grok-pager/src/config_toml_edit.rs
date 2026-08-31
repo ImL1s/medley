@@ -78,7 +78,7 @@ pub(crate) fn lock_config_destination(path: &Path) -> std::io::Result<(File, std
 pub(crate) fn write_config_toml(path: &Path, contents: &str) -> std::io::Result<()> {
     let dest = xai_grok_config::fs_atomic::resolve_write_path(path)?;
     let mode = destination_unix_mode(&dest);
-    xai_grok_config::fs_atomic::write_atomically(&dest, contents, mode)
+    xai_grok_config::fs_atomic::write_atomically_at(&dest, contents, mode)
 }
 
 fn overlay_digest_for(path: &Path) -> String {
@@ -164,7 +164,7 @@ where
         current_generation,
         edit,
         read_config_bytes,
-        move |path, contents| xai_grok_config::fs_atomic::write_atomically(path, contents, mode),
+        move |path, contents| xai_grok_config::fs_atomic::write_atomically_at(path, contents, mode),
     )?;
     outcome.overlay_digest = overlay_digest_for(path);
     Ok(outcome)
@@ -399,7 +399,7 @@ mod tests {
                     fs::read(path)
                 }
             },
-            |path, contents| xai_grok_config::fs_atomic::write_atomically(path, contents, None),
+            |path, contents| xai_grok_config::fs_atomic::write_atomically_at(path, contents, None),
         )
         .unwrap_err();
 

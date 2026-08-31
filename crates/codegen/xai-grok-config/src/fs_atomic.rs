@@ -76,7 +76,20 @@ pub fn resolve_write_path(path: &Path) -> std::io::Result<PathBuf> {
 /// and then again with `set_permissions` so umask cannot strip group bits
 /// (e.g. 0640 with umask 077). Existing symlinks are followed so the write
 /// updates the target instead of replacing the link.
+///
+/// Callers that already pinned a destination must use [`write_atomically_at`]
+/// so a later symlink substitution cannot redirect the rename.
 pub fn write_atomically(
+    final_path: &Path,
+    contents: &str,
+    mode: Option<u32>,
+) -> std::io::Result<()> {
+    let final_path = resolve_write_path(final_path)?;
+    write_atomically_at(&final_path, contents, mode)
+}
+
+/// Like [`write_atomically`], but writes `final_path` verbatim (no canonicalize).
+pub fn write_atomically_at(
     final_path: &Path,
     contents: &str,
     mode: Option<u32>,
@@ -85,7 +98,6 @@ pub fn write_atomically(
     use std::sync::atomic::{AtomicU64, Ordering};
     static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
-    let final_path = resolve_write_path(final_path)?;
     let dir = final_path.parent().unwrap_or_else(|| Path::new("."));
     let name = final_path
         .file_name()
@@ -222,10 +234,30 @@ mod tests {
         let pinned = resolve_write_path(&link).unwrap();
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&second, &link).unwrap();
-        write_atomically(&pinned, "pinned\n", None).unwrap();
+        write_atomically_at(&pinned, "pinned\n", None).unwrap();
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "pinned\n");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "two\n");
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "two\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_at_does_not_follow_dest_replaced_with_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("config.toml");
+        let other = dir.path().join("other.toml");
+        std::fs::write(&dest, "orig\n").unwrap();
+        std::fs::write(&other, "other\n").unwrap();
+        let pinned = dest.clone();
+        std::fs::remove_file(&dest).unwrap();
+        std::os::unix::fs::symlink(&other, &dest).unwrap();
+        write_atomically_at(&pinned, "pinned\n", None).unwrap();
+        assert!(
+            !dest.symlink_metadata().unwrap().file_type().is_symlink(),
+            "verbatim write must replace the symlink, not follow it"
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "pinned\n");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "other\n");
     }
 
     #[cfg(unix)]
@@ -245,7 +277,7 @@ mod tests {
         std::fs::create_dir(&other).unwrap();
         std::fs::write(other.join("config.toml"), "other\n").unwrap();
         std::os::unix::fs::symlink(&other, &linked_home).unwrap();
-        write_atomically(&pinned, "pinned\n", None).unwrap();
+        write_atomically_at(&pinned, "pinned\n", None).unwrap();
         assert_eq!(
             std::fs::read_to_string(real_home.join("config.toml")).unwrap(),
             "pinned\n"
