@@ -268,7 +268,7 @@ MACRO_INVOKE = re.compile(
     rf"({RUST_IDENT_TOKEN})\s*!"
 )
 INLINE_MOD = re.compile(
-    r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+    rf"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?:r#)?({RUST_IDENT_BODY})\s*\{{"
 )
 MACRO_TEST_FN = re.compile(
     rf"\bfn\s+(?:\$)?({RUST_IDENT_BODY})"
@@ -2337,6 +2337,62 @@ def _path_attr_covers(path: Path, target: Path) -> bool:
     return False
 
 
+def _is_always_compiled_root(path: Path) -> bool:
+    """Cargo crate roots are compiled even if some other `mod` is cfg-off."""
+
+    if _integration_binary_stem(path) is not None:
+        return True
+    parts = path.parts
+    if "src" not in parts:
+        return False
+    segs = list(parts[parts.index("src") + 1 :])
+    return segs in (["lib.rs"], ["main.rs"])
+
+
+def _cfg_inactive_out_of_line_files(
+    sources: list[tuple[Path, str]],
+) -> set[Path]:
+    """Files reached only through `#[cfg(off)] mod name;` on this host.
+
+    `#[cfg(windows)] mod windows_tests;` does not compile `windows_tests.rs`
+    on Linux; tests there must not join membership (#516 review).
+    """
+
+    text_of = dict(sources)
+    by_posix = {_norm_posix(path): path for path, _text in sources}
+    incoming: dict[Path, list[bool]] = {path: [] for path, _text in sources}
+    for path, text in sources:
+        code = _code_only(text)
+        for match in _MOD_DECL.finditer(code):
+            inactive = any(
+                _attr_cfg_inactive(attr)
+                for attr in _preceding_attributes(text, code, match.start())
+            )
+            for child in _declared_mod_files(path.parent, match.group(1), by_posix):
+                incoming[child].append(inactive)
+    inactive_files = {
+        path
+        for path, flags in incoming.items()
+        if flags and all(flags) and not _is_always_compiled_root(path)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for path in list(inactive_files):
+            text = text_of.get(path)
+            if text is None:
+                continue
+            code = _code_only(text)
+            for name in _MOD_DECL.findall(code):
+                for child in _declared_mod_files(path.parent, name, by_posix):
+                    if _is_always_compiled_root(child):
+                        continue
+                    if child not in inactive_files:
+                        inactive_files.add(child)
+                        changed = True
+    return inactive_files
+
+
 def _file_process_groups(
     sources: list[tuple[Path, str]],
 ) -> dict[Path, frozenset[str]]:
@@ -2921,8 +2977,8 @@ def _body_touches(
 
     for ident in identifiers:
         pattern = re.compile(
-            rf"(?:((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+))"
-            rf"?(?<![A-Za-z0-9_])(?:r#)?{re.escape(ident)}\b"
+            rf"(?:((?:(?:r#)?{RUST_IDENT_BODY}\s*::\s*)+))"
+            rf"?(?<![\w])(?:r#)?{re.escape(ident)}(?![\w])"
         )
         for match in pattern.finditer(code_only_body):
             prefix_raw = match.group(1)
@@ -3018,7 +3074,9 @@ def _inline_module_spans(code: str) -> list[tuple[int, int, int, str]]:
     for match in INLINE_MOD.finditer(code):
         open_index = match.end() - 1
         end = _balanced_end(code, open_index)
-        spans.append((match.start(), open_index, end, match.group(1)))
+        spans.append(
+            (match.start(), open_index, end, _raw_ident(match.group(1)))
+        )
     return spans
 
 
@@ -3367,6 +3425,7 @@ def index_functions(
     _load_path_overrides(sources)
     _load_reexports(sources)
     file_groups = _file_process_groups(sources)
+    inactive_files = _cfg_inactive_out_of_line_files(sources)
     out: list[FnInfo] = []
     pending: list[_PendingMacroTest] = []
     generated_by_macro: dict[tuple[Path, str], list[_MacroArm]] = {}
@@ -3379,6 +3438,8 @@ def index_functions(
         tuple[Path, str, str, list[tuple[int, int]], list[tuple[int, int, int, str]]]
     ] = []
     for rel, raw in sources:
+        if rel in inactive_files:
+            continue
         code = _code_only(raw)
         impls = _impl_blocks(code)
         inline_spans = _inline_module_spans(code)

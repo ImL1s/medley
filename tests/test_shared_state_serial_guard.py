@@ -4605,6 +4605,85 @@ class TypeAssociatedResolution(unittest.TestCase):
         else:
             self.assertEqual(names, set())
 
+    def test_cfg_disabled_out_of_line_module_is_not_a_member(self):
+        """`#[cfg(windows)] mod windows_tests;` is off on Unix
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    #[cfg(windows)]
+                    mod windows_tests;
+
+                    #[test]
+                    fn only_active() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/windows_tests.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn windows_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        if sys.platform == "win32":
+            self.assertEqual(names, {"only_active", "windows_untagged"})
+        else:
+            self.assertEqual(names, {"only_active"})
+            findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
+            self.assertEqual(errors, [])
+            self.assertEqual(findings, [])
+
+    def test_unicode_qualified_static_path_is_a_touch(self):
+        """`xai_grok_shell::動作::COUNTER` is the library static
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    pub mod 動作 {
+                        // SERIAL-GROUP: demo_key
+                        pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn first_untagged() {
+                        xai_grok_shell::動作::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        xai_grok_shell::動作::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_unicode_identifier_tests_are_members(self):
         """`fn prémier` / `fn deuxième` are Stage-1 touchers (#516 review)."""
 
