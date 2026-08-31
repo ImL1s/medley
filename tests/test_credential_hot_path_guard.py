@@ -70,7 +70,12 @@ _CRATE_ROOTS = ("crates", "prod", "third_party")
 CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 
 sys.path.insert(0, str(ROOT / "scripts"))
-from check_test_filter_coverage import parse_workflow  # noqa: E402
+from check_test_filter_coverage import (  # noqa: E402
+    ALL_FEATURES_TOKEN,
+    EXACT_PREFIX,
+    parse_workflow,
+    parse_workflow_by_features,
+)
 from toml_package_name import package_name  # noqa: E402
 
 _TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test\b")
@@ -133,7 +138,7 @@ _RAW_STRING_START = re.compile(r"(?:c|b)?r(#*)\"")
 _MACRO_IDENT = re.compile(rf"(?:r#)?({_RUST_IDENT})")
 _MACRO_INVOKE = re.compile(rf"(?<![\w:])(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]")
 _CRATE_MACRO_INVOKE = re.compile(
-    rf"\bcrate\s*::\s*(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]"
+    rf"\b(?:crate|self|super)\s*::\s*(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]"
 )
 
 
@@ -155,7 +160,7 @@ def _append_crate_qualified_invokes(
     def_spans: list[tuple[int, int]],
     invoke_at: list[tuple[int, str, str, str]],
 ) -> None:
-    """`crate::generated!(...)` is a crate-root invocation (#507 review)."""
+    """`crate::`/`self::`/`super::` invocations (#507 review)."""
 
     available = {name for name, _source, _end, _scope in scoped_defs} | {
         name for name, _source in inherited_macros
@@ -1003,6 +1008,53 @@ def _cargo_target_of(
     return ""
 
 
+def _filters_contain_pattern(filters: set[str], pattern: str) -> bool:
+    return pattern in filters or (EXACT_PREFIX + pattern) in filters
+
+
+def _ci_feature_lanes(
+    by_features: dict[str, dict[frozenset[str], dict[str, set[str]]]],
+    pattern: str,
+) -> list[tuple[str, frozenset[str], str]]:
+    """`(package, --features set, target)` lanes whose filter is `pattern`."""
+
+    found: list[tuple[str, frozenset[str], str]] = []
+    for crate, featmap in by_features.items():
+        for feat, targets in featmap.items():
+            for target, filters in targets.items():
+                if _filters_contain_pattern(filters, pattern):
+                    found.append((crate, feat, target))
+    return found
+
+
+def _hot_path_matches_for_lanes(
+    records_for_feat: dict[frozenset[str], list[_TestRecord]],
+    pattern: str,
+    lanes: list[tuple[str, frozenset[str], str]],
+) -> list[_TestRecord]:
+    """Count tests that actually exist in each matching CI lane's feature set."""
+
+    hits: list[_TestRecord] = []
+    seen: set[tuple[str, str, str]] = set()
+    for crate, feat, target in lanes:
+        records = records_for_feat.get(feat)
+        if records is None:
+            continue
+        for record in records:
+            if pattern not in record.name:
+                continue
+            if record.package != crate:
+                continue
+            if target != "*" and record.target != target:
+                continue
+            key = (record.package, record.target, record.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(record)
+    return hits
+
+
 def _ci_scopes_for_pattern(
     parsed: dict[str, dict[str, set[str]]], pattern: str
 ) -> set[tuple[str, str]] | None:
@@ -1189,6 +1241,8 @@ def _manifest_default_features(text: str) -> set[str]:
 
 def _cargo_test_targets(
     root: Path,
+    extra_features: frozenset[str] | set[str] | None = None,
+    all_features: bool = False,
 ) -> tuple[
     set[Path],
     set[Path],
@@ -1217,6 +1271,7 @@ def _cargo_test_targets(
     crate_feats: dict[Path, set[str]] = {}
     test_names: dict[Path, str] = {}
     lib_roots: set[Path] = set()
+    extra_features = extra_features or frozenset()
     for manifest in root.rglob("Cargo.toml"):
         if "target" in manifest.parts:
             continue
@@ -1247,7 +1302,15 @@ def _cargo_test_targets(
             default_feats = _feature_closure(
                 feat_table, _toml_str_list(feat_table.get("default"))
             )
-            crate_feats[crate.resolve()] = default_feats
+            if all_features:
+                enabled = _feature_closure(
+                    feat_table, {name for name in feat_table if name != "default"}
+                )
+            else:
+                enabled = _feature_closure(
+                    feat_table, default_feats | set(extra_features)
+                )
+            crate_feats[crate.resolve()] = enabled
             lib = data.get("lib")
             if isinstance(lib, dict):
                 lib_path = lib.get("path")
@@ -1290,7 +1353,7 @@ def _cargo_test_targets(
                 if table.get("test") is False or table.get("harness") is False:
                     gated.add(target)
                     continue
-                extra_required = required_feats - default_feats
+                extra_required = required_feats - enabled
                 if extra_required:
                     gated.add(target)
                 elif target.is_file():
@@ -1334,7 +1397,12 @@ def _cargo_test_targets(
                 elif name:
                     target = (crate / "tests" / f"{name}.rs").resolve()
                 if target is not None:
-                    extra_required = required_feats - default_feats
+                    enabled_feats = (
+                        set(extra_features)
+                        if all_features
+                        else default_feats | set(extra_features)
+                    )
+                    extra_required = set() if all_features else required_feats - enabled_feats
                     if name:
                         test_names[target.resolve()] = name
                     if not test_enabled or not harness_enabled:
@@ -1411,7 +1479,11 @@ def _cargo_test_targets(
                 inner = stripped.split("=", 1)[-1]
                 required_feats = set(re.findall(r'"([^"]+)"', inner))
         flush()
-        crate_feats[crate.resolve()] = default_feats
+        crate_feats[crate.resolve()] = (
+            set(extra_features)
+            if all_features
+            else default_feats | set(extra_features)
+        )
     return extra, gated, suppressed_libs, no_autotest, crate_feats, test_names, lib_roots
 
 
@@ -1810,8 +1882,16 @@ def _include_concat_hits(text: str) -> list[tuple[int, str]]:
     return out
 
 
+def _lane_feature_args(feat: frozenset[str]) -> tuple[frozenset[str], bool]:
+    all_features = ALL_FEATURES_TOKEN in feat
+    named = frozenset(name for name in feat if name != ALL_FEATURES_TOKEN)
+    return named, all_features
+
+
 def _declared_module_overrides(
     root: Path,
+    extra_features: frozenset[str] | None = None,
+    all_features: bool = False,
 ) -> dict[Path, list[tuple[list[str], str, tuple[tuple[str, str], ...]]]]:
     """Logical module prefixes for files reached via `mod` / `#[path]`.
 
@@ -1857,7 +1937,9 @@ def _declared_module_overrides(
         return text
 
     extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names, lib_roots = (
-        _cargo_test_targets(root)
+        _cargo_test_targets(
+            root, extra_features=extra_features, all_features=all_features
+        )
     )
     for base in _CRATE_ROOTS:
         base_dir = root / base
@@ -2901,7 +2983,10 @@ def _module_prefixes_for_source(
     return prefixes or None
 
 
-def _qualified_test_records(root: Path) -> list[_TestRecord]:
+def _qualified_test_records(
+    root: Path,
+    extra_features: frozenset[str] | None = None,
+) -> list[_TestRecord]:
     """Every `#[test]`/`#[tokio::test]` function under `crates/`/`prod/`
     with the cargo package and target that would compile it.
 
@@ -2913,10 +2998,17 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
     whose file is not `x.rs` and has no `#[path]` is still a shorter
     name than cargo would report -- conservative, same direction as
     the defect this guard exists to catch.
+
+    `extra_features` is a CI lane's `--features` set (including the
+    all-features sentinel) so cfg-gated tests in that lane are counted
+    (#507 review).
     """
-    overrides = _declared_module_overrides(root)
+    named, all_features = _lane_feature_args(extra_features or frozenset())
+    overrides = _declared_module_overrides(
+        root, extra_features=named, all_features=all_features
+    )
     extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names, lib_roots = (
-        _cargo_test_targets(root)
+        _cargo_test_targets(root, extra_features=named, all_features=all_features)
     )
     records: list[_TestRecord] = []
     pkg_cache: dict[Path, str] = {}
@@ -2991,6 +3083,23 @@ class CredentialHotPathCorpus(unittest.TestCase):
         cls.ci_filters = parse_workflow(
             CI_YML.read_text(encoding="utf-8"), root=ROOT
         )
+        cls.ci_by_features = parse_workflow_by_features(
+            CI_YML.read_text(encoding="utf-8"), root=ROOT
+        )
+        needed: set[frozenset[str]] = set()
+        for pattern in cls.documented:
+            for _crate, feat, _target in _ci_feature_lanes(
+                cls.ci_by_features, pattern
+            ):
+                if feat:
+                    needed.add(feat)
+        cls.records_for_feat: dict[frozenset[str], list[_TestRecord]] = {
+            frozenset(): cls.records
+        }
+        for feat in needed:
+            cls.records_for_feat[feat] = _qualified_test_records(
+                ROOT, extra_features=feat
+            )
 
     def test_the_corpus_is_not_empty(self):
         # A scan that silently finds nothing satisfies every assertion
@@ -3032,8 +3141,15 @@ class CredentialHotPathCorpus(unittest.TestCase):
         # another crate without reddening the count (#507 review).
         wrong = {}
         for pattern, expected in self.documented.items():
-            scopes = _ci_scopes_for_pattern(self.ci_filters, pattern)
-            matched = _hot_path_matches(self.records, pattern, scopes)
+            lanes = _ci_feature_lanes(self.ci_by_features, pattern)
+            if lanes:
+                matched = _hot_path_matches_for_lanes(
+                    self.records_for_feat, pattern, lanes
+                )
+                scopes = {(crate, target) for crate, _feat, target in lanes}
+            else:
+                scopes = _ci_scopes_for_pattern(self.ci_filters, pattern)
+                matched = _hot_path_matches(self.records, pattern, scopes)
             if len(matched) != expected:
                 wrong[pattern] = (
                     len(matched),
@@ -3232,6 +3348,88 @@ class CiPackageTargetCounts(unittest.TestCase):
                     "provider_error_body_preview_is_secret_free_and_bounded",
                 ],
             )
+
+    def test_features_lane_counts_cfg_gated_and_required_feature_tests(self):
+        """A `--features hot` lane must count `#[cfg(feature = \"hot\")]`
+        tests and `required-features` targets that those features
+        unlock (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            (crate / "src").mkdir(parents=True)
+            (crate / "tests").mkdir()
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"xai-grok-sampler\"\n\n"
+                "[features]\nhot = []\n\n"
+                "[[test]]\nname = \"wire\"\n"
+                'path = "tests/wire.rs"\n'
+                'required-features = ["hot"]\n',
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[cfg(feature = \"hot\")]\n"
+                "#[test]\nfn none_auth_scheme_hot() {}\n"
+                "#[test]\nfn none_auth_scheme_cold() {}\n"
+            )
+            (crate / "tests" / "wire.rs").write_text(
+                "#[test]\nfn none_auth_scheme_wire() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --features hot "
+                "--lib none_auth_scheme_ -- --nocapture\n"
+                "          run_nonzero -p xai-grok-sampler --features hot "
+                "--test wire none_auth_scheme_ -- --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
+            feat = frozenset({"hot"})
+            records_for_feat = {
+                feat: _qualified_test_records(root, extra_features=feat)
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "none_auth_scheme_", lanes
+            )
+            self.assertEqual(
+                sorted((r.target, r.name) for r in matched),
+                [
+                    ("lib", "none_auth_scheme_cold"),
+                    ("lib", "none_auth_scheme_hot"),
+                    ("test:wire", "none_auth_scheme_wire"),
+                ],
+            )
+
+    def test_all_features_lane_counts_cfg_gated_tests(self):
+        """`--all-features` must enable cfg-gated hot-path tests
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "codegen" / "xai-grok-sampler"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"xai-grok-sampler\"\n\n"
+                "[features]\nhot = []\n",
+                encoding="utf-8",
+            )
+            (crate / "src" / "lib.rs").write_text(
+                "#[cfg(feature = \"hot\")]\n"
+                "#[test]\nfn none_auth_scheme_hot() {}\n"
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --all-features "
+                "--lib none_auth_scheme_ -- --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
+            feat = frozenset({ALL_FEATURES_TOKEN})
+            records_for_feat = {
+                feat: _qualified_test_records(root, extra_features=feat)
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "none_auth_scheme_", lanes
+            )
+            self.assertEqual([r.name for r in matched], ["none_auth_scheme_hot"])
 
 
 class ExternalModulePrefix(unittest.TestCase):
@@ -4791,6 +4989,24 @@ class ExternalModulePrefix(unittest.TestCase):
         names = _tests_in_file(text, [])
         self.assertEqual(names, ["none_auth_scheme_case"])
 
+    def test_self_qualified_local_macro_is_counted(self):
+        """`self::generated!(name)` at the crate root is an invocation
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            macro_rules! generated {
+                ($name:ident) => {
+                    #[test]
+                    fn $name() {}
+                };
+            }
+            self::generated!(none_auth_scheme_self);
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_self"])
+
     def test_parent_macro_rules_test_in_external_child_is_counted(self):
         """A parent macro defined before `mod child;` is lexically visible
         inside the external child module (#507 review)."""
@@ -4825,6 +5041,43 @@ class ExternalModulePrefix(unittest.TestCase):
 
             self.assertIn(
                 "child::none_auth_scheme_inherited",
+                _qualified_test_names(root),
+            )
+
+    def test_super_qualified_macro_in_child_is_counted(self):
+        """`super::emit!(name)` in a child module is an invocation
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    macro_rules! generated {
+                        ($name:ident) => {
+                            #[test]
+                            fn $name() {}
+                        };
+                    }
+                    mod child;
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (src / "child.rs").write_text(
+                "super::generated!(none_auth_scheme_super);\n",
+                encoding="utf-8",
+            )
+
+            self.assertIn(
+                "child::none_auth_scheme_super",
                 _qualified_test_names(root),
             )
 
