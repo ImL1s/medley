@@ -90,11 +90,10 @@ async fn save_config_locked(config: &Config) -> Result<()> {
 pub(crate) async fn lock_config_writes() -> std::io::Result<ConfigWriteGuard> {
     let in_process = SAVE_LOCK.lock().await;
     let path = user_config_path();
-    let os = tokio::task::spawn_blocking(move || {
-        xai_grok_config::fs_atomic::lock_config_file(&path)
-    })
-    .await
-    .map_err(std::io::Error::other)??;
+    let os =
+        tokio::task::spawn_blocking(move || xai_grok_config::fs_atomic::lock_config_file(&path))
+            .await
+            .map_err(std::io::Error::other)??;
     Ok(ConfigWriteGuard {
         _in_process: in_process,
         _os: os,
