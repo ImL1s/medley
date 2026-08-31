@@ -84,9 +84,7 @@ pub fn lock_config_destination(path: &Path) -> std::io::Result<(File, PathBuf)> 
 pub fn resolve_write_path(path: &Path) -> std::io::Result<PathBuf> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => dunce::canonicalize(path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(canonicalize_missing_path(path)?)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(canonicalize_missing_path(path)?),
         Err(e) => Err(e),
     }
 }
@@ -273,7 +271,10 @@ mod tests {
         assert_eq!(pinned_alias, pinned_real);
         assert_eq!(
             pinned_alias,
-            dunce::canonicalize(&real_root).unwrap().join(".grok").join("config.toml")
+            dunce::canonicalize(&real_root)
+                .unwrap()
+                .join(".grok")
+                .join("config.toml")
         );
         assert_eq!(
             config_lock_path(&pinned_alias),
