@@ -82,7 +82,7 @@ _FN = re.compile(
     rf"fn\s+(?:r#)?({_RUST_IDENT})"
 )
 _INCLUDE = re.compile(
-    r'\binclude!\s*\(\s*(?:"([^"]*)"|r(#*)"((?:.|\n)*?)"\2)\s*\)',
+    r'\binclude!\s*[(\[{]\s*(?:"([^"]*)"|r(#*)"((?:.|\n)*?)"\2)\s*[)\]}]',
     re.DOTALL,
 )
 _MOD_OPEN = re.compile(
@@ -1795,7 +1795,7 @@ def _include_concat_hits(text: str) -> list[tuple[int, str]]:
         cursor = start + len("include!")
         while cursor < len(text) and text[cursor].isspace():
             cursor += 1
-        if cursor >= len(text) or text[cursor] != "(":
+        if cursor >= len(text) or text[cursor] not in "([{":
             index = cursor + 1
             continue
         end = _balanced_pair_end(text, cursor)
@@ -2113,9 +2113,20 @@ def _host_target_vendor() -> str:
     return "unknown"
 
 
+def _decode_cooked_path(value: str) -> str:
+    """Interpret cooked-string escapes (`\\x75` → `u`)."""
+
+    try:
+        return value.encode("utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return value
+
+
 def _path_attr_value(match: re.Match[str]) -> str:
     quoted = match.group(1)
-    return quoted if quoted is not None else (match.group(3) or "")
+    if quoted is not None:
+        return _decode_cooked_path(quoted)
+    return match.group(3) or ""
 
 
 def _live_path_redirect(
@@ -3282,6 +3293,22 @@ class ExternalModulePrefix(unittest.TestCase):
             self.assertIn("child::none_auth_scheme_actual", names)
             self.assertNotIn("child::none_auth_scheme_child", names)
 
+    def test_cooked_path_escape_is_decoded(self):
+        """`#[path = \"act\\x75al.rs\"]` loads actual.rs (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                '#[path = "act\\x75al.rs"]\nmod child;\n'
+            )
+            (src / "actual.rs").write_text(
+                "#[test]\nfn none_auth_scheme_escaped_path() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("child::none_auth_scheme_escaped_path", names)
+
     def test_path_attr_split_across_lines_is_followed(self):
         """`#[path =\\n\"actual.rs\"]` still redirects the module
         (#507 review)."""
@@ -3650,6 +3677,20 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_included", names)
+
+    def test_braced_include_literal_is_scanned(self):
+        """`include! { \"included.rs\" }` splices tests (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text('include! { "included.rs" };\n')
+            (src / "included.rs").write_text(
+                "#[test]\nfn none_auth_scheme_braced_include() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_braced_include", names)
 
     def test_concat_env_include_is_scanned(self):
         """`include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/included.rs\"))`
