@@ -4589,6 +4589,93 @@ class TypeAssociatedResolution(unittest.TestCase):
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
 
+    def test_local_module_use_is_resolved(self):
+        """`mod a; use a::bump;` reaches the local module (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            mod a {
+                pub fn bump() {
+                    super::COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            use a::bump;
+
+            #[test]
+            fn first_untagged() {
+                bump();
+            }
+
+            #[test]
+            fn second_untagged() {
+                bump();
+            }
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_integration_nested_mod_shares_process_group(self):
+        """`mod support;` then `mod nested;` stay in the race binary
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    mod support;
+
+                    #[test]
+                    fn first_untagged() {
+                        xai_grok_shell::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/support.rs"),
+                src(
+                    """\
+                    mod nested;
+                    """
+                ),
+            ),
+            (
+                Path("tests/nested.rs"),
+                src(
+                    """\
+                    #[test]
+                    fn second_untagged() {
+                        xai_grok_shell::COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+        findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
+        self.assertEqual(errors, [])
+        self.assertGreaterEqual(
+            len(findings),
+            1,
+            "nested integration mods must share the race process group",
+        )
+
     def test_imported_library_type_assoc_counts_in_integration_tests(self):
         """`use xai_grok_shell::State; State::bump()` in tests/ is
         the library impl (#516 review)."""

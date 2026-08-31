@@ -1975,9 +1975,7 @@ def _use_module_prefix(
 ) -> tuple[str, ...] | None:
     if root == "crate" or _is_lib_crate_ident(root):
         return mid
-    if file_mod is None:
-        return None
-    effective = file_mod + inline_mods
+    effective = (file_mod or ()) + inline_mods
     if root == "self":
         return effective + mid
     if root == "super":
@@ -1987,7 +1985,7 @@ def _use_module_prefix(
             cur = cur[:-1] if cur else ()
             rest = rest[1:]
         return tuple(cur) + tuple(rest)
-    return None
+    return effective + (root,) + mid
 
 
 @dataclass(frozen=True)
@@ -2350,6 +2348,17 @@ def _file_process_groups(
                         break
             if text is None:
                 continue
+            code = _code_only(text)
+            for name in _MOD_DECL.findall(code):
+                file_mod = current.parent / f"{name}.rs"
+                dir_mod = current.parent / name
+                for path in groups:
+                    if path == current:
+                        continue
+                    if path == file_mod or _path_is_relative_to(path, dir_mod):
+                        if group not in groups[path]:
+                            groups[path].add(group)
+                        pending.append(path)
             for target in _path_attr_files(current, text):
                 for path in groups:
                     if path == current:
