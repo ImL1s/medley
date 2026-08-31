@@ -4472,6 +4472,87 @@ class TypeAssociatedResolution(unittest.TestCase):
         else:
             self.assertEqual(names, {"unix_untagged"})
 
+    def test_empty_vis_fragment_selects_the_macro_arm(self):
+        """`$visibility:vis fn $name` accepts `case!(fn one)` (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! case {
+                ($visibility:vis fn $name:ident) => {
+                    #[test]
+                    $visibility fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            case!(fn first_untagged);
+            case!(fn second_untagged);
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertTrue(any(n.startswith("case!") for n in names), names)
+        self.assertEqual(len(names), 2, names)
+        findings = guard.scan_source(text)
+        self.assertGreaterEqual(
+            len(findings),
+            1,
+            "empty vis must not drop generated untagged touchers",
+        )
+
+    def test_cfg_disabled_enclosing_module_is_not_a_member(self):
+        """`#[cfg(windows)] mod { #[test] ... }` is off on Unix
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[cfg(windows)]
+            mod windows_tests {
+                #[test]
+                fn first_untagged() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+                #[test]
+                fn second_untagged() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        if sys.platform == "win32":
+            self.assertEqual(names, {"first_untagged", "second_untagged"})
+        else:
+            self.assertEqual(names, set())
+
+    def test_unicode_identifier_tests_are_members(self):
+        """`fn prémier` / `fn deuxième` are Stage-1 touchers (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn prémier() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[test]
+            fn deuxième() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"prémier", "deuxième"})
+
     def test_ufcs_nested_generic_type_still_resolves(self):
         """`<Box<Vec<u8>> as Bump>::bump()` must survive nested `<>`
         (#516 review)."""

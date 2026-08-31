@@ -255,12 +255,12 @@ DEFAULT_SCAN_ROOTS = (DEFAULT_SCAN_ROOT, DEFAULT_SCAN_TEST_ROOT)
 
 RAW_STRING_START = re.compile(r'r(#+)?"')
 CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'\n])'")
-FN_DEF = re.compile(
-    r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+"
-    r"(?:r#)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
-)
 RUST_IDENT_BODY = r"[^\W\d](?:\w|[^\x00-\x7f\s])*"
 RUST_IDENT_TOKEN = rf"(?:r#)?{RUST_IDENT_BODY}"
+FN_DEF = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+"
+    rf"(?:r#)?(?P<name>{RUST_IDENT_BODY})"
+)
 MACRO_DEF = re.compile(rf"macro_rules!\s+(?P<name>{RUST_IDENT_TOKEN})")
 MACRO_INVOKE = re.compile(
     rf"(?<![:.\w])((?:\:\:\s*)?(?:{RUST_IDENT_TOKEN}\s*::\s*)*)"
@@ -270,7 +270,7 @@ INLINE_MOD = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
 )
 MACRO_TEST_FN = re.compile(
-    r"\bfn\s+(?:\$)?([A-Za-z_][A-Za-z0-9_]*)"
+    rf"\bfn\s+(?:\$)?({RUST_IDENT_BODY})"
 )
 TEST_ATTR = re.compile(
     r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b",
@@ -283,7 +283,9 @@ SERIAL_ATTR = re.compile(
 IMPL_KW = re.compile(r"\bimpl\b")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 RUST_IDENT = re.compile(RUST_IDENT_BODY)
-FREE_CALL = re.compile(r"(?<![:.\w])(?:r#)?([a-z_][a-z0-9_]*)\s*\(")
+FREE_CALL = re.compile(
+    rf"(?<![:.\w])(?:r#)?((?:[a-z_]|[^\W\dA-Z_])(?:\w|[^\x00-\x7f\s])*)\s*\("
+)
 USE_PLAIN = re.compile(
     r"\buse\s+(crate|super|self)((?:::(?:r#)?[A-Za-z_][A-Za-z0-9_]*)+)"
     r"(?:\s+as\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*))?\s*;"
@@ -568,9 +570,41 @@ def _fragment_token_ok(token: str, kind: str) -> bool:
     return True
 
 
+def _consume_vis(tokens: list[str], cursor: int) -> int | None:
+    """`$v:vis` matches `pub`, `pub(...)`, `crate`, or zero tokens."""
+
+    if cursor >= len(tokens):
+        return cursor
+    tok = tokens[cursor]
+    if tok == "pub":
+        nxt = cursor + 1
+        if nxt < len(tokens) and tokens[nxt] == "(":
+            depth = 0
+            index = nxt
+            while index < len(tokens):
+                cur = tokens[index]
+                if cur == "(":
+                    depth += 1
+                elif cur == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return index + 1
+                index += 1
+            return None
+        return nxt
+    if tok == "crate":
+        nxt = cursor + 1
+        if nxt < len(tokens) and tokens[nxt] == "::":
+            return cursor
+        return nxt
+    return cursor
+
+
 def _consume_fragment(
     tokens: list[str], cursor: int, kind: str, next_literal: str | None
 ) -> int | None:
+    if kind == "vis":
+        return _consume_vis(tokens, cursor)
     if cursor >= len(tokens):
         return None
     if kind in {"ident", "lifetime", "literal", "tt"}:
@@ -1141,6 +1175,22 @@ def _cfg_pred_active(expr: str) -> bool | None:
                 return None
             return False
     return _cfg_atom_active(expr)
+
+
+def _enclosing_module_cfg_inactive(
+    source: str,
+    code: str,
+    spans: list[tuple[int, int, int, str]],
+    pos: int,
+) -> bool:
+    """True when an inline `#[cfg(...)] mod { ... }` wrapping `pos` is off."""
+
+    for start, open_index, end, _name in spans:
+        if start < pos and open_index <= pos < end:
+            attrs = _preceding_attributes(source, code, start)
+            if any(_attr_cfg_inactive(a) for a in attrs):
+                return True
+    return False
 
 
 def _attr_cfg_inactive(attr: str) -> bool:
@@ -3043,13 +3093,37 @@ def _macro_rule_arms(body: str) -> list[tuple[str, str]]:
     return arms or [("*", body)]
 
 
+def _position_before_vis(code: str, fn_start: int) -> int:
+    """Skip `$vis` / `$vis:vis` immediately before a generated `fn`.
+
+    `#[test] $visibility fn $name()` still belongs to that `#[test]`
+    (#516 review).
+    """
+
+    index = fn_start
+    while index > 0 and code[index - 1].isspace():
+        index -= 1
+    if index >= 4 and code[index - 4 : index] == ":vis":
+        index -= 4
+        while index > 0 and code[index - 1].isspace():
+            index -= 1
+    ident_end = index
+    while index > 0 and (code[index - 1].isalnum() or code[index - 1] == "_"):
+        index -= 1
+    if index > 0 and code[index - 1] == "$" and ident_end > index:
+        return index - 1
+    return fn_start
+
+
 def _generated_test_templates_in_arm(
     arm: str,
 ) -> list[tuple[frozenset[str], bool, bool, str, tuple[str, ...]]]:
     parsed: list[tuple[str, bool, frozenset[str], bool, bool, str, tuple[str, ...]]] = []
     code = _code_only(arm)
     for match in MACRO_TEST_FN.finditer(code):
-        attrs = _preceding_attributes(arm, code, match.start())
+        attrs = _preceding_attributes(
+            arm, code, _position_before_vis(code, match.start())
+        )
         is_test = any(_is_test_attr(a) for a in attrs)
         held: set[str] = set()
         has_unkeyed = False
@@ -3245,7 +3319,7 @@ def index_functions(
         for match in FN_DEF.finditer(code):
             if any(start <= match.start() < end for start, end in macro_bodies):
                 continue
-            name = match.group("name")
+            name = _raw_ident(match.group("name"))
             body_span = _fn_body(raw, match.end())
             if body_span is None:
                 continue
@@ -3314,8 +3388,12 @@ def index_functions(
                     trait_name = trname
                     break
             attrs = _preceding_attributes(raw, code, match.start())
-            is_test = any(_is_test_attr(a) for a in attrs) and not any(
-                _attr_cfg_inactive(a) for a in attrs
+            is_test = (
+                any(_is_test_attr(a) for a in attrs)
+                and not any(_attr_cfg_inactive(a) for a in attrs)
+                and not _enclosing_module_cfg_inactive(
+                    raw, code, inline_spans, match.start()
+                )
             )
             serial_held: set[str] = set()
             has_unkeyed = False
