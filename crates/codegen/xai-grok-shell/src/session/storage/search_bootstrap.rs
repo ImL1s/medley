@@ -23,7 +23,9 @@ use super::search_db::{
     HealAwareLogCounter, log_bootstrap_timeout, log_session_index_failure, search_db_path,
     sqlite_to_io_error, with_search_index, with_search_index_blocking,
 };
-use super::search_fts::{META_KEY_BOOTSTRAP_CLAIM, META_KEY_LAST_BOOTSTRAP, SessionSearchIndex};
+use super::search_fts::{
+    ClaimFencedInsertOutcome, META_KEY_BOOTSTRAP_CLAIM, META_KEY_LAST_BOOTSTRAP, SessionSearchIndex,
+};
 use super::search_recovery;
 use crate::session::persistence::Summary;
 
@@ -87,6 +89,10 @@ pub(super) struct BootstrapProgress {
     /// before the claim-fenced document write (#515).
     #[cfg(test)]
     pub(super) before_session_write: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: deterministic interleaving point before a large-session
+    /// title-only placeholder write (#515 follow-up).
+    #[cfg(test)]
+    pub(super) before_title_only_write: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl BootstrapProgress {
@@ -563,7 +569,7 @@ async fn reindex_all(
             }
 
             #[cfg(test)]
-            let before_write_progress = Arc::clone(&progress);
+            let write_hooks_progress = Arc::clone(&progress);
 
             let session_id = summary.info.id.to_string();
 
@@ -582,16 +588,31 @@ async fn reindex_all(
                 let doc = build_session_doc(&summary, String::new());
                 let db_path = search_db_path(&root);
                 let shared = shared.clone();
+                #[cfg(test)]
+                if let Ok(guard) = write_hooks_progress.before_title_only_write.lock()
+                    && let Some(hook) = guard.as_ref()
+                {
+                    hook();
+                }
                 let title_only = tokio::task::spawn_blocking(move || {
-                    shared.with(&db_path, |index| index.insert_doc_if_absent(&doc))
+                    shared.with(&db_path, |index| {
+                        index.insert_doc_if_absent_if_claim_owner(&doc, &claim_token)
+                    })
                 })
                 .await;
-                if let Err(e) = title_only.map_err(io::Error::other).and_then(|r| r) {
-                    log_session_index_failure(
-                        &session_id,
-                        &e,
-                        "failed to write title-only index row for large session",
-                    );
+                match title_only.map_err(io::Error::other).and_then(|r| r) {
+                    Ok(ClaimFencedInsertOutcome::ClaimLost) => return,
+                    Ok(
+                        ClaimFencedInsertOutcome::Inserted
+                        | ClaimFencedInsertOutcome::AlreadyPresent,
+                    ) => {}
+                    Err(e) => {
+                        log_session_index_failure(
+                            &session_id,
+                            &e,
+                            "failed to write title-only index row for large session",
+                        );
+                    }
                 }
                 progress.skipped.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -616,7 +637,7 @@ async fn reindex_all(
                 let db_path = search_db_path(&root);
 
                 #[cfg(test)]
-                if let Ok(guard) = before_write_progress.before_session_write.lock()
+                if let Ok(guard) = write_hooks_progress.before_session_write.lock()
                     && let Some(hook) = guard.as_ref()
                 {
                     hook();

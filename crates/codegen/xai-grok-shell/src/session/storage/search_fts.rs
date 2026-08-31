@@ -63,6 +63,17 @@ pub struct SessionDoc {
     pub content_hash: String,
 }
 
+pub(super) enum ClaimOwnedContentHash {
+    ClaimLost,
+    Owned(Option<String>),
+}
+
+pub(super) enum ClaimFencedInsertOutcome {
+    Inserted,
+    AlreadyPresent,
+    ClaimLost,
+}
+
 /// A single search result row.
 #[derive(Debug, Clone)]
 pub struct SessionSearchRow {
@@ -325,6 +336,85 @@ impl SessionSearchIndex {
             ],
         )?;
         Ok(changed == 1)
+    }
+
+    /// Read a session's content hash and claim ownership from one SQLite
+    /// snapshot. `Owned(None)` means the claim is ours and no row exists.
+    pub(super) fn get_content_hash_if_claim_owner(
+        &self,
+        session_id: &str,
+        token: &str,
+    ) -> Result<ClaimOwnedContentHash, rusqlite::Error> {
+        let (owns_claim, content_hash): (bool, Option<String>) = self.db.query_row(
+            &format!(
+                "SELECT
+                     EXISTS(
+                         SELECT 1 FROM meta WHERE key = ?2 AND {CLAIM_TOKEN_SQL} = ?3
+                     ),
+                     (SELECT content_hash FROM session_docs WHERE session_id = ?1)"
+            ),
+            params![session_id, META_KEY_BOOTSTRAP_CLAIM, token],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(if owns_claim {
+            ClaimOwnedContentHash::Owned(content_hash)
+        } else {
+            ClaimOwnedContentHash::ClaimLost
+        })
+    }
+
+    /// Insert a title-only placeholder only while `token` owns the bootstrap
+    /// claim. The immediate transaction keeps the fenced insert and its
+    /// three-way outcome linearizable across process takeover.
+    pub(super) fn insert_doc_if_absent_if_claim_owner(
+        &self,
+        doc: &SessionDoc,
+        token: &str,
+    ) -> Result<ClaimFencedInsertOutcome, rusqlite::Error> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let changed = tx.execute(
+            &format!(
+                "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE EXISTS (
+                     SELECT 1 FROM meta WHERE key = ?7 AND {CLAIM_TOKEN_SQL} = ?8
+                 )
+                 ON CONFLICT(session_id) DO NOTHING"
+            ),
+            params![
+                doc.session_id,
+                doc.cwd,
+                doc.updated_at_unix,
+                doc.title,
+                doc.content,
+                doc.content_hash,
+                META_KEY_BOOTSTRAP_CLAIM,
+                token,
+            ],
+        )?;
+        let outcome = if changed == 1 {
+            ClaimFencedInsertOutcome::Inserted
+        } else {
+            let owns_claim: bool = tx.query_row(
+                &format!(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM meta WHERE key = ?1 AND {CLAIM_TOKEN_SQL} = ?2
+                     )"
+                ),
+                params![META_KEY_BOOTSTRAP_CLAIM, token],
+                |row| row.get(0),
+            )?;
+            if owns_claim {
+                ClaimFencedInsertOutcome::AlreadyPresent
+            } else {
+                ClaimFencedInsertOutcome::ClaimLost
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// Insert a session document only if no row exists for its `session_id`.
