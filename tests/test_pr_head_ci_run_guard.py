@@ -616,8 +616,208 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
         text = (REPO / "scripts" / "merge-pr.sh").read_text(encoding="utf-8")
         self.assertIn("check_pr_head_ci_run.py", text)
         self.assertIn("--evaluate-pr-checks", text)
+        self.assertIn("--report-pr-heads", text)
         self.assertIn("gh pr checks", text)
         self.assertNotIn("if not rows:", text)
+
+
+class PrHeadHistoryReportTests(unittest.TestCase):
+    SHA_1 = "1111111111111111111111111111111111111111"
+    SHA_2 = "2222222222222222222222222222222222222222"
+
+    @staticmethod
+    def check_run(
+        run_id: int,
+        name: str,
+        sha: str,
+        *,
+        status: str = "completed",
+        conclusion: str | None = "success",
+    ) -> dict:
+        return {
+            "id": run_id,
+            "name": name,
+            "head_sha": sha,
+            "status": status,
+            "conclusion": conclusion,
+        }
+
+    def fake_api(self, responses: dict[str, object]):
+        def fake_run(command, **kwargs):
+            if command[:3] == ["gh", "pr", "view"]:
+                return completed(
+                    command,
+                    stdout=json.dumps(
+                        {
+                            "headRefName": "fix/history",
+                            "headRefOid": self.SHA_2,
+                            "url": "https://github.com/ImL1s/medley/pull/506",
+                        }
+                    ),
+                )
+            if command[:4] != ["gh", "api", "--paginate", "--slurp"]:
+                raise AssertionError(f"unexpected command: {command}")
+            endpoint = command[4]
+            if endpoint not in responses:
+                raise AssertionError(f"unexpected endpoint: {endpoint}")
+            return completed(command, stdout=json.dumps(responses[endpoint]))
+
+        return fake_run
+
+    def test_report_distinguishes_cancelled_queued_and_success_without_blocking(
+        self,
+    ) -> None:
+        responses = {
+            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+                [{"sha": self.SHA_1}, {"sha": self.SHA_2}]
+            ],
+            (
+                f"repos/ImL1s/medley/commits/{self.SHA_1}/check-runs"
+                "?filter=all&per_page=100"
+            ): [
+                {
+                    "total_count": 2,
+                    "check_runs": [
+                        self.check_run(
+                            1,
+                            "Compile every test target",
+                            self.SHA_1,
+                            conclusion="cancelled",
+                        ),
+                        self.check_run(
+                            2,
+                            "Format",
+                            self.SHA_1,
+                        ),
+                    ],
+                }
+            ],
+            (
+                f"repos/ImL1s/medley/commits/{self.SHA_2}/check-runs"
+                "?filter=all&per_page=100"
+            ): [
+                {
+                    "total_count": 2,
+                    "check_runs": [
+                        self.check_run(
+                            3,
+                            "Compile every test target",
+                            self.SHA_2,
+                            status="queued",
+                            conclusion=None,
+                        ),
+                        self.check_run(4, "Format", self.SHA_2),
+                    ],
+                }
+            ],
+        }
+        with mock.patch.object(
+            guard.subprocess, "run", side_effect=self.fake_api(responses)
+        ):
+            out = io.StringIO()
+            rc = guard.report_pr_head_history(
+                repo="ImL1s/medley", pr_number=506, stream=out
+            )
+
+        text = out.getvalue()
+        self.assertEqual(rc, 0, text)
+        self.assertIn(f"head {self.SHA_1[:8]}", text)
+        self.assertIn("Compile every test target: cancelled", text)
+        self.assertIn(f"head {self.SHA_2[:8]} (current)", text)
+        self.assertIn("Compile every test target: queued", text)
+        self.assertIn("Format: success", text)
+        self.assertIn("historical states are report-only", text)
+
+    def test_report_paginates_and_shows_superseded_rerun_attempts(self) -> None:
+        responses = {
+            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+                [{"sha": self.SHA_1}],
+                [{"sha": self.SHA_2}],
+            ],
+            (
+                f"repos/ImL1s/medley/commits/{self.SHA_1}/check-runs"
+                "?filter=all&per_page=100"
+            ): [
+                {
+                    "total_count": 2,
+                    "check_runs": [
+                        self.check_run(
+                            10,
+                            "Tests (providers hot path)",
+                            self.SHA_1,
+                            conclusion="cancelled",
+                        )
+                    ],
+                },
+                {
+                    "total_count": 2,
+                    "check_runs": [
+                        self.check_run(
+                            11, "Tests (providers hot path)", self.SHA_1
+                        )
+                    ],
+                },
+            ],
+            (
+                f"repos/ImL1s/medley/commits/{self.SHA_2}/check-runs"
+                "?filter=all&per_page=100"
+            ): [{"total_count": 0, "check_runs": []}],
+        }
+        with mock.patch.object(
+            guard.subprocess, "run", side_effect=self.fake_api(responses)
+        ):
+            out = io.StringIO()
+            rc = guard.report_pr_head_history(
+                repo="ImL1s/medley", pr_number=506, stream=out
+            )
+
+        text = out.getvalue()
+        self.assertEqual(rc, 0, text)
+        self.assertIn(
+            "Tests (providers hot path): success "
+            "(attempts: cancelled -> success)",
+            text,
+        )
+        self.assertIn(f"head {self.SHA_2[:8]} (current): absent", text)
+
+    def test_report_rejects_check_run_for_a_different_head(self) -> None:
+        responses = {
+            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+                [{"sha": self.SHA_2}]
+            ],
+            (
+                f"repos/ImL1s/medley/commits/{self.SHA_2}/check-runs"
+                "?filter=all&per_page=100"
+            ): [
+                {
+                    "total_count": 1,
+                    "check_runs": [
+                        self.check_run(1, "CI", self.SHA_1)
+                    ],
+                }
+            ],
+        }
+        with mock.patch.object(
+            guard.subprocess, "run", side_effect=self.fake_api(responses)
+        ):
+            with self.assertRaisesRegex(guard.CiHeadGateError, "different head SHA"):
+                guard.report_pr_head_history(
+                    repo="ImL1s/medley", pr_number=506, stream=io.StringIO()
+                )
+
+    def test_report_rejects_commit_pages_that_omit_the_current_head(self) -> None:
+        responses = {
+            "repos/ImL1s/medley/pulls/506/commits?per_page=100": [
+                [{"sha": self.SHA_1}]
+            ]
+        }
+        with mock.patch.object(
+            guard.subprocess, "run", side_effect=self.fake_api(responses)
+        ):
+            with self.assertRaisesRegex(guard.CiHeadGateError, "current head"):
+                guard.report_pr_head_history(
+                    repo="ImL1s/medley", pr_number=506, stream=io.StringIO()
+                )
 
 
 if __name__ == "__main__":

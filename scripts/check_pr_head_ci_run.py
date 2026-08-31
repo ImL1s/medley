@@ -16,6 +16,8 @@ Why this exists:
 This script is a pre-merge guard meant to run on a developer machine (or merge
 orchestrator), not inside CI itself. `--evaluate-pr-checks` is the fail-closed
 wrapper for `gh pr checks --json` used by `scripts/merge-pr.sh`.
+`--report-pr-heads` reconciles every commit in a PR with its check runs so a
+cancelled historical run cannot be mistaken for a still-pending current run.
 """
 
 from __future__ import annotations
@@ -78,6 +80,18 @@ def gh_json(args: list[str]) -> Any:
         ) from exc
 
 
+def gh_paginated_json(endpoint: str) -> Any:
+    """Load every REST page while preserving page boundaries for validation."""
+
+    result = run_command(["gh", "api", "--paginate", "--slurp", endpoint])
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CiHeadGateError(
+            f"`gh api --paginate --slurp {endpoint}` did not return valid JSON"
+        ) from exc
+
+
 def _is_sha(value: str) -> bool:
     return len(value) == 40 and all(c in string.hexdigits for c in value)
 
@@ -106,6 +120,146 @@ def load_pr_head(repo: str, pr_number: int) -> tuple[str, str, str]:
     if not isinstance(pr_url, str) or not pr_url:
         raise CiHeadGateError("PR URL is missing from `gh pr view`")
     return branch, head_sha.lower(), pr_url
+
+
+def list_pr_commit_shas(repo: str, pr_number: int) -> list[str]:
+    endpoint = f"repos/{repo}/pulls/{pr_number}/commits?per_page=100"
+    pages = gh_paginated_json(endpoint)
+    if not isinstance(pages, list):
+        raise CiHeadGateError("PR commits API returned a non-array page list")
+
+    shas: list[str] = []
+    seen: set[str] = set()
+    for page in pages:
+        if not isinstance(page, list):
+            raise CiHeadGateError("PR commits API returned a non-array page")
+        for row in page:
+            if not isinstance(row, dict):
+                raise CiHeadGateError("PR commits API returned a non-object commit")
+            sha = row.get("sha")
+            if not isinstance(sha, str) or not _is_sha(sha):
+                raise CiHeadGateError("PR commits API returned a malformed commit SHA")
+            sha = sha.lower()
+            if sha in seen:
+                raise CiHeadGateError(f"PR commits API repeated commit SHA {sha}")
+            seen.add(sha)
+            shas.append(sha)
+
+    if not shas:
+        raise CiHeadGateError("PR commits API returned no commits")
+    return shas
+
+
+def _check_run_state(row: dict[str, Any]) -> str:
+    status = row.get("status")
+    if not isinstance(status, str) or not status:
+        raise CiHeadGateError("check-runs API returned a malformed status")
+    status = status.lower()
+    if status != "completed":
+        return status
+
+    conclusion = row.get("conclusion")
+    if not isinstance(conclusion, str) or not conclusion:
+        raise CiHeadGateError(
+            "check-runs API returned a completed run without a conclusion"
+        )
+    return conclusion.lower()
+
+
+def list_commit_check_runs(repo: str, sha: str) -> list[dict[str, Any]]:
+    endpoint = f"repos/{repo}/commits/{sha}/check-runs?filter=all&per_page=100"
+    pages = gh_paginated_json(endpoint)
+    if not isinstance(pages, list):
+        raise CiHeadGateError("check-runs API returned a non-array page list")
+
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    total_count: int | None = None
+    for page in pages:
+        if not isinstance(page, dict):
+            raise CiHeadGateError("check-runs API returned a non-object page")
+        page_total = page.get("total_count")
+        page_rows = page.get("check_runs")
+        if not isinstance(page_total, int) or page_total < 0:
+            raise CiHeadGateError("check-runs API returned a malformed total_count")
+        if total_count is None:
+            total_count = page_total
+        elif page_total != total_count:
+            raise CiHeadGateError("check-runs API returned inconsistent total_count values")
+        if not isinstance(page_rows, list):
+            raise CiHeadGateError("check-runs API returned a non-array check_runs value")
+
+        for row in page_rows:
+            if not isinstance(row, dict):
+                raise CiHeadGateError("check-runs API returned a non-object check run")
+            run_id = row.get("id")
+            name = row.get("name")
+            run_sha = row.get("head_sha")
+            if not isinstance(run_id, int) or run_id <= 0:
+                raise CiHeadGateError("check-runs API returned a malformed check run ID")
+            if run_id in seen_ids:
+                raise CiHeadGateError(f"check-runs API repeated check run ID {run_id}")
+            if not isinstance(name, str) or not name:
+                raise CiHeadGateError("check-runs API returned a nameless check run")
+            if not isinstance(run_sha, str) or not _is_sha(run_sha):
+                raise CiHeadGateError("check-runs API returned a malformed head SHA")
+            if run_sha.lower() != sha:
+                raise CiHeadGateError(
+                    f"check run {run_id} belongs to a different head SHA"
+                )
+            _check_run_state(row)
+            seen_ids.add(run_id)
+            rows.append(row)
+
+    if total_count is None:
+        raise CiHeadGateError("check-runs API returned no pages")
+    if len(rows) != total_count:
+        raise CiHeadGateError(
+            "check-runs API total_count does not match the paginated rows "
+            f"({total_count} != {len(rows)})"
+        )
+    return rows
+
+
+def report_pr_head_history(
+    *, repo: str, pr_number: int, stream: TextIO
+) -> int:
+    """Print check-run states for every commit without gating on old states."""
+
+    _branch, current_head, pr_url = load_pr_head(repo, pr_number)
+    commit_shas = list_pr_commit_shas(repo, pr_number)
+    if current_head not in commit_shas:
+        raise CiHeadGateError("PR commit history omits the current head")
+    if commit_shas[-1] != current_head:
+        raise CiHeadGateError("PR commit history does not end at the current head")
+
+    print(f"PR #{pr_number} head history: {pr_url}", file=stream)
+    for sha in commit_shas:
+        current = " (current)" if sha == current_head else ""
+        label = f"head {_short_sha(sha)}{current}"
+        runs = list_commit_check_runs(repo, sha)
+        if not runs:
+            print(f"{label}: absent", file=stream)
+            continue
+
+        print(label, file=stream)
+        attempts_by_name: dict[str, list[dict[str, Any]]] = {}
+        for row in runs:
+            attempts_by_name.setdefault(str(row["name"]), []).append(row)
+        for name in sorted(attempts_by_name):
+            attempts = sorted(attempts_by_name[name], key=lambda row: int(row["id"]))
+            states = [_check_run_state(row) for row in attempts]
+            suffix = ""
+            if len(states) > 1:
+                suffix = f" (attempts: {' -> '.join(states)})"
+            print(f"  {name}: {states[-1]}{suffix}", file=stream)
+
+    print(
+        "note: historical states are report-only; the exact current-head gates "
+        "below remain authoritative",
+        file=stream,
+    )
+    return 0
 
 
 def remote_head_sha(remote: str, branch: str) -> str:
@@ -555,6 +709,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     target.add_argument("--pr", type=int, help="Pull request number")
     target.add_argument("--branch", help="Branch name to probe directly")
     target.add_argument(
+        "--report-pr-heads",
+        type=int,
+        metavar="PR",
+        help="Report check-run states for every commit in a pull request",
+    )
+    target.add_argument(
         "--evaluate-pr-checks",
         action="store_true",
         help=(
@@ -594,6 +754,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.head_sha is not None:
             raise CiHeadGateError("--head-sha cannot be used with --evaluate-pr-checks")
         return run_evaluate_pr_checks(sys.stdin, sys.stdout, sys.stderr)
+    if args.report_pr_heads is not None:
+        if args.head_sha is not None:
+            raise CiHeadGateError("--head-sha cannot be used with --report-pr-heads")
+        if args.report_pr_heads <= 0:
+            raise CiHeadGateError("--report-pr-heads must be a positive integer")
+        return report_pr_head_history(
+            repo=args.repo,
+            pr_number=args.report_pr_heads,
+            stream=sys.stdout,
+        )
     if args.limit <= 0:
         raise CiHeadGateError("--limit must be a positive integer")
     if args.pr is not None and args.head_sha is not None:

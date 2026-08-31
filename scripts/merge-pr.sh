@@ -74,6 +74,10 @@ TIP="$(git ls-remote "$REMOTE" "refs/heads/$BRANCH" | cut -f1)"
 [ -n "$TIP" ] || die "$REMOTE has no refs/heads/$BRANCH"
 [ "$TIP" = "$HEAD" ] || die "PR head $HEAD != remote tip $TIP -- the branch moved; re-check and retry"
 
+echo "==> Reporting check-run history for every PR head"
+python3 -B "$GUARD" --report-pr-heads "$PR" --repo "$REPO" ||
+  die "could not reconcile PR head history"
+
 echo "==> Requiring a successful ci.yml run for exactly $HEAD"
 python3 -B "$GUARD" --branch "$BRANCH" --head-sha "$HEAD" --repo "$REPO" --remote "$REMOTE" ||
   die "no successful CI run for $HEAD"
