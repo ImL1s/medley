@@ -476,6 +476,33 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"calls_nested_helper_untagged"})
 
+    def test_sibling_nested_helpers_do_not_share_keys(self):
+        """A touching nested `fn helper` must not taint a sibling test's
+        clean nested `helper` (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[test]
+            fn dirty_nested_helper_untagged() {
+                fn helper() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+                helper();
+            }
+
+            #[test]
+            fn clean_nested_helper_untagged() {
+                fn helper() {}
+                helper();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, {"dirty_nested_helper_untagged"})
+
     def test_unused_nested_impl_body_is_not_a_direct_touch(self):
         """An unused nested `impl { fn helper() { COUNTER... } }` must
         not mark the enclosing test as a Stage-1 toucher (#516 review)."""

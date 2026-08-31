@@ -2383,6 +2383,7 @@ class FnInfo:
     macro_arms: tuple[tuple[str, int], ...] = ()
     is_macro_arm: bool = False
     is_macro_export: bool = False
+    enclosing_start: int | None = None
 
 
 def _import_from_uses(
@@ -3155,6 +3156,11 @@ def index_functions(
                     has_unkeyed = True
                 else:
                     serial_held.update(parsed)
+            enclosing_start = None
+            for _om, _on, other_bs, other_be, _oc, _oi in pending_fns:
+                if other_bs < body_start < other_be:
+                    if enclosing_start is None or other_bs >= enclosing_start:
+                        enclosing_start = other_bs
             out.append(
                 FnInfo(
                     name=name,
@@ -3172,6 +3178,7 @@ def index_functions(
                     attrs_line=_line(raw, match.start()),
                     local_uses=local_uses,
                     local_globs=local_globs,
+                    enclosing_start=enclosing_start,
                 )
             )
         for match in _macro_def_matches(code):
@@ -3561,7 +3568,9 @@ def _resolve_calls(
     by_macro_any: dict[str, list[int]],
     by_macro_arms: dict[int, tuple[tuple[str, int], ...]],
     macro_defs_by_module: dict[tuple[tuple[str, ...], str], list[int]],
-    by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]],
+    by_inline: dict[
+        tuple[Path, tuple[str, ...], int | None], dict[str, list[int]]
+    ],
     imports_by_file: dict[
         Path, dict[tuple[str, ...], dict[str, tuple[tuple[str, ...], str]]]
     ],
@@ -3622,7 +3631,13 @@ def _resolve_calls(
         if not js:
             prefix = fn.inline_mods
             while True:
-                js = by_inline.get((fn.file, prefix), {}).get(name, [])
+                js = by_inline.get((fn.file, prefix, fn.start), {}).get(
+                    name, []
+                )
+                if not js:
+                    js = by_inline.get((fn.file, prefix, None), {}).get(
+                        name, []
+                    )
                 if js:
                     break
                 if not prefix:
@@ -3787,11 +3802,17 @@ def _resolve_calls(
             )
         # Inline `mod inner { fn relay }` is not a filename leaf (#516 review).
         for prefix in (fn.inline_mods, ()):
+            nested = by_inline.get(
+                (fn.file, prefix + segs, fn.start), {}
+            ).get(m.group(2), [])
+            module_level = by_inline.get(
+                (fn.file, prefix + segs, None), {}
+            ).get(m.group(2), [])
             _gain_from(
                 gained,
                 keys_of,
                 self_index,
-                by_inline.get((fn.file, prefix + segs), {}).get(m.group(2), []),
+                nested or module_level,
             )
     for m in TYPE_ASSOC_CALL.finditer(fn.body):
         # `Self::name(` resolves against the CALLING function's own
@@ -3860,7 +3881,9 @@ def analyze(
     by_macro_any: dict[str, list[int]] = {}
     by_macro_arms: dict[int, tuple[tuple[str, int], ...]] = {}
     macro_defs_by_module: dict[tuple[tuple[str, ...], str], list[int]] = {}
-    by_inline: dict[tuple[Path, tuple[str, ...]], dict[str, list[int]]] = {}
+    by_inline: dict[
+        tuple[Path, tuple[str, ...], int | None], dict[str, list[int]]
+    ] = {}
     for i, fn in enumerate(functions):
         if fn.is_macro:
             by_macro_any.setdefault(fn.name, []).append(i)
@@ -3878,9 +3901,9 @@ def analyze(
         if fn.is_macro_arm:
             continue
         by_file.setdefault(fn.file, {}).setdefault(fn.name, []).append(i)
-        by_inline.setdefault((fn.file, fn.inline_mods), {}).setdefault(
-            fn.name, []
-        ).append(i)
+        by_inline.setdefault(
+            (fn.file, fn.inline_mods, fn.enclosing_start), {}
+        ).setdefault(fn.name, []).append(i)
         module = _module_path(fn.file)
         crate_mod = module if module is not None else ()
         for group in file_groups.get(fn.file, frozenset({_process_group(fn.file)})):
