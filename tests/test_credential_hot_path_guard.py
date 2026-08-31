@@ -3337,12 +3337,12 @@ def _tests_in_file(
                 mod_stack.append((depth, _fn_name(inline_mod), line_cfg_off))
 
         in_macro_def = any(start <= line_start < end for start, end in def_spans)
-        seen_on_line = {found} if has_test and found and not compact_fns else set()
+        seen_on_line: set[str] = set()
+        if has_test and found and not compact_fns:
+            prefix_parts = file_mods + [name for _, name, _ in mod_stack]
+            prefix = "::".join(prefix_parts)
+            seen_on_line.add(f"{prefix}::{found}" if prefix else found)
         for fname, cinactive, cignored, col in compact_fns:
-            if fname in seen_on_line:
-                continue
-            if enclosing_off or cinactive or cignored or in_macro_def:
-                continue
             col_stack = _mod_stack_at_column(
                 masked_line, col, line_stack, line_depth, enabled_features
             )
@@ -3350,8 +3350,13 @@ def _tests_in_file(
                 continue
             prefix_parts = file_mods + [name for _, name, _ in col_stack]
             prefix = "::".join(prefix_parts)
-            names.append(f"{prefix}::{fname}" if prefix else fname)
-            seen_on_line.add(fname)
+            qualified = f"{prefix}::{fname}" if prefix else fname
+            if qualified in seen_on_line:
+                continue
+            if enclosing_off or cinactive or cignored or in_macro_def:
+                continue
+            names.append(qualified)
+            seen_on_line.add(qualified)
 
         invoke_end = line_start + len(masked_line)
         while (
@@ -5742,6 +5747,20 @@ class ExternalModulePrefix(unittest.TestCase):
         self.assertEqual(
             sorted(names),
             ["none_auth_scheme_a", "none_auth_scheme_b"],
+        )
+
+    def test_same_line_same_basename_in_different_modules_are_both_counted(self):
+        """Two inline modules on one line with the same fn name both register
+        under their qualified paths (#507 review)."""
+
+        names = _tests_in_file(
+            "mod a { #[test] fn none_auth_scheme_same() {} } "
+            "mod b { #[test] fn none_auth_scheme_same() {} }\n",
+            [],
+        )
+        self.assertEqual(
+            sorted(names),
+            ["a::none_auth_scheme_same", "b::none_auth_scheme_same"],
         )
 
     def test_unexpanded_macro_rules_test_is_not_counted(self):
