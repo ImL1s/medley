@@ -63,6 +63,17 @@ pub struct SessionDoc {
     pub content_hash: String,
 }
 
+pub(super) enum ClaimOwnedContentHash {
+    ClaimLost,
+    Owned(Option<String>),
+}
+
+pub(super) enum ClaimFencedInsertOutcome {
+    Inserted,
+    AlreadyPresent,
+    ClaimLost,
+}
+
 /// A single search result row.
 #[derive(Debug, Clone)]
 pub struct SessionSearchRow {
@@ -289,6 +300,121 @@ impl SessionSearchIndex {
             ],
         )?;
         Ok(())
+    }
+
+    /// Insert or update a session document only while `token` owns the
+    /// bootstrap claim. The ownership check and document write are one SQL
+    /// statement so a lease takeover cannot interleave between them.
+    pub(super) fn upsert_doc_if_claim_owner(
+        &self,
+        doc: &SessionDoc,
+        token: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let changed = self.db.execute(
+            &format!(
+                "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE EXISTS (
+                     SELECT 1 FROM meta WHERE key = ?7 AND {CLAIM_TOKEN_SQL} = ?8
+                 )
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     cwd = excluded.cwd,
+                     updated_at = excluded.updated_at,
+                     title = excluded.title,
+                     content = excluded.content,
+                     content_hash = excluded.content_hash"
+            ),
+            params![
+                doc.session_id,
+                doc.cwd,
+                doc.updated_at_unix,
+                doc.title,
+                doc.content,
+                doc.content_hash,
+                META_KEY_BOOTSTRAP_CLAIM,
+                token,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Read a session's content hash and claim ownership from one SQLite
+    /// snapshot. `Owned(None)` means the claim is ours and no row exists.
+    pub(super) fn get_content_hash_if_claim_owner(
+        &self,
+        session_id: &str,
+        token: &str,
+    ) -> Result<ClaimOwnedContentHash, rusqlite::Error> {
+        let (owns_claim, content_hash): (bool, Option<String>) = self.db.query_row(
+            &format!(
+                "SELECT
+                     EXISTS(
+                         SELECT 1 FROM meta WHERE key = ?2 AND {CLAIM_TOKEN_SQL} = ?3
+                     ),
+                     (SELECT content_hash FROM session_docs WHERE session_id = ?1)"
+            ),
+            params![session_id, META_KEY_BOOTSTRAP_CLAIM, token],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(if owns_claim {
+            ClaimOwnedContentHash::Owned(content_hash)
+        } else {
+            ClaimOwnedContentHash::ClaimLost
+        })
+    }
+
+    /// Insert a title-only placeholder only while `token` owns the bootstrap
+    /// claim. The immediate transaction keeps the fenced insert and its
+    /// three-way outcome linearizable across process takeover.
+    pub(super) fn insert_doc_if_absent_if_claim_owner(
+        &self,
+        doc: &SessionDoc,
+        token: &str,
+    ) -> Result<ClaimFencedInsertOutcome, rusqlite::Error> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let changed = tx.execute(
+            &format!(
+                "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE EXISTS (
+                     SELECT 1 FROM meta WHERE key = ?7 AND {CLAIM_TOKEN_SQL} = ?8
+                 )
+                 ON CONFLICT(session_id) DO NOTHING"
+            ),
+            params![
+                doc.session_id,
+                doc.cwd,
+                doc.updated_at_unix,
+                doc.title,
+                doc.content,
+                doc.content_hash,
+                META_KEY_BOOTSTRAP_CLAIM,
+                token,
+            ],
+        )?;
+        let outcome = if changed == 1 {
+            ClaimFencedInsertOutcome::Inserted
+        } else {
+            let owns_claim: bool = tx.query_row(
+                &format!(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM meta WHERE key = ?1 AND {CLAIM_TOKEN_SQL} = ?2
+                     )"
+                ),
+                params![META_KEY_BOOTSTRAP_CLAIM, token],
+                |row| row.get(0),
+            )?;
+            if owns_claim {
+                ClaimFencedInsertOutcome::AlreadyPresent
+            } else {
+                ClaimFencedInsertOutcome::ClaimLost
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// Insert a session document only if no row exists for its `session_id`.
@@ -864,6 +990,69 @@ mod tests {
             Some("v2"),
             "owner writes take the update arm on conflict"
         );
+    }
+
+    #[test]
+    fn test_claim_fenced_insert_distinguishes_insert_conflict_and_claim_loss() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        assert!(index.try_claim_bootstrap(1_000, LEASE, "owner").unwrap());
+
+        let full_doc = SessionDoc {
+            session_id: "existing-session".to_string(),
+            cwd: "/workspace/完整\0path".to_string(),
+            updated_at_unix: -1_234_567_890,
+            title: "successor title 🧪".to_string(),
+            content: "full\0content\nwith every stored field".to_string(),
+            content_hash: "full-content-hash-not-a-placeholder".to_string(),
+        };
+        assert!(matches!(
+            index
+                .insert_doc_if_absent_if_claim_owner(&full_doc, "owner")
+                .unwrap(),
+            ClaimFencedInsertOutcome::Inserted
+        ));
+
+        let conflicting_placeholder = SessionDoc {
+            session_id: full_doc.session_id.clone(),
+            cwd: "/stale/workspace".to_string(),
+            updated_at_unix: 9_999_999_999,
+            title: "stale placeholder".to_string(),
+            content: String::new(),
+            content_hash: "stale-placeholder-hash".to_string(),
+        };
+        assert!(matches!(
+            index
+                .insert_doc_if_absent_if_claim_owner(&conflicting_placeholder, "owner")
+                .unwrap(),
+            ClaimFencedInsertOutcome::AlreadyPresent
+        ));
+
+        let stored = index
+            .get_doc(&full_doc.session_id)
+            .unwrap()
+            .expect("the original full document remains present");
+        assert_eq!(stored.session_id.as_bytes(), full_doc.session_id.as_bytes());
+        assert_eq!(stored.cwd.as_bytes(), full_doc.cwd.as_bytes());
+        assert_eq!(stored.updated_at_unix, full_doc.updated_at_unix);
+        assert_eq!(stored.title.as_bytes(), full_doc.title.as_bytes());
+        assert_eq!(stored.content.as_bytes(), full_doc.content.as_bytes());
+        assert_eq!(
+            stored.content_hash.as_bytes(),
+            full_doc.content_hash.as_bytes()
+        );
+
+        let absent_doc = SessionDoc {
+            session_id: "stale-absent-session".to_string(),
+            ..conflicting_placeholder
+        };
+        assert!(matches!(
+            index
+                .insert_doc_if_absent_if_claim_owner(&absent_doc, "stale")
+                .unwrap(),
+            ClaimFencedInsertOutcome::ClaimLost
+        ));
+        assert_eq!(index.get_doc(&absent_doc.session_id).unwrap(), None);
     }
 
     #[test]

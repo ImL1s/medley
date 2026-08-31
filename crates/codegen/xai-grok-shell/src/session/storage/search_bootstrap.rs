@@ -17,13 +17,15 @@ use tokio::time::Instant;
 use super::StorageAdapter;
 use super::search_content::{
     UpsertOutcome, build_session_doc, collect_all_indexable_content_single_pass,
-    should_skip_session, upsert_unless_unchanged,
+    should_skip_session, upsert_unless_unchanged_if_claim_owner,
 };
 use super::search_db::{
     HealAwareLogCounter, log_bootstrap_timeout, log_session_index_failure, search_db_path,
     sqlite_to_io_error, with_search_index, with_search_index_blocking,
 };
-use super::search_fts::{META_KEY_BOOTSTRAP_CLAIM, META_KEY_LAST_BOOTSTRAP, SessionSearchIndex};
+use super::search_fts::{
+    ClaimFencedInsertOutcome, META_KEY_BOOTSTRAP_CLAIM, META_KEY_LAST_BOOTSTRAP, SessionSearchIndex,
+};
 use super::search_recovery;
 use crate::session::persistence::Summary;
 
@@ -83,6 +85,14 @@ pub(super) struct BootstrapProgress {
     /// (#498 review). Production always reads `claim_lost` directly.
     #[cfg(test)]
     pub(super) session_claim_check: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    /// Test-only: deterministic interleaving point after content is read but
+    /// before the claim-fenced document write (#515).
+    #[cfg(test)]
+    pub(super) before_session_write: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: deterministic interleaving point before a large-session
+    /// title-only placeholder write (#515 follow-up).
+    #[cfg(test)]
+    pub(super) before_title_only_write: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl BootstrapProgress {
@@ -541,6 +551,7 @@ async fn reindex_all(
         let root = root.clone();
         let shared = shared.clone();
         let claim_lost = Arc::clone(&claim_lost);
+        let claim_token = claim_token.as_str().to_string();
         let per_session_timeout = BOOTSTRAP_PER_SESSION_TIMEOUT;
         let max_file_size = BOOTSTRAP_MAX_FILE_SIZE;
 
@@ -550,11 +561,15 @@ async fn reindex_all(
                 .await
                 .expect("semaphore is never closed");
 
-            // A successor owns the index. These upserts are idempotent,
-            // not fenced; stopping just avoids contending with it.
+            // Stop before expensive reads once takeover is observed. The
+            // later document write is independently fenced in SQLite so a
+            // takeover after this check cannot clobber successor content.
             if session_claim_is_lost(&claim_lost, &progress) {
                 return;
             }
+
+            #[cfg(test)]
+            let write_hooks_progress = Arc::clone(&progress);
 
             let session_id = summary.info.id.to_string();
 
@@ -573,16 +588,31 @@ async fn reindex_all(
                 let doc = build_session_doc(&summary, String::new());
                 let db_path = search_db_path(&root);
                 let shared = shared.clone();
+                #[cfg(test)]
+                if let Ok(guard) = write_hooks_progress.before_title_only_write.lock()
+                    && let Some(hook) = guard.as_ref()
+                {
+                    hook();
+                }
                 let title_only = tokio::task::spawn_blocking(move || {
-                    shared.with(&db_path, |index| index.insert_doc_if_absent(&doc))
+                    shared.with(&db_path, |index| {
+                        index.insert_doc_if_absent_if_claim_owner(&doc, &claim_token)
+                    })
                 })
                 .await;
-                if let Err(e) = title_only.map_err(io::Error::other).and_then(|r| r) {
-                    log_session_index_failure(
-                        &session_id,
-                        &e,
-                        "failed to write title-only index row for large session",
-                    );
+                match title_only.map_err(io::Error::other).and_then(|r| r) {
+                    Ok(ClaimFencedInsertOutcome::ClaimLost) => return,
+                    Ok(
+                        ClaimFencedInsertOutcome::Inserted
+                        | ClaimFencedInsertOutcome::AlreadyPresent,
+                    ) => {}
+                    Err(e) => {
+                        log_session_index_failure(
+                            &session_id,
+                            &e,
+                            "failed to write title-only index row for large session",
+                        );
+                    }
                 }
                 progress.skipped.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -606,9 +636,21 @@ async fn reindex_all(
                 let doc = build_session_doc(&summary, content);
                 let db_path = search_db_path(&root);
 
+                #[cfg(test)]
+                if let Ok(guard) = write_hooks_progress.before_session_write.lock()
+                    && let Some(hook) = guard.as_ref()
+                {
+                    hook();
+                }
+
                 match tokio::task::spawn_blocking(move || {
                     shared.with(&db_path, |index| {
-                        upsert_unless_unchanged(index, &doc, bytes_read)
+                        upsert_unless_unchanged_if_claim_owner(
+                            index,
+                            &doc,
+                            bytes_read,
+                            &claim_token,
+                        )
                     })
                 })
                 .await
@@ -627,6 +669,7 @@ async fn reindex_all(
                         progress.unchanged.fetch_add(1, Ordering::Relaxed);
                         progress.bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
                     }
+                    UpsertOutcome::ClaimLost => return,
                     UpsertOutcome::NoContent => {}
                 },
                 Ok(Err(e)) => {

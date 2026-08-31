@@ -4,7 +4,7 @@
 use std::io::{self, BufRead};
 use std::path::Path;
 
-use super::search_fts::{SessionDoc, SessionSearchIndex};
+use super::search_fts::{ClaimOwnedContentHash, SessionDoc, SessionSearchIndex};
 use super::{
     ContentPeek, PromptExtractEvent, RawLinePeek, RawParamsPeek, XAI_SESSION_UPDATE_METHOD,
     apply_assistant_text_xai_boundary, collect_prompts_from_events,
@@ -30,8 +30,36 @@ pub(super) enum UpsertOutcome {
     Unchanged {
         bytes_read: u64,
     },
+    /// Bootstrap lease changed before the document reached SQLite.
+    ClaimLost,
     /// Storage backend doesn't expose an updates file path.
     NoContent,
+}
+
+/// Upsert `doc` only while `claim_token` still owns the bootstrap lease.
+///
+/// Both the unchanged read and changed-document write validate ownership at
+/// their SQLite linearization point.
+pub(super) fn upsert_unless_unchanged_if_claim_owner(
+    index: &SessionSearchIndex,
+    doc: &SessionDoc,
+    bytes_read: u64,
+    claim_token: &str,
+) -> Result<UpsertOutcome, rusqlite::Error> {
+    match index.get_content_hash_if_claim_owner(&doc.session_id, claim_token) {
+        Ok(ClaimOwnedContentHash::ClaimLost) => return Ok(UpsertOutcome::ClaimLost),
+        Ok(ClaimOwnedContentHash::Owned(Some(existing_hash)))
+            if existing_hash == doc.content_hash =>
+        {
+            return Ok(UpsertOutcome::Unchanged { bytes_read });
+        }
+        Ok(ClaimOwnedContentHash::Owned(_)) | Err(_) => {}
+    }
+    if index.upsert_doc_if_claim_owner(doc, claim_token)? {
+        Ok(UpsertOutcome::Indexed { bytes_read })
+    } else {
+        Ok(UpsertOutcome::ClaimLost)
+    }
 }
 
 /// Upsert `doc` unless the stored content hash already matches.

@@ -431,7 +431,8 @@ async fn test_concurrent_gates_single_flight() {
 // stated in `reindex_all`'s own comments, none of which #440/#476 exercise:
 //
 //   1. `upsert_doc` is an UPSERT keyed by `session_id` -- concurrent writers
-//      cannot corrupt a row, only race harmlessly to redundant writes.
+//      cannot structurally corrupt a row. Bootstrap callers additionally
+//      fence writes on claim ownership so stale content cannot win (#515).
 //   2. `claim_lost` gives a displaced claimant an early exit before it does
 //      any (redundant, but wasted) per-session work.
 //   3. the completion marker and orphan-prune writes are fenced on claim
@@ -509,13 +510,10 @@ fn stream_doc(session_id: &str, stream: &str, revision: usize) -> SessionDoc {
 /// This is a storage-layer property of `upsert_doc` alone -- it is
 /// necessary but **not sufficient** to show overlap is harmless
 /// end-to-end. `upsert_doc` has no ownership or recency fence: last
-/// write always wins by *arrival order*, not by content freshness, so a
-/// stale claimant's write that arrives after a successor's can silently
-/// overwrite it (#515). That gap is out of scope for this test, which
-/// only asserts the SQL-layer convergence; it is pinned on its own,
-/// deliberately as a green characterization rather than a red assertion
-/// of a property nothing currently guarantees, by the test directly
-/// below this one.
+/// write always wins by *arrival order*, not by content freshness. Bootstrap
+/// therefore must not call it without an ownership fence. The two tests
+/// directly below bind that fence at both the SQL boundary and through
+/// `reindex_all` (#515).
 #[test]
 fn test_upsert_doc_converges_under_every_interleaving_of_two_streams() {
     const SESSION_ID: &str = "s1";
@@ -555,40 +553,284 @@ fn test_upsert_doc_converges_under_every_interleaving_of_two_streams() {
     }
 }
 
-/// Characterizes a known gap (#515), found via Codex review of this file:
-/// `upsert_doc` has no ownership or recency fence, so whichever write
-/// physically arrives last always wins -- even when it carries staler
-/// content than the row it overwrites. This models `reindex_all`'s own
-/// documented scenario ("these upserts are idempotent, not fenced"): a
-/// stale claimant that already passed its one early `claim_lost` check,
-/// then finishes its slower read+write *after* a successor already wrote
-/// fresher content for the same `session_id`.
-///
-/// This test is **green today because it pins the actual, imperfect
-/// behavior**, not the desired one -- it is not a claim that this is
-/// safe. If `upsert_doc` (or a caller) grows ownership/recency fencing,
-/// this assertion should flip deliberately; do not delete it to make a
-/// future change pass, since deleting it re-loses the coverage that
-/// caught this gap in the first place.
+/// A bootstrap document write is fenced atomically on claim ownership.
+/// This models a stale claimant that already passed its early
+/// `claim_lost` check, then reaches SQLite only after a successor has taken
+/// the lease and written fresher content for the same session.
 #[test]
-fn test_upsert_doc_has_no_fence_against_a_later_stale_write() {
+fn test_stale_claimant_cannot_overwrite_successor_document() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("session_search.sqlite");
     let index = SessionSearchIndex::open_or_create(&db_path).unwrap();
+    let now = chrono::Utc::now().timestamp();
 
-    // The successor writes fresher content for this session first...
-    index.upsert_doc(&stream_doc("s1", "SUCCESSOR", 1)).unwrap();
-    // ...then a stale claimant's write, carrying older content it read
-    // before losing the claim, arrives after.
-    index.upsert_doc(&stream_doc("s1", "STALE", 1)).unwrap();
-
-    let hash = index.get_content_hash("s1").unwrap();
-    assert_eq!(
-        hash.as_deref(),
-        Some("STALE-rev1"),
-        "known gap (#515): upsert_doc has no ownership/recency fence, so \
-         a later write always wins even when it is the staler one"
+    assert!(
+        index
+            .try_claim_bootstrap(now, TEST_TIMING.lease, "stale")
+            .unwrap()
     );
+    let takeover_at = now + TEST_TIMING.lease.as_secs() as i64 + 1;
+    assert!(
+        index
+            .try_claim_bootstrap(takeover_at, TEST_TIMING.lease, "successor")
+            .unwrap(),
+        "the successor must first take over the stale claimant's expired lease"
+    );
+    assert!(
+        index
+            .upsert_doc_if_claim_owner(&stream_doc("s1", "SUCCESSOR", 1), "successor")
+            .unwrap()
+    );
+    assert!(
+        !index
+            .upsert_doc_if_claim_owner(&stream_doc("s1", "STALE", 1), "stale")
+            .unwrap(),
+        "a displaced claimant must be rejected at the write boundary"
+    );
+
+    assert_eq!(
+        index.get_doc("s1").unwrap(),
+        Some(stream_doc("s1", "SUCCESSOR", 1)),
+        "the successor's full row must survive a later stale write"
+    );
+}
+
+/// End-to-end caller binding for #515: takeover happens after `reindex_all`
+/// has read stale content and passed its early `claim_lost` check, but before
+/// its SQLite write. The successor's row must still win.
+#[tokio::test]
+#[serial(search_cache_epoch)]
+async fn test_reindex_write_is_fenced_against_takeover_after_content_read() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let storage = JsonlStorageAdapter::with_root(root.clone());
+    let info = Info {
+        id: acp::SessionId::new("s1"),
+        cwd: "/ws".to_string(),
+    };
+    storage
+        .init_session(&info, acp::ModelId::new("test"))
+        .await
+        .unwrap();
+
+    let stale_token = ClaimToken::new();
+    let now = chrono::Utc::now().timestamp();
+    let takeover_at = now + TEST_TIMING.lease.as_secs() as i64 + 1;
+    let db_path = search_db_path(&root);
+    with_search_index(&db_path, |index| {
+        index.try_claim_bootstrap(now, TEST_TIMING.lease, stale_token.as_str())
+    })
+    .unwrap();
+
+    let progress = Arc::new(BootstrapProgress::default());
+    let db_for_hook = db_path.clone();
+    *progress.before_session_write.lock().expect("hook mutex") = Some(Arc::new(move || {
+        with_search_index(&db_for_hook, |index| {
+            assert!(index.try_claim_bootstrap(takeover_at, TEST_TIMING.lease, "successor")?);
+            assert!(
+                index.upsert_doc_if_claim_owner(&stream_doc("s1", "SUCCESSOR", 1), "successor")?
+            );
+            Ok(())
+        })
+        .unwrap();
+    }));
+
+    reindex_all(
+        &root,
+        &storage,
+        &progress,
+        &stale_token,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        with_search_index(&db_path, |index| index.get_doc("s1")).unwrap(),
+        Some(stream_doc("s1", "SUCCESSOR", 1)),
+        "a stale reindex task must not clobber the successor after takeover"
+    );
+    assert_eq!(progress.indexed.load(Ordering::Relaxed), 0);
+    assert_eq!(read_marker(&db_path), None);
+}
+
+/// A same-hash successor row must not let a stale claimant report successful
+/// unchanged work after takeover. Ownership is part of the unchanged read,
+/// not only the changed-document UPSERT.
+#[tokio::test]
+#[serial(search_cache_epoch)]
+async fn test_reindex_same_hash_after_takeover_reports_claim_lost() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let storage = JsonlStorageAdapter::with_root(root.clone());
+    let info = Info {
+        id: acp::SessionId::new("s1"),
+        cwd: "/ws".to_string(),
+    };
+    storage
+        .init_session(&info, acp::ModelId::new("test"))
+        .await
+        .unwrap();
+
+    let summary = storage.list_sessions(None).await.unwrap().pop().unwrap();
+    let updates_path = storage.updates_file_path(&summary.info).unwrap();
+    let (stale_content, _) = collect_all_indexable_content_single_pass(&updates_path).unwrap();
+    let stale_doc = build_session_doc(&summary, stale_content);
+    let successor_doc = SessionDoc {
+        title: "SUCCESSOR".to_string(),
+        content: "successor content with deliberately reused hash".to_string(),
+        ..stale_doc
+    };
+
+    let stale_token = ClaimToken::new();
+    let now = chrono::Utc::now().timestamp();
+    let takeover_at = now + TEST_TIMING.lease.as_secs() as i64 + 1;
+    let db_path = search_db_path(&root);
+    with_search_index(&db_path, |index| {
+        index.try_claim_bootstrap(now, TEST_TIMING.lease, stale_token.as_str())
+    })
+    .unwrap();
+
+    let progress = Arc::new(BootstrapProgress::default());
+    let db_for_hook = db_path.clone();
+    let successor_for_hook = successor_doc.clone();
+    *progress.before_session_write.lock().expect("hook mutex") = Some(Arc::new(move || {
+        with_search_index(&db_for_hook, |index| {
+            assert!(index.try_claim_bootstrap(takeover_at, TEST_TIMING.lease, "successor")?);
+            assert!(index.upsert_doc_if_claim_owner(&successor_for_hook, "successor")?);
+            Ok(())
+        })
+        .unwrap();
+    }));
+
+    reindex_all(
+        &root,
+        &storage,
+        &progress,
+        &stale_token,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        with_search_index(&db_path, |index| index.get_doc("s1")).unwrap(),
+        Some(successor_doc)
+    );
+    assert_eq!(progress.indexed.load(Ordering::Relaxed), 0);
+    assert_eq!(progress.unchanged.load(Ordering::Relaxed), 0);
+    assert_eq!(progress.bytes_read.load(Ordering::Relaxed), 0);
+    assert_eq!(read_marker(&db_path), None);
+}
+
+/// Create a sparse updates file just above the bootstrap size limit.
+async fn init_large_session(storage: &JsonlStorageAdapter) -> Info {
+    let info = Info {
+        id: acp::SessionId::new("s1"),
+        cwd: "/ws".to_string(),
+    };
+    storage
+        .init_session(&info, acp::ModelId::new("test"))
+        .await
+        .unwrap();
+    let updates_path = storage.updates_file_path(&info).unwrap();
+    std::fs::create_dir_all(updates_path.parent().unwrap()).unwrap();
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&updates_path)
+        .unwrap()
+        .set_len(BOOTSTRAP_MAX_FILE_SIZE + 1)
+        .unwrap();
+    info
+}
+
+/// Positive control: the current claimant still indexes a large session's
+/// title-only placeholder and reports the size skip.
+#[tokio::test]
+#[serial(search_cache_epoch)]
+async fn test_large_session_current_owner_inserts_placeholder() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let storage = JsonlStorageAdapter::with_root(root.clone());
+    init_large_session(&storage).await;
+
+    let token = ClaimToken::new();
+    let now = chrono::Utc::now().timestamp();
+    let db_path = search_db_path(&root);
+    with_search_index(&db_path, |index| {
+        index.try_claim_bootstrap(now, TEST_TIMING.lease, token.as_str())
+    })
+    .unwrap();
+    let progress = Arc::new(BootstrapProgress::default());
+
+    reindex_all(
+        &root,
+        &storage,
+        &progress,
+        &token,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
+
+    let doc = with_search_index(&db_path, |index| index.get_doc("s1"))
+        .unwrap()
+        .expect("current owner must insert the title-only placeholder");
+    assert!(doc.content.is_empty());
+    assert_eq!(progress.skipped.load(Ordering::Relaxed), 1);
+    assert!(read_marker(&db_path).is_some());
+}
+
+/// A stale claimant on the large-session branch must not recreate a
+/// title-only row after its successor takes over and leaves the key absent.
+#[tokio::test]
+#[serial(search_cache_epoch)]
+async fn test_large_session_placeholder_is_fenced_against_takeover() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let storage = JsonlStorageAdapter::with_root(root.clone());
+    init_large_session(&storage).await;
+
+    let stale_token = ClaimToken::new();
+    let now = chrono::Utc::now().timestamp();
+    let takeover_at = now + TEST_TIMING.lease.as_secs() as i64 + 1;
+    let db_path = search_db_path(&root);
+    with_search_index(&db_path, |index| {
+        index.try_claim_bootstrap(now, TEST_TIMING.lease, stale_token.as_str())
+    })
+    .unwrap();
+
+    let progress = Arc::new(BootstrapProgress::default());
+    let db_for_hook = db_path.clone();
+    *progress.before_title_only_write.lock().expect("hook mutex") = Some(Arc::new(move || {
+        with_search_index(&db_for_hook, |index| {
+            assert!(index.try_claim_bootstrap(takeover_at, TEST_TIMING.lease, "successor")?);
+            Ok(())
+        })
+        .unwrap();
+    }));
+
+    reindex_all(
+        &root,
+        &storage,
+        &progress,
+        &stale_token,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        with_search_index(&db_path, |index| index.get_doc("s1")).unwrap(),
+        None,
+        "a stale claimant must not insert an old title-only placeholder"
+    );
+    assert_eq!(progress.indexed.load(Ordering::Relaxed), 0);
+    assert_eq!(progress.skipped.load(Ordering::Relaxed), 0);
+    assert_eq!(progress.bytes_read.load(Ordering::Relaxed), 0);
+    assert_eq!(read_marker(&db_path), None);
 }
 
 /// Companion to the single-key exhaustive test: two independent
