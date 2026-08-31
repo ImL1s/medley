@@ -804,7 +804,9 @@ def _macro_invoke_inners(
         if not _qualified_macro_invocation(masked, match.start())
     }
     invoke_scopes = (
-        _brace_scopes_at(masked, invoke_starts) if invoke_starts else {}
+        _brace_scopes_at(masked, invoke_starts, bodies)
+        if invoke_starts
+        else {}
     )
     out: list[tuple[str, str]] = []
     for match in _MACRO_INVOKE.finditer(masked):
