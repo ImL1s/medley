@@ -74,11 +74,13 @@ from toml_package_name import package_name  # noqa: E402
 
 _TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test\b")
 _IGNORE_ATTR = re.compile(r"^#\[\s*ignore\b")
+_RUST_IDENT = r"(?:[A-Za-z_]|[^\W\d_])(?:[A-Za-z0-9_]|[^\x00-\x7f])*"
 _FN = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
     r"(?:(?:async|const|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
-    r"fn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)"
+    rf"fn\s+(?:r#)?({_RUST_IDENT})"
 )
+_INCLUDE = re.compile(r'\binclude!\s*\(\s*"([^"]+)"\s*\)')
 _MOD_OPEN = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{"
 )
@@ -121,7 +123,6 @@ def _strip_line_comment(line: str) -> str:
 
 
 _RAW_STRING_START = re.compile(r"(?:c|b)?r(#*)\"")
-_RUST_IDENT = r"(?:[A-Za-z_]|[^\W\d_])(?:[A-Za-z0-9_]|[^\x00-\x7f])*"
 _MACRO_IDENT = re.compile(rf"(?:r#)?({_RUST_IDENT})")
 _MACRO_INVOKE = re.compile(rf"(?<![\w:])(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]")
 _CRATE_MACRO_INVOKE = re.compile(
@@ -134,6 +135,10 @@ def _macro_name(match: re.Match[str]) -> str:
 
     name = unicodedata.normalize("NFC", match.group(1))
     return name if name.isidentifier() else ""
+
+
+def _fn_name(match: re.Match[str]) -> str:
+    return unicodedata.normalize("NFC", match.group(1))
 
 
 def _append_crate_qualified_invokes(
@@ -1144,6 +1149,15 @@ def _cargo_test_targets(
             pkg = data.get("package")
             if isinstance(pkg, dict) and pkg.get("autotests") is False:
                 no_autotest.add(crate.resolve())
+            lib = data.get("lib") if data is not None else None
+            if (
+                isinstance(pkg, dict)
+                and pkg.get("autolib") is False
+                and not isinstance(lib, dict)
+            ):
+                lib_rs = (crate / "src" / "lib.rs").resolve()
+                suppressed_libs.add(lib_rs)
+                gated.add(lib_rs)
             feat_table = (
                 data.get("features")
                 if isinstance(data.get("features"), dict)
@@ -1709,6 +1723,29 @@ def _declared_module_overrides(
         if _file_inner_cfg_inactive(text, enabled):
             continue
         masked = _mask_rust_literals(text)
+        for inc in _INCLUDE.finditer(text):
+            start = inc.start()
+            if start >= len(masked) or not masked[start].isalpha():
+                continue
+            included = (declaring.parent / inc.group(1)).resolve()
+            if not included.is_file() or included == declaring:
+                continue
+            if included in ancestors:
+                continue
+            overrides.setdefault(included, []).append(
+                (list(prefix), root_target, macro_env)
+            )
+            queue.append(
+                (
+                    included,
+                    prefix,
+                    ancestors + (declaring,),
+                    False,
+                    root_target,
+                    macro_env,
+                    included.parent,
+                )
+            )
         scoped_macros = _scoped_macro_rules_sources(
             masked, enabled_features=enabled
         )
@@ -2064,7 +2101,7 @@ def _compact_test_fns(
             _cfg_attr_is_inactive(a, enabled_features) for a in effective
         )
         ignored = any(_IGNORE_ATTR.match(a.strip()) for a in effective)
-        out.append((matched.group(1), inactive, ignored, j))
+        out.append((_fn_name(matched), inactive, ignored, j))
         consumed = len(masked_line[j:]) - len(rest) + matched.end()
         i = j + max(consumed, 2)
     return out
@@ -2303,14 +2340,14 @@ def _tests_in_file(
                     all_attrs.extend(more)
                     matched = _FN.match(rest)
                     if matched:
-                        found = matched.group(1)
+                        found = _fn_name(matched)
                         break
                     continue
                 if not follow:
                     continue
                 matched = _FN.match(follow)
                 if matched:
-                    found = matched.group(1)
+                    found = _fn_name(matched)
                     break
                 if re.match(
                     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:mod|struct|enum|impl|use)\b",
@@ -3152,6 +3189,42 @@ class ExternalModulePrefix(unittest.TestCase):
             names = _qualified_test_names(root)
             self.assertNotIn("none_auth_scheme_lib", names)
 
+    def test_autolib_false_does_not_seed_inferred_lib(self):
+        """`[package] autolib = false` does not infer `src/lib.rs`
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+                "autolib = false\n",
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                "#[test]\nfn none_auth_scheme_lib() {}\n"
+            )
+            (src / "main.rs").write_text("fn main() {}\n")
+            names = _qualified_test_names(root)
+            self.assertNotIn("none_auth_scheme_lib", names)
+
+    def test_include_literal_is_scanned_in_the_including_module(self):
+        """`include!(\"included.rs\")` splices tests into this module
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text('include!("included.rs");\n')
+            (src / "included.rs").write_text(
+                "#[test]\nfn none_auth_scheme_included() {}\n"
+            )
+            names = _qualified_test_names(root)
+            self.assertIn("none_auth_scheme_included", names)
+
     def test_lib_harness_false_is_not_counted(self):
         """`[lib] harness = false` is not a libtest target (#507 review)."""
 
@@ -3900,6 +3973,16 @@ class ExternalModulePrefix(unittest.TestCase):
             [],
         )
         self.assertEqual(names, ["none_auth_scheme_case"])
+
+    def test_unicode_identifier_test_name_is_counted(self):
+        """`fn café_none_auth_scheme_case` is the full XID name
+        (#507 review)."""
+
+        names = _tests_in_file(
+            "#[test]\nfn café_none_auth_scheme_case() {}\n",
+            [],
+        )
+        self.assertEqual(names, ["café_none_auth_scheme_case"])
 
     def test_raw_identifier_module_prefix_is_counted(self):
         """`mod r#none_auth_scheme_ { #[test] fn works() }` is
