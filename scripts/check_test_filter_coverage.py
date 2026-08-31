@@ -407,6 +407,19 @@ def main() -> int:
     for crate in crates:
         lanes = by_features.get(crate, {})
 
+        if not lanes:
+            # Named loudly rather than silently skipped, which is the vanishing
+            # this sweep was widened to prevent. Do not launch Cargo first:
+            # "no lane names this crate at all" is already wholly owned by
+            # `check_uncovered_crates.py` and its #280 allowlist. This also
+            # deliberately leaves captured listings and baseline hygiene for
+            # no-lane crates outside this guard's ownership.
+            print(
+                f"{crate}: no filter in the workflow at all -- deferring to "
+                "check_uncovered_crates.py (#280)"
+            )
+            continue
+
         # Every feature set any lane builds this crate with, plus default
         # features. A test gated behind `--features X` exists only in the
         # X build, so listing with defaults alone reports it as absent and the
@@ -481,18 +494,6 @@ def main() -> int:
             for target_filters in lanes.values()
             for f in target_filters.get("lib", set()) | target_filters.get("*", set())
         }
-        if not lanes:
-            # Named loudly rather than silently skipped, which is the vanishing
-            # this sweep was widened to prevent. But its tests are NOT folded
-            # into this baseline: "no lane names this crate at all" is exactly
-            # `check_uncovered_crates.py`'s verdict (#280), and it has its own
-            # allowlist. Two guards owning one fact means two places to grant an
-            # exemption and one of them will drift.
-            print(
-                f"{crate}: no filter in the workflow at all -- deferring to "
-                "check_uncovered_crates.py (#280)"
-            )
-            continue
         missing = [t for t in tests if not _is_covered(t)]
 
         # Baseline hygiene, both directions (#408 review). An entry that a
