@@ -37,7 +37,7 @@ pub fn lock_config_file(path: &Path) -> std::io::Result<File> {
 /// is returned unchanged. A dangling symlink is an error.
 pub fn resolve_write_path(path: &Path) -> std::io::Result<PathBuf> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path),
+        Ok(meta) if meta.file_type().is_symlink() => dunce::canonicalize(path),
         Ok(_) => Ok(path.to_path_buf()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
         Err(e) => Err(e),
