@@ -239,6 +239,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import platform
 import re
 import sys
 import unicodedata
@@ -1136,6 +1137,25 @@ def _split_top_level(inner: str, sep: str = ",") -> list[str]:
     return parts
 
 
+def _host_target_os() -> str:
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def _host_target_arch() -> str:
+    machine = platform.machine().lower()
+    if machine in {"amd64", "x64"}:
+        return "x86_64"
+    if machine in {"arm64", "aarch64"}:
+        return "aarch64"
+    return machine
+
+
 def _cfg_atom_active(atom: str) -> bool | None:
     atom = atom.strip()
     if atom in {"test", "true"}:
@@ -1150,6 +1170,24 @@ def _cfg_atom_active(atom: str) -> bool | None:
         return sys.platform == "darwin"
     if atom == "linux":
         return sys.platform.startswith("linux")
+    os_eq = re.fullmatch(r'target_os\s*=\s*"([^"]+)"', atom)
+    if os_eq:
+        return _host_target_os() == os_eq.group(1)
+    family = re.fullmatch(r'target_family\s*=\s*"([^"]+)"', atom)
+    if family:
+        fam = family.group(1)
+        if fam == "unix":
+            return sys.platform != "win32"
+        if fam == "windows":
+            return sys.platform == "win32"
+        return False
+    arch_eq = re.fullmatch(r'target_arch\s*=\s*"([^"]+)"', atom)
+    if arch_eq:
+        return _host_target_arch() == arch_eq.group(1)
+    width_eq = re.fullmatch(r'target_pointer_width\s*=\s*"([^"]+)"', atom)
+    if width_eq:
+        host = "64" if sys.maxsize > 2**32 else "32"
+        return host == width_eq.group(1)
     return None
 
 
@@ -2890,7 +2928,8 @@ def _body_touches(
                         module, fname, static_module, identifiers
                     ):
                         continue
-            elif ident not in original_names:
+                return True
+            if ident not in original_names:
                 continue
             if not same_process:
                 continue
@@ -4087,18 +4126,19 @@ def _resolve_calls(
         type_name = fn.type_name if raw_type == "Self" else _resolve_type_alias(fn, raw_type)
         if type_name is None:
             continue
+        imported = None
         if raw_type != "Self":
             imported = _fn_import(fn, type_name, m.start(), imports_by_file)
             if imported is not None:
                 type_name = imported[1]
-        caller_groups = groups_of.get(
-            fn.file, frozenset({_process_group(fn.file)})
+        slots = _type_method_slots(
+            fn,
+            type_name,
+            m.group(2),
+            imported,
+            groups_of,
+            by_type,
         )
-        slots: list[int] = []
-        for group in caller_groups:
-            slots.extend(
-                by_type.get((group, type_name), {}).get(m.group(2), [])
-            )
         _gain_from(
             gained,
             keys_of,
@@ -4110,17 +4150,20 @@ def _resolve_calls(
         imported = _fn_import(fn, type_name, 0, imports_by_file)
         if imported is not None:
             type_name = imported[1]
+        trait_imported = None
         if trait is not None:
             trait_imported = _fn_import(fn, trait, 0, imports_by_file)
             if trait_imported is not None:
                 trait = trait_imported[1]
         lookup = trait if trait is not None else type_name
-        caller_groups = groups_of.get(
-            fn.file, frozenset({_process_group(fn.file)})
+        slots = _type_method_slots(
+            fn,
+            lookup,
+            method,
+            trait_imported if trait is not None else imported,
+            groups_of,
+            by_type,
         )
-        slots = []
-        for group in caller_groups:
-            slots.extend(by_type.get((group, lookup), {}).get(method, []))
         _gain_from(
             gained,
             keys_of,
@@ -4128,6 +4171,29 @@ def _resolve_calls(
             slots,
         )
     return frozenset(gained)
+
+def _type_method_slots(
+    fn: FnInfo,
+    type_name: str,
+    method: str,
+    imported: tuple[tuple[str, ...], str] | None,
+    groups_of: dict[Path, frozenset[str]],
+    by_type: dict[tuple[str, str], dict[str, list[int]]],
+) -> list[int]:
+    """Slots for `Type::method`. Imported library types search `lib:` groups."""
+
+    groups = set(groups_of.get(fn.file, frozenset({_process_group(fn.file)})))
+    if imported is not None:
+        groups.update(
+            group
+            for group, tname in by_type
+            if tname == type_name and group.startswith("lib:")
+        )
+    slots: list[int] = []
+    for group in groups:
+        slots.extend(by_type.get((group, type_name), {}).get(method, []))
+    return slots
+
 
 def analyze(
     sources: list[tuple[Path, str]], *, scan_root: Path

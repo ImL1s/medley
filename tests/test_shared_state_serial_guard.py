@@ -4553,6 +4553,113 @@ class TypeAssociatedResolution(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"prémier", "deuxième"})
 
+    def test_imported_library_static_counts_in_integration_tests(self):
+        """`use xai_grok_shell::COUNTER; COUNTER.load` in tests/ is
+        the library static (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    use xai_grok_shell::COUNTER;
+
+                    #[test]
+                    fn first_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_imported_library_type_assoc_counts_in_integration_tests(self):
+        """`use xai_grok_shell::State; State::bump()` in tests/ is
+        the library impl (#516 review)."""
+
+        sources = [
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    pub struct State;
+
+                    impl State {
+                        pub fn bump() {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("tests/race.rs"),
+                src(
+                    """\
+                    use xai_grok_shell::State;
+
+                    #[test]
+                    fn first_untagged() {
+                        State::bump();
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        State::bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
+    def test_target_os_key_value_cfg_is_evaluated(self):
+        """`#[cfg(target_os = \"windows\")]` is off on Unix (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[cfg(target_os = "windows")]
+            #[test]
+            fn first_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[cfg(target_os = "windows")]
+            #[test]
+            fn second_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        if sys.platform == "win32":
+            self.assertEqual(names, {"first_untagged", "second_untagged"})
+        else:
+            self.assertEqual(names, set())
+
     def test_ufcs_nested_generic_type_still_resolves(self):
         """`<Box<Vec<u8>> as Bump>::bump()` must survive nested `<>`
         (#516 review)."""
