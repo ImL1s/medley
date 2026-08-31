@@ -82,18 +82,18 @@ _FN = re.compile(
 )
 _INCLUDE = re.compile(r'\binclude!\s*\(\s*"([^"]+)"\s*\)')
 _MOD_OPEN = re.compile(
-    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+    rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?({_RUST_IDENT})\s*\{{"
 )
 _MOD_SEMI = re.compile(
-    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;"
+    rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?({_RUST_IDENT})\s*;"
 )
 _MOD_KW_ONLY = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s*$"
 )
-_IDENT_SEMI = re.compile(r"^\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
-_IDENT_OPEN = re.compile(r"^\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{")
+_IDENT_SEMI = re.compile(rf"^\s*(?:r#)?({_RUST_IDENT})\s*;")
+_IDENT_OPEN = re.compile(rf"^\s*(?:r#)?({_RUST_IDENT})\s*\{{")
 _INLINE_MOD_OPEN = re.compile(
-    r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+    rf"(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?({_RUST_IDENT})\s*\{{"
 )
 _PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]', re.DOTALL)
 
@@ -1459,7 +1459,7 @@ def _iter_module_decls(
             )
             skip = enclosing_off or cfg_off or in_macro
             if not skip:
-                name = semi.group(1)
+                name = _fn_name(semi)
                 inline_names = tuple(n for _, n, _ in inline_stack)
                 search = module_search_dir or _mod_search_dir(
                     declaring,
@@ -1511,7 +1511,7 @@ def _iter_module_decls(
                 or _MOD_OPEN.match(remainder)
             )
             if brace_mod:
-                inline_stack.append((depth, brace_mod.group(1), skip))
+                inline_stack.append((depth, _fn_name(brace_mod), skip))
                 pending_path = None
                 pending_attrs = []
                 pending_mod = False
@@ -1631,7 +1631,7 @@ def _selected_macro_expansions(
         stripped = _strip_line_comment(line)
         brace_mod = _MOD_OPEN.match(stripped)
         if brace_mod:
-            inline_stack.append((depth, brace_mod.group(1)))
+            inline_stack.append((depth, _fn_name(brace_mod)))
         depth += line.count("{") - line.count("}")
         while inline_stack and depth <= inline_stack[-1][0]:
             inline_stack.pop()
@@ -1653,7 +1653,7 @@ def _declared_module_overrides(
     `test:common` (#507 review).
     """
     overrides: dict[
-        Path, list[tuple[list[str], str, tuple[tuple[str, str], ...]]]
+        Path, list[tuple[list[str], str, tuple[tuple[str, str], ...], str]]
     ] = {}
     queue: deque[
         tuple[
@@ -1664,8 +1664,10 @@ def _declared_module_overrides(
             str,
             tuple[tuple[str, str], ...],
             Path,
+            str,
         ]
     ] = deque()
+    pkg_cache: dict[Path, str] = {}
     texts: dict[Path, str] = {}
 
     def read_rs(rs: Path) -> str | None:
@@ -1701,6 +1703,7 @@ def _declared_module_overrides(
                         _cargo_target_of(rs, extra_roots, test_names),
                         (),
                         rs.resolve().parent,
+                        _package_name_for(rs, pkg_cache),
                     )
                 )
 
@@ -1713,6 +1716,7 @@ def _declared_module_overrides(
             root_target,
             macro_env,
             module_search_dir,
+            origin_pkg,
         ) = queue.popleft()
         if declaring in ancestors:
             continue
@@ -1733,7 +1737,7 @@ def _declared_module_overrides(
             if included in ancestors:
                 continue
             overrides.setdefault(included, []).append(
-                (list(prefix), root_target, macro_env)
+                (list(prefix), root_target, macro_env, origin_pkg)
             )
             queue.append(
                 (
@@ -1744,6 +1748,7 @@ def _declared_module_overrides(
                     root_target,
                     macro_env,
                     included.parent,
+                    origin_pkg,
                 )
             )
         scoped_macros = _scoped_macro_rules_sources(
@@ -1811,7 +1816,7 @@ def _declared_module_overrides(
                 + macro_env
             )
             overrides.setdefault(child, []).append(
-                (child_prefix, root_target, child_macro_env)
+                (child_prefix, root_target, child_macro_env, origin_pkg)
             )
             queue.append(
                 (
@@ -1822,6 +1827,7 @@ def _declared_module_overrides(
                     root_target,
                     child_macro_env,
                     child_search_dir,
+                    origin_pkg,
                 )
             )
     return overrides
@@ -2138,7 +2144,7 @@ def _mod_stack_at_column(
                     _cfg_attr_is_inactive(a, enabled_features)
                     for a in _effective_attrs(attrs, enabled_features)
                 )
-            stack.append((depth, matched.group(1), inactive))
+            stack.append((depth, _fn_name(matched), inactive))
             depth += 1
             i = matched.end()
             continue
@@ -2386,13 +2392,13 @@ def _tests_in_file(
                 remainder_masked
             )
             if mod_match:
-                mod_stack.append((depth, mod_match.group(1), item_off))
+                mod_stack.append((depth, _fn_name(mod_match), item_off))
                 pushed_mod = True
 
         if not pushed_mod:
             inline_mod = _INLINE_MOD_OPEN.search(masked_line)
             if inline_mod is not None:
-                mod_stack.append((depth, inline_mod.group(1), line_cfg_off))
+                mod_stack.append((depth, _fn_name(inline_mod), line_cfg_off))
 
         in_macro_def = any(start <= line_start < end for start, end in def_spans)
         seen_on_line = {found} if has_test and found and not compact_fns else set()
@@ -2460,14 +2466,14 @@ def _tests_in_file(
 def _module_prefixes_for_source(
     rs: Path,
     overrides: dict[
-        Path, list[tuple[list[str], str, tuple[tuple[str, str], ...]]]
+        Path, list[tuple[list[str], str, tuple[tuple[str, str], ...], str]]
     ],
     extra_roots: set[Path] | frozenset[Path] | None = None,
     gated_roots: set[Path] | frozenset[Path] | None = None,
     suppressed_libs: set[Path] | frozenset[Path] | None = None,
     no_autotest: set[Path] | frozenset[Path] | None = None,
     test_names: dict[Path, str] | None = None,
-) -> list[tuple[list[str], str, tuple[tuple[str, str], ...]]] | None:
+) -> list[tuple[list[str], str, tuple[tuple[str, str], ...], str]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
     Cargo crate roots (`src/lib.rs`, `tests/*.rs`, explicit `[lib] path`
@@ -2481,14 +2487,19 @@ def _module_prefixes_for_source(
 
     key = rs.resolve()
     prefixes: list[
-        tuple[list[str], str, tuple[tuple[str, str], ...]]
+        tuple[list[str], str, tuple[tuple[str, str], ...], str]
     ] = []
     if key in overrides:
         prefixes.extend(overrides[key])
     if _is_cargo_crate_root_file(
         rs, extra_roots, gated_roots, suppressed_libs, no_autotest
     ):
-        root_entry = ([], _cargo_target_of(rs, extra_roots, test_names), ())
+        root_entry = (
+            [],
+            _cargo_target_of(rs, extra_roots, test_names),
+            (),
+            _package_name_for(rs, {}),
+        )
         if root_entry not in prefixes:
             prefixes.append(root_entry)
     return prefixes or None
@@ -2541,8 +2552,8 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
             )
             if prefix_lists is None:
                 continue
-            pkg = _package_name_for(rs, pkg_cache)
-            for file_mods, target, inherited_macros in prefix_lists:
+            for file_mods, target, inherited_macros, origin_pkg in prefix_lists:
+                pkg = origin_pkg or _package_name_for(rs, pkg_cache)
                 for name in _tests_in_file(
                     text, file_mods, enabled, inherited_macros
                 ):
@@ -3983,6 +3994,50 @@ class ExternalModulePrefix(unittest.TestCase):
             [],
         )
         self.assertEqual(names, ["café_none_auth_scheme_case"])
+
+    def test_unicode_module_prefix_is_counted(self):
+        """`mod café_none_auth_scheme_ { #[test] fn works }` is
+        `café_none_auth_scheme_::works` (#507 review)."""
+
+        names = _tests_in_file(
+            "mod café_none_auth_scheme_ { #[test] fn works() {} }\n",
+            [],
+        )
+        self.assertEqual(names, ["café_none_auth_scheme_::works"])
+
+    def test_path_imported_file_keeps_declaring_package(self):
+        """A `#[path]` file under crate B still belongs to crate A
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            a_src = root / "crates" / "a" / "src"
+            b_src = root / "crates" / "b" / "src"
+            a_src.mkdir(parents=True)
+            b_src.mkdir(parents=True)
+            (root / "crates" / "a" / "Cargo.toml").write_text(
+                '[package]\nname = "a"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (root / "crates" / "b" / "Cargo.toml").write_text(
+                '[package]\nname = "b"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (a_src / "lib.rs").write_text(
+                '#[path = "../../b/src/helper.rs"]\nmod helper;\n'
+            )
+            (b_src / "lib.rs").write_text("\n")
+            (b_src / "helper.rs").write_text(
+                "#[test]\nfn none_auth_scheme_imported() {}\n"
+            )
+            records = _qualified_test_records(root)
+            scoped = _hot_path_matches(
+                records, "none_auth_scheme_imported", {("a", "lib")}
+            )
+            self.assertEqual(
+                [(r.package, r.target, r.name) for r in scoped],
+                [("a", "lib", "helper::none_auth_scheme_imported")],
+            )
 
     def test_raw_identifier_module_prefix_is_counted(self):
         """`mod r#none_auth_scheme_ { #[test] fn works() }` is
