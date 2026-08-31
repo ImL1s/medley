@@ -906,6 +906,7 @@ def _cargo_target_of(
     rs: Path,
     extra_roots: set[Path] | frozenset[Path] | None = None,
     test_names: dict[Path, str] | None = None,
+    lib_roots: set[Path] | frozenset[Path] | None = None,
 ) -> str:
     """Cargo test target key matching `parse_workflow` (`lib`, `test:name`)."""
 
@@ -914,6 +915,8 @@ def _cargo_target_of(
         return f"test:{test_names[key]}"
     split = _crate_source_rel(rs)
     if split is None:
+        if lib_roots and key in lib_roots:
+            return "lib"
         if extra_roots and key in extra_roots:
             return f"test:{rs.stem}"
         return ""
@@ -1117,7 +1120,15 @@ def _manifest_default_features(text: str) -> set[str]:
 
 def _cargo_test_targets(
     root: Path,
-) -> tuple[set[Path], set[Path], set[Path], set[Path], dict[Path, set[str]], dict[Path, str]]:
+) -> tuple[
+    set[Path],
+    set[Path],
+    set[Path],
+    set[Path],
+    dict[Path, set[str]],
+    dict[Path, str],
+    set[Path],
+]:
     """Explicit `[[test]]` paths and feature-gated integration targets.
 
     Extra roots: `path =` files cargo compiles without extra features.
@@ -1136,6 +1147,7 @@ def _cargo_test_targets(
     no_autotest: set[Path] = set()
     crate_feats: dict[Path, set[str]] = {}
     test_names: dict[Path, str] = {}
+    lib_roots: set[Path] = set()
     for manifest in root.rglob("Cargo.toml"):
         if "target" in manifest.parts:
             continue
@@ -1184,6 +1196,7 @@ def _cargo_test_targets(
                 elif isinstance(lib_path, str):
                     if lib_target.is_file():
                         extra.add(lib_target)
+                        lib_roots.add(lib_target)
                     suppressed_libs.add((crate / "src" / "lib.rs").resolve())
             tests = data.get("test")
             if isinstance(tests, dict):
@@ -1239,6 +1252,7 @@ def _cargo_test_targets(
                     else:
                         if target.is_file():
                             extra.add(target)
+                            lib_roots.add(target)
                         suppressed_libs.add(
                             (crate / "src" / "lib.rs").resolve()
                         )
@@ -1329,7 +1343,7 @@ def _cargo_test_targets(
                 required_feats = set(re.findall(r'"([^"]+)"', inner))
         flush()
         crate_feats[crate.resolve()] = default_feats
-    return extra, gated, suppressed_libs, no_autotest, crate_feats, test_names
+    return extra, gated, suppressed_libs, no_autotest, crate_feats, test_names, lib_roots
 
 
 def _features_for(path: Path, crate_feats: dict[Path, set[str]]) -> set[str]:
@@ -1681,7 +1695,7 @@ def _declared_module_overrides(
         texts[key] = text
         return text
 
-    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names = (
+    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names, lib_roots = (
         _cargo_test_targets(root)
     )
     for base in _CRATE_ROOTS:
@@ -1700,7 +1714,7 @@ def _declared_module_overrides(
                         (),
                         (),
                         True,
-                        _cargo_target_of(rs, extra_roots, test_names),
+                        _cargo_target_of(rs, extra_roots, test_names, lib_roots),
                         (),
                         rs.resolve().parent,
                         _package_name_for(rs, pkg_cache),
@@ -1730,6 +1744,8 @@ def _declared_module_overrides(
         for inc in _INCLUDE.finditer(text):
             start = inc.start()
             if start >= len(masked) or not masked[start].isalpha():
+                continue
+            if _position_cfg_inactive(text, masked, start, enabled):
                 continue
             included = (declaring.parent / inc.group(1)).resolve()
             if not included.is_file() or included == declaring:
@@ -2011,6 +2027,77 @@ def _eval_cfg(
                 return None
             return False
     return _cfg_atom(expr, enabled_features)
+
+
+def _attrs_before(source: str, code: str, position: int) -> list[str]:
+    """`#[attr]` blocks immediately before ``position``."""
+
+    attrs: list[str] = []
+    index = position
+    while index > 0:
+        index -= 1
+        if code[index].isspace():
+            continue
+        if code[index] != "]":
+            break
+        end = index + 1
+        depth = 1
+        cursor = index - 1
+        while cursor >= 0 and depth:
+            if code[cursor] == "]":
+                depth += 1
+                cursor -= 1
+            elif code[cursor] == "[":
+                depth -= 1
+                cursor -= 1
+            else:
+                cursor -= 1
+        hash_index = cursor
+        while hash_index >= 0 and code[hash_index].isspace():
+            hash_index -= 1
+        if hash_index < 0 or code[hash_index] != "#":
+            break
+        attrs.append(source[hash_index:end])
+        index = hash_index
+    attrs.reverse()
+    return attrs
+
+
+def _position_cfg_inactive(
+    text: str,
+    masked: str,
+    pos: int,
+    enabled_features: set[str] | frozenset[str] | None,
+) -> bool:
+    """True when attrs or an enclosing inline module cfg excludes ``pos``."""
+
+    attrs = _attrs_before(text, masked, pos)
+    if any(
+        _cfg_attr_is_inactive(a, enabled_features)
+        for a in _effective_attrs(attrs, enabled_features)
+    ):
+        return True
+    stack: list[tuple[int, str, bool]] = []
+    depth = 0
+    offset = 0
+    for mline in masked.splitlines(keepends=True):
+        ml = mline.rstrip("\n")
+        line_start = offset
+        line_end = offset + len(mline)
+        if pos < line_start:
+            break
+        if line_start <= pos < line_end:
+            col = max(0, min(pos - line_start, len(ml)))
+            stack = _mod_stack_at_column(
+                ml, col, stack, depth, enabled_features
+            )
+            break
+        stack = _mod_stack_at_column(
+            ml, len(ml), stack, depth, enabled_features
+        )
+        depth += ml.count("{") - ml.count("}")
+        offset = line_end
+    return any(off for _, _, off in stack)
 
 
 def _cfg_attr_is_inactive(
@@ -2473,6 +2560,7 @@ def _module_prefixes_for_source(
     suppressed_libs: set[Path] | frozenset[Path] | None = None,
     no_autotest: set[Path] | frozenset[Path] | None = None,
     test_names: dict[Path, str] | None = None,
+    lib_roots: set[Path] | frozenset[Path] | None = None,
 ) -> list[tuple[list[str], str, tuple[tuple[str, str], ...], str]] | None:
     """Prefixes to scan `rs` under, or `None` to skip an unreachable file.
 
@@ -2496,7 +2584,7 @@ def _module_prefixes_for_source(
     ):
         root_entry = (
             [],
-            _cargo_target_of(rs, extra_roots, test_names),
+            _cargo_target_of(rs, extra_roots, test_names, lib_roots),
             (),
             _package_name_for(rs, {}),
         )
@@ -2519,7 +2607,7 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
     the defect this guard exists to catch.
     """
     overrides = _declared_module_overrides(root)
-    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names = (
+    extra_roots, gated_roots, suppressed_libs, no_autotest, crate_feats, test_names, lib_roots = (
         _cargo_test_targets(root)
     )
     records: list[_TestRecord] = []
@@ -2549,6 +2637,7 @@ def _qualified_test_records(root: Path) -> list[_TestRecord]:
                 suppressed_libs,
                 no_autotest,
                 test_names,
+                lib_roots,
             )
             if prefix_lists is None:
                 continue
@@ -3078,6 +3167,14 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_lib_root", names)
+            records = _qualified_test_records(root)
+            scoped = _hot_path_matches(
+                records, "none_auth_scheme_lib_root", {("demo", "lib")}
+            )
+            self.assertEqual(
+                [(r.package, r.target, r.name) for r in scoped],
+                [("demo", "lib", "none_auth_scheme_lib_root")],
+            )
 
     def test_custom_lib_path_inside_src_is_prefixless(self):
         """`[lib] path = \"src/none_auth_scheme_root.rs\"` is the crate
@@ -3235,6 +3332,26 @@ class ExternalModulePrefix(unittest.TestCase):
             )
             names = _qualified_test_names(root)
             self.assertIn("none_auth_scheme_included", names)
+
+    def test_cfg_gated_include_is_not_scanned(self):
+        """`#[cfg(windows)] include!(\"win.rs\")` is off on Unix
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "crates" / "demo" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                '#[cfg(windows)]\ninclude!("win.rs");\n'
+            )
+            (src / "win.rs").write_text(
+                "#[test]\nfn none_auth_scheme_windows() {}\n"
+            )
+            names = _qualified_test_names(root)
+            if sys.platform == "win32":
+                self.assertIn("none_auth_scheme_windows", names)
+            else:
+                self.assertNotIn("none_auth_scheme_windows", names)
 
     def test_lib_harness_false_is_not_counted(self):
         """`[lib] harness = false` is not a libtest target (#507 review)."""
