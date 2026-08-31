@@ -21,6 +21,9 @@ pub struct SubagentInfo {
     pub persona: Option<Arc<str>>,
     pub role: Option<Arc<str>>,
     pub model: Option<Arc<str>>,
+    /// Canonical route/receipt facts received over ACP. Display surfaces must
+    /// consume this typed snapshot rather than infer route identity from model.
+    pub route_snapshot: Option<xai_grok_subagent_resolution::AgentRouteUxSnapshot>,
     /// "new" or "resumed".
     pub context_source: Option<Arc<str>>,
     pub resumed_from: Option<Arc<str>>,
@@ -375,6 +378,35 @@ pub(crate) fn format_context_badge(info: &SubagentInfo) -> &str {
         _ => "",
     }
 }
+
+/// Non-color route and lifecycle label shared by pager surfaces. Falls back
+/// to the effective model only when an older peer omitted the typed snapshot.
+pub(crate) fn format_route_lifecycle_label(info: &SubagentInfo) -> String {
+    let Some(route) = &info.route_snapshot else {
+        return info
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("")
+            .to_owned();
+    };
+    let selected = route
+        .selected_catalog_id
+        .as_deref()
+        .unwrap_or_else(|| route.selection_mode.as_str());
+    let lifecycle = if info.finished {
+        info.status
+            .as_deref()
+            .map(|status| format!(" · {status}"))
+            .unwrap_or_default()
+    } else {
+        xai_grok_subagent_resolution::native_route::lifecycle_phase_for_snapshot(route)
+            .map(|phase| format!(" · {}", phase.as_str()))
+            .unwrap_or_default()
+    };
+    format!("{selected} · {}{lifecycle}", route.route_status.as_str())
+}
 /// Parse a leading `[tag]` prefix from a description.
 ///
 /// Returns `(Some(tag), rest_after_close_bracket)` if the description begins
@@ -522,6 +554,7 @@ mod tests {
             persona: None,
             role: None,
             model: None,
+            route_snapshot: None,
             context_source: None,
             resumed_from: None,
             capability_mode: None,

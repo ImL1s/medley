@@ -5,7 +5,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use xai_grok_agent::config::{AgentDefinition, ModelOverride};
 
 use super::resolve::validate_published_receipt;
-use super::types::{NativeSubagentRouteResult, RejectionCode};
+use super::types::{NativeSubagentRouteResult, RejectionCode, RouteReceipt};
 
 /// Selection intent shown in compact rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,7 +363,34 @@ pub fn snapshot_from_resolution(
     capability_floor: Option<&str>,
     generation: u64,
 ) -> AgentRouteUxSnapshot {
-    let mode = match result.receipt.selection_mode.as_str() {
+    snapshot_from_receipt(
+        agent_id,
+        display_name,
+        scope,
+        enabled,
+        active,
+        default_for_new_sessions,
+        &result.receipt,
+        capability_floor,
+        generation,
+    )
+}
+
+/// Build the canonical UX projection directly from an immutable execution
+/// receipt. Callers supply the generation owned by their surface; read-only
+/// lifecycle notifications use `0` because they cannot authorize mutation.
+pub fn snapshot_from_receipt(
+    agent_id: &str,
+    display_name: &str,
+    scope: &str,
+    enabled: bool,
+    active: bool,
+    default_for_new_sessions: bool,
+    receipt: &RouteReceipt,
+    capability_floor: Option<&str>,
+    generation: u64,
+) -> AgentRouteUxSnapshot {
+    let mode = match receipt.selection_mode.as_str() {
         "exact" => AgentSelectionMode::Exact,
         "ordered_candidates" => AgentSelectionMode::OrderedCandidates,
         "inherit" => AgentSelectionMode::Inherit,
@@ -377,9 +404,9 @@ pub fn snapshot_from_resolution(
                 active,
                 default_for_new_sessions,
                 selection_mode: AgentSelectionMode::Inherit,
-                requested_model_refs: result.receipt.requested_catalog_ids.clone(),
-                policy_id: result.receipt.consumer_policy_id.clone(),
-                policy_digest: result.receipt.consumer_policy_digest.clone(),
+                requested_model_refs: receipt.requested_catalog_ids.clone(),
+                policy_id: receipt.consumer_policy_id.clone(),
+                policy_digest: receipt.consumer_policy_digest.clone(),
                 route_status: RouteStatus::Incompatible,
                 selected_catalog_id: None,
                 selected_wire_model: None,
@@ -392,7 +419,7 @@ pub fn snapshot_from_resolution(
             };
         }
     };
-    if validate_published_receipt(&result.receipt).is_err() {
+    if validate_published_receipt(receipt).is_err() {
         return AgentRouteUxSnapshot {
             generation,
             agent_id: agent_id.into(),
@@ -402,9 +429,9 @@ pub fn snapshot_from_resolution(
             active,
             default_for_new_sessions,
             selection_mode: mode,
-            requested_model_refs: result.receipt.requested_catalog_ids.clone(),
-            policy_id: result.receipt.consumer_policy_id.clone(),
-            policy_digest: result.receipt.consumer_policy_digest.clone(),
+            requested_model_refs: receipt.requested_catalog_ids.clone(),
+            policy_id: receipt.consumer_policy_id.clone(),
+            policy_digest: receipt.consumer_policy_digest.clone(),
             route_status: RouteStatus::Incompatible,
             selected_catalog_id: None,
             selected_wire_model: None,
@@ -425,22 +452,24 @@ pub fn snapshot_from_resolution(
         active,
         default_for_new_sessions,
         selection_mode: mode,
-        requested_model_refs: result.receipt.requested_catalog_ids.clone(),
-        policy_id: result.receipt.consumer_policy_id.clone(),
-        policy_digest: result.receipt.consumer_policy_digest.clone(),
+        requested_model_refs: receipt.requested_catalog_ids.clone(),
+        policy_id: receipt.consumer_policy_id.clone(),
+        policy_digest: receipt.consumer_policy_digest.clone(),
         route_status: RouteStatus::Ready,
-        selected_catalog_id: Some(result.receipt.selected_catalog_id.clone()),
-        selected_wire_model: Some(result.receipt.selected_wire_model.clone()),
+        selected_catalog_id: Some(receipt.selected_catalog_id.clone()),
+        selected_wire_model: Some(receipt.selected_wire_model.clone()),
         capability_floor: capability_floor.map(str::to_string),
-        route_receipt_digest: Some(result.receipt.route_digest.clone()),
-        attempt: Some(result.receipt.attempt),
-        resume_source_receipt: result.receipt.resume_source_receipt.clone(),
-        rejected_candidates: result
-            .receipt
+        route_receipt_digest: Some(receipt.route_digest.clone()),
+        attempt: Some(receipt.attempt),
+        resume_source_receipt: receipt.resume_source_receipt.clone(),
+        rejected_candidates: receipt
             .rejected_candidates
             .iter()
             .map(|row| (row.catalog_id.clone(), row.reason_code))
             .collect(),
+        // Candidate rejections describe initial ordered selection, not a
+        // runtime fallback decision. Only an explicit execution event may set
+        // this lifecycle fact.
         last_fallback_admitted: None,
     }
 }

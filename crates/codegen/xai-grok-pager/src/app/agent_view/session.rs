@@ -1659,6 +1659,7 @@ mod resolve_turn_activity_tests {
                 persona: None,
                 role: None,
                 model: None,
+                route_snapshot: None,
                 context_source: None,
                 resumed_from: None,
                 capability_mode: None,
