@@ -1275,33 +1275,35 @@ def _ci_feature_lanes(
     A longer CI filter that contains `pattern` (for example
     `provider_error_body_preview_is_secret_free_and_bounded` covering
     documented `is_secret_free_`) still selects that lane's feature set
-    so cfg-gated matches are counted. Matching uses the lane's actual
-    filter token, not the shorter documented pattern (#507 review).
+    so cfg-gated matches are counted — but only when `pattern` has no
+    dedicated `run_nonzero` token of its own. A dedicated
+    `--lib hostile_injector` lane must not also absorb hits from an
+    unrelated longer filter on another target (#507 review). Matching
+    uses the lane's actual filter token, not the shorter documented
+    pattern (#507 review).
     """
 
-    found: list[tuple[str, frozenset[str], str, bool, str]] = []
+    dedicated: list[tuple[str, frozenset[str], str, bool, str]] = []
+    covering: list[tuple[str, frozenset[str], str, bool, str]] = []
     for crate, featmap in by_features.items():
         for feat, targets in featmap.items():
             for target, filters in targets.items():
-                hit: tuple[bool, str] | None = None
                 if (EXACT_PREFIX + pattern) in filters:
-                    hit = (True, pattern)
-                elif pattern in filters:
-                    hit = (False, pattern)
-                else:
-                    for filt in filters:
-                        if filt.startswith(EXACT_PREFIX):
-                            token = filt[len(EXACT_PREFIX) :]
-                            if pattern != token and pattern in token:
-                                hit = (True, token)
-                                break
-                        elif pattern != filt and pattern in filt:
-                            hit = (False, filt)
+                    dedicated.append((crate, feat, target, True, pattern))
+                    continue
+                if pattern in filters:
+                    dedicated.append((crate, feat, target, False, pattern))
+                    continue
+                for filt in filters:
+                    if filt.startswith(EXACT_PREFIX):
+                        token = filt[len(EXACT_PREFIX) :]
+                        if pattern != token and pattern in token:
+                            covering.append((crate, feat, target, True, token))
                             break
-                if hit is not None:
-                    exact, token = hit
-                    found.append((crate, feat, target, exact, token))
-    return found
+                    elif pattern != filt and pattern in filt:
+                        covering.append((crate, feat, target, False, filt))
+                        break
+    return dedicated if dedicated else covering
 
 
 def _hot_path_matches_for_lanes(
@@ -2786,6 +2788,17 @@ def _cfg_atom(
     endian_eq = re.fullmatch(r'target_endian\s*=\s*"([^"]+)"', atom)
     if endian_eq:
         return sys.byteorder == endian_eq.group(1)
+    atomic_eq = re.fullmatch(r'target_has_atomic\s*=\s*"([^"]+)"', atom)
+    if atomic_eq:
+        # Hosts this guard runs on (CI + developer laptops) expose the
+        # usual integer/pointer atomic widths; treat unknown widths as
+        # inactive rather than falling through as "maybe on" (#507 review).
+        wanted = atomic_eq.group(1)
+        width = int(_host_pointer_width())
+        supported = {"8", "16", "32", "ptr"}
+        if width >= 64:
+            supported.add("64")
+        return wanted in supported
     if atom == "debug_assertions":
         # `cargo test` is the debug profile; the documented hot path is
         # never `--release` (#507 review).
@@ -4166,7 +4179,14 @@ class CiPackageTargetCounts(unittest.TestCase):
             by_feat = parse_workflow_by_features(wf, root=root)
             lanes = _ci_feature_lanes(by_feat, "none_auth_scheme_")
             self.assertTrue(
+<<<<<<< HEAD
                 any(NO_DEFAULT_FEATURES_TOKEN in feat for _c, feat, _t, _e, _f in lanes)
+=======
+                any(
+                    NO_DEFAULT_FEATURES_TOKEN in feat
+                    for _c, feat, _t, _e, _f in lanes
+                )
+>>>>>>> bccdf278 (fix(ci): fix hot-path lane unpacking and covering filters)
             )
             feat = frozenset({NO_DEFAULT_FEATURES_TOKEN})
             records_for_feat = {
@@ -4207,6 +4227,48 @@ class CiPackageTargetCounts(unittest.TestCase):
                 records_for_feat, "none_auth_scheme_exact", lanes
             )
             self.assertEqual([r.name for r in matched], ["none_auth_scheme_exact"])
+
+    def test_covering_filter_ignored_when_dedicated_lane_exists(self):
+        """A dedicated `--lib hostile_injector` lane must not also count
+        tests selected only by a longer filter on another target
+        (#507 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sampler = root / "crates" / "codegen" / "xai-grok-sampler"
+            (sampler / "src").mkdir(parents=True)
+            (sampler / "tests").mkdir()
+            (sampler / "Cargo.toml").write_text(
+                '[package]\nname = "xai-grok-sampler"\n',
+                encoding="utf-8",
+            )
+            (sampler / "src" / "lib.rs").write_text(
+                "#[test]\nfn after_hostile_injector() {}\n",
+                encoding="utf-8",
+            )
+            (sampler / "tests" / "wire.rs").write_text(
+                "#[test]\nfn none_auth_scheme_after_hostile_injector() {}\n",
+                encoding="utf-8",
+            )
+            wf = (
+                "          run_nonzero -p xai-grok-sampler --lib "
+                "hostile_injector -- --nocapture\n"
+                "          run_nonzero -p xai-grok-sampler --test wire "
+                "none_auth_scheme_after_hostile_injector -- --nocapture\n"
+            )
+            by_feat = parse_workflow_by_features(wf, root=root)
+            lanes = _ci_feature_lanes(by_feat, "hostile_injector")
+            self.assertEqual(
+                {(target, exact, filt) for _c, _f, target, exact, filt in lanes},
+                {("lib", False, "hostile_injector")},
+            )
+            records_for_feat = {
+                frozenset(): _qualified_test_records(root),
+            }
+            matched = _hot_path_matches_for_lanes(
+                records_for_feat, "hostile_injector", lanes
+            )
+            self.assertEqual([r.name for r in matched], ["after_hostile_injector"])
 
 
 class ExternalModulePrefix(unittest.TestCase):
@@ -5362,6 +5424,23 @@ class ExternalModulePrefix(unittest.TestCase):
             self.assertEqual(names, ["none_auth_scheme_windows"])
         else:
             self.assertEqual(names, [])
+
+    def test_cfg_target_has_atomic_is_evaluated(self):
+        """`target_has_atomic = \"ptr\"` must not fall through as unknown
+        (#507 review)."""
+
+        text = textwrap.dedent(
+            """\
+            #[cfg(target_has_atomic = "ptr")]
+            #[test]
+            fn none_auth_scheme_atomic() {}
+            #[cfg(not(target_has_atomic = "ptr"))]
+            #[test]
+            fn none_auth_scheme_no_atomic() {}
+            """
+        )
+        names = _tests_in_file(text, [])
+        self.assertEqual(names, ["none_auth_scheme_atomic"])
 
     def test_cfg_after_test_attr_is_honored(self):
         text = textwrap.dedent(
