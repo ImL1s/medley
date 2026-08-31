@@ -1174,6 +1174,8 @@ pub use crate::util::config::load_effective_config;
 /// Effective config with disk campaigns only — for one-shot entrypoints that
 /// never fetch remote settings (avoids resolving against a never-seeded cache).
 pub use crate::util::config::load_effective_config_disk_only;
+/// Like [`load_effective_config`], with a caller-supplied layer set (pinned user dest).
+pub use crate::util::config::load_effective_config_from_layers;
 /// Where a requirement or permission rule was loaded from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequirementSource {
