@@ -76,7 +76,7 @@ fn config_lock_path(path: &Path) -> std::path::PathBuf {
     }
 }
 
-fn lock_config_file(path: &Path) -> std::io::Result<File> {
+pub(crate) fn lock_config_file(path: &Path) -> std::io::Result<File> {
     let lock_path = config_lock_path(path);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -97,6 +97,11 @@ fn lock_config_file(path: &Path) -> std::io::Result<File> {
         }
     }
     Ok(file)
+}
+
+pub(crate) fn write_config_toml(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mode = destination_unix_mode(path);
+    xai_grok_config::fs_atomic::write_atomically(path, contents, mode)
 }
 
 fn destination_unix_mode(path: &Path) -> Option<u32> {
@@ -251,11 +256,12 @@ fn set_hint_at(path: &Path, key: &str, value: impl Into<toml_edit::Value>) -> st
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let _lock = lock_config_file(path)?;
     let Some(mut doc) = read_config_document_for_edit(path) else {
         return Ok(());
     };
     doc["hints"][key] = toml_edit::value(value);
-    std::fs::write(path, doc.to_string())
+    write_config_toml(path, &doc.to_string())
 }
 
 #[cfg(test)]
@@ -561,6 +567,33 @@ mod tests {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         assert!(disabled, "should read back true after set_hint write");
+    }
+
+    #[test]
+    fn set_hint_at_uses_shared_lock_and_preserves_unix_mode() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            fs::write(&path, "[ui]\ntheme = \"dark\"\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            set_hint_at(&path, "memory_modal_fullscreen", true).unwrap();
+            let body = fs::read_to_string(&path).unwrap();
+            assert!(body.contains("theme = \"dark\""));
+            assert!(body.contains("memory_modal_fullscreen"));
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            assert!(config_lock_path(&path).is_file());
+        }
+        #[cfg(not(unix))]
+        {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            fs::write(&path, "[ui]\ntheme = \"dark\"\n").unwrap();
+            set_hint_at(&path, "memory_modal_fullscreen", true).unwrap();
+            assert!(config_lock_path(&path).is_file());
+        }
     }
 
     #[test]

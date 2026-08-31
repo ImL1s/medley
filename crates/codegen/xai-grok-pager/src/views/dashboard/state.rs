@@ -4852,6 +4852,7 @@ pub fn write_persisted_to_path(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let _lock = crate::config_toml_edit::lock_config_file(path)?;
     let mut doc = match crate::config_toml_edit::read_config_document_for_edit(path) {
         Some(d) => d,
         None => {
