@@ -1143,6 +1143,26 @@ def _cfg_pred_active(expr: str) -> bool | None:
     return _cfg_atom_active(expr)
 
 
+def _attr_cfg_inactive(attr: str) -> bool:
+    """True when `#[cfg(...)]` (or cfg_attr emitting cfg) is off here."""
+
+    stripped = attr.strip()
+    match = re.match(r"#\[\s*cfg\s*\((.*)\)\s*\]\s*$", stripped, re.DOTALL)
+    if match is not None:
+        return _cfg_pred_active(match.group(1)) is False
+    wrap = re.match(r"#\[\s*cfg_attr\s*\((.*)\)\s*\]\s*$", stripped, re.DOTALL)
+    if wrap is None:
+        return False
+    parts = _split_top_level(wrap.group(1))
+    if len(parts) < 2 or _cfg_pred_active(parts[0]) is not True:
+        return False
+    return any(
+        _attr_cfg_inactive(f"#[{piece}]")
+        for piece in parts[1:]
+        if piece.startswith("cfg(") or piece.startswith("cfg_attr(")
+    )
+
+
 def _cfg_attr_emits_test(attr: str) -> bool:
     """True when `#[cfg_attr(pred, … test)]` is a harness test here."""
 
@@ -3294,7 +3314,9 @@ def index_functions(
                     trait_name = trname
                     break
             attrs = _preceding_attributes(raw, code, match.start())
-            is_test = any(_is_test_attr(a) for a in attrs)
+            is_test = any(_is_test_attr(a) for a in attrs) and not any(
+                _attr_cfg_inactive(a) for a in attrs
+            )
             serial_held: set[str] = set()
             has_unkeyed = False
             for a in attrs:
@@ -3652,15 +3674,17 @@ class Finding:
     reason: str
 
 
-def _ufcs_calls(body: str) -> list[tuple[str, str]]:
+def _ufcs_calls(body: str) -> list[tuple[str, str, str | None]]:
     """`<Type as Trait>::method(` and `<Type>::method(`.
 
     Resolves like TYPE_ASSOC_CALL: last segment of the type path against
     `by_type` (#516 review). `<Type>::method()` is valid Rust and is
-    not rejected for lacking `as Trait` (#516 review).
+    not rejected for lacking `as Trait` (#516 review). Named `as Trait`
+    is kept so a sibling impl of the same method is not inherited
+    (#516 review).
     """
 
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str | None]] = []
     index = 0
     n = len(body)
     while index < n:
@@ -3673,13 +3697,14 @@ def _ufcs_calls(body: str) -> list[tuple[str, str]]:
         if type_name is None:
             index = lt + 1
             continue
+        trait: str | None = None
         if body.startswith("as", i):
             after_as = i + 2
             if after_as < n and (body[after_as].isalnum() or body[after_as] == "_"):
                 index = lt + 1
                 continue
             i = _skip_ws(body, after_as)
-            _trait, i = _read_type_path(body, i)
+            trait, i = _read_type_path(body, i)
             i = _skip_ws(body, i)
         if i >= n or body[i] != ">":
             index = lt + 1
@@ -3695,7 +3720,7 @@ def _ufcs_calls(body: str) -> list[tuple[str, str]]:
             continue
         i = _skip_ws(body, method.end())
         if i < n and body[i] == "(":
-            out.append((type_name, method.group(0)))
+            out.append((type_name, method.group(0), trait))
         index = lt + 1
     return out
 
@@ -4002,17 +4027,22 @@ def _resolve_calls(
             self_index,
             slots,
         )
-    for type_name, method in _ufcs_calls(fn.body):
+    for type_name, method, trait in _ufcs_calls(fn.body):
         type_name = _resolve_type_alias(fn, type_name)
         imported = _fn_import(fn, type_name, 0, imports_by_file)
         if imported is not None:
             type_name = imported[1]
+        if trait is not None:
+            trait_imported = _fn_import(fn, trait, 0, imports_by_file)
+            if trait_imported is not None:
+                trait = trait_imported[1]
+        lookup = trait if trait is not None else type_name
         caller_groups = groups_of.get(
             fn.file, frozenset({_process_group(fn.file)})
         )
         slots = []
         for group in caller_groups:
-            slots.extend(by_type.get((group, type_name), {}).get(method, []))
+            slots.extend(by_type.get((group, lookup), {}).get(method, []))
         _gain_from(
             gained,
             keys_of,

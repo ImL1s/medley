@@ -4377,8 +4377,12 @@ class TypeAssociatedResolution(unittest.TestCase):
 
             pub(super) struct Snapshot(u64);
 
-            impl Snapshot {
-                pub(super) fn now() -> Self {
+            pub(super) trait Probe {
+                fn now() -> Self;
+            }
+
+            impl Probe for Snapshot {
+                fn now() -> Self {
                     Self(COUNTER.load(Ordering::SeqCst))
                 }
             }
@@ -4386,13 +4390,9 @@ class TypeAssociatedResolution(unittest.TestCase):
         )
         test_file = src(
             """\
-            trait Probe {
-                fn now() -> Self;
-            }
-
             #[test]
             fn calls_ufcs_trait_untagged() {
-                let _s = <inner::Snapshot as Probe>::now();
+                let _s = <inner::Snapshot as inner::Probe>::now();
             }
             """
         )
@@ -4402,6 +4402,75 @@ class TypeAssociatedResolution(unittest.TestCase):
         ]
         names = derived_names(sources, "demo_key")
         self.assertEqual(names, {"calls_ufcs_trait_untagged"})
+
+    def test_ufcs_named_trait_does_not_inherit_sibling_impl(self):
+        """`<S as Clean>::act()` must not inherit `Touch::act` keys
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            struct S;
+
+            trait Touch {
+                fn act();
+            }
+            trait Clean {
+                fn act();
+            }
+
+            impl Touch for S {
+                fn act() {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            impl Clean for S {
+                fn act() {}
+            }
+
+            #[test]
+            fn first_untagged() {
+                <S as Clean>::act();
+            }
+
+            #[test]
+            fn second_untagged() {
+                <S as Clean>::act();
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        self.assertEqual(names, set())
+
+    def test_cfg_disabled_test_is_not_a_member(self):
+        """`#[cfg(windows)] #[test]` is not a harness test on Unix
+        (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            #[cfg(unix)]
+            #[test]
+            fn unix_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn windows_untagged() {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            """
+        )
+        names = derived_names([(Path("f.rs"), text)], "demo_key")
+        if sys.platform == "win32":
+            self.assertEqual(names, {"windows_untagged"})
+        else:
+            self.assertEqual(names, {"unix_untagged"})
 
     def test_ufcs_nested_generic_type_still_resolves(self):
         """`<Box<Vec<u8>> as Bump>::bump()` must survive nested `<>`
