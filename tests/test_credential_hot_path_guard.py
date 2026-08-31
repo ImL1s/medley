@@ -56,6 +56,7 @@ import tempfile
 import textwrap
 import tomllib
 import unittest
+from bisect import bisect_right
 from collections import deque
 from pathlib import Path
 from typing import NamedTuple
@@ -118,7 +119,9 @@ def _strip_line_comment(line: str) -> str:
 
 
 _RAW_STRING_START = re.compile(r"(?:c|b)?r(#*)\"")
-_MACRO_INVOKE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*!\s*[([{]")
+_RUST_IDENT = r"[^\W\d]\w*"
+_MACRO_IDENT = re.compile(rf"(?:r#)?({_RUST_IDENT})")
+_MACRO_INVOKE = re.compile(rf"(?<!\w)(?:r#)?({_RUST_IDENT})\s*!\s*[([{{]")
 
 
 def _skip_quoted(text: str, index: int, quote: str) -> int:
@@ -315,11 +318,11 @@ def _macro_rules_defs(masked: str) -> list[tuple[str, int, int]]:
         index = match.end()
         while index < len(masked) and masked[index].isspace():
             index += 1
-        ident = re.match(r"[A-Za-z_][A-Za-z0-9_]*", masked[index:])
+        ident = _MACRO_IDENT.match(masked, index)
         if not ident:
             continue
-        name = ident.group(0)
-        index += ident.end()
+        name = ident.group(1)
+        index = ident.end()
         while index < len(masked) and masked[index].isspace():
             index += 1
         if index < len(masked) and masked[index] in "{([":
@@ -360,6 +363,7 @@ def _brace_scopes_at(
 def _scoped_macro_rules_sources(
     masked: str,
     defs: list[tuple[str, int, int]] | None = None,
+    enabled_features: set[str] | frozenset[str] | None = None,
 ) -> tuple[tuple[str, str, int, tuple[int, ...]], ...]:
     """`(name, source, end, lexical brace scope)` macro definitions."""
 
@@ -374,6 +378,8 @@ def _scoped_macro_rules_sources(
         if start >= 0
     )
     scopes = _brace_scopes_at(masked, set(starts), spans)
+    attr_spans = _outer_attr_spans(masked)
+    attr_ends = [end for _start, end, _attr in attr_spans]
     return tuple(
         (
             name,
@@ -383,7 +389,53 @@ def _scoped_macro_rules_sources(
         )
         for start, (name, _body_start, body_end) in zip(starts, defs)
         if start >= 0
+        if not any(
+            _cfg_attr_is_inactive(attr, enabled_features)
+            for attr in _effective_attrs(
+                _outer_attrs_before(masked, start, attr_spans, attr_ends),
+                enabled_features,
+            )
+        )
     )
+
+
+def _outer_attr_spans(masked: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(masked):
+        end = (
+            _attribute_end(masked, index)
+            if masked[index] == "#" and not masked.startswith("#![", index)
+            else None
+        )
+        if end is None:
+            index += 1
+            continue
+        spans.append((index, end, masked[index:end]))
+        index = end
+    return spans
+
+
+def _outer_attrs_before(
+    masked: str,
+    item_start: int,
+    spans: list[tuple[int, int, str]],
+    ends: list[int],
+) -> list[str]:
+    """Contiguous outer attributes attached to the item at `item_start`."""
+
+    attrs: list[str] = []
+    cursor = item_start
+    index = bisect_right(ends, cursor) - 1
+    while index >= 0:
+        start, end, attr = spans[index]
+        if masked[end:cursor].strip():
+            break
+        attrs.append(attr)
+        cursor = start
+        index -= 1
+    attrs.reverse()
+    return attrs
 
 
 def _macro_rules_sources_before(
@@ -1437,7 +1489,9 @@ def _declared_module_overrides(
         if _file_inner_cfg_inactive(text, enabled):
             continue
         masked = _mask_rust_literals(text)
-        scoped_macros = _scoped_macro_rules_sources(masked)
+        scoped_macros = _scoped_macro_rules_sources(
+            masked, enabled_features=enabled
+        )
         decls = _iter_module_decls(
             text,
             declaring,
@@ -1833,13 +1887,13 @@ def _tests_in_file(
     if len(brace_lines) < len(raw_lines):
         brace_lines.extend([""] * (len(raw_lines) - len(brace_lines)))
     defs = _macro_rules_defs(masked)
-    scoped_defs = _scoped_macro_rules_sources(masked, defs)
+    scoped_defs = _scoped_macro_rules_sources(masked, defs, enabled_features)
     def_spans = [(start, end) for _, start, end in defs]
     macro_spans = [
         (masked.rfind("macro_rules", 0, start), end)
         for _name, start, end in defs
     ]
-    available_names = {name for name, _start, _end in defs} | {
+    available_names = {name for name, _source, _end, _scope in scoped_defs} | {
         name for name, _source in inherited_macros
     }
     raw_invocations = [
@@ -3611,6 +3665,100 @@ class ExternalModulePrefix(unittest.TestCase):
                     "child::inner::inner_case",
                     "child::local_case",
                     "child::parent_case",
+                ],
+            )
+            self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_cfg_inactive_macro_does_not_shadow_active_parent_macro(self):
+        """Only cfg-active definitions participate in lexical shadowing."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    #[cfg(unix)]
+                    macro_rules! generated {
+                        () => {
+                            #[test]
+                            fn none_auth_scheme_sends() {}
+                        };
+                    }
+                    #[cfg(windows)]
+                    macro_rules! generated {
+                        () => {
+                            #[test]
+                            fn clean_case() {}
+                        };
+                    }
+                    mod first;
+                    mod second;
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (src / "first.rs").write_text("generated!();\n", encoding="utf-8")
+            (src / "second.rs").write_text("generated!();\n", encoding="utf-8")
+
+            cargo_names = _cargo_list_test_names(crate)
+            self.assertEqual(
+                cargo_names,
+                [
+                    "first::none_auth_scheme_sends",
+                    "second::none_auth_scheme_sends",
+                ],
+            )
+            self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
+
+    def test_raw_and_unicode_macro_names_are_inherited_by_children(self):
+        """Rust raw and Unicode identifiers work in definitions/invocations."""
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            crate = root / "crates" / "demo"
+            src = crate / "src"
+            src.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (src / "lib.rs").write_text(
+                textwrap.dedent(
+                    """\
+                    macro_rules! r#type {
+                        () => {
+                            #[test]
+                            fn none_auth_scheme_raw() {}
+                        };
+                    }
+                    macro_rules! 生成 {
+                        () => {
+                            #[test]
+                            fn none_auth_scheme_unicode() {}
+                        };
+                    }
+                    mod raw_child;
+                    mod unicode_child;
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (src / "raw_child.rs").write_text("r#type!();\n", encoding="utf-8")
+            (src / "unicode_child.rs").write_text("生成!();\n", encoding="utf-8")
+
+            cargo_names = _cargo_list_test_names(crate)
+            self.assertEqual(
+                cargo_names,
+                [
+                    "raw_child::none_auth_scheme_raw",
+                    "unicode_child::none_auth_scheme_unicode",
                 ],
             )
             self.assertEqual(sorted(_qualified_test_names(root)), cargo_names)
