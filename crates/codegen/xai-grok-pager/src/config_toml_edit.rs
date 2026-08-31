@@ -8,6 +8,7 @@ use std::path::Path;
 pub(crate) struct ConfigMutationSnapshot {
     pub generation: u64,
     pub byte_digest: String,
+    pub overlay_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub(crate) enum ConfigMutationPersistence {
 pub(crate) struct ConfigMutationOutcome {
     pub generation: u64,
     pub byte_digest: String,
+    pub overlay_digest: String,
     pub persistence: ConfigMutationPersistence,
     pub active_session_changed: bool,
 }
@@ -74,8 +76,35 @@ pub(crate) fn lock_config_file(path: &Path) -> std::io::Result<File> {
 }
 
 pub(crate) fn write_config_toml(path: &Path, contents: &str) -> std::io::Result<()> {
-    let mode = destination_unix_mode(path);
-    xai_grok_config::fs_atomic::write_atomically(path, contents, mode)
+    let dest = xai_grok_config::fs_atomic::resolve_write_path(path)?;
+    let mode = destination_unix_mode(&dest);
+    xai_grok_config::fs_atomic::write_atomically(&dest, contents, mode)
+}
+
+fn overlay_digest_for(path: &Path) -> String {
+    let mut payload = Vec::new();
+    let mut dirs = Vec::new();
+    if let Some(parent) = path.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    if let Some(system) = xai_grok_config::system_config_dir() {
+        dirs.push(system);
+    }
+    for dir in dirs {
+        for name in [
+            xai_grok_config::MANAGED_CONFIG_FILENAME,
+            xai_grok_config::REQUIREMENTS_FILENAME,
+        ] {
+            match std::fs::read(dir.join(name)) {
+                Ok(bytes) => {
+                    payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                    payload.extend_from_slice(&bytes);
+                }
+                Err(_) => payload.extend_from_slice(&0u64.to_le_bytes()),
+            }
+        }
+    }
+    digest_bytes(&payload)
 }
 
 fn destination_unix_mode(path: &Path) -> Option<u32> {
@@ -102,6 +131,7 @@ pub(crate) fn config_mutation_snapshot(
     Ok(ConfigMutationSnapshot {
         generation,
         byte_digest: digest_bytes(&bytes),
+        overlay_digest: overlay_digest_for(path),
     })
 }
 
@@ -118,15 +148,22 @@ where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
 {
     let _lock = lock_config_file(path).map_err(ConfigMutationError::Write)?;
-    let mode = destination_unix_mode(path);
-    mutate_config_document_at_with(
-        path,
+    if overlay_digest_for(path) != rendered.overlay_digest {
+        return Err(ConfigMutationError::ConcurrentEdit);
+    }
+    let dest =
+        xai_grok_config::fs_atomic::resolve_write_path(path).map_err(ConfigMutationError::Write)?;
+    let mode = destination_unix_mode(&dest);
+    let mut outcome = mutate_config_document_at_with(
+        &dest,
         rendered,
         current_generation,
         edit,
         read_config_bytes,
         move |path, contents| xai_grok_config::fs_atomic::write_atomically(path, contents, mode),
-    )
+    )?;
+    outcome.overlay_digest = overlay_digest_for(path);
+    Ok(outcome)
 }
 
 fn mutate_config_document_at_with<F, R, W>(
@@ -171,6 +208,7 @@ where
         Ok(bytes) if bytes == intended.as_bytes() => Ok(ConfigMutationOutcome {
             generation: current_generation,
             byte_digest: digest_bytes(&bytes),
+            overlay_digest: overlay_digest_for(path),
             persistence: ConfigMutationPersistence::PersistedForNewSessions,
             active_session_changed: false,
         }),
@@ -391,6 +429,7 @@ mod tests {
         let second = ConfigMutationSnapshot {
             generation: 4,
             byte_digest: outcome.byte_digest,
+            overlay_digest: outcome.overlay_digest,
         };
         let outcome = mutate_config_document_at(&path, &second, 4, |document| {
             document["agent"]["name"] = toml_edit::value("explore");
@@ -458,6 +497,25 @@ mod tests {
         let body = fs::read_to_string(&target).unwrap();
         assert!(body.contains("verifier = true"));
         assert!(body.contains("theme = \"dark\""));
+    }
+
+    #[test]
+    fn transaction_rejects_overlay_change_as_concurrent_edit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[ui]\ntheme = \"dark\"\n").unwrap();
+        let rendered = config_mutation_snapshot(&path, 1).unwrap();
+        fs::write(
+            dir.path().join(xai_grok_config::MANAGED_CONFIG_FILENAME),
+            "[subagents.toggle]\nexplore = false\n",
+        )
+        .unwrap();
+        let error = mutate_config_document_at(&path, &rendered, 1, set_agent_enabled).unwrap_err();
+        assert!(matches!(error, ConfigMutationError::ConcurrentEdit));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[ui]\ntheme = \"dark\"\n"
+        );
     }
 
     #[cfg(unix)]

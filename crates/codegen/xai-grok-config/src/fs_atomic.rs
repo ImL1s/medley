@@ -141,4 +141,23 @@ mod tests {
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
         assert!(!target.exists());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_on_pinned_target_ignores_later_retarget() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.toml");
+        let second = dir.path().join("second.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&first, "one\n").unwrap();
+        std::fs::write(&second, "two\n").unwrap();
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let pinned = resolve_write_path(&link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+        write_atomically(&pinned, "pinned\n", None).unwrap();
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "pinned\n");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "two\n");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "two\n");
+    }
 }
