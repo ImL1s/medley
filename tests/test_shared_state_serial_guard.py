@@ -517,6 +517,47 @@ class TransitiveClosure(unittest.TestCase):
         names = derived_names([(Path("f.rs"), text)], "demo_key")
         self.assertEqual(names, {"first_untagged", "second_untagged"})
 
+    def test_uppercase_qualified_call_is_a_member(self):
+        """`helper::Bump()` is a module-qualified identifier call
+        (#516 review)."""
+
+        sources = [
+            (
+                Path("src/helper.rs"),
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                    #[allow(non_snake_case)]
+                    pub fn Bump() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+            ),
+            (
+                Path("src/lib.rs"),
+                src(
+                    """\
+                    mod helper;
+
+                    #[test]
+                    fn first_untagged() {
+                        helper::Bump();
+                    }
+
+                    #[test]
+                    fn second_untagged() {
+                        helper::Bump();
+                    }
+                    """
+                ),
+            ),
+        ]
+        names = derived_names(sources, "demo_key")
+        self.assertEqual(names, {"first_untagged", "second_untagged"})
+
     def test_unused_nested_fn_body_is_not_a_direct_touch(self):
         """An unused nested `fn helper() { COUNTER... }` must not mark
         the enclosing test as a Stage-1 toucher (#516 review)."""
@@ -1693,6 +1734,32 @@ class TransitiveClosure(unittest.TestCase):
 
             cases!(42, one);
             cases!(42, two);
+            """
+        )
+        names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
+        generated = {n for n in names if n.startswith("cases!")}
+        self.assertEqual(len(generated), 2, names)
+
+    def test_macro_invoke_keeps_string_literals_intact(self):
+        """`($label:literal, $name:ident)` must match `cases!(\"one\", one)`
+        without splitting the string into quote tokens (#516 review)."""
+
+        text = src(
+            """\
+            // SERIAL-GROUP: demo_key
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            macro_rules! cases {
+                ($label:literal, $name:ident) => {
+                    #[test]
+                    fn $name() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+            }
+
+            cases!("one", one);
+            cases!("two", two);
             """
         )
         names = derived_names([(Path("src/lib.rs"), text)], "demo_key")
@@ -6245,6 +6312,49 @@ class DefaultScanRoots(unittest.TestCase):
         findings, errors, _membership = guard.analyze(sources, scan_root=Path("."))
         self.assertEqual(errors, [])
         self.assertEqual(findings, [])
+
+    def test_undeclared_src_file_is_not_collected(self):
+        """A `.rs` file not reached from crate roots is not a Cargo
+        source and must not join the library process (#516 review)."""
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            src_dir = repo / "src"
+            src_dir.mkdir()
+            (src_dir / "lib.rs").write_text(
+                src(
+                    """\
+                    // SERIAL-GROUP: demo_key
+                    pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (src_dir / "orphan.rs").write_text(
+                src(
+                    """\
+                    #[test]
+                    fn first_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    #[test]
+                    fn second_untagged() {
+                        COUNTER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    """
+                ),
+                encoding="utf-8",
+            )
+            sources = guard.collect_sources(repo, [src_dir])
+            self.assertEqual(
+                [path.as_posix() for path, _text in sources],
+                ["src/lib.rs"],
+            )
+            findings, errors, _membership = guard.analyze(
+                sources, scan_root=src_dir
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(findings, [])
 
     def test_same_path_file_keeps_every_module_alias(self):
         """`#[path = \"shared.rs\"] mod support` and `mod common` both

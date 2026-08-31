@@ -313,7 +313,7 @@ EXTERN_CRATE = re.compile(
 # leaf -- the shape a sibling module is actually called by in this tree
 # (`search_recovery::heal_unusable(`, no `crate::` prefix at all).
 QUALIFIED_CALL = re.compile(
-    r"\b((?:(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)(?:r#)?([a-z_][a-z0-9_]*)\s*\("
+    rf"\b((?:(?:r#)?{RUST_IDENT_BODY}\s*::\s*)+)(?:r#)?({RUST_IDENT_BODY})\s*\("
 )
 TYPE_ASSOC_CALL = re.compile(
     r"\b([A-Z][A-Za-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>\s*)?\("
@@ -499,10 +499,64 @@ def _macro_invoke_inner(source: str, bang_end: int) -> str:
 _TOKEN = re.compile(
     rf"(?:r#)?{RUST_IDENT_BODY}|[0-9]+|::|[^\sA-Za-z0-9_]"
 )
+_RAW_LIT = re.compile(r"(?:[cb]|br|cr)?r(#*)\"")
+
+
+def _cooked_string_end(text: str, quote_at: int) -> int | None:
+    index = quote_at + 1
+    while index < len(text):
+        ch = text[index]
+        if ch == "\\":
+            index += 2
+            continue
+        if ch == '"':
+            return index + 1
+        if ch == "\n":
+            return None
+        index += 1
+    return None
+
+
+def _quoted_literal_end(text: str, index: int) -> int | None:
+    """End of a string/char literal starting at `index`, or None."""
+
+    raw = _RAW_LIT.match(text, index)
+    if raw:
+        closer = '"' + raw.group(1)
+        found = text.find(closer, raw.end())
+        return None if found < 0 else found + len(closer)
+    if index < len(text) and text[index] in "cb" and index + 1 < len(text) and text[index + 1] == '"':
+        return _cooked_string_end(text, index + 1)
+    if index < len(text) and text[index] == '"':
+        return _cooked_string_end(text, index)
+    char = CHAR_LITERAL.match(text, index)
+    if char:
+        return char.end()
+    return None
 
 
 def _token_list(text: str) -> list[str]:
-    return _TOKEN.findall(text)
+    """Keep string and char literals intact for `:literal` metavars (#516)."""
+
+    tokens: list[str] = []
+    index = 0
+    n = len(text)
+    while index < n:
+        if text[index].isspace():
+            index += 1
+            continue
+        end = _quoted_literal_end(text, index)
+        if end is not None:
+            tokens.append(text[index:end])
+            index = end
+            continue
+        match = _TOKEN.match(text, index)
+        if match:
+            tokens.append(match.group(0))
+            index = match.end()
+        else:
+            index += 1
+    return tokens
 
 
 _METAVAR = re.compile(
@@ -548,6 +602,11 @@ def _matcher_named_parts(
         if metavar:
             parts.append((None, metavar.group("kind") or "ident", metavar.group("name")))
             index = metavar.end()
+            continue
+        quoted_end = _quoted_literal_end(inner, index)
+        if quoted_end is not None:
+            parts.append((inner[index:quoted_end], None, None))
+            index = quoted_end
             continue
         token = _TOKEN.match(inner, index)
         if token:
@@ -2597,7 +2656,52 @@ def _file_process_groups(
 
 
 def rust_files(scan_root: Path) -> list[Path]:
-    return sorted(path for path in scan_root.rglob("*.rs") if path.is_file())
+    """Rust files compiled from crate roots under `scan_root` (#516 review).
+
+    Undeclared `.rs` files are not Cargo sources; scanning them assigns
+    phantom tests to the library process.
+    """
+
+    by_posix: dict[str, Path] = {}
+    for path in scan_root.rglob("*.rs"):
+        if path.is_file():
+            by_posix[_norm_posix(path)] = path
+    pending: list[Path] = [
+        path for path in by_posix.values() if _is_always_compiled_root(path)
+    ]
+    seen: set[str] = set()
+    reachable: list[Path] = []
+    texts: dict[Path, str] = {}
+    while pending:
+        current = pending.pop()
+        key = _norm_posix(current)
+        if key in seen:
+            continue
+        seen.add(key)
+        reachable.append(current)
+        if current not in texts:
+            try:
+                texts[current] = current.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                texts[current] = ""
+        text = texts[current]
+        code = _code_only(text)
+        for match in _MOD_DECL.finditer(code):
+            if any(
+                _attr_cfg_inactive(attr)
+                for attr in _preceding_attributes(text, code, match.start())
+            ):
+                continue
+            pending.extend(
+                _declared_mod_files(current.parent, match.group(1), by_posix)
+            )
+        for target in _path_attr_files(current, text):
+            pending.extend(
+                path
+                for path in by_posix.values()
+                if _path_attr_covers(path, target)
+            )
+    return sorted(reachable)
 
 
 def collect_sources(
@@ -4088,7 +4192,7 @@ def index_functions(
                 continue
             line = _line(raw, invoke.start())
             arity = _macro_invoke_arity(code, invoke.end())
-            inner = _macro_invoke_inner(code, invoke.end())
+            inner = _macro_invoke_inner(raw, invoke.end())
             for arms, macro_file, definition_name in resolved_candidates:
                 chosen: _MacroArm | None = None
                 for arm in arms:
