@@ -8,10 +8,12 @@ Why this exists:
 - Queued/in-progress, skipped, and zero-run are different states; only the
   last one is `absent`.
 - For pull_request runs, GitHub's SHA fields are inconsistent in practice:
-  sometimes `head_sha` is the PR head, sometimes it points at a merge commit,
-  and `pull_requests[].head.sha` may be missing.
-- The reliable question is branch-head based: compare `git ls-remote` for the
-  branch against CI runs that actually target that branch head.
+  sometimes `head_sha` is the PR head, sometimes it is the synthetic merge
+  commit Actions checked out. `pull_requests[].head.sha` is rewritten to the
+  live PR tip and is not a receipt.
+- The reliable question is: does this branch have a ci.yml run whose recorded
+  `head_sha` is the requested commit, or a merge commit whose git parents
+  include that commit.
 
 This script is a pre-merge guard meant to run on a developer machine (or merge
 orchestrator), not inside CI itself. `--evaluate-pr-checks` is the fail-closed
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import string
 import subprocess
 import sys
@@ -447,25 +450,47 @@ def remote_head_sha(remote: str, branch: str) -> str:
     return sha
 
 
-def list_branch_runs(repo: str, branch: str, event: str, limit: int) -> list[dict[str, Any]]:
-    data = gh_json(
-        [
-            "run",
-            "list",
-            "--repo",
-            repo,
-            "--workflow",
-            "ci.yml",
-            "--branch",
-            branch,
-            "--event",
-            event,
-            "--limit",
-            str(limit),
-            "--json",
-            RUN_LIST_FIELDS,
-        ]
-    )
+def list_ci_runs(
+    repo: str,
+    event: str,
+    limit: int,
+    *,
+    branch: str | None = None,
+    commit: str | None = None,
+) -> list[dict[str, Any]]:
+    """List ci.yml runs for a branch or an exact commit.
+
+    Pull-request CI in this repository is recorded against the synthetic
+    merge commit, so `--commit $PR_HEAD` returns no run. Callers list
+    pull_request rows by `--branch` and then associate each row with the
+    requested head via immutable `headSha` / git parents. Do not treat
+    `pull_requests[].head.sha` as a receipt: GitHub rewrites it to the
+    live tip.
+    """
+
+    args = [
+        "run",
+        "list",
+        "--repo",
+        repo,
+        "--workflow",
+        "ci.yml",
+        "--event",
+        event,
+        "--limit",
+        str(limit),
+        "--json",
+        RUN_LIST_FIELDS,
+    ]
+    if commit is not None:
+        if not _is_sha(commit):
+            raise CiHeadGateError("commit SHA is missing or malformed")
+        args.extend(["--commit", commit])
+    elif branch:
+        args.extend(["--branch", branch])
+    else:
+        raise CiHeadGateError("list_ci_runs requires a branch or commit")
+    data = gh_json(args)
     if not isinstance(data, list):
         raise CiHeadGateError("`gh run list` returned a non-array response")
     rows: list[dict[str, Any]] = []
@@ -482,6 +507,191 @@ def run_detail(repo: str, run_id: int) -> dict[str, Any]:
         raise CiHeadGateError(f"run detail for {run_id} is not an object")
     return data
 
+
+def commit_parent_shas(repo: str, sha: str) -> set[str]:
+    """Direct git parents of `sha`. Merge-commit CI uses these, not `--commit`.
+
+    Actions sometimes records a synthetic merge SHA that GitHub later GC's.
+    Treat a missing commit as "no parents" so historical probes stay
+    fail-closed on identity without aborting the whole gate.
+    """
+
+    return commit_parents_and_message(repo, sha)[0]
+
+
+def commit_parents_and_message(repo: str, sha: str) -> tuple[set[str], str]:
+    """`(parents, first-line message)` for `sha`."""
+
+    parents, message, _github = commit_parents_message_and_github_proof(repo, sha)
+    return parents, message
+
+
+def commit_is_github_synthetic_merge_proof(data: dict[str, Any]) -> bool:
+    """True when GitHub itself authored a verified Actions synthetic merge.
+
+    Message + parent shape alone is forgeable (#530 review). Require the
+    commit API's GitHub-verified signature and the `GitHub` /
+    `noreply@github.com` committer identity Actions uses for
+    `Merge <head> into <base>` checkout commits.
+    """
+
+    commit = data.get("commit")
+    if not isinstance(commit, dict):
+        return False
+    verification = commit.get("verification")
+    if not isinstance(verification, dict) or verification.get("verified") is not True:
+        return False
+    committer = commit.get("committer")
+    if not isinstance(committer, dict):
+        return False
+    name = committer.get("name")
+    email = committer.get("email")
+    if not isinstance(name, str) or not isinstance(email, str):
+        return False
+    return name == "GitHub" and email.lower() == "noreply@github.com"
+
+
+def commit_parents_message_and_github_proof(
+    repo: str, sha: str
+) -> tuple[set[str], str, bool]:
+    """`(parents, first-line message, github_synthetic_proof)` for `sha`."""
+
+    if not _is_sha(sha):
+        raise CiHeadGateError("commit SHA is missing or malformed")
+    result = run_command(
+        ["gh", "api", f"repos/{repo}/commits/{sha}"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = ((result.stderr or result.stdout) or "").lower()
+        if "http 404" in detail or "http 422" in detail or "no commit found" in detail:
+            return set(), "", False
+        raise CiHeadGateError(
+            f"`gh api repos/{repo}/commits/{sha}` failed: "
+            f"{(result.stderr or result.stdout or f'exit {result.returncode}').strip()}"
+        )
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CiHeadGateError(
+            f"commit {sha} response is not valid JSON"
+        ) from exc
+    if not isinstance(data, dict):
+        raise CiHeadGateError(f"commit {sha} is not an object")
+    parents_raw = data.get("parents")
+    out: set[str] = set()
+    if isinstance(parents_raw, list):
+        for parent in parents_raw:
+            if not isinstance(parent, dict):
+                continue
+            parent_sha = parent.get("sha")
+            if isinstance(parent_sha, str) and _is_sha(parent_sha):
+                out.add(parent_sha.lower())
+    message = ""
+    commit = data.get("commit")
+    if isinstance(commit, dict):
+        raw_msg = commit.get("message")
+        if isinstance(raw_msg, str) and raw_msg:
+            message = raw_msg.splitlines()[0].strip()
+    return out, message, commit_is_github_synthetic_merge_proof(data)
+
+
+_ACTIONS_SYNTHETIC_MERGE = re.compile(
+    r"(?i)^Merge ([0-9a-f]{40}) into ([0-9a-f]{40})\s*$"
+)
+
+
+def run_head_matches_requested(
+    *,
+    repo: str,
+    recorded_sha: object,
+    requested_sha: str,
+    parent_cache: dict[str, set[str]],
+    message_cache: dict[str, str] | None = None,
+    github_proof_cache: dict[str, bool] | None = None,
+    pull_merge_sha: str | None = None,
+    require_pull_merge: bool = False,
+) -> bool:
+    """True when a run's immutable head is `requested_sha` or merges it.
+
+    Exact `head_sha` match covers runs recorded against the PR head.
+    Parent association covers only the live Actions synthetic merge at
+    `refs/pull/<n>/merge` (`Merge <head> into <base>`, two parents, GitHub
+    verified). When `require_pull_merge` is set (merge-pr / `--pr` probes),
+    an unavailable or absent merge ref fails closed for parent association
+    rather than skipping the binding (#530 review).
+    """
+
+    if not isinstance(recorded_sha, str) or not _is_sha(recorded_sha):
+        return False
+    recorded = recorded_sha.lower()
+    requested = requested_sha.lower()
+    if recorded == requested:
+        return True
+    if require_pull_merge:
+        if (
+            pull_merge_sha is None
+            or not _is_sha(pull_merge_sha)
+            or recorded != pull_merge_sha.lower()
+        ):
+            return False
+    elif pull_merge_sha is not None:
+        if not _is_sha(pull_merge_sha) or recorded != pull_merge_sha.lower():
+            return False
+    parents = parent_cache.get(recorded)
+    messages = message_cache if message_cache is not None else {}
+    proofs = github_proof_cache if github_proof_cache is not None else {}
+    message = messages.get(recorded)
+    proof = proofs.get(recorded)
+    if parents is None or message is None or proof is None:
+        fetched_parents, fetched_message, fetched_proof = (
+            commit_parents_message_and_github_proof(repo, recorded)
+        )
+        if parents is None:
+            parents = fetched_parents
+            parent_cache[recorded] = parents
+        if message is None:
+            message = fetched_message
+            messages[recorded] = message
+        if proof is None:
+            proof = fetched_proof
+            proofs[recorded] = proof
+    if not proof:
+        return False
+    if requested not in parents or len(parents) != 2:
+        return False
+    match = _ACTIONS_SYNTHETIC_MERGE.match(message or "")
+    if match is None:
+        return False
+    if match.group(1).lower() != requested:
+        return False
+    base = match.group(2).lower()
+    return base in parents
+
+
+def pull_request_merge_sha(remote: str, pr_number: int) -> str | None:
+    """Current `refs/pull/<n>/merge` object, or None when the ref is absent.
+
+    A failed `git ls-remote` is not treated as absence — it raises so the
+    merge gate cannot silently drop the synthetic-merge binding (#530).
+    """
+
+    if pr_number <= 0:
+        raise CiHeadGateError("--pr must be a positive integer")
+    result = run_command(
+        ["git", "ls-remote", remote, f"refs/pull/{pr_number}/merge"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        raise CiHeadGateError(
+            f"`git ls-remote {remote} refs/pull/{pr_number}/merge` failed: {detail}"
+        )
+    line = (result.stdout or "").splitlines()[:1]
+    if not line:
+        return None
+    sha = line[0].split("\t", 1)[0].strip().lower()
+    return sha if _is_sha(sha) else None
 
 def matches_release_gate_shape(detail: dict[str, Any], *, sha: str, branch: str) -> bool:
     """Mirror release.yml's CI-run identity checks for this SHA."""
@@ -516,27 +726,28 @@ def pull_request_head_sha(detail: dict[str, Any], branch: str) -> str | None:
 
 
 def pull_request_candidate_shas(detail: dict[str, Any], branch: str) -> set[str]:
-    """Collect every SHA that can identify this pull_request run's branch head."""
+    """Immutable SHA identity of a pull_request run.
+
+    `head_sha` is frozen at creation (PR head or the merge commit CI
+    checked out). `pull_requests[].head.sha` is rewritten to the live PR
+    tip and must not be used as a receipt for a later head.
+    """
 
     candidates: set[str] = set()
     head_sha = detail.get("head_sha")
     if isinstance(head_sha, str) and _is_sha(head_sha):
         candidates.add(head_sha.lower())
-
-    pr_head_sha = pull_request_head_sha(detail, branch)
-    if pr_head_sha is not None:
-        candidates.add(pr_head_sha)
+    _ = branch
     return candidates
 
 
-def matches_pull_request_gate_shape(detail: dict[str, Any], *, sha: str, branch: str) -> bool:
+def matches_pull_request_gate_shape(detail: dict[str, Any], *, branch: str) -> bool:
     return (
         detail.get("event") == "pull_request"
         and detail.get("head_branch") == branch
         and detail.get("path") == CI_WORKFLOW_PATH
         and detail.get("status") == "completed"
         and detail.get("conclusion") == "success"
-        and sha in pull_request_candidate_shas(detail, branch)
     )
 
 
@@ -694,6 +905,8 @@ def check_branch_head_ci(
     limit: int,
     stream: TextIO,
     head_source: str = "explicit --head-sha",
+    pull_merge_sha: str | None = None,
+    require_pull_merge: bool = False,
 ) -> int:
     if not _is_sha(head_sha):
         raise CiHeadGateError("target head SHA is missing or malformed")
@@ -704,8 +917,11 @@ def check_branch_head_ci(
         file=stream,
     )
 
-    runs = list_branch_runs(repo, branch, event=event, limit=limit)
+    runs = list_ci_runs(repo, event, limit, branch=branch)
     details_by_id: dict[int, dict[str, Any]] = {}
+    parent_cache: dict[str, set[str]] = {}
+    message_cache: dict[str, str] = {}
+    github_proof_cache: dict[str, bool] = {}
 
     def detail_for(run_id: int) -> dict[str, Any]:
         detail = details_by_id.get(run_id)
@@ -714,39 +930,68 @@ def check_branch_head_ci(
             details_by_id[run_id] = detail
         return detail
 
+    # Prefer exact headSha matches first so a current successful receipt does
+    # not pay for parent lookups on up to `--limit` historical merge SHAs
+    # (#530 review). Only fall through to parent association when needed.
     head_runs: list[dict[str, Any]] = []
-    if event == "push":
-        head_runs = [row for row in runs if row.get("headSha") == head_sha]
-    else:
-        for row in runs:
-            run_id = row.get("databaseId")
-            if not isinstance(run_id, int):
-                continue
-            detail = detail_for(run_id)
-            if head_sha in pull_request_candidate_shas(detail, branch):
-                head_runs.append(row)
-
-    candidate_success = [
-        row
-        for row in head_runs
-        if row.get("status") == "completed" and row.get("conclusion") == "success"
-    ]
-
     verified_success: list[dict[str, Any]] = []
     rejected_success: list[int] = []
-    for row in candidate_success:
+
+    def verify_row(row: dict[str, Any]) -> bool | None:
+        """Return True/False once verified, or None when the row is not a success candidate."""
+        if row.get("status") != "completed" or row.get("conclusion") != "success":
+            return None
         run_id = row.get("databaseId")
         if not isinstance(run_id, int):
-            continue
+            return None
         detail = detail_for(run_id)
         if event == "push":
             is_match = matches_release_gate_shape(detail, sha=head_sha, branch=branch)
         else:
-            is_match = matches_pull_request_gate_shape(detail, sha=head_sha, branch=branch)
+            is_match = matches_pull_request_gate_shape(
+                detail, branch=branch
+            ) and run_head_matches_requested(
+                repo=repo,
+                recorded_sha=detail.get("head_sha"),
+                requested_sha=head_sha,
+                parent_cache=parent_cache,
+                message_cache=message_cache,
+                github_proof_cache=github_proof_cache,
+                pull_merge_sha=pull_merge_sha,
+                require_pull_merge=require_pull_merge,
+            )
         if is_match:
             verified_success.append(row)
-        else:
-            rejected_success.append(run_id)
+            return True
+        rejected_success.append(run_id)
+        return False
+
+    if event == "push":
+        head_runs = [row for row in runs if row.get("headSha") == head_sha]
+        for row in head_runs:
+            verify_row(row)
+    else:
+        exact_rows = [row for row in runs if row.get("headSha") == head_sha]
+        head_runs.extend(exact_rows)
+        for row in exact_rows:
+            if verify_row(row) is True:
+                break
+        if not verified_success:
+            for row in runs:
+                if row.get("headSha") == head_sha:
+                    continue
+                if not run_head_matches_requested(
+                    repo=repo,
+                    recorded_sha=row.get("headSha"),
+                    requested_sha=head_sha,
+                    parent_cache=parent_cache,
+                    message_cache=message_cache,
+                    github_proof_cache=github_proof_cache,
+                ):
+                    continue
+                head_runs.append(row)
+                if verify_row(row) is True:
+                    break
 
     verdict = classify_head_ci(
         head_runs,
@@ -828,8 +1073,10 @@ def check_branch_head_ci(
         )
 
     print(
-        "       Probe rationale: uses branch head + `gh run list --branch`; "
-        "it intentionally avoids `gh pr checks`.",
+        "       Probe rationale: uses `gh run list --branch` plus immutable "
+        "head_sha / merge-commit parents for pull_request heads, and "
+        "`--branch` for providers push; it intentionally avoids "
+        "`gh pr checks` and rewritten `pull_requests[].head.sha`.",
         file=stream,
     )
     if runs:
@@ -872,13 +1119,25 @@ def check_pr_head_ci(
         limit=limit,
         stream=stream,
         head_source=f"from git ls-remote {remote} refs/heads/{branch}",
+        pull_merge_sha=pull_request_merge_sha(remote, pr_number),
+        require_pull_merge=True,
     )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--pr", type=int, help="Pull request number")
+    # `--pr` may accompany `--branch --head-sha` so merge-pr can bind
+    # `refs/pull/<n>/merge` while probing an explicit tip (#530). Keep the
+    # other modes exclusive of each other.
+    parser.add_argument(
+        "--pr",
+        type=int,
+        help=(
+            "Pull request number. Alone: probe that PR's head. "
+            "With --branch: also bind refs/pull/<n>/merge for parent CI."
+        ),
+    )
+    target = parser.add_mutually_exclusive_group(required=False)
     target.add_argument("--branch", help="Branch name to probe directly")
     target.add_argument(
         "--report-pr-heads",
@@ -922,6 +1181,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    mode_count = sum(
+        [
+            bool(args.evaluate_pr_checks),
+            args.report_pr_heads is not None,
+            args.branch is not None,
+            args.pr is not None
+            and args.branch is None
+            and args.report_pr_heads is None
+            and not args.evaluate_pr_checks,
+        ]
+    )
+    if mode_count != 1:
+        raise CiHeadGateError(
+            "specify exactly one of --pr (alone), --branch, "
+            "--report-pr-heads, or --evaluate-pr-checks"
+        )
     if args.evaluate_pr_checks:
         if args.head_sha is not None:
             raise CiHeadGateError("--head-sha cannot be used with --evaluate-pr-checks")
@@ -938,9 +1213,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.limit <= 0:
         raise CiHeadGateError("--limit must be a positive integer")
-    if args.pr is not None and args.head_sha is not None:
-        raise CiHeadGateError("--head-sha can only be used with --branch")
-    if args.pr is not None:
+    if args.pr is not None and args.head_sha is not None and args.branch is None:
+        raise CiHeadGateError("--head-sha with --pr also requires --branch")
+    if args.pr is not None and args.head_sha is None and args.branch is None:
         if args.pr <= 0:
             raise CiHeadGateError("--pr must be a positive integer")
         return check_pr_head_ci(
@@ -960,6 +1235,14 @@ def main(argv: list[str] | None = None) -> int:
         head_sha = remote_head_sha(args.remote, args.branch)
         head_source = f"from git ls-remote {args.remote} refs/heads/{args.branch}"
 
+    pull_merge_sha = None
+    require_pull_merge = False
+    if args.pr is not None:
+        if args.pr <= 0:
+            raise CiHeadGateError("--pr must be a positive integer")
+        pull_merge_sha = pull_request_merge_sha(args.remote, args.pr)
+        require_pull_merge = True
+
     return check_branch_head_ci(
         repo=args.repo,
         branch=args.branch,
@@ -967,6 +1250,8 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         stream=sys.stdout,
         head_source=head_source,
+        pull_merge_sha=pull_merge_sha,
+        require_pull_merge=require_pull_merge,
     )
 
 
