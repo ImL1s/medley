@@ -559,9 +559,7 @@ fn extract_error_detail(raw: &str) -> Option<String> {
     // JSON before carrier-prefix strips: an Internal-error envelope
     // (`{"message":"Provider request failed (HTTP 400).","http_status":400}`)
     // must not be sliced mid-object by the provider-prefix matcher.
-    if let Some(resolved) = resolve_embedded_json(&s) {
-        s = resolved;
-    }
+    s = resolve_embedded_json_to_fixed_point(&s);
 
     if let Some(rest) = strip_provider_request_failed_prefix(&s) {
         s = rest;
@@ -580,9 +578,7 @@ fn extract_error_detail(raw: &str) -> Option<String> {
     // A remaining JSON object after the prefix strips (API error + body), taken
     // before the URL-clause strip: a URL inside a JSON string would otherwise
     // split the body at its own ": " and leave garbage.
-    if let Some(resolved) = resolve_embedded_json(&s) {
-        s = resolved;
-    }
+    s = resolve_embedded_json_to_fixed_point(&s);
 
     s = strip_from_url_clause(&s);
 
@@ -743,6 +739,29 @@ fn find_json_object(s: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// How many times [`resolve_embedded_json`] may run in one unwrap phase before
+/// stopping. Each successful pass peels one envelope layer; gateway stacks of
+/// three or more need more than the two fixed calls this module used to make.
+/// The cap bounds work on adversarial strings where each layer is a separate
+/// parse (serde's depth limit does not apply across passes). Stated here so
+/// the unwrap depth is explicit rather than incidental.
+const MAX_JSON_UNWRAP_PASSES: usize = 8;
+
+/// Peel [`resolve_embedded_json`] layers until none remain or the pass cap hits.
+fn resolve_embedded_json_to_fixed_point(s: &str) -> String {
+    let mut current = s.to_string();
+    for _ in 0..MAX_JSON_UNWRAP_PASSES {
+        let Some(resolved) = resolve_embedded_json(&current) else {
+            break;
+        };
+        if resolved == current {
+            break;
+        }
+        current = resolved;
+    }
+    current
+}
+
 /// Resolve an embedded JSON object: the message it carries, or nothing.
 ///
 /// [`extract_from_json`] answers only the first half. When the object parses
@@ -823,7 +842,7 @@ fn trim_dangling_separator(s: &str) -> String {
 ///
 /// Those figures are one shape (`function(){if(a){`, ~17 bytes per unmatched
 /// open). All-braces is ~8× denser, and `extract_error_detail` calls this
-/// twice, so the retained worst case per *format* is higher than per call:
+/// twice per phase (each to a fixed point capped by [`MAX_JSON_UNWRAP_PASSES`]), so the retained worst case per *format* is higher than per call:
 /// measured at the bound, ~49 ms for one call and ~93 ms for a format. The
 /// absolute milliseconds are machine- and load-dependent; the ~4× growth per
 /// doubling and the 2× are not.
@@ -833,8 +852,8 @@ fn trim_dangling_separator(s: &str) -> String {
 /// ([`crate::app::effects::sanitize_user_error`] truncates past that), and the
 /// largest envelope in this file's fixtures is a few hundred bytes.
 ///
-/// There is no second bite. `extract_error_detail` calls this before the
-/// carrier strips as well as after, so an oversized body has already had
+/// `extract_error_detail` runs this to a fixed point (see [`MAX_JSON_UNWRAP_PASSES`])
+/// before the carrier strips as well as after, so an oversized body has already had
 /// everything from its first `{` cut by the time the strips run — only the two
 /// prefix-anchored strips (~25 and ~16 bytes) precede that call. A readable
 /// envelope just over the bound is therefore dropped unread rather than
@@ -1912,6 +1931,53 @@ mod tests {
         )
         .expect("an already-formatted banner is typed");
         assert_eq!(carrier.detail, "whatever");
+    }
+
+    /// #432: two fixed `resolve_embedded_json` passes left a third envelope
+    /// layer verbatim (`b {"secret":"x"}`). Fixed-point unwrap must peel it.
+    #[test]
+    fn issue432_triple_nested_error_envelope_unwraps() {
+        let raw = r#"API error (status 400 Bad Request): {"error":"a {\"error\":\"b {\\\"secret\\\":\\\"x\\\"}\"}"}"#;
+        let formatted = format_request_failure(Some(400), None, raw);
+        assert!(
+            !formatted.message().contains('{') && !formatted.message().contains("secret"),
+            "triple-nested envelope must not ship raw JSON: {}",
+            formatted.message()
+        );
+        // Same payload on the fast rail used to stop at depth 2 (`b {"secret":"x"}`).
+        let fast = compose_typed_provider_failure(
+            Some(400),
+            None,
+            r#"Bad request (400) — b {"secret":"x"}"#,
+        )
+        .expect("typed banner");
+        assert!(
+            !fast.message().contains('{') && !fast.message().contains("secret"),
+            "fast rail must peel the third layer too: {}",
+            fast.message()
+        );
+    }
+
+    /// One layer deeper than [`MAX_JSON_UNWRAP_PASSES`] pins the cap: the
+    /// innermost payload must still be redacted, not shown as raw JSON.
+    #[test]
+    fn issue432_unwrap_pass_cap_pins_boundary() {
+        let mut msg = serde_json::json!({"secret": "x"});
+        for _ in 0..=super::MAX_JSON_UNWRAP_PASSES {
+            msg = serde_json::json!({"error": msg.to_string()});
+        }
+        let raw = format!("API error (status 400 Bad Request): {}", msg.to_string());
+        let formatted = format_request_failure(Some(400), None, &raw);
+        assert!(
+            !formatted.message().contains("secret"),
+            "beyond the unwrap cap, payloads must still be redacted: {}",
+            formatted.message()
+        );
+        assert!(
+            !formatted.message().contains('{'),
+            "beyond the unwrap cap, raw JSON must not reach the user: {}",
+            formatted.message()
+        );
     }
 
     /// The scan is quadratic in unmatched `{`, and truncation — not an
