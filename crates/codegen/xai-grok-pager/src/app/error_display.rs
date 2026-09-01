@@ -1966,7 +1966,7 @@ mod tests {
         for _ in 0..=super::MAX_JSON_UNWRAP_PASSES {
             msg = serde_json::json!({"error": msg.to_string()});
         }
-        let raw = format!("API error (status 400 Bad Request): {}", msg.to_string());
+        let raw = format!("API error (status 400 Bad Request): {msg}");
         let formatted = format_request_failure(Some(400), None, &raw);
         assert!(
             !formatted.message().contains("secret"),
