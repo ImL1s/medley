@@ -726,6 +726,26 @@ class Selected(unittest.TestCase):
             )
         )
 
+    def test_inline_mod_tests_is_visible_to_module_path_filters(self):
+        """#460: `mod tests {` inside a file is part of Cargo's module path."""
+        self.assertTrue(
+            selected(
+                "reclaim_removes_a_lock_no_process_holds",
+                "crates/codegen/xai-grok-shell/src/leader/lock.rs",
+                {"leader::lock::tests::reclaim"},
+            )
+        )
+
+    def test_path_attr_mod_tests_resolves_to_declaring_module(self):
+        """#460: `#[path = "manager_tests.rs"] mod tests;` is auth::manager::tests."""
+        self.assertTrue(
+            selected(
+                "anything",
+                "crates/codegen/xai-grok-shell/src/auth/manager_tests.rs",
+                {"auth::manager::tests::"},
+            )
+        )
+
 
 class EndToEnd(unittest.TestCase):
     SCRIPT = REPO / "scripts" / "check_new_tests_are_filtered.py"
