@@ -18,7 +18,8 @@ no `--exact`), so a new test is "selected" when some filter for its crate is a
 substring of its name. Matching on the bare function name is deliberately
 lenient: a filter like `slash::commands::model::` selects by module path, which
 this cannot see from the diff alone, so module-path filters are also checked
-against the file's path.
+against the file's path — and, for #460, against inline `mod name {` blocks and
+same-directory `#[path = "..."] mod name;` declarations the file path omits.
 
 What this deliberately does NOT cover (issue #408): a test that already
 existed before `--base`. Reading the diff is what buys the two properties
@@ -47,6 +48,17 @@ from toml_package_name import name_in_block  # noqa: E402
 _TEST_ATTR = re.compile(r"^\+\s*#\[(?:tokio::)?test\b")
 _FN = re.compile(r"^\+\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
 _DIFF_FILE = re.compile(r"^\+\+\+ b/(.+)$")
+_INLINE_MOD_OPEN = re.compile(r"\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
+_PATH_ATTR = re.compile(r"#\[path\s*=\s*\"([^\"]+)\"\]")
+_MOD_SEMI = re.compile(r"\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+_FN_NAME = re.compile(
+    r"\b(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+
+# Corpus + CI call `selected` many times per file; cache disk reads (#460).
+_SOURCE_CACHE: dict[str, str] = {}
+_PATH_ATTR_CACHE: dict[str, list[str] | None] = {}
+_INLINE_INDEX_CACHE: dict[str, dict[str, list[str]]] = {}
 
 
 def _crate_split(path: str) -> tuple[str, tuple[str, ...]] | None:
@@ -306,41 +318,163 @@ def added_tests(diff: str) -> list[tuple[str, str]]:
     return out
 
 
-def selected(test_fn: str, file_path: str, filters: set[str]) -> bool:
+def _file_module_components(file_path: str | Path) -> list[str]:
+    """Approximate Rust module components from a source file path under `src/`."""
     path = Path(file_path)
     parts = list(path.parts)
     try:
         src_index = parts.index("src")
     except ValueError:
-        module_components: list[str] = []
-    else:
-        module_components = parts[src_index + 1 :]
-        if module_components:
-            stem = Path(module_components[-1]).stem
-            if stem == "mod":
-                module_components.pop()
-            else:
-                module_components[-1] = stem
+        return []
+    module_components = parts[src_index + 1 :]
+    if module_components:
+        stem = Path(module_components[-1]).stem
+        if stem == "mod":
+            module_components.pop()
+        else:
+            module_components[-1] = stem
+    return module_components
+
+
+def enclosing_inline_mods(source: str, test_fn: str) -> list[str]:
+    """Inline `mod name { ... }` path enclosing `fn test_fn`, if present (#460).
+
+    File-path approximation cannot see modules that never become their own file.
+    A line-oriented brace walk is enough for the ci.yml filters that previously
+    looked unresolvable: they name an inline `tests` (or similar) block.
+    """
+    return _inline_mods_index(source).get(test_fn, [])
+
+
+def _inline_mods_index(source: str) -> dict[str, list[str]]:
+    """Map each `fn` name to the inline `mod` stack at its definition site."""
+    stack: list[tuple[int, str]] = []
+    depth = 0
+    index: dict[str, list[str]] = {}
+    for raw in source.splitlines():
+        code = raw.split("//", 1)[0]
+        for match in _INLINE_MOD_OPEN.finditer(code):
+            stack.append((depth, match.group(1)))
+        for match in _FN_NAME.finditer(code):
+            index[match.group(1)] = [name for _, name in stack]
+        depth += code.count("{") - code.count("}")
+        while stack and depth <= stack[-1][0]:
+            stack.pop()
+    return index
+
+
+def _inline_mods_for_path(path: Path, test_fn: str) -> list[str]:
+    key = str(path)
+    if key not in _INLINE_INDEX_CACHE:
+        source = _read_source(path)
+        _INLINE_INDEX_CACHE[key] = _inline_mods_index(source) if source else {}
+    return _INLINE_INDEX_CACHE[key].get(test_fn, [])
+
+
+def _read_source(path: Path) -> str | None:
+    key = str(path)
+    if key in _SOURCE_CACHE:
+        return _SOURCE_CACHE[key]
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        _SOURCE_CACHE[key] = ""
+        return None
+    _SOURCE_CACHE[key] = text
+    return text
+
+
+def path_attr_module_components(file_path: Path) -> list[str] | None:
+    """Module path when `file_path` is pulled in via same-dir `#[path] mod NAME` (#460).
+
+    Example: `auth/manager.rs` declares `#[path = "manager_tests.rs"] mod tests;`,
+    so tests in `manager_tests.rs` live at `auth::manager::tests`, not
+    `auth::manager_tests`.
+    """
+    key = str(file_path)
+    if key in _PATH_ATTR_CACHE:
+        return _PATH_ATTR_CACHE[key]
+    if not file_path.name.endswith(".rs"):
+        _PATH_ATTR_CACHE[key] = None
+        return None
+    parent = file_path.parent
+    if not parent.is_dir():
+        _PATH_ATTR_CACHE[key] = None
+        return None
+    want = file_path.name
+    try:
+        siblings = sorted(p for p in parent.glob("*.rs") if p != file_path)
+    except OSError:
+        _PATH_ATTR_CACHE[key] = None
+        return None
+    result: list[str] | None = None
+    for sibling in siblings:
+        text = _read_source(sibling)
+        if text is None:
+            continue
+        for path_match in _PATH_ATTR.finditer(text):
+            rel = path_match.group(1)
+            if Path(rel).name != want and rel != want:
+                continue
+            after = text[path_match.end() : path_match.end() + 240]
+            mod_match = _MOD_SEMI.search(after)
+            if mod_match is None:
+                continue
+            result = _file_module_components(sibling) + [mod_match.group(1)]
+            break
+        if result is not None:
+            break
+    _PATH_ATTR_CACHE[key] = result
+    return result
+
+
+def _module_path_candidates(test_fn: str, file_path: str) -> list[list[str]]:
+    """Every module-path candidate `selected` should try for this test (#460)."""
+    module_components = _file_module_components(file_path)
+    candidates = [module_components + [test_fn]]
+    # Sibling `*_tests.rs` files are commonly `#[path]`-included as `mod tests`
+    # from the stem before `_tests` (restore_fetch_tests → restore_fetch).
+    if module_components and module_components[-1].endswith("_tests"):
+        included = module_components.copy()
+        included[-1] = included[-1].removesuffix("_tests")
+        candidates.append(included + [test_fn])
+
+    path = Path(file_path)
+    if not path.is_file():
+        return candidates
+
+    inline = _inline_mods_for_path(path, test_fn)
+    if inline:
+        candidates.append(module_components + inline + [test_fn])
+
+    via_path_attr = path_attr_module_components(path)
+    if via_path_attr is not None:
+        candidates.append(via_path_attr + [test_fn])
+    return candidates
+
+
+def selected(test_fn: str, file_path: str, filters: set[str]) -> bool:
+    candidates: list[list[str]] | None = None
 
     def module_filter_matches(filter_value: str) -> bool:
+        nonlocal candidates
         wanted = [component for component in filter_value.strip(":").split("::") if component]
         if not wanted:
             return False
-        candidates = [module_components + [test_fn]]
-        # This repository keeps some large test modules in sibling `*_tests.rs`
-        # files included with `#[path = "..."]`. Their Rust module is the stem
-        # before `_tests` (for example `restore_fetch_tests.rs` is declared from
-        # `restore_fetch.rs`). Preserve that established approximation without
-        # letting an arbitrary prefix such as `session` match `session_state`.
-        if module_components and module_components[-1].endswith("_tests"):
-            included = module_components.copy()
-            included[-1] = included[-1].removesuffix("_tests")
-            candidates.append(included + [test_fn])
-        return any(
+        if candidates is None:
+            candidates = _module_path_candidates(test_fn, file_path)
+        if any(
             candidate[start : start + len(wanted)] == wanted
             for candidate in candidates
             for start in range(len(candidate) - len(wanted) + 1)
-        )
+        ):
+            return True
+        # Cargo filters are substrings of the full test path. A filter like
+        # `leader::lock::tests::reclaim` selects `...::reclaim_removes_...`
+        # even though `reclaim` is not its own path component (#460).
+        # Keep the `::` delimiters — stripping them would let `session::`
+        # match inside `session_state`.
+        return any(filter_value in "::".join(candidate) for candidate in candidates)
 
     for f in filters:
         if not f:
@@ -348,7 +482,8 @@ def selected(test_fn: str, file_path: str, filters: set[str]) -> bool:
         if f in test_fn:
             return True
         # Module-path filters (`slash::commands::model::`) cannot be matched
-        # against a bare fn name; approximate the module path from the file.
+        # against a bare fn name; approximate the module path from the file,
+        # plus inline / `#[path]` modules the file-path walk cannot see (#460).
         # Compare Rust components rather than raw substrings: Cargo's
         # `session::` filter selects a `session` module but not the
         # `extensions::session_state` module.
@@ -414,11 +549,37 @@ def main() -> int:
         print(f"      {file_path}")
         target_filters = per_crate.get(crate, {})
         formatted_filters = []
+        unresolved_module_filters: list[str] = []
         for tgt in sorted(target_filters):
             flts = sorted(target_filters[tgt])
             if flts:
                 formatted_filters.append(f"{tgt}: {flts}")
+            for flt in flts:
+                if "::" not in flt:
+                    continue
+                wanted = [c for c in flt.strip(":").split("::") if c]
+                # Honest #460 signal: a module-path filter whose components never
+                # appear in any candidate for this file — including after inline
+                # / #[path] resolution — cannot be judged as "unenrolled" the
+                # same way a name filter can.
+                candidates = _module_path_candidates(fn, file_path)
+                if wanted and not any(
+                    candidate[start : start + len(wanted)] == wanted
+                    for candidate in candidates
+                    for start in range(max(0, len(candidate) - len(wanted) + 1))
+                ):
+                    # Only report when the filter names a component the file
+                    # path itself does not provide (likely inline / path-attr).
+                    file_comps = set(_file_module_components(file_path))
+                    if any(comp not in file_comps and comp != fn for comp in wanted):
+                        unresolved_module_filters.append(flt)
         print(f"      crate `{crate}` filters: {formatted_filters if formatted_filters else '(none)'}")
+        if unresolved_module_filters:
+            print(
+                "      note: these module-path filters name components this "
+                "guard still cannot resolve for this file "
+                f"(#460): {sorted(set(unresolved_module_filters))}"
+            )
     print()
     print("These tests will not run in CI. `ci.yml` has no unfiltered test job, so a")
     print("test no filter selects executes nowhere -- not on a developer machine if it")

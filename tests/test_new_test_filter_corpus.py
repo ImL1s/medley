@@ -299,31 +299,11 @@ def _real_tests_by_crate() -> dict[str, list[tuple[str, str]]]:
     return grouped
 
 # Module filters that resolve to no file in their own crate, because the
-# component they name is an INLINE module and the guard derives module paths
-# from file paths. Each is a filter that works in Cargo and that the guard
-# would report as selecting nothing -- #460. This list is a ratchet: it must
-# not grow, and it shrinks to empty when #460 is fixed.
-#
-# Keyed on (crate, target, value), TARGET included. Collapsing to (crate,
-# value) let an allowlisted filter reused against a different, genuinely
-# broken target be absorbed by the entry a DIFFERENT target earned -- a new
-# breakage would reuse an existing key and `test_no_new_unresolvable_module_filter`
-# would report nothing new. Proven by construction, not by count: today every
-# (crate, value) here maps to exactly one target ("lib"), so this widening is
-# a re-expression of the same seven entries, not new coverage (#458 review).
-KNOWN_UNRESOLVABLE = {
-    ("xai-grok-shell", "lib", "auth::manager::tests::"),
-    ("xai-grok-shell", "lib", "auth::openai_codex::tests::"),
-    (
-        "xai-grok-shell",
-        "lib",
-        "auth::openai_codex::tests::full_login_flow_persists_provider_scoped_codex_credential",
-    ),
-    ("xai-grok-shell", "lib", "leader::lock::tests::reclaim"),
-    ("xai-grok-shell", "lib", "terminal::pty_session::tests::"),
-    ("xai-grok-shell", "lib", "terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child"),
-    ("xai-grok-subagent-resolution", "lib", "resume::tests"),
-}
+# component they name is an INLINE / `#[path]` module and the guard's
+# file-path approximation cannot see it. Emptied by #460 (inline + path-attr
+# resolution). Kept as an explicit empty ratchet so a regression reintroduces
+# entries through `test_no_new_unresolvable_module_filter` rather than silence.
+KNOWN_UNRESOLVABLE: set[tuple[str, str, str]] = set()
 
 
 class ModulePathApproximationCorpus(unittest.TestCase):
@@ -390,14 +370,23 @@ class ModulePathApproximationCorpus(unittest.TestCase):
             f"these now resolve; remove them from KNOWN_UNRESOLVABLE: {sorted(fixed)}",
         )
 
-    def test_the_approximation_really_cannot_see_an_inline_module(self):
-        # Pins WHY the list above exists. If this starts passing, #460 is fixed
-        # and the list should be emptied rather than left as folklore.
+    def test_the_approximation_sees_an_inline_module(self):
+        # Was the negative pin for #460's file-path-only approximation. With
+        # inline-mod resolution the real pager-bin module is visible; a
+        # non-existent synthetic path still must not invent modules.
+        self.assertTrue(
+            guard.selected(
+                "version_json_payload_carries_each_value_from_its_own_source",
+                "crates/codegen/xai-grok-pager-bin/src/main.rs",
+                {"version_json_payload_tests::"},
+            ),
+            "inline mod version_json_payload_tests in main.rs must resolve (#460)",
+        )
         self.assertFalse(
             guard.selected(
                 "some_unrelated_test_name",
                 "crates/codegen/x/src/main.rs",
                 {"version_json_payload_tests::"},
             ),
-            "the file-path approximation now resolves inline modules; see #460",
+            "a missing file must not invent inline modules",
         )
