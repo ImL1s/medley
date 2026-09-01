@@ -1064,6 +1064,56 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             prepared_new_session_plan_preserves_selected_effort_with_implicit_menu -- --nocapture
 
+      - name: "Generation CAS config.toml persist (issue #290)"
+        run: |
+          set -o pipefail
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          # Unique module path so #171 proves the five CAS tests are selected.
+          run_nonzero -p xai-grok-pager --lib config_toml_edit:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            set_hint_at_propagates_unreadable_file_without_replace -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
+            mdm_requirements_fingerprint_is_stable_absent_layer -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            read_config_text_propagates_unreadable_file -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            write_config_toml_keeps_pinned_destination_verbatim -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            atomic_write_string_at_keeps_pinned_destination_verbatim -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            transaction_does_not_rollback_over_a_newer_editor_after_overlay_mismatch -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            transaction_rechecks_bytes_before_replace -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            apply_items_to_config_writes_path_entries -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            new_loads_toggle_under_the_same_lock_as_the_snapshot -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            add_dismissed_plugin_cta_uses_shared_config_lock -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            user_mcp_config_mutations_lock_and_follow_symlink_dest -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            append_marketplace_source_skips_duplicate_identity -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            atomic_write_string_creates_temp_with_destination_mode -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            project_mcp_mutations_pin_symlink_dest_before_read -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
+            write_atomically_applies_saved_mode_after_umask -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
+            write_atomically_at_does_not_follow_dest_replaced_with_symlink -- --nocapture
+
       - name: Restricted subagent capability boundaries
         run: |
           run_nonzero() {
@@ -1480,6 +1530,10 @@ jobs:
           # ran nowhere. 13 tests.
           run_nonzero -p xai-grok-config --lib \
             paths:: -- --nocapture
+          # Portable config.toml sibling lock + symlink-following atomic write
+          # used by pager CAS and shell save.
+          run_nonzero -p xai-grok-config --lib \
+            fs_atomic:: -- --nocapture
           # `xai-grok-config-types` had no filter at all, so every test in it
           # ran nowhere. `BoolFlag`'s `.env_alias()` opt-in (#426) is a choke
           # point ~49 other flags flow through unaliased -- the one place a

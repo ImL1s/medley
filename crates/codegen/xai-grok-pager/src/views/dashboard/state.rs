@@ -4852,7 +4852,8 @@ pub fn write_persisted_to_path(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut doc = match crate::config_toml_edit::read_config_document_for_edit(path) {
+    let (_lock, dest) = crate::config_toml_edit::lock_config_destination(path)?;
+    let mut doc = match crate::config_toml_edit::read_config_document_for_edit(&dest)? {
         Some(d) => d,
         None => {
             // File exists but is unparseable. Refuse to overwrite —
@@ -4886,7 +4887,7 @@ pub fn write_persisted_to_path(
     // The onboarding hint was removed — drop the stale table so old
     // configs don't carry a dead `[dashboard.onboarding]` key forever.
     t.remove("onboarding");
-    atomic_write(path, doc.to_string().as_bytes())
+    atomic_write(&dest, doc.to_string().as_bytes())
 }
 
 /// Atomic write via `<path>.dashboard.tmp.<pid>` + `rename`. Concurrent

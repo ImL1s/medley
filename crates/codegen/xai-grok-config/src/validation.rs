@@ -237,6 +237,20 @@ pub(crate) fn mdm_requirements_value() -> Option<toml::Value> {
     )
 }
 
+/// Stable bytes for the MDM requirements layer so CAS overlay snapshots
+/// invalidate when an administrator changes `ai.x.grok` while a modal is open.
+pub fn mdm_requirements_fingerprint() -> Vec<u8> {
+    match mdm_requirements_value() {
+        Some(value) => {
+            let encoded = toml::to_string(&value).unwrap_or_default();
+            let mut out = vec![1];
+            out.extend_from_slice(encoded.as_bytes());
+            out
+        }
+        None => vec![0],
+    }
+}
+
 /// Errors from validating requirements layers at startup.
 #[derive(Debug, thiserror::Error)]
 pub enum RequirementsError {
@@ -526,6 +540,14 @@ minimum_version = "not-a-version"
     fn validate_user_requirements_ok_without_user_home() {
         // No user home => nothing to validate, no error.
         assert!(validate_user_requirements(None).is_ok());
+    }
+
+    #[test]
+    fn mdm_requirements_fingerprint_is_stable_absent_layer() {
+        let first = mdm_requirements_fingerprint();
+        let second = mdm_requirements_fingerprint();
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
     }
 
     #[test]

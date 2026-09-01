@@ -650,15 +650,18 @@ pub(crate) async fn save_mcp_disabled_tools(
     server_name: &str,
     disabled_tools: &[String],
 ) -> Result<()> {
-    let path = config_path();
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => toml::from_str(&s).unwrap_or(TomlValue::Table(TomlMap::new())),
-        Err(_) => TomlValue::Table(TomlMap::new()),
-    };
-    let table = root
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
+    mutate_toml_table(&config_path(), true, |table| {
+        apply_mcp_disabled_tools(table, server_name, disabled_tools)
+    })
+    .await?;
+    Ok(())
+}
 
+fn apply_mcp_disabled_tools(
+    table: &mut TomlMap<String, TomlValue>,
+    server_name: &str,
+    disabled_tools: &[String],
+) -> Result<()> {
     let section = table
         .entry("disabled_mcp_tools")
         .or_insert_with(|| TomlValue::Table(TomlMap::new()))
@@ -677,14 +680,6 @@ pub(crate) async fn save_mcp_disabled_tools(
             .collect();
         section.insert(server_name.to_string(), TomlValue::Array(arr));
     }
-
-    let toml_str = toml::to_string_pretty(&root)?;
-    let tmp = path.with_extension("toml.tmp");
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    tokio::fs::write(&tmp, &toml_str).await?;
-    tokio::fs::rename(&tmp, &path).await?;
     Ok(())
 }
 
@@ -787,19 +782,58 @@ async fn write_toml_table_if_changed(
     path: &std::path::Path,
     f: impl FnOnce(&mut TomlMap<String, TomlValue>),
 ) -> Result<bool> {
-    let is_user = path == config_path().as_path();
-    let _guard = if is_user {
-        Some(super::persist::lock_config_writes().await)
-    } else {
-        None
-    };
+    Ok(mutate_toml_table(path, false, |table| {
+        f(table);
+        Ok(())
+    })
+    .await?
+    .map(|(written, _)| written)
+    .unwrap_or(false))
+}
 
-    let original = match tokio::fs::read_to_string(path).await {
+/// Apply `f` to the TOML table at `path`. User-config writes take the shared
+/// `config.toml` lock and run against the pinned destination.
+///
+/// Returns `None` when a non-user file is missing and `create_missing` is
+/// false. Missing user config (or `create_missing`) starts as an empty table.
+/// The bool is whether bytes were written.
+async fn mutate_toml_table<R>(
+    path: &std::path::Path,
+    create_missing: bool,
+    f: impl FnOnce(&mut TomlMap<String, TomlValue>) -> Result<R>,
+) -> Result<Option<(bool, R)>> {
+    let is_user = path == config_path().as_path();
+    let user_guard;
+    let project_lock;
+    let dest;
+    if is_user {
+        let guard = super::persist::lock_config_writes().await?;
+        dest = guard.dest.clone();
+        user_guard = Some(guard);
+        project_lock = None;
+    } else {
+        user_guard = None;
+        let path_owned = path.to_path_buf();
+        let (os, pinned) = tokio::task::spawn_blocking(move || {
+            xai_grok_config::fs_atomic::lock_config_destination(&path_owned)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to lock {}: {e}", path.display()))?
+        .map_err(|e| anyhow::anyhow!("failed to lock {}: {e}", path.display()))?;
+        project_lock = Some(os);
+        dest = pinned;
+    }
+    let _held = (user_guard, project_lock);
+    let io_path = dest.as_path();
+
+    let original = match tokio::fs::read_to_string(io_path).await {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_user => String::new(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && (is_user || create_missing) => {
+            String::new()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            return Err(anyhow::anyhow!("failed to read {}: {e}", path.display()));
+            return Err(anyhow::anyhow!("failed to read {}: {e}", io_path.display()));
         }
     };
     let mut root: TomlValue = if original.is_empty() {
@@ -810,7 +844,7 @@ async fn write_toml_table_if_changed(
             Err(parse_err) => {
                 return Err(anyhow::anyhow!(
                     "refusing to overwrite unparseable {}: {}; fix the syntax before retrying",
-                    path.display(),
+                    io_path.display(),
                     parse_err
                 ));
             }
@@ -819,7 +853,7 @@ async fn write_toml_table_if_changed(
     let table = root
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
-    f(table);
+    let value = f(table)?;
     let toml_str = toml::to_string_pretty(&root)?;
     // Normalize empty original so first enable/disable still writes when needed.
     let before = if original.is_empty() {
@@ -832,11 +866,11 @@ async fn write_toml_table_if_changed(
         }
     };
     if before == toml_str {
-        return Ok(false);
+        return Ok(Some((false, value)));
     }
-    super::persist::atomic_write_string(path, &toml_str)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
-    Ok(true)
+    super::persist::atomic_write_string_at(io_path, &toml_str)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", io_path.display()))?;
+    Ok(Some((true, value)))
 }
 
 /// Flip sticky project `enabled = false` → true with toml_edit (comments kept).
@@ -844,56 +878,39 @@ async fn clear_sticky_project_disabled_at(
     path: &std::path::Path,
     server_name: &str,
 ) -> Result<bool> {
-    let original = match tokio::fs::read_to_string(path).await {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => {
-            return Err(anyhow::anyhow!("failed to read {}: {e}", path.display()));
-        }
-    };
-    let mut doc: toml_edit::DocumentMut = original
-        .parse()
-        .map_err(|e| anyhow::anyhow!("refusing to rewrite unparseable {}: {e}", path.display()))?;
-
-    let Some(servers) = doc
-        .get_mut("mcp_servers")
-        .and_then(|item| item.as_table_like_mut())
-    else {
-        return Ok(false);
-    };
-    let Some(entry) = servers.get_mut(server_name) else {
-        return Ok(false);
-    };
-    let Some(server_table) = entry.as_table_like_mut() else {
-        return Ok(false);
-    };
-    if server_table.get("enabled").and_then(|v| v.as_bool()) != Some(false) {
-        return Ok(false);
-    }
-    server_table.insert("enabled", toml_edit::value(true));
-
-    let updated = doc.to_string();
-    if updated == original {
-        return Ok(false);
-    }
-    super::persist::atomic_write_string(path, &updated)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
-    Ok(true)
+    rewrite_sticky_project_enabled(path, server_name, false, true).await
 }
 
 /// Flip sticky project `enabled = true` → false with toml_edit (comments kept).
 /// Inverse of [`clear_sticky_project_disabled_at`].
 async fn set_sticky_project_disabled_at(path: &std::path::Path, server_name: &str) -> Result<bool> {
-    let original = match tokio::fs::read_to_string(path).await {
+    rewrite_sticky_project_enabled(path, server_name, true, false).await
+}
+
+async fn rewrite_sticky_project_enabled(
+    path: &std::path::Path,
+    server_name: &str,
+    from_enabled: bool,
+    to_enabled: bool,
+) -> Result<bool> {
+    let path_owned = path.to_path_buf();
+    let (lock, dest) = tokio::task::spawn_blocking(move || {
+        xai_grok_config::fs_atomic::lock_config_destination(&path_owned)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to lock {}: {e}", path.display()))?
+    .map_err(|e| anyhow::anyhow!("failed to lock {}: {e}", path.display()))?;
+    let _lock = lock;
+    let original = match tokio::fs::read_to_string(&dest).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => {
-            return Err(anyhow::anyhow!("failed to read {}: {e}", path.display()));
+            return Err(anyhow::anyhow!("failed to read {}: {e}", dest.display()));
         }
     };
     let mut doc: toml_edit::DocumentMut = original
         .parse()
-        .map_err(|e| anyhow::anyhow!("refusing to rewrite unparseable {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("refusing to rewrite unparseable {}: {e}", dest.display()))?;
 
     let Some(servers) = doc
         .get_mut("mcp_servers")
@@ -907,17 +924,17 @@ async fn set_sticky_project_disabled_at(path: &std::path::Path, server_name: &st
     let Some(server_table) = entry.as_table_like_mut() else {
         return Ok(false);
     };
-    if server_table.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+    if server_table.get("enabled").and_then(|v| v.as_bool()) != Some(from_enabled) {
         return Ok(false);
     }
-    server_table.insert("enabled", toml_edit::value(false));
+    server_table.insert("enabled", toml_edit::value(to_enabled));
 
     let updated = doc.to_string();
     if updated == original {
         return Ok(false);
     }
-    super::persist::atomic_write_string(path, &updated)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    super::persist::atomic_write_string_at(&dest, &updated)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", dest.display()))?;
     Ok(true)
 }
 
@@ -990,25 +1007,27 @@ pub async fn save_mcp_server_config_at(
     server_name: &str,
     config: &McpServerConfig,
 ) -> Result<()> {
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => toml::from_str(&s).unwrap_or(TomlValue::Table(TomlMap::new())),
-        Err(_) => TomlValue::Table(TomlMap::new()),
-    };
-    let table = root
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
+    let serialized = toml::Value::try_from(config)
+        .map_err(|e| anyhow::anyhow!("failed to serialize MCP server config: {e}"))?;
+    mutate_toml_table(path, true, |table| {
+        apply_mcp_server_config(table, server_name, serialized)
+    })
+    .await?;
+    Ok(())
+}
 
+fn apply_mcp_server_config(
+    table: &mut TomlMap<String, TomlValue>,
+    server_name: &str,
+    serialized: TomlValue,
+) -> Result<()> {
     let servers = table
         .entry("mcp_servers")
         .or_insert_with(|| TomlValue::Table(TomlMap::new()))
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("mcp_servers is not a table"))?;
-
-    let serialized = toml::Value::try_from(config)
-        .map_err(|e| anyhow::anyhow!("failed to serialize MCP server config: {e}"))?;
     servers.insert(server_name.to_string(), serialized);
 
-    // Ensure the server isn't in the disabled list.
     if let Some(arr) = table
         .get_mut("disabled_mcp_servers")
         .and_then(|v| v.as_array_mut())
@@ -1018,14 +1037,6 @@ pub async fn save_mcp_server_config_at(
             table.remove("disabled_mcp_servers");
         }
     }
-
-    let toml_str = toml::to_string_pretty(&root)?;
-    let tmp = path.with_extension("toml.tmp");
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    tokio::fs::write(&tmp, &toml_str).await?;
-    tokio::fs::rename(&tmp, &path).await?;
     Ok(())
 }
 
@@ -1047,25 +1058,36 @@ pub async fn delete_mcp_server_config_at(
     path: &std::path::Path,
     server_name: &str,
 ) -> Result<bool> {
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => toml::from_str(&s).unwrap_or(TomlValue::Table(TomlMap::new())),
-        Err(_) => return Ok(false),
+    let Some((_written, existed)) = mutate_toml_table(path, false, |table| {
+        Ok(apply_delete_mcp_server(table, server_name))
+    })
+    .await?
+    else {
+        return Ok(false);
     };
-    let table = root
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
 
+    if existed
+        && let Ok(mut cred_store) = xai_grok_mcp::credentials::McpCredentialStore::load_default()
+    {
+        let removed = cred_store.remove_by_server_name(server_name);
+        if removed > 0 {
+            let _ = cred_store.save_default();
+        }
+    }
+
+    Ok(existed)
+}
+
+fn apply_delete_mcp_server(table: &mut TomlMap<String, TomlValue>, server_name: &str) -> bool {
     let existed = table
         .get_mut("mcp_servers")
         .and_then(|v| v.as_table_mut())
         .and_then(|servers| servers.remove(server_name))
         .is_some();
-
     if !existed {
-        return Ok(false);
+        return false;
     }
 
-    // Clean up empty mcp_servers table.
     if table
         .get("mcp_servers")
         .and_then(|v| v.as_table())
@@ -1074,7 +1096,6 @@ pub async fn delete_mcp_server_config_at(
         table.remove("mcp_servers");
     }
 
-    // Remove from disabled_mcp_servers list.
     if let Some(arr) = table
         .get_mut("disabled_mcp_servers")
         .and_then(|v| v.as_array_mut())
@@ -1085,7 +1106,6 @@ pub async fn delete_mcp_server_config_at(
         }
     }
 
-    // Remove disabled_mcp_tools entry.
     if let Some(section) = table
         .get_mut("disabled_mcp_tools")
         .and_then(|v| v.as_table_mut())
@@ -1095,24 +1115,7 @@ pub async fn delete_mcp_server_config_at(
             table.remove("disabled_mcp_tools");
         }
     }
-
-    let toml_str = toml::to_string_pretty(&root)?;
-    let tmp = path.with_extension("toml.tmp");
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    tokio::fs::write(&tmp, &toml_str).await?;
-    tokio::fs::rename(&tmp, &path).await?;
-
-    // Clean up OAuth credentials for the deleted server.
-    if let Ok(mut cred_store) = xai_grok_mcp::credentials::McpCredentialStore::load_default() {
-        let removed = cred_store.remove_by_server_name(server_name);
-        if removed > 0 {
-            let _ = cred_store.save_default();
-        }
-    }
-
-    Ok(true)
+    true
 }
 
 /// Load disabled_tools for all MCP servers from `[disabled_mcp_tools]` in config.toml.
@@ -2947,6 +2950,132 @@ enabled = false
             std::fs::read_to_string(&path).unwrap(),
             "not = [valid\n",
             "file must be left intact"
+        );
+    }
+
+    fn sample_stdio_server() -> McpServerConfig {
+        McpServerConfig {
+            transport: McpServerTransportConfig::Stdio {
+                command: "true".into(),
+                args: Vec::new(),
+                env: None,
+                cwd: None,
+            },
+            enabled: true,
+            oauth: None,
+            setup: None,
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
+            tool_timeouts: None,
+            expose_image_base64: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_mcp_config_mutations_lock_and_follow_symlink_dest() {
+        let home = tempfile::tempdir().unwrap();
+        let _pin = xai_grok_config::state_home::StateHomeGuard::pin(home.path());
+        let logical = config_path();
+        let server = "issue532_lock_mcp_svc";
+        let config = sample_stdio_server();
+
+        #[cfg(unix)]
+        let _real_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let write_target = {
+            let target = _real_dir.path().join("config.toml");
+            std::fs::write(&target, "").unwrap();
+            std::os::unix::fs::symlink(&target, &logical).unwrap();
+            target
+        };
+        #[cfg(not(unix))]
+        let write_target = logical.clone();
+
+        save_mcp_server_config_at(&logical, server, &config)
+            .await
+            .unwrap();
+        save_mcp_disabled_tools(server, &["tool_a".to_string()])
+            .await
+            .unwrap();
+
+        #[cfg(unix)]
+        {
+            assert!(
+                logical.symlink_metadata().unwrap().file_type().is_symlink(),
+                "logical config.toml must remain a symlink"
+            );
+        }
+        let body = std::fs::read_to_string(&write_target).unwrap();
+        assert!(
+            body.contains("[mcp_servers.issue532_lock_mcp_svc]")
+                || body.contains("[mcp_servers.\"issue532_lock_mcp_svc\"]"),
+            "{body}"
+        );
+        assert!(
+            body.contains("tool_a"),
+            "disabled tools must land on dest: {body}"
+        );
+
+        let existed = delete_mcp_server_config_at(&logical, server).await.unwrap();
+        assert!(existed);
+        let after = std::fs::read_to_string(&write_target).unwrap();
+        assert!(
+            !after.contains("issue532_lock_mcp_svc"),
+            "delete must drop the server on dest: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_mcp_mutations_pin_symlink_dest_before_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _real_dir = tempfile::tempdir().unwrap();
+        let target = _real_dir.path().join("config.toml");
+        std::fs::write(&target, "").unwrap();
+        let logical = tmp.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &logical).unwrap();
+        save_mcp_server_config_at(&logical, "proj_symlink_svc", &sample_stdio_server())
+            .await
+            .unwrap();
+        set_sticky_project_disabled_at(&logical, "proj_symlink_svc")
+            .await
+            .unwrap();
+        let stuck = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            stuck.contains("enabled = false"),
+            "sticky disable must write dest: {stuck}"
+        );
+        clear_sticky_project_disabled_at(&logical, "proj_symlink_svc")
+            .await
+            .unwrap();
+        assert!(
+            logical.symlink_metadata().unwrap().file_type().is_symlink(),
+            "project config.toml must remain a symlink"
+        );
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert!(body.contains("proj_symlink_svc"), "{body}");
+        assert!(body.contains("enabled = true"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn save_mcp_server_config_at_creates_missing_project_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        save_mcp_server_config_at(&path, "proj_svc", &sample_stdio_server())
+            .await
+            .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("proj_svc"), "{body}");
+        assert!(
+            delete_mcp_server_config_at(&path, "proj_svc")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !delete_mcp_server_config_at(&path, "proj_svc")
+                .await
+                .unwrap(),
+            "second delete is a no-op"
         );
     }
 

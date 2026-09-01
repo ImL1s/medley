@@ -422,30 +422,33 @@ fn unsupported_leader_flags(flags: &ConnectFlags) -> Vec<&'static str> {
 
 /// Write config.toml fields based on CLI flags.
 fn apply_config_writes(flags: &ConnectFlags) {
-    // Use toml_edit to preserve existing config structure
+    let Some(ref installer) = flags.installer else {
+        return;
+    };
     let config_path = xai_grok_shell::util::grok_home::grok_home().join("config.toml");
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    if let Some(parent) = config_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok((_lock, dest)) = crate::config_toml_edit::lock_config_destination(&config_path) else {
+        tracing::warn!("failed to lock config.toml");
+        return;
+    };
+    let content = match crate::config_toml_edit::read_config_text(&dest) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read config.toml");
+            return;
+        }
+    };
     let mut doc = content
         .parse::<toml_edit::DocumentMut>()
         .unwrap_or_default();
-
-    let mut changed = false;
-
-    if let Some(ref installer) = flags.installer {
-        let cli = doc
-            .entry("cli")
-            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-        if let Some(tbl) = cli.as_table_mut() {
-            tbl["installer"] = toml_edit::value(installer.as_str());
-            changed = true;
-        }
-    }
-
-    if changed {
-        if let Some(parent) = config_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(&config_path, doc.to_string()) {
+    let cli = doc
+        .entry("cli")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    if let Some(tbl) = cli.as_table_mut() {
+        tbl["installer"] = toml_edit::value(installer.as_str());
+        if let Err(e) = crate::config_toml_edit::write_config_toml(&dest, &doc.to_string()) {
             tracing::warn!(error = %e, "failed to write config.toml");
         }
     }

@@ -283,6 +283,10 @@ pub struct AgentsModalState {
     model_agent_type: Option<String>,
     /// Generation for stale-action admission. Bumped on rebuild/refresh.
     pub generation: u64,
+    /// Bytes+generation snapshot taken when this modal was last rendered.
+    config_snapshot: Option<crate::config_toml_edit::ConfigMutationSnapshot>,
+    /// `[agent] name` captured with [`Self::config_snapshot`].
+    config_agent_name: Option<String>,
     pub personas: Vec<PersonaDetail>,
     pub persona_selected: usize,
     pub persona_scroll: usize,
@@ -307,15 +311,19 @@ impl AgentsModalState {
     /// populating personas from `bundle`.
     pub fn new(
         cwd: &Path,
-        toggle: &HashMap<String, bool>,
+        _toggle: &HashMap<String, bool>,
         bundle: &BundleState,
         model_agent_type: Option<&str>,
         active_agent: Option<String>,
     ) -> Self {
-        let mut agents = build_agent_list(cwd, toggle);
+        // Effective toggles are loaded inside capture_locked_config_state's
+        // overlay digest window so rows and the mutation snapshot stay paired.
+        // The caller-supplied map is ignored (kept for API stability).
+        let (config_snapshot, config_agent_name, default_agent, effective_toggle) =
+            capture_locked_config_state(1, cwd, model_agent_type);
+        let mut agents = build_agent_list(cwd, &effective_toggle);
         stamp_entry_generation(&mut agents, 1);
         let personas = merge_persona_lists(bundle, cwd);
-        let default_agent = resolve_default_agent_name(cwd, model_agent_type);
         Self {
             window: ModalWindowState::with_tabs(AgentsTab::ALL.len()),
             active_tab: AgentsTab::Agents,
@@ -335,6 +343,8 @@ impl AgentsModalState {
             active_agent,
             model_agent_type: model_agent_type.map(str::to_owned),
             generation: 1,
+            config_snapshot,
+            config_agent_name,
             personas,
             persona_selected: 0,
             persona_scroll: 0,
@@ -343,9 +353,16 @@ impl AgentsModalState {
     }
     /// Rebuild agent list from disk after a mutation.
     fn rebuild_agents(&mut self) {
-        let toggle = load_agent_toggle();
         self.generation = self.generation.saturating_add(1);
-        self.agents = build_agent_list(&self.cwd, &toggle);
+        let (snapshot, agent_name, default_agent, effective_toggle) = capture_locked_config_state(
+            self.generation,
+            &self.cwd,
+            self.model_agent_type.as_deref(),
+        );
+        self.config_snapshot = snapshot;
+        self.config_agent_name = agent_name;
+        self.default_agent = default_agent;
+        self.agents = build_agent_list(&self.cwd, &effective_toggle);
         stamp_entry_generation(&mut self.agents, self.generation);
         if self.selected >= self.agents.len() {
             self.selected = self.agents.len().saturating_sub(1);
@@ -598,11 +615,37 @@ fn persona_detail_from_local_file(
     })
 }
 /// Load the `[subagents.toggle]` map from config.toml.
-pub fn load_agent_toggle() -> HashMap<String, bool> {
-    let root = match xai_grok_shell::config::load_effective_config() {
-        Ok(r) => r,
-        Err(_) => return HashMap::new(),
+pub fn load_agent_toggle() -> Result<HashMap<String, bool>, String> {
+    let root = xai_grok_shell::config::load_effective_config().map_err(|e| e.to_string())?;
+    Ok(toggle_map_from_effective_root(&root))
+}
+
+/// Effective `[subagents.toggle]` with the user layer taken from a pinned
+/// destination (the same path the mutation CAS snapshot locks).
+///
+/// `ConfigLayers::load` reads the user file through the logical
+/// `$GROK_HOME/config.toml` path. After `lock_config_destination` pins
+/// destination A, a retarget of that logical path would otherwise pair rows
+/// from B with a snapshot of A (#532 review).
+fn load_agent_toggle_with_pinned_user(dest: &Path) -> Result<HashMap<String, bool>, String> {
+    let mut layers = xai_grok_config::ConfigLayers::load().map_err(|e| e.to_string())?;
+    let text = crate::config_toml_edit::read_config_text(dest).map_err(|e| e.to_string())?;
+    let mut user = if text.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str(&text).map_err(|e| format!("parse pinned user config: {e}"))?
     };
+    let user_campaigns = xai_grok_config::campaigns::take_campaign_entries(&mut user, "user");
+    layers.user = user;
+    layers.campaigns.user = user_campaigns;
+    // Match runtime `load_effective_config`: remote cache + GROK_CAMPAIGNS_OVERRIDE
+    // must still apply on top of the pinned user layer (#532 review).
+    let root = xai_grok_shell::config::load_effective_config_from_layers(layers)
+        .map_err(|e| e.to_string())?;
+    Ok(toggle_map_from_effective_root(&root))
+}
+
+fn toggle_map_from_effective_root(root: &toml::Value) -> HashMap<String, bool> {
     let Some(subagents) = root.get("subagents") else {
         return HashMap::new();
     };
@@ -616,6 +659,13 @@ pub fn load_agent_toggle() -> HashMap<String, bool> {
         .iter()
         .filter_map(|(k, v)| v.as_bool().map(|b| (k.to_string(), b)))
         .collect()
+}
+
+fn logical_destination_still_pinned(logical: &Path, dest: &Path) -> bool {
+    matches!(
+        xai_grok_config::fs_atomic::resolve_write_path(logical),
+        Ok(current) if current == *dest
+    )
 }
 /// Sanitize a name for use as a filename: replace non-alphanumeric chars
 /// (except `-` and `_`) with `-`, require at least one alphanumeric char.
@@ -736,9 +786,6 @@ fn load_agent_selection_config() -> AgentSelectionConfig {
         .unwrap_or_default()
 }
 /// Explicit `[agent] name` in config.toml (not env/CLI overrides).
-fn load_config_agent_name() -> Option<String> {
-    load_agent_selection_config().name.filter(|s| !s.is_empty())
-}
 /// Resolve the agent name new sessions would start with — mirrors
 /// `MvpAgent::resolve_agent_definition` in xai-grok-shell.
 pub fn resolve_default_agent_name(cwd: &Path, model_agent_type: Option<&str>) -> String {
@@ -752,61 +799,177 @@ pub fn resolve_default_agent_name(cwd: &Path, model_agent_type: Option<&str>) ->
     )
     .name
 }
-fn refresh_default_agent(state: &mut AgentsModalState) {
-    let model_agent_type = state.model_agent_type.as_deref();
-    state.default_agent = resolve_default_agent_name(&state.cwd, model_agent_type);
+fn load_toggle_and_agent_name_at(
+    path: &Path,
+) -> Result<(HashMap<String, bool>, Option<String>), String> {
+    let doc = crate::config_toml_edit::read_config_document_for_edit(path)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let toggle = doc
+        .get("subagents")
+        .and_then(|v| v.get("toggle"))
+        .and_then(|v| v.as_table())
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.to_string(), b)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let agent_name = doc
+        .get("agent")
+        .and_then(|v| v.get("name"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    Ok((toggle, agent_name))
+}
+
+fn capture_locked_config_state(
+    generation: u64,
+    cwd: &Path,
+    model_agent_type: Option<&str>,
+) -> (
+    Option<crate::config_toml_edit::ConfigMutationSnapshot>,
+    Option<String>,
+    String,
+    HashMap<String, bool>,
+) {
+    let path = xai_grok_config::grok_home().join("config.toml");
+    let Ok((_lock, dest)) = crate::config_toml_edit::lock_config_destination(&path) else {
+        return (
+            None,
+            None,
+            resolve_default_agent_name(cwd, model_agent_type),
+            HashMap::new(),
+        );
+    };
+    // Hold the pinned destination lock. Overlay writers are not covered by that
+    // lock — load effective toggles (user layer from `dest`) inside the overlay
+    // digest window so rows pair with the mutation snapshot. Fail closed (no
+    // snapshot) if effective config cannot be read or the logical path no
+    // longer resolves to `dest` (#532 review).
+    const MAX_ATTEMPTS: usize = 4;
+    for _ in 0..MAX_ATTEMPTS {
+        if !logical_destination_still_pinned(&path, &dest) {
+            return (
+                None,
+                None,
+                resolve_default_agent_name(cwd, model_agent_type),
+                HashMap::new(),
+            );
+        }
+        let before_overlay = crate::config_toml_edit::overlay_digest_for(&path);
+        let effective_toggle = match load_agent_toggle_with_pinned_user(&dest) {
+            Ok(toggle) => toggle,
+            Err(_) => {
+                return (
+                    None,
+                    None,
+                    resolve_default_agent_name(cwd, model_agent_type),
+                    HashMap::new(),
+                );
+            }
+        };
+        let agent_name = match load_toggle_and_agent_name_at(&dest) {
+            Ok((_user_toggle, agent_name)) => agent_name,
+            Err(_) => {
+                return (
+                    None,
+                    None,
+                    resolve_default_agent_name(cwd, model_agent_type),
+                    HashMap::new(),
+                );
+            }
+        };
+        let Some(snapshot) =
+            crate::config_toml_edit::config_mutation_snapshot_for_dest(&path, &dest, generation)
+                .ok()
+        else {
+            continue;
+        };
+        if snapshot.overlay_digest != before_overlay {
+            continue;
+        }
+        if !logical_destination_still_pinned(&path, &dest) {
+            continue;
+        }
+        return (
+            Some(snapshot),
+            agent_name,
+            resolve_default_agent_name(cwd, model_agent_type),
+            effective_toggle,
+        );
+    }
+    (
+        None,
+        None,
+        resolve_default_agent_name(cwd, model_agent_type),
+        HashMap::new(),
+    )
 }
 /// Set or clear the default agent via `[agent] name` in config.toml.
 ///
 /// Pass `Some(name)` to set, `None` to clear (remove the key).
-pub fn set_default_agent(name: Option<&str>) -> Result<(), String> {
+pub(crate) fn set_default_agent(
+    name: Option<&str>,
+    rendered: &crate::config_toml_edit::ConfigMutationSnapshot,
+    current_generation: u64,
+) -> Result<(), String> {
     let config_path = xai_grok_config::grok_home().join("config.toml");
-    if let Some(parent) = config_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Some(mut doc) = crate::config_toml_edit::read_config_document_for_edit(&config_path) else {
-        return Err("Could not read or parse config.toml".to_string());
-    };
-    if let Some(agent_name) = name {
-        if !doc.contains_key("agent") {
-            doc["agent"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        let agent_table = doc["agent"]
-            .as_table_mut()
-            .ok_or("[agent] is not a table")?;
-        agent_table["name"] = toml_edit::value(agent_name);
-    } else if let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
-        agent_table.remove("name");
-    }
-    std::fs::write(&config_path, doc.to_string())
-        .map_err(|e| format!("Failed to write config.toml: {e}"))?;
-    Ok(())
+    crate::config_toml_edit::mutate_config_document_at(
+        &config_path,
+        rendered,
+        current_generation,
+        |doc| {
+            if let Some(agent_name) = name {
+                if !doc.contains_key("agent") {
+                    doc["agent"] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                let agent_table = doc["agent"]
+                    .as_table_mut()
+                    .ok_or("[agent] is not a table")?;
+                agent_table["name"] = toml_edit::value(agent_name);
+            } else if let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
+                agent_table.remove("name");
+            }
+            Ok(())
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 /// Toggle an agent's enabled state via `[subagents.toggle]` in config.toml.
-pub fn toggle_agent(name: &str, enabled: bool) -> Result<(), String> {
+pub(crate) fn toggle_agent(
+    name: &str,
+    enabled: bool,
+    rendered: &crate::config_toml_edit::ConfigMutationSnapshot,
+    current_generation: u64,
+) -> Result<(), String> {
     let config_path = xai_grok_config::grok_home().join("config.toml");
-    if let Some(parent) = config_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Some(mut doc) = crate::config_toml_edit::read_config_document_for_edit(&config_path) else {
-        return Err("Could not read or parse config.toml".to_string());
-    };
-    if !doc.contains_key("subagents") {
-        doc["subagents"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let subagents = doc["subagents"]
-        .as_table_mut()
-        .ok_or("subagents is not a table")?;
-    if !subagents.contains_key("toggle") {
-        subagents["toggle"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let toggle_table = subagents["toggle"]
-        .as_table_mut()
-        .ok_or("subagents.toggle is not a table")?;
-    toggle_table[name] = toml_edit::value(enabled);
-    std::fs::write(&config_path, doc.to_string())
-        .map_err(|e| format!("Failed to write config.toml: {e}"))?;
-    Ok(())
+    crate::config_toml_edit::mutate_config_document_at(
+        &config_path,
+        rendered,
+        current_generation,
+        |doc| {
+            if !doc.contains_key("subagents") {
+                doc["subagents"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let subagents = doc["subagents"]
+                .as_table_mut()
+                .ok_or("subagents is not a table")?;
+            if !subagents.contains_key("toggle") {
+                subagents["toggle"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let toggle_table = subagents["toggle"]
+                .as_table_mut()
+                .ok_or("subagents.toggle is not a table")?;
+            toggle_table[name] = toml_edit::value(enabled);
+            Ok(())
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 fn route_snapshot_for_entry(entry: &AgentListEntry) -> AgentRouteUxSnapshot {
     let floor = entry.definition.capability_mode.map(|mode| mode.as_str());
@@ -2254,15 +2417,21 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                     return AgentsModalOutcome::Changed;
                 }
                 let name = entry.name.clone();
-                let is_already_default = load_config_agent_name().as_deref() == Some(name.as_str());
+                let is_already_default = state.config_agent_name.as_deref() == Some(name.as_str());
                 let new_default = if is_already_default {
                     None
                 } else {
                     Some(name.as_str())
                 };
-                match set_default_agent(new_default) {
+                let Some(rendered) = state.config_snapshot.as_ref() else {
+                    state.message = Some(AgentsModalMessage::error(
+                        "config.toml snapshot is unavailable".to_string(),
+                    ));
+                    return AgentsModalOutcome::Changed;
+                };
+                match set_default_agent(new_default, rendered, state.generation) {
                     Ok(()) => {
-                        refresh_default_agent(state);
+                        state.rebuild_agents();
                         state.message = Some(if is_already_default {
                             AgentsModalMessage::info(format!(
                                 "Persisted: cleared default in config.toml (generation {}). New sessions use '{}'. This session is unchanged.",
@@ -2292,7 +2461,13 @@ fn handle_agents_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
                 }
                 let new_enabled = !entry.enabled;
                 let name = entry.name.clone();
-                match toggle_agent(&name, new_enabled) {
+                let Some(rendered) = state.config_snapshot.as_ref() else {
+                    state.message = Some(AgentsModalMessage::error(
+                        "config.toml snapshot is unavailable".to_string(),
+                    ));
+                    return AgentsModalOutcome::Changed;
+                };
+                match toggle_agent(&name, new_enabled, rendered, state.generation) {
                     Ok(()) => {
                         state.rebuild_agents();
                         state.message = Some(AgentsModalMessage::info(format!(
@@ -2740,6 +2915,30 @@ mod tests {
         assert!(state.agents[0].enabled);
     }
     #[test]
+    fn new_loads_toggle_under_the_same_lock_as_the_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let _pin = xai_grok_config::state_home::StateHomeGuard::pin(home.path());
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[subagents.toggle]\nexplore = false\n",
+        )
+        .unwrap();
+        let mut supplied = HashMap::new();
+        supplied.insert("explore".to_string(), true);
+        let state =
+            AgentsModalState::new(home.path(), &supplied, &BundleState::default(), None, None);
+        let explore = state
+            .agents
+            .iter()
+            .find(|entry| entry.name == "explore")
+            .expect("explore agent");
+        assert!(
+            !explore.enabled,
+            "effective toggle must be loaded under the CAS lock, not the caller map"
+        );
+        assert!(state.config_snapshot.is_some());
+    }
+    #[test]
     fn model_picker_actions_are_generation_bound_and_persistence_explicit() {
         let def = AgentDefinition::explore();
         let mut state = make_persona_state(vec![], "", 0);
@@ -3034,6 +3233,8 @@ mod tests {
                 persona_scroll: 0,
                 persona_expanded: std::collections::HashSet::new(),
                 generation: 1,
+                config_snapshot: None,
+                config_agent_name: None,
             };
             state.set_search_query(query);
             state
@@ -3076,6 +3277,8 @@ mod tests {
             persona_scroll: 0,
             persona_expanded: std::collections::HashSet::new(),
             generation: 1,
+            config_snapshot: None,
+            config_agent_name: None,
         };
         state.set_search_query(query);
         state
@@ -3154,6 +3357,8 @@ mod tests {
             persona_scroll: 0,
             persona_expanded: std::collections::HashSet::new(),
             generation: 1,
+            config_snapshot: None,
+            config_agent_name: None,
         }
     }
     fn buffer_text(buffer: &Buffer) -> String {

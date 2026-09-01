@@ -1174,6 +1174,8 @@ pub use crate::util::config::load_effective_config;
 /// Effective config with disk campaigns only — for one-shot entrypoints that
 /// never fetch remote settings (avoids resolving against a never-seeded cache).
 pub use crate::util::config::load_effective_config_disk_only;
+/// Like [`load_effective_config`], with a caller-supplied layer set (pinned user dest).
+pub use crate::util::config::load_effective_config_from_layers;
 /// Where a requirement or permission rule was loaded from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequirementSource {
@@ -1988,18 +1990,32 @@ pub(crate) fn resolve_effective_plugins_config(
     plugins_cfg
 }
 pub use xai_grok_config::{deep_merge_toml, expand_env_vars_in_string, expand_env_vars_in_toml};
-/// Add a plugin path to `[plugins].paths` in `~/.grok/config.toml`.
-///
-/// Creates the `[plugins]` section and `paths` array if they don't exist.
-/// Deduplicates: if the path is already present, this is a no-op.
-pub(crate) fn add_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = crate::util::grok_home::grok_home().join("config.toml");
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+fn mutate_config_toml_file(
+    config_path: &std::path::Path,
+    f: impl FnOnce(&mut toml::Value) -> Result<bool, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_lock, dest) = xai_grok_config::fs_atomic::lock_config_destination(config_path)?;
+    let content = match std::fs::read_to_string(&dest) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
     let mut config: toml::Value = if content.is_empty() {
         toml::Value::Table(toml::map::Map::new())
     } else {
         toml::from_str(&content).map_err(|e| format!("failed to parse config.toml: {e}"))?
     };
+    if !f(&mut config)? {
+        return Ok(());
+    }
+    crate::util::config::atomic_write_string_at(&dest, &toml::to_string_pretty(&config)?)?;
+    Ok(())
+}
+
+fn plugins_table(
+    config: &mut toml::Value,
+) -> Result<&mut toml::map::Map<String, toml::Value>, Box<dyn std::error::Error>> {
     let table = config
         .as_table_mut()
         .ok_or("config.toml root is not a table")?;
@@ -2009,49 +2025,53 @@ pub(crate) fn add_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Erro
             toml::Value::Table(toml::map::Map::new()),
         );
     }
-    let plugins = table
+    table
         .get_mut("plugins")
         .and_then(|v| v.as_table_mut())
-        .ok_or("[plugins] is not a table")?;
-    if !plugins.contains_key("paths") {
-        plugins.insert("paths".to_string(), toml::Value::Array(vec![]));
-    }
-    let paths = plugins
-        .get_mut("paths")
-        .and_then(|v| v.as_array_mut())
-        .ok_or("[plugins].paths is not an array")?;
-    let already_present = paths.iter().any(|v| v.as_str().is_some_and(|s| s == path));
-    if !already_present {
+        .ok_or_else(|| "[plugins] is not a table".into())
+}
+
+/// Add a plugin path to `[plugins].paths` in `~/.grok/config.toml`.
+///
+/// Creates the `[plugins]` section and `paths` array if they don't exist.
+/// Deduplicates: if the path is already present, this is a no-op.
+pub(crate) fn add_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = crate::util::grok_home::grok_home().join("config.toml");
+    mutate_config_toml_file(&config_path, |config| {
+        let plugins = plugins_table(config)?;
+        if !plugins.contains_key("paths") {
+            plugins.insert("paths".to_string(), toml::Value::Array(vec![]));
+        }
+        let paths = plugins
+            .get_mut("paths")
+            .and_then(|v| v.as_array_mut())
+            .ok_or("[plugins].paths is not an array")?;
+        if paths.iter().any(|v| v.as_str().is_some_and(|s| s == path)) {
+            return Ok(false);
+        }
         paths.push(toml::Value::String(path.to_string()));
-    }
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
-    Ok(())
+        Ok(true)
+    })
 }
 /// Remove a plugin path from `[plugins].paths` in `~/.grok/config.toml`.
 ///
 /// If the path is not found, this is a no-op (returns Ok).
 pub(crate) fn remove_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::util::grok_home::grok_home().join("config.toml");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut config: toml::Value =
-        toml::from_str(&content).map_err(|e| format!("failed to parse config.toml: {e}"))?;
-    if let Some(plugins) = config
-        .as_table_mut()
-        .and_then(|t| t.get_mut("plugins"))
-        .and_then(|v| v.as_table_mut())
-        && let Some(paths) = plugins.get_mut("paths").and_then(|v| v.as_array_mut())
-    {
+    mutate_config_toml_file(&config_path, |config| {
+        let Some(paths) = config
+            .as_table_mut()
+            .and_then(|t| t.get_mut("plugins"))
+            .and_then(|v| v.as_table_mut())
+            .and_then(|plugins| plugins.get_mut("paths"))
+            .and_then(|v| v.as_array_mut())
+        else {
+            return Ok(false);
+        };
+        let before = paths.len();
         paths.retain(|v| v.as_str().is_none_or(|s| s != path));
-    }
-    std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
-    Ok(())
+        Ok(paths.len() != before)
+    })
 }
 /// Add a plugin to `[plugins].disabled` in `~/.grok/config.toml`.
 ///
@@ -2059,66 +2079,44 @@ pub(crate) fn remove_plugin_path(path: &str) -> Result<(), Box<dyn std::error::E
 /// Deduplicates: if already present, this is a no-op.
 pub fn add_disabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::util::grok_home::grok_home().join("config.toml");
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let mut config: toml::Value = if content.is_empty() {
-        toml::Value::Table(toml::map::Map::new())
-    } else {
-        toml::from_str(&content).map_err(|e| format!("failed to parse config.toml: {e}"))?
-    };
-    let table = config
-        .as_table_mut()
-        .ok_or("config.toml root is not a table")?;
-    if !table.contains_key("plugins") {
-        table.insert(
-            "plugins".to_string(),
-            toml::Value::Table(toml::map::Map::new()),
-        );
-    }
-    let plugins = table
-        .get_mut("plugins")
-        .and_then(|v| v.as_table_mut())
-        .ok_or("[plugins] is not a table")?;
-    if !plugins.contains_key("disabled") {
-        plugins.insert("disabled".to_string(), toml::Value::Array(vec![]));
-    }
-    let disabled = plugins
-        .get_mut("disabled")
-        .and_then(|v| v.as_array_mut())
-        .ok_or("[plugins].disabled is not an array")?;
-    let already = disabled
-        .iter()
-        .any(|v| v.as_str().is_some_and(|s| s == plugin_id));
-    if !already {
+    mutate_config_toml_file(&config_path, |config| {
+        let plugins = plugins_table(config)?;
+        if !plugins.contains_key("disabled") {
+            plugins.insert("disabled".to_string(), toml::Value::Array(vec![]));
+        }
+        let disabled = plugins
+            .get_mut("disabled")
+            .and_then(|v| v.as_array_mut())
+            .ok_or("[plugins].disabled is not an array")?;
+        if disabled
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s == plugin_id))
+        {
+            return Ok(false);
+        }
         disabled.push(toml::Value::String(plugin_id.to_string()));
-    }
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
-    Ok(())
+        Ok(true)
+    })
 }
 /// Remove a plugin from `[plugins].disabled` in `~/.grok/config.toml`.
 ///
 /// If the plugin is not in the disabled list, this is a no-op.
 pub fn remove_disabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::util::grok_home::grok_home().join("config.toml");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut config: toml::Value =
-        toml::from_str(&content).map_err(|e| format!("failed to parse config.toml: {e}"))?;
-    if let Some(plugins) = config
-        .as_table_mut()
-        .and_then(|t| t.get_mut("plugins"))
-        .and_then(|v| v.as_table_mut())
-        && let Some(disabled) = plugins.get_mut("disabled").and_then(|v| v.as_array_mut())
-    {
+    mutate_config_toml_file(&config_path, |config| {
+        let Some(disabled) = config
+            .as_table_mut()
+            .and_then(|t| t.get_mut("plugins"))
+            .and_then(|v| v.as_table_mut())
+            .and_then(|plugins| plugins.get_mut("disabled"))
+            .and_then(|v| v.as_array_mut())
+        else {
+            return Ok(false);
+        };
+        let before = disabled.len();
         disabled.retain(|v| v.as_str().is_none_or(|s| s != plugin_id));
-    }
-    std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
-    Ok(())
+        Ok(disabled.len() != before)
+    })
 }
 /// Add a plugin to `[plugin_cta].dismissed` in `~/.grok/config.toml`.
 ///
@@ -2134,43 +2132,36 @@ pub fn add_dismissed_plugin_cta_to_file(
     plugin_id: &str,
     config_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(config_path).unwrap_or_default();
-    let mut config: toml::Value = if content.is_empty() {
-        toml::Value::Table(toml::map::Map::new())
-    } else {
-        toml::from_str(&content).map_err(|e| format!("failed to parse config.toml: {e}"))?
-    };
-    let table = config
-        .as_table_mut()
-        .ok_or("config.toml root is not a table")?;
-    if !table.contains_key("plugin_cta") {
-        table.insert(
-            "plugin_cta".to_string(),
-            toml::Value::Table(toml::map::Map::new()),
-        );
-    }
-    let plugin_cta = table
-        .get_mut("plugin_cta")
-        .and_then(|v| v.as_table_mut())
-        .ok_or("[plugin_cta] is not a table")?;
-    if !plugin_cta.contains_key("dismissed") {
-        plugin_cta.insert("dismissed".to_string(), toml::Value::Array(vec![]));
-    }
-    let dismissed = plugin_cta
-        .get_mut("dismissed")
-        .and_then(|v| v.as_array_mut())
-        .ok_or("[plugin_cta].dismissed is not an array")?;
-    let already = dismissed
-        .iter()
-        .any(|v| v.as_str().is_some_and(|s| s == plugin_id));
-    if !already {
+    mutate_config_toml_file(config_path, |config| {
+        let table = config
+            .as_table_mut()
+            .ok_or("config.toml root is not a table")?;
+        if !table.contains_key("plugin_cta") {
+            table.insert(
+                "plugin_cta".to_string(),
+                toml::Value::Table(toml::map::Map::new()),
+            );
+        }
+        let plugin_cta = table
+            .get_mut("plugin_cta")
+            .and_then(|v| v.as_table_mut())
+            .ok_or("[plugin_cta] is not a table")?;
+        if !plugin_cta.contains_key("dismissed") {
+            plugin_cta.insert("dismissed".to_string(), toml::Value::Array(vec![]));
+        }
+        let dismissed = plugin_cta
+            .get_mut("dismissed")
+            .and_then(|v| v.as_array_mut())
+            .ok_or("[plugin_cta].dismissed is not an array")?;
+        if dismissed
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s == plugin_id))
+        {
+            return Ok(false);
+        }
         dismissed.push(toml::Value::String(plugin_id.to_string()));
-    }
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(config_path, toml::to_string_pretty(&config)?)?;
-    Ok(())
+        Ok(true)
+    })
 }
 /// All plugin ids listed in `[plugin_cta].dismissed` in `~/.grok/config.toml`.
 ///
@@ -2276,64 +2267,42 @@ pub(crate) fn post_install_plugin(repo_key: &str) -> (Vec<String>, Vec<String>) 
 /// Deduplicates: if already present, this is a no-op.
 pub fn add_enabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::util::grok_home::grok_home().join("config.toml");
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let mut config: toml::Value = if content.is_empty() {
-        toml::Value::Table(toml::map::Map::new())
-    } else {
-        toml::from_str(&content).map_err(|e| format!("failed to parse config.toml: {e}"))?
-    };
-    let table = config
-        .as_table_mut()
-        .ok_or("config.toml root is not a table")?;
-    if !table.contains_key("plugins") {
-        table.insert(
-            "plugins".to_string(),
-            toml::Value::Table(toml::map::Map::new()),
-        );
-    }
-    let plugins = table
-        .get_mut("plugins")
-        .and_then(|v| v.as_table_mut())
-        .ok_or("[plugins] is not a table")?;
-    if !plugins.contains_key("enabled") {
-        plugins.insert("enabled".to_string(), toml::Value::Array(Vec::new()));
-    }
-    let enabled = plugins
-        .get_mut("enabled")
-        .and_then(|v| v.as_array_mut())
-        .ok_or("[plugins].enabled is not an array")?;
-    let already = enabled
-        .iter()
-        .any(|v| v.as_str().is_some_and(|s| s == plugin_id));
-    if !already {
+    mutate_config_toml_file(&config_path, |config| {
+        let plugins = plugins_table(config)?;
+        if !plugins.contains_key("enabled") {
+            plugins.insert("enabled".to_string(), toml::Value::Array(Vec::new()));
+        }
+        let enabled = plugins
+            .get_mut("enabled")
+            .and_then(|v| v.as_array_mut())
+            .ok_or("[plugins].enabled is not an array")?;
+        if enabled
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s == plugin_id))
+        {
+            return Ok(false);
+        }
         enabled.push(toml::Value::String(plugin_id.to_string()));
-    }
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
-    Ok(())
+        Ok(true)
+    })
 }
 /// Remove a plugin from `[plugins].enabled` in `~/.grok/config.toml`.
 pub fn remove_enabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::util::grok_home::grok_home().join("config.toml");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut config: toml::Value =
-        toml::from_str(&content).map_err(|e| format!("failed to parse config.toml: {e}"))?;
-    if let Some(plugins) = config
-        .as_table_mut()
-        .and_then(|t| t.get_mut("plugins"))
-        .and_then(|v| v.as_table_mut())
-        && let Some(enabled) = plugins.get_mut("enabled").and_then(|v| v.as_array_mut())
-    {
+    mutate_config_toml_file(&config_path, |config| {
+        let Some(enabled) = config
+            .as_table_mut()
+            .and_then(|t| t.get_mut("plugins"))
+            .and_then(|v| v.as_table_mut())
+            .and_then(|plugins| plugins.get_mut("enabled"))
+            .and_then(|v| v.as_array_mut())
+        else {
+            return Ok(false);
+        };
+        let before = enabled.len();
         enabled.retain(|v| v.as_str().is_none_or(|s| s != plugin_id));
-    }
-    std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
-    Ok(())
+        Ok(enabled.len() != before)
+    })
 }
 /// Add a hook path to `~/.grok/hooks-paths` (one path per line).
 ///

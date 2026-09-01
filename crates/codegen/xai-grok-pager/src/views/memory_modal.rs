@@ -1150,7 +1150,7 @@ fn format_modified(epoch_secs: Option<u64>, now_secs: u64) -> String {
 
 fn load_fullscreen_pref() -> bool {
     let path = xai_grok_tools::util::grok_home::grok_home().join("config.toml");
-    let Some(doc) = crate::config_toml_edit::read_config_document_for_edit(&path) else {
+    let Ok(Some(doc)) = crate::config_toml_edit::read_config_document_for_edit(&path) else {
         return false;
     };
     doc.get("hints")

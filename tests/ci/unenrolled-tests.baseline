@@ -3891,14 +3891,6 @@ xai-grok-pager-render::util::tests::system_time_from_unix_ms_zero_falls_back_to_
 xai-grok-pager-render::util::tests::truncate_to_width_keeps_marker_within_budget
 xai-grok-pager::client_identity::tests::client_user_agent_has_expected_shape
 xai-grok-pager::completions_cmd::tests::zsh_completions_drop_prompt_slot_and_dispatch_on_line_1
-xai-grok-pager::config_toml_edit::tests::merge_round_trip_preserves_sibling_tables
-xai-grok-pager::config_toml_edit::tests::missing_file_is_editable_empty_doc
-xai-grok-pager::config_toml_edit::tests::nonempty_unparseable_returns_none_and_leaves_file
-xai-grok-pager::config_toml_edit::tests::set_hint_at_creates_missing_file
-xai-grok-pager::config_toml_edit::tests::set_hint_at_leaves_unparseable_file_untouched
-xai-grok-pager::config_toml_edit::tests::set_hint_at_round_trips_and_preserves_siblings
-xai-grok-pager::config_toml_edit::tests::set_hint_write_then_read_back_round_trips
-xai-grok-pager::config_toml_edit::tests::vim_mode_round_trip
 xai-grok-pager::diagnostics::doctor_format::tests::healthy_local_output_is_stable
 xai-grok-pager::diagnostics::doctor_format::tests::keyboard_fact_formats_from_explicit_target_evidence
 xai-grok-pager::diagnostics::doctor_format::tests::legacy_fact_only_clipboard_issue_never_claims_no_issues
@@ -5308,7 +5300,6 @@ xai-grok-shell::claude_import::tests::apply_hooks_to_dir_no_hooks_returns_zero
 xai-grok-shell::claude_import::tests::apply_hooks_to_dir_removes_timeout_when_new_has_none
 xai-grok-shell::claude_import::tests::apply_hooks_to_dir_updates_timeout_on_dedup
 xai-grok-shell::claude_import::tests::apply_hooks_to_dir_writes_new_file
-xai-grok-shell::claude_import::tests::apply_items_to_config_writes_path_entries
 xai-grok-shell::claude_import::tests::as_sources_gates_project_sources_on_trust
 xai-grok-shell::claude_import::tests::discover_hook_source_paths_includes_claude_when_marker_unset
 xai-grok-shell::claude_import::tests::discover_hook_source_paths_includes_cursor_hooks_json

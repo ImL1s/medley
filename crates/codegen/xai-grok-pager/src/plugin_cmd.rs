@@ -904,19 +904,7 @@ fn marketplace_add(
         bail!("Marketplace source blocked: {}", allowlist.block_reason());
     }
 
-    let already_configured = match &input {
-        MarketplaceAddInput::GitUrl(git_url) => {
-            let normalized = git_url.trim_end_matches(".git");
-            sources.iter().any(|s| {
-                matches!(&s.kind, SourceKind::Git { url: u, .. }
-                    if u.trim_end_matches(".git") == normalized)
-            })
-        }
-        MarketplaceAddInput::LocalPath(path) => sources
-            .iter()
-            .any(|s| matches!(&s.kind, SourceKind::Local { path: p } if p == path)),
-    };
-    if already_configured {
+    if marketplace_source_already_configured(sources, &input) {
         bail!("Marketplace source already configured.");
     }
 
@@ -934,12 +922,73 @@ fn marketplace_add(
         MarketplaceAddInput::LocalPath(p) => plugin::name_from_path(p),
     };
     let config_path = xai_grok_config::grok_home().join("config.toml");
+    let (_lock, dest) = crate::config_toml_edit::lock_config_destination(&config_path)?;
 
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let content = crate::config_toml_edit::read_config_text(&dest)?;
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| anyhow::anyhow!("Failed to parse config.toml: {e}"))?;
 
+    if !append_marketplace_source(&mut doc, &name, &input)? {
+        bail!("Marketplace source already configured.");
+    }
+
+    crate::config_toml_edit::write_config_toml(&dest, &doc.to_string())?;
+
+    println!("Added marketplace source: {name}");
+    Ok(())
+}
+
+fn marketplace_source_already_configured(
+    sources: &[xai_grok_plugin_marketplace::MarketplaceSource],
+    input: &plugin::MarketplaceAddInput,
+) -> bool {
+    match input {
+        plugin::MarketplaceAddInput::GitUrl(git_url) => {
+            let normalized = git_url.trim_end_matches(".git");
+            sources.iter().any(|s| {
+                matches!(&s.kind, SourceKind::Git { url: u, .. }
+                    if u.trim_end_matches(".git") == normalized)
+            })
+        }
+        plugin::MarketplaceAddInput::LocalPath(path) => sources
+            .iter()
+            .any(|s| matches!(&s.kind, SourceKind::Local { path: p } if p == path)),
+    }
+}
+
+fn marketplace_doc_has_source(
+    sources: &toml_edit::ArrayOfTables,
+    input: &plugin::MarketplaceAddInput,
+) -> bool {
+    match input {
+        plugin::MarketplaceAddInput::GitUrl(git_url) => {
+            let normalized = git_url.trim_end_matches(".git");
+            sources.iter().any(|t| {
+                t.get("git")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|u| u.trim_end_matches(".git") == normalized)
+            })
+        }
+        plugin::MarketplaceAddInput::LocalPath(path) => {
+            let path_str = path.display().to_string();
+            sources.iter().any(|t| {
+                t.get("path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|p| p == path_str)
+            })
+        }
+    }
+}
+
+/// Append a `[[marketplace.sources]]` entry. Returns `false` when a source
+/// with the same normalized git URL or local path is already present on the
+/// locked document (the pre-lock check can race two serialized adds).
+fn append_marketplace_source(
+    doc: &mut toml_edit::DocumentMut,
+    name: &str,
+    input: &plugin::MarketplaceAddInput,
+) -> Result<bool> {
     if doc.get("marketplace").is_none() {
         doc["marketplace"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
@@ -947,27 +996,24 @@ fn marketplace_add(
         doc["marketplace"]["sources"] =
             toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
     }
-
     let sources = doc["marketplace"]["sources"]
         .as_array_of_tables_mut()
         .ok_or_else(|| anyhow::anyhow!("marketplace.sources is not an array of tables"))?;
-
+    if marketplace_doc_has_source(sources, input) {
+        return Ok(false);
+    }
     let mut entry = toml_edit::Table::new();
-    entry["name"] = toml_edit::value(&name);
-    match &input {
-        MarketplaceAddInput::GitUrl(git_url) => {
-            entry["git"] = toml_edit::value(git_url);
+    entry["name"] = toml_edit::value(name);
+    match input {
+        plugin::MarketplaceAddInput::GitUrl(git_url) => {
+            entry["git"] = toml_edit::value(git_url.as_str());
         }
-        MarketplaceAddInput::LocalPath(path) => {
+        plugin::MarketplaceAddInput::LocalPath(path) => {
             entry["path"] = toml_edit::value(path.display().to_string());
         }
     }
     sources.push(entry);
-
-    std::fs::write(&config_path, doc.to_string())?;
-
-    println!("Added marketplace source: {name}");
-    Ok(())
+    Ok(true)
 }
 
 /// Resolve `remove` input to a source: exact name match first, then the same
@@ -1048,14 +1094,20 @@ fn marketplace_remove(
 
     let config_path = xai_grok_config::grok_home().join("config.toml");
     let mut removed_from_config = false;
-    if let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Some(new) = plugin::remove_toml_marketplace_block(&content, &identity)
-    {
-        if let Err(e) = std::fs::write(&config_path, new) {
-            tracing::warn!("failed to write config.toml: {e}");
-        } else {
-            removed_from_config = true;
-        }
+    match crate::config_toml_edit::lock_config_destination(&config_path) {
+        Ok((_lock, dest)) => match crate::config_toml_edit::read_config_text(&dest) {
+            Ok(content) => {
+                if let Some(new) = plugin::remove_toml_marketplace_block(&content, &identity) {
+                    if let Err(e) = crate::config_toml_edit::write_config_toml(&dest, &new) {
+                        tracing::warn!("failed to write config.toml: {e}");
+                    } else {
+                        removed_from_config = true;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("failed to read config.toml: {e}"),
+        },
+        Err(e) => tracing::warn!("failed to lock config.toml: {e}"),
     }
 
     // Fallback: settings.json / known_marketplaces.json.
@@ -1185,6 +1237,36 @@ mod tests {
                 },
             },
         ]
+    }
+
+    #[test]
+    fn append_marketplace_source_skips_duplicate_identity() {
+        let mut doc = toml_edit::DocumentMut::new();
+        let git = plugin::MarketplaceAddInput::GitUrl(
+            "https://github.com/xai-org/plugin-marketplace.git".into(),
+        );
+        assert!(append_marketplace_source(&mut doc, "official", &git).unwrap());
+        let git_no_suffix = plugin::MarketplaceAddInput::GitUrl(
+            "https://github.com/xai-org/plugin-marketplace".into(),
+        );
+        assert!(
+            !append_marketplace_source(&mut doc, "official-dup", &git_no_suffix).unwrap(),
+            "normalized git URL must be treated as already present after lock"
+        );
+        let local = plugin::MarketplaceAddInput::LocalPath("/tmp/my-marketplace".into());
+        assert!(append_marketplace_source(&mut doc, "local", &local).unwrap());
+        assert!(!append_marketplace_source(&mut doc, "local-dup", &local).unwrap());
+        let rendered = doc.to_string();
+        assert_eq!(
+            rendered.matches("plugin-marketplace").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("/tmp/my-marketplace").count(),
+            1,
+            "{rendered}"
+        );
     }
 
     #[test]

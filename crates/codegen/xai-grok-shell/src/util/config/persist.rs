@@ -9,17 +9,23 @@ use xai_grok_agent::prompt::skills::SkillsConfig;
 /// Serializes the read-modify-write in `save_config` so two rapid
 /// settings toggles can't interleave and clobber each other.
 static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// In-process mutex plus the shared sibling `config.toml.lock` (pager + shell).
+pub(crate) struct ConfigWriteGuard {
+    _in_process: tokio::sync::MutexGuard<'static, ()>,
+    _os: std::fs::File,
+    pub dest: std::path::PathBuf,
+}
 /// [`save_config`] body; caller must hold [`SAVE_LOCK`].
-async fn save_config_locked(config: &Config) -> Result<()> {
-    let path = user_config_path();
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
+async fn save_config_locked(config: &Config, dest: &std::path::Path) -> Result<()> {
+    let mut root: TomlValue = match tokio::fs::read_to_string(&dest).await {
         Ok(s) => match toml::from_str::<TomlValue>(&s) {
             Ok(v) => v,
             Err(parse_err) => {
                 return Err(anyhow::anyhow!(
                     "refusing to overwrite unparseable {}: {}; save a backup \
                          and fix the syntax error before retrying",
-                    path.display(),
+                    dest.display(),
                     parse_err,
                 ));
             }
@@ -47,42 +53,28 @@ async fn save_config_locked(config: &Config) -> Result<()> {
         merge_section(table, "skills", &config.skills);
     }
     let toml_str = toml::to_string_pretty(&root)?;
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    #[cfg(unix)]
-    let prior_mode: Option<u32> = match tokio::fs::metadata(&path).await {
-        Ok(m) => {
-            use std::os::unix::fs::PermissionsExt;
-            Some(m.permissions().mode())
-        }
-        Err(_) => None,
-    };
-    #[cfg(not(unix))]
-    let prior_mode: Option<u32> = None;
-    let suffix = {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("toml.tmp.{}.{}", std::process::id(), nanos)
-    };
-    let tmp = path.with_extension(suffix);
-    tokio::fs::write(&tmp, toml_str).await?;
-    #[cfg(unix)]
-    if let Some(mode) = prior_mode {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await;
-    }
-    let _ = prior_mode;
-    tokio::fs::rename(&tmp, &path).await?;
+    xai_grok_config::fs_atomic::write_atomically_at(dest, &toml_str, destination_unix_mode(dest))?;
     Ok(())
 }
 /// Acquire the `config.toml` write lock used by [`save_config`], so callers that
 /// mutate the file directly (marketplace add/remove) can't interleave with a
 /// settings save and clobber it.
-pub(crate) async fn lock_config_writes() -> tokio::sync::MutexGuard<'static, ()> {
-    SAVE_LOCK.lock().await
+pub(crate) async fn lock_config_writes() -> std::io::Result<ConfigWriteGuard> {
+    let in_process = SAVE_LOCK.lock().await;
+    let path = user_config_path();
+    let (os, dest) = tokio::task::spawn_blocking(move || {
+        xai_grok_config::fs_atomic::lock_config_destination(&path)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    Ok(ConfigWriteGuard {
+        _in_process: in_process,
+        _os: os,
+        dest,
+    })
 }
 /// Read a file, treating only `NotFound` as empty. Hard read errors (EACCES,
 /// EIO) propagate so callers don't clobber an unreadable file on the next write.
@@ -93,42 +85,36 @@ pub(crate) fn read_to_string_or_empty(path: &std::path::Path) -> std::io::Result
         Err(e) => Err(e),
     }
 }
+fn destination_unix_mode(path: &std::path::Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Atomic write via temp file + `rename` (mirrors [`save_config`]) so a crash
-/// mid-write can't truncate `config.toml`. Preserves the dest mode on unix.
+/// mid-write can't truncate `config.toml`. On Unix the temp file is created
+/// with the destination mode so credentials are never briefly world-readable.
 pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let dest = xai_grok_config::fs_atomic::resolve_write_path(path)?;
+    atomic_write_string_at(&dest, content)
+}
+
+/// Like [`atomic_write_string`], but writes `path` verbatim (no canonicalize).
+/// Callers that already pinned a destination must use this.
+pub(crate) fn atomic_write_string_at(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    #[cfg(unix)]
-    let prior_mode: Option<u32> = match std::fs::metadata(path) {
-        Ok(m) => {
-            use std::os::unix::fs::PermissionsExt;
-            Some(m.permissions().mode())
-        }
-        Err(_) => None,
-    };
-    #[cfg(not(unix))]
-    let prior_mode: Option<u32> = None;
-    let suffix = {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("toml.tmp.{}.{}", std::process::id(), nanos)
-    };
-    let tmp = path.with_extension(suffix);
-    std::fs::write(&tmp, content)?;
-    #[cfg(unix)]
-    if let Some(mode) = prior_mode {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-    }
-    let _ = prior_mode;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    xai_grok_config::fs_atomic::write_atomically_at(path, content, destination_unix_mode(path))
 }
 /// Merge `[toolset.ask_user_question]` into the root table. `[toolset]` is
 /// deliberately NOT merged wholesale — it carries runtime-only structs
@@ -212,12 +198,14 @@ pub async fn update_config<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Config),
 {
-    let _guard = SAVE_LOCK.lock().await;
-    let root: TomlValue =
-        crate::config::load_from_disk().unwrap_or_else(|_| TomlValue::Table(TomlMap::new()));
+    let guard = lock_config_writes().await?;
+    let root: TomlValue = match std::fs::read_to_string(&guard.dest) {
+        Ok(s) => toml::from_str(&s).unwrap_or_else(|_| TomlValue::Table(TomlMap::new())),
+        Err(_) => TomlValue::Table(TomlMap::new()),
+    };
     let mut cfg = load_config_from_toml(&root);
     f(&mut cfg);
-    save_config_locked(&cfg).await
+    save_config_locked(&cfg, &guard.dest).await
 }
 #[cfg(test)]
 mod tests {
@@ -447,6 +435,44 @@ mod tests {
         merge_section(&mut table, "ui", &cfg);
         let ui = table.get("ui").unwrap().as_table().unwrap();
         assert_eq!(ui.get("yolo").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_string_creates_temp_with_destination_mode() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, "old = true\n").unwrap();
+        atomic_write_string(&path, "new = true\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "destination mode must survive the replace");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new = true\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_string_at_keeps_pinned_destination_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("config.toml");
+        let other = dir.path().join("other.toml");
+        std::fs::write(&dest, "orig\n").unwrap();
+        std::fs::write(&other, "other\n").unwrap();
+        std::fs::remove_file(&dest).unwrap();
+        std::os::unix::fs::symlink(&other, &dest).unwrap();
+        atomic_write_string_at(&dest, "pinned = true\n").unwrap();
+        assert!(
+            !dest.symlink_metadata().unwrap().file_type().is_symlink(),
+            "verbatim write must not follow a dest replaced with a symlink"
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "pinned = true\n");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "other\n");
     }
     /// Regression test: pager-side commits of a
     /// [session] field (e.g., `auto_compact_threshold_percent`) must

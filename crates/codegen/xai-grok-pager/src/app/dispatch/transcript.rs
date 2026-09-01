@@ -524,7 +524,7 @@ pub(super) fn dispatch_open_config_agents_modal(
     app: &mut AppView,
     initial_tab: Option<crate::views::agents_modal::AgentsTab>,
 ) -> Vec<Effect> {
-    use crate::views::agents_modal::{AgentsModalState, load_agent_toggle};
+    use crate::views::agents_modal::AgentsModalState;
 
     let ActiveView::Agent(id) = app.active_view else {
         toast_session_only_slash(app, config_agents_slash_name(initial_tab));
@@ -539,7 +539,8 @@ pub(super) fn dispatch_open_config_agents_modal(
     agent.extensions_modal = None;
 
     let cwd = agent.session.cwd.clone();
-    let toggle = load_agent_toggle();
+    // Effective toggles are captured inside AgentsModalState::new together with
+    // the mutation snapshot; do not substitute an empty map on load failure.
     let model_agent_type = agent
         .session
         .models
@@ -551,7 +552,7 @@ pub(super) fn dispatch_open_config_agents_modal(
     let active_agent = agent.session_agent_name.clone();
     let mut modal = AgentsModalState::new(
         &cwd,
-        &toggle,
+        &std::collections::HashMap::new(),
         &bundle,
         model_agent_type.as_deref(),
         active_agent,

@@ -911,14 +911,24 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
     };
 
     // Run the write under SAVE_LOCK + flock, off the reactor.
-    let config_path = xai_grok_config::grok_home().join("config.toml");
     let grok_home = xai_grok_config::grok_home();
-    let _save_guard = crate::util::config::lock_config_writes().await;
+    let save_guard = match crate::util::config::lock_config_writes().await {
+        Ok(guard) => guard,
+        Err(e) => {
+            return ActionOutcome {
+                status: OutcomeStatus::InternalError,
+                message: format!("Failed to lock config: {e}"),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
+    let dest = save_guard.dest.clone();
     let write = {
         let name = name.clone();
         tokio::task::spawn_blocking(move || {
             let _flock = acquire_init_lock(&grok_home).ok();
-            add_marketplace_source(&config_path, &name, &input, is_official)
+            add_marketplace_source(&dest, &name, &input, is_official)
         })
         .await
     };
@@ -1030,7 +1040,7 @@ fn add_marketplace_source(
         marketplace["official_marketplace_auto_installed"] = toml_edit::value(true);
     }
 
-    crate::util::config::atomic_write_string(config_path, &doc.to_string())
+    crate::util::config::atomic_write_string_at(config_path, &doc.to_string())
 }
 
 /// Remove a marketplace source from `~/.grok/config.toml` and uninstall all
@@ -1038,8 +1048,19 @@ fn add_marketplace_source(
 async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_types::ActionOutcome {
     let src = source_url_or_path.to_string();
     // Lock + run the blocking FS work off the reactor.
-    let _save_guard = crate::util::config::lock_config_writes().await;
-    match tokio::task::spawn_blocking(move || remove_source_locked(&src)).await {
+    let save_guard = match crate::util::config::lock_config_writes().await {
+        Ok(guard) => guard,
+        Err(e) => {
+            return xai_hooks_plugins_types::ActionOutcome {
+                status: xai_hooks_plugins_types::OutcomeStatus::InternalError,
+                message: format!("Failed to lock config: {e}"),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
+    let dest = save_guard.dest.clone();
+    match tokio::task::spawn_blocking(move || remove_source_locked(&src, &dest)).await {
         Ok(outcome) => outcome,
         Err(e) => xai_hooks_plugins_types::ActionOutcome {
             status: xai_hooks_plugins_types::OutcomeStatus::InternalError,
@@ -1053,7 +1074,10 @@ async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_typ
 /// Sync body of [`handle_remove_source`], run on a blocking thread under the
 /// flock for the whole read-modify-write so a concurrent auto-register can't
 /// re-add the source mid-removal.
-fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::ActionOutcome {
+fn remove_source_locked(
+    source_url_or_path: &str,
+    config_path: &std::path::Path,
+) -> xai_hooks_plugins_types::ActionOutcome {
     use crate::plugin;
     use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus};
 
@@ -1064,10 +1088,9 @@ fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::Ac
 
     // Remove the source and (if official) set the flag in ONE atomic write so a
     // crash can't drop the flag and re-add the source next startup.
-    let config_path = grok_home.join("config.toml");
     let is_official = xai_grok_plugin_marketplace::is_official_source_url(source_url_or_path);
     let mut removed_from_config = false;
-    let content = match crate::util::config::read_to_string_or_empty(&config_path) {
+    let content = match crate::util::config::read_to_string_or_empty(config_path) {
         Ok(c) => c,
         Err(e) => {
             return ActionOutcome {
@@ -1094,7 +1117,7 @@ fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::Ac
         } else {
             removed
         };
-        if let Err(e) = crate::util::config::atomic_write_string(&config_path, &final_content) {
+        if let Err(e) = crate::util::config::atomic_write_string_at(config_path, &final_content) {
             return ActionOutcome {
                 status: OutcomeStatus::InternalError,
                 message: format!("Failed to write config: {e}"),
@@ -1118,7 +1141,7 @@ fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::Ac
     // already set it atomically above).
     if is_official
         && !removed_from_config
-        && let Err(e) = set_official_marketplace_auto_installed(&config_path)
+        && let Err(e) = set_official_marketplace_auto_installed(config_path)
     {
         tracing::warn!(
             error = %e,
@@ -1173,7 +1196,7 @@ fn set_marketplace_bool_flag(config_path: &std::path::Path, key: &str) -> std::i
     }
     let existing = crate::util::config::read_to_string_or_empty(config_path)?;
     let updated = set_marketplace_bool_flag_in_toml(&existing, key)?;
-    crate::util::config::atomic_write_string(config_path, &updated)
+    crate::util::config::atomic_write_string_at(config_path, &updated)
 }
 
 fn read_marketplace_bool_flag(config_path: &std::path::Path, key: &str) -> bool {
@@ -1289,6 +1312,19 @@ fn purge_default_skills_installs_impl(
         return;
     }
 
+    // Same lock order as `handle_add_source` / official auto-register:
+    // config.toml.lock then init lock, then the marker write.
+    let (_cfg, dest) = match xai_grok_config::fs_atomic::lock_config_destination(&config_path) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %config_path.display(),
+                "skipping default-skills purge: failed to lock config.toml"
+            );
+            return;
+        }
+    };
     let _lock = match acquire_init_lock(grok_home) {
         Ok(f) => f,
         Err(e) => {
@@ -1301,7 +1337,7 @@ fn purge_default_skills_installs_impl(
         }
     };
 
-    if read_default_skills_installs_purged(&config_path) {
+    if read_default_skills_installs_purged(&dest) {
         return;
     }
 
@@ -1352,7 +1388,7 @@ fn purge_default_skills_installs_impl(
         );
     }
 
-    if let Err(e) = set_default_skills_installs_purged(&config_path) {
+    if let Err(e) = set_default_skills_installs_purged(&dest) {
         tracing::warn!(
             error = %e,
             path = %config_path.display(),
@@ -1375,6 +1411,18 @@ pub(crate) fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
         return;
     }
 
+    // Same lock order as `handle_add_source`: pinned dest lock then init lock.
+    let (_cfg, dest) = match xai_grok_config::fs_atomic::lock_config_destination(&config_path) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %config_path.display(),
+                "skipping official marketplace auto-register: failed to lock config.toml"
+            );
+            return;
+        }
+    };
     let _lock = match acquire_init_lock(grok_home) {
         Ok(f) => f,
         Err(e) => {
@@ -1388,11 +1436,11 @@ pub(crate) fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
     };
 
     // Re-check under the lock: another process may have registered meanwhile.
-    if read_official_marketplace_auto_installed(&config_path) {
+    if read_official_marketplace_auto_installed(&dest) {
         return;
     }
 
-    let raw = match crate::util::config::read_to_string_or_empty(&config_path) {
+    let raw = match crate::util::config::read_to_string_or_empty(&dest) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "skipping official marketplace auto-register: cannot read config.toml");
@@ -1423,10 +1471,10 @@ pub(crate) fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
 
     let write_result = if already_present {
         // Already present: just set the flag.
-        set_official_marketplace_auto_installed(&config_path)
+        set_official_marketplace_auto_installed(&dest)
     } else {
         add_marketplace_source(
-            &config_path,
+            &dest,
             xai_grok_plugin_marketplace::OFFICIAL_SOURCE_NAME,
             &crate::plugin::MarketplaceAddInput::GitUrl(
                 xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL.to_string(),
@@ -1844,6 +1892,7 @@ mod default_skills_purge_tests {
         });
         let config_path = home.join("config.toml");
         assert!(read_default_skills_installs_purged(&config_path));
+        assert!(xai_grok_config::fs_atomic::config_lock_path(&config_path).is_file());
 
         let after_first = std::fs::read_to_string(&config_path).unwrap();
         purge_default_skills_installs_impl(home, || Ok(InstallRegistry::empty(install_dir)));

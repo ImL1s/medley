@@ -613,17 +613,18 @@ pub(crate) fn is_claude_import_marked_at(config_path: &Path) -> bool {
 /// `.tmp`, then rename). Creates the file and parent directory if missing.
 /// Existing content in the file is preserved.
 fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
+    let (_lock, dest) = xai_grok_config::fs_atomic::lock_config_destination(config_path)?;
     // Surface parse errors instead of silently discarding the file: an atomic
     // rewrite would otherwise drop unrelated sections ([model], [ui], etc.)
     // and overwrite a hand-edited config that just happens to have a trailing
     // comma. The user can fix the TOML and retry.
-    let mut root: TomlValue = match std::fs::read_to_string(config_path) {
+    let mut root: TomlValue = match std::fs::read_to_string(&dest) {
         Ok(s) => toml::from_str(&s).map_err(|e| {
             anyhow::anyhow!(
                 "refusing to write import marker: existing config at {} is \
                  not valid TOML ({}). Fix the file (or move it aside) and \
                  retry.",
-                config_path.display(),
+                dest.display(),
                 e
             )
         })?,
@@ -642,10 +643,10 @@ fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
     compat_table.insert("imported".to_string(), TomlValue::Boolean(true));
 
     let toml_str = toml::to_string_pretty(&root)?;
-    if let Some(parent) = config_path.parent() {
+    if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = config_path.with_extension("toml.tmp");
+    let tmp = dest.with_extension("toml.tmp");
     // Best-effort cleanup of the .tmp file if either write or rename fails so
     // a failed marker write doesn't leave a stale artefact next to the real
     // config (otherwise the next attempt would inherit a half-written file
@@ -654,7 +655,7 @@ fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
-    if let Err(e) = std::fs::rename(&tmp, config_path) {
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
@@ -766,11 +767,13 @@ impl ImportResult {
 
 /// Apply items to a single config.toml file using atomic write.
 fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow::Result<usize> {
+    let (lock, dest) = xai_grok_config::fs_atomic::lock_config_destination(config_path)?;
+    let _lock = lock;
     // Read existing TOML. Surface parse errors instead of silently
     // discarding the file: an atomic rewrite would otherwise drop
     // unrelated sections ([model], [ui], etc.) and overwrite a hand-edited
     // config that just happens to have a trailing comma.
-    let mut root: TomlValue = match std::fs::read_to_string(config_path) {
+    let mut root: TomlValue = match std::fs::read_to_string(&dest) {
         Ok(s) => toml::from_str(&s).map_err(|e| {
             anyhow::anyhow!(
                 "refusing to import: existing config at {} is not valid TOML \
@@ -831,14 +834,8 @@ fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow
     }
 
     if count > 0 {
-        // Atomic write: write to .tmp, then rename.
         let toml_str = toml::to_string_pretty(&root)?;
-        let tmp = config_path.with_extension("toml.tmp");
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&tmp, &toml_str)?;
-        std::fs::rename(&tmp, config_path)?;
+        crate::util::config::atomic_write_string_at(&dest, &toml_str)?;
         info!(
             path = %config_path.display(),
             count,

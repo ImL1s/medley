@@ -50,6 +50,21 @@ fn cached_remote_campaigns() -> Vec<CampaignEntry> {
         .unwrap_or_default()
 }
 
+/// Stable bytes covering the process-global remote campaign cache so CAS
+/// snapshots can reject Actions after the cache is seeded or cleared.
+pub fn remote_campaign_cache_fingerprint() -> Vec<u8> {
+    let entries = cached_remote_campaigns();
+    let mut out = Vec::new();
+    for entry in entries {
+        let patch = toml::to_string(&toml::Value::Table(entry.patch)).unwrap_or_default();
+        out.extend_from_slice(&(entry.id.len() as u64).to_le_bytes());
+        out.extend_from_slice(entry.id.as_bytes());
+        out.extend_from_slice(&(patch.len() as u64).to_le_bytes());
+        out.extend_from_slice(patch.as_bytes());
+    }
+    out
+}
+
 /// Fail-open dismissed campaign ids from `campaigns_state.json`.
 pub(crate) fn load_dismissed_ids() -> HashSet<String> {
     load_dismissed_ids_from_home()
@@ -219,7 +234,12 @@ fn resolve_dismissable_campaigns() -> Vec<CampaignEntry> {
 /// Effective config with remote/override-aware campaign overlay
 /// (base → resolve [override/kill/merge/dismiss] → apply), one `ConfigLayers::load`.
 pub fn load_effective_config() -> std::io::Result<toml::Value> {
-    let layers = ConfigLayers::load()?;
+    load_effective_config_from_layers(ConfigLayers::load()?)
+}
+
+/// Like [`load_effective_config`], but with a caller-supplied layer set (e.g. a
+/// pinned user `config.toml` destination for Agents modal CAS (#532 review)).
+pub fn load_effective_config_from_layers(layers: ConfigLayers) -> std::io::Result<toml::Value> {
     let dismissed = load_dismissed_ids();
     let remote = cached_remote_campaigns();
     let mut effective = layers.effective_config_base();
