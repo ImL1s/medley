@@ -118,6 +118,9 @@ jobs:
         # as part of CI itself. CI only executes its Python unit tests.
         run: python3 -B -m unittest tests.test_pr_head_ci_run_guard -v
 
+      - name: Test the negated closing-keyword guard
+        run: python3 -B -m unittest tests.test_negated_closing_keywords_guard -v
+
       - name: Guard distChannel docs against the release stamp
         run: python3 -B -m unittest tests.test_dist_channel_docs_guard -v
 

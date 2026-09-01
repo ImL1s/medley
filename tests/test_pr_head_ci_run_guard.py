@@ -103,6 +103,9 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
                 return completed(command, stdout=f"{pr_head_sha}\trefs/heads/{branch}\n")
             if command[:3] == ["gh", "run", "list"]:
                 self.assertEqual(command[command.index("--event") + 1], "pull_request")
+                self.assertIn("--branch", command)
+                self.assertEqual(command[command.index("--branch") + 1], branch)
+                self.assertNotIn("--commit", command)
                 return completed(
                     command,
                     stdout=json.dumps(
@@ -119,7 +122,13 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
                     ),
                 )
             if command[:2] == ["gh", "api"]:
-                self.assertEqual(command[2], "repos/ImL1s/medley/actions/runs/31182413606")
+                endpoint = command[2]
+                self.assertNotIn(
+                    "/commits/",
+                    endpoint,
+                    f"exact PR-head match must not fetch merge parents: {command}",
+                )
+                self.assertEqual(endpoint, "repos/ImL1s/medley/actions/runs/31182413606")
                 return completed(
                     command,
                     stdout=json.dumps(
@@ -149,11 +158,14 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
         self.assertEqual(rc, 0, out.getvalue())
         run_list = next(cmd for cmd in commands if cmd[:3] == ["gh", "run", "list"])
         self.assertEqual(run_list[run_list.index("--event") + 1], "pull_request")
+        self.assertIn("--branch", run_list)
+        self.assertNotIn("--commit", run_list)
 
     def test_feature_branch_uses_pull_request_probe_and_passes_for_pr_head(self) -> None:
         branch = "fix/54-switch-transaction-boundaries"
         pr_head_sha = "960d816ecb19a52bdea9288b7bf66c6095276036"
         merge_sha = "e9eca323281b192e3a14f670c490ec9fb8d64a8f"
+        base_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         commands: list[list[str]] = []
 
         def fake_run(command, **kwargs):
@@ -170,9 +182,23 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
                     ),
                 )
             if command[:2] == ["git", "ls-remote"]:
+                ref = command[3] if len(command) > 3 else ""
+                if ref == "refs/pull/202/merge":
+                    return completed(
+                        command, stdout=f"{merge_sha}\trefs/pull/202/merge\n"
+                    )
                 return completed(command, stdout=f"{pr_head_sha}\trefs/heads/{branch}\n")
             if command[:3] == ["gh", "run", "list"]:
                 self.assertEqual(command[command.index("--event") + 1], "pull_request")
+                # `--commit $PR_HEAD` does not return the merge-commit run.
+                # A fake that ignored that filter used to mask the production miss.
+                if "--commit" in command:
+                    self.assertEqual(
+                        command[command.index("--commit") + 1], pr_head_sha
+                    )
+                    return completed(command, stdout=json.dumps([]))
+                self.assertIn("--branch", command)
+                self.assertEqual(command[command.index("--branch") + 1], branch)
                 return completed(
                     command,
                     stdout=json.dumps(
@@ -189,7 +215,29 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
                     ),
                 )
             if command[:2] == ["gh", "api"]:
-                self.assertEqual(command[2], "repos/ImL1s/medley/actions/runs/31178074734")
+                endpoint = command[2]
+                if endpoint == f"repos/ImL1s/medley/commits/{merge_sha}":
+                    return completed(
+                        command,
+                        stdout=json.dumps(
+                            {
+                                "sha": merge_sha,
+                                "parents": [
+                                    {"sha": base_sha},
+                                    {"sha": pr_head_sha},
+                                ],
+                                "commit": {
+                                    "committer": {
+                                        "name": "GitHub",
+                                        "email": "noreply@github.com",
+                                    },
+                                    "verification": {"verified": True},
+                                    "message": f"Merge {pr_head_sha} into {base_sha}",
+                                },
+                            }
+                        ),
+                    )
+                self.assertEqual(endpoint, "repos/ImL1s/medley/actions/runs/31178074734")
                 return completed(
                     command,
                     stdout=json.dumps(
@@ -227,11 +275,20 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
         run_list = next(cmd for cmd in commands if cmd[:3] == ["gh", "run", "list"])
         self.assertIn("--workflow", run_list)
         self.assertEqual(run_list[run_list.index("--workflow") + 1], "ci.yml")
+        self.assertNotIn("--commit", run_list)
         self.assertIn("--branch", run_list)
         self.assertEqual(run_list[run_list.index("--branch") + 1], branch)
         self.assertIn("--event", run_list)
         self.assertEqual(run_list[run_list.index("--event") + 1], "pull_request")
         self.assertFalse(any(cmd[:3] == ["gh", "pr", "checks"] for cmd in commands))
+        self.assertTrue(
+            any(
+                cmd[:2] == ["gh", "api"]
+                and cmd[2] == f"repos/ImL1s/medley/commits/{merge_sha}"
+                for cmd in commands
+            ),
+            commands,
+        )
 
     def test_providers_branch_uses_push_probe_and_passes_for_verified_head(self) -> None:
         branch = "providers"
@@ -311,43 +368,11 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
                 raise AssertionError("explicit head-sha mode must not call ls-remote")
             if command[:3] == ["gh", "run", "list"]:
                 self.assertEqual(command[command.index("--event") + 1], "pull_request")
-                return completed(
-                    command,
-                    stdout=json.dumps(
-                        [
-                            {
-                                "databaseId": 31178074734,
-                                "headSha": "e9eca323281b192e3a14f670c490ec9fb8d64a8f",
-                                "status": "completed",
-                                "conclusion": "success",
-                                "url": "https://github.com/ImL1s/medley/actions/runs/31178074734",
-                                "displayTitle": "CI",
-                            }
-                        ]
-                    ),
-                )
+                self.assertIn("--branch", command)
+                self.assertNotIn("--commit", command)
+                return completed(command, stdout=json.dumps([]))
             if command[:2] == ["gh", "api"]:
-                return completed(
-                    command,
-                    stdout=json.dumps(
-                        {
-                            "head_sha": "e9eca323281b192e3a14f670c490ec9fb8d64a8f",
-                            "event": "pull_request",
-                            "head_branch": branch,
-                            "path": ".github/workflows/ci.yml",
-                            "status": "completed",
-                            "conclusion": "success",
-                            "pull_requests": [
-                                {
-                                    "head": {
-                                        "ref": branch,
-                                        "sha": "960d816ecb19a52bdea9288b7bf66c6095276036",
-                                    }
-                                }
-                            ],
-                        }
-                    ),
-                )
+                raise AssertionError("absent commit list must not fetch run detail")
             raise AssertionError(f"unexpected command: {command}")
 
         with mock.patch.object(guard.subprocess, "run", side_effect=fake_run):
@@ -366,7 +391,111 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
             out.getvalue(),
         )
         self.assertIn("verdict: absent", out.getvalue())
-        self.assertNotIn("`gh run list` returned 0 rows", out.getvalue())
+
+    def test_rewritten_pr_head_on_old_run_is_not_a_receipt(self) -> None:
+        """GitHub rewrites pull_requests[].head.sha to the live tip.
+
+        An older successful run must not verify a later head (#530).
+        """
+
+        branch = "fix/513-negated-close-guard"
+        current = "ff40de1f6a6c56a4884f609a98a206264924103b"
+        old = "fb4ffbacb3bce9be58980b81366428c2b632857f"
+        old_merge = "cccccccccccccccccccccccccccccccccccccccc"
+        current_merge = "dddddddddddddddddddddddddddddddddddddddd"
+        base_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+        def fake_run(command, **kwargs):
+            if command[:3] == ["gh", "run", "list"]:
+                self.assertIn("--branch", command)
+                self.assertEqual(command[command.index("--branch") + 1], branch)
+                self.assertNotIn("--commit", command)
+                return completed(
+                    command,
+                    stdout=json.dumps(
+                        [
+                            {
+                                "databaseId": 33365597354,
+                                "headSha": old_merge,
+                                "status": "completed",
+                                "conclusion": "success",
+                                "url": "https://github.com/ImL1s/medley/actions/runs/33365597354",
+                                "displayTitle": "CI",
+                                "event": "pull_request",
+                            },
+                            {
+                                "databaseId": 33383438551,
+                                "headSha": current_merge,
+                                "status": "in_progress",
+                                "conclusion": "",
+                                "url": "https://github.com/ImL1s/medley/actions/runs/33383438551",
+                                "displayTitle": "CI",
+                                "event": "pull_request",
+                            },
+                        ]
+                    ),
+                )
+            if command[:2] == ["gh", "api"]:
+                endpoint = command[2]
+                if endpoint == f"repos/ImL1s/medley/commits/{old_merge}":
+                    return completed(
+                        command,
+                        stdout=json.dumps(
+                            {
+                                "sha": old_merge,
+                                "parents": [
+                                    {"sha": base_sha},
+                                    {"sha": old},
+                                ],
+                                "commit": {
+                                    "committer": {
+                                        "name": "GitHub",
+                                        "email": "noreply@github.com",
+                                    },
+                                    "verification": {"verified": True},
+                                    "message": f"Merge {old} into {base_sha}",
+                                },
+                            }
+                        ),
+                    )
+                if endpoint == f"repos/ImL1s/medley/commits/{current_merge}":
+                    return completed(
+                        command,
+                        stdout=json.dumps(
+                            {
+                                "sha": current_merge,
+                                "parents": [
+                                    {"sha": base_sha},
+                                    {"sha": current},
+                                ],
+                                "commit": {
+                                    "committer": {
+                                        "name": "GitHub",
+                                        "email": "noreply@github.com",
+                                    },
+                                    "verification": {"verified": True},
+                                    "message": f"Merge {current} into {base_sha}",
+                                },
+                            }
+                        ),
+                    )
+                raise AssertionError(
+                    "in-progress current-head list must not treat rewritten "
+                    f"pull_requests[].head.sha on old run as a receipt: {command}"
+                )
+            raise AssertionError(f"unexpected command: {command}")
+
+        with mock.patch.object(guard.subprocess, "run", side_effect=fake_run):
+            out = io.StringIO()
+            rc = guard.check_branch_head_ci(
+                repo="ImL1s/medley",
+                branch=branch,
+                head_sha=current,
+                limit=20,
+                stream=out,
+            )
+        self.assertEqual(rc, 1, out.getvalue())
+        self.assertIn("verdict: in_progress", out.getvalue())
 
     def test_classify_zero_runs_is_absent_not_skipped(self) -> None:
         self.assertEqual(
@@ -389,6 +518,116 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
             guard.VERDICT_SKIPPED,
         )
         self.assertNotEqual(guard.VERDICT_ABSENT, guard.VERDICT_SKIPPED)
+
+    def test_one_parent_successor_is_not_a_ci_receipt(self) -> None:
+        """A green child of tip H must not satisfy a later force-push of H
+        (#530 review). Only Actions synthetic merges inherit via parent
+        association."""
+
+        tip = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        child = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        merge = "cccccccccccccccccccccccccccccccccccccccc"
+        ordinary = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        forged = "ffffffffffffffffffffffffffffffffffffffff"
+        base = "dddddddddddddddddddddddddddddddddddddddd"
+        cache: dict[str, set[str]] = {
+            child: {tip},
+            merge: {base, tip},
+            ordinary: {base, tip},
+            forged: {base, tip},
+        }
+        messages = {
+            child: "fix something",
+            merge: f"Merge {tip} into {base}",
+            ordinary: "Merge branch 'feature' into providers",
+            forged: f"Merge {tip} into {base}",
+        }
+        proofs = {
+            child: False,
+            merge: True,
+            ordinary: False,
+            forged: False,
+        }
+        self.assertFalse(
+            guard.run_head_matches_requested(
+                repo="ImL1s/medley",
+                recorded_sha=child,
+                requested_sha=tip,
+                parent_cache=cache,
+                message_cache=messages,
+                github_proof_cache=proofs,
+            )
+        )
+        self.assertFalse(
+            guard.run_head_matches_requested(
+                repo="ImL1s/medley",
+                recorded_sha=ordinary,
+                requested_sha=tip,
+                parent_cache=cache,
+                message_cache=messages,
+                github_proof_cache=proofs,
+            )
+        )
+        # Matching message + parents without GitHub verification is forgeable.
+        self.assertFalse(
+            guard.run_head_matches_requested(
+                repo="ImL1s/medley",
+                recorded_sha=forged,
+                requested_sha=tip,
+                parent_cache=cache,
+                message_cache=messages,
+                github_proof_cache=proofs,
+            )
+        )
+        # GitHub-signed ordinary merges can forge the same subject; bind to
+        # the live refs/pull/N/merge identity (#530 review).
+        self.assertFalse(
+            guard.run_head_matches_requested(
+                repo="ImL1s/medley",
+                recorded_sha=merge,
+                requested_sha=tip,
+                parent_cache=cache,
+                message_cache=messages,
+                github_proof_cache=proofs,
+                pull_merge_sha=forged,
+                require_pull_merge=True,
+            )
+        )
+        self.assertFalse(
+            guard.run_head_matches_requested(
+                repo="ImL1s/medley",
+                recorded_sha=merge,
+                requested_sha=tip,
+                parent_cache=cache,
+                message_cache=messages,
+                github_proof_cache=proofs,
+                pull_merge_sha=None,
+                require_pull_merge=True,
+            )
+        )
+        self.assertTrue(
+            guard.run_head_matches_requested(
+                repo="ImL1s/medley",
+                recorded_sha=merge,
+                requested_sha=tip,
+                parent_cache=cache,
+                message_cache=messages,
+                github_proof_cache=proofs,
+                pull_merge_sha=merge,
+                require_pull_merge=True,
+            )
+        )
+        self.assertTrue(
+            guard.run_head_matches_requested(
+                repo="ImL1s/medley",
+                recorded_sha=tip,
+                requested_sha=tip,
+                parent_cache=cache,
+                message_cache=messages,
+                github_proof_cache=proofs,
+                pull_merge_sha=merge,
+            )
+        )
 
     def test_classify_failed_and_cancelled_are_not_absent(self) -> None:
         failed = listed_run(
@@ -619,6 +858,17 @@ class PrHeadCiRunGuardTests(unittest.TestCase):
         self.assertIn("--report-pr-heads", text)
         self.assertIn("gh pr checks", text)
         self.assertNotIn("if not rows:", text)
+
+    def test_fork_md_describes_immutable_pr_receipt(self) -> None:
+        text = (REPO / "FORK.md").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "matches the target commit against the run detail's\n"
+            "`pull_requests[].head.sha`",
+            text,
+        )
+        self.assertIn("immutable `head_sha`", text)
+        self.assertIn("synthetic merge commit whose git", text)
+        self.assertIn("parents include that PR head", text)
 
 
 class PrHeadHistoryReportTests(unittest.TestCase):

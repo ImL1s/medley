@@ -353,12 +353,14 @@ This guard runs from the developer/orchestrator host (outside GitHub Actions),
 so it can fail closed when the thing being watched is "no run created". For
 feature PR branches it resolves the branch head with `git ls-remote`, lists
 `pull_request` runs via `gh run list --workflow ci.yml --branch <branch>
---event pull_request`, and matches the target commit against the run detail's
-`pull_requests[].head.sha` (not top-level `head_sha`, which is the ephemeral
-merge commit). For `providers`, where CI push runs actually exist, it keeps the
-release-gate identity shape (`event == "push"`, `head_branch`, exact
-`head_sha`, and workflow `path == ".github/workflows/ci.yml"`). It
-intentionally does **not** use `gh pr checks` to answer "did this SHA get CI".
+--event pull_request`, and matches the target commit against the run's
+immutable `head_sha` (the PR head, or the synthetic merge commit whose git
+parents include that PR head). `pull_requests[].head.sha` is rewritten to the
+live PR tip and is **not** a receipt. For `providers`, where CI push runs
+actually exist, it keeps the release-gate identity shape (`event == "push"`,
+`head_branch`, exact `head_sha`, and workflow
+`path == ".github/workflows/ci.yml"`). It intentionally does **not** use
+`gh pr checks` to answer "did this SHA get CI".
 
 `gh pr checks` is the wrong probe for that question: an empty result prints
 **"no checks reported"**, which looks unfinished rather than fail-closed, and
