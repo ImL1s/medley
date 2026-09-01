@@ -46,6 +46,28 @@ impl SessionIdLock {
     }
 }
 
+/// `flock` attaches to the open file description, not the fd. A forked child
+/// keeps a duplicate for the whole fork-to-exec window even when the parent
+/// drops its `File`s (`O_CLOEXEC` only helps at `execve`). Explicit
+/// `LOCK_UN` releases the lease on the description immediately — the same
+/// reason `transition_exclusive_to_lifetime_shared` unlocks before reacquiring
+/// shared. Shell already has this Drop (#517); workspace must match (#463).
+impl Drop for SessionIdLock {
+    fn drop(&mut self) {
+        // Best-effort: Drop also runs during unwinding, where a panic aborts.
+        if let Some(namespace) = self.namespace.as_ref()
+            && let Err(error) = FileExt::unlock(namespace)
+        {
+            tracing::warn!(%error, "failed to unlock session-id namespace lease on drop");
+        }
+        if let Some(mutation) = self.mutation.as_ref()
+            && let Err(error) = FileExt::unlock(mutation)
+        {
+            tracing::warn!(%error, "failed to unlock session-id mutation lease on drop");
+        }
+    }
+}
+
 /// The one derivation of a session id's lock-namespace stem (#406).
 ///
 /// Every stack that addresses the `session-ids` namespace derives its leaf
@@ -443,6 +465,26 @@ mod tests {
             .unwrap()
             .expect("exclusive after readers drop");
         drop(exclusive);
+    }
+
+    #[test]
+    fn drop_unlocks_lease_for_a_subsequent_exclusive_acquirer() {
+        // Relies on Drop calling flock LOCK_UN (#463 / #517 pattern).
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let _held = acquire_session_id_lock_sync(temp.path(), SESSION_ID).unwrap();
+            assert!(
+                try_acquire_session_id_write_lock_sync(temp.path(), SESSION_ID)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            try_acquire_session_id_write_lock_sync(temp.path(), SESSION_ID)
+                .unwrap()
+                .is_some(),
+            "Drop must unlock so a later exclusive claim can succeed"
+        );
     }
 
     #[test]
