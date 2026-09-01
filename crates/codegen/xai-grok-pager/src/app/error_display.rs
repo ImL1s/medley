@@ -1418,7 +1418,9 @@ mod tests {
         );
         // 500's classify has no default_why; action is the retry hint.
         assert!(
-            formatted.detail.contains("Something went wrong on our side"),
+            formatted
+                .detail
+                .contains("Something went wrong on our side"),
             "suppressed body must fall back to the caller's class copy: {}",
             formatted.detail
         );
