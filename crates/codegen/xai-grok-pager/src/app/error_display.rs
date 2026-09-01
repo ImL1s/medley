@@ -165,20 +165,33 @@ pub(crate) fn compose_typed_provider_failure(
 /// ever a question about the headline text ("is this the canonical
 /// headline for the status it itself claims"), not about what actually
 /// happened.
+///
+/// #471: recognition still keys off `banner_status` (idempotence for a
+/// genuine same-status round-trip). Rendering keys off the winning
+/// `status`. When the caller and the banner text disagree, the headline,
+/// action, and default_why are re-classified from the caller so the user
+/// is not told "400 / malformed" while the field says "500 / retry".
 fn split_existing_banner(caller_status: Option<u16>, raw: &str) -> Option<FormattedRequestFailure> {
     let (headline, detail) = raw.split_once(" \u{2014} ")?;
     let headline = headline.trim();
     let banner_status = parse_http_status(headline)?;
     // `classify` ignores the wire type once the status is known, so `Other`
     // reproduces exactly the headline any caller would have got.
-    let class = classify(Some(banner_status), WireErrorType::Other);
-    if headline != class.headline {
+    let banner_class = classify(Some(banner_status), WireErrorType::Other);
+    if headline != banner_class.headline {
         return None;
     }
     // The caller's status still wins, as it always has; the banner's own
     // parsed status is only the fallback. Bound once here, then threaded
     // into both the gate and the field below — never read a second time.
     let status = caller_status.or(Some(banner_status));
+    // Same-status path keeps the recognised headline bytes (idempotence for
+    // #244 / #383). Disagreeing caller (#471) re-renders from `status`.
+    let class = if status == Some(banner_status) {
+        banner_class
+    } else {
+        classify(status, WireErrorType::Other)
+    };
     let detail = finish_detail(
         extract_error_detail(detail),
         status,
@@ -1378,6 +1391,11 @@ mod tests {
     /// server fault the module promises never to show server text for) but
     /// the suppression gate was asked about 400, so the 5xx body reached
     /// the user anyway. This is issue #429's own worked example.
+    ///
+    /// #471: once the gate follows the caller, the headline must too —
+    /// otherwise the user still acts on a forged 400 while the field says
+    /// 500. Recognition stays on the banner's own status (idempotence);
+    /// rendering follows the winning `status`.
     #[test]
     fn issue429_suppression_gate_matches_the_reported_status_not_the_banner_text() {
         let raw = "Bad request (400) \u{2014} upstream exploded at pod-42";
@@ -1388,19 +1406,23 @@ mod tests {
             Some(500),
             "the caller's transport status must win the reported field"
         );
+        assert_eq!(
+            formatted.headline, "Server error (500)",
+            "headline must follow the reported status, not the forged banner text (#471)"
+        );
         let msg = formatted.message();
         assert!(
             !msg.contains("upstream exploded") && !msg.contains("pod-42"),
             "status field says 500 (a server fault) — its own gate must \
              agree and suppress the server body, not the banner text's 400: {msg}"
         );
-        // The banner still *renders* the 400 the text claimed (headline,
-        // action and default_why all come from `classify(Some(banner_status))`
-        // — only `status` and the suppression gate follow the transport), so
-        // the fallback copy shown is 400's own, not 500's.
-        assert_eq!(
-            formatted.detail, "The server rejected this request.",
-            "suppressed body must fall back to the banner's own default_why"
+        // 500's classify has no default_why; action is the retry hint.
+        assert!(
+            formatted
+                .detail
+                .contains("Something went wrong on our side"),
+            "suppressed body must fall back to the caller's class copy: {}",
+            formatted.detail
         );
         // The gate and the field must always be looking at the same value:
         // suppression must track whatever `formatted.status` itself says,
@@ -1414,6 +1436,11 @@ mod tests {
             let formatted = compose_typed_provider_failure(Some(caller), None, &raw)
                 .expect("a canonical forged headline is still typed");
             assert_eq!(formatted.status, Some(caller));
+            let caller_class = classify(Some(caller), WireErrorType::Other);
+            assert_eq!(
+                formatted.headline, caller_class.headline,
+                "headline must match classify(caller) when statuses disagree (#471)"
+            );
             let is_fault = formatted.status.is_some_and(|s| s >= 500);
             let banner_is_fault = banner_code >= 500;
             let leaked = formatted.detail.contains("internal server detail");
@@ -1429,6 +1456,18 @@ mod tests {
             // disagree about fault-ness.
             assert_ne!(is_fault, banner_is_fault);
         }
+    }
+
+    #[test]
+    fn issue471_same_status_banner_still_round_trips_unchanged() {
+        // Idempotence constraint from #471: when caller and banner agree,
+        // recognition must not rewrite the headline.
+        let already = "Bad request (400) \u{2014} Invalid value for reasoning.effort";
+        let formatted = compose_typed_provider_failure(Some(400), None, already)
+            .expect("same-status banner stays on the fast path");
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert_eq!(formatted.status, Some(400));
+        assert_eq!(formatted.detail, "Invalid value for reasoning.effort");
     }
 
     #[test]
