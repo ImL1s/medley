@@ -10,6 +10,7 @@ filter that cannot match a bare function name.
 
 import contextlib
 import io
+import os
 import re
 import subprocess
 import sys
@@ -799,6 +800,67 @@ class EndToEnd(unittest.TestCase):
         proc = self._run(diff)
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("none_auth_scheme_lib_regression_for_171", proc.stdout)
+
+
+class LiveGitPath(unittest.TestCase):
+    """#461: the live CI path never uses `--diff-file`."""
+
+    SCRIPT = REPO / "scripts" / "check_new_tests_are_filtered.py"
+    WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+
+    def _run(self, git_script: str) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as raw:
+            fake_bin = Path(raw) / "bin"
+            fake_bin.mkdir()
+            git = fake_bin / "git"
+            git.write_text(git_script, encoding="utf-8")
+            git.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(self.SCRIPT),
+                    "--workflow",
+                    str(self.WORKFLOW),
+                    "--base",
+                    "origin/providers",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(REPO),
+            )
+
+    def test_failed_git_diff_is_not_no_new_tests(self):
+        """A failed `git diff` must not print the empty-diff success line."""
+        proc = self._run(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            "merge-base) printf 'deadbeef\\n'; exit 0 ;;\n"
+            "rev-parse) printf 'cafebabe\\n'; exit 0 ;;\n"
+            'diff) printf \'fatal: bad revision\\n\' >&2; exit 128 ;;\n'
+            '*) printf \'unexpected git %s\\n\' "$*" >&2; exit 99 ;;\n'
+            "esac\n"
+        )
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertNotIn("no new tests in this diff", proc.stdout)
+        self.assertIn("git diff", proc.stderr)
+
+    def test_merge_base_equals_head_is_not_no_new_tests(self):
+        """Push onto the base: merge-base is HEAD; finding tests is impossible."""
+        proc = self._run(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            "merge-base) printf 'deadbeef\\n'; exit 0 ;;\n"
+            "rev-parse) printf 'deadbeef\\n'; exit 0 ;;\n"
+            'diff) printf \'\\n\'; exit 0 ;;\n'
+            '*) printf \'unexpected git %s\\n\' "$*" >&2; exit 99 ;;\n'
+            "esac\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("no new tests in this diff", proc.stdout)
+        self.assertIn("merge-base is HEAD", proc.stdout)
 
 
 class TargetOf(unittest.TestCase):

@@ -41,6 +41,14 @@ class DistChannelDocsGuardTests(unittest.TestCase):
         self.assertIn(RELEASE_DIST_CHANNEL_JSON, text)
         self.assertIn(RELEASE_DIST_CHANNEL_CASE, text)
 
+    def test_stale_providers_expectation_matches_known_bad_wording(self) -> None:
+        """Absence on README is only a pass if this regex can fire."""
+        self.assertIsNotNone(
+            STALE_PROVIDERS_EXPECTATION.search(
+                "distChannel is expected to be `providers`"
+            )
+        )
+
     def test_readme_does_not_expect_distchannel_providers(self) -> None:
         text = README.read_text(encoding="utf-8")
         match = STALE_PROVIDERS_EXPECTATION.search(text)
