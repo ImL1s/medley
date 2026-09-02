@@ -748,16 +748,26 @@ fn find_json_object(s: &str) -> Option<(usize, usize)> {
 const MAX_JSON_UNWRAP_PASSES: usize = 8;
 
 /// Peel [`resolve_embedded_json`] layers until none remain or the pass cap hits.
+/// Hitting the cap with a leftover object means the remainder was not fully
+/// read — drop the JSON tail rather than returning prefixed payload unchanged
+/// (`p0 {"secret":"x"}` does not start with `{`, so [`is_noise_detail`] would
+/// accept it).
 fn resolve_embedded_json_to_fixed_point(s: &str) -> String {
     let mut current = s.to_string();
+    let mut exhausted = true;
     for _ in 0..MAX_JSON_UNWRAP_PASSES {
         let Some(resolved) = resolve_embedded_json(&current) else {
+            exhausted = false;
             break;
         };
         if resolved == current {
+            exhausted = false;
             break;
         }
         current = resolved;
+    }
+    if exhausted && let Some(start) = current.find('{') {
+        return drop_json_tail(&current[..start]);
     }
     current
 }
@@ -1976,6 +1986,54 @@ mod tests {
         assert!(
             !formatted.message().contains('{'),
             "beyond the unwrap cap, raw JSON must not reach the user: {}",
+            formatted.message()
+        );
+    }
+
+    /// Prefixed envelopes (`pN {…}`) are the remaining leak at the cap:
+    /// after the unwrap budget the remainder does not start with `{`, so
+    /// [`is_noise_detail`] would accept it. The sibling boundary test nests
+    /// bare JSON, which that leading-brace check already rejects.
+    ///
+    /// Depth is [`MAX_JSON_UNWRAP_PASSES`] wraps of a one-layer inner
+    /// object — one more peel than one phase, and under [`MAX_JSON_SCAN`].
+    /// Deeper JSON-in-string stacking exceeds the scan bound by escaping
+    /// growth and would pass via the oversized drop path instead.
+    #[test]
+    fn issue432_prefixed_unwrap_cap_redacts_json_tail() {
+        // Innermost has no `error`/`message` key: the unreadable-object drop
+        // would redact it on one more pass. The cap must fire first, leaving
+        // `p0 {"secret":"x"}`, which does not start with `{`.
+        let mut inner = serde_json::json!({"secret": "x"}).to_string();
+        for i in 0..super::MAX_JSON_UNWRAP_PASSES {
+            inner = serde_json::json!({"error": format!("p{i} {inner}")}).to_string();
+        }
+        assert!(
+            inner.len() <= super::MAX_JSON_SCAN,
+            "fixture must exercise the pass cap, not the scan bound: {} bytes",
+            inner.len()
+        );
+        // `format_request_failure` runs two phases; the second still drops an
+        // unreadable leftover. The helper Codex asked to change is one phase.
+        let resolved = super::resolve_embedded_json_to_fixed_point(&inner);
+        assert!(
+            !resolved.contains("secret"),
+            "beyond the unwrap cap, prefixed payloads must still be redacted: {resolved}"
+        );
+        assert!(
+            !resolved.contains('{'),
+            "beyond the unwrap cap, remaining JSON must be dropped: {resolved}"
+        );
+        let raw = format!("API error (status 400 Bad Request): {inner}");
+        let formatted = format_request_failure(Some(400), None, &raw);
+        assert!(
+            !formatted.message().contains("secret"),
+            "beyond the unwrap cap, prefixed payloads must still be redacted: {}",
+            formatted.message()
+        );
+        assert!(
+            !formatted.message().contains('{'),
+            "beyond the unwrap cap, remaining JSON must be dropped: {}",
             formatted.message()
         );
     }
