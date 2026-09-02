@@ -504,17 +504,46 @@ def main() -> int:
     if args.diff_file:
         diff = args.diff_file.read_text()
     else:
-        merge_base = subprocess.run(
+        merge_base_proc = subprocess.run(
             ["git", "merge-base", "HEAD", args.base],
             capture_output=True, text=True, check=False,
-        ).stdout.strip()
-        if not merge_base:
-            print(f"error: no merge base with {args.base}", file=sys.stderr)
+        )
+        merge_base = merge_base_proc.stdout.strip()
+        if merge_base_proc.returncode != 0 or not merge_base:
+            print(f"error: git merge-base with {args.base} failed", file=sys.stderr)
+            if merge_base_proc.stderr:
+                print(merge_base_proc.stderr, file=sys.stderr, end="")
             return 2
-        diff = subprocess.run(
+        head_proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        head = head_proc.stdout.strip()
+        if head_proc.returncode != 0 or not head:
+            print("error: git rev-parse HEAD failed", file=sys.stderr)
+            if head_proc.stderr:
+                print(head_proc.stderr, file=sys.stderr, end="")
+            return 2
+        if merge_base == head:
+            # Push onto the base: HEAD...HEAD is empty by construction, so
+            # "no new tests in this diff" would be the same line as a PR
+            # that genuinely added none (#461).
+            print("no new tests to check: merge-base is HEAD (push onto the base branch)")
+            return 0
+        diff_proc = subprocess.run(
             ["git", "diff", "-U0", f"{merge_base}...HEAD"],
             capture_output=True, text=True, check=False,
-        ).stdout
+        )
+        if diff_proc.returncode != 0:
+            print(
+                f"error: git diff {merge_base}...HEAD failed "
+                f"(exit {diff_proc.returncode})",
+                file=sys.stderr,
+            )
+            if diff_proc.stderr:
+                print(diff_proc.stderr, file=sys.stderr, end="")
+            return 2
+        diff = diff_proc.stdout
 
     per_crate = parse_workflow(args.workflow.read_text())
     tests = added_tests(diff)
