@@ -748,10 +748,11 @@ fn find_json_object(s: &str) -> Option<(usize, usize)> {
 const MAX_JSON_UNWRAP_PASSES: usize = 8;
 
 /// Peel [`resolve_embedded_json`] layers until none remain or the pass cap hits.
-/// Hitting the cap with a leftover object means the remainder was not fully
-/// read — drop the JSON tail rather than returning prefixed payload unchanged
-/// (`p0 {"secret":"x"}` does not start with `{`, so [`is_noise_detail`] would
-/// accept it).
+/// Hitting the cap with a leftover *object* means the remainder was not
+/// fully read — drop that JSON tail rather than returning prefixed payload
+/// unchanged (`p0 {"secret":"x"}` does not start with `{`, so
+/// [`is_noise_detail`] would accept it). Brace prose (`{'a','b'}`) is not
+/// an object; [`find_json_object`] leaves it alone.
 fn resolve_embedded_json_to_fixed_point(s: &str) -> String {
     let mut current = s.to_string();
     let mut exhausted = true;
@@ -766,7 +767,7 @@ fn resolve_embedded_json_to_fixed_point(s: &str) -> String {
         }
         current = resolved;
     }
-    if exhausted && let Some(start) = current.find('{') {
+    if exhausted && let Some((start, _)) = find_json_object(&current) {
         return drop_json_tail(&current[..start]);
     }
     current
@@ -2035,6 +2036,24 @@ mod tests {
             !formatted.message().contains('{'),
             "beyond the unwrap cap, remaining JSON must be dropped: {}",
             formatted.message()
+        );
+    }
+
+    /// Hitting the pass cap must not treat brace *prose* as a JSON tail.
+    /// Eight `{"error": …}` wraps around `Supported values are: {'a','b'}`
+    /// exhaust the budget with a leftover that contains `{` but is not a
+    /// parseable object — `find('{')` would truncate it to `Supported values
+    /// are`.
+    #[test]
+    fn issue432_unwrap_cap_keeps_brace_prose() {
+        let mut inner = "Supported values are: {'a','b'}".to_string();
+        for _ in 0..super::MAX_JSON_UNWRAP_PASSES {
+            inner = serde_json::json!({"error": inner}).to_string();
+        }
+        let resolved = super::resolve_embedded_json_to_fixed_point(&inner);
+        assert!(
+            resolved.contains("{'a','b'}"),
+            "brace prose must survive the unwrap cap: {resolved}"
         );
     }
 
